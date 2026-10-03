@@ -2599,6 +2599,7 @@ dependencies = [
 name = "threnody-net"
 version = "0.1.0"
 dependencies = [
+ "const-cbor",
  "socket2",
  "tempfile",
  "thiserror",

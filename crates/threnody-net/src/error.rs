@@ -16,6 +16,8 @@ pub enum NetError {
     IdentityMismatch { expected: String, got: String },
     #[error("peer {0} refused by local policy")]
     Refused(String),
+    #[error("no relay path to {0} (relays need mutual approval with both ends)")]
+    NoRoute(String),
     #[error("node has shut down")]
     Shutdown,
 }

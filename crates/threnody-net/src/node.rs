@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
+use crate::relay::RelayState;
 
 /// Who may hold a session with us (checked right after authentication).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +63,8 @@ pub enum Event {
         addr: SocketAddr,
         suite: Suite,
         new_contact: bool,
+        /// Set when the session runs over a relay circuit through this peer.
+        via: Option<PublicIdentity>,
     },
     Message {
         peer: PublicIdentity,
@@ -118,6 +121,8 @@ pub struct SessionInfo {
     pub transport: &'static str,
     pub since_ms: u64,
     pub outbound: bool,
+    /// For relayed sessions, the neighbour the circuit runs through.
+    pub via: Option<PublicIdentity>,
 }
 
 struct SessionHandle {
@@ -126,7 +131,7 @@ struct SessionHandle {
     info: SessionInfo,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     identity: Identity,
     home: Home,
     contacts: Mutex<Contacts>,
@@ -137,10 +142,11 @@ struct Shared {
     tunnel: Option<(u16, [u8; 32])>,
     /// WireGuard keys peers offered us, for clean removal on revocation.
     tunnel_peers: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
+    pub(crate) relay: Mutex<RelayState>,
     next_id: AtomicU64,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic while holding a lock leaves plain data behind; keep going.
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -150,7 +156,7 @@ impl Shared {
         let _ = self.events.send(e);
     }
 
-    fn mutual(&self, peer: &PublicIdentity) -> bool {
+    pub(crate) fn mutual(&self, peer: &PublicIdentity) -> bool {
         lock(&self.contacts)
             .get(peer)
             .is_some_and(|c| c.mutually_approved())
@@ -175,7 +181,7 @@ impl Shared {
 
 #[derive(Clone)]
 pub struct Node {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl Node {
@@ -195,6 +201,7 @@ impl Node {
             constant_rate: cfg.constant_rate,
             tunnel,
             tunnel_peers: Mutex::new(HashMap::new()),
+            relay: Mutex::new(RelayState::default()),
             next_id: AtomicU64::new(1),
         };
         Ok((
@@ -263,7 +270,7 @@ impl Node {
         let _ = stream.set_nodelay(true);
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
         self.check_policy(chan.peer())?;
-        self.spawn_session(stream, chan, addr, false, None);
+        self.spawn_session(stream, chan, addr, false, None, None);
         Ok(())
     }
 
@@ -285,11 +292,44 @@ impl Node {
                 got: peer.fingerprint().to_string(),
             });
         }
-        self.spawn_session(stream, chan, peer_addr, true, Some(addr.to_owned()));
+        self.spawn_session(stream, chan, peer_addr, true, Some(addr.to_owned()), None);
         Ok(peer)
     }
 
-    fn check_policy(&self, peer: &PublicIdentity) -> Result<()> {
+    pub(crate) fn identity_ref(&self) -> &Identity {
+        &self.shared.identity
+    }
+
+    /// Address shown for sessions and rejections that arrive over a relay.
+    fn relay_addr(&self, via: &PublicIdentity) -> SocketAddr {
+        self.sessions()
+            .into_iter()
+            .find(|s| s.peer == *via && s.via.is_none())
+            .map_or(SocketAddr::from(([0, 0, 0, 0], 0)), |s| s.addr)
+    }
+
+    pub(crate) fn emit_rejected_relay(&self, via: PublicIdentity, reason: String) {
+        let addr = self.relay_addr(&via);
+        self.shared.emit(Event::Rejected {
+            addr,
+            reason: format!("via relay: {reason}"),
+        });
+    }
+
+    pub(crate) fn spawn_relayed_session<S>(
+        &self,
+        stream: S,
+        chan: SecureChannel,
+        via: PublicIdentity,
+        outbound: bool,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let addr = self.relay_addr(&via);
+        self.spawn_session(stream, chan, addr, outbound, None, Some(via));
+    }
+
+    pub(crate) fn check_policy(&self, peer: &PublicIdentity) -> Result<()> {
         let contacts = lock(&self.shared.contacts);
         let ok = match self.policy() {
             AcceptPolicy::Anyone => true,
@@ -362,6 +402,7 @@ impl Node {
         addr: SocketAddr,
         outbound: bool,
         dialed: Option<String>,
+        via: Option<PublicIdentity>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -379,9 +420,10 @@ impl Node {
             peer,
             addr,
             suite: chan.suite(),
-            transport: "tcp",
+            transport: if via.is_some() { "relay" } else { "tcp" },
             since_ms: now_ms(),
             outbound,
+            via,
         };
         // A newer session to the same peer replaces the old one; dropping
         // the old handle's sender ends its task.
@@ -391,34 +433,47 @@ impl Node {
             addr,
             suite: chan.suite(),
             new_contact,
+            via,
         });
 
-        let shared = Arc::clone(&self.shared);
+        let node = self.clone();
         tokio::spawn(async move {
-            let reason = match run_session(&shared, stream, chan, addr, rx).await {
+            let reason = match run_session(&node, stream, chan, addr, via, rx).await {
                 Ok(()) => "closed".to_owned(),
                 Err(e) => e.to_string(),
             };
-            let mut sessions = lock(&shared.sessions);
-            if sessions.get(&peer).is_some_and(|h| h.id == id) {
-                sessions.remove(&peer);
+            let current = {
+                let mut sessions = lock(&node.shared.sessions);
+                // Absent (disconnected locally) or still ours: either way no
+                // newer session has replaced this one.
+                let current = !sessions.get(&peer).is_some_and(|h| h.id != id);
+                if sessions.get(&peer).is_some_and(|h| h.id == id) {
+                    sessions.remove(&peer);
+                }
+                current
+            };
+            // Circuits relayed over this link die with it (unless a newer
+            // session to the same peer already took over).
+            if current && via.is_none() {
+                node.drop_circuits_of(&peer);
             }
-            drop(sessions);
-            shared.emit(Event::Disconnected { peer, reason });
+            node.shared.emit(Event::Disconnected { peer, reason });
         });
     }
 }
 
 async fn run_session<S>(
-    shared: &Shared,
+    node: &Node,
     stream: S,
     mut chan: SecureChannel,
     addr: SocketAddr,
+    via: Option<PublicIdentity>,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let shared: &Shared = &node.shared;
     let peer = *chan.peer();
     let (mut rd, mut wr) = tokio::io::split(stream);
 
@@ -472,7 +527,9 @@ where
                 discovery_keyed = true;
             }
             // Offer a tunnel once per session, as soon as approval is mutual.
+            // Tunnels need a direct UDP path, so never over relayed sessions.
             if let Some((port, wg_public)) = shared.tunnel
+                && via.is_none()
                 && !offered
                 && shared.mutual(&peer)
             {
@@ -534,6 +591,12 @@ where
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 });
+                            }
+                        }
+                        AppMessage::Relay(payload) => {
+                            // Circuits only ride on direct links, never nest.
+                            if via.is_none() {
+                                node.on_relay(peer, &payload);
                             }
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {

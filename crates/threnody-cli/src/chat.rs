@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use threnody_core::store::Home;
-use threnody_core::{AppMessage, Identity, PublicIdentity, now_ms, safety_number};
+use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, now_ms, safety_number};
 use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -33,7 +33,8 @@ pub struct TunnelOptions {
 
 const HELP: &str = "\
 Type a line to send it to the current peer. Commands:
-  /connect <invite|contact|host:port>   dial a peer
+  /connect <invite|contact|host:port>   dial a peer (contacts fall back to relays)
+  /relay <peer>                         reach a contact through approved relays
   /to <peer>                            choose who plain lines go to
   /peers                                live sessions
   /contacts                             contact book
@@ -181,17 +182,46 @@ impl Ui {
         }
     }
 
+    /// Dials directly; for known contacts, falls back to a relay circuit
+    /// when the direct path fails or no address is known (spec §7.3).
     fn connect(&self, t: &str) {
-        let resolved = target::resolve(t, &self.node.contacts());
+        let contacts = self.node.contacts();
+        let known = match contacts.find(t) {
+            threnody_core::store::Lookup::Found(c) => Some(c.key),
+            _ => None,
+        };
+        let resolved = target::resolve(t, &contacts);
         let node = self.node.clone();
         let t = t.to_owned();
         tokio::spawn(async move {
-            let r = match resolved {
+            let direct = match resolved {
                 Ok((addr, pin)) => node.connect(&addr, pin).await.map_err(anyhow::Error::from),
                 Err(e) => Err(e),
             };
-            if let Err(e) = r {
-                println!("! connect {t}: {e:#}");
+            let Err(e) = direct else { return };
+            match known {
+                Some(key) => {
+                    println!("* {t}: direct path failed ({e:#}); trying relays");
+                    if let Err(e) = node.connect_relayed(key.fingerprint()).await {
+                        println!("! connect {t}: {e:#}");
+                    }
+                }
+                None => println!("! connect {t}: {e:#}"),
+            }
+        });
+    }
+
+    fn relay(&self, dest: Fingerprint) {
+        let node = self.node.clone();
+        let who = self
+            .node
+            .contacts()
+            .iter()
+            .find(|c| c.fingerprint() == dest)
+            .map_or_else(|| dest.to_string(), |c| c.label());
+        tokio::spawn(async move {
+            if let Err(e) = node.connect_relayed(dest).await {
+                println!("! relay to {who}: {e:#}");
             }
         });
     }
@@ -203,9 +233,17 @@ impl Ui {
                 addr,
                 suite,
                 new_contact,
+                via,
             } => {
                 let who = self.name(&peer);
-                println!("* connected to {who} at {addr} [tcp, {}]", suite.name());
+                match via {
+                    Some(v) => println!(
+                        "* connected to {who} through relay {} [{}, end-to-end]",
+                        self.name(&v),
+                        suite.name()
+                    ),
+                    None => println!("* connected to {who} at {addr} [tcp, {}]", suite.name()),
+                }
                 if new_contact {
                     println!("  new contact (trust on first use). Compare safety numbers: /safety");
                 }
@@ -346,11 +384,13 @@ impl Ui {
                 }
                 for i in s {
                     let dir = if i.outbound { "out" } else { "in" };
+                    let path = match i.via {
+                        Some(v) => format!("relay through {}", self.name(&v)),
+                        None => format!("{} {}", i.transport, i.addr),
+                    };
                     println!(
-                        "  {} via {} {} ({dir}, {})",
+                        "  {} via {path} ({dir}, {})",
                         self.name(&i.peer),
-                        i.transport,
-                        i.addr,
                         i.suite.name()
                     );
                 }
@@ -443,6 +483,24 @@ impl Ui {
                 println!("* policy: {p:?}");
             }
             "status" => self.status(),
+            "relay" => {
+                let q = arg.ok_or_else(|| anyhow!("usage: /relay <contact|fingerprint|invite>"))?;
+                // A contact, a bare fingerprint, or an invite link's fingerprint.
+                let dest = match self.resolve_peer(Some(q)) {
+                    Ok(p) => p.fingerprint(),
+                    Err(_) => q
+                        .trim_start_matches("threnody://")
+                        .split('@')
+                        .next()
+                        .unwrap_or_default()
+                        .parse::<Fingerprint>()
+                        .map_err(|_| {
+                            anyhow!("{q:?} is not a contact, fingerprint or invite link")
+                        })?,
+                };
+                println!("* looking for a relay path to {dest}");
+                self.relay(dest);
+            }
             "group" => {
                 let node = self.node.clone();
                 let name = |p: &PublicIdentity| name_of(&node, p);

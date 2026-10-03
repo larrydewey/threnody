@@ -46,6 +46,8 @@ pub enum AppMessage {
     },
     /// An opaque group-layer message (MLS, see `threnody-groups`).
     Group(Vec<u8>),
+    /// An opaque relay-circuit message (see `threnody-net::relay`).
+    Relay(Vec<u8>),
 }
 
 mod kind {
@@ -56,6 +58,7 @@ mod kind {
     pub const COVER: u64 = 4;
     pub const TUNNEL_OFFER: u64 = 5;
     pub const GROUP: u64 = 6;
+    pub const RELAY: u64 = 7;
 }
 
 impl AppMessage {
@@ -92,6 +95,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::GROUP)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Relay(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::RELAY)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -105,7 +112,7 @@ impl AppMessage {
         match self {
             Self::Text { body, .. } => body.len() + 32,
             Self::File { name, data, .. } => name.len() + data.len() + 48,
-            Self::Group(p) => p.len() + 16,
+            Self::Group(p) | Self::Relay(p) => p.len() + 16,
             _ => 16,
         }
     }
@@ -150,12 +157,16 @@ impl AppMessage {
                     data,
                 }
             }
-            kind::GROUP => {
-                let p = required(bytes, "group payload")?;
-                if p.len() > MAX_FILE {
-                    return Err(Error::Malformed("group message too large"));
+            kind::GROUP | kind::RELAY => {
+                let p = required(bytes, "payload")?;
+                if p.len() > MAX_FILE + 4096 {
+                    return Err(Error::Malformed("message too large"));
                 }
-                Self::Group(p)
+                if k == Some(kind::GROUP) {
+                    Self::Group(p)
+                } else {
+                    Self::Relay(p)
+                }
             }
             kind::TUNNEL_OFFER => Self::TunnelOffer {
                 wg_public: required(bytes, "wireguard key")?
@@ -226,6 +237,7 @@ mod tests {
                 port: 51820,
             },
             AppMessage::Group(vec![1, 2, 3]),
+            AppMessage::Relay(vec![4, 5]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }

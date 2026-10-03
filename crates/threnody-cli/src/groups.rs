@@ -98,13 +98,19 @@ impl GroupUi {
         // that peers have already moved to.
         self.save();
         for o in out.send {
-            let sent = o.wire.encode().map_err(anyhow::Error::from).and_then(|b| {
-                node.send(&o.to, AppMessage::Group(b))
-                    .map_err(anyhow::Error::from)
-            });
-            if sent.is_err() {
-                println!("! {} is offline; group message not delivered", name(&o.to));
+            let Ok(bytes) = o.wire.encode() else { continue };
+            if node.send(&o.to, AppMessage::Group(bytes.clone())).is_ok() {
+                continue;
             }
+            // No live session: try to reach the member through relays.
+            let (node, to, who) = (node.clone(), o.to, name(&o.to));
+            tokio::spawn(async move {
+                let delivered = node.connect_relayed(to.fingerprint()).await.is_ok()
+                    && node.send(&to, AppMessage::Group(bytes)).is_ok();
+                if !delivered {
+                    println!("! {who} is unreachable; group message not delivered");
+                }
+            });
         }
         for e in out.events {
             self.show(node, name, e);

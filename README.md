@@ -2,7 +2,7 @@
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
 
-**Status: milestone 3.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Multi-hop mesh routing, offline delivery and onion routing are still to come (see [Roadmap](#roadmap)).
+**Status: milestone 3.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Offline delivery and onion routing are still to come (see [Roadmap](#roadmap)).
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
@@ -22,7 +22,7 @@ threnody --home ~/.thr-a init
 threnody --home ~/.thr-a run --no-listen -c 'threnody://<fingerprint>@192.0.2.7:7450'
 ```
 
-Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`.
+Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails.
 
 ```
 /connect <invite|contact|host:port>   /to <peer>   /peers   /contacts
@@ -58,6 +58,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix D: WireGuard tunnels](docs/appendix-d-tunnels.md)
 - [Appendix E: private LAN discovery](docs/appendix-e-discovery.md)
 - [Appendix F: MLS groups](docs/appendix-f-groups.md)
+- [Appendix G: relay circuits](docs/appendix-g-relay.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake and ratchet](proofs/README.md)
 
@@ -77,7 +78,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ identity and contacts (message history, sync and backup not yet) |
-| §7 Transports | ✅ TCP/IP, private LAN discovery with auto-connect; ❌ BLE, Wi-Fi Direct, multi-hop mesh routing |
+| §7 Transports | ✅ TCP/IP, private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays) among approved nodes; ❌ BLE, Wi-Fi Direct, store-and-forward |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover; ❌ onion routing, local-first preference |
 | §10 Status indicators | ✅ `/status` |
@@ -89,7 +90,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 1. **Hardening (remaining).** OS keystores, ratchet persistence across reconnects, and an external audit.
 2. **Groups (remaining).** Store-and-forward via members, and more admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
-4. **Local mesh (remaining).** BLE / Wi-Fi Direct transports with the same beacon scheme, and multi-hop relay.
+4. **Mesh (remaining).** Store-and-forward via asynchronous prekeys, and BLE / Wi-Fi Direct transports with the same beacon scheme.
 5. **Metadata.** Onion routing through volunteer nodes; anonymous and selective-disclosure identities.
 6. **Mobile.** UniFFI bindings for iOS and Android. The core is sans-IO, so this is mostly glue code.
 

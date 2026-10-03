@@ -10,6 +10,7 @@ pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod node;
+pub mod relay;
 
 pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};
