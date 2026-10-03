@@ -44,6 +44,8 @@ pub enum AppMessage {
         wg_public: [u8; 32],
         port: u16,
     },
+    /// An opaque group-layer message (MLS, see `threnody-groups`).
+    Group(Vec<u8>),
 }
 
 mod kind {
@@ -53,6 +55,7 @@ mod kind {
     pub const APPROVAL: u64 = 3;
     pub const COVER: u64 = 4;
     pub const TUNNEL_OFFER: u64 = 5;
+    pub const GROUP: u64 = 6;
 }
 
 impl AppMessage {
@@ -85,6 +88,10 @@ impl AppMessage {
                     e.u8(2)?.bytes(wg_public)?;
                     e.u8(3)?.u16(*port)?;
                 }
+                Self::Group(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::GROUP)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -98,6 +105,7 @@ impl AppMessage {
         match self {
             Self::Text { body, .. } => body.len() + 32,
             Self::File { name, data, .. } => name.len() + data.len() + 48,
+            Self::Group(p) => p.len() + 16,
             _ => 16,
         }
     }
@@ -141,6 +149,13 @@ impl AppMessage {
                     name: required(name, "file name")?,
                     data,
                 }
+            }
+            kind::GROUP => {
+                let p = required(bytes, "group payload")?;
+                if p.len() > MAX_FILE {
+                    return Err(Error::Malformed("group message too large"));
+                }
+                Self::Group(p)
             }
             kind::TUNNEL_OFFER => Self::TunnelOffer {
                 wg_public: required(bytes, "wireguard key")?
@@ -210,6 +225,7 @@ mod tests {
                 wg_public: [7; 32],
                 port: 51820,
             },
+            AppMessage::Group(vec![1, 2, 3]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }

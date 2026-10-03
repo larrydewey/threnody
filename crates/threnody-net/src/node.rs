@@ -536,7 +536,7 @@ where
                                 });
                             }
                         }
-                        msg @ (AppMessage::Text { .. } | AppMessage::File { .. }) => {
+                        msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
                             shared.emit(Event::Message { peer, msg });
                         }
                     }

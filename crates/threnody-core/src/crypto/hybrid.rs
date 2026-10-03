@@ -11,8 +11,7 @@
 //! The 32-byte seed is the whole private key, which keeps persisted
 //! ratchet state small.
 
-use ml_kem::kem::Decapsulate;
-use ml_kem::{B32, Ciphertext, EncapsulateDeterministic, EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::{B32, Ciphertext, Decapsulate, Key, KeyExport, MlKem768, Seed};
 use rand_core::{CryptoRngCore, OsRng};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Digest, Sha3_256, Shake256};
@@ -21,8 +20,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
-type DecapKey = <MlKem768 as KemCore>::DecapsulationKey;
-type EncapKey = <MlKem768 as KemCore>::EncapsulationKey;
+type DecapKey = ml_kem::DecapsulationKey768;
+type EncapKey = ml_kem::EncapsulationKey768;
 
 pub const PK_M_LEN: usize = 1184;
 pub const CT_M_LEN: usize = 1088;
@@ -77,14 +76,14 @@ impl HybridSecret {
         let mut xof = Shake256::default();
         xof.update(seed);
         xof.finalize_xof().read(&mut expanded[..]);
-        let d = B32::try_from(&expanded[0..32]).expect("32-byte slice");
-        let z = B32::try_from(&expanded[32..64]).expect("32-byte slice");
-        let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
+        // FIPS 203 seed form: d || z.
+        let dk = DecapKey::from_seed(Seed::try_from(&expanded[0..64]).expect("64-byte slice"));
+        let ek = dk.encapsulation_key().clone();
         let sk_x: [u8; 32] = expanded[64..96].try_into().expect("32-byte slice");
         let x = StaticSecret::from(sk_x);
         let xp = PublicKey::from(&x);
         let mut bytes = Box::new([0u8; PUBLIC_LEN]);
-        bytes[..PK_M_LEN].copy_from_slice(&ek.as_bytes());
+        bytes[..PK_M_LEN].copy_from_slice(&ek.to_bytes());
         bytes[PK_M_LEN..].copy_from_slice(xp.as_bytes());
         Self {
             seed: Zeroizing::new(*seed),
@@ -109,8 +108,7 @@ impl HybridSecret {
         let (ct_m, ct_x) = ct.split_at(CT_M_LEN);
         let ct_m = Ciphertext::<MlKem768>::try_from(ct_m).map_err(|_| Error::InvalidKey)?;
         // ML-KEM decapsulation uses implicit rejection and never fails.
-        let ss_m: Zeroizing<[u8; 32]> =
-            Zeroizing::new(self.dk.decapsulate(&ct_m).unwrap_or_default().into());
+        let ss_m: Zeroizing<[u8; 32]> = Zeroizing::new(self.dk.decapsulate(&ct_m).into());
         let ct_x: [u8; 32] = ct_x.try_into().map_err(|_| Error::InvalidKey)?;
         let ss_x = self.x.diffie_hellman(&PublicKey::from(ct_x));
         if !ss_x.was_contributory() {
@@ -130,10 +128,10 @@ impl HybridPublic {
     /// FIPS 203 §7.2 modulus check (decode/encode round trip).
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let bytes: Box<[u8; PUBLIC_LEN]> = Box::new(b.try_into().map_err(|_| Error::InvalidKey)?);
-        let ek_enc =
-            ml_kem::Encoded::<EncapKey>::try_from(&b[..PK_M_LEN]).map_err(|_| Error::InvalidKey)?;
-        let ek = EncapKey::from_bytes(&ek_enc);
-        if ek.as_bytes() != ek_enc {
+        let ek_enc = Key::<EncapKey>::try_from(&b[..PK_M_LEN]).map_err(|_| Error::InvalidKey)?;
+        let ek = EncapKey::new(&ek_enc).map_err(|_| Error::InvalidKey)?;
+        // Belt and braces: the encoding must round-trip exactly.
+        if ek.to_bytes() != ek_enc {
             return Err(Error::InvalidKey);
         }
         let xb: [u8; 32] = b[PK_M_LEN..].try_into().map_err(|_| Error::InvalidKey)?;
@@ -166,10 +164,7 @@ impl HybridPublic {
     /// X-Wing `EncapsulateDerand`.
     pub fn encapsulate_derand(&self, eseed: &[u8; 64]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
         let m = B32::try_from(&eseed[..32]).expect("32-byte slice");
-        let (ct_m, ss_m) = self
-            .ek
-            .encapsulate_deterministic(&m)
-            .map_err(|_| Error::InvalidKey)?;
+        let (ct_m, ss_m) = self.ek.encapsulate_deterministic(&m);
         let ss_m: Zeroizing<[u8; 32]> = Zeroizing::new(ss_m.into());
         let ek_x: [u8; 32] = eseed[32..].try_into().expect("32-byte slice");
         let eph = StaticSecret::from(ek_x);

@@ -9,6 +9,7 @@ use threnody_core::{AppMessage, Identity, PublicIdentity, now_ms, safety_number}
 use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::groups::GroupUi;
 use crate::tunnel::Tunnels;
 use crate::{describe_contact, find_contact, target};
 
@@ -44,7 +45,8 @@ Type a line to send it to the current peer. Commands:
   /drop [peer]                          close a session
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
-  /quit";
+  /quit
+Groups (MLS, post-quantum X-Wing ciphersuite):";
 
 struct Ui {
     node: Node,
@@ -53,10 +55,12 @@ struct Ui {
     current: Option<PublicIdentity>,
     tunnels: Option<Tunnels>,
     discovery: Option<std::net::SocketAddr>,
+    groups: GroupUi,
 }
 
 pub async fn run(opts: Options) -> Result<()> {
     let downloads = opts.home.dir().join("downloads");
+    let groups = GroupUi::new(&opts.identity);
     let tunnels = opts
         .tunnel
         .as_ref()
@@ -110,6 +114,7 @@ pub async fn run(opts: Options) -> Result<()> {
         current: None,
         tunnels,
         discovery: None,
+        groups,
     };
     if let (Some(port), Some(tcp)) = (opts.discover, listen_addr) {
         let cfg = DiscoveryConfig {
@@ -153,12 +158,15 @@ pub async fn run(opts: Options) -> Result<()> {
     Ok(())
 }
 
+fn name_of(node: &Node, p: &PublicIdentity) -> String {
+    node.contacts()
+        .get(p)
+        .map_or_else(|| p.fingerprint().to_string(), |c| c.label())
+}
+
 impl Ui {
     fn name(&self, p: &PublicIdentity) -> String {
-        self.node
-            .contacts()
-            .get(p)
-            .map_or_else(|| p.fingerprint().to_string(), |c| c.label())
+        name_of(&self.node, p)
     }
 
     fn resolve_peer(&self, arg: Option<&str>) -> Result<PublicIdentity> {
@@ -217,6 +225,11 @@ impl Ui {
                             ),
                             Err(e) => println!("! could not save file from {who}: {e:#}"),
                         }
+                    }
+                    AppMessage::Group(payload) => {
+                        let node = self.node.clone();
+                        let name = |p: &PublicIdentity| name_of(&node, p);
+                        self.groups.incoming(&self.node, &name, peer, &payload);
                     }
                     _ => {}
                 }
@@ -313,7 +326,7 @@ impl Ui {
         let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
         match verb {
             "quit" | "q" | "exit" => return Ok(true),
-            "help" | "h" | "?" => println!("{HELP}"),
+            "help" | "h" | "?" => println!("{HELP}\n{}", crate::groups::HELP),
             "connect" | "c" => {
                 self.connect(arg.ok_or_else(|| anyhow!("usage: /connect <target>"))?)
             }
@@ -427,6 +440,26 @@ impl Ui {
                 println!("* policy: {p:?}");
             }
             "status" => self.status(),
+            "group" => {
+                let node = self.node.clone();
+                let name = |p: &PublicIdentity| name_of(&node, p);
+                let resolve = |q: &str| Ok(find_contact(&node.contacts(), q)?.key);
+                self.groups
+                    .command(&self.node, &name, &resolve, arg.unwrap_or("list"))?;
+            }
+            "groups" => {
+                let node = self.node.clone();
+                self.groups.list(&|p: &PublicIdentity| name_of(&node, p));
+            }
+            "g" => {
+                let node = self.node.clone();
+                let name = |p: &PublicIdentity| name_of(&node, p);
+                self.groups.say(
+                    &self.node,
+                    &name,
+                    arg.ok_or_else(|| anyhow!("usage: /g <group> <text>"))?,
+                )?;
+            }
             other => bail!("unknown command /{other}; try /help"),
         }
         Ok(false)

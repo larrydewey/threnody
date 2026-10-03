@@ -1,6 +1,7 @@
 //! `threnody`: command-line client for the Threnody protocol.
 
 mod chat;
+mod groups;
 mod target;
 mod tunnel;
 

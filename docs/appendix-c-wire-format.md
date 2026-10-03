@@ -32,12 +32,17 @@ RatchetMsg    = { 0 => bstr .size 12, 1 => bstr, 2 => bstr }   ; header nonce, e
 RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => uint }
 
 ; --- Application layer (inside the ratchet, after unpadding) ---
-AppMessage = Hello / Text / File / Approval / Cover
+AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group
 Hello    = { 0 => 0 }
 Text     = { 0 => 1, 1 => uint, 2 => tstr }                 ; sent_ms, body
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr }      ; sent_ms, data (≤ 8 MiB), name
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
+TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D)
+Group    = { 0 => 6, 2 => bstr .cbor GroupWire }          ; Appendix F
+
+GroupWire = { 0 => 1..4, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr }
+          ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message), group id, payload, name
 ```
 
 ## Padding (spec §9, layer 1)

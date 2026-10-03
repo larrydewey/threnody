@@ -1,0 +1,22 @@
+[package]
+name = "threnody-groups"
+description = "MLS (RFC 9420) groups for Threnody with an X-Wing post-quantum ciphersuite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+threnody-core.workspace = true
+openmls.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+const-cbor.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+openmls.workspace = true

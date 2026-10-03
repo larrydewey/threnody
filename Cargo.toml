@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/threnody-core", "crates/threnody-net", "crates/threnody-cli"]
+members = ["crates/threnody-core", "crates/threnody-net", "crates/threnody-groups", "crates/threnody-cli"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -13,8 +13,13 @@ repository = "https://github.com/larrydewey/threnody"
 [workspace.dependencies]
 threnody-core = { path = "crates/threnody-core" }
 threnody-net = { path = "crates/threnody-net" }
+threnody-groups = { path = "crates/threnody-groups" }
+openmls = { version = "0.9", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_rust_crypto = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = "0.6"
 const-cbor = { version = "0.3", features = ["std"] }
-ml-kem = { version = "0.2.3", features = ["zeroize", "deterministic"] }
+ml-kem = { version = "0.3.2", features = ["zeroize", "hazmat"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 chacha20poly1305 = "0.10"
