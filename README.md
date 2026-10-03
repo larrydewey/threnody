@@ -2,7 +2,7 @@
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
 
-**Status: milestone 2.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices get post-quantum-hybrid WireGuard tunnels. The KEM matches the official X-Wing test vectors, the handshake's security properties are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Mesh routing, MLS groups and onion routing are still to come (see [Roadmap](#roadmap)).
+**Status: milestone 2.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices get post-quantum-hybrid WireGuard tunnels. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Mesh routing, MLS groups and onion routing are still to come (see [Roadmap](#roadmap)).
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
@@ -54,7 +54,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix C: CBOR schemas](docs/appendix-c-wire-format.md)
 - [Appendix D: WireGuard tunnels](docs/appendix-d-tunnels.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
-- [Tamarin proofs of the handshake](proofs/README.md)
+- [Tamarin proofs of the handshake and ratchet](proofs/README.md)
 
 ## Spec coverage
 
@@ -63,7 +63,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.2 Hybrid KEM X25519 + ML-KEM-768 | ✅ X-Wing (draft-11), passes the official vectors |
 | §3.2 Ed25519, ChaCha20-Poly1305 + AES-256-GCM, domain-separated KDF | ✅ BLAKE3 KDF; both AEADs negotiated |
 | §3.3 FS / PCS ratchet with hybrid PQ updates | ✅ KEM double ratchet with header encryption |
-| §3.4 Formal verification | 🟡 handshake verified in Tamarin (secrecy, FS, KCI, hybrid security, mutual auth); ratchet not yet modelled |
+| §3.4 Formal verification | ✅ Tamarin: handshake (secrecy, FS, KCI, hybrid, mutual auth) and ratchet (FS, PCS, hybrid); `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
 | §4.5 Multi-device | ❌ |
@@ -81,7 +81,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 
 ## Roadmap
 
-1. **Hardening (remaining).** A Tamarin model of the ratchet, OS keystores, ratchet persistence across reconnects, and an external audit.
+1. **Hardening (remaining).** OS keystores, ratchet persistence across reconnects, and an external audit.
 2. **MLS groups.** Use `openmls` with an X-Wing ciphersuite.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Local mesh.** Beacons that only approved peers can recognise, BLE / Wi-Fi Direct transports, and multi-hop relay.

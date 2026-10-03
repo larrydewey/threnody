@@ -54,7 +54,7 @@ The plaintext is a padded `AppMessage` (Appendix C).
 ## Properties
 
 - **Forward secrecy.** Message keys are deleted after use, chain keys advance one way, and each decapsulation key is deleted after its step.
-- **Post-compromise security (hybrid).** After a compromise, the next round trip mixes in a secret encapsulated to a key the attacker never saw. Recovery holds as long as either X25519 or ML-KEM-768 stays secure.
+- **Post-compromise security (hybrid).** After a compromise, the next round trip mixes in a secret encapsulated to a key the attacker never saw. Recovery holds as long as either X25519 or ML-KEM-768 stays secure. Forward secrecy, post-compromise security and hybrid security are proved in [`proofs/ratchet.spthy`](../proofs/README.md).
 - **Cost.** Every header carries a full public key and ciphertext (about 2.3 KB). That is fine on IP links. On Bluetooth LE a future minor version should send the KEM material only in the first messages of a chain, or move to a sparse post-quantum ratchet.
 - **Opaque headers.** Path observers and relays see only random-looking bytes of a fixed size per chain. Ratchet public keys, KEM ciphertexts and message counters stay hidden, so frames cannot be linked to chains or ordered by counter.
 

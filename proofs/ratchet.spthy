@@ -1,0 +1,144 @@
+theory Threnody_Ratchet
+begin
+
+/*
+ * Symbolic model of the Threnody v1 KEM double ratchet
+ * (docs/appendix-b-ratchet.md).
+ *
+ * Abstractions:
+ *  - The session starts from a root key and the responder's first ratchet
+ *    key, both established by the handshake (proved in handshake.spthy).
+ *  - X-Wing is two abstract KEMs (M = ML-KEM-768, X = X25519). Breaking a
+ *    component leaks that component's decapsulation key for honest keys.
+ *  - Each chain carries one message: the symmetric chain inside an epoch
+ *    is a one-way hash chain and adds nothing at this level.
+ *  - Header encryption is a metadata feature and is left out.
+ *
+ * The attacker controls the network and may reveal any root key at any
+ * time, and any decapsulation key while its owner still holds it
+ * (restriction reveal_only_while_held). Reveals read persistent copies of
+ * each state so the prover knows their shape without unrolling history.
+ *
+ * Claim: a message sent to an honest ratchet key stays secret unless that
+ * key was revealed while its owner still held it, or both KEMs are broken.
+ * The claim holds even if every earlier root key leaked (post-compromise
+ * security) and whatever leaks later (forward secrecy).
+ */
+
+builtins: hashing, symmetric-encryption
+
+functions: pkM/1, encM/2, decM/2, pkX/1, encX/2, decX/2
+equations:
+  decM(k, encM(pkM(k), s)) = s,
+  decX(k, encX(pkX(k), s)) = s
+
+restriction reveal_only_while_held:
+  "All p #r #d. RevealKey(p) @ #r & Deleted(p) @ #d ==> #r < #d"
+
+// ------------------------------------------------------------ setup
+// A fresh session: root key from the handshake and the responder's
+// first ratchet key pair (sent inside HS2).
+rule Session:
+  [ Fr(~sid), Fr(~rk), Fr(~kM), Fr(~kX) ]
+  --[ HonestKey(~kM, ~kX) ]->
+  [ Snd(~sid, 'I', ~rk, pkM(~kM), pkX(~kX)),
+    Rcv(~sid, 'R', ~rk, ~kM, ~kX),
+    !KeyState(~kM, ~kX), !RootState(~rk) ]
+
+// ------------------------------------------------------ ratchet step
+// The sending party opens a new chain: fresh own key pair, encapsulate
+// to the peer's current key, derive the next root and the message key.
+rule Step_Send:
+  let ctM = encM(pM, ~sM)
+      ctX = encX(pX, ~sX)
+      ss  = h(<'xwing', ~sM, ~sX, ctX, pX>)
+      rk2 = h(<'root', rk, ss>)
+      mk  = h(<'chain', rk, ss>)
+  in
+  [ Snd(sid, role, rk, pM, pX), Fr(~nM), Fr(~nX), Fr(~sM), Fr(~sX), Fr(~m) ]
+  --[ SentTo(~m, pM, pX), StepSecret(ss, pM, pX), HonestKey(~nM, ~nX) ]->
+  [ Out(<pkM(~nM), pkX(~nX), ctM, ctX, senc(~m, mk)>),
+    Rcv(sid, role, rk2, ~nM, ~nX),
+    !KeyState(~nM, ~nX), !RootState(rk2) ]
+
+// The receiving party decapsulates with its current key (pattern
+// matching = honest decapsulation), opens the chain and switches to
+// sending towards the peer's new key. Its old key is deleted.
+rule Step_Recv:
+  let ctM = encM(pkM(kM), sM)
+      ctX = encX(pkX(kX), sX)
+      ss  = h(<'xwing', sM, sX, ctX, pkX(kX)>)
+      rk2 = h(<'root', rk, ss>)
+      mk  = h(<'chain', rk, ss>)
+  in
+  [ Rcv(sid, role, rk, kM, kX), In(<npM, npX, ctM, ctX, senc(m, mk)>) ]
+  --[ Received(m), Deleted(<pkM(kM), pkX(kX)>) ]->
+  [ Snd(sid, role, rk2, npM, npX), !RootState(rk2) ]
+
+// --------------------------------------------------- compromise
+rule Reveal_Key:
+  [ !KeyState(kM, kX) ] --[ RevealKey(<pkM(kM), pkX(kX)>) ]-> [ Out(<kM, kX>) ]
+
+rule Reveal_Root:
+  [ !RootState(rk) ] --[ RevealRoot(rk) ]-> [ Out(rk) ]
+
+rule Break_MLKEM:
+  [ !KeyState(kM, kX) ] --[ BrokenM() ]-> [ Out(kM) ]
+
+rule Break_X25519:
+  [ !KeyState(kM, kX) ] --[ BrokenX() ]-> [ Out(kX) ]
+
+// ------------------------------------------------------------ lemmas
+lemma executable:
+  exists-trace
+  "Ex m1 m2 m3 #i #j #k.
+      Received(m1) @ #i & Received(m2) @ #j & Received(m3) @ #k
+    & #i < #j & #j < #k
+    & not (Ex r #c. RevealRoot(r) @ #c)
+    & not (Ex #x. BrokenM() @ #x) & not (Ex #x. BrokenX() @ #x)"
+
+// The secret mixed into the root by an honest step depends only on the
+// KEM: it is safe unless the recipient's key leaked or both KEMs broke.
+// Every earlier root key may be known to the attacker.
+lemma step_secret_secrecy [reuse]:
+  "All ss kM kX #i #h #j.
+      StepSecret(ss, pkM(kM), pkX(kX)) @ #i & HonestKey(kM, kX) @ #h & K(ss) @ #j
+    ==>
+      (Ex #c. RevealKey(<pkM(kM), pkX(kX)>) @ #c)
+    | (Ex #x #y. BrokenM() @ #x & BrokenX() @ #y)"
+
+// Forward secrecy + post-compromise security, hybrid.
+lemma message_secrecy:
+  "All m kM kX #i #h #j.
+      SentTo(m, pkM(kM), pkX(kX)) @ #i & HonestKey(kM, kX) @ #h & K(m) @ #j
+    ==>
+      (Ex #c. RevealKey(<pkM(kM), pkX(kX)>) @ #c)
+    | (Ex #x #y. BrokenM() @ #x & BrokenX() @ #y)"
+
+// ------------------------------------------------------- sanity checks
+// Each exception in message_secrecy really enables an attack, so the
+// lemma is not vacuous.
+
+lemma sanity_key_reveal_leaks_message:
+  exists-trace
+  "Ex m kM kX #i #h #j #c.
+      SentTo(m, pkM(kM), pkX(kX)) @ #i & HonestKey(kM, kX) @ #h & K(m) @ #j
+    & RevealKey(<pkM(kM), pkX(kX)>) @ #c
+    & not (Ex #x. BrokenM() @ #x) & not (Ex #x. BrokenX() @ #x)"
+
+lemma sanity_both_breaks_leak_message:
+  exists-trace
+  "Ex m kM kX #i #h #j.
+      SentTo(m, pkM(kM), pkX(kX)) @ #i & HonestKey(kM, kX) @ #h & K(m) @ #j
+    & not (Ex p #c. RevealKey(p) @ #c)"
+
+// Post-compromise traffic is possible: a root key leaks, then a message
+// goes to a fresh honest key (which message_secrecy then protects).
+lemma sanity_root_leak_then_honest_traffic:
+  exists-trace
+  "Ex r m kM kX #c #i #h.
+      RevealRoot(r) @ #c & SentTo(m, pkM(kM), pkX(kX)) @ #i & HonestKey(kM, kX) @ #h
+    & #c < #h
+    & not (Ex #x. RevealKey(<pkM(kM), pkX(kX)>) @ #x)"
+
+end
