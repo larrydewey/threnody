@@ -1,0 +1,86 @@
+theory Threnody_Onion_Hop
+begin
+
+/*
+ * Symbolic model of the Threnody v1 onion hop handshake
+ * (docs/appendix-i-onion.md): an anonymous client and a relay
+ * authenticated by its identity key agree on layer keys.
+ *
+ * Abstractions: X-Wing is one abstract KEM whose break (both components)
+ * leaks any KEM secret; signatures are ideal. Client anonymity holds by
+ * construction (the client sends only a fresh ephemeral key and signs
+ * nothing); proving it formally needs observational equivalence and is
+ * not attempted here.
+ */
+
+builtins: hashing, signing
+
+functions: pkK/1, encK/2, decK/2
+equations: decK(sk, encK(pkK(sk), s)) = s
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+rule Register_Ltk:
+  [ Fr(~ltk) ] --[ Register($R) ]-> [ !Ltk($R, ~ltk), !Pk($R, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Reveal_Ltk:
+  [ !Ltk(R, ltk) ] --[ RevLtk(R) ]-> [ Out(ltk) ]
+
+rule Break_KEM:
+  [ !KemKey(k) ] --[ Broken() ]-> [ Out(k) ]
+
+// Client: fresh ephemeral X-Wing key, addressed to relay $R.
+rule Client_Create:
+  [ Fr(~e) ] --[ Start($R, pkK(~e)) ]-> [ Out(pkK(~e)), Client($R, ~e), !KemKey(~e) ]
+
+// Relay: encapsulate to the client's key and sign the exchange.
+rule Relay_Created:
+  let ct  = encK(epk, ~s)
+      sig = sign(<'onion created', h(epk), h(ct), pk(ltk)>, ltk)
+      k   = h(<'onion layer keys', ~s, epk, ct, pk(ltk)>)
+  in
+  [ !Ltk($R, ltk), In(epk), Fr(~s) ]
+  --[ Running($R, epk), RelayKey($R, epk, k) ]->
+  [ Out(<pk(ltk), ct, sig>) ]
+
+// Client: the signer must be the relay it addressed; decapsulate.
+rule Client_Finish:
+  let epk = pkK(~e)
+      ct  = encK(epk, s)
+      k   = h(<'onion layer keys', s, epk, ct, pkR>)
+  in
+  [ Client($R, ~e), !Pk($R, pkR), In(<pkR, ct, sig>) ]
+  --[ Eq(verify(sig, <'onion created', h(epk), h(ct), pkR>, pkR), true),
+      Commit($R, epk),
+      ClientKey($R, k) ]->
+  [ ]
+
+lemma executable:
+  exists-trace
+  "Ex R k #i. ClientKey(R, k) @ #i
+    & not (Ex X #r. RevLtk(X) @ #r) & not (Ex #x. Broken() @ #x)"
+
+// Layer keys are secret unless the relay's identity key leaked before the
+// handshake (impersonation) or the KEM is broken. Later leaks don't help.
+lemma client_key_secrecy:
+  "All R k #i #j. ClientKey(R, k) @ #i & K(k) @ #j ==>
+      (Ex #r. RevLtk(R) @ #r & #r < #i) | (Ex #x. Broken() @ #x)"
+
+// The hop the client talks to is the relay it addressed, on this exchange.
+lemma relay_authentication:
+  "All R e #i. Commit(R, e) @ #i ==>
+      (Ex #j. Running(R, e) @ #j & #j < #i) | (Ex #r. RevLtk(R) @ #r & #r < #i)"
+
+// Both sides end with the same key.
+lemma key_agreement:
+  "All R e k #i. Commit(R, e) @ #i & ClientKey(R, k) @ #i
+    & not (Ex #r. RevLtk(R) @ #r)
+    ==> (Ex #j. RelayKey(R, e, k) @ #j)"
+
+lemma sanity_early_ltk_leak_allows_impersonation:
+  exists-trace
+  "Ex R k #i #j #r. ClientKey(R, k) @ #i & K(k) @ #j & RevLtk(R) @ #r & #r < #i
+    & not (Ex #x. Broken() @ #x)"
+
+end

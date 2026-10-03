@@ -5,6 +5,7 @@ This directory has two Tamarin models:
 - `handshake.spthy` models the v1 handshake ([Appendix A](../docs/appendix-a-handshake.md)).
 - `ratchet.spthy` models the KEM double ratchet ([Appendix B](../docs/appendix-b-ratchet.md)).
 - `sealed.spthy` models sealed messages and prekeys for offline delivery ([Appendix H](../docs/appendix-h-offline.md)).
+- `onion.spthy` models the onion hop handshake ([Appendix I](../docs/appendix-i-onion.md)).
 
 Every lemma verifies automatically in about 2.5 minutes:
 
@@ -71,6 +72,18 @@ Key lifecycles are restrictions over persistent facts:
 - A key can only be revealed before it is deleted.
 
 That last restriction is what makes the secrecy lemmas forward-secrecy statements.
+
+## Onion hop handshake
+
+| Lemma | Property |
+|---|---|
+| `executable` | An anonymous client and a relay agree on layer keys. |
+| `client_key_secrecy` | The client's layer keys stay secret unless the relay's identity key leaked before the handshake, or the KEM is broken. This gives forward secrecy: later leaks don't help. |
+| `relay_authentication` | The hop the client finishes with is the relay it addressed, on this very exchange. |
+| `key_agreement` | Client and relay derive the same keys. |
+| `sanity_*` | An early identity-key leak really does allow impersonation. |
+
+Client anonymity holds by construction: the client sends only a fresh ephemeral key and signs nothing. A formal proof would need observational equivalence, which isn't modelled.
 
 ## Abstractions and limits
 
