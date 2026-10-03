@@ -2,7 +2,7 @@
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
 
-**Status: milestone 4.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Onion routing, multi-device and mobile are still to come (see [Roadmap](#roadmap)).
+**Status: milestone 5.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Multi-device, Bluetooth / Wi-Fi Direct and mobile are still to come (see [Roadmap](#roadmap)).
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
@@ -22,7 +22,7 @@ threnody --home ~/.thr-a init
 threnody --home ~/.thr-a run --no-listen -c 'threnody://<fingerprint>@192.0.2.7:7450'
 ```
 
-Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns.
+Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/onion <peer> [min-relays]` builds an onion circuit (two relays by default) so no single relay learns both ends.
 
 ```
 /connect <invite|contact|host:port>   /to <peer>   /peers   /contacts
@@ -60,8 +60,9 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix F: MLS groups](docs/appendix-f-groups.md)
 - [Appendix G: relay circuits](docs/appendix-g-relay.md)
 - [Appendix H: offline delivery](docs/appendix-h-offline.md)
+- [Appendix I: onion circuits](docs/appendix-i-onion.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
-- [Tamarin proofs of the handshake, ratchet and sealed messages](proofs/README.md)
+- [Tamarin proofs of the handshake, ratchet, sealed messages and onion hops](proofs/README.md)
 
 ## Spec coverage
 
@@ -70,7 +71,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.2 Hybrid KEM X25519 + ML-KEM-768 | ✅ X-Wing (draft-11), passes the official vectors |
 | §3.2 Ed25519, ChaCha20-Poly1305 + AES-256-GCM, domain-separated KDF | ✅ BLAKE3 KDF; both AEADs negotiated |
 | §3.3 FS / PCS ratchet with hybrid PQ updates | ✅ KEM double ratchet with header encryption |
-| §3.4 Formal verification | ✅ Tamarin: handshake (secrecy, FS, KCI, hybrid, mutual auth), ratchet (FS, PCS, hybrid), sealed messages (FS, sender auth, KCI, no replay); `proofs/check.sh` |
+| §3.4 Formal verification | ✅ Tamarin: handshake (secrecy, FS, KCI, hybrid, mutual auth), ratchet (FS, PCS, hybrid), sealed messages (FS, sender auth, KCI, no replay), onion hop handshake (secrecy, FS, relay auth); `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
 | §4.5 Multi-device | ❌ |
@@ -81,7 +82,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.4 Local-first store | ✅ identity and contacts (message history, sync and backup not yet) |
 | §7 Transports | ✅ TCP/IP, private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes; ❌ BLE, Wi-Fi Direct |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
-| §9 Metadata layers | ✅ padding, constant-rate + cover; ❌ onion routing, local-first preference |
+| §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |
 | §10 Status indicators | ✅ `/status` |
 | §3.1 Platform keystore | software fallback: 0600 files plus optional Argon2id passphrase |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
@@ -92,7 +93,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 2. **Groups (remaining).** Store-and-forward via members, and more admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** BLE / Wi-Fi Direct transports with the same beacon scheme.
-5. **Metadata.** Onion routing through volunteer nodes; anonymous and selective-disclosure identities.
+5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.
 6. **Mobile.** UniFFI bindings for iOS and Android. The core is sans-IO, so this is mostly glue code.
 
 ## Development

@@ -52,6 +52,8 @@ pub enum AppMessage {
     Prekeys(Vec<u8>),
     /// An opaque mailbox message (see `threnody-net::mailbox`).
     Mailbox(Vec<u8>),
+    /// An opaque onion-circuit message (see `threnody-net::onion`).
+    Onion(Vec<u8>),
 }
 
 mod kind {
@@ -65,6 +67,7 @@ mod kind {
     pub const RELAY: u64 = 7;
     pub const PREKEYS: u64 = 8;
     pub const MAILBOX: u64 = 9;
+    pub const ONION: u64 = 10;
 }
 
 impl AppMessage {
@@ -113,6 +116,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::MAILBOX)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Onion(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::ONION)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -126,7 +133,11 @@ impl AppMessage {
         match self {
             Self::Text { body, .. } => body.len() + 32,
             Self::File { name, data, .. } => name.len() + data.len() + 48,
-            Self::Group(p) | Self::Relay(p) | Self::Prekeys(p) | Self::Mailbox(p) => p.len() + 16,
+            Self::Group(p)
+            | Self::Relay(p)
+            | Self::Prekeys(p)
+            | Self::Mailbox(p)
+            | Self::Onion(p) => p.len() + 16,
             _ => 16,
         }
     }
@@ -171,7 +182,7 @@ impl AppMessage {
                     data,
                 }
             }
-            kind::GROUP | kind::RELAY | kind::PREKEYS | kind::MAILBOX => {
+            kind::GROUP | kind::RELAY | kind::PREKEYS | kind::MAILBOX | kind::ONION => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
                     return Err(Error::Malformed("message too large"));
@@ -180,6 +191,7 @@ impl AppMessage {
                     Some(kind::GROUP) => Self::Group(p),
                     Some(kind::RELAY) => Self::Relay(p),
                     Some(kind::PREKEYS) => Self::Prekeys(p),
+                    Some(kind::ONION) => Self::Onion(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -255,6 +267,7 @@ mod tests {
             AppMessage::Relay(vec![4, 5]),
             AppMessage::Prekeys(vec![6]),
             AppMessage::Mailbox(vec![7]),
+            AppMessage::Onion(vec![8]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }

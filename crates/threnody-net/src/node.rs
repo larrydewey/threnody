@@ -22,6 +22,7 @@ use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
 use crate::mailbox::MailboxStore;
+use crate::onion::OnionState;
 use crate::relay::RelayState;
 
 /// Who may hold a session with us (checked right after authentication).
@@ -139,6 +140,27 @@ pub struct SessionInfo {
     pub via: Option<PublicIdentity>,
 }
 
+/// How a session reaches its peer.
+enum Route {
+    /// A direct link; `Some(addr)` when we dialed a reusable address.
+    Direct(Option<String>),
+    /// A relay circuit (Appendix G) through this neighbour.
+    Relay(PublicIdentity),
+    /// An onion circuit (Appendix I) whose first hop is this neighbour.
+    Onion(PublicIdentity),
+}
+
+impl Route {
+    /// `(dialed address, first hop, transport label)`.
+    fn into_parts(self) -> (Option<String>, Option<PublicIdentity>, &'static str) {
+        match self {
+            Self::Direct(dialed) => (dialed, None, "tcp"),
+            Self::Relay(v) => (None, Some(v), "relay"),
+            Self::Onion(v) => (None, Some(v), "onion"),
+        }
+    }
+}
+
 struct SessionHandle {
     id: u64,
     tx: mpsc::UnboundedSender<AppMessage>,
@@ -160,6 +182,7 @@ pub(crate) struct Shared {
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
     pub(crate) mailbox: Mutex<MailboxStore>,
+    pub(crate) onion: Mutex<OnionState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
 }
@@ -255,6 +278,7 @@ impl Node {
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
             mailbox: Mutex::new(mailbox),
+            onion: Mutex::new(OnionState::default()),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
         };
@@ -330,7 +354,7 @@ impl Node {
         let _ = stream.set_nodelay(true);
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
         self.check_policy(chan.peer())?;
-        self.spawn_session(stream, chan, addr, false, None, None);
+        self.spawn_session(stream, chan, addr, false, Route::Direct(None));
         Ok(())
     }
 
@@ -352,7 +376,13 @@ impl Node {
                 got: peer.fingerprint().to_string(),
             });
         }
-        self.spawn_session(stream, chan, peer_addr, true, Some(addr.to_owned()), None);
+        self.spawn_session(
+            stream,
+            chan,
+            peer_addr,
+            true,
+            Route::Direct(Some(addr.to_owned())),
+        );
         Ok(peer)
     }
 
@@ -401,7 +431,20 @@ impl Node {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let addr = self.relay_addr(&via);
-        self.spawn_session(stream, chan, addr, outbound, None, Some(via));
+        self.spawn_session(stream, chan, addr, outbound, Route::Relay(via));
+    }
+
+    pub(crate) fn spawn_onion_session<S>(
+        &self,
+        stream: S,
+        chan: SecureChannel,
+        via: PublicIdentity,
+        outbound: bool,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let addr = self.relay_addr(&via);
+        self.spawn_session(stream, chan, addr, outbound, Route::Onion(via));
     }
 
     pub(crate) fn check_policy(&self, peer: &PublicIdentity) -> Result<()> {
@@ -476,11 +519,11 @@ impl Node {
         chan: SecureChannel,
         addr: SocketAddr,
         outbound: bool,
-        dialed: Option<String>,
-        via: Option<PublicIdentity>,
+        route: Route,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let (dialed, via, transport) = route.into_parts();
         let peer = *chan.peer();
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -495,7 +538,7 @@ impl Node {
             peer,
             addr,
             suite: chan.suite(),
-            transport: if via.is_some() { "relay" } else { "tcp" },
+            transport,
             since_ms: now_ms(),
             outbound,
             via,
@@ -531,6 +574,7 @@ impl Node {
             // session to the same peer already took over).
             if current && via.is_none() {
                 node.drop_circuits_of(&peer);
+                node.drop_onion_circuits_of(&peer);
             }
             node.shared.emit(Event::Disconnected { peer, reason });
         });
@@ -679,6 +723,11 @@ where
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
                         AppMessage::Mailbox(payload) => node.on_mailbox(peer, &payload),
+                        AppMessage::Onion(payload) => {
+                            if via.is_none() {
+                                node.on_onion(peer, &payload);
+                            }
+                        }
                         AppMessage::Relay(payload) => {
                             // Circuits only ride on direct links, never nest.
                             if via.is_none() {

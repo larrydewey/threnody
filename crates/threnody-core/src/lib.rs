@@ -12,6 +12,7 @@ pub mod error;
 pub mod handshake;
 pub mod identity;
 pub mod message;
+pub mod onion;
 pub mod prekey;
 pub mod ratchet;
 #[cfg(test)]

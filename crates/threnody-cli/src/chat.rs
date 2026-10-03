@@ -36,6 +36,7 @@ const HELP: &str = "\
 Type a line to send it to the current peer. Commands:
   /connect <invite|contact|host:port>   dial a peer (contacts fall back to relays)
   /relay <peer>                         reach a contact through approved relays
+  /onion <peer> [min-relays]            reach a peer so no single relay sees both ends
   /to <peer>                            choose who plain lines go to
   /peers                                live sessions
   /contacts                             contact book
@@ -250,6 +251,20 @@ impl Ui {
         Ok(())
     }
 
+    /// A contact, a bare fingerprint, or an invite link's fingerprint.
+    fn parse_destination(&self, q: &str) -> Result<Fingerprint> {
+        match self.resolve_peer(Some(q)) {
+            Ok(p) => Ok(p.fingerprint()),
+            Err(_) => q
+                .trim_start_matches("threnody://")
+                .split('@')
+                .next()
+                .unwrap_or_default()
+                .parse::<Fingerprint>()
+                .map_err(|_| anyhow!("{q:?} is not a contact, fingerprint or invite link")),
+        }
+    }
+
     fn relay(&self, dest: Fingerprint) {
         let node = self.node.clone();
         let who = self
@@ -276,11 +291,21 @@ impl Ui {
             } => {
                 let who = self.name(&peer);
                 match via {
-                    Some(v) => println!(
-                        "* connected to {who} through relay {} [{}, end-to-end]",
-                        self.name(&v),
-                        suite.name()
-                    ),
+                    Some(v) => {
+                        let info = self.node.sessions().into_iter().find(|s| s.peer == peer);
+                        let how = match info {
+                            Some(i) if i.transport == "onion" && i.outbound => {
+                                "onion circuit, first hop"
+                            }
+                            Some(i) if i.transport == "onion" => "onion circuit, last relay",
+                            _ => "relay",
+                        };
+                        println!(
+                            "* connected to {who} through {how} {} [{}, end-to-end]",
+                            self.name(&v),
+                            suite.name()
+                        );
+                    }
                     None => println!("* connected to {who} at {addr} [tcp, {}]", suite.name()),
                 }
                 if new_contact {
@@ -413,6 +438,14 @@ impl Ui {
                 for i in s {
                     let dir = if i.outbound { "out" } else { "in" };
                     let path = match i.via {
+                        Some(v) if i.transport == "onion" => {
+                            let end = if i.outbound {
+                                "first hop"
+                            } else {
+                                "last relay"
+                            };
+                            format!("onion circuit, {end} {}", self.name(&v))
+                        }
                         Some(v) => format!("relay through {}", self.name(&v)),
                         None => format!("{} {}", i.transport, i.addr),
                     };
@@ -511,21 +544,29 @@ impl Ui {
                 println!("* policy: {p:?}");
             }
             "status" => self.status(),
+            "onion" => {
+                let a = arg.ok_or_else(|| {
+                    anyhow!("usage: /onion <contact|fingerprint|invite> [min-relays]")
+                })?;
+                let (q, min) = match a.rsplit_once(' ') {
+                    Some((q, n)) if n.parse::<usize>().is_ok() => (q, n.parse::<usize>()?),
+                    _ => (a, 2),
+                };
+                let dest = self.parse_destination(q)?;
+                println!("* building an onion circuit to {dest} ({min}+ relays)");
+                if min < 2 {
+                    println!("  note: with one relay, that relay sees both ends");
+                }
+                let node = self.node.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node.connect_onion(dest, min).await {
+                        println!("! onion to {dest}: {e:#}");
+                    }
+                });
+            }
             "relay" => {
                 let q = arg.ok_or_else(|| anyhow!("usage: /relay <contact|fingerprint|invite>"))?;
-                // A contact, a bare fingerprint, or an invite link's fingerprint.
-                let dest = match self.resolve_peer(Some(q)) {
-                    Ok(p) => p.fingerprint(),
-                    Err(_) => q
-                        .trim_start_matches("threnody://")
-                        .split('@')
-                        .next()
-                        .unwrap_or_default()
-                        .parse::<Fingerprint>()
-                        .map_err(|_| {
-                            anyhow!("{q:?} is not a contact, fingerprint or invite link")
-                        })?,
-                };
+                let dest = self.parse_destination(q)?;
                 println!("* looking for a relay path to {dest}");
                 self.relay(dest);
             }
@@ -589,7 +630,8 @@ impl Ui {
             None => "off".into(),
         };
         println!(
-            "  metadata     length padding: on; timing protection: {rate}; onion routing: not available"
+            "  metadata     length padding: on; timing protection: {rate}; onion: /onion (carrying {} circuit(s) for others)",
+            self.node.onion_hops()
         );
     }
 }

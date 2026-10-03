@@ -27,6 +27,8 @@ pub mod label {
     pub const SIG_SEALED_SENDER: &str = "threnody v1 2026-10-03 sealed sender";
     pub const SEALED_TRANSCRIPT: &str = "threnody v1 2026-10-03 sealed transcript";
     pub const SEALED_KEY: &str = "threnody v1 2026-10-03 sealed key";
+    pub const ONION_LAYER_KEYS: &str = "threnody v1 2026-10-03 onion layer keys";
+    pub const SIG_ONION_CREATED: &str = "threnody v1 2026-10-03 onion created";
 }
 
 /// Fills `out` from the KDF.

@@ -11,6 +11,7 @@ pub mod frame;
 pub mod handshake;
 pub mod mailbox;
 pub mod node;
+pub mod onion;
 pub mod relay;
 
 pub use discovery::DiscoveryConfig;
