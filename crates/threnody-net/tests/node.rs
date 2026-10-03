@@ -256,3 +256,125 @@ async fn no_tunnel_without_mutual_approval() {
     .await;
     assert!(r.is_err(), "tunnel offered with one-sided approval");
 }
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[tokio::test]
+async fn approved_peers_rediscover_each_other_on_the_lan() {
+    use threnody_net::DiscoveryConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let a_tcp = alice.listen("127.0.0.1:0").await.unwrap();
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+
+    // Pair once over TCP so both sides hold the discovery key.
+    let bob_id = alice.connect(&b_tcp.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    next(&mut brx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    timeout(Duration::from_secs(5), async {
+        while alice
+            .contacts()
+            .get(&bob_id)
+            .unwrap()
+            .discovery_key
+            .is_none()
+            || bob
+                .contacts()
+                .get(&alice.identity())
+                .unwrap()
+                .discovery_key
+                .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        alice.contacts().get(&bob_id).unwrap().discovery_key,
+        bob.contacts().get(&alice.identity()).unwrap().discovery_key
+    );
+
+    // Drop the session; forget where bob was.
+    alice.disconnect(&bob_id);
+    next(&mut brx, |e| matches!(e, Event::Disconnected { .. })).await;
+    alice.update_contacts(|c| c.get_mut(&bob_id).unwrap().last_addr = None);
+
+    let (pa, pb) = (free_udp_port(), free_udp_port());
+    let cfg = |me: u16, other: u16| DiscoveryConfig {
+        bind: format!("127.0.0.1:{me}").parse().unwrap(),
+        targets: vec![format!("127.0.0.1:{other}").parse().unwrap()],
+        interval: Duration::from_millis(100),
+        auto_connect: true,
+    };
+    alice.start_discovery(cfg(pa, pb), a_tcp.port()).unwrap();
+    bob.start_discovery(cfg(pb, pa), b_tcp.port()).unwrap();
+
+    next(
+        &mut arx,
+        |e| matches!(e, Event::Discovered { peer, .. } if *peer == bob_id),
+    )
+    .await;
+    next(&mut brx, |e| matches!(e, Event::Discovered { .. })).await;
+    // One side dials (smaller key), and both end up connected again.
+    next(
+        &mut arx,
+        |e| matches!(e, Event::Connected { peer, .. } if *peer == bob_id),
+    )
+    .await;
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+}
+
+#[tokio::test]
+async fn revocation_clears_discovery_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    next(&mut brx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    bob.set_approval(&alice.identity(), false).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: false, .. })
+    })
+    .await;
+    assert!(
+        alice
+            .contacts()
+            .get(&bob_id)
+            .unwrap()
+            .discovery_key
+            .is_none()
+    );
+    assert!(
+        bob.contacts()
+            .get(&alice.identity())
+            .unwrap()
+            .discovery_key
+            .is_none()
+    );
+}

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use threnody_core::crypto::aead::Suite;
+use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, SecureChannel, now_ms};
@@ -88,6 +89,18 @@ pub enum Event {
         endpoint: SocketAddr,
         overlay: Ipv6Addr,
         psk: Secret,
+    },
+    /// An approved peer's beacon was seen on the local network.
+    Discovered {
+        peer: PublicIdentity,
+        addr: SocketAddr,
+        connected: bool,
+    },
+    /// An automatic dial (e.g. after discovery) failed.
+    DialFailed {
+        peer: PublicIdentity,
+        addr: SocketAddr,
+        reason: String,
     },
     /// Mutual approval ended: remove the peer from the tunnel.
     TunnelDown {
@@ -190,6 +203,10 @@ impl Node {
             },
             rx,
         ))
+    }
+
+    pub(crate) fn emit(&self, e: Event) {
+        self.shared.emit(e);
     }
 
     pub fn identity(&self) -> PublicIdentity {
@@ -301,6 +318,9 @@ impl Node {
             contacts.observe(*peer, None, now_ms());
             if let Some(c) = contacts.get_mut(peer) {
                 c.local_approved = approved;
+                if !approved {
+                    c.discovery_key = None;
+                }
             }
             self.shared.save_contacts(&contacts);
         }
@@ -438,8 +458,19 @@ where
     });
 
     let mut offered = false;
+    let mut discovery_keyed = false;
     let result: Result<()> = async {
         loop {
+            // Refresh the pairwise LAN discovery key once per session.
+            if !discovery_keyed && shared.mutual(&peer) {
+                let key = *chan.export(DISCOVERY_CONTEXT);
+                let mut contacts = lock(&shared.contacts);
+                if let Some(c) = contacts.get_mut(&peer) {
+                    c.discovery_key = Some(key);
+                }
+                shared.save_contacts(&contacts);
+                discovery_keyed = true;
+            }
             // Offer a tunnel once per session, as soon as approval is mutual.
             if let Some((port, wg_public)) = shared.tunnel
                 && !offered
@@ -483,6 +514,12 @@ where
                                 if !mutual {
                                     shared.tunnel_down(&peer);
                                     offered = false;
+                                    discovery_keyed = false;
+                                    let mut contacts = lock(&shared.contacts);
+                                    if let Some(c) = contacts.get_mut(&peer) {
+                                        c.discovery_key = None;
+                                    }
+                                    shared.save_contacts(&contacts);
                                 }
                             }
                         }

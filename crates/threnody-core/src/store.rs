@@ -198,6 +198,9 @@ pub struct Contact {
     pub last_addr: Option<String>,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
+    /// Pairwise LAN discovery key from the latest mutually approved
+    /// session (see `discovery`). Cleared on revocation.
+    pub discovery_key: Option<[u8; 32]>,
 }
 
 impl Contact {
@@ -211,6 +214,7 @@ impl Contact {
             last_addr: None,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
+            discovery_key: None,
         }
     }
 
@@ -306,7 +310,10 @@ impl Contacts {
             e.u8(0)?.uint(FILE_VERSION)?;
             e.u8(1)?.array_len(self.list.len())?;
             for c in &self.list {
-                let n = 6 + usize::from(c.petname.is_some()) + usize::from(c.last_addr.is_some());
+                let n = 6
+                    + usize::from(c.petname.is_some())
+                    + usize::from(c.last_addr.is_some())
+                    + usize::from(c.discovery_key.is_some());
                 e.map_len(n)?;
                 e.u8(0)?.bytes(c.key.as_bytes())?;
                 if let Some(p) = &c.petname {
@@ -320,6 +327,9 @@ impl Contacts {
                 }
                 e.u8(6)?.u64(c.first_seen_ms)?;
                 e.u8(7)?.u64(c.last_seen_ms)?;
+                if let Some(k) = &c.discovery_key {
+                    e.u8(8)?.bytes(k)?;
+                }
             }
             Ok(())
         })
@@ -357,6 +367,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         last_addr: None,
         first_seen_ms: 0,
         last_seen_ms: 0,
+        discovery_key: None,
     };
     read_map(d, |k, d| {
         match k {
@@ -368,6 +379,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             5 => c.last_addr = Some(d.str()?.to_owned()),
             6 => c.first_seen_ms = d.u64()?,
             7 => c.last_seen_ms = d.u64()?,
+            8 => c.discovery_key = Some(fixed_bytes::<32>(d)?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -395,6 +407,7 @@ mod tests {
         let ct = c.get_mut(&peer).unwrap();
         ct.petname = Some("alice".into());
         ct.local_approved = true;
+        ct.discovery_key = Some([4; 32]);
         home.save_contacts(&c).unwrap();
         let loaded = home.load_contacts().unwrap();
         assert_eq!(loaded, c);

@@ -29,6 +29,7 @@ clap = { version = "4.6", features = ["derive"] }
 anyhow = "1"
 qrcode = { version = "0.14", default-features = false }
 tempfile = "3"
+socket2 = { version = "0.6", features = ["all"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 rpassword = "7"
 

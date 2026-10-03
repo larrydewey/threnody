@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity, now_ms, safety_number};
-use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
+use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::tunnel::Tunnels;
@@ -20,6 +20,8 @@ pub struct Options {
     pub policy: AcceptPolicy,
     pub constant_rate: Option<Duration>,
     pub tunnel: Option<TunnelOptions>,
+    /// UDP port for LAN discovery; `None` disables it.
+    pub discover: Option<u16>,
 }
 
 pub struct TunnelOptions {
@@ -50,6 +52,7 @@ struct Ui {
     listen_addr: Option<std::net::SocketAddr>,
     current: Option<PublicIdentity>,
     tunnels: Option<Tunnels>,
+    discovery: Option<std::net::SocketAddr>,
 }
 
 pub async fn run(opts: Options) -> Result<()> {
@@ -106,7 +109,27 @@ pub async fn run(opts: Options) -> Result<()> {
         listen_addr,
         current: None,
         tunnels,
+        discovery: None,
     };
+    if let (Some(port), Some(tcp)) = (opts.discover, listen_addr) {
+        let cfg = DiscoveryConfig {
+            bind: std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+            targets: vec![std::net::SocketAddr::from((
+                threnody_net::discovery::DEFAULT_GROUP,
+                port,
+            ))],
+            ..DiscoveryConfig::default()
+        };
+        match ui.node.start_discovery(cfg, tcp.port()) {
+            Ok(a) => {
+                ui.discovery = Some(a);
+                println!(
+                    "LAN discovery on udp/{port}: approved peers nearby connect automatically."
+                );
+            }
+            Err(e) => println!("! LAN discovery unavailable: {e}"),
+        }
+    }
     for t in &opts.connect {
         ui.connect(t);
     }
@@ -246,6 +269,18 @@ impl Ui {
                         Err(e) => println!("! removing tunnel to {who}: {e:#}"),
                     }
                 }
+            }
+            Event::Discovered {
+                peer,
+                addr,
+                connected,
+            } => {
+                if !connected {
+                    println!("* found {} nearby at {addr}", self.name(&peer));
+                }
+            }
+            Event::DialFailed { peer, addr, reason } => {
+                println!("! could not reach {} at {addr}: {reason}", self.name(&peer));
             }
             Event::Rejected { addr, reason } => {
                 println!("* rejected connection from {addr}: {reason}")
@@ -414,6 +449,13 @@ impl Ui {
                 format!("tcp ({} session(s))", sessions.len())
             }
         );
+        match self.discovery {
+            Some(a) => println!(
+                "  discovery    lan beacons on udp/{} (approved peers only)",
+                a.port()
+            ),
+            None => println!("  discovery    off"),
+        }
         match &self.tunnels {
             Some(t) => println!("  tunnel       {}", t.summary()),
             None => println!("  tunnel       off (run with --tunnel)"),

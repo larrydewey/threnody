@@ -84,6 +84,12 @@ enum Cmd {
         /// when idle. Hides message timing at a bandwidth cost.
         #[arg(long, value_name = "MS")]
         constant_rate_ms: Option<u64>,
+        /// Do not send or listen for LAN discovery beacons.
+        #[arg(long)]
+        no_discover: bool,
+        /// UDP port for LAN discovery beacons (multicast 239.255.84.86).
+        #[arg(long, default_value_t = threnody_net::discovery::DEFAULT_PORT)]
+        discover_port: u16,
         /// Build WireGuard tunnels to mutually approved peers on this UDP port.
         #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "51820")]
         tunnel: Option<u16>,
@@ -359,6 +365,8 @@ fn main() -> Result<()> {
             tunnel,
             wg_iface,
             wg_apply,
+            no_discover,
+            discover_port,
         } => {
             let identity = load_identity(&home)?;
             let rt = tokio::runtime::Runtime::new()?;
@@ -369,6 +377,7 @@ fn main() -> Result<()> {
                 connect,
                 policy: policy.into(),
                 constant_rate: constant_rate_ms.map(std::time::Duration::from_millis),
+                discover: (!no_discover).then_some(discover_port),
                 tunnel: tunnel.map(|port| chat::TunnelOptions {
                     port,
                     iface: wg_iface,

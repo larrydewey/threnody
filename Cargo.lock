@@ -919,6 +919,7 @@ dependencies = [
 name = "threnody-net"
 version = "0.1.0"
 dependencies = [
+ "socket2",
  "tempfile",
  "thiserror",
  "threnody-core",

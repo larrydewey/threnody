@@ -12,6 +12,7 @@ threnody-core.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

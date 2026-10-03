@@ -67,5 +67,6 @@ Contact = {
   4 => bool,             ; safety number verified
   ? 5 => tstr,           ; last dialable address
   6 => uint, 7 => uint,  ; first / last seen (ms)
+  ? 8 => bstr .size 32,  ; LAN discovery key (Appendix E)
 }
 ```
