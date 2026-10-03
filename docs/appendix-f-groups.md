@@ -41,6 +41,16 @@ Spec §6.2 leaves admin semantics to the application layer.
 - **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it.
 - **Past epochs.** Application messages from up to five past epochs are still accepted, to tolerate reordering around commits.
 
+## Persistence
+
+After every change, the full openmls key-value store and the group metadata are exported to `<home>/groups.state`. The file is written mode 0600 and encrypted:
+
+```
+file = nonce (12) || ChaCha20-Poly1305(KDF("state encryption key", identity_seed), nonce, ad = "groups", export)
+```
+
+The key is derived from the identity seed, so group secrets are only as accessible as the identity: if the identity is passphrase-sealed, so is everything else. State is saved *before* any resulting message leaves, so a crash can't leave us behind an epoch our peers have already moved to.
+
 ## CLI
 
 ```
@@ -51,7 +61,7 @@ Spec §6.2 leaves admin semantics to the application layer.
 
 ## Not yet done
 
-- **Persistence.** Group state lives in openmls's in-memory store and is lost when the node exits. Next step: persist the storage provider, sealed with the identity passphrase.
+- **Secure deletion.** Each save rewrites the whole state file atomically. Old epoch secrets are gone from the file system's view, but not necessarily from the storage medium (spec §16 secure deletion).
 - **Store-and-forward.** Members must be online when a message is sent. Relaying through other members would fix this, and it fits the planned mesh relay.
 - **More committers.** Admin roles beyond a single owner, and self-removal ("leave" proposals committed by the owner).
 - **Ciphersuite version.** openmls's X-Wing HPKE implements X-Wing draft-06, while the 1:1 protocol uses draft-11. Both are hybrid; they will converge once the MLS PQ ciphersuite draft settles.

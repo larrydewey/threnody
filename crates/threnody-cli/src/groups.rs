@@ -1,6 +1,7 @@
 //! `/group` commands: MLS groups delivered over the node's 1:1 sessions.
 
 use anyhow::{Result, anyhow, bail};
+use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_groups::{GroupEvent, GroupId, GroupWire, Groups, Output};
 use threnody_net::Node;
@@ -17,17 +18,44 @@ pub struct GroupUi {
     groups: Groups,
     /// Invitations awaiting consent: (group, name, inviter).
     pending: Vec<(GroupId, String, PublicIdentity)>,
+    /// Where group state is persisted (encrypted under the identity).
+    home: Home,
+    identity: Identity,
 }
+
+const STATE: &str = "groups";
 
 fn short(id: &GroupId) -> String {
     id[..3].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl GroupUi {
-    pub fn new(identity: &Identity) -> Self {
-        Self {
-            groups: Groups::new(identity),
+    /// Loads persisted groups for `identity` from `home`.
+    pub fn load(home: &Home, identity: &Identity) -> Result<Self> {
+        let groups = match home.load_state(identity, STATE)? {
+            Some(bytes) => Groups::restore(identity, &bytes)?,
+            None => Groups::new(identity),
+        };
+        Ok(Self {
+            groups,
             pending: Vec::new(),
+            home: Home::new(home.dir()),
+            identity: Identity::from_seed(&identity.seed()),
+        })
+    }
+
+    pub fn count(&self) -> usize {
+        self.groups.list().len()
+    }
+
+    fn save(&self) {
+        let r = self
+            .groups
+            .export()
+            .map_err(anyhow::Error::from)
+            .and_then(|b| Ok(self.home.save_state(&self.identity, STATE, &b)?));
+        if let Err(e) = r {
+            println!("! could not save group state: {e:#}");
         }
     }
 
@@ -66,6 +94,9 @@ impl GroupUi {
 
     /// Delivers outgoing group traffic and prints events.
     fn apply(&mut self, node: &Node, name: &dyn Fn(&PublicIdentity) -> String, out: Output) {
+        // Persist before anything leaves: a crash must not lose an epoch
+        // that peers have already moved to.
+        self.save();
         for o in out.send {
             let sent = o.wire.encode().map_err(anyhow::Error::from).and_then(|b| {
                 node.send(&o.to, AppMessage::Group(b))
@@ -162,6 +193,7 @@ impl GroupUi {
                     bail!("usage: /group new <name>");
                 }
                 let id = self.groups.create(&gname)?;
+                self.save();
                 println!(
                     "* created {} — invite with /group invite {} <peer>",
                     self.label(&id),

@@ -13,6 +13,9 @@ use const_cbor::Decoder;
 use zeroize::Zeroizing;
 
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
+use crate::crypto::aead::Suite;
+use crate::crypto::kdf;
+use crate::crypto::random_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{Fingerprint, Identity, PublicIdentity, fingerprint_matches_prefix};
 use crate::sealed::{self, KdfParams};
@@ -149,6 +152,56 @@ impl Home {
     pub fn save_contacts(&self, c: &Contacts) -> Result<()> {
         write_private(&self.dir, &self.contacts_path(), &c.encode()?)
     }
+
+    fn state_path(&self, name: &str) -> Result<PathBuf> {
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(Error::Malformed("state name"));
+        }
+        Ok(self.dir.join(format!("{name}.state")))
+    }
+
+    /// Stores `data` encrypted under a key derived from the identity seed
+    /// (so it is as protected as the identity itself), bound to `name`.
+    ///
+    /// ```text
+    /// file = nonce (12) || ChaCha20-Poly1305(KDF("state encryption key", seed), nonce, ad = name, data)
+    /// ```
+    pub fn save_state(&self, identity: &Identity, name: &str, data: &[u8]) -> Result<()> {
+        let path = self.state_path(name)?;
+        let key = state_key(identity);
+        let nonce: [u8; 12] = random_bytes();
+        let mut out = nonce.to_vec();
+        out.extend(Suite::ChaCha20Poly1305.seal(&key, &nonce, name.as_bytes(), data));
+        write_private(&self.dir, &path, &out)
+    }
+
+    /// Loads state written by [`Home::save_state`]; `Ok(None)` if absent.
+    pub fn load_state(
+        &self,
+        identity: &Identity,
+        name: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let path = self.state_path(name)?;
+        let raw = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if raw.len() < 12 {
+            return Err(Error::Malformed("state file"));
+        }
+        let (nonce, ct) = raw.split_at(12);
+        let nonce: [u8; 12] = nonce
+            .try_into()
+            .map_err(|_| Error::Malformed("state file"))?;
+        let pt = Suite::ChaCha20Poly1305.open(&state_key(identity), &nonce, name.as_bytes(), ct)?;
+        Ok(Some(Zeroizing::new(pt)))
+    }
+}
+
+fn state_key(identity: &Identity) -> Zeroizing<[u8; 32]> {
+    let seed = identity.seed();
+    Zeroizing::new(kdf::derive(kdf::label::STATE_KEY, &[&seed[..]]))
 }
 
 fn check_version(v: Option<u64>) -> Result<()> {
@@ -424,6 +477,37 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_and_is_bound_to_identity_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let a = Identity::generate();
+        assert!(home.load_state(&a, "groups").unwrap().is_none());
+        home.save_state(&a, "groups", b"secret state").unwrap();
+        assert_eq!(
+            &home.load_state(&a, "groups").unwrap().unwrap()[..],
+            b"secret state"
+        );
+        let raw = fs::read(dir.path().join("groups.state")).unwrap();
+        assert!(!raw.windows(6).any(|w| w == b"secret"));
+        assert!(home.load_state(&Identity::generate(), "groups").is_err());
+        fs::copy(
+            dir.path().join("groups.state"),
+            dir.path().join("other.state"),
+        )
+        .unwrap();
+        assert!(
+            home.load_state(&a, "other").is_err(),
+            "state must be bound to its name"
+        );
+        assert!(home.save_state(&a, "../x", b"").is_err());
     }
 }
 

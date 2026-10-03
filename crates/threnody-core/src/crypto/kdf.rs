@@ -21,6 +21,7 @@ pub mod label {
     pub const WG_STATIC: &str = "threnody v1 2026-10-03 wireguard static key";
     pub const OVERLAY_PREFIX: &str = "threnody v1 2026-10-03 overlay ula prefix";
     pub const OVERLAY_ADDR: &str = "threnody v1 2026-10-03 overlay address";
+    pub const STATE_KEY: &str = "threnody v1 2026-10-03 state encryption key";
 }
 
 /// Fills `out` from the KDF.

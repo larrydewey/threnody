@@ -28,6 +28,7 @@ use threnody_core::{Identity, PublicIdentity};
 pub use wire::{GroupId, GroupWire};
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
+const STATE_VERSION: u8 = 1;
 /// How many past epochs' application messages can still be decrypted.
 const MAX_PAST_EPOCHS: usize = 5;
 /// Group names are display labels; keep them short.
@@ -165,6 +166,97 @@ impl Groups {
             groups: HashMap::new(),
             pending_adds: Vec::new(),
         }
+    }
+
+    /// Serializes every group (openmls key-value store plus our metadata)
+    /// for [`Groups::restore`]. Contains secrets: store it encrypted
+    /// (`Home::save_state`).
+    pub fn export(&self) -> Result<Vec<u8>> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| GroupError::Mls("storage lock poisoned".into()))?;
+        let size: usize = values
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 16)
+            .sum::<usize>()
+            + 256;
+        Ok(threnody_core::cbor::to_vec(size, |e| {
+            e.map_len(3)?;
+            e.u8(0)?.u8(STATE_VERSION)?;
+            e.u8(1)?.array_len(values.len())?;
+            for (k, v) in values.iter() {
+                e.array_len(2)?.bytes(k)?.bytes(v)?;
+            }
+            e.u8(2)?.array_len(self.groups.len())?;
+            for (id, g) in &self.groups {
+                e.array_len(3)?
+                    .bytes(id)?
+                    .str(&g.name)?
+                    .bytes(g.owner.as_bytes())?;
+            }
+            Ok(())
+        })?)
+    }
+
+    /// Rebuilds the manager from [`Groups::export`] output.
+    pub fn restore(identity: &Identity, bytes: &[u8]) -> Result<Self> {
+        use threnody_core::cbor::{fixed_bytes, read_map};
+        let mut me = Self::new(identity);
+        let mut dec = const_cbor::Decoder::new(bytes);
+        let mut meta: Vec<(GroupId, String, [u8; 32])> = Vec::new();
+        let mut version = None;
+        {
+            let mut values = me
+                .provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| GroupError::Mls("storage lock poisoned".into()))?;
+            read_map(&mut dec, |k, d| {
+                match k {
+                    0 => version = Some(d.u8()?),
+                    1 => {
+                        for _ in 0..d.array_len()? {
+                            if d.array_len()? != 2 {
+                                return Err(threnody_core::Error::Malformed("storage entry"));
+                            }
+                            let key = d.bytes()?.to_vec();
+                            values.insert(key, d.bytes()?.to_vec());
+                        }
+                    }
+                    2 => {
+                        for _ in 0..d.array_len()? {
+                            if d.array_len()? != 3 {
+                                return Err(threnody_core::Error::Malformed("group entry"));
+                            }
+                            let id = fixed_bytes::<16>(d)?;
+                            let name = d.str()?.to_owned();
+                            meta.push((id, name, fixed_bytes::<32>(d)?));
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        }
+        threnody_core::cbor::finish(&dec)?;
+        if version != Some(STATE_VERSION) {
+            return Err(GroupError::Unexpected("group state version"));
+        }
+        for (id, name, owner) in meta {
+            let mls = MlsGroup::load(
+                me.provider.storage(),
+                &openmls::group::GroupId::from_slice(&id),
+            )
+            .map_err(mls)?
+            .ok_or(GroupError::Unexpected("group missing from storage"))?;
+            let owner = PublicIdentity::from_bytes(&owner)?;
+            me.groups.insert(id, Group { mls, name, owner });
+        }
+        Ok(me)
     }
 
     /// `(id, name, owner, members)` for every group we are in.

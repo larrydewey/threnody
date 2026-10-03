@@ -60,7 +60,7 @@ struct Ui {
 
 pub async fn run(opts: Options) -> Result<()> {
     let downloads = opts.home.dir().join("downloads");
-    let groups = GroupUi::new(&opts.identity);
+    let groups = GroupUi::load(&opts.home, &opts.identity).context("loading groups")?;
     let tunnels = opts
         .tunnel
         .as_ref()
@@ -82,6 +82,9 @@ pub async fn run(opts: Options) -> Result<()> {
         tunnel_port: opts.tunnel.as_ref().map(|t| t.port),
     })?;
     println!("Threnody — you are {}", node.identity().fingerprint());
+    if groups.count() > 0 {
+        println!("{} group(s) restored. /groups to list", groups.count());
+    }
     if let Some(t) = &tunnels {
         println!("Tunnels on: overlay address {}", t.overlay());
         println!("  WireGuard config: {}", t.conf_path().display());

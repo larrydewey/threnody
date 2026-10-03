@@ -219,3 +219,33 @@ fn group_uses_the_xwing_ciphersuite() {
         openmls::prelude::Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519
     );
 }
+
+#[test]
+fn groups_survive_export_and_restore() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let g = net.node(&pa).create("persist").unwrap();
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    net.take(&pa);
+    net.take(&pb);
+
+    // Both sides restart from their exported state.
+    for (id, ident) in [(pa, &a), (pb, &b)] {
+        let state = net.node(&id).export().unwrap();
+        let restored = Groups::restore(ident, &state).unwrap();
+        net.nodes.insert(id, restored);
+    }
+    let out = net.node(&pb).send_text(&g, "still here").unwrap();
+    net.deliver(pb, out);
+    assert!(net.take(&pa).contains(&GroupEvent::Text {
+        group: g,
+        from: pb,
+        text: "still here".into()
+    }));
+    let (_, name, owner, members) = net.node(&pb).list().pop().unwrap();
+    assert_eq!((name.as_str(), owner, members.len()), ("persist", pa, 2));
+
+    assert!(Groups::restore(&a, b"garbage").is_err());
+}

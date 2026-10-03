@@ -74,7 +74,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §4.5 Multi-device | ❌ |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
 | §6.1 1:1 text + files | ✅ (disappearing messages not yet) |
-| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; in-memory only so far |
+| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ identity and contacts (message history, sync and backup not yet) |
 | §7 Transports | ✅ TCP/IP, private LAN discovery with auto-connect; ❌ BLE, Wi-Fi Direct, multi-hop mesh routing |
@@ -87,7 +87,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 ## Roadmap
 
 1. **Hardening (remaining).** OS keystores, ratchet persistence across reconnects, and an external audit.
-2. **Groups (remaining).** Persistent group state, store-and-forward via members, and more admin roles.
+2. **Groups (remaining).** Store-and-forward via members, and more admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Local mesh (remaining).** BLE / Wi-Fi Direct transports with the same beacon scheme, and multi-hop relay.
 5. **Metadata.** Onion routing through volunteer nodes; anonymous and selective-disclosure identities.
