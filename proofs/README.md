@@ -4,8 +4,9 @@ This directory has two Tamarin models:
 
 - `handshake.spthy` models the v1 handshake ([Appendix A](../docs/appendix-a-handshake.md)).
 - `ratchet.spthy` models the KEM double ratchet ([Appendix B](../docs/appendix-b-ratchet.md)).
+- `sealed.spthy` models sealed messages and prekeys for offline delivery ([Appendix H](../docs/appendix-h-offline.md)).
 
-Every lemma verifies automatically in under 20 seconds:
+Every lemma verifies automatically in about 2.5 minutes:
 
 ```sh
 proofs/check.sh   # fails unless every lemma in every model verifies
@@ -51,6 +52,25 @@ Abstractions specific to this model:
 - Each chain carries one message, because the symmetric chain is a one-way hash chain.
 - Header encryption is not modelled.
 - Reveal rules read persistent copies of each state, so Tamarin does not have to unroll the ratchet's history.
+
+## Sealed messages
+
+| Lemma | Property |
+|---|---|
+| `executable_opk`, `executable_spk_only` | Both message forms can be delivered. |
+| `secrecy_with_opk` | The body stays secret unless B's identity key leaked before sending (forged prekeys), both the SPK and OPK secrets were revealed while they existed, or the KEM is broken. |
+| `secrecy_spk_only` | The same with the SPK alone. |
+| `sender_authentication` | B accepts a message from A only if A sent exactly that body to B, unless A's key leaked earlier. Holds even when all of B's keys are compromised (KCI). |
+| `no_replay` | Every message is accepted at most once. |
+| `sanity_*` | Revealing both prekeys, or A's key, really does enable an attack. |
+
+Key lifecycles are restrictions over persistent facts:
+
+- An SPK cannot be used after it is retired.
+- An OPK is accepted at most once.
+- A key can only be revealed before it is deleted.
+
+That last restriction is what makes the secrecy lemmas forward-secrecy statements.
 
 ## Abstractions and limits
 

@@ -1,0 +1,183 @@
+theory Threnody_Sealed
+begin
+
+/*
+ * Symbolic model of Threnody v1 sealed messages and prekeys
+ * (docs/appendix-h-offline.md).
+ *
+ * Abstractions:
+ *  - X-Wing is one abstract KEM. Its hybrid strength is proved in
+ *    handshake.spthy / ratchet.spthy; here Break_KEM stands for breaking
+ *    *both* components and leaks any KEM secret, even a deleted one
+ *    (harvest now, decrypt later).
+ *  - Prekeys reach the sender over the network (the attacker controls
+ *    it); only B's signature vouches for them.
+ *  - Key lifecycles are restrictions over persistent key facts (so the
+ *    prover never unrolls state): an SPK is unusable after retirement, an
+ *    OPK is accepted at most once, and a secret can be revealed only
+ *    before it is deleted (SPK retired / OPK used). That is what makes the
+ *    secrecy lemmas forward-secrecy statements.
+ *  - The receiver's replay cache for SPK-only messages is a restriction.
+ */
+
+builtins: hashing, signing, symmetric-encryption
+
+functions: pkK/1, encK/2, decK/2
+equations: decK(sk, encK(pkK(sk), s)) = s
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+// Seen-transcript cache: an SPK-only message is accepted at most once.
+restriction replay_cache:
+  "All B h #i #j. AcceptedSPK(B, h) @ #i & AcceptedSPK(B, h) @ #j ==> #i = #j"
+
+restriction spk_unusable_after_retirement:
+  "All k #u #d. UseSPK(k) @ #u & Retired(k) @ #d ==> #u < #d"
+
+restriction opk_used_once:
+  "All B k #i #j. AcceptedOPK(B, k) @ #i & AcceptedOPK(B, k) @ #j ==> #i = #j"
+
+restriction reveal_only_before_deletion:
+  "All k #r #d. RevKey(k) @ #r & Deleted(k) @ #d ==> #r < #d"
+
+// ---------------------------------------------------------- identities
+rule Register_Ltk:
+  [ Fr(~ltk) ] --[ Register($A) ]-> [ !Ltk($A, ~ltk), !Pk($A, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Reveal_Ltk:
+  [ !Ltk(A, ltk) ] --[ RevLtk(A) ]-> [ Out(ltk) ]
+
+// ------------------------------------------------------------- prekeys
+rule Gen_SPK:
+  [ !Ltk($B, ltk), Fr(~sk), Fr(~id) ]
+  --[ GenSPK($B, pkK(~sk)) ]->
+  [ !SPK($B, ~id, ~sk), !KemKey(~sk),
+    Out(<~id, pkK(~sk), sign(<'prekey', $B, ~id, pkK(~sk)>, ltk)>) ]
+
+rule Gen_OPK:
+  [ !Ltk($B, ltk), Fr(~sk), Fr(~id) ]
+  --[ GenOPK($B, pkK(~sk)) ]->
+  [ !OPK($B, ~id, ~sk), !KemKey(~sk),
+    Out(<~id, pkK(~sk), sign(<'one-time prekey', $B, ~id, pkK(~sk)>, ltk)>) ]
+
+rule Retire_SPK:
+  [ !SPK(B, id, sk) ] --[ Retired(pkK(sk)), Deleted(pkK(sk)) ]-> [ ]
+
+rule Reveal_SPK:
+  [ !SPK(B, id, sk) ] --[ RevKey(pkK(sk)) ]-> [ Out(sk) ]
+
+rule Reveal_OPK:
+  [ !OPK(B, id, sk) ] --[ RevKey(pkK(sk)) ]-> [ Out(sk) ]
+
+rule Break_KEM:
+  [ !KemKey(sk) ] --[ Broken() ]-> [ Out(sk) ]
+
+// -------------------------------------------------------------- sending
+rule Send_With_OPK:
+  let cs = encK(spkPub, ~ss)
+      co = encK(opkPub, ~so)
+      t  = h(<'transcript', $B, sid, cs, oid, co>)
+      k  = h(<'key', ~ss, ~so, t>)
+      sg = sign(<'sender', t, $A, $B, h(~m)>, ltkA)
+  in
+  [ !Ltk($A, ltkA), !Pk($B, pkB),
+    In(<sid, spkPub, sigS, oid, opkPub, sigO>),
+    Fr(~ss), Fr(~so), Fr(~m) ]
+  --[ Eq(verify(sigS, <'prekey', $B, sid, spkPub>, pkB), true),
+      Eq(verify(sigO, <'one-time prekey', $B, oid, opkPub>, pkB), true),
+      Sent($A, $B, ~m, t),
+      SentOPK($A, $B, ~m, spkPub, opkPub) ]->
+  [ Out(<sid, cs, oid, co, senc(<$A, sg, ~m>, k)>) ]
+
+rule Send_SPK_Only:
+  let cs = encK(spkPub, ~ss)
+      t  = h(<'transcript', $B, sid, cs>)
+      k  = h(<'key', ~ss, 'none', t>)
+      sg = sign(<'sender', t, $A, $B, h(~m)>, ltkA)
+  in
+  [ !Ltk($A, ltkA), !Pk($B, pkB), In(<sid, spkPub, sigS>), Fr(~ss), Fr(~m) ]
+  --[ Eq(verify(sigS, <'prekey', $B, sid, spkPub>, pkB), true),
+      Sent($A, $B, ~m, t),
+      SentSPK($A, $B, ~m, spkPub) ]->
+  [ Out(<sid, cs, senc(<$A, sg, ~m>, k)>) ]
+
+// ------------------------------------------------------------ receiving
+rule Recv_With_OPK:
+  let cs = encK(pkK(sks), ss)
+      co = encK(pkK(sko), so)
+      t  = h(<'transcript', $B, sid, cs, oid, co>)
+      k  = h(<'key', ss, so, t>)
+  in
+  [ !SPK($B, sid, sks), !OPK($B, oid, sko), !Pk(A, pkA),
+    In(<sid, cs, oid, co, senc(<A, sg, m>, k)>) ]
+  --[ Eq(verify(sg, <'sender', t, A, $B, h(m)>, pkA), true),
+      Accepted($B, A, m, t),
+      UseSPK(pkK(sks)),
+      AcceptedOPK($B, pkK(sko)),
+      Deleted(pkK(sko)) ]->                // the OPK secret is deleted
+  [ ]
+
+rule Recv_SPK_Only:
+  let cs = encK(pkK(sks), ss)
+      t  = h(<'transcript', $B, sid, cs>)
+      k  = h(<'key', ss, 'none', t>)
+  in
+  [ !SPK($B, sid, sks), !Pk(A, pkA), In(<sid, cs, senc(<A, sg, m>, k)>) ]
+  --[ Eq(verify(sg, <'sender', t, A, $B, h(m)>, pkA), true),
+      Accepted($B, A, m, t),
+      UseSPK(pkK(sks)),
+      AcceptedSPK($B, t) ]->
+  [ ]
+
+// --------------------------------------------------------------- lemmas
+lemma executable_opk:
+  exists-trace
+  "Ex A B m t #i #j. Sent(A, B, m, t) @ #i & Accepted(B, A, m, t) @ #j & not (A = B)
+    & (Ex k #o. AcceptedOPK(B, k) @ #o)
+    & not (Ex C #r. RevLtk(C) @ #r) & not (Ex k #r. RevKey(k) @ #r)
+    & not (Ex #x. Broken() @ #x)"
+
+lemma executable_spk_only:
+  exists-trace
+  "Ex A B m t #i #j. Sent(A, B, m, t) @ #i & Accepted(B, A, m, t) @ #j & not (A = B)
+    & (Ex #o. AcceptedSPK(B, t) @ #o)
+    & not (Ex C #r. RevLtk(C) @ #r) & not (Ex k #r. RevKey(k) @ #r)
+    & not (Ex #x. Broken() @ #x)"
+
+// Confidentiality with an OPK: needs B's identity key before sending (to
+// forge prekeys), or both prekey secrets while they existed, or a KEM break.
+lemma secrecy_with_opk:
+  "All A B m s o #i #j. SentOPK(A, B, m, s, o) @ #i & K(m) @ #j ==>
+      (Ex #r. RevLtk(B) @ #r & #r < #i)
+    | ((Ex #x. RevKey(s) @ #x) & (Ex #y. RevKey(o) @ #y))
+    | (Ex #x. Broken() @ #x)"
+
+lemma secrecy_spk_only:
+  "All A B m s #i #j. SentSPK(A, B, m, s) @ #i & K(m) @ #j ==>
+      (Ex #r. RevLtk(B) @ #r & #r < #i)
+    | (Ex #x. RevKey(s) @ #x)
+    | (Ex #x. Broken() @ #x)"
+
+// Sender authentication, robust to compromise of all of B's keys (KCI).
+lemma sender_authentication:
+  "All A B m t #i. Accepted(B, A, m, t) @ #i ==>
+      (Ex #j. Sent(A, B, m, t) @ #j & #j < #i)
+    | (Ex #r. RevLtk(A) @ #r & #r < #i)"
+
+// Every message is accepted at most once.
+lemma no_replay:
+  "All A B m t #i #j. Accepted(B, A, m, t) @ #i & Accepted(B, A, m, t) @ #j ==> #i = #j"
+
+// --------------------------------------------------------- sanity checks
+lemma sanity_both_prekeys_leak_opk_message:
+  exists-trace
+  "Ex A B m s o #i #j. SentOPK(A, B, m, s, o) @ #i & K(m) @ #j
+    & not (Ex C #r. RevLtk(C) @ #r) & not (Ex #x. Broken() @ #x)"
+
+lemma sanity_forged_sender_with_leaked_key:
+  exists-trace
+  "Ex A B m t #i #r. Accepted(B, A, m, t) @ #i & RevLtk(A) @ #r
+    & not (Ex #j. Sent(A, B, m, t) @ #j)"
+
+end
