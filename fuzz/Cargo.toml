@@ -1,0 +1,38 @@
+[package]
+name = "threnody-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+threnody-core = { path = "../crates/threnody-core" }
+
+[workspace]
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "handshake_respond"
+path = "fuzz_targets/handshake_respond.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "handshake_finish"
+path = "fuzz_targets/handshake_finish.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "app_message"
+path = "fuzz_targets/app_message.rs"
+test = false
+doc = false

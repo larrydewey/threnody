@@ -1,0 +1,258 @@
+use std::time::Duration;
+
+use threnody_core::store::Home;
+use threnody_core::{AppMessage, Identity};
+use threnody_net::{AcceptPolicy, Event, NetError, Node, NodeConfig};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::timeout;
+
+fn node(
+    dir: &tempfile::TempDir,
+    name: &str,
+    policy: AcceptPolicy,
+    rate: Option<Duration>,
+) -> (Node, UnboundedReceiver<Event>) {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.create_identity(None).unwrap();
+    Node::new(NodeConfig {
+        home,
+        identity,
+        policy,
+        constant_rate: rate,
+        tunnel_port: Some(51820),
+    })
+    .unwrap()
+}
+
+async fn next(rx: &mut UnboundedReceiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let e = rx.recv().await.expect("event stream open");
+            if pred(&e) {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("expected event did not arrive")
+}
+
+#[tokio::test]
+async fn chat_and_mutual_approval_over_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+
+    let bob_id = alice
+        .connect(&addr.to_string(), Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    assert_eq!(bob_id, bob.identity());
+    let Event::Connected {
+        peer, new_contact, ..
+    } = next(&mut brx, |e| matches!(e, Event::Connected { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(peer, alice.identity());
+    assert!(new_contact);
+
+    alice
+        .send(
+            &bob_id,
+            AppMessage::Text {
+                sent_ms: 1,
+                body: "hi bob".into(),
+            },
+        )
+        .unwrap();
+    let Event::Message { msg, .. } = next(&mut brx, |e| matches!(e, Event::Message { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        msg,
+        AppMessage::Text {
+            sent_ms: 1,
+            body: "hi bob".into()
+        }
+    );
+
+    bob.send(
+        &alice.identity(),
+        AppMessage::Text {
+            sent_ms: 2,
+            body: "hi alice".into(),
+        },
+    )
+    .unwrap();
+    next(&mut arx, |e| matches!(e, Event::Message { .. })).await;
+
+    alice.set_approval(&bob_id, true).unwrap();
+    next(&mut brx, |e| {
+        matches!(
+            e,
+            Event::ApprovalChanged {
+                remote_approved: true,
+                mutual: false,
+                ..
+            }
+        )
+    })
+    .await;
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    assert!(alice.contacts().get(&bob_id).unwrap().mutually_approved());
+
+    // Revocation propagates.
+    bob.set_approval(&alice.identity(), false).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: false, .. })
+    })
+    .await;
+    assert!(!alice.contacts().get(&bob_id).unwrap().mutually_approved());
+    assert_eq!(
+        alice.contacts().get(&bob_id).unwrap().last_addr.as_deref(),
+        Some(addr.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn pinned_fingerprint_mismatch_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let wrong = Identity::generate().public().fingerprint();
+    let r = alice.connect(&addr.to_string(), Some(wrong)).await;
+    assert!(matches!(r, Err(NetError::IdentityMismatch { .. })));
+    assert!(alice.sessions().is_empty());
+}
+
+#[tokio::test]
+async fn approved_only_policy_rejects_strangers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::ApprovedOnly, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    // The handshake completes (alice learns who bob is), then bob hangs up.
+    let _ = alice.connect(&addr.to_string(), None).await;
+    let e = next(&mut brx, |e| matches!(e, Event::Rejected { .. })).await;
+    assert!(matches!(e, Event::Rejected { reason, .. } if reason.contains("refused")));
+    assert!(bob.sessions().is_empty());
+}
+
+#[tokio::test]
+async fn constant_rate_mode_delivers_and_hides_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let rate = Some(Duration::from_millis(20));
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, rate);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, rate);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    alice
+        .send(
+            &bob_id,
+            AppMessage::Text {
+                sent_ms: 3,
+                body: "steady".into(),
+            },
+        )
+        .unwrap();
+    let Event::Message { msg, .. } = next(&mut brx, |e| matches!(e, Event::Message { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        msg,
+        AppMessage::Text {
+            sent_ms: 3,
+            body: "steady".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn tunnels_follow_mutual_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    let Event::TunnelUp {
+        peer: pa,
+        endpoint: ea,
+        psk: ka,
+        overlay: oa,
+        ..
+    } = next(&mut arx, up).await
+    else {
+        unreachable!()
+    };
+    let Event::TunnelUp {
+        peer: pb,
+        psk: kb,
+        overlay: ob,
+        ..
+    } = next(&mut brx, up).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(pa, bob_id);
+    assert_eq!(pb, alice.identity());
+    assert_eq!(ea, "127.0.0.1:51820".parse().unwrap());
+    assert_eq!(*ka.0, *kb.0, "both ends must derive the same WireGuard PSK");
+    assert_eq!(oa, threnody_core::tunnel::overlay_addr(&bob_id));
+    assert_eq!(ob, threnody_core::tunnel::overlay_addr(&alice.identity()));
+    assert_eq!(alice.tunnel_peers(), vec![bob_id]);
+
+    bob.set_approval(&alice.identity(), false).unwrap();
+    next(&mut arx, |e| {
+        matches!(
+            e,
+            Event::TunnelDown {
+                wg_public: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    next(&mut brx, |e| matches!(e, Event::TunnelDown { .. })).await;
+    assert!(alice.tunnel_peers().is_empty());
+}
+
+#[tokio::test]
+async fn no_tunnel_without_mutual_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    alice
+        .send(
+            &bob_id,
+            AppMessage::Text {
+                sent_ms: 0,
+                body: "sync".into(),
+            },
+        )
+        .unwrap();
+    let r = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(Event::TunnelUp { .. }) = arx.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(r.is_err(), "tunnel offered with one-sided approval");
+}

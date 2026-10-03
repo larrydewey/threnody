@@ -1,0 +1,137 @@
+theory Threnody_Handshake
+begin
+
+/*
+ * Symbolic model of the Threnody v1 handshake (docs/appendix-a-handshake.md).
+ *
+ * Abstractions:
+ *  - X-Wing is two abstract KEMs, M (ML-KEM-768) and X (X25519). The
+ *    adversary may "break" either one: given a ciphertext it learns that
+ *    component's shared secret. ss is the X-Wing combiner over both parts.
+ *  - The AEAD is perfect symmetric encryption, BLAKE3/SHA3 are random
+ *    oracles, Ed25519 is an ideal signature scheme.
+ *  - Suite negotiation is left out: the offer is just a transcript input
+ *    and is covered by the same signatures.
+ *
+ * Claims proved:
+ *  - session-key secrecy with forward secrecy and resistance to key
+ *    compromise impersonation (only the *peer's* long-term key, revealed
+ *    *before* the session, helps the attacker)
+ *  - hybrid security: secrecy survives breaking either KEM, only both together
+ *  - responder authentication (initiator agrees on the transcript)
+ *  - initiator authentication with injective agreement on the session id
+ */
+
+builtins: hashing, signing, symmetric-encryption
+
+functions: pkM/1, encM/2, decM/2, pkX/1, encX/2, decX/2
+equations:
+  decM(sk, encM(pkM(sk), ss)) = ss,
+  decX(sk, encX(pkX(sk), ss)) = ss
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+// ---------------------------------------------------------------- PKI
+rule Register_Ltk:
+  [ Fr(~ltk) ]
+  --[ Register($A) ]->
+  [ !Ltk($A, ~ltk), !Pk($A, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Reveal_Ltk:
+  [ !Ltk(A, ltk) ] --[ RevLtk(A) ]-> [ Out(ltk) ]
+
+// ------------------------------------------------- component breaks
+rule Break_MLKEM:
+  [ In(encM(p, s)) ] --[ BrokenM() ]-> [ Out(s) ]
+
+rule Break_X25519:
+  [ In(encX(p, s)) ] --[ BrokenX() ]-> [ Out(s) ]
+
+// ----------------------------------------------------------- protocol
+rule I_1_send_HS1:
+  let ePk = <pkM(~eM), pkX(~eX)>
+  in
+  [ Fr(~eM), Fr(~eX), !Ltk($A, ltkA) ]
+  --[ Start_I($A) ]->
+  [ Out(ePk), I_1($A, ~eM, ~eX) ]
+
+rule R_1_send_HS2:
+  let ctM    = encM(ePkM, ~ssM)
+      ctX    = encX(ePkX, ~ssX)
+      ss     = h(<'xwing', ~ssM, ~ssX, ctX, ePkX>)
+      h2     = h(<'transcript', ePkM, ePkX, ctM, ctX>)
+      kR     = h(<'kR', ss, h2>)
+      kI     = h(<'kI', ss, h2>)
+      rkPub  = pkM(~rk)
+      sigR   = sign(<'responder', h2, pk(ltkB), rkPub>, ltkB)
+      sealR  = senc(<pk(ltkB), sigR, rkPub>, kR)
+      h3     = h(<h2, sealR>)
+  in
+  [ In(<ePkM, ePkX>), Fr(~ssM), Fr(~ssX), Fr(~rk), !Ltk($B, ltkB) ]
+  --[ Running_R($B, h3) ]->
+  [ Out(<ctM, ctX, sealR>), R_1($B, ss, h3, kI) ]
+
+rule I_2_send_HS3:
+  let ePkM   = pkM(eM)
+      ePkX   = pkX(eX)
+      ss     = h(<'xwing', decM(eM, ctM), decX(eX, ctX), ctX, ePkX>)
+      h2     = h(<'transcript', ePkM, ePkX, ctM, ctX>)
+      kR     = h(<'kR', ss, h2>)
+      kI     = h(<'kI', ss, h2>)
+      sealR  = senc(<pkB, sigR, rkPub>, kR)
+      h3     = h(<h2, sealR>)
+      sigI   = sign(<'initiator', h3, pk(ltkA)>, ltkA)
+      sealI  = senc(<pk(ltkA), sigI>, kI)
+      sid    = h(<h3, sealI>)
+      root   = h(<'root', ss, sid>)
+  in
+  [ I_1($A, eM, eX), In(<ctM, ctX, sealR>), !Pk(B, pkB), !Ltk($A, ltkA) ]
+  --[ Eq(verify(sigR, <'responder', h2, pkB, rkPub>, pkB), true),
+      Commit_I($A, B, h3),
+      Running_I($A, B, sid),
+      Key_I($A, B, root) ]->
+  [ Out(sealI) ]
+
+rule R_2_accept:
+  let sealI = senc(<pkA, sigI>, kI)
+      sid   = h(<h3, sealI>)
+      root  = h(<'root', ss, sid>)
+  in
+  [ R_1($B, ss, h3, kI), In(sealI), !Pk(A, pkA) ]
+  --[ Eq(verify(sigI, <'initiator', h3, pkA>, pkA), true),
+      Commit_R($B, A, sid),
+      Key_R($B, A, root) ]->
+  [ ]
+
+// ------------------------------------------------------------- lemmas
+lemma executable:
+  exists-trace
+  "Ex A B sid k #i #j.
+      Commit_R(B, A, sid) @ #i & Key_I(A, B, k) @ #j & not (A = B)
+    & not (Ex C #r. RevLtk(C) @ #r)
+    & not (Ex #x. BrokenM() @ #x)
+    & not (Ex #x. BrokenX() @ #x)"
+
+lemma secrecy_initiator:
+  "All A B k #i #j. Key_I(A, B, k) @ #i & K(k) @ #j ==>
+      (Ex #r. RevLtk(B) @ #r & #r < #i)
+    | (Ex #x #y. BrokenM() @ #x & BrokenX() @ #y)"
+
+lemma secrecy_responder:
+  "All A B k #i #j. Key_R(B, A, k) @ #i & K(k) @ #j ==>
+      (Ex #r. RevLtk(A) @ #r & #r < #i)
+    | (Ex #x #y. BrokenM() @ #x & BrokenX() @ #y)"
+
+lemma responder_authentication:
+  "All A B t #i. Commit_I(A, B, t) @ #i ==>
+      (Ex #j. Running_R(B, t) @ #j & #j < #i)
+    | (Ex #r. RevLtk(B) @ #r & #r < #i)"
+
+lemma initiator_authentication_injective:
+  "All A B sid #i. Commit_R(B, A, sid) @ #i ==>
+      ( (Ex #j. Running_I(A, B, sid) @ #j & #j < #i)
+        & not (Ex B2 A2 #i2. Commit_R(B2, A2, sid) @ #i2 & not (#i2 = #i)) )
+    | (Ex #r. RevLtk(A) @ #r & #r < #i)"
+
+end

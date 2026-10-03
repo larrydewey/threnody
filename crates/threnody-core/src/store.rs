@@ -1,0 +1,452 @@
+//! Local-first persistence (spec §6.4): the device identity and the contact
+//! book, as CBOR files in a per-user directory.
+//!
+//! This is the software-keystore fallback of spec §3.1: secrets live in a
+//! file readable only by the owning user (mode 0600, directory 0700).
+//! Platform keystores (Secure Enclave, StrongBox, TPM) plug in here later.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use const_cbor::Decoder;
+use zeroize::Zeroizing;
+
+use crate::cbor::{self, finish, fixed_bytes, read_map, required};
+use crate::error::{Error, Result};
+use crate::identity::{Fingerprint, Identity, PublicIdentity, fingerprint_matches_prefix};
+use crate::sealed::{self, KdfParams};
+
+const FILE_VERSION: u64 = 1;
+const IDENTITY_PURPOSE: &str = "threnody v1 identity seed";
+
+enum IdentityFile {
+    Plain(Zeroizing<[u8; 32]>),
+    Sealed(Vec<u8>),
+}
+
+/// The per-user Threnody directory.
+pub struct Home {
+    dir: PathBuf,
+}
+
+impl Home {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn identity_path(&self) -> PathBuf {
+        self.dir.join("identity.cbor")
+    }
+
+    fn contacts_path(&self) -> PathBuf {
+        self.dir.join("contacts.cbor")
+    }
+
+    pub fn has_identity(&self) -> bool {
+        self.identity_path().exists()
+    }
+
+    /// Creates and stores a fresh identity, sealed under `passphrase` when
+    /// one is given.
+    pub fn create_identity(&self, passphrase: Option<&[u8]>) -> Result<Identity> {
+        self.create_identity_with(passphrase, KdfParams::DEFAULT)
+    }
+
+    pub fn create_identity_with(
+        &self,
+        passphrase: Option<&[u8]>,
+        p: KdfParams,
+    ) -> Result<Identity> {
+        let id = Identity::generate();
+        self.store_identity(&id, passphrase, p)?;
+        Ok(id)
+    }
+
+    fn store_identity(&self, id: &Identity, passphrase: Option<&[u8]>, p: KdfParams) -> Result<()> {
+        let seed = id.seed();
+        let sealed = passphrase
+            .map(|pw| sealed::seal(pw, IDENTITY_PURPOSE, &seed[..], p))
+            .transpose()?;
+        let bytes = Zeroizing::new(cbor::to_vec(1024, |e| {
+            e.map_len(2)?;
+            e.u8(0)?.uint(FILE_VERSION)?;
+            match &sealed {
+                Some(s) => e.u8(2)?.bytes(s)?,
+                None => e.u8(1)?.bytes(&seed[..])?,
+            };
+            Ok(())
+        })?);
+        write_private(&self.dir, &self.identity_path(), &bytes)
+    }
+
+    /// True when the identity file is passphrase-sealed.
+    pub fn identity_is_sealed(&self) -> Result<bool> {
+        Ok(matches!(
+            self.read_identity_file()?,
+            IdentityFile::Sealed(_)
+        ))
+    }
+
+    /// Loads the identity. Sealed files need the passphrase: `None` yields
+    /// [`Error::PassphraseRequired`], a wrong one [`Error::Decrypt`].
+    pub fn load_identity(&self, passphrase: Option<&[u8]>) -> Result<Identity> {
+        match self.read_identity_file()? {
+            IdentityFile::Plain(seed) => Ok(Identity::from_seed(&seed)),
+            IdentityFile::Sealed(blob) => {
+                let pw = passphrase.ok_or(Error::PassphraseRequired)?;
+                let seed = sealed::open(pw, IDENTITY_PURPOSE, &blob)?;
+                let seed: &[u8; 32] = seed[..]
+                    .try_into()
+                    .map_err(|_| Error::Malformed("identity seed"))?;
+                Ok(Identity::from_seed(seed))
+            }
+        }
+    }
+
+    /// Adds, changes or removes (`new = None`) the identity passphrase.
+    pub fn change_passphrase(&self, current: Option<&[u8]>, new: Option<&[u8]>) -> Result<()> {
+        let id = self.load_identity(current)?;
+        self.store_identity(&id, new, KdfParams::DEFAULT)
+    }
+
+    fn read_identity_file(&self) -> Result<IdentityFile> {
+        let bytes = Zeroizing::new(fs::read(self.identity_path())?);
+        let mut dec = Decoder::new(&bytes);
+        let (mut ver, mut seed, mut blob) = (None, None, None);
+        read_map(&mut dec, |k, d| {
+            match k {
+                0 => ver = Some(d.u64()?),
+                1 => seed = Some(Zeroizing::new(fixed_bytes::<32>(d)?)),
+                2 => blob = Some(d.bytes()?.to_vec()),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        check_version(ver)?;
+        match (seed, blob) {
+            (Some(s), None) => Ok(IdentityFile::Plain(s)),
+            (None, Some(b)) => Ok(IdentityFile::Sealed(b)),
+            _ => Err(Error::Malformed(
+                "identity file needs exactly one of seed, sealed seed",
+            )),
+        }
+    }
+
+    pub fn load_contacts(&self) -> Result<Contacts> {
+        match fs::read(self.contacts_path()) {
+            Ok(b) => Contacts::decode(&b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Contacts::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn save_contacts(&self, c: &Contacts) -> Result<()> {
+        write_private(&self.dir, &self.contacts_path(), &c.encode()?)
+    }
+}
+
+fn check_version(v: Option<u64>) -> Result<()> {
+    match v {
+        Some(FILE_VERSION) => Ok(()),
+        Some(other) => Err(Error::UnsupportedVersion(other)),
+        None => Err(Error::Malformed("file version")),
+    }
+}
+
+/// Atomically replaces `path` with `bytes`, owner-only permissions.
+fn write_private(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// A known peer. Identity is the key; everything else is local metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Contact {
+    pub key: PublicIdentity,
+    pub petname: Option<String>,
+    /// We approve this peer for mesh / tunnel participation.
+    pub local_approved: bool,
+    /// The peer told us (inside an authenticated session) that it approves us.
+    pub remote_approved: bool,
+    /// The user confirmed the safety number out of band.
+    pub verified: bool,
+    pub last_addr: Option<String>,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+}
+
+impl Contact {
+    pub fn new(key: PublicIdentity, now_ms: u64) -> Self {
+        Self {
+            key,
+            petname: None,
+            local_approved: false,
+            remote_approved: false,
+            verified: false,
+            last_addr: None,
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+        }
+    }
+
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.key.fingerprint()
+    }
+
+    /// Spec §5.2: mesh and tunnel participation need approval on both sides.
+    pub fn mutually_approved(&self) -> bool {
+        self.local_approved && self.remote_approved
+    }
+
+    pub fn label(&self) -> String {
+        match &self.petname {
+            Some(n) => format!("{n} ({})", &self.fingerprint().to_string()[..9]),
+            None => self.fingerprint().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Contacts {
+    list: Vec<Contact>,
+}
+
+/// Outcome of a contact lookup by user-supplied text.
+pub enum Lookup<'a> {
+    Found(&'a Contact),
+    None,
+    Ambiguous(Vec<&'a Contact>),
+}
+
+impl Contacts {
+    pub fn iter(&self) -> impl Iterator<Item = &Contact> {
+        self.list.iter()
+    }
+
+    pub fn get(&self, key: &PublicIdentity) -> Option<&Contact> {
+        self.list.iter().find(|c| &c.key == key)
+    }
+
+    pub fn get_mut(&mut self, key: &PublicIdentity) -> Option<&mut Contact> {
+        self.list.iter_mut().find(|c| &c.key == key)
+    }
+
+    /// Records a sighting, creating the contact on first use (TOFU, §5.2).
+    /// Returns true when the contact is new.
+    pub fn observe(&mut self, key: PublicIdentity, addr: Option<String>, now_ms: u64) -> bool {
+        if let Some(c) = self.get_mut(&key) {
+            c.last_seen_ms = now_ms;
+            if addr.is_some() {
+                c.last_addr = addr;
+            }
+            false
+        } else {
+            let mut c = Contact::new(key, now_ms);
+            c.last_addr = addr;
+            self.list.push(c);
+            true
+        }
+    }
+
+    pub fn remove(&mut self, key: &PublicIdentity) -> bool {
+        let before = self.list.len();
+        self.list.retain(|c| &c.key != key);
+        before != self.list.len()
+    }
+
+    /// Finds a contact by exact petname, else by fingerprint prefix.
+    pub fn find(&self, query: &str) -> Lookup<'_> {
+        if let Some(c) = self
+            .list
+            .iter()
+            .find(|c| c.petname.as_deref() == Some(query))
+        {
+            return Lookup::Found(c);
+        }
+        let hits: Vec<_> = self
+            .list
+            .iter()
+            .filter(|c| fingerprint_matches_prefix(&c.fingerprint(), query))
+            .collect();
+        match hits.len() {
+            0 => Lookup::None,
+            1 => Lookup::Found(hits[0]),
+            _ => Lookup::Ambiguous(hits),
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        cbor::to_vec(64 + self.list.len() * 160, |e| {
+            e.map_len(2)?;
+            e.u8(0)?.uint(FILE_VERSION)?;
+            e.u8(1)?.array_len(self.list.len())?;
+            for c in &self.list {
+                let n = 6 + usize::from(c.petname.is_some()) + usize::from(c.last_addr.is_some());
+                e.map_len(n)?;
+                e.u8(0)?.bytes(c.key.as_bytes())?;
+                if let Some(p) = &c.petname {
+                    e.u8(1)?.str(p)?;
+                }
+                e.u8(2)?.bool(c.local_approved)?;
+                e.u8(3)?.bool(c.remote_approved)?;
+                e.u8(4)?.bool(c.verified)?;
+                if let Some(a) = &c.last_addr {
+                    e.u8(5)?.str(a)?;
+                }
+                e.u8(6)?.u64(c.first_seen_ms)?;
+                e.u8(7)?.u64(c.last_seen_ms)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode(b: &[u8]) -> Result<Self> {
+        let mut dec = Decoder::new(b);
+        let (mut ver, mut list) = (None, Vec::new());
+        read_map(&mut dec, |k, d| {
+            match k {
+                0 => ver = Some(d.u64()?),
+                1 => {
+                    for _ in 0..d.array_len()? {
+                        list.push(decode_contact(d)?);
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        check_version(ver)?;
+        Ok(Self { list })
+    }
+}
+
+fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
+    let mut key = None;
+    let mut c = Contact {
+        key: Identity::from_seed(&[0; 32]).public(),
+        petname: None,
+        local_approved: false,
+        remote_approved: false,
+        verified: false,
+        last_addr: None,
+        first_seen_ms: 0,
+        last_seen_ms: 0,
+    };
+    read_map(d, |k, d| {
+        match k {
+            0 => key = Some(fixed_bytes::<32>(d)?),
+            1 => c.petname = Some(d.str()?.to_owned()),
+            2 => c.local_approved = d.bool()?,
+            3 => c.remote_approved = d.bool()?,
+            4 => c.verified = d.bool()?,
+            5 => c.last_addr = Some(d.str()?.to_owned()),
+            6 => c.first_seen_ms = d.u64()?,
+            7 => c.last_seen_ms = d.u64()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    c.key = PublicIdentity::from_bytes(&required(key, "contact key")?)?;
+    Ok(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_contacts_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("t"));
+        assert!(!home.has_identity());
+        let id = home.create_identity(None).unwrap();
+        assert_eq!(home.load_identity(None).unwrap().public(), id.public());
+
+        let peer = Identity::generate().public();
+        let mut c = home.load_contacts().unwrap();
+        assert!(c.observe(peer, Some("10.0.0.1:7450".into()), 5));
+        assert!(!c.observe(peer, None, 6));
+        let ct = c.get_mut(&peer).unwrap();
+        ct.petname = Some("alice".into());
+        ct.local_approved = true;
+        home.save_contacts(&c).unwrap();
+        let loaded = home.load_contacts().unwrap();
+        assert_eq!(loaded, c);
+        assert!(matches!(loaded.find("alice"), Lookup::Found(_)));
+        let fp = peer.fingerprint().to_string();
+        assert!(matches!(loaded.find(&fp[..4]), Lookup::Found(_)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(home.identity_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+}
+
+#[cfg(test)]
+mod passphrase_tests {
+    use super::*;
+    use crate::sealed::TEST_PARAMS;
+
+    #[test]
+    fn sealed_identity_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home
+            .create_identity_with(Some(b"hunter2"), TEST_PARAMS)
+            .unwrap();
+        assert!(home.identity_is_sealed().unwrap());
+        assert!(matches!(
+            home.load_identity(None),
+            Err(Error::PassphraseRequired)
+        ));
+        assert!(matches!(
+            home.load_identity(Some(b"wrong")),
+            Err(Error::Decrypt)
+        ));
+        assert_eq!(
+            home.load_identity(Some(b"hunter2")).unwrap().public(),
+            id.public()
+        );
+        let raw = fs::read(home.identity_path()).unwrap();
+        assert!(
+            !raw.windows(32).any(|w| w == &id.seed()[..]),
+            "seed stored in clear"
+        );
+
+        home.change_passphrase(Some(b"hunter2"), None).unwrap();
+        assert!(!home.identity_is_sealed().unwrap());
+        assert_eq!(home.load_identity(None).unwrap().public(), id.public());
+    }
+}

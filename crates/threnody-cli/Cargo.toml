@@ -1,0 +1,28 @@
+[package]
+name = "threnody-cli"
+description = "Command-line Threnody client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "threnody"
+path = "src/main.rs"
+
+[dependencies]
+threnody-core.workspace = true
+threnody-net.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+qrcode.workspace = true
+rpassword.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
