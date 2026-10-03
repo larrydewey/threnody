@@ -6,8 +6,11 @@ begin
  *
  * Abstractions:
  *  - X-Wing is two abstract KEMs, M (ML-KEM-768) and X (X25519). The
- *    adversary may "break" either one: given a ciphertext it learns that
- *    component's shared secret. ss is the X-Wing combiner over both parts.
+ *    adversary may "break" either one: it then learns that component's
+ *    decapsulation key for any honest ephemeral, and so can decapsulate
+ *    every ciphertext sent to it. ss is the X-Wing combiner over both parts.
+ *  - Decapsulation is pattern matching on the ciphertext: an honest party
+ *    only accepts ciphertexts of the form encM(pkM(its key), s).
  *  - The AEAD is perfect symmetric encryption, BLAKE3/SHA3 are random
  *    oracles, Ed25519 is an ideal signature scheme.
  *  - Suite negotiation is left out: the offer is just a transcript input
@@ -43,10 +46,10 @@ rule Reveal_Ltk:
 
 // ------------------------------------------------- component breaks
 rule Break_MLKEM:
-  [ In(encM(p, s)) ] --[ BrokenM() ]-> [ Out(s) ]
+  [ !EphM(k) ] --[ BrokenM() ]-> [ Out(k) ]
 
 rule Break_X25519:
-  [ In(encX(p, s)) ] --[ BrokenX() ]-> [ Out(s) ]
+  [ !EphX(k) ] --[ BrokenX() ]-> [ Out(k) ]
 
 // ----------------------------------------------------------- protocol
 rule I_1_send_HS1:
@@ -54,7 +57,7 @@ rule I_1_send_HS1:
   in
   [ Fr(~eM), Fr(~eX), !Ltk($A, ltkA) ]
   --[ Start_I($A) ]->
-  [ Out(ePk), I_1($A, ~eM, ~eX) ]
+  [ Out(ePk), I_1($A, ~eM, ~eX), !EphM(~eM), !EphX(~eX) ]
 
 rule R_1_send_HS2:
   let ctM    = encM(ePkM, ~ssM)
@@ -75,7 +78,9 @@ rule R_1_send_HS2:
 rule I_2_send_HS3:
   let ePkM   = pkM(eM)
       ePkX   = pkX(eX)
-      ss     = h(<'xwing', decM(eM, ctM), decX(eX, ctX), ctX, ePkX>)
+      ctM    = encM(ePkM, ssM)
+      ctX    = encX(ePkX, ssX)
+      ss     = h(<'xwing', ssM, ssX, ctX, ePkX>)
       h2     = h(<'transcript', ePkM, ePkX, ctM, ctX>)
       kR     = h(<'kR', ss, h2>)
       kI     = h(<'kI', ss, h2>)
@@ -133,5 +138,20 @@ lemma initiator_authentication_injective:
       ( (Ex #j. Running_I(A, B, sid) @ #j & #j < #i)
         & not (Ex B2 A2 #i2. Commit_R(B2, A2, sid) @ #i2 & not (#i2 = #i)) )
     | (Ex #r. RevLtk(A) @ #r & #r < #i)"
+
+// ------------------------------------------------- sanity checks
+// These show the exceptions above are not vacuous: each one really
+// enables an attack in the model. (That a single break is *not* enough
+// is exactly what secrecy_initiator / secrecy_responder prove.)
+
+lemma sanity_both_breaks_leak_key:
+  exists-trace
+  "Ex A B k #i #j. Key_I(A, B, k) @ #i & K(k) @ #j
+    & not (Ex C #r. RevLtk(C) @ #r)"
+
+lemma sanity_early_reveal_allows_impersonation:
+  exists-trace
+  "Ex A B t #i #r. Commit_I(A, B, t) @ #i & RevLtk(B) @ #r & #r < #i
+    & not (Ex #j. Running_R(B, t) @ #j)"
 
 end

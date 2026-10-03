@@ -89,5 +89,4 @@ sig_I    = Sign(id_I, L("initiator signature") || L(h3) || L(id_I) || L(""))
 
 ## Not yet done
 
-- Machine-checked proof (spec §3.4). The Tamarin model should cover: secrecy of `root` under compromise of either primitive alone, injective agreement on `session_id`, and identity hiding for I.
-- Deterministic test vectors. These need an RNG-injection hook in `Initiator::start` and `Responder::respond`.
+- Tamarin models of identity hiding (needs observational equivalence) and of suite negotiation. Secrecy, forward secrecy, KCI resistance, hybrid security and mutual authentication are already proved in [`proofs/handshake.spthy`](../proofs/README.md).
