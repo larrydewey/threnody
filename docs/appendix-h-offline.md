@@ -60,18 +60,20 @@ The signature means sealed messages are not deniable, the same as the interactiv
 Mailbox traffic is carried as `AppMessage::Mailbox` (kind 9):
 
 ```
-Mailbox = { 0: op, ? 1: to (32), ? 2: sealed }      op: 1 deposit, 2 deliver
+Mailbox = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status }
+op: 1 deposit, 2 deliver, 3 receipt (status 0 declined, 1 held, 2 delivered now)
 ```
 
 - **Depositing.** If A has no session with B, A sends `deposit { to: id_B, sealed }` to every live, mutually approved neighbour except B.
 - **Holding.** A neighbour R accepts a deposit only if R is mutually approved with both A and B. It holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days.
 - **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, then deletes its copy.
+- **Receipts.** Every deposit is answered with a receipt, so the sender knows whether each mailbox holds the message, delivered it immediately, or declined it.
 - **Duplicates.** B ignores duplicates by `h`, so depositing with several neighbours is safe.
 
 Mailboxes see that A sent something to B, when, and roughly how large. They never see the contents or the sender's signature. A malicious mailbox can drop or delay messages, but cannot alter or forge them.
 
 ## Not yet done
 
-- Delivery receipts.
+- End-to-end read receipts. Mailbox receipts only report what the mailbox did with the message.
 - Onion-routed deposits, which would hide A from the mailbox.
 - Prekey bundles fetched through relays from contacts that have not handed one out yet.

@@ -22,6 +22,11 @@ pub mod label {
     pub const OVERLAY_PREFIX: &str = "threnody v1 2026-10-03 overlay ula prefix";
     pub const OVERLAY_ADDR: &str = "threnody v1 2026-10-03 overlay address";
     pub const STATE_KEY: &str = "threnody v1 2026-10-03 state encryption key";
+    pub const SIG_PREKEY: &str = "threnody v1 2026-10-03 prekey";
+    pub const SIG_ONE_TIME_PREKEY: &str = "threnody v1 2026-10-03 one-time prekey";
+    pub const SIG_SEALED_SENDER: &str = "threnody v1 2026-10-03 sealed sender";
+    pub const SEALED_TRANSCRIPT: &str = "threnody v1 2026-10-03 sealed transcript";
+    pub const SEALED_KEY: &str = "threnody v1 2026-10-03 sealed key";
 }
 
 /// Fills `out` from the KDF.

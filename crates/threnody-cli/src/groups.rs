@@ -102,7 +102,15 @@ impl GroupUi {
             if node.send(&o.to, AppMessage::Group(bytes.clone())).is_ok() {
                 continue;
             }
-            // No live session: try to reach the member through relays.
+            // No live session: seal it for the member's mailboxes, else
+            // try to reach the member through relays.
+            if node.can_send_offline(&o.to)
+                && node
+                    .send_offline(&o.to, &AppMessage::Group(bytes.clone()))
+                    .is_ok()
+            {
+                continue;
+            }
             let (node, to, who) = (node.clone(), o.to, name(&o.to));
             tokio::spawn(async move {
                 let delivered = node.connect_relayed(to.fingerprint()).await.is_ok()

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
+use threnody_core::prekey::{BundleBook, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, SecureChannel, now_ms};
@@ -20,6 +21,7 @@ use zeroize::Zeroizing;
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
+use crate::mailbox::MailboxStore;
 use crate::relay::RelayState;
 
 /// Who may hold a session with us (checked right after authentication).
@@ -99,6 +101,18 @@ pub enum Event {
         addr: SocketAddr,
         connected: bool,
     },
+    /// A sealed message from `from`, delivered by mailbox `via` (Appendix H).
+    OfflineMessage {
+        from: PublicIdentity,
+        via: PublicIdentity,
+        msg: AppMessage,
+    },
+    /// A mailbox reported what it did with our deposit for `to`.
+    DepositReceipt {
+        mailbox: PublicIdentity,
+        to: PublicIdentity,
+        status: crate::mailbox::DepositStatus,
+    },
     /// An automatic dial (e.g. after discovery) failed.
     DialFailed {
         peer: PublicIdentity,
@@ -143,6 +157,10 @@ pub(crate) struct Shared {
     /// WireGuard keys peers offered us, for clean removal on revocation.
     tunnel_peers: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
     pub(crate) relay: Mutex<RelayState>,
+    pub(crate) prekeys: Mutex<PrekeyStore>,
+    pub(crate) bundles: Mutex<BundleBook>,
+    pub(crate) mailbox: Mutex<MailboxStore>,
+    shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
 }
 
@@ -172,6 +190,25 @@ impl Shared {
         }
     }
 
+    fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
+        let r = bytes.and_then(|b| self.home.save_state(&self.identity, name, b.as_ref()));
+        if let Err(e) = r {
+            eprintln!("threnody: failed to save {name}: {e}");
+        }
+    }
+
+    pub(crate) fn persist_prekeys(&self, p: &PrekeyStore) {
+        self.save_state("prekeys", p.encode());
+    }
+
+    pub(crate) fn persist_bundles(&self, b: &BundleBook) {
+        self.save_state("bundles", b.encode());
+    }
+
+    pub(crate) fn persist_mailbox(&self, m: &MailboxStore) {
+        self.save_state("mailbox", m.encode());
+    }
+
     fn save_contacts(&self, c: &Contacts) {
         if let Err(e) = self.home.save_contacts(c) {
             eprintln!("threnody: failed to save contacts: {e}");
@@ -187,6 +224,19 @@ pub struct Node {
 impl Node {
     pub fn new(cfg: NodeConfig) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let contacts = cfg.home.load_contacts()?;
+        let now = now_ms();
+        let prekeys = match cfg.home.load_state(&cfg.identity, "prekeys")? {
+            Some(b) => PrekeyStore::decode(&b)?,
+            None => PrekeyStore::new(now),
+        };
+        let bundles = match cfg.home.load_state(&cfg.identity, "bundles")? {
+            Some(b) => BundleBook::decode(&b)?,
+            None => BundleBook::default(),
+        };
+        let mailbox = match cfg.home.load_state(&cfg.identity, "mailbox")? {
+            Some(b) => MailboxStore::decode(&b)?,
+            None => MailboxStore::default(),
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let tunnel = cfg
             .tunnel_port
@@ -202,6 +252,10 @@ impl Node {
             tunnel,
             tunnel_peers: Mutex::new(HashMap::new()),
             relay: Mutex::new(RelayState::default()),
+            prekeys: Mutex::new(prekeys),
+            bundles: Mutex::new(bundles),
+            mailbox: Mutex::new(mailbox),
+            shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
         };
         Ok((
@@ -248,8 +302,14 @@ impl Node {
         let local = listener.local_addr()?;
         let node = self.clone();
         tokio::spawn(async move {
+            let closed = node.closed();
+            tokio::pin!(closed);
             loop {
-                let Ok((stream, peer_addr)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    a = listener.accept() => a,
+                    () = &mut closed => break,
+                };
+                let Ok((stream, peer_addr)) = accepted else {
                     continue;
                 };
                 let node = node.clone();
@@ -294,6 +354,21 @@ impl Node {
         }
         self.spawn_session(stream, chan, peer_addr, true, Some(addr.to_owned()), None);
         Ok(peer)
+    }
+
+    /// Stops listening, discovery and every session. Persisted state
+    /// stays on disk; the node can be recreated from the same home.
+    pub fn shutdown(&self) {
+        self.shared.shutdown.send_replace(true);
+        lock(&self.shared.sessions).clear();
+    }
+
+    /// Resolves once [`Node::shutdown`] has been called.
+    pub(crate) fn closed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.shared.shutdown.subscribe();
+        async move {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
     }
 
     pub(crate) fn identity_ref(&self) -> &Identity {
@@ -514,6 +589,9 @@ where
 
     let mut offered = false;
     let mut discovery_keyed = false;
+    let mut prekeys_sent = false;
+    // Anything mailboxes held for this peer goes out first.
+    pending.extend(node.mailbox_for(&peer));
     let result: Result<()> = async {
         loop {
             // Refresh the pairwise LAN discovery key once per session.
@@ -525,6 +603,11 @@ where
                 }
                 shared.save_contacts(&contacts);
                 discovery_keyed = true;
+            }
+            // Hand a mutually approved peer fresh prekeys once per session.
+            if !prekeys_sent && shared.mutual(&peer) {
+                pending.extend(node.prekeys_for(&peer));
+                prekeys_sent = true;
             }
             // Offer a tunnel once per session, as soon as approval is mutual.
             // Tunnels need a direct UDP path, so never over relayed sessions.
@@ -572,6 +655,7 @@ where
                                     shared.tunnel_down(&peer);
                                     offered = false;
                                     discovery_keyed = false;
+                                    prekeys_sent = false;
                                     let mut contacts = lock(&shared.contacts);
                                     if let Some(c) = contacts.get_mut(&peer) {
                                         c.discovery_key = None;
@@ -593,6 +677,8 @@ where
                                 });
                             }
                         }
+                        AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
+                        AppMessage::Mailbox(payload) => node.on_mailbox(peer, &payload),
                         AppMessage::Relay(payload) => {
                             // Circuits only ride on direct links, never nest.
                             if via.is_none() {

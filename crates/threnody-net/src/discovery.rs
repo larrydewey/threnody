@@ -76,8 +76,13 @@ impl Node {
         let (node, tx, c) = (self.clone(), sock.clone(), cfg.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(c.interval);
+            let closed = node.closed();
+            tokio::pin!(closed);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    () = &mut closed => break,
+                }
                 let keys: Vec<[u8; 32]> = node
                     .contacts()
                     .iter()
@@ -98,8 +103,14 @@ impl Node {
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let mut last_dial: HashMap<PublicIdentity, Instant> = HashMap::new();
+            let closed = node.closed();
+            tokio::pin!(closed);
             loop {
-                let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                let received = tokio::select! {
+                    r = sock.recv_from(&mut buf) => r,
+                    () = &mut closed => break,
+                };
+                let Ok((n, src)) = received else {
                     continue;
                 };
                 let contacts = node.contacts();

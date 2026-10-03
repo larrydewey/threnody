@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, now_ms, safety_number};
+use threnody_net::mailbox::DepositStatus;
 use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -211,6 +212,44 @@ impl Ui {
         });
     }
 
+    /// Shows a message from `peer`; `via` marks mailbox (offline) delivery.
+    fn show_message(&mut self, peer: PublicIdentity, msg: AppMessage, via: Option<PublicIdentity>) {
+        let who = match via {
+            Some(v) => format!("{} (offline, via {})", self.name(&peer), self.name(&v)),
+            None => self.name(&peer),
+        };
+        match msg {
+            AppMessage::Text { body, .. } => println!("<{who}> {body}"),
+            AppMessage::File { name, data, .. } => {
+                match save_download(&self.downloads, &name, &data) {
+                    Ok(p) => println!(
+                        "* {who} sent {name} ({} bytes) -> {}",
+                        data.len(),
+                        p.display()
+                    ),
+                    Err(e) => println!("! could not save file from {who}: {e:#}"),
+                }
+            }
+            AppMessage::Group(payload) => {
+                let node = self.node.clone();
+                let name = |p: &PublicIdentity| name_of(&node, p);
+                self.groups.incoming(&self.node, &name, peer, &payload);
+            }
+            _ => {}
+        }
+    }
+
+    /// Seals `msg` for an absent contact and leaves it with mailboxes.
+    fn send_offline(&self, peer: PublicIdentity, msg: &AppMessage) -> Result<()> {
+        let who = self.name(&peer);
+        if !self.node.can_send_offline(&peer) {
+            bail!("{who} is not connected and has not given us prekeys yet; try /relay");
+        }
+        let n = self.node.send_offline(&peer, msg)?;
+        println!("* {who} is not connected; sealed message offered to {n} mailbox(es)");
+        Ok(())
+    }
+
     fn relay(&self, dest: Fingerprint) {
         let node = self.node.clone();
         let who = self
@@ -252,27 +291,20 @@ impl Ui {
                     println!("  messages now go to {who}");
                 }
             }
-            Event::Message { peer, msg } => {
-                let who = self.name(&peer);
-                match msg {
-                    AppMessage::Text { body, .. } => println!("<{who}> {body}"),
-                    AppMessage::File { name, data, .. } => {
-                        match save_download(&self.downloads, &name, &data) {
-                            Ok(p) => println!(
-                                "* {who} sent {} ({} bytes) -> {}",
-                                name,
-                                data.len(),
-                                p.display()
-                            ),
-                            Err(e) => println!("! could not save file from {who}: {e:#}"),
-                        }
-                    }
-                    AppMessage::Group(payload) => {
-                        let node = self.node.clone();
-                        let name = |p: &PublicIdentity| name_of(&node, p);
-                        self.groups.incoming(&self.node, &name, peer, &payload);
-                    }
-                    _ => {}
+            Event::Message { peer, msg } => self.show_message(peer, msg, None),
+            Event::OfflineMessage { from, via, msg } => self.show_message(from, msg, Some(via)),
+            Event::DepositReceipt {
+                mailbox,
+                to,
+                status,
+            } => {
+                let (m, t) = (self.name(&mailbox), self.name(&to));
+                match status {
+                    DepositStatus::Held => println!("* {m} is holding your message for {t}"),
+                    DepositStatus::Delivered => println!("* {m} delivered your message to {t}"),
+                    DepositStatus::Declined => println!(
+                        "! {m} declined to hold your message for {t} (it needs mutual approval with both of you)"
+                    ),
                 }
             }
             Event::ApprovalChanged {
@@ -292,10 +324,8 @@ impl Ui {
                 );
             }
             Event::Disconnected { peer, reason } => {
+                // Keep `current`: plain lines then go out as sealed messages.
                 println!("* {} disconnected ({reason})", self.name(&peer));
-                if self.current == Some(peer) {
-                    self.current = None;
-                }
             }
             Event::TunnelUp {
                 peer,
@@ -351,15 +381,13 @@ impl Ui {
             let peer = self
                 .current
                 .ok_or_else(|| anyhow!("no current peer; /connect or /to first"))?;
-            self.node
-                .send(
-                    &peer,
-                    AppMessage::Text {
-                        sent_ms: now_ms(),
-                        body: line.to_owned(),
-                    },
-                )
-                .map_err(|_| anyhow!("{} is not connected", self.name(&peer)))?;
+            let msg = AppMessage::Text {
+                sent_ms: now_ms(),
+                body: line.to_owned(),
+            };
+            if self.node.send(&peer, msg.clone()).is_err() {
+                self.send_offline(peer, &msg)?;
+            }
             return Ok(false);
         };
         let mut parts = cmd.splitn(2, ' ');
@@ -543,6 +571,8 @@ impl Ui {
                 format!("tcp ({} session(s))", sessions.len())
             }
         );
+        let held = self.node.held_messages();
+        println!("  mailbox      holding {held} sealed message(s) for others");
         match self.discovery {
             Some(a) => println!(
                 "  discovery    lan beacons on udp/{} (approved peers only)",

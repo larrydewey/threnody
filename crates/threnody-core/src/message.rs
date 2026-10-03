@@ -48,6 +48,10 @@ pub enum AppMessage {
     Group(Vec<u8>),
     /// An opaque relay-circuit message (see `threnody-net::relay`).
     Relay(Vec<u8>),
+    /// Our prekey bundle for the peer (`prekey::PrekeyBundle`, Appendix H).
+    Prekeys(Vec<u8>),
+    /// An opaque mailbox message (see `threnody-net::mailbox`).
+    Mailbox(Vec<u8>),
 }
 
 mod kind {
@@ -59,6 +63,8 @@ mod kind {
     pub const TUNNEL_OFFER: u64 = 5;
     pub const GROUP: u64 = 6;
     pub const RELAY: u64 = 7;
+    pub const PREKEYS: u64 = 8;
+    pub const MAILBOX: u64 = 9;
 }
 
 impl AppMessage {
@@ -99,6 +105,14 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::RELAY)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Prekeys(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::PREKEYS)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
+                Self::Mailbox(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::MAILBOX)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -112,7 +126,7 @@ impl AppMessage {
         match self {
             Self::Text { body, .. } => body.len() + 32,
             Self::File { name, data, .. } => name.len() + data.len() + 48,
-            Self::Group(p) | Self::Relay(p) => p.len() + 16,
+            Self::Group(p) | Self::Relay(p) | Self::Prekeys(p) | Self::Mailbox(p) => p.len() + 16,
             _ => 16,
         }
     }
@@ -157,15 +171,16 @@ impl AppMessage {
                     data,
                 }
             }
-            kind::GROUP | kind::RELAY => {
+            kind::GROUP | kind::RELAY | kind::PREKEYS | kind::MAILBOX => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
                     return Err(Error::Malformed("message too large"));
                 }
-                if k == Some(kind::GROUP) {
-                    Self::Group(p)
-                } else {
-                    Self::Relay(p)
+                match k {
+                    Some(kind::GROUP) => Self::Group(p),
+                    Some(kind::RELAY) => Self::Relay(p),
+                    Some(kind::PREKEYS) => Self::Prekeys(p),
+                    _ => Self::Mailbox(p),
                 }
             }
             kind::TUNNEL_OFFER => Self::TunnelOffer {
@@ -238,6 +253,8 @@ mod tests {
             },
             AppMessage::Group(vec![1, 2, 3]),
             AppMessage::Relay(vec![4, 5]),
+            AppMessage::Prekeys(vec![6]),
+            AppMessage::Mailbox(vec![7]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }
