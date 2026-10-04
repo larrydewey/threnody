@@ -350,58 +350,73 @@ pub async fn listen(node: &Node) -> Result<Listening> {
     Ok(Listening { psm, tasks })
 }
 
+/// How long one discovery run lasts before we restart it to hear
+/// everything again (well inside the 45 s dialing fallback).
+const RESCAN: Duration = Duration::from_secs(30);
+
 /// Scans continuously; dials approved contacts recognised from their
 /// beacons (the smaller key dials, as on the LAN).
 async fn auto_dial(node: &Node, adapter: &bluer::Adapter, uuid: bluer::Uuid) -> Result<()> {
+    // No duplicate reports: to deliver them, the kernel restarts the scan
+    // on its own every few seconds, and on a MediaTek controller a restart
+    // racing with this process exiting left the controller scanning
+    // behind the kernel's back, refusing every later scan (EBUSY) until
+    // power-cycled. Instead we restart discovery ourselves, which clears
+    // the controller's duplicate filter so contacts are heard again.
     adapter
         .set_discovery_filter(bluer::DiscoveryFilter {
             transport: bluer::DiscoveryTransport::Le,
-            duplicate_data: true,
+            duplicate_data: false,
             ..Default::default()
         })
         .await
         .ok();
-    let events = adapter.discover_devices_with_changes().await?;
-    let mut events = Box::pin(events);
-    // Devices are re-reported on every advert; look at each one at most
-    // every few seconds.
+    // Look at each device at most every few seconds.
     let mut last: HashMap<Address, std::time::Instant> = HashMap::new();
-    while let Some(ev) = events.next().await {
-        let AdapterEvent::DeviceAdded(addr) = ev else {
-            continue;
-        };
-        if last
-            .get(&addr)
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
-        {
-            continue;
-        }
-        let Ok(dev) = adapter.device(addr) else {
-            continue;
-        };
-        let Ok(Some(mut data)) = dev.service_data().await else {
-            continue;
-        };
-        let Some(adv) = data.remove(&uuid) else {
-            continue;
-        };
-        last.insert(addr, std::time::Instant::now());
-        let Some((peer, psm)) = node.ble_heard(&adv) else {
-            continue;
-        };
-        let f = Found {
-            addr,
-            addr_type: dev.address_type().await.unwrap_or(AddressType::LeRandom),
-            psm,
-            rssi: None,
-            name: None,
-        };
-        let node = node.clone();
-        tokio::spawn(async move {
-            if let Err(e) = connect(&node, &f, Some(peer.fingerprint())).await {
-                eprintln!("! Bluetooth auto-connect to {}: {e:#}", peer.fingerprint());
+    loop {
+        let events = adapter.discover_devices_with_changes().await?;
+        let mut events = Box::pin(events);
+        let until = tokio::time::Instant::now() + RESCAN;
+        while let Ok(Some(ev)) = tokio::time::timeout_at(until, events.next()).await {
+            let AdapterEvent::DeviceAdded(addr) = ev else {
+                continue;
+            };
+            if last
+                .get(&addr)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+            {
+                continue;
             }
-        });
+            let Ok(dev) = adapter.device(addr) else {
+                continue;
+            };
+            let Ok(Some(mut data)) = dev.service_data().await else {
+                continue;
+            };
+            let Some(adv) = data.remove(&uuid) else {
+                continue;
+            };
+            last.insert(addr, std::time::Instant::now());
+            let Some((peer, psm)) = node.ble_heard(&adv) else {
+                continue;
+            };
+            let f = Found {
+                addr,
+                addr_type: dev.address_type().await.unwrap_or(AddressType::LeRandom),
+                psm,
+                rssi: None,
+                name: None,
+            };
+            let node = node.clone();
+            tokio::spawn(async move {
+                if let Err(e) = connect(&node, &f, Some(peer.fingerprint())).await {
+                    eprintln!("! Bluetooth auto-connect to {}: {e:#}", peer.fingerprint());
+                }
+            });
+        }
+        // Dropping the stream stops discovery; BlueZ finishes that before
+        // the next start.
+        drop(events);
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Ok(())
 }
