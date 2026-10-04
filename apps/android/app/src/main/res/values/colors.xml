@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="background">#FFF7F7F9</color>
+    <color name="bar">#FFF7F7F9</color>
+    <color name="surface">#FFFFFFFF</color>
+    <color name="text">#FF1B1B1F</color>
+    <color name="muted">#FF6B6B76</color>
+    <color name="divider">#FFE3E3E8</color>
+    <color name="accent">#FF4A4FC4</color>
+    <color name="on_accent">#FFFFFFFF</color>
+    <color name="bubble_in">#FFE9E9EF</color>
+    <color name="bubble_out">#FF4A4FC4</color>
+    <color name="on_bubble_out">#FFFFFFFF</color>
+    <color name="online">#FF2E9E5B</color>
+    <color name="warning">#FFB4561A</color>
+</resources>

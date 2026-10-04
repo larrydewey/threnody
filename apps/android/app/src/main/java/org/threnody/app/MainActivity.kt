@@ -2,232 +2,414 @@ package org.threnody.app
 
 import android.Manifest
 import android.app.Activity
-import android.bluetooth.BluetoothDevice
-import android.content.Context
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.os.Bundle
-import android.text.method.ScrollingMovementMethod
+import android.text.InputType
+import android.text.format.DateUtils
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.PopupMenu
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.net.Inet4Address
 import java.util.concurrent.Executors
-import uniffi.threnody_ffi.NodeEvent
+import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.ThrenodyNode
+import uniffi.threnody_ffi.qrMatrix
 
-/**
- * The node lives for the whole process, not the Activity: rotating the
- * screen or backgrounding the app must not drop sessions. [ThrenodyService]
- * keeps the process alive; this object owns the node, the event pump, the
- * on-screen log and the Bluetooth listener.
- */
-object Threnody {
-    @Volatile private var instance: ThrenodyNode? = null
-    var listenAddr: String = ""
-        private set
-    @Volatile var current: String? = null
-    private val log = StringBuilder()
-    /** The visible Activity's log view, or null while backgrounded. */
-    @Volatile private var listener: ((String) -> Unit)? = null
-
-    @Synchronized
-    fun start(ctx: Context): ThrenodyNode = instance ?: ThrenodyNode.open(ctx.filesDir.resolve("threnody").path, null).also {
-        listenAddr = it.listen("0.0.0.0:7450")
-        instance = it
-        say("listening on $listenAddr")
-        pump(ctx.applicationContext, it)
-        if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
-    }
-
-    /** Attaches a log view; returns everything logged so far. */
-    fun watch(l: ((String) -> Unit)?): String = synchronized(log) {
-        listener = l
-        log.toString()
-    }
-
-    fun say(line: String) {
-        val l = synchronized(log) {
-            log.append(line).append('\n')
-            listener
-        }
-        l?.invoke(line)
-    }
-
-    private fun pump(ctx: Context, node: ThrenodyNode) = Thread {
-        while (true) {
-            when (val e = node.nextEvent(1000u)) {
-                null -> {}
-                is NodeEvent.Connected -> { current = current ?: e.peer; say("* connected ${short(e.peer)}") }
-                is NodeEvent.Disconnected -> say("* ${short(e.peer)} disconnected (${e.reason})")
-                is NodeEvent.Message -> {
-                    current = current ?: e.peer
-                    say("<${short(e.peer)}> ${e.text}")
-                    if (listener == null) ThrenodyService.notifyMessage(ctx, short(e.peer), e.text)
-                }
-                is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
-                is NodeEvent.File -> say("* ${short(e.peer)} sent ${e.name} (${e.data.size} bytes)")
-                is NodeEvent.WifiDirectOffer -> WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
-                is NodeEvent.WifiDirectRequested -> {
-                    say("* ${short(e.peer)} asks for a Wi-Fi Direct link")
-                    WifiDirect.host(ctx, node, e.peer)
-                }
-                else -> say("· $e")
-            }
-        }
-    }.apply { isDaemon = true; name = "threnody-events" }.start()
-
-    fun short(fp: String) = fp.take(9)
-}
-
-/** Minimal Threnody client: one node, a log, connect / send / approve. */
+/** The conversation list, plus invites, adding contacts and device linking. */
 class MainActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
-    private lateinit var node: ThrenodyNode
-    private lateinit var log: TextView
-    private var seen: List<Pair<BluetoothDevice, Int>> = emptyList()
-    private var current: String?
-        get() = Threnody.current
-        set(v) { Threnody.current = v }
+    private var node: ThrenodyNode? = null
+    private lateinit var list: LinearLayout
+    private lateinit var scroll: ScrollView
+    private var unsubscribe: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 96, 32, 32)
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val bar = TopBar(this, null).apply {
+            title.text = "Threnody"
+            action(R.drawable.ic_qr, "My invite") { showInvite() }
+            action(R.drawable.ic_add, "New conversation") { add(it) }
+            action(R.drawable.ic_more, "More") { more(it) }
         }
-        val header = TextView(this).apply { setTextIsSelectable(true); textSize = 13f }
-        val target = EditText(this).apply { hint = "threnody://… invite or host:port" }
-        val connect = Button(this).apply { text = "Connect" }
-        val message = EditText(this).apply { hint = "message"; maxLines = 4 }
-        val send = Button(this).apply { text = "Send" }
-        val approve = Button(this).apply { text = "Approve current peer" }
-        val bluetooth = Button(this).apply { text = "Start Bluetooth" }
-        val scan = Button(this).apply { text = "Scan Bluetooth" }
-        val direct = Button(this).apply { text = "Wi-Fi Direct with current peer" }
-        val leave = Button(this).apply { text = "Leave Wi-Fi Direct" }
-        log = TextView(this).apply {
-            movementMethod = ScrollingMovementMethod()
-            setTextIsSelectable(true)
-            textSize = 13f
+        list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll = ScrollView(this).apply {
+            isFillViewport = true
+            clipToPadding = false
+            addView(list, MATCH_PARENT, WRAP_CONTENT)
         }
-        for (v in listOf(header, target, connect, message, send, approve, bluetooth, scan, direct, leave)) {
-            root.addView(v, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        }
-        root.addView(log, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(bar, matchWrap)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
+        fitSystemBars(root, bar, scroll)
+
         ThrenodyService.start(this)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 3)
         }
-
         worker.execute {
             try {
                 node = Threnody.start(this)
-                val bound = Threnody.listenAddr
-                val ip = wifiIp() ?: "127.0.0.1"
-                val port = bound.substringAfterLast(':')
-                val invite = node.inviteLink("$ip:$port")
-                runOnUiThread {
-                    header.text = "device ${node.deviceFingerprint()}\n" +
-                        "account ${node.accountFingerprint()}\n" +
-                        "invite  $invite"
-                }
+                refresh()
             } catch (e: Exception) {
-                say("! start failed: ${e.message}")
+                runOnUiThread { failed("Couldn't start: ${e.message}") }
             }
         }
-
-        connect.setOnClickListener {
-            val t = target.text.toString().trim()
-            if (t.startsWith("ble ")) {
-                val n = t.removePrefix("ble ").trim().toIntOrNull()
-                val found = n?.let { seen.getOrNull(it - 1) }
-                    ?: return@setOnClickListener say("! no such Bluetooth device; scan first")
-                worker.execute { Bluetooth.dial(node, found.first, found.second, null) }
-                return@setOnClickListener
-            }
-            worker.execute {
-                try { current = node.connect(t); say("* connected to ${short(current!!)}") }
-                catch (e: Exception) { say("! connect: ${e.message}") }
-            }
-        }
-        send.setOnClickListener {
-            val text = message.text.toString()
-            message.setText("")
-            val peer = current ?: return@setOnClickListener say("! no peer yet")
-            worker.execute {
-                try { node.sendText(peer, text); say("<me> $text") }
-                catch (e: Exception) { say("! send: ${e.message}") }
-            }
-        }
-        scan.setOnClickListener {
-            if (Bluetooth.permitted(this)) scanBluetooth()
-            else requestPermissions(Bluetooth.permissions, 2)
-        }
-        bluetooth.setOnClickListener {
-            if (Bluetooth.permitted(this)) startBluetooth()
-            else requestPermissions(Bluetooth.permissions, 1)
-        }
-        direct.setOnClickListener {
-            val peer = current ?: return@setOnClickListener say("! no peer yet")
-            if (WifiDirect.permitted(this)) WifiDirect.host(applicationContext, node, peer)
-            else requestPermissions(arrayOf(WifiDirect.permission), 4)
-        }
-        leave.setOnClickListener { WifiDirect.leave(applicationContext) }
-        approve.setOnClickListener {
-            val peer = current ?: return@setOnClickListener say("! no peer yet")
-            worker.execute {
-                try { node.setApproval(peer, true); say("* approved ${short(peer)}") }
-                catch (e: Exception) { say("! approve: ${e.message}") }
-            }
-        }
+        if (savedInstanceState == null) handleLink(intent)
     }
 
-    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
-        super.onRequestPermissionsResult(code, perms, results)
-        if (code == 3 || code == 4) return
-        if (results.isEmpty() || results.any { it != PackageManager.PERMISSION_GRANTED }) {
-            say("! Bluetooth permission denied")
-        } else if (code == 2) scanBluetooth() else startBluetooth()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleLink(intent)
     }
-
-    private fun startBluetooth() {
-        if (Bluetooth.running) return say("* Bluetooth already on")
-        worker.execute { Bluetooth.start(applicationContext, node) }
-    }
-
-    private fun scanBluetooth() {
-        say("* scanning Bluetooth for 8s…")
-        Bluetooth.scanOnce(this, node) { found ->
-            seen = found
-            if (found.isEmpty()) say("* no Threnody devices nearby")
-            found.forEachIndexed { i, (d, psm) -> say("  ${i + 1}: ${d.address} psm $psm — connect with \"ble ${i + 1}\"") }
-        }
-    }
-
-    private fun wifiIp(): String? {
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return null
-        val props = cm.getLinkProperties(cm.activeNetwork) ?: return null
-        return props.linkAddresses.map { it.address }.firstOrNull { it is Inet4Address }?.hostAddress
-    }
-
-    private fun short(fp: String) = Threnody.short(fp)
-
-    private fun say(line: String) = Threnody.say(line)
 
     override fun onStart() {
         super.onStart()
-        val past = Threnody.watch { line -> runOnUiThread { log.append(line + "\n") } }
-        log.text = past
+        Threnody.visible++
+        unsubscribe = Threnody.subscribe { worker.execute { refresh() } }
+        worker.execute { refresh() }
     }
 
     override fun onStop() {
-        // Backgrounded: incoming messages become notifications instead.
-        Threnody.watch(null)
+        Threnody.visible--
+        unsubscribe?.invoke()
         super.onStop()
+    }
+
+    /** One line in the list: a contact, a group, or an invitation to one. */
+    private data class Row(
+        val title: String,
+        val avatarKey: String,
+        val preview: String,
+        val atMs: Long,
+        /** Null for groups, which have no single connection. */
+        val connected: Boolean?,
+        val open: () -> Unit,
+    )
+
+    /** Reloads the list (on the worker thread). */
+    private fun refresh() {
+        val n = node ?: return
+        val contacts = Threnody.conversations(n).map { c ->
+            val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
+            Row(c.title, c.key, last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
+                last?.atMs?.toLong() ?: 0, c.connected) { openChat(c.key, c.device) }
+        }
+        val groups = n.groups().map { g ->
+            val last = try { n.groupHistory(g.id, 1u).lastOrNull() } catch (_: Exception) { null }
+            val who = last?.let { if (it.outgoing) "You" else Threnody.nameOf(n, it.device) }
+            Row(g.name, g.id, last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
+                last?.atMs?.toLong() ?: 0, null) { openGroup(g.id) }
+        }
+        // Invitations go first: they wait on the user.
+        val invites = n.groupInvites().map { i ->
+            Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null) { openGroup(i.group) }
+        }
+        val rows = invites + (contacts + groups).sortedByDescending { it.atMs }
+        runOnUiThread { show(rows) }
+    }
+
+    private fun preview(e: HistoryEntry) = e.file?.let { "📎 ${it.name}" } ?: e.text
+
+    private fun show(rows: List<Row>) {
+        list.removeAllViews()
+        if (rows.isEmpty()) return empty()
+        for (r in rows) list.addView(row(r))
+    }
+
+    private fun row(r: Row): View {
+        val avatar = Avatar(this, 44).apply { show(r.title, r.avatarKey) }
+        val title = label(r.title, 16f).apply { isSingleLine = true }
+        val preview = label(r.preview, 14f, if (r.atMs == Long.MAX_VALUE) R.color.accent else R.color.muted)
+            .apply { isSingleLine = true }
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(title)
+            addView(preview)
+        }
+        val time = label(if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else "", 12f, R.color.muted)
+            .apply { isSingleLine = true }
+        val side = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+            addView(time, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            if (r.connected != null) {
+                val dot = View(this@MainActivity).apply {
+                    background = rounded(color(if (r.connected) R.color.online else R.color.divider), dp(5).toFloat())
+                    contentDescription = if (r.connected) "connected" else "not connected"
+                }
+                addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply { topMargin = dp(8); gravity = Gravity.END })
+            }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            minimumHeight = dp(72)
+            background = getDrawable(android.R.drawable.list_selector_background)
+            addView(avatar)
+            addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(14); marginEnd = dp(8) })
+            addView(side)
+            setOnClickListener { r.open() }
+        }
+    }
+
+    private fun add(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add("Add a contact").setOnMenuItemClickListener { addContact(null); true }
+            menu.add("New group").setOnMenuItemClickListener { newGroup(); true }
+            show()
+        }
+    }
+
+    private fun newGroup() {
+        val field = input("Group name", null).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+        }
+        AlertDialog.Builder(this)
+            .setTitle("New group")
+            .setMessage("You'll own the group: only you can add and remove members. Everyone in it sees who else is.")
+            .setView(padded(field))
+            .setPositiveButton("Create") { _, _ ->
+                val name = field.text.toString().trim()
+                val n = node ?: return@setPositiveButton
+                if (name.isEmpty()) return@setPositiveButton
+                worker.execute {
+                    try {
+                        val id = n.createGroup(name)
+                        runOnUiThread { openGroup(id) }
+                    } catch (e: Exception) {
+                        runOnUiThread { failed("Couldn't create the group: ${e.message}") }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun openGroup(id: String) {
+        startActivity(Intent(this, ChatActivity::class.java).putExtra(ChatActivity.GROUP, id))
+    }
+
+    private fun status(c: Conversation) = when {
+        c.approved && c.verified -> "Approved · verified"
+        c.approved -> "Approved"
+        else -> "Not approved yet"
+    }
+
+    private fun ago(ms: Long): String = when {
+        System.currentTimeMillis() - ms < DateUtils.MINUTE_IN_MILLIS -> "now"
+        DateUtils.isToday(ms) -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_TIME)
+        else -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_ABBREV_MONTH)
+    }
+
+    private fun empty() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(32), dp(48), dp(32), dp(48))
+        }
+        box.addView(label("No contacts yet", 20f).apply { gravity = Gravity.CENTER }, matchWrap)
+        box.addView(label(
+            "Show your invite to someone nearby, or paste theirs. " +
+                "Scanning a Threnody QR code with your camera opens it here.",
+            15f, R.color.muted,
+        ).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, dp(24)) }, matchWrap)
+        box.addView(primary("Show my invite") { showInvite() }, matchWrap)
+        box.addView(secondary("Add a contact") { addContact(null) }, matchWrap.apply { topMargin = dp(8) })
+        list.addView(box, LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+    }
+
+    private fun primary(text: String, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setTextColor(color(R.color.on_accent))
+        background = rounded(color(R.color.accent), dp(24).toFloat())
+        minHeight = dp(48)
+        setOnClickListener { onClick() }
+    }
+
+    private fun secondary(text: String, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setTextColor(color(R.color.accent))
+        background = getDrawable(android.R.drawable.list_selector_background)
+        minHeight = dp(48)
+        setOnClickListener { onClick() }
+    }
+
+    private fun more(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
+            menu.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
+            menu.add("Diagnostics").setOnMenuItemClickListener {
+                startActivity(Intent(this@MainActivity, LogActivity::class.java)); true
+            }
+            show()
+        }
+    }
+
+    private fun openChat(key: String, device: String) {
+        startActivity(Intent(this, ChatActivity::class.java)
+            .putExtra(ChatActivity.KEY, key)
+            .putExtra(ChatActivity.DEVICE, device))
+    }
+
+    /** The address others should dial: our Wi-Fi (or other) IPv4 address. */
+    private fun ourAddr(): String? {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+        val props = cm.getLinkProperties(cm.activeNetwork) ?: return null
+        val ip = props.linkAddresses.map { it.address }.firstOrNull { it is Inet4Address }?.hostAddress ?: return null
+        return "$ip:${Threnody.listenAddr.substringAfterLast(':')}"
+    }
+
+    private fun showInvite() {
+        val n = node ?: return
+        val addr = ourAddr() ?: return failed("No network: connect to Wi-Fi to make an invite.")
+        val link = n.inviteLink(addr)
+        showCode(
+            "Your invite",
+            "Let the other person scan this, or send them the link. " +
+                "Anyone with it can contact this device.",
+            link,
+            "Device ${n.deviceFingerprint()}",
+        )
+    }
+
+    private fun linkDevice() {
+        val n = node ?: return
+        val addr = ourAddr() ?: return failed("No network: both devices need to be on the same network.")
+        showCode(
+            "Link a new device",
+            "On the new device, choose “Join another device's account” and scan or paste this. " +
+                "It works once. Only show it to your own devices.",
+            n.createLinkCode(addr),
+            "Account ${n.accountFingerprint()}",
+        )
+    }
+
+    /** A dialog showing [code] as a QR code, with copy and share. */
+    private fun showCode(title: String, help: String, code: String, footer: String) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+        }
+        box.addView(label(help, 14f, R.color.muted), matchWrap)
+        try {
+            box.addView(QrView(this, qrMatrix(code)), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+                topMargin = dp(16); bottomMargin = dp(16)
+            })
+        } catch (_: Exception) {}
+        box.addView(label(code, 12f, R.color.muted).apply { setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }, matchWrap)
+        box.addView(label(footer, 12f, R.color.muted).apply { setTextIsSelectable(true); setPadding(0, dp(8), 0, 0) }, matchWrap)
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Share") { _, _ ->
+                startActivity(Intent.createChooser(
+                    Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, code), title))
+            }
+            .setNeutralButton("Copy") { _, _ ->
+                getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText(title, code))
+                Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Done", null)
+            .show()
+    }
+
+    private fun input(hint: String, value: String?) = EditText(this).apply {
+        this.hint = hint
+        setText(value ?: "")
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        isSingleLine = true
+    }
+
+    private fun padded(v: View) = LinearLayout(this).apply {
+        setPadding(dp(24), dp(8), dp(24), 0)
+        addView(v, matchWrap)
+    }
+
+    private fun addContact(prefill: String?) {
+        val field = input("threnody://… or host:port", prefill)
+        AlertDialog.Builder(this)
+            .setTitle("Add a contact")
+            .setMessage("Paste their invite link. You'll check their safety number together later.")
+            .setView(padded(field))
+            .setPositiveButton("Connect") { _, _ -> connect(field.text.toString().trim()) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun connect(target: String) {
+        if (target.isEmpty()) return
+        val n = node ?: return
+        Toast.makeText(this, "Connecting…", Toast.LENGTH_SHORT).show()
+        worker.execute {
+            try {
+                val peer = n.connect(target)
+                val key = Threnody.key(n.contacts(), peer)
+                runOnUiThread { openChat(key, peer) }
+            } catch (e: Exception) {
+                runOnUiThread { failed("Couldn't connect: ${e.message}") }
+            }
+        }
+    }
+
+    private fun joinAccount(prefill: String?) {
+        val field = input("threnody-link://…", prefill)
+        AlertDialog.Builder(this)
+            .setTitle("Join another device's account")
+            .setMessage("This device becomes part of that account: your contacts see both as you. " +
+                "Get the code from “Link a new device” on the other device.")
+            .setView(padded(field))
+            .setPositiveButton("Join") { _, _ ->
+                val code = field.text.toString().trim()
+                val n = node ?: return@setPositiveButton
+                worker.execute {
+                    try {
+                        val account = n.linkWith(code)
+                        runOnUiThread { Toast.makeText(this, "Joined account ${Threnody.short(account)}", Toast.LENGTH_LONG).show() }
+                        refresh()
+                    } catch (e: Exception) {
+                        runOnUiThread { failed("Couldn't join: ${e.message}") }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** `threnody://` invites and `threnody-link://` codes, from a QR scan or a tapped link. */
+    private fun handleLink(intent: Intent?) {
+        val uri = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString ?: return
+        // Handle each link once, not again after rotation.
+        intent.action = null
+        when {
+            uri.startsWith("threnody://") -> addContact(uri)
+            uri.startsWith("threnody-link://") -> joinAccount(uri)
+        }
+    }
+
+    private fun failed(msg: String) {
+        AlertDialog.Builder(this).setMessage(msg).setPositiveButton("OK", null).show()
+    }
+
+    override fun onDestroy() {
+        worker.shutdown()
+        super.onDestroy()
     }
 }

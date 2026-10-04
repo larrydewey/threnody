@@ -89,7 +89,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message) |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
-| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history (sync between devices and backups not yet) |
+| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers (sync between devices and backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |
@@ -104,7 +104,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.
-6. **Mobile (remaining).** A sample Android app is in [`apps/android`](apps/android) and has been tested on a Pixel 8a. It keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
+6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
 
 ## Development
 

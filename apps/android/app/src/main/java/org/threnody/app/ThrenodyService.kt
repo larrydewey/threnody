@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.app.TaskStackBuilder
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -47,21 +48,45 @@ class ThrenodyService : Service() {
             ctx.startForegroundService(Intent(ctx, ThrenodyService::class.java))
         }
 
-        /** Shows an incoming message while no Activity is in front. */
-        fun notifyMessage(ctx: Context, from: String, text: String) {
+        /** Shows an incoming message while its chat isn't on screen. */
+        fun notifyMessage(ctx: Context, key: String, device: String, from: String, text: String) {
+            val open = Intent(ctx, ChatActivity::class.java)
+                .putExtra(ChatActivity.KEY, key)
+                .putExtra(ChatActivity.DEVICE, device)
+            post(ctx, key, from, text, open)
+        }
+
+        /** One notification per conversation [key], opening [open] above the list. */
+        private fun post(ctx: Context, key: String, title: String, text: String, open: Intent) {
             channels(ctx)
             val n = Notification.Builder(ctx, CHANNEL_MESSAGES)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
-                .setContentTitle(from)
+                .setContentTitle(title)
                 .setContentText(text)
-                .setContentIntent(openApp(ctx))
+                .setContentIntent(
+                    // Back from the chat leads to the conversation list.
+                    TaskStackBuilder.create(ctx)
+                        .addNextIntent(Intent(ctx, MainActivity::class.java))
+                        .addNextIntent(open)
+                        .getPendingIntent(key.hashCode(), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT),
+                )
                 .setAutoCancel(true)
                 .build()
             try {
-                ctx.getSystemService(NotificationManager::class.java)?.notify(ID_MESSAGE, n)
+                ctx.getSystemService(NotificationManager::class.java)?.notify(key, ID_MESSAGE, n)
             } catch (_: SecurityException) {
                 // Notifications not permitted; the message is still in history.
             }
+        }
+
+        /** A group message or invitation; opens the group. */
+        fun notifyGroup(ctx: Context, group: String, title: String, text: String) {
+            val open = Intent(ctx, ChatActivity::class.java).putExtra(ChatActivity.GROUP, group)
+            post(ctx, group, title, text, open)
+        }
+
+        fun clearNotification(ctx: Context, key: String) {
+            ctx.getSystemService(NotificationManager::class.java)?.cancel(key, ID_MESSAGE)
         }
 
         private fun channels(ctx: Context) {
