@@ -6,8 +6,9 @@ This directory has two Tamarin models:
 - `ratchet.spthy` models the KEM double ratchet ([Appendix B](../docs/appendix-b-ratchet.md)).
 - `sealed.spthy` models sealed messages and prekeys for offline delivery ([Appendix H](../docs/appendix-h-offline.md)).
 - `onion.spthy` models the onion hop handshake ([Appendix I](../docs/appendix-i-onion.md)).
+- `devices.spthy` models device linking and account chains ([Appendix J](../docs/appendix-j-devices.md)).
 
-Every lemma verifies automatically in about 2.5 minutes:
+Every lemma verifies automatically, in a few minutes in total:
 
 ```sh
 proofs/check.sh   # fails unless every lemma in every model verifies
@@ -84,6 +85,17 @@ That last restriction is what makes the secrecy lemmas forward-secrecy statement
 | `sanity_*` | An early identity-key leak really does allow impersonation. |
 
 Client anonymity holds by construction: the client sends only a fresh ephemeral key and signs nothing. A formal proof would need observational equivalence, which isn't modelled.
+
+## Devices
+
+| Lemma | Property |
+|---|---|
+| `only_code_holder_is_linked` | A device is linked only if it received the out-of-band link code. Proofs are bound to the session and the device, so a code captured off the network is useless. |
+| `honest_signer_authorized_and_linked` | When an honest member signs an add, it authorised exactly that add, after linking that very device. |
+| `honest_devices_consent` | An honest device is never put into an account without its own signature. |
+| `*_executable`, `sanity_*` | Both protocols can complete, and a leaked code or a compromised member really does let an intruder in. |
+
+These lemmas are stated per add, so the prover never has to unroll the chain. Applied link by link from the genesis link, they give the global property: with no compromised device and no leaked code, every member of an account is an honest device that an existing member linked.
 
 ## Abstractions and limits
 

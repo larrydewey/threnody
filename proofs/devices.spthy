@@ -1,0 +1,136 @@
+theory Threnody_Devices
+begin
+
+/*
+ * Symbolic model of Threnody v1 device linking and account chains
+ * (docs/appendix-j-devices.md).
+ *
+ * Part 1, linking: an existing device E shows a code (its key pinned
+ * plus a secret s) over an out-of-band channel; the new device proves
+ * knowledge of s bound to the session id and its own key. Sessions are
+ * abstracted: E learns the authenticated peer key of each session; the
+ * attacker may open sessions with any key it holds, and sees session ids.
+ *
+ * Part 2, chain authority: an add is accepted only with a signature by a
+ * current member and by the new device. Devices may be compromised.
+ */
+
+builtins: hashing, signing
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction Inequality:
+  "All x #i. Neq(x, x) @ #i ==> F"
+
+// ---------------------------------------------------------------- devices
+rule Device:
+  [ Fr(~k) ] --[ Device(pk(~k)) ]-> [ !Dev(pk(~k), ~k), Out(pk(~k)) ]
+
+rule Compromise_Device:
+  [ !Dev(p, k) ] --[ Compromised(p) ]-> [ Out(k) ]
+
+// ------------------------------------------------------- part 1: linking
+// E creates a link code; it travels over a secure out-of-band channel.
+rule Make_Code:
+  [ !Dev(pE, kE), Fr(~s) ] --[ MakeCode(pE, ~s) ]-> [ !ECode(pE, ~s), OOB(pE, ~s) ]
+
+rule Leak_Code:
+  [ !ECode(pE, s) ] --[ LeakCode(s) ]-> [ Out(s) ]
+
+// The new device N receives the code out of band.
+rule Receive_Code:
+  [ OOB(pE, s), !Dev(pN, kN) ]
+  --[ GotCode(pN, s), Neq(pN, pE) ]->      // a device never links itself
+  [ HasCode(pN, pE, s) ]
+
+// An authenticated session between N and E (E learns N's key).
+rule Honest_Session:
+  [ HasCode(pN, pE, s), Fr(~sid) ]
+  --[ Session(pE, ~sid, pN) ]->
+  [ ESession(pE, ~sid, pN), NSession(pN, s, ~sid), Out(~sid) ]
+
+// The attacker opens sessions to E with any key it holds.
+rule Attacker_Session:
+  [ !Dev(pE, kE), In(k), Fr(~sid) ]
+  --[ Session(pE, ~sid, pk(k)), AttackerSession() ]->
+  [ ESession(pE, ~sid, pk(k)), Out(~sid) ]
+
+rule Link_Request:
+  [ NSession(pN, s, sid) ] --> [ Out(<sid, h(<'link proof', s, sid, pN>)>) ]
+
+rule Link_Accept:
+  [ ESession(pE, sid, pX), !ECode(pE, s), In(<sid, h(<'link proof', s, sid, pX>)>) ]
+  --[ Linked(pE, pX, s) ]->
+  [ LinkedDev(pE, pX) ]
+
+lemma linking_executable:
+  exists-trace
+  "Ex e n s #i. Linked(e, n, s) @ #i
+    & not (Ex x #r. LeakCode(x) @ #r) & not (Ex d #c. Compromised(d) @ #c)"
+
+// Only the device that received the code gets linked.
+lemma only_code_holder_is_linked:
+  "All e x s #i. Linked(e, x, s) @ #i ==>
+      (Ex #j. GotCode(x, s) @ #j) | (Ex #r. LeakCode(s) @ #r)"
+
+lemma sanity_leaked_code_links_attacker:
+  exists-trace
+  "Ex e x s #i #r. Linked(e, x, s) @ #i & LeakCode(s) @ #r
+    & not (Ex #j. GotCode(x, s) @ #j)"
+
+// ------------------------------------------------ part 2: chain authority
+rule Genesis:
+  [ !Dev(p, k), Fr(~acct) ]
+  --[ Genesis(~acct, p) ]->
+  [ !Member(~acct, p), Out(<~acct, sign(<'genesis', ~acct, p>, k)>) ]
+
+// An honest member authorises adding exactly a device it has linked.
+rule Authorize_Add:
+  [ !Member(acct, pM), !Dev(pM, kM), LinkedDev(pM, pNew) ]
+  --[ Authorized(acct, pNew, pM) ]->
+  [ Out(sign(<'add', acct, pNew>, kM)) ]
+
+// The new device consents by signing the same statement.
+rule Consent_Add:
+  [ !Dev(pNew, kNew), In(acct) ]
+  --[ Consented(acct, pNew) ]->
+  [ Out(sign(<'add', acct, pNew>, kNew)) ]
+
+// Any verifier applies a link that carries both signatures.
+rule Apply_Add:
+  [ !Member(acct, pM), In(<pNew, sM, sN>) ]
+  --[ Eq(verify(sM, <'add', acct, pNew>, pM), true),
+      Eq(verify(sN, <'add', acct, pNew>, pNew), true),
+      Neq(pNew, pM),                       // a member cannot (re-)add itself
+      MemberAdded(acct, pNew, pM) ]->
+  [ !Member(acct, pNew) ]
+
+lemma chain_executable:
+  exists-trace
+  "Ex a p q #i. MemberAdded(a, p, q) @ #i & not (Ex d #c. Compromised(d) @ #c)
+    & not (Ex s #r. LeakCode(s) @ #r) & not (Ex #x. AttackerSession() @ #x)"
+
+// Per-add statements (no recursion over the chain, so they terminate).
+// Applied link by link from genesis they give the global property: with
+// no compromised device and no leaked code, every member is an honest
+// device that an existing member linked and authorised.
+
+// An honest signing member authorised exactly this add, and only after
+// linking that very device through the code protocol.
+lemma honest_signer_authorized_and_linked:
+  "All a p q #i #d. MemberAdded(a, p, q) @ #i & Device(q) @ #d ==>
+      ((Ex #j. Authorized(a, p, q) @ #j) & (Ex s #l. Linked(q, p, s) @ #l))
+    | (Ex #c. Compromised(q) @ #c)"
+
+// An honest device is never put into an account without its consent.
+lemma honest_devices_consent:
+  "All a p q #i #d. MemberAdded(a, p, q) @ #i & Device(p) @ #d ==>
+      (Ex #j. Consented(a, p) @ #j) | (Ex #c. Compromised(p) @ #c)"
+
+lemma sanity_compromised_member_adds_intruder:
+  exists-trace
+  "Ex a p q #i #c. MemberAdded(a, p, q) @ #i & Compromised(q) @ #c
+    & not (Ex #j. Authorized(a, p, q) @ #j)"
+
+end
