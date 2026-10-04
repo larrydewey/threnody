@@ -51,6 +51,7 @@ class ChatActivity : Activity() {
     /** Messages being sent, shown until history has them. */
     private val pending = mutableListOf<String>()
     private var unsubscribe: (() -> Unit)? = null
+    private var myDevice = ""
 
     /** A history entry, or a message still being sent. */
     private data class Item(val entry: HistoryEntry, val sending: Boolean = false)
@@ -149,6 +150,7 @@ class ChatActivity : Activity() {
 
     /** Whether an event is about this conversation (cheap check, then by account). */
     private fun concerns(e: NodeEvent): Boolean {
+        if (e is NodeEvent.HistorySynced) return true
         group?.let { g ->
             return when (e) {
                 is NodeEvent.GroupMessage -> e.group == g
@@ -193,6 +195,7 @@ class ChatActivity : Activity() {
             history = try { node.history(device, 200u) } catch (_: Exception) { emptyList() }
         }
         val me = node.deviceFingerprint()
+        myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
             pending.map { Item(HistoryEntry(ULong.MAX_VALUE, true, me, it, false, null, false, 0u, 0u), sending = true) }
         }
@@ -341,8 +344,11 @@ class ChatActivity : Activity() {
         }
         // One tick once sent, two once delivered: to a device of the
         // contact, or to every member of a group (with a count until then).
+        // Sent from another of our devices: that device sees its ticks.
+        val elsewhere = outgoing && !item.sending && e.device != myDevice
         val tick = when {
             !outgoing || item.sending -> ""
+            elsewhere -> " · from your other device"
             e.delivered -> " ✓✓"
             group != null && e.deliveredTo > 0u -> " ✓ ${e.deliveredTo}/${e.recipients}"
             else -> " ✓"
@@ -466,6 +472,7 @@ class ChatActivity : Activity() {
             // One row per account: a contact's devices are invited and removed together.
             val contacts = node.contacts()
             val me = node.deviceFingerprint()
+        myDevice = me
             val rows = g.members.groupBy { fp -> if (fp == me) me else Threnody.key(contacts, fp) }
                 .map { (_, devices) -> devices.first() }
             val labels = rows.map { fp ->

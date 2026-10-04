@@ -53,7 +53,7 @@ Type a line to send it to the current peer. Commands:
   /drop [peer]                          close a session
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
-  /devices   /device add   /device remove <name>   your account's devices
+  /devices   /device add [host:port]   /device remove <name>   your account's devices
   /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
   /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
   /history [peer] [n]                   recent messages (stored encrypted)
@@ -505,6 +505,12 @@ impl Ui {
                 .relayed(&self.node, &peer, &group, local_id, &origin),
             // Shown as ✓✓ in /history; too chatty to print live.
             Event::Delivered { .. } => {}
+            Event::HistorySynced { from, added } => {
+                println!(
+                    "* {added} message(s) synced from your device {}",
+                    self.name(&from)
+                );
+            }
             Event::DepositReceipt {
                 mailbox,
                 to,
@@ -818,11 +824,18 @@ impl Ui {
             "device" => {
                 let a = arg.unwrap_or("");
                 match a.split_once(' ').map_or((a, ""), |(x, y)| (x, y.trim())) {
-                    ("add", _) => {
-                        let addr = self.listen_addr.ok_or_else(|| {
+                    ("add", given) => {
+                        let listen = self.listen_addr.ok_or_else(|| {
                             anyhow!("run with --listen so the new device can reach this one")
                         })?;
-                        let code = self.node.create_link_code(addr.to_string());
+                        // The code carries an address the new device dials:
+                        // the one given, else ours on the LAN.
+                        let addr = if given.is_empty() {
+                            reachable(listen).to_string()
+                        } else {
+                            given.to_owned()
+                        };
+                        let code = self.node.create_link_code(addr);
                         println!("  On the new device run:\n\n    threnody link '{code}'\n");
                         if let Ok(qr) = qrcode::QrCode::new(code.to_string().as_bytes()) {
                             let art = qr
@@ -856,7 +869,9 @@ impl Ui {
                         self.node.remove_device(&target)?;
                         println!("* removed {} from your account", target.fingerprint());
                     }
-                    _ => bail!("usage: /device add | /device remove <name|fingerprint>"),
+                    _ => {
+                        bail!("usage: /device add [host:port] | /device remove <name|fingerprint>")
+                    }
                 }
             }
             "onion" => {
@@ -1127,6 +1142,23 @@ fn human_secs(s: u32) -> String {
 }
 
 /// `HH:MM` (UTC) for a Unix-ms time.
+/// An address other devices can dial for `listen`: if it is a wildcard
+/// (0.0.0.0 / ::), this machine's address on the network its default route
+/// uses (found without sending anything).
+fn reachable(listen: std::net::SocketAddr) -> std::net::SocketAddr {
+    if !listen.ip().is_unspecified() {
+        return listen;
+    }
+    let probe = if listen.is_ipv4() {
+        "192.0.2.1:9"
+    } else {
+        "[2001:db8::1]:9"
+    };
+    std::net::UdpSocket::bind(std::net::SocketAddr::new(listen.ip(), 0))
+        .and_then(|s| s.connect(probe).and_then(|()| s.local_addr()))
+        .map_or(listen, |a| std::net::SocketAddr::new(a.ip(), listen.port()))
+}
+
 /// `HH:MM` in local time, with the date if it isn't today.
 fn clock(ms: u64) -> String {
     let tz = jiff::tz::TimeZone::system();
@@ -1145,6 +1177,17 @@ fn clock(ms: u64) -> String {
 #[cfg(test)]
 mod duration_tests {
     use super::*;
+
+    #[test]
+    fn link_codes_get_a_dialable_address() {
+        let any: std::net::SocketAddr = "0.0.0.0:7450".parse().unwrap();
+        let r = reachable(any);
+        assert_eq!(r.port(), 7450);
+        // Without any network the wildcard comes back unchanged.
+        assert!(!r.ip().is_unspecified() || r == any);
+        let lo: std::net::SocketAddr = "127.0.0.1:7450".parse().unwrap();
+        assert_eq!(reachable(lo), lo);
+    }
 
     #[test]
     fn durations_parse_and_print() {

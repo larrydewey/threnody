@@ -102,7 +102,17 @@ impl GroupUi {
                 Update::Left { group } => {
                     println!("* you were removed from group #{}", short(&group));
                 }
-                Update::Text { group, from, text } => {
+                Update::Text {
+                    group,
+                    from,
+                    text,
+                    ours: true,
+                } => {
+                    println!("[{}] <me, on {}> {text}", self.label(&group), name(&from));
+                }
+                Update::Text {
+                    group, from, text, ..
+                } => {
                     println!("[{}] <{}> {text}", self.label(&group), name(&from));
                 }
             }

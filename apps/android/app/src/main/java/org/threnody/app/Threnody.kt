@@ -175,7 +175,8 @@ object Threnody {
                 }
                 is NodeEvent.GroupMessage -> {
                     say("[${e.group.take(6)}] <${short(e.from)}> ${e.text}")
-                    if (visible == 0 || e.group !in visibleChat) {
+                    // Our own other device's messages aren't news.
+                    if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}")
                     }

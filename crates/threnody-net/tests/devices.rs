@@ -215,3 +215,65 @@ async fn contacts_can_seal_to_a_sibling_they_never_met() {
     assert_eq!((from, msg), (bob.node.identity(), text));
     let _ = (&mut laptop.rx, &mut phone.rx);
 }
+
+fn texts(n: &Node, peer: &threnody_core::PublicIdentity) -> Vec<(bool, String)> {
+    n.history(n.conversation_for(peer))
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|e| (e.outgoing, e.text.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn history_follows_us_across_our_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let bid = bob.node.identity();
+    laptop
+        .node
+        .send_text(&bid, "before the phone existed")
+        .unwrap();
+    next(&mut bob.rx, |e| matches!(e, Event::Message { .. })).await;
+    wait_for(|| laptop.node.unacked(&bid) == 0).await;
+
+    // A newly linked device gets the history so far.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    wait_for(|| texts(&phone.node, &bid) == [(true, "before the phone existed".into())]).await;
+
+    // New messages from either device reach the other.
+    laptop.node.send_text(&bid, "from the laptop").unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    // Bob may not have met the phone; it reaches him sealed or relayed.
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    phone.node.send_text(&bid, "from the phone").unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let want = |extra: &[(bool, &str)]| {
+        let mut v: Vec<(bool, String)> = vec![
+            (true, "before the phone existed".into()),
+            (true, "from the laptop".into()),
+            (true, "from the phone".into()),
+        ];
+        v.extend(extra.iter().map(|(o, t)| (*o, (*t).to_owned())));
+        v
+    };
+    wait_for(|| texts(&laptop.node, &bid) == want(&[])).await;
+    wait_for(|| texts(&phone.node, &bid) == want(&[])).await;
+
+    // Bob's reply reaches both devices directly; nothing is doubled.
+    bob.node
+        .send_text(&laptop.node.identity(), "hi both")
+        .unwrap();
+    wait_for(|| texts(&laptop.node, &bid) == want(&[(false, "hi both")])).await;
+    wait_for(|| texts(&phone.node, &bid) == want(&[(false, "hi both")])).await;
+
+    // Nothing arrives twice later on.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(texts(&phone.node, &bid).len(), 4);
+    assert_eq!(texts(&laptop.node, &bid).len(), 4);
+}

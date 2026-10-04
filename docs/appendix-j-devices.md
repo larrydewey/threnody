@@ -64,7 +64,22 @@ existing device E                                  new device N
 
 - Devices in the same account approve each other automatically.
 - They exchange `ContactSync` snapshots at the start of each session and after changes. Approval and verification flags merge last-writer-wins on `approval_changed_ms`, and petnames and addresses fill in where missing.
-- Message history isn't synced in v1.
+- They share message history (below).
+
+## History
+
+Contacts send to every device of an account, so each device receives incoming messages itself. What a device *sends*, its siblings would never see. So devices exchange `Transcript` account messages (`{ 0 => 8, 1 => conversation, 2 => history }`). `conversation` is `0 ‖ account or device id (32)` for a 1:1 chat (`1 ‖ group id` is reserved), and `history` uses the history encoding (Appendix C, *Local storage*) for some of that conversation's entries.
+
+- **Live.** An outgoing 1:1 entry goes at once to every connected sibling.
+- **Catching up.** When a session with a sibling starts, a device sends its outgoing entries newer than what that sibling last had from it. Each device keeps that position per sibling, encrypted (`history-sync`).
+- **New devices.** The first time, a device sends all of its 1:1 history, so a newly linked device starts complete. Linking triggers this right away, without waiting for a new session.
+- **Merging.** Receivers merge entries that aren't already present, and accept transcripts only from devices of their own account. Outgoing entries match by local id. Incoming ones match by sender and content within ten minutes, because each device stamps its own receipt time.
+- **Reliability.** Transcripts are sent tracked (Appendix C, *Acknowledgements*), so one lost with a dying session is resent.
+- **Files.** A file entry travels without its location; the contents stay on the device that has them.
+- **Groups.** Group history is not transcribed, because a device can only read a group from when it joined (MLS). Messages a sibling sends to a group reach the other devices as group members, and are recorded as the account's own.
+- **Conversation ids.** A device that has a contact from contact sync, but hasn't seen the contact's account chain, files the chat under the account recorded in its contact book. Its siblings do the same, so transcripts land in the right conversation.
+
+Apps show a sibling's messages as yours, without delivery ticks: the sending device collects those.
 
 ## Contacts and messages
 
@@ -102,4 +117,4 @@ MLS leaves stay per device. `/group invite` sends a key-package request to every
 
 - Gathering co-signatures for thresholds above 1, so removals need several devices.
 - Devices added to an account after a group was created must be invited to it separately.
-- Syncing message history between devices.
+- Syncing group history from before a device joined (MLS can't), file contents, and delivery ticks between devices.

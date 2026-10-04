@@ -68,10 +68,16 @@ fn event(u: Update) -> NodeEvent {
             removed: vec![fp(&member)],
         },
         Update::Left { group } => NodeEvent::GroupLeft { group: hex(&group) },
-        Update::Text { group, from, text } => NodeEvent::GroupMessage {
+        Update::Text {
+            group,
+            from,
+            text,
+            ours,
+        } => NodeEvent::GroupMessage {
             group: hex(&group),
             from: fp(&from),
             text,
+            ours,
         },
     }
 }

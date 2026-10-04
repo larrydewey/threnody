@@ -219,10 +219,17 @@ pub enum NodeEvent {
     GroupLeft {
         group: String,
     },
+    /// `ours`: sent by another device of our own account.
     GroupMessage {
         group: String,
         from: String,
         text: String,
+        ours: bool,
+    },
+    /// Our own device `from` shared history; reload conversations.
+    HistorySynced {
+        from: String,
+        added: u32,
     },
     /// Anything else, described for logs.
     Other {
@@ -359,6 +366,10 @@ fn convert(e: Event) -> NodeEvent {
             device: fp(&device),
         },
         Event::ThisDeviceRemoved => NodeEvent::ThisDeviceRemoved,
+        Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
+            from: fp(&from),
+            added: u32::try_from(added).unwrap_or(u32::MAX),
+        },
         Event::Delivered { peer, group, .. } => NodeEvent::Delivered {
             peer: fp(&peer),
             group: group.map(|g| g.iter().map(|b| format!("{b:02x}")).collect()),
@@ -1222,7 +1233,8 @@ mod tests {
                 NodeEvent::GroupMessage {
                     group: g.clone(),
                     from: c_fp.clone(),
-                    text: "hi all".into()
+                    text: "hi all".into(),
+                    ours: false,
                 }
             );
         }

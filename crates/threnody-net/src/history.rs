@@ -7,7 +7,7 @@ use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
-use crate::node::{Event, Node};
+use crate::node::{Event, Node, lock};
 
 /// A random non-zero id for an outgoing history entry.
 pub fn local_id() -> u64 {
@@ -29,10 +29,18 @@ impl Node {
     /// The conversation a peer device belongs to: its account if known,
     /// otherwise the device itself.
     pub fn conversation_for(&self, peer: &PublicIdentity) -> ConversationId {
-        match self.account_of(peer) {
-            Some(a) if !self.is_own_device(peer) => ConversationId::Peer(a.id().0),
-            _ => ConversationId::Peer(*peer.as_bytes()),
+        if self.is_own_device(peer) {
+            return ConversationId::Peer(*peer.as_bytes());
         }
+        // The account chain if we've seen it, else the account our contact
+        // book records (synced from our other devices, say).
+        let account = self.account_of(peer).map(|a| a.id().0).or_else(|| {
+            lock(&self.shared.contacts)
+                .get(peer)
+                .and_then(|c| c.account)
+                .map(|a| a.0)
+        });
+        ConversationId::Peer(account.unwrap_or(*peer.as_bytes()))
     }
 
     /// Sends `body` to every device of `peer`'s account (live where
@@ -172,12 +180,18 @@ impl Node {
     }
 
     /// Appends an entry to a conversation's history.
+    /// Our own outgoing 1:1 entries also go to our other devices.
     pub fn append(&self, conv: ConversationId, entry: Entry) {
         let now = entry.at_ms;
+        let ours = entry.outgoing && entry.device == *self.identity().as_bytes();
+        let pushed = ours.then(|| entry.clone());
         let _ = self
             .shared
             .home
             .append_history(self.identity_ref(), conv, entry, now);
+        if let Some(e) = pushed {
+            self.push_entry(conv, &e);
+        }
     }
 
     /// Sets the disappearing-message timer for the conversation with

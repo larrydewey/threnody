@@ -31,17 +31,45 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum AccountMsg {
     Chain(Vec<u8>),
-    LinkRequest { proof: [u8; 32], name: String },
-    LinkOffer { chain: Vec<u8>, link: Vec<u8> },
-    LinkConsent { link: Vec<u8> },
+    LinkRequest {
+        proof: [u8; 32],
+        name: String,
+    },
+    LinkOffer {
+        chain: Vec<u8>,
+        link: Vec<u8>,
+    },
+    LinkConsent {
+        link: Vec<u8>,
+    },
     ContactSync(Vec<u8>),
     LinkRefused,
     SiblingBundle(Vec<u8>),
+    /// History entries for one conversation (see `sync`).
+    Transcript {
+        conversation: Vec<u8>,
+        history: Vec<u8>,
+    },
+}
+
+/// An `AppMessage` carrying a transcript of `history` for `conversation`.
+pub(crate) fn transcript(conversation: Vec<u8>, history: Vec<u8>) -> Option<AppMessage> {
+    AccountMsg::Transcript {
+        conversation,
+        history,
+    }
+    .encode()
+    .ok()
+    .map(AppMessage::Account)
 }
 
 impl AccountMsg {
     fn encode(&self) -> threnody_core::Result<Vec<u8>> {
-        cbor::to_vec(4096, |e| {
+        let hint = match self {
+            Self::Transcript { history, .. } => history.len() + 64,
+            _ => 4096,
+        };
+        cbor::to_vec(hint, |e| {
             match self {
                 Self::Chain(c) => {
                     e.map_len(2)?.u8(0)?.u8(1)?.u8(1)?.bytes(c)?;
@@ -65,6 +93,13 @@ impl AccountMsg {
                 }
                 Self::SiblingBundle(b) => {
                     e.map_len(2)?.u8(0)?.u8(7)?.u8(1)?.bytes(b)?;
+                }
+                Self::Transcript {
+                    conversation,
+                    history,
+                } => {
+                    e.map_len(3)?.u8(0)?.u8(8)?.u8(1)?.bytes(conversation)?;
+                    e.u8(2)?.bytes(history)?;
                 }
             }
             Ok(())
@@ -103,6 +138,10 @@ impl AccountMsg {
             5 => Self::ContactSync(required(one, "snapshot")?),
             6 => Self::LinkRefused,
             7 => Self::SiblingBundle(required(one, "bundle")?),
+            8 => Self::Transcript {
+                conversation: required(one, "conversation")?,
+                history: required(two, "history")?,
+            },
             other => return Err(threnody_core::Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -159,6 +198,7 @@ impl Node {
         }
         if self.is_own_device(peer) {
             out.extend(self.contact_sync_message());
+            out.extend(self.transcripts_for(peer));
             if let Some(b) = self.shared_bundle() {
                 out.extend(
                     AccountMsg::SiblingBundle(b)
@@ -191,8 +231,17 @@ impl Node {
             return;
         }
         if let Some(m) = self.contact_sync_message() {
-            for p in own {
-                let _ = self.send(&p, m.clone());
+            for p in &own {
+                let _ = self.send(p, m.clone());
+            }
+        }
+        // A device just linked (in a session that started before it was
+        // ours) gets our history now.
+        for p in own {
+            if !self.has_synced(&p) {
+                for m in self.transcripts_for(&p) {
+                    let _ = self.send(&p, m);
+                }
             }
         }
     }
@@ -233,6 +282,10 @@ impl Node {
             AccountMsg::LinkOffer { chain, link } => self.on_link_offer(from, &chain, &link),
             AccountMsg::LinkConsent { link } => self.on_link_consent(from, &link),
             AccountMsg::SiblingBundle(b) => self.on_sibling_bundle(from, &b),
+            AccountMsg::Transcript {
+                conversation,
+                history,
+            } => self.on_transcript(from, &conversation, &history),
             AccountMsg::LinkRefused => {
                 let mut st = lock(&self.shared.linking);
                 if st.joining.as_ref().is_some_and(|(e, _)| *e == from)

@@ -28,7 +28,7 @@ Inside `run`, any line you type goes to the current peer. The available commands
 
 `/history [peer] [n]` shows recent messages, which are stored encrypted. `/disappear 1h` (or `30s`, `10m`, `1d`, `off`) sets disappearing messages with the current peer, and the peer adopts the same timer.
 
-To add a device to your account, run `/device add` on a device you already have. It prints a one-time code (and a QR code). Then run `threnody link '<code>'` on the new device. `/devices` lists your devices and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices.
+To add a device to your account, run `/device add [host:port]` on a device you already have. It prints a one-time code (and a QR code) with this machine's LAN address, or the one given. Then run `threnody link '<code>'` on the new device. `/devices` lists your devices and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices. Your devices share your message history, and a new device gets it all when linked.
 
 ```
 /connect <invite|contact|host:port>   /to <peer>   /peers   /contacts
@@ -84,12 +84,12 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.4 Formal verification | ✅ Tamarin, 33 lemmas: handshake, ratchet, sealed messages, onion hops, device linking and account chains; `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
-| §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync, account-wide offline keys and group invites; history not synced |
+| §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync and history sync (with a backfill for newly linked devices), account-wide offline keys and group invites |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
 | §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
-| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers (sync between devices and backups not yet) |
+| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices (backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |

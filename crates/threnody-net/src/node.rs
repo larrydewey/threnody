@@ -129,6 +129,11 @@ pub enum Event {
     ContactsSynced {
         from: PublicIdentity,
     },
+    /// Our own device `from` sent history entries; `added` were new here.
+    HistorySynced {
+        from: PublicIdentity,
+        added: usize,
+    },
     /// This device was removed from its account.
     ThisDeviceRemoved,
     /// A nearby approved peer created a Wi-Fi Direct group for us: join
@@ -264,6 +269,8 @@ pub(crate) struct Shared {
     next_id: AtomicU64,
     /// Acknowledgement bookkeeping for user content (see `delivery`).
     pub(crate) delivery: Mutex<Delivery>,
+    /// How far each of our other devices has our history (see `sync`).
+    pub(crate) sync: Mutex<crate::sync::SyncState>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -369,6 +376,13 @@ impl Node {
             Some(b) => MailboxStore::decode(&b)?,
             None => MailboxStore::default(),
         };
+        let sync = crate::sync::SyncState::decode(
+            &cfg.home
+                .load_state(&cfg.identity, "history-sync")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         let delivery = {
             let load = |n| {
                 cfg.home
@@ -406,6 +420,7 @@ impl Node {
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),
+            sync: Mutex::new(sync),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -658,9 +673,18 @@ impl Node {
     /// [`Node::send`], marking the history entry `tag` names delivered
     /// when the peer acknowledges.
     pub fn send_tagged(&self, peer: &PublicIdentity, msg: AppMessage, tag: Tag) -> Result<()> {
+        self.queue(peer, msg, tag, false)
+    }
+
+    /// Sends `msg` tracked (acknowledged, resent if lost) whatever its kind.
+    pub(crate) fn send_tracked(&self, peer: &PublicIdentity, msg: AppMessage) -> Result<()> {
+        self.queue(peer, msg, Tag::NONE, true)
+    }
+
+    fn queue(&self, peer: &PublicIdentity, msg: AppMessage, tag: Tag, always: bool) -> Result<()> {
         let sessions = lock(&self.shared.sessions);
         let h = sessions.get(peer).ok_or(NetError::Closed)?;
-        let msg = if trackable(&msg) {
+        let msg = if always || trackable(&msg) {
             self.shared.delivery(|d| d.track(peer, msg, tag))
         } else {
             msg

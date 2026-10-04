@@ -17,6 +17,7 @@ pub mod mailbox;
 pub mod node;
 pub mod onion;
 pub mod relay;
+pub mod sync;
 
 pub use delivery::Tag;
 pub use direct::DirectOffer;

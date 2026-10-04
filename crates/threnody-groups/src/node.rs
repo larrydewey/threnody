@@ -62,10 +62,13 @@ pub enum Update {
     },
     /// The owner removed us.
     Left { group: GroupId },
+    /// `ours`: sent by another device of our own account (shown as ours,
+    /// not notified).
     Text {
         group: GroupId,
         from: PublicIdentity,
         text: String,
+        ours: bool,
     },
 }
 
@@ -452,15 +455,22 @@ impl GroupNode {
             GroupEvent::MemberRemoved { group, member } => Update::MemberRemoved { group, member },
             GroupEvent::Left { group } => Update::Left { group },
             GroupEvent::Text { group, from, text } => {
+                // What our other devices send to the group is ours too.
+                let ours = node.is_own_device(&from);
                 node.record(
                     ConversationId::Group(group),
                     *from.as_bytes(),
-                    false,
+                    ours,
                     &text,
                     false,
                     None,
                 );
-                Update::Text { group, from, text }
+                Update::Text {
+                    group,
+                    from,
+                    text,
+                    ours,
+                }
             }
         });
     }

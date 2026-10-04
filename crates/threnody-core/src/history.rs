@@ -26,6 +26,22 @@ pub enum ConversationId {
 }
 
 impl ConversationId {
+    /// `0 ‖ id (32)` for a peer, `1 ‖ id (16)` for a group.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Peer(k) => [&[0u8][..], k].concat(),
+            Self::Group(g) => [&[1u8][..], g].concat(),
+        }
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        match b.split_first()? {
+            (0, k) => k.try_into().ok().map(Self::Peer),
+            (1, g) => g.try_into().ok().map(Self::Group),
+            _ => None,
+        }
+    }
+
     fn state_name(&self) -> String {
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         match self {
@@ -91,7 +107,48 @@ pub struct History {
     entries: Vec<Entry>,
 }
 
+/// Whether two entries record the same message: outgoing ones by their
+/// local id (or time and content), incoming ones by sender and content
+/// within ten minutes (each device stamps its own receipt time).
+fn same(a: &Entry, b: &Entry) -> bool {
+    if a.outgoing != b.outgoing || a.device != b.device {
+        return false;
+    }
+    let content =
+        a.text == b.text && a.file.as_ref().map(|f| &f.name) == b.file.as_ref().map(|f| &f.name);
+    if a.outgoing && a.local_id != 0 && b.local_id != 0 {
+        return a.local_id == b.local_id;
+    }
+    content && a.at_ms.abs_diff(b.at_ms) <= 10 * 60 * 1000
+}
+
 impl History {
+    /// Adds `incoming` entries that aren't already here, keeping time
+    /// order. Returns how many were added.
+    pub fn merge(&mut self, incoming: Vec<Entry>, now_ms: u64) -> usize {
+        let mut added = 0;
+        for e in incoming {
+            if !self.entries.iter().any(|x| same(x, &e)) {
+                self.entries.push(e);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.entries.sort_by_key(|e| e.at_ms);
+            self.prune(now_ms);
+        }
+        added
+    }
+
+    /// Entries for a transcript: a conversation's (part of) history for
+    /// our own other devices (Appendix J).
+    pub fn transcript(entries: Vec<Entry>) -> Self {
+        Self {
+            timer_s: None,
+            entries,
+        }
+    }
+
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -337,6 +394,23 @@ impl Home {
         Ok(true)
     }
 
+    /// Merges entries from another of our devices into a conversation;
+    /// returns how many were new.
+    pub fn merge_entries(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        entries: Vec<Entry>,
+        now_ms: u64,
+    ) -> Result<usize> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let added = h.merge(entries, now_ms);
+        if added > 0 {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(added)
+    }
+
     /// Moves `from`'s history into `into` (keeping time order) and deletes
     /// `from`. Used when a device's account becomes known. Returns true if
     /// anything moved.
@@ -513,6 +587,55 @@ mod tests {
         assert!(!get().delivered && get().delivered_to == [[1; 32]]);
         assert!(home.mark_delivered(&id, g, 5, [2; 32], 301).unwrap());
         assert!(get().delivered && get().delivered_to.len() == 2 && get().recipients == 2);
+    }
+
+    #[test]
+    fn merging_skips_messages_already_here() {
+        let mut h = History::default();
+        let sent = Entry {
+            local_id: 9,
+            ..entry(1000, "hi", None)
+        };
+        let got = Entry {
+            device: [5; 32],
+            outgoing: false,
+            ..entry(2001, "hello", None)
+        };
+        h.push(sent.clone(), 0);
+        h.push(got.clone(), 0);
+        // The same messages as another device recorded them: the incoming
+        // one with that device's own receipt time.
+        let theirs = vec![
+            sent.clone(),
+            Entry {
+                at_ms: 2001 + 60_000,
+                ..got.clone()
+            },
+            Entry {
+                local_id: 10,
+                ..entry(500, "earlier, from the other device", None)
+            },
+        ];
+        assert_eq!(h.merge(theirs, 0), 1);
+        assert_eq!(h.entries().len(), 3);
+        assert_eq!(
+            h.entries()[0].text,
+            "earlier, from the other device",
+            "time order"
+        );
+        // Same text much later is a different message.
+        let again = Entry {
+            at_ms: 2001 + 3_600_000,
+            ..got
+        };
+        assert_eq!(h.merge(vec![again], 0), 1);
+        for c in [
+            ConversationId::Peer([3; 32]),
+            ConversationId::Group([4; 16]),
+        ] {
+            assert_eq!(ConversationId::from_bytes(&c.to_bytes()), Some(c));
+        }
+        assert_eq!(ConversationId::from_bytes(&[2, 0]), None);
     }
 
     #[test]
