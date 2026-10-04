@@ -29,6 +29,10 @@ pub mod label {
     pub const SEALED_KEY: &str = "threnody v1 2026-10-03 sealed key";
     pub const ONION_LAYER_KEYS: &str = "threnody v1 2026-10-03 onion layer keys";
     pub const SIG_ONION_CREATED: &str = "threnody v1 2026-10-03 onion created";
+    pub const ACCOUNT_ID: &str = "threnody v1 2026-10-03 account id";
+    pub const ACCOUNT_FINGERPRINT: &str = "threnody v1 2026-10-03 account fingerprint";
+    pub const SIG_ACCOUNT_LINK: &str = "threnody v1 2026-10-03 account link";
+    pub const LINK_PROOF: &str = "threnody v1 2026-10-03 link proof";
 }
 
 /// Fills `out` from the KDF.

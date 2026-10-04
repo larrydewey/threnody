@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use const_cbor::Decoder;
 use zeroize::Zeroizing;
 
+use crate::account::AccountId;
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::crypto::aead::Suite;
 use crate::crypto::kdf;
@@ -254,6 +255,11 @@ pub struct Contact {
     /// Pairwise LAN discovery key from the latest mutually approved
     /// session (see `discovery`). Cleared on revocation.
     pub discovery_key: Option<[u8; 32]>,
+    /// Account this device belongs to (Appendix J), once its chain is known.
+    pub account: Option<AccountId>,
+    /// When the approval or verification flags last changed (own-device
+    /// sync merges these last-writer-wins).
+    pub approval_changed_ms: u64,
 }
 
 impl Contact {
@@ -268,6 +274,8 @@ impl Contact {
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             discovery_key: None,
+            account: None,
+            approval_changed_ms: 0,
         }
     }
 
@@ -357,6 +365,59 @@ impl Contacts {
         }
     }
 
+    /// A snapshot for own-device sync: per-device secrets and the peer's
+    /// approval of *this* device are not meaningful elsewhere, so they are
+    /// stripped.
+    pub fn sync_snapshot(&self) -> Result<Vec<u8>> {
+        let mut c = self.clone();
+        for x in &mut c.list {
+            x.discovery_key = None;
+            x.remote_approved = false;
+        }
+        c.encode()
+    }
+
+    /// Merges a snapshot from one of our own devices. Approval and
+    /// verification are last-writer-wins on `approval_changed_ms`; names,
+    /// addresses and accounts fill gaps. Returns true if anything changed.
+    pub fn merge_snapshot(&mut self, bytes: &[u8], now_ms: u64) -> Result<bool> {
+        let other = Self::decode(bytes)?;
+        let mut changed = false;
+        for o in other.list {
+            match self.get_mut(&o.key) {
+                None => {
+                    let mut c = o;
+                    c.discovery_key = None;
+                    c.remote_approved = false;
+                    c.first_seen_ms = now_ms;
+                    self.list.push(c);
+                    changed = true;
+                }
+                Some(c) => {
+                    if o.approval_changed_ms > c.approval_changed_ms {
+                        c.local_approved = o.local_approved;
+                        c.verified = o.verified;
+                        c.approval_changed_ms = o.approval_changed_ms;
+                        changed = true;
+                    }
+                    if c.petname.is_none() && o.petname.is_some() {
+                        c.petname = o.petname;
+                        changed = true;
+                    }
+                    if c.last_addr.is_none() && o.last_addr.is_some() {
+                        c.last_addr = o.last_addr;
+                        changed = true;
+                    }
+                    if c.account.is_none() && o.account.is_some() {
+                        c.account = o.account;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         cbor::to_vec(64 + self.list.len() * 160, |e| {
             e.map_len(2)?;
@@ -366,7 +427,9 @@ impl Contacts {
                 let n = 6
                     + usize::from(c.petname.is_some())
                     + usize::from(c.last_addr.is_some())
-                    + usize::from(c.discovery_key.is_some());
+                    + usize::from(c.discovery_key.is_some())
+                    + usize::from(c.account.is_some())
+                    + 1;
                 e.map_len(n)?;
                 e.u8(0)?.bytes(c.key.as_bytes())?;
                 if let Some(p) = &c.petname {
@@ -383,6 +446,10 @@ impl Contacts {
                 if let Some(k) = &c.discovery_key {
                     e.u8(8)?.bytes(k)?;
                 }
+                if let Some(a) = &c.account {
+                    e.u8(9)?.bytes(&a.0)?;
+                }
+                e.u8(10)?.u64(c.approval_changed_ms)?;
             }
             Ok(())
         })
@@ -421,6 +488,8 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         first_seen_ms: 0,
         last_seen_ms: 0,
         discovery_key: None,
+        account: None,
+        approval_changed_ms: 0,
     };
     read_map(d, |k, d| {
         match k {
@@ -433,6 +502,8 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             6 => c.first_seen_ms = d.u64()?,
             7 => c.last_seen_ms = d.u64()?,
             8 => c.discovery_key = Some(fixed_bytes::<32>(d)?),
+            9 => c.account = Some(AccountId(fixed_bytes::<32>(d)?)),
+            10 => c.approval_changed_ms = d.u64()?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -461,6 +532,8 @@ mod tests {
         ct.petname = Some("alice".into());
         ct.local_approved = true;
         ct.discovery_key = Some([4; 32]);
+        ct.account = Some(AccountId([5; 32]));
+        ct.approval_changed_ms = 77;
         home.save_contacts(&c).unwrap();
         let loaded = home.load_contacts().unwrap();
         assert_eq!(loaded, c);
@@ -477,6 +550,52 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_merge_last_writer_wins_without_pairwise_secrets() {
+        let (bob, carol) = (Identity::generate().public(), Identity::generate().public());
+        let mut mine = Contacts::default();
+        mine.observe(bob, None, 1);
+        let c = mine.get_mut(&bob).unwrap();
+        c.local_approved = true;
+        c.approval_changed_ms = 10;
+        c.discovery_key = Some([1; 32]);
+
+        let mut theirs = Contacts::default();
+        theirs.observe(bob, Some("bob.example:1".into()), 1);
+        theirs.observe(carol, None, 1);
+        let t = theirs.get_mut(&bob).unwrap();
+        t.local_approved = false; // revoked later on the other device
+        t.approval_changed_ms = 20;
+        t.petname = Some("bob".into());
+        t.remote_approved = true;
+        theirs.get_mut(&carol).unwrap().discovery_key = Some([9; 32]);
+
+        assert!(
+            mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 5)
+                .unwrap()
+        );
+        let b = mine.get(&bob).unwrap();
+        assert!(!b.local_approved, "later revocation wins");
+        assert_eq!(b.petname.as_deref(), Some("bob"));
+        assert_eq!(b.discovery_key, Some([1; 32]), "own pairwise key kept");
+        let c = mine.get(&carol).unwrap();
+        assert!(
+            c.discovery_key.is_none() && !c.remote_approved,
+            "pairwise state not copied"
+        );
+        assert!(
+            !mine
+                .merge_snapshot(&theirs.sync_snapshot().unwrap(), 6)
+                .unwrap(),
+            "idempotent"
+        );
     }
 }
 

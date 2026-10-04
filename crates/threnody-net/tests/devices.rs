@@ -1,0 +1,170 @@
+use std::time::Duration;
+
+use threnody_core::store::Home;
+use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::timeout;
+
+struct N {
+    node: Node,
+    rx: UnboundedReceiver<Event>,
+    addr: String,
+}
+
+async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.create_identity(None).unwrap();
+    let (node, rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
+    N { node, rx, addr }
+}
+
+async fn next(rx: &mut UnboundedReceiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let e = rx.recv().await.expect("event stream open");
+            if pred(&e) {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("expected event did not arrive")
+}
+
+async fn wait_for(cond: impl Fn() -> bool) {
+    timeout(Duration::from_secs(10), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("condition not reached");
+}
+
+async fn link(x: &mut N, y: &mut N) {
+    let yid = x.node.connect(&y.addr, None).await.unwrap();
+    next(&mut y.rx, |e| matches!(e, Event::Connected { .. })).await;
+    x.node.set_approval(&yid, true).unwrap();
+    y.node.set_approval(&x.node.identity(), true).unwrap();
+    next(&mut x.rx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    next(&mut y.rx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn link_a_device_sync_contacts_and_show_the_account_to_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await; // laptop already knows and approves bob
+    let account = laptop.node.account().id();
+
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    let joined = phone.node.link_with(&code).await.unwrap();
+    assert_eq!(joined, account);
+    next(&mut laptop.rx, |e| matches!(e, Event::DeviceLinked { .. })).await;
+    assert_eq!(laptop.node.account().state().devices.len(), 2);
+    assert_eq!(phone.node.account(), laptop.node.account());
+    assert!(phone.node.is_own_device(&laptop.node.identity()));
+
+    // The phone inherits the laptop's contacts and approvals.
+    let bid = bob.node.identity();
+    wait_for(|| {
+        phone
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.local_approved)
+    })
+    .await;
+    // Own devices end up mutually approved.
+    let lid = laptop.node.identity();
+    wait_for(|| {
+        phone
+            .node
+            .contacts()
+            .get(&lid)
+            .is_some_and(|c| c.mutually_approved())
+    })
+    .await;
+
+    // Bob learns the account (pushed by the laptop) and recognises the phone.
+    let pid = phone.node.identity();
+    wait_for(|| bob.node.account_of(&pid).is_some_and(|a| a.id() == account)).await;
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    wait_for(|| {
+        bob.node
+            .contacts()
+            .get(&pid)
+            .is_some_and(|c| c.account == Some(account))
+    })
+    .await;
+    let _ = &mut phone.rx;
+}
+
+#[tokio::test]
+async fn link_codes_are_single_use_and_must_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let tablet = spawn(&dir, "tablet").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+
+    let mut forged = code.clone();
+    forged.secret[0] ^= 1;
+    assert!(
+        tablet.node.link_with(&forged).await.is_err(),
+        "wrong secret accepted"
+    );
+    next(&mut laptop.rx, |e| matches!(e, Event::LinkRejected { .. })).await;
+
+    phone.node.link_with(&code).await.unwrap();
+    assert!(tablet.node.link_with(&code).await.is_err(), "code reused");
+    assert_eq!(laptop.node.account().state().devices.len(), 2);
+}
+
+#[tokio::test]
+async fn removing_a_device_revokes_it_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    wait_for(|| bob.node.account_of(&pid).is_some()).await;
+
+    // Lost phone: the laptop removes it.
+    laptop.node.remove_device(&pid).unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::ThisDeviceRemoved)).await;
+    next(
+        &mut bob.rx,
+        |e| matches!(e, Event::AccountChanged { removed, .. } if removed.contains(&pid)),
+    )
+    .await;
+    assert!(laptop.node.account().state().removed.contains(&pid));
+
+    // Bob now refuses the removed phone.
+    let _ = phone.node.connect(&bob.addr, None).await;
+    next(
+        &mut bob.rx,
+        |e| matches!(e, Event::Rejected { reason, .. } if reason.contains("removed")),
+    )
+    .await;
+    assert!(bob.node.sessions().iter().all(|s| s.peer != pid));
+}

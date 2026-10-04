@@ -48,6 +48,7 @@ Type a line to send it to the current peer. Commands:
   /drop [peer]                          close a session
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
+  /devices   /device add   /device remove <name>   your account's devices
   /quit
 Groups (MLS, post-quantum X-Wing ciphersuite):";
 
@@ -240,14 +241,44 @@ impl Ui {
         }
     }
 
-    /// Seals `msg` for an absent contact and leaves it with mailboxes.
-    fn send_offline(&self, peer: PublicIdentity, msg: &AppMessage) -> Result<()> {
-        let who = self.name(&peer);
-        if !self.node.can_send_offline(&peer) {
-            bail!("{who} is not connected and has not given us prekeys yet; try /relay");
+    /// Sends `msg` to every device of `peer`'s account (Appendix J): over
+    /// live sessions where possible, otherwise sealed per device.
+    fn send_to_account(&self, peer: PublicIdentity, msg: &AppMessage) -> Result<()> {
+        let devices: Vec<PublicIdentity> = match self.node.account_of(&peer) {
+            Some(a) if !self.node.is_own_device(&peer) => {
+                a.state().devices.iter().map(|(d, _)| *d).collect()
+            }
+            _ => vec![peer],
+        };
+        let mut live = 0;
+        let mut sealed = 0;
+        let mut failed = Vec::new();
+        for d in &devices {
+            if self.node.send(d, msg.clone()).is_ok() {
+                live += 1;
+            } else if self.node.can_send_offline(d) && self.node.send_offline(d, msg).is_ok() {
+                sealed += 1;
+            } else {
+                failed.push(*d);
+            }
         }
-        let n = self.node.send_offline(&peer, msg)?;
-        println!("* {who} is not connected; sealed message offered to {n} mailbox(es)");
+        if devices.len() > 1 || sealed > 0 {
+            println!(
+                "* to {} device(s): {live} live, {sealed} sealed for mailboxes{}",
+                devices.len(),
+                if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} unreachable", failed.len())
+                }
+            );
+        }
+        if live + sealed == 0 {
+            bail!(
+                "{} is not reachable (no session, no prekeys); try /relay",
+                self.name(&peer)
+            );
+        }
         Ok(())
     }
 
@@ -391,6 +422,41 @@ impl Ui {
             Event::DialFailed { peer, addr, reason } => {
                 println!("! could not reach {} at {addr}: {reason}", self.name(&peer));
             }
+            Event::AccountChanged {
+                account,
+                added,
+                removed,
+            } => {
+                let a = account.fingerprint().to_string();
+                for d in added {
+                    println!("* account {} added device {}", &a[..9], self.name(&d));
+                }
+                for d in removed {
+                    println!(
+                        "! account {} REMOVED device {} — it is no longer trusted",
+                        &a[..9],
+                        self.name(&d)
+                    );
+                }
+            }
+            Event::AccountFork { device, account } => println!(
+                "! WARNING: {} presented a conflicting history for account {} — possible compromise; ignored",
+                self.name(&device),
+                account.fingerprint()
+            ),
+            Event::DeviceLinked { device } => println!(
+                "* linked new device {} into your account",
+                self.name(&device)
+            ),
+            Event::LinkRejected { device } => {
+                println!("! rejected a link attempt from {}", self.name(&device))
+            }
+            Event::ContactsSynced { from } => {
+                println!("* contacts updated from {}", self.name(&from))
+            }
+            Event::ThisDeviceRemoved => {
+                println!("! THIS DEVICE WAS REMOVED from its account; peers will refuse it")
+            }
             Event::Rejected { addr, reason } => {
                 println!("* rejected connection from {addr}: {reason}")
             }
@@ -410,9 +476,7 @@ impl Ui {
                 sent_ms: now_ms(),
                 body: line.to_owned(),
             };
-            if self.node.send(&peer, msg.clone()).is_err() {
-                self.send_offline(peer, &msg)?;
-            }
+            self.send_to_account(peer, &msg)?;
             return Ok(false);
         };
         let mut parts = cmd.splitn(2, ' ');
@@ -544,6 +608,51 @@ impl Ui {
                 println!("* policy: {p:?}");
             }
             "status" => self.status(),
+            "devices" => self.devices(),
+            "device" => {
+                let a = arg.unwrap_or("");
+                match a.split_once(' ').map_or((a, ""), |(x, y)| (x, y.trim())) {
+                    ("add", _) => {
+                        let addr = self.listen_addr.ok_or_else(|| {
+                            anyhow!("run with --listen so the new device can reach this one")
+                        })?;
+                        let code = self.node.create_link_code(addr.to_string());
+                        println!("  On the new device run:\n\n    threnody link '{code}'\n");
+                        if let Ok(qr) = qrcode::QrCode::new(code.to_string().as_bytes()) {
+                            let art = qr
+                                .render::<qrcode::render::unicode::Dense1x2>()
+                                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                                .build();
+                            println!("{art}");
+                        }
+                        println!(
+                            "  The code works once, for 10 minutes. Never share it with anyone else."
+                        );
+                    }
+                    ("remove", who) if !who.is_empty() => {
+                        let own = self.node.account();
+                        let target = own
+                            .state()
+                            .devices
+                            .iter()
+                            .find(|(d, n)| {
+                                n == who
+                                    || threnody_core::identity::fingerprint_matches_prefix(
+                                        &d.fingerprint(),
+                                        who,
+                                    )
+                            })
+                            .map(|(d, _)| *d)
+                            .ok_or_else(|| {
+                                anyhow!("no device {who:?} in your account; see /devices")
+                            })?;
+                        self.node.remove_device(&target)?;
+                        println!("* removed {} from your account", target.fingerprint());
+                    }
+                    _ => bail!("usage: /device add | /device remove <name|fingerprint>"),
+                }
+            }
             "onion" => {
                 let a = arg.ok_or_else(|| {
                     anyhow!("usage: /onion <contact|fingerprint|invite> [min-relays]")
@@ -595,10 +704,34 @@ impl Ui {
         Ok(false)
     }
 
+    fn devices(&self) {
+        let account = self.node.account();
+        let me = self.node.identity();
+        println!("  account {}", account.id().fingerprint());
+        for (d, name) in &account.state().devices {
+            let tag = if *d == me { " (this device)" } else { "" };
+            let live = if self.node.sessions().iter().any(|s| s.peer == *d) {
+                ", connected"
+            } else {
+                ""
+            };
+            println!("    {name:<16} {}{tag}{live}", d.fingerprint());
+        }
+        for d in &account.state().removed {
+            println!("    removed          {}", d.fingerprint());
+        }
+    }
+
     /// Spec §10: persistent indicators of transport, tunnel and protection.
     fn status(&self) {
         let sessions = self.node.sessions();
-        println!("  identity     {}", self.node.identity().fingerprint());
+        let account = self.node.account();
+        println!(
+            "  account      {} ({} device(s))",
+            account.id().fingerprint(),
+            account.state().devices.len()
+        );
+        println!("  this device  {}", self.node.identity().fingerprint());
         match self.listen_addr {
             Some(a) => println!("  listening    tcp {a}"),
             None => println!("  listening    no"),

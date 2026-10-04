@@ -5,6 +5,7 @@
 //! first backend; the [`node::Node`] session driver is generic over any
 //! reliable byte stream so Bluetooth and Wi-Fi Direct sockets slot in later.
 
+pub mod account;
 pub mod discovery;
 pub mod error;
 pub mod frame;

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::prekey::{BundleBook, PrekeyStore};
@@ -18,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use crate::account::LinkState;
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
@@ -102,6 +104,31 @@ pub enum Event {
         addr: SocketAddr,
         connected: bool,
     },
+    /// A peer account was learned or changed (devices added / removed).
+    AccountChanged {
+        account: AccountId,
+        added: Vec<PublicIdentity>,
+        removed: Vec<PublicIdentity>,
+    },
+    /// A device presented a chain that forks one we hold: possible compromise.
+    AccountFork {
+        device: PublicIdentity,
+        account: AccountId,
+    },
+    /// We linked a new device into our account.
+    DeviceLinked {
+        device: PublicIdentity,
+    },
+    /// A link request failed (bad code, expired, revoked device).
+    LinkRejected {
+        device: PublicIdentity,
+    },
+    /// One of our own devices sent us contact changes.
+    ContactsSynced {
+        from: PublicIdentity,
+    },
+    /// This device was removed from its account.
+    ThisDeviceRemoved,
     /// A sealed message from `from`, delivered by mailbox `via` (Appendix H).
     OfflineMessage {
         from: PublicIdentity,
@@ -138,6 +165,8 @@ pub struct SessionInfo {
     pub outbound: bool,
     /// For relayed sessions, the neighbour the circuit runs through.
     pub via: Option<PublicIdentity>,
+    /// The handshake transcript hash (public; binds link proofs).
+    pub session_id: [u8; 32],
 }
 
 /// How a session reaches its peer.
@@ -170,7 +199,7 @@ struct SessionHandle {
 pub(crate) struct Shared {
     identity: Identity,
     home: Home,
-    contacts: Mutex<Contacts>,
+    pub(crate) contacts: Mutex<Contacts>,
     sessions: Mutex<HashMap<PublicIdentity, SessionHandle>>,
     events: mpsc::UnboundedSender<Event>,
     policy: Mutex<AcceptPolicy>,
@@ -183,6 +212,9 @@ pub(crate) struct Shared {
     pub(crate) bundles: Mutex<BundleBook>,
     pub(crate) mailbox: Mutex<MailboxStore>,
     pub(crate) onion: Mutex<OnionState>,
+    pub(crate) account: Mutex<AccountChain>,
+    pub(crate) accounts: Mutex<AccountBook>,
+    pub(crate) linking: Mutex<LinkState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
 }
@@ -213,7 +245,7 @@ impl Shared {
         }
     }
 
-    fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
+    pub(crate) fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
         let r = bytes.and_then(|b| self.home.save_state(&self.identity, name, b.as_ref()));
         if let Err(e) = r {
             eprintln!("threnody: failed to save {name}: {e}");
@@ -232,7 +264,7 @@ impl Shared {
         self.save_state("mailbox", m.encode());
     }
 
-    fn save_contacts(&self, c: &Contacts) {
+    pub(crate) fn save_contacts(&self, c: &Contacts) {
         if let Err(e) = self.home.save_contacts(c) {
             eprintln!("threnody: failed to save contacts: {e}");
         }
@@ -255,6 +287,19 @@ impl Node {
         let bundles = match cfg.home.load_state(&cfg.identity, "bundles")? {
             Some(b) => BundleBook::decode(&b)?,
             None => BundleBook::default(),
+        };
+        let account = match cfg.home.load_state(&cfg.identity, "account")? {
+            Some(b) => AccountChain::decode(&b)?,
+            None => {
+                let chain = AccountChain::genesis(&cfg.identity, &device_name())?;
+                cfg.home
+                    .save_state(&cfg.identity, "account", &chain.encode()?)?;
+                chain
+            }
+        };
+        let accounts = match cfg.home.load_state(&cfg.identity, "accounts")? {
+            Some(b) => AccountBook::decode(&b)?,
+            None => AccountBook::default(),
         };
         let mailbox = match cfg.home.load_state(&cfg.identity, "mailbox")? {
             Some(b) => MailboxStore::decode(&b)?,
@@ -279,6 +324,9 @@ impl Node {
             bundles: Mutex::new(bundles),
             mailbox: Mutex::new(mailbox),
             onion: Mutex::new(OnionState::default()),
+            account: Mutex::new(account),
+            accounts: Mutex::new(accounts),
+            linking: Mutex::new(LinkState::default()),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
         };
@@ -448,6 +496,12 @@ impl Node {
     }
 
     pub(crate) fn check_policy(&self, peer: &PublicIdentity) -> Result<()> {
+        if self.is_revoked(peer) {
+            return Err(NetError::Refused(format!(
+                "{} (device removed from its account)",
+                peer.fingerprint()
+            )));
+        }
         let contacts = lock(&self.shared.contacts);
         let ok = match self.policy() {
             AcceptPolicy::Anyone => true,
@@ -476,6 +530,7 @@ impl Node {
             contacts.observe(*peer, None, now_ms());
             if let Some(c) = contacts.get_mut(peer) {
                 c.local_approved = approved;
+                c.approval_changed_ms = now_ms();
                 if !approved {
                     c.discovery_key = None;
                 }
@@ -486,6 +541,7 @@ impl Node {
             self.shared.tunnel_down(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });
+        self.push_contact_sync();
         Ok(())
     }
 
@@ -542,6 +598,7 @@ impl Node {
             since_ms: now_ms(),
             outbound,
             via,
+            session_id: *chan.session_id(),
         };
         // A newer session to the same peer replaces the old one; dropping
         // the old handle's sender ends its task.
@@ -634,7 +691,9 @@ where
     let mut offered = false;
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
-    // Anything mailboxes held for this peer goes out first.
+    // Our account chain (and, for own devices, our contacts), then anything
+    // mailboxes held for this peer.
+    pending.extend(node.account_hello(&peer));
     pending.extend(node.mailbox_for(&peer));
     let result: Result<()> = async {
         loop {
@@ -722,6 +781,7 @@ where
                             }
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
+                        AppMessage::Account(payload) => node.on_account(peer, &payload),
                         AppMessage::Mailbox(payload) => node.on_mailbox(peer, &payload),
                         AppMessage::Onion(payload) => {
                             if via.is_none() {
@@ -765,4 +825,14 @@ async fn tick(t: &mut Option<tokio::time::Interval>) {
         }
         None => std::future::pending().await,
     }
+}
+
+/// A default device name: the host name, else "device".
+fn device_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "device".to_owned())
 }

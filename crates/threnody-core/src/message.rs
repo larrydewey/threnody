@@ -54,6 +54,8 @@ pub enum AppMessage {
     Mailbox(Vec<u8>),
     /// An opaque onion-circuit message (see `threnody-net::onion`).
     Onion(Vec<u8>),
+    /// An opaque account / device-linking message (see `threnody-net::account`).
+    Account(Vec<u8>),
 }
 
 mod kind {
@@ -68,6 +70,7 @@ mod kind {
     pub const PREKEYS: u64 = 8;
     pub const MAILBOX: u64 = 9;
     pub const ONION: u64 = 10;
+    pub const ACCOUNT: u64 = 11;
 }
 
 impl AppMessage {
@@ -118,6 +121,10 @@ impl AppMessage {
                 }
                 Self::Onion(payload) => {
                     e.map_len(2)?.u8(0)?.uint(kind::ONION)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
+                Self::Account(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::ACCOUNT)?;
                     e.u8(2)?.bytes(payload)?;
                 }
                 Self::Approval { approved } => {
@@ -182,7 +189,12 @@ impl AppMessage {
                     data,
                 }
             }
-            kind::GROUP | kind::RELAY | kind::PREKEYS | kind::MAILBOX | kind::ONION => {
+            kind::GROUP
+            | kind::RELAY
+            | kind::PREKEYS
+            | kind::MAILBOX
+            | kind::ONION
+            | kind::ACCOUNT => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
                     return Err(Error::Malformed("message too large"));
@@ -192,6 +204,7 @@ impl AppMessage {
                     Some(kind::RELAY) => Self::Relay(p),
                     Some(kind::PREKEYS) => Self::Prekeys(p),
                     Some(kind::ONION) => Self::Onion(p),
+                    Some(kind::ACCOUNT) => Self::Account(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -268,6 +281,7 @@ mod tests {
             AppMessage::Prekeys(vec![6]),
             AppMessage::Mailbox(vec![7]),
             AppMessage::Onion(vec![8]),
+            AppMessage::Account(vec![9]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }

@@ -4,6 +4,7 @@
 //! the hybrid post-quantum handshake, the hybrid double ratchet, the CBOR
 //! wire format and local persistence. Transports live in `threnody-net`.
 
+pub mod account;
 pub mod cbor;
 pub mod channel;
 pub mod crypto;

@@ -56,7 +56,8 @@ existing device E                                  new device N
 
 - **The secret.** `s` is 16 random bytes, good for one use and 10 minutes.
 - **Authenticating each side.** The code pins `fp(E)`, which authenticates E to N. The proof binds `s` to *this* session and *this* device, which authenticates N to E. An attacker without the code can't be added, and can't replay a proof into another session.
-- **Signing.** N's signature over the link body is computed in advance from `prev`, `seq` and its own key, both of which E sends first (`LinkOffer`).
+- **Signing.** E sends the current chain and a proposed `Add(N)` link that E has already signed (`LinkOffer`). N checks that the proposal is exactly the next link adding N on top of that chain, then countersigns it (`LinkConsent`).
+- **Refusal.** A wrong or expired code gets an explicit `LinkRefused`, so N fails at once instead of waiting.
 - **Aftermath.** E then broadcasts the new chain to every session.
 
 ## Own devices

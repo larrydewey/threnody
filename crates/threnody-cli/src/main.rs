@@ -45,8 +45,13 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Show this device's fingerprint.
+    /// Show this device's fingerprint and its account.
     Id,
+    /// Join an existing account using a link code from one of its devices.
+    Link {
+        /// The `threnody-link://…` code shown by `/device add`.
+        code: String,
+    },
     /// Print an invite link (and QR code) others can connect with.
     Invite {
         /// Address peers should dial, e.g. 192.0.2.7:7450.
@@ -291,6 +296,45 @@ fn main() -> Result<()> {
         Cmd::Id => {
             let id = load_identity(&home)?;
             println!("{}", id.public().fingerprint());
+            if let Some(b) = home.load_state(&id, "account")?
+                && let Ok(chain) = threnody_core::account::AccountChain::decode(&b)
+            {
+                println!(
+                    "account {} ({} device(s))",
+                    chain.id().fingerprint(),
+                    chain.state().devices.len()
+                );
+            }
+        }
+        Cmd::Link { code } => {
+            let code: threnody_core::account::LinkCode =
+                code.parse().context("parsing link code")?;
+            let identity = load_identity(&home)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let (node, mut events) = threnody_net::Node::new(threnody_net::NodeConfig {
+                    home,
+                    identity,
+                    policy: threnody_net::AcceptPolicy::Anyone,
+                    constant_rate: None,
+                    tunnel_port: None,
+                })?;
+                println!("Linking with {} at {}…", code.device, code.addr);
+                let account = node.link_with(&code).await?;
+                println!("Joined account {}", account.fingerprint());
+                // Give the existing device a moment to send our contacts.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while let Some(e) = events.recv().await {
+                        if matches!(e, threnody_net::Event::ContactsSynced { .. }) {
+                            println!("Contacts synced.");
+                            break;
+                        }
+                    }
+                })
+                .await;
+                node.shutdown();
+                anyhow::Ok(())
+            })?;
         }
         Cmd::Invite { addr, no_qr } => {
             let id = load_identity(&home)?;
