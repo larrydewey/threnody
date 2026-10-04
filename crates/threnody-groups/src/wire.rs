@@ -2,8 +2,10 @@
 //! ratchets (so MLS traffic is itself end-to-end encrypted per hop).
 //!
 //! ```text
-//! GroupWire = { 0: kind uint, 1: group_id bstr, ? 2: payload bstr, ? 3: name tstr }
-//! kind: 1 key-package request, 2 key package, 3 welcome, 4 MLS message
+//! GroupWire = { 0: kind uint, 1: group_id bstr, ? 2: payload bstr, ? 3: name tstr,
+//!               ? 4: member bstr .size 32 }
+//! kind: 1 key-package request, 2 key package, 3 welcome, 4 MLS message,
+//!       5 forward (an MLS message for another member)
 //! ```
 
 use const_cbor::Decoder;
@@ -28,6 +30,13 @@ pub enum GroupWire {
     },
     /// A serialized `MlsMessageOut` (application message or commit).
     Message { group: GroupId, message: Vec<u8> },
+    /// "Deliver this MLS message to member `to` for me": sent to a member
+    /// the sender can reach when it can't reach `to` itself.
+    Forward {
+        group: GroupId,
+        to: [u8; 32],
+        message: Vec<u8>,
+    },
 }
 
 impl GroupWire {
@@ -36,20 +45,32 @@ impl GroupWire {
             Self::KeyPackageRequest { group, .. }
             | Self::KeyPackage { group, .. }
             | Self::Welcome { group, .. }
-            | Self::Message { group, .. } => group,
+            | Self::Message { group, .. }
+            | Self::Forward { group, .. } => group,
         }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let (kind, payload, name): (u8, Option<&[u8]>, Option<&str>) = match self {
-            Self::KeyPackageRequest { name, .. } => (1, None, Some(name)),
-            Self::KeyPackage { key_package, .. } => (2, Some(key_package), None),
-            Self::Welcome { welcome, name, .. } => (3, Some(welcome), Some(name)),
-            Self::Message { message, .. } => (4, Some(message), None),
+        #[allow(clippy::type_complexity)]
+        let (kind, payload, name, to): (
+            u8,
+            Option<&[u8]>,
+            Option<&str>,
+            Option<&[u8; 32]>,
+        ) = match self {
+            Self::KeyPackageRequest { name, .. } => (1, None, Some(name), None),
+            Self::KeyPackage { key_package, .. } => (2, Some(key_package), None, None),
+            Self::Welcome { welcome, name, .. } => (3, Some(welcome), Some(name), None),
+            Self::Message { message, .. } => (4, Some(message), None, None),
+            Self::Forward { to, message, .. } => (5, Some(message), None, Some(to)),
         };
         let size = payload.map_or(0, <[u8]>::len) + name.map_or(0, str::len) + 48;
         cbor::to_vec(size, |e| {
-            e.map_len(2 + usize::from(payload.is_some()) + usize::from(name.is_some()))?;
+            e.map_len(
+                2 + usize::from(payload.is_some())
+                    + usize::from(name.is_some())
+                    + usize::from(to.is_some()),
+            )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.bytes(self.group())?;
             if let Some(p) = payload {
@@ -58,19 +79,23 @@ impl GroupWire {
             if let Some(n) = name {
                 e.u8(3)?.str(n)?;
             }
+            if let Some(t) = to {
+                e.u8(4)?.bytes(t)?;
+            }
             Ok(())
         })
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut kind, mut group, mut payload, mut name) = (None, None, None, None);
+        let (mut kind, mut group, mut payload, mut name, mut to) = (None, None, None, None, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
                 1 => group = Some(cbor::fixed_bytes::<16>(d)?),
                 2 => payload = Some(d.bytes()?.to_vec()),
                 3 => name = Some(d.str()?.to_owned()),
+                4 => to = Some(cbor::fixed_bytes::<32>(d)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -93,6 +118,11 @@ impl GroupWire {
             },
             4 => Self::Message {
                 group,
+                message: required(payload, "mls message")?,
+            },
+            5 => Self::Forward {
+                group,
+                to: required(to, "forward target")?,
                 message: required(payload, "mls message")?,
             },
             other => return Err(Error::UnexpectedType(u64::from(other))),
@@ -125,9 +155,23 @@ mod tests {
                 group: g,
                 message: vec![4, 5, 6],
             },
+            GroupWire::Forward {
+                group: g,
+                to: [9; 32],
+                message: vec![7],
+            },
         ] {
             assert_eq!(GroupWire::decode(&m.encode().unwrap()).unwrap(), m);
         }
         assert!(GroupWire::decode(&[0xa0]).is_err());
+        // A forward must name its target.
+        let mut no_target = GroupWire::Message {
+            group: g,
+            message: vec![1],
+        }
+        .encode()
+        .unwrap();
+        no_target[2] = 5; // { 0: 5, ... }
+        assert!(GroupWire::decode(&no_target).is_err());
     }
 }

@@ -14,6 +14,8 @@
 //! The manager is sans-IO: callers feed it messages and deliver what it
 //! returns. See `docs/appendix-f-groups.md`.
 
+#[cfg(feature = "node")]
+pub mod node;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -444,7 +446,35 @@ impl Groups {
                 welcome,
             } => self.on_welcome(from, group, &name, &welcome),
             GroupWire::Message { group, message } => self.on_message(group, &message),
+            GroupWire::Forward { group, to, message } => self.on_forward(from, group, to, message),
         }
+    }
+
+    /// Passes a member's message on to another member it couldn't reach.
+    /// Both must be in the group as we know it; the result goes out as a
+    /// plain `Message`, never forwarded again.
+    fn on_forward(
+        &self,
+        from: PublicIdentity,
+        group: GroupId,
+        to: [u8; 32],
+        message: Vec<u8>,
+    ) -> Result<Output> {
+        let to = PublicIdentity::from_bytes(&to)?;
+        let members = self.members_of(self.group(&group)?);
+        if !members.contains(&from) {
+            return Err(GroupError::NotMember(from.fingerprint().to_string()));
+        }
+        if to == self.me || to == from || !members.contains(&to) {
+            return Err(GroupError::NotMember(to.fingerprint().to_string()));
+        }
+        Ok(Output {
+            send: vec![Outgoing {
+                to,
+                wire: GroupWire::Message { group, message },
+            }],
+            events: vec![],
+        })
     }
 
     fn on_key_package(

@@ -483,6 +483,9 @@ impl Ui {
                     self.current = Some(peer);
                     println!("  messages now go to {who}");
                 }
+                let node = self.node.clone();
+                let name = |p: &PublicIdentity| name_of(&node, p);
+                self.groups.connected(&self.node, &name, &peer);
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
             Event::OfflineMessage { from, via, msg } => self.show_message(from, msg, Some(via)),
@@ -893,11 +896,8 @@ impl Ui {
                 self.groups.list(&|p: &PublicIdentity| name_of(&node, p));
             }
             "g" => {
-                let node = self.node.clone();
-                let name = |p: &PublicIdentity| name_of(&node, p);
                 self.groups.say(
                     &self.node,
-                    &name,
                     arg.ok_or_else(|| anyhow!("usage: /g <group> <text>"))?,
                 )?;
             }

@@ -1,30 +1,25 @@
-//! `/group` commands: MLS groups delivered over the node's 1:1 sessions.
+//! `/group` commands: MLS groups on the shared [`GroupNode`], which
+//! persists them and delivers their traffic (Appendix F).
 
 use anyhow::{Result, anyhow, bail};
-use threnody_core::history::ConversationId;
 use threnody_core::store::Home;
-use threnody_core::{AppMessage, Identity, PublicIdentity};
-use threnody_groups::{GroupEvent, GroupId, GroupWire, Groups, Output};
+use threnody_core::{Identity, PublicIdentity};
+use threnody_groups::GroupId;
+use threnody_groups::node::{GroupNode, Update};
 use threnody_net::Node;
 
 pub const HELP: &str = "\
   /group new <name>                     create a group (you own it)
-  /group invite <group> <peer>          add a peer (they must be online)
+  /group invite <group> <peer>          add a contact (every device of theirs)
   /group accept [n]                     accept a pending invitation
+  /group decline [n]                    decline a pending invitation
   /group remove <group> <peer>          remove a member (owner only)
   /groups                               list groups and members
   /g <group> <text>                     send to a group";
 
 pub struct GroupUi {
-    groups: Groups,
-    /// Invitations awaiting consent: (group, name, inviter).
-    pending: Vec<(GroupId, String, PublicIdentity)>,
-    /// Where group state is persisted (encrypted under the identity).
-    home: Home,
-    identity: Identity,
+    groups: GroupNode,
 }
-
-const STATE: &str = "groups";
 
 fn short(id: &GroupId) -> String {
     id[..3].iter().map(|b| format!("{b:02x}")).collect()
@@ -33,31 +28,13 @@ fn short(id: &GroupId) -> String {
 impl GroupUi {
     /// Loads persisted groups for `identity` from `home`.
     pub fn load(home: &Home, identity: &Identity) -> Result<Self> {
-        let groups = match home.load_state(identity, STATE)? {
-            Some(bytes) => Groups::restore(identity, &bytes)?,
-            None => Groups::new(identity),
-        };
         Ok(Self {
-            groups,
-            pending: Vec::new(),
-            home: Home::new(home.dir()),
-            identity: Identity::from_seed(&identity.seed()),
+            groups: GroupNode::load(home, identity)?,
         })
     }
 
     pub fn count(&self) -> usize {
         self.groups.list().len()
-    }
-
-    fn save(&self) {
-        let r = self
-            .groups
-            .export()
-            .map_err(anyhow::Error::from)
-            .and_then(|b| Ok(self.home.save_state(&self.identity, STATE, &b)?));
-        if let Err(e) = r {
-            println!("! could not save group state: {e:#}");
-        }
     }
 
     fn label(&self, id: &GroupId) -> String {
@@ -67,6 +44,13 @@ impl GroupUi {
             .into_iter()
             .find(|(g, ..)| g == id)
             .map(|(_, n, ..)| n)
+            .or_else(|| {
+                self.groups
+                    .invites()
+                    .iter()
+                    .find(|i| i.group == *id)
+                    .map(|i| i.name.clone())
+            })
             .unwrap_or_default();
         format!("{name}#{}", short(id))
     }
@@ -93,92 +77,34 @@ impl GroupUi {
         }
     }
 
-    /// Delivers outgoing group traffic and prints events.
-    fn apply(&mut self, node: &Node, name: &dyn Fn(&PublicIdentity) -> String, out: Output) {
-        // Persist before anything leaves: a crash must not lose an epoch
-        // that peers have already moved to.
-        self.save();
-        for o in out.send {
-            let Ok(bytes) = o.wire.encode() else { continue };
-            if node.send(&o.to, AppMessage::Group(bytes.clone())).is_ok() {
-                continue;
-            }
-            // No live session: seal it for the member's mailboxes, else
-            // try to reach the member through relays.
-            if node.can_send_offline(&o.to)
-                && node
-                    .send_offline(&o.to, &AppMessage::Group(bytes.clone()))
-                    .is_ok()
-            {
-                continue;
-            }
-            let (node, to, who) = (node.clone(), o.to, name(&o.to));
-            tokio::spawn(async move {
-                let delivered = node.connect_relayed(to.fingerprint()).await.is_ok()
-                    && node.send(&to, AppMessage::Group(bytes)).is_ok();
-                if !delivered {
-                    println!("! {who} is unreachable; group message not delivered");
-                }
-            });
-        }
-        for e in out.events {
-            self.show(node, name, e);
-        }
-    }
-
-    fn show(&mut self, node: &Node, name: &dyn Fn(&PublicIdentity) -> String, e: GroupEvent) {
-        match e {
-            GroupEvent::Joined { group, owner, .. } => {
-                println!(
-                    "* joined group {} (owner {})",
-                    self.label(&group),
-                    name(&owner)
-                );
-            }
-            GroupEvent::InviteRequested {
-                group,
-                name: gname,
-                peer,
-            } => {
-                // Mutually approved contacts are trusted to add us; anyone
-                // else needs explicit consent.
-                let trusted = node
-                    .contacts()
-                    .get(&peer)
-                    .is_some_and(|c| c.mutually_approved());
-                if trusted {
-                    match self.groups.accept_invite(&group, peer) {
-                        Ok(out) => self.apply(node, name, out),
-                        Err(e) => println!("! invitation from {}: {e}", name(&peer)),
-                    }
-                } else {
-                    self.pending.push((group, gname.clone(), peer));
+    fn show(&self, name: &dyn Fn(&PublicIdentity) -> String, updates: Vec<Update>) {
+        for u in updates {
+            match u {
+                Update::Joined { group, owner, .. } => {
                     println!(
-                        "* {} invites you to group {gname:?}. /group accept {} to join",
-                        name(&peer),
-                        self.pending.len()
+                        "* joined group {} (owner {})",
+                        self.label(&group),
+                        name(&owner)
                     );
                 }
-            }
-            GroupEvent::MemberAdded { group, member } => {
-                println!("* {} joined {}", name(&member), self.label(&group));
-            }
-            GroupEvent::MemberRemoved { group, member } => {
-                println!("* {} left {}", name(&member), self.label(&group));
-            }
-            GroupEvent::Left { group } => {
-                println!("* you were removed from group #{}", short(&group))
-            }
-            GroupEvent::Text { group, from, text } => {
-                println!("[{}] <{}> {text}", self.label(&group), name(&from));
-                node.record(
-                    ConversationId::Group(group),
-                    *from.as_bytes(),
-                    false,
-                    &text,
-                    false,
-                    None,
-                );
+                Update::Invited(i) => println!(
+                    "* {} invites you to group {:?}. /group accept {} to join",
+                    name(&i.from),
+                    i.name,
+                    self.groups.invites().len()
+                ),
+                Update::MemberAdded { group, member } => {
+                    println!("* {} joined {}", name(&member), self.label(&group));
+                }
+                Update::MemberRemoved { group, member } => {
+                    println!("* {} left {}", name(&member), self.label(&group));
+                }
+                Update::Left { group } => {
+                    println!("* you were removed from group #{}", short(&group));
+                }
+                Update::Text { group, from, text } => {
+                    println!("[{}] <{}> {text}", self.label(&group), name(&from));
+                }
             }
         }
     }
@@ -191,13 +117,38 @@ impl GroupUi {
         peer: PublicIdentity,
         payload: &[u8],
     ) {
-        let res = GroupWire::decode(payload)
-            .map_err(anyhow::Error::from)
-            .and_then(|w| self.groups.handle(peer, w).map_err(anyhow::Error::from));
-        match res {
-            Ok(out) => self.apply(node, name, out),
-            Err(e) => println!("! group message from {}: {e:#}", name(&peer)),
+        match self.groups.incoming(node, peer, payload) {
+            Ok(updates) => self.show(name, updates),
+            Err(e) => println!("! group message from {}: {e}", name(&peer)),
         }
+    }
+
+    /// Sends group messages held for `peer`, who just connected.
+    pub fn connected(
+        &mut self,
+        node: &Node,
+        name: &dyn Fn(&PublicIdentity) -> String,
+        peer: &PublicIdentity,
+    ) {
+        let held = self.groups.held_for(peer);
+        self.groups.connected(node, peer);
+        let sent = held - self.groups.held_for(peer);
+        if sent > 0 {
+            println!("* delivered {sent} held group message(s) to {}", name(peer));
+        }
+    }
+
+    /// Picks pending invitation `n` (1-based; the latest by default).
+    fn pending(&self, n: Option<&str>) -> Result<GroupId> {
+        let invites = self.groups.invites();
+        if invites.is_empty() {
+            bail!("no pending invitations");
+        }
+        let n: usize = n.map_or(Ok(invites.len()), str::parse)?;
+        if n == 0 || n > invites.len() {
+            bail!("pick 1..={}", invites.len());
+        }
+        Ok(invites[n - 1].group)
     }
 
     /// `/group ...` and `/groups`.
@@ -216,7 +167,6 @@ impl GroupUi {
                     bail!("usage: /group new <name>");
                 }
                 let id = self.groups.create(&gname)?;
-                self.save();
                 println!(
                     "* created {} — invite with /group invite {} <peer>",
                     self.label(&id),
@@ -229,48 +179,19 @@ impl GroupUi {
                     bail!("usage: /group invite <group> <peer>")
                 };
                 let (g, p) = (self.find(g)?, resolve(p)?);
-                // Invite every device of the contact's account (Appendix J);
-                // MLS leaves stay per device.
-                let me = node.identity();
-                let devices: Vec<PublicIdentity> = node
-                    .account_of(&p)
-                    .map(|a| {
-                        a.state()
-                            .devices
-                            .iter()
-                            .map(|(d, _)| *d)
-                            .filter(|d| *d != me)
-                            .collect()
-                    })
-                    .unwrap_or_else(|| vec![p]);
-                let mut invited = 0;
-                for d in devices {
-                    match self.groups.invite(&g, d) {
-                        Ok(out) => {
-                            invited += 1;
-                            println!("* invitation sent to {}", name(&d));
-                            self.apply(node, name, out);
-                        }
-                        Err(threnody_groups::GroupError::AlreadyMember(_)) => {}
-                        Err(e) => println!("! {}: {e}", name(&d)),
-                    }
-                }
-                if invited == 0 {
-                    bail!("every device of {} is already in the group", name(&p));
-                }
+                let n = self.groups.invite(node, &g, &p)?;
+                println!("* invitation sent to {} ({n} device(s))", name(&p));
             }
             "accept" => {
-                if self.pending.is_empty() {
-                    bail!("no pending invitations");
-                }
-                let n: usize = it.next().map_or(Ok(self.pending.len()), str::parse)?;
-                if n == 0 || n > self.pending.len() {
-                    bail!("pick 1..={}", self.pending.len());
-                }
-                let (g, gname, peer) = self.pending.remove(n - 1);
-                let out = self.groups.accept_invite(&g, peer)?;
-                println!("* accepting {gname:?} from {}", name(&peer));
-                self.apply(node, name, out);
+                let g = self.pending(it.next())?;
+                println!("* accepting {}", self.label(&g));
+                let updates = self.groups.accept(node, &g)?;
+                self.show(name, updates);
+            }
+            "decline" => {
+                let g = self.pending(it.next())?;
+                println!("* declined {}", self.label(&g));
+                self.groups.decline(&g);
             }
             "remove" | "kick" => {
                 let (g, p) = (it.next(), it.next());
@@ -278,8 +199,8 @@ impl GroupUi {
                     bail!("usage: /group remove <group> <peer>")
                 };
                 let (g, p) = (self.find(g)?, resolve(p)?);
-                let out = self.groups.remove(&g, &p)?;
-                self.apply(node, name, out);
+                let updates = self.groups.remove(node, &g, &p)?;
+                self.show(name, updates);
             }
             "list" => self.list(name),
             other => bail!("unknown /group {other}; try /help"),
@@ -293,7 +214,17 @@ impl GroupUi {
             println!("No groups. /group new <name>");
         }
         for (id, _, owner, members) in groups {
-            let names: Vec<String> = members.iter().map(name).collect();
+            let names: Vec<String> = members
+                .iter()
+                .map(|m| {
+                    let held = self.groups.held_for(m);
+                    if held > 0 {
+                        format!("{} ({held} held)", name(m))
+                    } else {
+                        name(m)
+                    }
+                })
+                .collect();
             println!(
                 "  {}  owner {}  members: {}",
                 self.label(&id),
@@ -301,32 +232,23 @@ impl GroupUi {
                 names.join(", ")
             );
         }
-        for (i, (_, g, p)) in self.pending.iter().enumerate() {
-            println!("  invitation {}: {g:?} from {}", i + 1, name(p));
+        for (i, inv) in self.groups.invites().iter().enumerate() {
+            println!(
+                "  invitation {}: {:?} from {}",
+                i + 1,
+                inv.name,
+                name(&inv.from)
+            );
         }
     }
 
     /// `/g <group> <text>`.
-    pub fn say(
-        &mut self,
-        node: &Node,
-        name: &dyn Fn(&PublicIdentity) -> String,
-        args: &str,
-    ) -> Result<()> {
+    pub fn say(&mut self, node: &Node, args: &str) -> Result<()> {
         let (g, text) = args
             .split_once(' ')
             .ok_or_else(|| anyhow!("usage: /g <group> <text>"))?;
         let g = self.find(g)?;
-        let out = self.groups.send_text(&g, text)?;
-        self.apply(node, name, out);
-        node.record(
-            ConversationId::Group(g),
-            *node.identity().as_bytes(),
-            true,
-            text,
-            false,
-            None,
-        );
+        self.groups.send_text(node, &g, text)?;
         Ok(())
     }
 }

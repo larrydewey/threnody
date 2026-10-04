@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 threnody-core.workspace = true
 threnody-net.workspace = true
-threnody-groups.workspace = true
+threnody-groups = { workspace = true, features = ["node"] }
 tokio = { workspace = true, features = ["process"] }
 clap.workspace = true
 anyhow.workspace = true

@@ -14,6 +14,12 @@ openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 const-cbor.workspace = true
 thiserror.workspace = true
+threnody-net = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+# GroupNode: persistence, consent and delivery on a running threnody-net Node.
+node = ["dep:threnody-net", "dep:tokio"]
 
 [lints]
 workspace = true

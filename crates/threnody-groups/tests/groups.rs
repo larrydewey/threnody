@@ -249,3 +249,78 @@ fn groups_survive_export_and_restore() {
 
     assert!(Groups::restore(&a, b"garbage").is_err());
 }
+
+#[test]
+fn members_forward_messages_for_each_other() {
+    let (a, b, c, x) = (
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+    );
+    let (pa, pb, pc, px) = (a.public(), b.public(), c.public(), x.public());
+    let mut net = Net::new(&[&a, &b, &c, &x]);
+    let g = net.node(&pa).create("team").unwrap();
+    for p in [pb, pc] {
+        let out = net.node(&pa).invite(&g, p).unwrap();
+        net.deliver(pa, out);
+    }
+    net.take(&pa);
+    net.take(&pb);
+
+    // Carol can't reach Bob: she hands Alice his copy.
+    let out = net.node(&pc).send_text(&g, "via alice").unwrap();
+    let for_bob = out.send.into_iter().find(|o| o.to == pb).unwrap();
+    let GroupWire::Message { message, .. } = for_bob.wire else {
+        panic!("expected an MLS message")
+    };
+    let fwd = GroupWire::Forward {
+        group: g,
+        to: *pb.as_bytes(),
+        message,
+    };
+    let wire = GroupWire::decode(&fwd.encode().unwrap()).unwrap();
+    let relayed = net.node(&pa).handle(pc, wire.clone()).unwrap();
+    assert!(relayed.events.is_empty(), "the forwarder sees nothing new");
+    assert_eq!(relayed.send.len(), 1);
+    assert_eq!(relayed.send[0].to, pb);
+    assert!(matches!(relayed.send[0].wire, GroupWire::Message { .. }));
+    net.deliver(pa, relayed);
+    assert!(net.take(&pb).contains(&GroupEvent::Text {
+        group: g,
+        from: pc,
+        text: "via alice".into()
+    }));
+
+    // Only members forward, only to members, and never to themselves.
+    assert!(
+        net.node(&pa).handle(px, wire.clone()).is_err(),
+        "sender outside the group"
+    );
+    let to = |t: PublicIdentity| GroupWire::Forward {
+        group: g,
+        to: *t.as_bytes(),
+        message: vec![1],
+    };
+    assert!(
+        net.node(&pa).handle(pc, to(px)).is_err(),
+        "target outside the group"
+    );
+    assert!(
+        net.node(&pa).handle(pc, to(pa)).is_err(),
+        "forward to the forwarder"
+    );
+    assert!(
+        net.node(&pa).handle(pc, to(pc)).is_err(),
+        "forward back to the sender"
+    );
+    // Unknown group.
+    let mut bad = to(pb);
+    if let GroupWire::Forward { group, .. } = &mut bad {
+        *group = [0; 16];
+    }
+    assert!(matches!(
+        net.node(&pa).handle(pc, bad),
+        Err(GroupError::UnknownGroup)
+    ));
+}

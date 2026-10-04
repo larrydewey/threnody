@@ -3077,6 +3077,8 @@ dependencies = [
  "openmls_traits",
  "thiserror",
  "threnody-core",
+ "threnody-net",
+ "tokio",
 ]
 
 [[package]]

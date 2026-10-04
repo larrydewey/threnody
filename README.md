@@ -22,7 +22,7 @@ threnody --home ~/.thr-a init
 threnody --home ~/.thr-a run --no-listen -c 'threnody://<fingerprint>@192.0.2.7:7450'
 ```
 
-Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/ble scan` finds nearby Threnody devices over Bluetooth LE, and `/ble connect <n>` opens a session over the radio (Linux, BlueZ). `run --ble` makes a Linux machine advertise a private beacon, accept Bluetooth sessions, and connect to approved contacts it hears. The Android sample app advertises after you tap *Start Bluetooth*, and it can scan and dial. With `run --wifi-direct`, `/wifi-direct request` asks the current (nearby, approved) peer to host a Wi-Fi Direct group, and the laptop joins it through NetworkManager. The session then moves to the faster link.
+Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|decline|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/ble scan` finds nearby Threnody devices over Bluetooth LE, and `/ble connect <n>` opens a session over the radio (Linux, BlueZ). `run --ble` makes a Linux machine advertise a private beacon, accept Bluetooth sessions, and connect to approved contacts it hears. The Android sample app advertises after you tap *Start Bluetooth*, and it can scan and dial. With `run --wifi-direct`, `/wifi-direct request` asks the current (nearby, approved) peer to host a Wi-Fi Direct group, and the laptop joins it through NetworkManager. The session then moves to the faster link.
 
 `/onion <peer> [min-relays]` builds an onion circuit (two relays by default) so no single relay learns both ends.
 
@@ -87,7 +87,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync, account-wide offline keys and group invites; history not synced |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
 | §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message) |
-| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |
+| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers (sync between devices and backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
@@ -100,7 +100,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 ## Roadmap
 
 1. **Hardening (remaining).** Desktop and iOS keystores, ratchet persistence across reconnects, and an external audit.
-2. **Groups (remaining).** Store-and-forward via members, and more admin roles.
+2. **Groups (remaining).** More admin roles and self-removal, files in groups, and acknowledgements so a copy sent on a dying session is resent.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.

@@ -20,8 +20,8 @@ uniffi::setup_scaffolding!();
 
 mod groups;
 
-use groups::GroupState;
 pub use groups::{GroupInfo, GroupInvite};
+use threnody_groups::node::GroupNode;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ThrenodyError {
@@ -246,7 +246,7 @@ pub struct ThrenodyNode {
     rt: Runtime,
     node: Node,
     events: Mutex<UnboundedReceiver<Event>>,
-    groups: Mutex<GroupState>,
+    groups: Mutex<GroupNode>,
     /// Events produced while handling another (group traffic), not yet returned.
     queued: Mutex<VecDeque<NodeEvent>>,
 }
@@ -341,7 +341,7 @@ fn convert(e: Event) -> NodeEvent {
 }
 
 impl ThrenodyNode {
-    fn group_state(&self) -> MutexGuard<'_, GroupState> {
+    fn group_node(&self) -> MutexGuard<'_, GroupNode> {
         self.groups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -389,7 +389,7 @@ impl ThrenodyNode {
             .enable_all()
             .build()
             .map_err(fail)?;
-        let groups = GroupState::load(&home, &identity)?;
+        let groups = GroupNode::load(&home, &identity).map_err(fail)?;
         let (node, events) = {
             let _guard = rt.enter();
             Node::new(NodeConfig {
@@ -789,7 +789,12 @@ impl ThrenodyNode {
                     msg: AppMessage::Group(payload),
                     ..
                 } => self.group_incoming(peer, &payload),
-                other => return Some(convert(other)),
+                other => {
+                    if let Event::Connected { peer, .. } = &other {
+                        self.group_connected(peer);
+                    }
+                    return Some(convert(other));
+                }
             }
         }
     }
@@ -1002,6 +1007,17 @@ mod tests {
             }
         }
 
+        /// Runs every node for a while, keeping their events.
+        fn settle(&mut self) {
+            for _ in 0..40 {
+                for (i, n) in self.nodes.iter().enumerate() {
+                    if let Some(e) = n.next_event(5) {
+                        self.seen[i].push_back(e);
+                    }
+                }
+            }
+        }
+
         /// The first event of node `target` matching `pred` (earlier ones are dropped).
         fn until(&mut self, target: usize, pred: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
             for _ in 0..400 {
@@ -1104,13 +1120,8 @@ mod tests {
         assert_eq!(info.members.len(), 3);
         assert!(!info.owned && alice.groups()[0].owned);
 
-        // Carol has no session with Bob: her messages reach him through
-        // Alice once Alice and Carol approve each other.
-        alice.set_approval(c_fp.clone(), true).unwrap();
-        carol.set_approval(a_fp.clone(), true).unwrap();
-        all.until(2, |e| {
-            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
-        });
+        // Carol has no session with Bob and no relay they both approve:
+        // Alice, the owner, forwards her messages to him.
         carol.send_group_text(g.clone(), "hi all".into()).unwrap();
         for i in [0, 1] {
             let m = all.until(i, |e| matches!(e, NodeEvent::GroupMessage { .. }));
@@ -1125,6 +1136,30 @@ mod tests {
         }
         assert_eq!(bob.group_history(g.clone(), 10).unwrap()[0].text, "hi all");
         assert!(carol.group_history(g.clone(), 10).unwrap()[0].outgoing);
+
+        // Store and forward: Bob is away when Carol writes; Alice holds
+        // her message until he is back.
+        drop(all);
+        bob.shutdown();
+        drop(bob);
+        let mut all = Pump::new(&[&*alice, &*carol]);
+        all.until(
+            0,
+            |e| matches!(e, NodeEvent::Disconnected { peer, .. } if *peer == b_fp),
+        );
+        carol
+            .send_group_text(g.clone(), "while you were out".into())
+            .unwrap();
+        // Let Alice take the forward (and hold it) before Bob is back.
+        all.settle();
+        drop(all);
+        let bob = open("b");
+        let mut all = Pump::new(&[&*alice, &*bob, &*carol]);
+        bob.reconnect();
+        let m = all.until(1, |e| matches!(e, NodeEvent::GroupMessage { .. }));
+        assert!(
+            matches!(m, NodeEvent::GroupMessage { from, text, .. } if from == c_fp && text == "while you were out")
+        );
 
         // Only the owner removes members.
         assert!(bob.remove_from_group(g.clone(), c_fp.clone()).is_err());

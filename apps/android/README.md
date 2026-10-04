@@ -32,4 +32,4 @@ The node is a process-wide singleton, so rotating the screen or recreating the A
 
 The UI flows were tested on an API 35 emulator against the desktop CLI: invites by deep link, chat both ways, approval, safety numbers, files both ways (and still listed after a restart), notifications, and redialing after a restart. For groups, the tests covered creating one, inviting an approved contact, joining an unapproved contact's group or declining it, chatting both ways and removing a member. They also covered light and dark themes, and portrait and landscape with three-button navigation.
 
-A group member who has no session with another member reaches them through an approved relay (Appendix G). Without one, the message isn't delivered.
+Group members don't need to be contacts of each other. A member who can't reach another one directly hands the message to a member who can, usually the owner. That member delivers it, or holds it until the other member is back (Appendix F).

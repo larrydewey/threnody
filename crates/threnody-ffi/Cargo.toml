@@ -25,7 +25,7 @@ threnody-net.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 qrcode.workspace = true
-threnody-groups.workspace = true
+threnody-groups = { workspace = true, features = ["node"] }
 uniffi = "0.32"
 
 [dev-dependencies]
