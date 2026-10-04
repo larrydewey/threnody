@@ -31,6 +31,10 @@ const TAG_LABEL: &[u8] = b"threnody v1 2026-10-03 discovery beacon";
 pub const TAG_BLOCK: usize = 8;
 /// Upper bound on tags per beacon (keeps datagrams under ~1.1 KB).
 pub const MAX_TAGS: usize = 64;
+/// Tags per Bluetooth LE beacon: one block, so the beacon (146 bytes) fits
+/// a single extended advertising PDU. With more approved peers, each beacon
+/// carries a fresh random subset of them.
+pub const BLE_TAGS: usize = TAG_BLOCK;
 
 fn tag(
     key: &[u8; 32],
@@ -53,15 +57,33 @@ fn tag(
 /// Builds a beacon for `keys` (one discovery key per approved peer; at most
 /// [`MAX_TAGS`] are used).
 pub fn beacon(me: &PublicIdentity, keys: &[[u8; 32]], port: u16, now_secs: u64) -> Vec<u8> {
+    beacon_with(me, keys, port, now_secs, MAX_TAGS)
+}
+
+/// Builds a beacon with at most `max_tags` tags. If there are more keys
+/// than that, a random subset is used, so over successive beacons every
+/// peer is eventually included.
+pub fn beacon_with(
+    me: &PublicIdentity,
+    keys: &[[u8; 32]],
+    port: u16,
+    now_secs: u64,
+    max_tags: usize,
+) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let used = keys.len().min(MAX_TAGS);
-    let slots = used.div_ceil(TAG_BLOCK).max(1) * TAG_BLOCK;
+    let max_tags = max_tags.clamp(1, MAX_TAGS);
+    let mut keys: Vec<&[u8; 32]> = keys.iter().collect();
+    if keys.len() > max_tags {
+        shuffle(&mut keys);
+        keys.truncate(max_tags);
+    }
+    let slots = keys.len().div_ceil(TAG_BLOCK).max(1) * TAG_BLOCK;
     let epoch = now_secs / EPOCH_SECS;
     let mut out = Vec::with_capacity(HEADER_LEN + slots * TAG_LEN);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&port.to_be_bytes());
-    let mut tags: Vec<[u8; TAG_LEN]> = keys[..used]
+    let mut tags: Vec<[u8; TAG_LEN]> = keys
         .iter()
         .map(|k| tag(k, me, epoch, &nonce, port))
         .collect();
@@ -71,14 +93,24 @@ pub fn beacon(me: &PublicIdentity, keys: &[[u8; 32]], port: u16, now_secs: u64) 
         tags.push(r);
     }
     // Shuffle so slot position does not reveal contact-book order.
-    for i in (1..tags.len()).rev() {
-        let j = (OsRng.next_u32() as usize) % (i + 1);
-        tags.swap(i, j);
-    }
+    shuffle(&mut tags);
     for t in tags {
         out.extend_from_slice(&t);
     }
     out
+}
+
+fn shuffle<T>(v: &mut [T]) {
+    for i in (1..v.len()).rev() {
+        let j = (OsRng.next_u32() as usize) % (i + 1);
+        v.swap(i, j);
+    }
+}
+
+/// The port (or Bluetooth PSM) a beacon advertises, readable by anyone.
+pub fn beacon_port(data: &[u8]) -> Option<u16> {
+    let p = data.get(NONCE_LEN..HEADER_LEN)?;
+    Some(u16::from_be_bytes([p[0], p[1]]))
 }
 
 /// Returns every candidate `(peer, port)` whose tag appears in `data`.
@@ -140,6 +172,26 @@ mod tests {
     }
 
     #[test]
+    fn ble_beacons_rotate_through_peers() {
+        let alice = Identity::generate().public();
+        let keys: Vec<[u8; 32]> = (0..20u8).map(|i| [i; 32]).collect();
+        let now = 1_791_000_000;
+        let mut seen = [false; 20];
+        for _ in 0..64 {
+            let b = beacon_with(&alice, &keys, 128, now, BLE_TAGS);
+            assert_eq!(b.len(), HEADER_LEN + BLE_TAGS * TAG_LEN);
+            let hits: Vec<usize> = (0..20)
+                .filter(|&i| !recognise(&b, [(&alice, &keys[i])], now).is_empty())
+                .collect();
+            assert_eq!(hits.len(), BLE_TAGS);
+            for i in hits {
+                seen[i] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every peer gets a turn");
+    }
+
+    #[test]
     fn beacons_are_unlinkable_and_reject_garbage() {
         let alice = Identity::generate().public();
         let b1 = beacon(&alice, &[[1u8; 32]], 7450, 0);
@@ -154,6 +206,8 @@ mod tests {
             beacon(&alice, &[], 1, 0).len(),
             HEADER_LEN + TAG_BLOCK * TAG_LEN
         );
+        assert_eq!(beacon_port(&b1), Some(7450));
+        assert_eq!(beacon_port(&[0u8; 17]), None);
         for bad in [&[][..], &[0u8; 20][..], &b1[..b1.len() - 1]] {
             assert!(recognise(bad, [(&alice, &[1u8; 32])], 0).is_empty());
         }

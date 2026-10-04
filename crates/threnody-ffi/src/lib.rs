@@ -52,6 +52,13 @@ pub struct HistoryEntry {
     pub disappearing: bool,
 }
 
+/// An approved contact heard over Bluetooth that this device should dial.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BleDial {
+    pub peer: String,
+    pub psm: u16,
+}
+
 /// Things the app should react to.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum NodeEvent {
@@ -442,6 +449,27 @@ impl ThrenodyNode {
             }
         });
         Ok(handle)
+    }
+
+    /// Service data to advertise under the Threnody Bluetooth UUID: a
+    /// private beacon carrying `psm`. Replace it at least every minute.
+    pub fn ble_beacon(&self, psm: u16) -> Vec<u8> {
+        self.node.ble_beacon(psm)
+    }
+
+    /// The PSM in any Threnody advert (readable without being a contact).
+    pub fn ble_advert_psm(&self, data: Vec<u8>) -> Option<u16> {
+        threnody_core::discovery::beacon_port(&data)
+    }
+
+    /// Checks heard service data. Returns the contact to dial (with
+    /// `attach_link(outbound = true, expect = peer)`) if it is an approved
+    /// contact this device should connect to now.
+    pub fn ble_heard(&self, data: Vec<u8>) -> Option<BleDial> {
+        self.node.ble_heard(&data).map(|(peer, psm)| BleDial {
+            peer: peer.fingerprint().to_string(),
+            psm,
+        })
     }
 
     /// Waits up to `timeout_ms` for the next event.

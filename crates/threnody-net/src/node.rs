@@ -234,6 +234,7 @@ pub(crate) struct Shared {
     pub(crate) linking: Mutex<LinkState>,
     /// Shared prekey bundles of our own other devices, to forward.
     pub(crate) siblings: Mutex<HashMap<[u8; 32], PrekeyBundle>>,
+    pub(crate) ble: Mutex<crate::discovery::BleState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
 }
@@ -347,6 +348,7 @@ impl Node {
             bundles: Mutex::new(bundles),
             mailbox: Mutex::new(mailbox),
             onion: Mutex::new(OnionState::default()),
+            ble: Mutex::default(),
             account: Mutex::new(account),
             accounts: Mutex::new(accounts),
             linking: Mutex::new(LinkState::default()),

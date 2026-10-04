@@ -35,5 +35,5 @@ k      = number of approved peers rounded up to a multiple of 8 (max 64); spare 
 ## Not yet done
 
 - IPv6 link-local multicast.
-- Bluetooth LE and Wi-Fi Aware advertising with the same tag scheme.
+- Wi-Fi Aware advertising with the same tag scheme. Bluetooth LE uses it already (Appendix K).
 - Rotating the TCP port so the port in the beacon isn't a stable fingerprint.

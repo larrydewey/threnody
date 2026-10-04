@@ -3,18 +3,8 @@ package org.threnody.app
 import android.Manifest
 import android.app.Activity
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
-import android.os.ParcelUuid
 import android.net.ConnectivityManager
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
@@ -25,9 +15,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.net.Inet4Address
-import java.util.UUID
 import java.util.concurrent.Executors
-import uniffi.threnody_ffi.ByteLink
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
 
@@ -42,7 +30,6 @@ object Threnody {
     var listenAddr: String = ""
         private set
     @Volatile var current: String? = null
-    @Volatile var bleServer: BluetoothServerSocket? = null
     private val log = StringBuilder()
     /** The visible Activity's log view, or null while backgrounded. */
     @Volatile private var listener: ((String) -> Unit)? = null
@@ -53,6 +40,7 @@ object Threnody {
         instance = it
         say("listening on $listenAddr")
         pump(ctx.applicationContext, it)
+        if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
     }
 
     /** Attaches a log view; returns everything logged so far. */
@@ -152,7 +140,7 @@ class MainActivity : Activity() {
                 val n = t.removePrefix("ble ").trim().toIntOrNull()
                 val found = n?.let { seen.getOrNull(it - 1) }
                     ?: return@setOnClickListener say("! no such Bluetooth device; scan first")
-                worker.execute { dial(found.first, found.second) }
+                worker.execute { Bluetooth.dial(node, found.first, found.second, null) }
                 return@setOnClickListener
             }
             worker.execute {
@@ -170,14 +158,12 @@ class MainActivity : Activity() {
             }
         }
         scan.setOnClickListener {
-            val needed = arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
-                .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-            if (needed.isEmpty()) scanBluetooth() else requestPermissions(needed.toTypedArray(), 2)
+            if (Bluetooth.permitted(this)) scanBluetooth()
+            else requestPermissions(Bluetooth.permissions, 2)
         }
         bluetooth.setOnClickListener {
-            val needed = arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-                .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-            if (needed.isEmpty()) startBluetooth() else requestPermissions(needed.toTypedArray(), 1)
+            if (Bluetooth.permitted(this)) startBluetooth()
+            else requestPermissions(Bluetooth.permissions, 1)
         }
         approve.setOnClickListener {
             val peer = current ?: return@setOnClickListener say("! no peer yet")
@@ -196,112 +182,18 @@ class MainActivity : Activity() {
         } else if (code == 2) scanBluetooth() else startBluetooth()
     }
 
-    /**
-     * Listens on an L2CAP channel and advertises its PSM under the Threnody
-     * service UUID. The channel is "insecure" at the Bluetooth layer on
-     * purpose: no pairing is needed, the Threnody handshake authenticates.
-     */
-    @Suppress("MissingPermission")
     private fun startBluetooth() {
-        if (Threnody.bleServer != null) return say("* Bluetooth already on")
-        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
-            ?: return say("! no Bluetooth adapter")
-        val server = try { adapter.listenUsingInsecureL2capChannel() }
-            catch (e: Exception) { return say("! L2CAP listen: ${e.message}") }
-        Threnody.bleServer = server
-        val psm = server.psm
-        val data = AdvertiseData.Builder()
-            .addServiceData(ParcelUuid(UUID.fromString(BLE_SERVICE)), byteArrayOf((psm and 0xff).toByte(), (psm shr 8).toByte()))
-            .setIncludeDeviceName(false)
-            .build()
-        val settings = AdvertiseSettings.Builder()
-            .setConnectable(true)
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .build()
-        adapter.bluetoothLeAdvertiser?.startAdvertising(settings, data, object : AdvertiseCallback() {
-            override fun onStartSuccess(s: AdvertiseSettings?) = say("* Bluetooth: advertising, L2CAP psm $psm")
-            override fun onStartFailure(code: Int) = say("! Bluetooth advertise failed ($code)")
-        }) ?: say("! BLE advertising not supported")
-        Thread {
-            while (true) {
-                val sock = try { server.accept() } catch (e: Exception) { break }
-                say("* Bluetooth link from ${sock.remoteDevice.address}")
-                attach(sock)
-            }
-        }.start()
+        if (Bluetooth.running) return say("* Bluetooth already on")
+        worker.execute { Bluetooth.start(applicationContext, node) }
     }
 
-    /** Scans for Threnody adverts for 8 seconds and lists them. */
-    @Suppress("MissingPermission")
     private fun scanBluetooth() {
-        val scanner = getSystemService(BluetoothManager::class.java)?.adapter?.bluetoothLeScanner
-            ?: return say("! no Bluetooth scanner")
-        val uuid = ParcelUuid(UUID.fromString(BLE_SERVICE))
-        val found = LinkedHashMap<String, Pair<BluetoothDevice, Int>>()
-        val cb = object : ScanCallback() {
-            override fun onScanResult(type: Int, r: ScanResult) {
-                val data = r.scanRecord?.getServiceData(uuid) ?: return
-                if (data.size < 2) return
-                val psm = (data[0].toInt() and 0xff) or ((data[1].toInt() and 0xff) shl 8)
-                found[r.device.address] = r.device to psm
-            }
-        }
         say("* scanning Bluetooth for 8s…")
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        scanner.startScan(null, settings, cb)
-        log.postDelayed({
-            scanner.stopScan(cb)
-            seen = found.values.toList()
-            if (seen.isEmpty()) say("* no Threnody devices nearby")
-            seen.forEachIndexed { i, (d, psm) -> say("  ${i + 1}: ${d.address} psm $psm — connect with \"ble ${i + 1}\"") }
-        }, 8000)
-    }
-
-    /**
-     * Opens an L2CAP channel to a scanned device and starts a session.
-     * LE connection setup fails transiently (HCI 0x3e) often enough that a
-     * few attempts are worth making.
-     */
-    @Suppress("MissingPermission")
-    private fun dial(device: BluetoothDevice, psm: Int) {
-        say("* dialing ${device.address} psm $psm…")
-        for (attempt in 1..3) {
-            try {
-                val sock = device.createInsecureL2capChannel(psm)
-                sock.connect()
-                attach(sock, outbound = true)
-                return
-            } catch (e: Exception) {
-                if (attempt == 3) say("! Bluetooth dial: ${e.message}")
-                else Thread.sleep(500)
-            }
+        Bluetooth.scanOnce(this, node) { found ->
+            seen = found
+            if (found.isEmpty()) say("* no Threnody devices nearby")
+            found.forEachIndexed { i, (d, psm) -> say("  ${i + 1}: ${d.address} psm $psm — connect with \"ble ${i + 1}\"") }
         }
-    }
-
-    /** Bridges one Bluetooth socket into the node. */
-    private fun attach(sock: BluetoothSocket, outbound: Boolean = false) {
-        val out = sock.outputStream
-        val link = object : ByteLink {
-            override fun send(data: ByteArray): Boolean =
-                try { out.write(data); out.flush(); true } catch (e: Exception) { false }
-            override fun disconnect() { try { sock.close() } catch (_: Exception) {} }
-        }
-        val handle = node.attachLink(link, outbound, "ble", sock.remoteDevice.address, null)
-        Thread {
-            val buf = ByteArray(16 * 1024)
-            try {
-                val input = sock.inputStream
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    handle.receive(buf.copyOf(n))
-                }
-            } catch (_: Exception) {
-            } finally {
-                handle.closed()
-            }
-        }.start()
     }
 
     private fun wifiIp(): String? {
@@ -311,11 +203,6 @@ class MainActivity : Activity() {
     }
 
     private fun short(fp: String) = Threnody.short(fp)
-
-    companion object {
-        /** Must match `threnody_net::discovery::BLE_SERVICE_UUID`. */
-        const val BLE_SERVICE = "7e9f0e1c-3b5a-4c7e-9d2a-5f1e8b6c4a01"
-    }
 
     private fun say(line: String) = Threnody.say(line)
 

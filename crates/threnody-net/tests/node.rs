@@ -425,3 +425,97 @@ async fn sessions_run_over_any_byte_stream() {
         .unwrap();
     next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
 }
+
+#[tokio::test]
+async fn bluetooth_beacons_pick_exactly_one_dialer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let (carol, _crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    next(&mut brx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    timeout(Duration::from_secs(5), async {
+        while alice
+            .contacts()
+            .get(&bob_id)
+            .unwrap()
+            .discovery_key
+            .is_none()
+            || bob
+                .contacts()
+                .get(&alice.identity())
+                .unwrap()
+                .discovery_key
+                .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Connected peers are not dialed.
+    let (a_adv, b_adv) = (alice.ble_beacon(0x81), bob.ble_beacon(0x82));
+    assert_eq!(a_adv.len(), 146, "one extended-advert-sized block");
+    assert_eq!(bob.ble_heard(&a_adv), None);
+    assert_eq!(alice.ble_heard(&b_adv), None);
+
+    alice.disconnect(&bob_id);
+    next(&mut brx, |e| matches!(e, Event::Disconnected { .. })).await;
+    timeout(Duration::from_secs(5), async {
+        while !alice.sessions().is_empty() || !bob.sessions().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Exactly one side dials, with the PSM from the other's advert.
+    let by_bob = bob.ble_heard(&alice.ble_beacon(0x81));
+    let by_alice = alice.ble_heard(&bob.ble_beacon(0x82));
+    if alice.identity().as_bytes() < bob_id.as_bytes() {
+        assert_eq!((by_alice, by_bob), (Some((bob_id, 0x82)), None));
+        assert_eq!(alice.ble_heard(&bob.ble_beacon(0x82)), None, "redial waits");
+    } else {
+        assert_eq!((by_alice, by_bob), (None, Some((alice.identity(), 0x81))));
+        assert_eq!(bob.ble_heard(&alice.ble_beacon(0x81)), None, "redial waits");
+    }
+    // If the dialer never shows up, the other side dials after a while.
+    let t0 = std::time::Instant::now();
+    let (other, other_psm) = if alice.identity().as_bytes() < bob_id.as_bytes() {
+        (&bob, 0x81)
+    } else {
+        (&alice, 0x82)
+    };
+    let heard = |n: &Node, at| {
+        let b = if n.identity() == bob_id {
+            alice.ble_beacon(0x81)
+        } else {
+            bob.ble_beacon(0x82)
+        };
+        n.ble_heard_at(&b, at)
+    };
+    assert_eq!(heard(other, t0 + Duration::from_secs(10)), None);
+    assert_eq!(heard(other, t0 + Duration::from_secs(40)), None);
+    let fallback = heard(other, t0 + Duration::from_secs(60)).expect("fallback dial");
+    assert_eq!(fallback.1, other_psm);
+    // A long silence restarts the clock.
+    assert_eq!(heard(other, t0 + Duration::from_secs(300)), None);
+
+    // Strangers learn nothing they can act on.
+    assert_eq!(carol.ble_heard(&alice.ble_beacon(0x81)), None);
+    assert_eq!(
+        threnody_core::discovery::beacon_port(&alice.ble_beacon(0x81)),
+        Some(0x81)
+    );
+}

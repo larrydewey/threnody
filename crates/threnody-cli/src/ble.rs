@@ -1,16 +1,18 @@
-//! Bluetooth LE transport via BlueZ: find Threnody devices advertising
-//! their L2CAP channel, and connect to them. The session over the channel
-//! is the ordinary Threnody handshake and ratchet.
+//! Bluetooth LE transport via BlueZ: advertise our L2CAP channel inside a
+//! private beacon (Appendix E, K), find other Threnody devices, and connect
+//! to them, automatically for approved contacts. The session over the
+//! channel is the ordinary Threnody handshake and ratchet.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bluer::adv::{Advertisement, AdvertisementHandle};
+use bluer::adv::{Advertisement, SecondaryChannel};
 use bluer::l2cap::{SocketAddr, Stream, StreamListener};
 use bluer::{AdapterEvent, Address, AddressType};
 use futures_util::StreamExt;
 use threnody_core::PublicIdentity;
+use threnody_core::discovery::{EPOCH_SECS, beacon_port};
 use threnody_net::Node;
 use threnody_net::discovery::BLE_SERVICE_UUID;
 
@@ -45,7 +47,7 @@ pub async fn scan(secs: u64) -> Result<Vec<Found>> {
                 let Some(AdapterEvent::DeviceAdded(addr)) = ev else { continue };
                 let Ok(dev) = adapter.device(addr) else { continue };
                 let Ok(Some(data)) = dev.service_data().await else { continue };
-                let Some(psm) = data.get(&uuid).and_then(|d| d.get(..2)).map(|b| u16::from_le_bytes([b[0], b[1]])) else { continue };
+                let Some(psm) = data.get(&uuid).and_then(|d| advert_psm(d)) else { continue };
                 found.insert(addr, Found {
                     addr,
                     addr_type: dev.address_type().await.unwrap_or(AddressType::LeRandom),
@@ -63,8 +65,22 @@ pub async fn scan(secs: u64) -> Result<Vec<Found>> {
     Ok(list)
 }
 
+/// How often the advertised beacon is replaced: well inside one discovery
+/// epoch, so peers always see a current tag and a fresh nonce.
+const REFRESH: Duration = Duration::from_secs(EPOCH_SECS / 5);
+
+/// The PSM in a Threnody advert: a beacon's port field.
+fn advert_psm(data: &[u8]) -> Option<u16> {
+    beacon_port(data)
+}
+
 /// Opens the device's L2CAP channel and runs a Threnody session over it.
-pub async fn connect(node: &Node, f: &Found) -> Result<PublicIdentity> {
+/// `expect` pins the peer's fingerprint.
+pub async fn connect(
+    node: &Node,
+    f: &Found,
+    expect: Option<threnody_core::Fingerprint>,
+) -> Result<PublicIdentity> {
     let target = SocketAddr::new(f.addr, f.addr_type, f.psm);
     let stream = tokio::time::timeout(Duration::from_secs(20), Stream::connect(target))
         .await
@@ -81,51 +97,142 @@ pub async fn connect(node: &Node, f: &Found) -> Result<PublicIdentity> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(node
-        .connect_stream(stream, "ble", f.addr.to_string(), None)
+        .connect_stream(stream, "ble", f.addr.to_string(), expect)
         .await?)
 }
 
-/// Keeps advertising for as long as it lives.
+/// Keeps advertising, accepting and auto-dialing for as long as it lives.
 pub struct Listening {
     pub psm: u16,
-    _adv: AdvertisementHandle,
-    _session: bluer::Session,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// Listens on an LE L2CAP channel, advertises its PSM under the Threnody
-/// UUID, and accepts sessions on it until the node shuts down.
+impl Drop for Listening {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Listens on an LE L2CAP channel, advertises its PSM inside a private
+/// beacon under the Threnody UUID, accepts sessions on it, and dials
+/// approved contacts whose beacons we hear.
 pub async fn listen(node: &Node) -> Result<Listening> {
     let session = bluer::Session::new().await.context("connecting to BlueZ")?;
-    let adapter = session.default_adapter().await.context("no Bluetooth adapter")?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .context("no Bluetooth adapter")?;
     adapter.set_powered(true).await.ok();
     let listener = StreamListener::bind(SocketAddr::new(Address::any(), AddressType::LePublic, 0))
         .await
         .context("binding an LE L2CAP channel")?;
     let psm = listener.as_ref().local_addr()?.psm;
     let uuid: bluer::Uuid = BLE_SERVICE_UUID.parse()?;
-    let adv = Advertisement {
+    let advert = move |node: &Node| Advertisement {
         advertisement_type: bluer::adv::Type::Peripheral,
-        service_data: [(uuid, psm.to_le_bytes().to_vec())].into(),
-        discoverable: Some(true),
+        service_data: [(uuid, node.ble_beacon(psm))].into(),
+        // The beacon is too big for a legacy advert; this makes BlueZ use
+        // extended advertising.
+        secondary_channel: Some(SecondaryChannel::OneM),
         ..Default::default()
     };
-    let handle = adapter
-        .advertise(adv)
+    // Fail early (and visibly) if the controller can't advertise.
+    let first = adapter
+        .advertise(advert(node))
         .await
         .context("starting the BLE advertisement")?;
-    let node = node.clone();
-    tokio::spawn(async move {
+
+    let mut tasks = Vec::new();
+    let (n, a) = (node.clone(), adapter.clone());
+    tasks.push(tokio::spawn(async move {
+        let _session = session;
+        let mut _advertising = first;
         loop {
-            let Ok((stream, sa)) = listener.accept().await else { break };
-            let node = node.clone();
+            tokio::time::sleep(REFRESH).await;
+            // Register the new beacon before dropping the old one.
+            match a.advertise(advert(&n)).await {
+                Ok(h) => _advertising = h,
+                Err(e) => eprintln!("! Bluetooth advert refresh: {e}"),
+            }
+        }
+    }));
+
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move {
+        loop {
+            let Ok((stream, sa)) = listener.accept().await else {
+                break;
+            };
+            let node = n.clone();
             tokio::spawn(async move {
                 let _ = node.accept_stream(stream, "ble", sa.addr.to_string()).await;
             });
         }
-    });
-    Ok(Listening {
-        psm,
-        _adv: handle,
-        _session: session,
-    })
+    }));
+
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = auto_dial(&n, &adapter, uuid).await {
+            eprintln!("! Bluetooth scanning stopped: {e:#}");
+        }
+    }));
+    Ok(Listening { psm, tasks })
+}
+
+/// Scans continuously; dials approved contacts recognised from their
+/// beacons (the smaller key dials, as on the LAN).
+async fn auto_dial(node: &Node, adapter: &bluer::Adapter, uuid: bluer::Uuid) -> Result<()> {
+    adapter
+        .set_discovery_filter(bluer::DiscoveryFilter {
+            transport: bluer::DiscoveryTransport::Le,
+            duplicate_data: true,
+            ..Default::default()
+        })
+        .await
+        .ok();
+    let events = adapter.discover_devices_with_changes().await?;
+    let mut events = Box::pin(events);
+    // Devices are re-reported on every advert; look at each one at most
+    // every few seconds.
+    let mut last: HashMap<Address, std::time::Instant> = HashMap::new();
+    while let Some(ev) = events.next().await {
+        let AdapterEvent::DeviceAdded(addr) = ev else {
+            continue;
+        };
+        if last
+            .get(&addr)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            continue;
+        }
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
+        let Ok(Some(mut data)) = dev.service_data().await else {
+            continue;
+        };
+        let Some(adv) = data.remove(&uuid) else {
+            continue;
+        };
+        last.insert(addr, std::time::Instant::now());
+        let Some((peer, psm)) = node.ble_heard(&adv) else {
+            continue;
+        };
+        let f = Found {
+            addr,
+            addr_type: dev.address_type().await.unwrap_or(AddressType::LeRandom),
+            psm,
+            rssi: None,
+            name: None,
+        };
+        let node = node.clone();
+        tokio::spawn(async move {
+            if let Err(e) = connect(&node, &f, Some(peer.fingerprint())).await {
+                eprintln!("! Bluetooth auto-connect to {}: {e:#}", peer.fingerprint());
+            }
+        });
+    }
+    Ok(())
 }

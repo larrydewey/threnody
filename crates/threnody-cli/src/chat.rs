@@ -158,7 +158,10 @@ pub async fn run(opts: Options) -> Result<()> {
     let _ble = if opts.ble {
         match crate::ble::listen(&ui.node).await {
             Ok(l) => {
-                println!("Bluetooth LE: advertising, L2CAP psm {}", l.psm);
+                println!(
+                    "Bluetooth LE: advertising, L2CAP psm {}; approved contacts nearby connect automatically",
+                    l.psm
+                );
                 Some(l)
             }
             Err(e) => {
@@ -840,7 +843,7 @@ impl Ui {
                     f.addr, f.psm
                 );
                 tokio::spawn(async move {
-                    if let Err(e) = crate::ble::connect(&node, &f).await {
+                    if let Err(e) = crate::ble::connect(&node, &f, None).await {
                         println!("! Bluetooth connect: {e:#}");
                     }
                 });
