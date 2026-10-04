@@ -24,6 +24,8 @@ pub struct Options {
     pub tunnel: Option<TunnelOptions>,
     /// UDP port for LAN discovery; `None` disables it.
     pub discover: Option<u16>,
+    /// Advertise and accept sessions over Bluetooth LE.
+    pub ble: bool,
 }
 
 pub struct TunnelOptions {
@@ -151,6 +153,25 @@ pub async fn run(opts: Options) -> Result<()> {
     }
     for t in &opts.connect {
         ui.connect(t);
+    }
+    #[cfg(all(feature = "ble", target_os = "linux"))]
+    let _ble = if opts.ble {
+        match crate::ble::listen(&ui.node).await {
+            Ok(l) => {
+                println!("Bluetooth LE: advertising, L2CAP psm {}", l.psm);
+                Some(l)
+            }
+            Err(e) => {
+                println!("! Bluetooth LE unavailable: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "ble", target_os = "linux")))]
+    if opts.ble {
+        println!("! this build has no Bluetooth LE support");
     }
     println!("Type /help for commands.");
 

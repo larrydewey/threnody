@@ -92,6 +92,9 @@ enum Cmd {
         /// when idle. Hides message timing at a bandwidth cost.
         #[arg(long, value_name = "MS")]
         constant_rate_ms: Option<u64>,
+        /// Also accept sessions over Bluetooth LE (advertise + listen).
+        #[arg(long)]
+        ble: bool,
         /// Do not send or listen for LAN discovery beacons.
         #[arg(long)]
         no_discover: bool,
@@ -414,6 +417,7 @@ fn main() -> Result<()> {
             wg_apply,
             no_discover,
             discover_port,
+            ble,
         } => {
             let identity = load_identity(&home)?;
             let rt = tokio::runtime::Runtime::new()?;
@@ -425,6 +429,7 @@ fn main() -> Result<()> {
                 policy: policy.into(),
                 constant_rate: constant_rate_ms.map(std::time::Duration::from_millis),
                 discover: (!no_discover).then_some(discover_port),
+                ble,
                 tunnel: tunnel.map(|port| chat::TunnelOptions {
                     port,
                     iface: wg_iface,

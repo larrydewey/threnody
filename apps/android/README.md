@@ -11,6 +11,6 @@ You also need the Android SDK and NDK (`ANDROID_HOME`, default `~/Android/Sdk`) 
 
 Tested on a Pixel 8a (Android API 37) over Wi-Fi with the desktop CLI: `threnody run -c threnody://…@<phone-ip>:7450`. Messages went both ways and mutual approval completed.
 
-Tap **Start Bluetooth** to listen on an LE L2CAP channel and advertise it (Appendix K). A Linux machine can then `/ble scan` and `/ble connect` to chat over the radio. Tested with a Pixel 8a.
+Tap **Start Bluetooth** to listen on an LE L2CAP channel and advertise it (Appendix K). A Linux machine can then `/ble scan` and `/ble connect` to chat over the radio. The other way round, run `threnody run --ble` on Linux, tap **Scan Bluetooth**, type `ble 1` (the number the scan printed) and tap **Connect**. Both directions were tested with a Pixel 8a.
 
-The node is a process-wide singleton, so rotating the screen or recreating the Activity doesn't drop sessions. There is no background service yet: Android may stop the app when it isn't in the foreground.
+The node is a process-wide singleton, so rotating the screen or recreating the Activity doesn't drop sessions. A foreground service (type `remoteMessaging`, with an ongoing notification) keeps the process alive in the background. Messages that arrive while the app isn't visible show up as notifications.

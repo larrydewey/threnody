@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bluer::l2cap::{SocketAddr, Stream};
+use bluer::adv::{Advertisement, AdvertisementHandle};
+use bluer::l2cap::{SocketAddr, Stream, StreamListener};
 use bluer::{AdapterEvent, Address, AddressType};
 use futures_util::StreamExt;
 use threnody_core::PublicIdentity;
@@ -82,4 +83,49 @@ pub async fn connect(node: &Node, f: &Found) -> Result<PublicIdentity> {
     Ok(node
         .connect_stream(stream, "ble", f.addr.to_string(), None)
         .await?)
+}
+
+/// Keeps advertising for as long as it lives.
+pub struct Listening {
+    pub psm: u16,
+    _adv: AdvertisementHandle,
+    _session: bluer::Session,
+}
+
+/// Listens on an LE L2CAP channel, advertises its PSM under the Threnody
+/// UUID, and accepts sessions on it until the node shuts down.
+pub async fn listen(node: &Node) -> Result<Listening> {
+    let session = bluer::Session::new().await.context("connecting to BlueZ")?;
+    let adapter = session.default_adapter().await.context("no Bluetooth adapter")?;
+    adapter.set_powered(true).await.ok();
+    let listener = StreamListener::bind(SocketAddr::new(Address::any(), AddressType::LePublic, 0))
+        .await
+        .context("binding an LE L2CAP channel")?;
+    let psm = listener.as_ref().local_addr()?.psm;
+    let uuid: bluer::Uuid = BLE_SERVICE_UUID.parse()?;
+    let adv = Advertisement {
+        advertisement_type: bluer::adv::Type::Peripheral,
+        service_data: [(uuid, psm.to_le_bytes().to_vec())].into(),
+        discoverable: Some(true),
+        ..Default::default()
+    };
+    let handle = adapter
+        .advertise(adv)
+        .await
+        .context("starting the BLE advertisement")?;
+    let node = node.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, sa)) = listener.accept().await else { break };
+            let node = node.clone();
+            tokio::spawn(async move {
+                let _ = node.accept_stream(stream, "ble", sa.addr.to_string()).await;
+            });
+        }
+    });
+    Ok(Listening {
+        psm,
+        _adv: handle,
+        _session: session,
+    })
 }

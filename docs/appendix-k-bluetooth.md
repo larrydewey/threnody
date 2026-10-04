@@ -22,11 +22,18 @@ The Bluetooth channel itself is **insecure** at the Bluetooth layer (no pairing,
 
 - **Linux.** A non-blocking LE L2CAP `connect` can report success before the channel exists, after which writes fail with `ENOTCONN`. The client waits until the channel's send MTU is readable (about 0.8 s on the test hardware) before starting the handshake.
 - **Linux scanning.** Scans list only devices actually heard during the scan, because BlueZ also returns cached entries with stale PSMs.
+- **Linux listening.** `threnody run --ble` binds an LE L2CAP listener on a dynamic PSM and registers the advert with BlueZ's `LEAdvertisingManager1`. While an old LE link to a peer lingers (the peer's Bluetooth stack can hold it after the app has gone), some controllers stop sending the connectable advert. The next session works once that link is dropped.
 - **Android.** `listenUsingInsecureL2capChannel()` (API 29+) and `BluetoothLeAdvertiser`, with the `BLUETOOTH_CONNECT` and `BLUETOOTH_ADVERTISE` runtime permissions. Each accepted socket is bridged into the node through `ByteLink` / `LinkHandle`.
+- **Android dialing.** A low-latency `BluetoothLeScanner` scan collects adverts carrying the service-data UUID (`BLUETOOTH_SCAN` with `neverForLocation`), and `createInsecureL2capChannel(psm)` opens the channel. LE connection setup sometimes fails with HCI status 0x3e ("connection failed to be established"), so the app makes up to three attempts.
+- **Android background.** A foreground service of type `remoteMessaging` keeps the process, and so the node and its Bluetooth sessions, alive while the app is in the background. Messages that arrive while no Activity is visible raise a notification.
 
 ## Tested
 
-A Pixel 8a (Android API 37) and a Linux laptop (BlueZ 5.87): the laptop found the advert, opened the channel and completed the handshake, and messages went both ways.
+A Pixel 8a (Android API 37) and a Linux laptop (BlueZ 5.87), in both directions:
+
+- The laptop found the phone's advert, opened the channel and completed the handshake, and messages went both ways.
+- The phone found the laptop's advert (`run --ble`), dialed it, and messages went both ways.
+- With the app in the background, and again after three minutes with the screen off, a message from the laptop arrived over the existing Bluetooth session and raised a notification.
 
 ## Privacy
 
@@ -34,7 +41,6 @@ The advert reveals that *a* Threnody device is nearby, plus its PSM. It reveals 
 
 ## Not yet done
 
-- Linux advertising and listening (phones currently listen; Linux dials).
-- Android scanning and dialing.
-- Automatic reconnection.
-- Running over Bluetooth with the app in the background.
+- Automatic reconnection, and dialing approved contacts as soon as they are heard.
+- Private beacons in extended adverts (see Privacy).
+- Android listening that survives the Activity being destroyed by the user (the listener is process-wide, but starting it needs the Activity).
