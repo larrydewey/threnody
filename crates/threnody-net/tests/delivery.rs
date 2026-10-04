@@ -293,7 +293,7 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     let entry = last(&alice);
     assert!(entry.delivered && entry.text == "tick");
     assert!(
-        matches!(e, Event::Delivered { peer, local_id, group: None } if peer == b && local_id == entry.local_id)
+        matches!(e, Event::Delivered { peer, local_id, group: None, relay_for: None } if peer == b && local_id == entry.local_id)
     );
 
     alice

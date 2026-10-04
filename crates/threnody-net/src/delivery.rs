@@ -26,7 +26,7 @@ pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
 pub const RECENT_IDS: usize = 4096;
 /// Messages larger than this (files) are resent only within one run.
 pub const MAX_PERSISTED: usize = 64 * 1024;
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// Whether a message is user content worth acknowledging and resending.
 pub fn trackable(m: &AppMessage) -> bool {
@@ -39,31 +39,44 @@ pub fn trackable(m: &AppMessage) -> bool {
     )
 }
 
-/// Which history entry an acknowledgement marks: the outgoing entry
-/// `local_id` in the 1:1 conversation with the acknowledging peer, or in
-/// `group`.
+/// What an acknowledgement means: our outgoing history entry `local_id`
+/// (in the 1:1 conversation with the acknowledging peer, or in `group`),
+/// or, with `relay_for`, a group message we forwarded for that member,
+/// who sent it with reference `local_id` and wants a receipt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tag {
     pub local_id: u64,
     pub group: Option<[u8; 16]>,
+    pub relay_for: Option<[u8; 32]>,
 }
 
 impl Tag {
     pub const NONE: Self = Self {
         local_id: 0,
         group: None,
+        relay_for: None,
     };
+    /// Encoded length (see [`Tag::encode`]).
+    pub const LEN: usize = 57;
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    /// `local id (u64 BE) | flags (1 group, 2 relay_for) | group (16) | relay_for (32)`
+    pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.local_id.to_be_bytes());
-        out.push(u8::from(self.group.is_some()));
+        out.push(u8::from(self.group.is_some()) | (u8::from(self.relay_for.is_some()) << 1));
         out.extend_from_slice(&self.group.unwrap_or_default());
+        out.extend_from_slice(&self.relay_for.unwrap_or_default());
     }
 
-    fn decode(b: &[u8; 25]) -> Self {
+    /// Reads [`Tag::LEN`] bytes written by [`Tag::encode`].
+    pub fn decode(b: &[u8]) -> Self {
         let local_id = u64::from_be_bytes(b[..8].try_into().unwrap_or_default());
-        let group = (b[8] == 1).then(|| b[9..].try_into().unwrap_or_default());
-        Self { local_id, group }
+        let group = (b[8] & 1 != 0).then(|| b[9..25].try_into().unwrap_or_default());
+        let relay_for = (b[8] & 2 != 0).then(|| b[25..57].try_into().unwrap_or_default());
+        Self {
+            local_id,
+            group,
+            relay_for,
+        }
     }
 }
 
@@ -89,15 +102,17 @@ impl Delivery {
     pub fn load(unacked: &[u8], delivered: &[u8]) -> Self {
         let mut d = Self::default();
         if let Some((&VERSION, mut rest)) = unacked.split_first() {
-            while let Some((head, r)) = rest.split_at_checked(69) {
-                let len = u32::from_le_bytes([head[65], head[66], head[67], head[68]]) as usize;
+            while let Some((head, r)) = rest.split_at_checked(44 + Tag::LEN) {
+                let n = 40 + Tag::LEN;
+                let len =
+                    u32::from_le_bytes([head[n], head[n + 1], head[n + 2], head[n + 3]]) as usize;
                 let Some((msg, r)) = r.split_at_checked(len) else {
                     break;
                 };
                 rest = r;
                 let peer: [u8; 32] = head[..32].try_into().unwrap_or_default();
                 let id = u64::from_be_bytes(head[32..40].try_into().unwrap_or_default());
-                let tag = Tag::decode(head[40..65].try_into().unwrap_or(&[0; 25]));
+                let tag = Tag::decode(&head[40..40 + Tag::LEN]);
                 if let (Ok(p), Ok(m)) = (PublicIdentity::from_bytes(&peer), AppMessage::decode(msg))
                 {
                     d.unacked.entry(p).or_default().push_back((id, m, len, tag));
@@ -130,8 +145,8 @@ impl Delivery {
         d
     }
 
-    /// `VERSION || * ( peer (32) | id (u64 BE) | tag (local id u64 BE,
-    /// has group u8, group 16) | len (u32 LE) | AppMessage )`
+    /// `VERSION || * ( peer (32) | id (u64 BE) | tag | len (u32 LE) | AppMessage )`,
+    /// tag = `local id (u64 BE) | flags (1 group, 2 relay_for) | group (16) | relay_for (32)`
     pub fn encode_unacked(&self) -> Vec<u8> {
         let mut out = vec![VERSION];
         for (p, q) in &self.unacked {
@@ -206,7 +221,7 @@ impl Delivery {
             let before = q.len();
             q.retain(|(id, _, _, tag)| {
                 let hit = ids.contains(id);
-                if hit && tag.local_id != 0 {
+                if hit && (tag.local_id != 0) {
                     tags.push(*tag);
                 }
                 !hit
@@ -268,6 +283,7 @@ mod tests {
             Tag {
                 local_id: 5,
                 group: Some([7; 16]),
+                relay_for: Some([3; 32]),
             },
         ) else {
             panic!()
@@ -279,7 +295,8 @@ mod tests {
             d.acked(&p, &[id]),
             [Tag {
                 local_id: 5,
-                group: Some([7; 16])
+                group: Some([7; 16]),
+                relay_for: Some([3; 32]),
             }]
         );
         assert!(d.acked(&p, &[id]).is_empty(), "only once");
@@ -310,6 +327,14 @@ mod tests {
         assert!(d.unacked_dirty && d.delivered_dirty);
         let (u, del) = (d.encode_unacked(), d.encode_delivered());
         let mut again = Delivery::load(&u, &del);
+        let t = Tag {
+            local_id: 1,
+            group: Some([4; 16]),
+            relay_for: None,
+        };
+        let mut b = Vec::new();
+        t.encode(&mut b);
+        assert_eq!((b.len(), Tag::decode(&b)), (Tag::LEN, t));
         assert_eq!(again.resend(&p), d.resend(&p)[..2]);
         assert!(
             !again.first_delivery(&p, 42),

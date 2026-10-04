@@ -446,7 +446,11 @@ impl Groups {
                 welcome,
             } => self.on_welcome(from, group, &name, &welcome),
             GroupWire::Message { group, message } => self.on_message(group, &message),
-            GroupWire::Forward { group, to, message } => self.on_forward(from, group, to, message),
+            GroupWire::Forward {
+                group, to, message, ..
+            } => self.on_forward(from, group, to, message),
+            // Delivery bookkeeping, not group state: see `node::GroupNode`.
+            GroupWire::Receipt { .. } => Ok(Output::default()),
         }
     }
 

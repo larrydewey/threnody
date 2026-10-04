@@ -155,10 +155,15 @@ pub enum Event {
     },
     /// `peer` acknowledged an outgoing message: the history entry
     /// `local_id` (in `group`, else the 1:1 conversation) changed.
+    ///
+    /// With `relay_for`, it was a group message we forwarded for that
+    /// member (`local_id` is its reference): nothing of ours changed, but
+    /// the group layer owes it a receipt.
     Delivered {
         peer: PublicIdentity,
         local_id: u64,
         group: Option<[u8; 16]>,
+        relay_for: Option<PublicIdentity>,
     },
     /// A mailbox reported what it did with our deposit for `to`.
     DepositReceipt {

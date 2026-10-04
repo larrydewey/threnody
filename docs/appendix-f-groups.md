@@ -23,7 +23,9 @@ GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (3
   2 KeyPackage         invitee -> owner           (MlsMessage(KeyPackage))
   3 Welcome            owner -> new member        (MlsMessage(Welcome), ratchet tree in extension)
   4 Message            sender -> every other member (MlsMessage, PrivateMessage only)
-  5 Forward            sender -> a reachable member (MlsMessage, member = the one to deliver it to)
+  5 Forward            sender -> a reachable member (MlsMessage, member = the one to deliver it to,
+                       reference = the sender's id for a receipt, or absent)
+  6 Receipt            forwarder -> sender      (member = who acknowledged, reference)
 ```
 
 The sender fans every message out to each other member. The groups use the pure-ciphertext wire format, so commits are encrypted too. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
@@ -40,6 +42,8 @@ Members need not be contacts of each other, or online together. Each copy goes t
 A forwarder checks that the sender and the target are both members of the group as it knows it, and that the target is neither itself nor the sender. It then delivers a plain `Message` by steps 1, 2 and 4, and never forwards again, so a message crosses at most one forwarding member. Since the owner invited everyone, it usually has a session with every member, and a member that only ever talks to the owner still reaches the whole group.
 
 Held messages are kept encrypted under the identity (`group-held` state), at most 200 per member, oldest dropped first. Pending invitations are kept the same way (`group-invites`). A message held for longer than five epochs' worth of membership changes can no longer be decrypted (see *Past epochs*).
+
+Delivery ticks (Appendix C, *Acknowledgements*) count only a member's own acknowledgement. So when the sender hands a copy to a forwarder, it includes a reference. Once the member acknowledges the copy the forwarder delivered (live, or later from its hold), the forwarder sends the sender a `Receipt` naming the member and the reference. The sender believes receipts only from members, and only about members. A member could claim a delivery that didn't happen, but that only affects the ticks, and members can already drop messages they forward.
 
 A forwarder learns only that one member is sending something to another, and the size and time. Both are members, so it could read the content anyway. Like any relay, it can drop or delay what it holds, but it cannot alter it: MLS authenticates every message. The membership checks keep a member from being used to send to non-members.
 

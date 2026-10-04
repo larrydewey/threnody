@@ -278,6 +278,7 @@ fn members_forward_messages_for_each_other() {
         group: g,
         to: *pb.as_bytes(),
         message,
+        reference: 1,
     };
     let wire = GroupWire::decode(&fwd.encode().unwrap()).unwrap();
     let relayed = net.node(&pa).handle(pc, wire.clone()).unwrap();
@@ -301,6 +302,7 @@ fn members_forward_messages_for_each_other() {
         group: g,
         to: *t.as_bytes(),
         message: vec![1],
+        reference: 0,
     };
     assert!(
         net.node(&pa).handle(pc, to(px)).is_err(),

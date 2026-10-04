@@ -57,7 +57,7 @@ impl Node {
         for d in &devices {
             let tag = Tag {
                 local_id,
-                group: None,
+                ..Tag::NONE
             };
             if self.send_tagged(d, msg.clone(), tag).is_ok() {
                 r.live += 1;
@@ -120,7 +120,7 @@ impl Node {
             msg,
             Tag {
                 local_id,
-                group: None,
+                ..Tag::NONE
             },
         )?;
         self.append_file(
@@ -137,8 +137,20 @@ impl Node {
     }
 
     /// Records `peer`'s acknowledgement of the entry `tag` names, and
-    /// tells the app if that changed anything.
-    pub(crate) fn mark_delivered(&self, peer: &PublicIdentity, tag: Tag) {
+    /// tells the app if that changed anything. For a message forwarded on
+    /// another member's behalf, only tells the app (to send a receipt).
+    pub fn mark_delivered(&self, peer: &PublicIdentity, tag: Tag) {
+        if let Some(origin) = tag.relay_for {
+            if let Ok(origin) = PublicIdentity::from_bytes(&origin) {
+                self.emit(Event::Delivered {
+                    peer: *peer,
+                    local_id: tag.local_id,
+                    group: tag.group,
+                    relay_for: Some(origin),
+                });
+            }
+            return;
+        }
         let conv = match tag.group {
             Some(g) => ConversationId::Group(g),
             None => self.conversation_for(peer),
@@ -154,6 +166,7 @@ impl Node {
                 peer: *peer,
                 local_id: tag.local_id,
                 group: tag.group,
+                relay_for: None,
             });
         }
     }

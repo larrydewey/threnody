@@ -791,6 +791,18 @@ impl ThrenodyNode {
                     msg: AppMessage::Group(payload),
                     ..
                 } => self.group_incoming(peer, &payload),
+                // A member acknowledged a group message we forwarded: the
+                // sender gets a receipt; nothing for the app to show.
+                Event::Delivered {
+                    peer,
+                    local_id,
+                    group: Some(group),
+                    relay_for: Some(origin),
+                } => {
+                    let _guard = self.rt.enter();
+                    self.group_node()
+                        .relayed(&self.node, &peer, &group, local_id, &origin);
+                }
                 other => {
                     if let Event::Connected { peer, .. } = &other {
                         self.group_connected(peer);
@@ -1152,15 +1164,18 @@ mod tests {
         }
         assert_eq!(bob.group_history(g.clone(), 10).unwrap()[0].text, "hi all");
         assert!(carol.group_history(g.clone(), 10).unwrap()[0].outgoing);
-        // Alice reached Carol's copy for Bob, not Bob: one of two counted.
+        // Alice acknowledges her own copy, and forwards Bob's: when Bob
+        // acknowledges it, Alice sends Carol a receipt. Both count.
         let mine = &carol.group_history(g.clone(), 10).unwrap()[0];
         assert_eq!(mine.recipients, 2);
-        all.until(
-            2,
-            |e| matches!(e, NodeEvent::Delivered { group: Some(x), .. } if *x == g),
-        );
+        for _ in 0..2 {
+            all.until(
+                2,
+                |e| matches!(e, NodeEvent::Delivered { group: Some(x), .. } if *x == g),
+            );
+        }
         let mine = &carol.group_history(g.clone(), 10).unwrap()[0];
-        assert!(mine.delivered_to == 1 && !mine.delivered, "{mine:?}");
+        assert!(mine.delivered_to == 2 && mine.delivered, "{mine:?}");
         // The owner reaches both directly: delivered.
         alice
             .send_group_text(g.clone(), "from the owner".into())

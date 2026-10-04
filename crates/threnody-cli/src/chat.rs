@@ -493,6 +493,16 @@ impl Ui {
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
             Event::OfflineMessage { from, via, msg } => self.show_message(from, msg, Some(via)),
+            // A member acknowledged a group message we forwarded: send the
+            // sender a receipt.
+            Event::Delivered {
+                peer,
+                local_id,
+                group: Some(group),
+                relay_for: Some(origin),
+            } => self
+                .groups
+                .relayed(&self.node, &peer, &group, local_id, &origin),
             // Shown as ✓✓ in /history; too chatty to print live.
             Event::Delivered { .. } => {}
             Event::DepositReceipt {

@@ -138,6 +138,19 @@ impl GroupUi {
         }
     }
 
+    /// Sends `origin` a receipt for the group message it asked us to
+    /// forward to `member`, who has now acknowledged it.
+    pub fn relayed(
+        &mut self,
+        node: &Node,
+        member: &PublicIdentity,
+        group: &GroupId,
+        reference: u64,
+        origin: &PublicIdentity,
+    ) {
+        self.groups.relayed(node, member, group, reference, origin);
+    }
+
     /// Picks pending invitation `n` (1-based; the latest by default).
     fn pending(&self, n: Option<&str>) -> Result<GroupId> {
         let invites = self.groups.invites();
