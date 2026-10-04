@@ -170,6 +170,10 @@ impl RelayState {
     }
 }
 
+/// How long an onion attempt may take before falling back to a direct
+/// dial.
+const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Node {
     fn relay_send(&self, to: &PublicIdentity, msg: &RelayMsg) -> bool {
         msg.encode()
@@ -458,6 +462,17 @@ impl Node {
         addr: Option<&str>,
         pin: Option<Fingerprint>,
     ) -> Result<PublicIdentity> {
+        // Metadata first (spec §9 layer 2): with two approved relays, an
+        // onion circuit keeps any single relay, and anyone watching our
+        // network, from seeing who we talk to.
+        if let Some(fp) = pin
+            && self.prefer_onion()
+            && self.onion_possible(fp)
+            && let Ok(Ok(p)) =
+                tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
+        {
+            return Ok(p);
+        }
         let direct = match addr {
             Some(a) => self.connect(a, pin).await,
             None => Err(NetError::NoRoute("no address".into())),
@@ -470,6 +485,25 @@ impl Node {
             (Err(_), Some(fp)) => self.connect_relayed(fp).await,
             (Err(e), None) => Err(e),
         }
+    }
+
+    /// Whether a two-relay onion path to `dest` could exist: a live,
+    /// mutually approved neighbour plus another approved contact.
+    fn onion_possible(&self, dest: Fingerprint) -> bool {
+        let me = self.identity();
+        let firsts = self
+            .sessions()
+            .into_iter()
+            .filter(|s| {
+                s.via.is_none() && s.peer.fingerprint() != dest && self.shared.mutual(&s.peer)
+            })
+            .count();
+        let others = self
+            .contacts()
+            .iter()
+            .filter(|c| c.mutually_approved() && c.fingerprint() != dest && c.key != me)
+            .count();
+        firsts >= 1 && others >= 2
     }
 
     /// Makes sure there is a session with `peer`: an existing one, a

@@ -197,3 +197,64 @@ async fn circuits_die_with_their_links() {
     .await
     .expect("relay state not cleaned up");
 }
+
+#[tokio::test]
+async fn contacts_are_reached_through_onions_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut r2 = spawn(&dir, "r2").await;
+    let mut c = spawn(&dir, "c").await;
+    befriend(&mut a, &mut r2).await;
+    link(&mut a, &mut r1).await;
+    link(&mut r1, &mut r2).await;
+    link(&mut r2, &mut c).await;
+    let cid = c.node.identity();
+    assert!(a.node.prefer_onion(), "on by default");
+
+    // a could dial c directly, but goes through r1 and r2.
+    let peer = a
+        .node
+        .reach(Some(&c.addr), Some(cid.fingerprint()))
+        .await
+        .unwrap();
+    assert_eq!(peer, cid);
+    let transport = |a: &N| {
+        a.node
+            .sessions()
+            .into_iter()
+            .find(|s| s.peer == cid)
+            .map(|s| s.transport)
+    };
+    assert_eq!(transport(&a), Some("onion"));
+
+    // Turned off, it dials directly.
+    a.node.set_prefer_onion(false);
+    a.node.disconnect(&cid);
+    next(&mut c.rx, |e| matches!(e, Event::Disconnected { .. })).await;
+    a.node
+        .reach(Some(&c.addr), Some(cid.fingerprint()))
+        .await
+        .unwrap();
+    assert_eq!(transport(&a), Some("tcp"));
+}
+
+#[tokio::test]
+async fn without_relays_contacts_are_dialled_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut c = spawn(&dir, "c").await;
+    befriend(&mut a, &mut c).await;
+    let cid = c.node.identity();
+    a.node
+        .reach(Some(&c.addr), Some(cid.fingerprint()))
+        .await
+        .unwrap();
+    let s = a
+        .node
+        .sessions()
+        .into_iter()
+        .find(|s| s.peer == cid)
+        .unwrap();
+    assert_eq!(s.transport, "tcp");
+}

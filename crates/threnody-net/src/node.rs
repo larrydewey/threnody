@@ -45,7 +45,8 @@ pub struct NodeConfig {
     pub identity: Identity,
     pub policy: AcceptPolicy,
     /// When set, each session sends exactly one padded frame per interval,
-    /// using cover messages when idle (spec §9, layer 1).
+    /// using cover messages when idle (spec §9, layer 1). Can be changed
+    /// later with [`Node::set_constant_rate`]; running sessions follow.
     pub constant_rate: Option<Duration>,
     /// When set, offer WireGuard tunnels on this UDP port to mutually
     /// approved peers (spec §8).
@@ -250,7 +251,10 @@ pub(crate) struct Shared {
     sessions: Mutex<HashMap<PublicIdentity, SessionHandle>>,
     events: mpsc::UnboundedSender<Event>,
     policy: Mutex<AcceptPolicy>,
-    constant_rate: Option<Duration>,
+    /// The cover-traffic interval; sessions watch it (see `run_session`).
+    constant_rate: tokio::sync::watch::Sender<Option<Duration>>,
+    /// Dial contacts through onion circuits first when possible.
+    pub(crate) prefer_onion: std::sync::atomic::AtomicBool,
     tunnel: Option<(u16, [u8; 32])>,
     /// WireGuard keys peers offered us, for clean removal on revocation.
     tunnel_peers: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
@@ -404,7 +408,8 @@ impl Node {
             sessions: Mutex::new(HashMap::new()),
             events: tx,
             policy: Mutex::new(cfg.policy),
-            constant_rate: cfg.constant_rate,
+            constant_rate: tokio::sync::watch::Sender::new(cfg.constant_rate),
+            prefer_onion: std::sync::atomic::AtomicBool::new(true),
             tunnel,
             tunnel_peers: Mutex::new(HashMap::new()),
             relay: Mutex::new(RelayState::default()),
@@ -446,7 +451,23 @@ impl Node {
     }
 
     pub fn constant_rate(&self) -> Option<Duration> {
-        self.shared.constant_rate
+        *self.shared.constant_rate.borrow()
+    }
+
+    /// Sets the cover-traffic interval (`None` = off). Running sessions
+    /// switch to it at once.
+    pub fn set_constant_rate(&self, rate: Option<Duration>) {
+        self.shared.constant_rate.send_replace(rate);
+    }
+
+    /// Whether contacts are reached through onion circuits first, when two
+    /// approved relays make one possible (on by default).
+    pub fn prefer_onion(&self) -> bool {
+        self.shared.prefer_onion.load(Ordering::Relaxed)
+    }
+
+    pub fn set_prefer_onion(&self, on: bool) {
+        self.shared.prefer_onion.store(on, Ordering::Relaxed);
     }
 
     /// WireGuard listen port, when tunnels are enabled.
@@ -871,11 +892,15 @@ where
     // first message. Until then, tracked messages wait.
     let mut peer_acks: Option<bool> = None;
 
-    let mut ticker = shared.constant_rate.map(|d| {
-        let mut t = tokio::time::interval(d);
-        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        t
-    });
+    let make_ticker = |rate: Option<Duration>| {
+        rate.map(|d| {
+            let mut t = tokio::time::interval(d);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            t
+        })
+    };
+    let mut rate = shared.constant_rate.subscribe();
+    let mut ticker = make_ticker(*rate.borrow_and_update());
 
     let mut offered = false;
     let mut discovery_keyed = false;
@@ -1037,6 +1062,9 @@ where
                     Some(m) => pending.push_back(m),
                     None => return Ok(()), // replaced or disconnected locally
                 },
+                Ok(()) = rate.changed() => {
+                    ticker = make_ticker(*rate.borrow_and_update());
+                }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {
                         // The first message that can go now, else cover.

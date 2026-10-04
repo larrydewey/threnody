@@ -70,6 +70,10 @@ op: 1 create, 2 created, 3 cell, 4 destroy
 - **Passing cells on.** Cells that aren't recognized are forwarded on the paired link circuit. Cells from the next hop get this hop's backward layer and are forwarded upstream.
 - **Teardown.** `DESTROY`, or losing either link, tears the circuit down in both directions.
 
+## When circuits are used
+
+Nodes reach contacts through onion circuits first, by default (`Node::reach`, the CLI and the apps). That happens whenever a two-relay path could exist: a live, mutually approved neighbour, plus another approved contact. If building a circuit fails or takes over 10 s, the node falls back to a direct dial, then to a relay circuit (Appendix G). `--no-onion`, or the app's toggle, turns this off. `/onion` still builds a circuit on demand.
+
 ## Path selection
 
 A tries paths in this order:

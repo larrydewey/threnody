@@ -182,6 +182,34 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
 }
 
 #[tokio::test]
+async fn cover_traffic_can_be_switched_on_and_off_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    let say = |s: &str| AppMessage::Text {
+        sent_ms: 0,
+        body: s.into(),
+        expires_in_s: None,
+    };
+    for (rate, body) in [
+        (Some(Duration::from_millis(20)), "at a constant rate"),
+        (None, "immediately again"),
+        (Some(Duration::from_millis(50)), "and slower"),
+    ] {
+        alice.set_constant_rate(rate);
+        assert_eq!(alice.constant_rate(), rate);
+        alice.send(&bob_id, say(body)).unwrap();
+        next(
+            &mut brx,
+            |e| matches!(e, Event::Message { msg, .. } if *msg == say(body)),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn tunnels_follow_mutual_approval() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);

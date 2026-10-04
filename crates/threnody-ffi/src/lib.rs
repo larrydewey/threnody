@@ -38,6 +38,9 @@ fn fail(e: impl std::fmt::Display) -> ThrenodyError {
 
 type Result<T> = std::result::Result<T, ThrenodyError>;
 
+/// Cover-traffic interval a node starts with (see `set_cover_traffic`).
+pub const DEFAULT_COVER_MS: u32 = 2000;
+
 /// A contact as an app shows it.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ContactInfo {
@@ -451,7 +454,8 @@ impl ThrenodyNode {
                 home,
                 identity,
                 policy: AcceptPolicy::Anyone,
-                constant_rate: None,
+                // Metadata protection is on unless the app turns it off.
+                constant_rate: Some(Duration::from_millis(u64::from(DEFAULT_COVER_MS))),
                 tunnel_port: None,
             })
             .map_err(fail)?
@@ -665,6 +669,30 @@ impl ThrenodyNode {
             }
         });
         Ok(())
+    }
+
+    /// Cover traffic (spec §9 layer 1): each session sends one padded frame
+    /// every `interval_ms`, filler when idle, so timing shows nothing.
+    /// `None` turns it off. Each frame is about 2.7 kB. On by default.
+    pub fn set_cover_traffic(&self, interval_ms: Option<u32>) {
+        self.node
+            .set_constant_rate(interval_ms.map(|ms| Duration::from_millis(u64::from(ms.max(10)))));
+    }
+
+    pub fn cover_traffic_ms(&self) -> Option<u32> {
+        self.node
+            .constant_rate()
+            .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
+    }
+
+    /// Reach contacts through onion circuits first when two approved
+    /// relays make one possible (spec §9 layer 2). On by default.
+    pub fn set_onion_first(&self, on: bool) {
+        self.node.set_prefer_onion(on);
+    }
+
+    pub fn onion_first(&self) -> bool {
+        self.node.prefer_onion()
     }
 
     /// The devices of our account, in the order they joined.
@@ -969,6 +997,9 @@ mod tests {
         let addr = bob.listen("127.0.0.1:0".into()).unwrap();
         let bob_fp = alice.connect(bob.invite_link(addr)).unwrap();
         assert_eq!(bob_fp, bob.device_fingerprint());
+        // Metadata protection is on unless turned off.
+        assert_eq!(alice.cover_traffic_ms(), Some(DEFAULT_COVER_MS));
+        assert!(alice.onion_first());
         wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
 
         alice
@@ -1207,8 +1238,13 @@ mod tests {
     #[test]
     fn groups_invite_chat_and_remove() {
         let dir = tempfile::tempdir().unwrap();
-        let open =
-            |n: &str| ThrenodyNode::open(dir.path().join(n).display().to_string(), None).unwrap();
+        // Group handshakes take many round trips: opt out of cover traffic
+        // (on by default) so this test about group logic runs quickly.
+        let open = |n: &str| {
+            let node = ThrenodyNode::open(dir.path().join(n).display().to_string(), None).unwrap();
+            node.set_cover_traffic(None);
+            node
+        };
         let (alice, bob, carol) = (open("a"), open("b"), open("c"));
         let addr = alice.listen("127.0.0.1:0".into()).unwrap();
         let a_fp = alice.device_fingerprint();

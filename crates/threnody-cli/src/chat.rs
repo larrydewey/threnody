@@ -22,6 +22,8 @@ pub struct Options {
     pub connect: Vec<String>,
     pub policy: AcceptPolicy,
     pub constant_rate: Option<Duration>,
+    /// Reach contacts through onion circuits first when possible.
+    pub onion_first: bool,
     pub tunnel: Option<TunnelOptions>,
     /// UDP port for LAN discovery; `None` disables it.
     pub discover: Option<u16>,
@@ -101,6 +103,7 @@ pub async fn run(opts: Options) -> Result<()> {
         constant_rate: opts.constant_rate,
         tunnel_port: opts.tunnel.as_ref().map(|t| t.port),
     })?;
+    node.set_prefer_onion(opts.onion_first);
     println!("Threnody — you are {}", node.identity().fingerprint());
     if groups.count() > 0 {
         println!("{} group(s) restored. /groups to list", groups.count());
@@ -1066,11 +1069,16 @@ impl Ui {
             None => println!("  tunnel       off (run with --tunnel)"),
         }
         let rate = match self.node.constant_rate() {
-            Some(d) => format!("constant-rate {} ms with cover traffic", d.as_millis()),
-            None => "off".into(),
+            Some(d) => format!("cover traffic every {} ms", d.as_millis()),
+            None => "off (--no-cover)".into(),
+        };
+        let onion = if self.node.prefer_onion() {
+            "onion circuits first when two approved relays allow"
+        } else {
+            "direct first (--no-onion)"
         };
         println!(
-            "  metadata     length padding: on; timing protection: {rate}; onion: /onion (carrying {} circuit(s) for others)",
+            "  metadata     padding: on; timing: {rate}; routing: {onion}; carrying {} circuit(s) for others",
             self.node.onion_hops()
         );
     }

@@ -256,6 +256,26 @@ class MainActivity : Activity() {
     private fun more(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add("Devices").setOnMenuItemClickListener { devices(); true }
+            fun toggle(title: String, on: Boolean, set: (Boolean) -> Unit, says: (Boolean) -> String) =
+                menu.add(title).apply {
+                    isCheckable = true
+                    isChecked = on
+                    setOnMenuItemClickListener {
+                        set(!on)
+                        Toast.makeText(this@MainActivity, says(!on), Toast.LENGTH_LONG).show()
+                        true
+                    }
+                }
+            toggle("Cover traffic", Privacy.coverTraffic(this@MainActivity),
+                { Privacy.setCoverTraffic(this@MainActivity, it) }) {
+                if (it) "Cover traffic on: traffic no longer shows when you send"
+                else "Cover traffic off: an observer can see when messages are sent"
+            }
+            toggle("Onion routing first", Privacy.onionFirst(this@MainActivity),
+                { Privacy.setOnionFirst(this@MainActivity, it) }) {
+                if (it) "Contacts are reached through onion circuits when possible"
+                else "Contacts are dialed directly: the network sees who you talk to"
+            }
             menu.add("Screen security").apply {
                 isCheckable = true
                 isChecked = Privacy.screenSecurity(this@MainActivity)

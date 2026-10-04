@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -44,8 +45,16 @@ object Threnody {
         say("listening on $listenAddr")
         pump(ctx.applicationContext, it)
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
+        applyPrivacy(ctx)
         redialOnNetwork(ctx.applicationContext, it)
         nameThisDevice(it)
+    }
+
+    /** Applies the privacy settings (all on unless turned off) to the node. */
+    fun applyPrivacy(ctx: Context) {
+        val node = instance ?: return
+        node.setCoverTraffic(Privacy.coverMs(ctx))
+        node.setOnionFirst(Privacy.onionFirst(ctx))
     }
 
     /**
@@ -108,6 +117,16 @@ object Threnody {
             override fun onAvailable(network: Network) {
                 say("* network available; reconnecting to approved contacts")
                 node.reconnect()
+            }
+
+            // Cover traffic stays on; on metered data it runs slower.
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                if (metered != Privacy.metered) {
+                    Privacy.metered = metered
+                    applyPrivacy(ctx)
+                    say("* ${if (metered) "metered" else "unmetered"} network: cover traffic every ${Privacy.coverMs(ctx) ?: "—"} ms")
+                }
             }
         })
     }

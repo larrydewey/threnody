@@ -29,6 +29,10 @@ enum KeyringAction {
     Status,
 }
 
+/// Cover-traffic interval unless told otherwise: one ~2.7 kB frame each
+/// way every 2 s per session, about 230 MB a day per connected contact.
+const DEFAULT_COVER_MS: u64 = 2000;
+
 #[derive(Parser)]
 #[command(
     name = "threnody",
@@ -112,9 +116,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Policy::Anyone)]
         policy: Policy,
         /// Send one padded frame per interval per session, with cover traffic
-        /// when idle. Hides message timing at a bandwidth cost.
-        #[arg(long, value_name = "MS")]
-        constant_rate_ms: Option<u64>,
+        /// when idle: hides when messages are sent, at a bandwidth cost
+        /// (each frame is about 2.7 kB). On by default.
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_COVER_MS, conflicts_with = "no_cover")]
+        constant_rate_ms: u64,
+        /// Turn cover traffic off (messages go out as soon as they're sent).
+        #[arg(long)]
+        no_cover: bool,
+        /// Dial contacts directly instead of through onion circuits first.
+        #[arg(long)]
+        no_onion: bool,
         /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
         ble: bool,
@@ -541,6 +552,8 @@ fn main() -> Result<()> {
             connect,
             policy,
             constant_rate_ms,
+            no_cover,
+            no_onion,
             tunnel,
             wg_iface,
             wg_apply,
@@ -557,7 +570,9 @@ fn main() -> Result<()> {
                 listen: (!no_listen).then_some(listen),
                 connect,
                 policy: policy.into(),
-                constant_rate: constant_rate_ms.map(std::time::Duration::from_millis),
+                constant_rate: (!no_cover)
+                    .then(|| std::time::Duration::from_millis(constant_rate_ms.max(10))),
+                onion_first: !no_onion,
                 discover: (!no_discover).then_some(discover_port),
                 ble,
                 wifi_direct,
