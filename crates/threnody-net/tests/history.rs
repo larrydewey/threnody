@@ -191,3 +191,63 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(me.sessions().iter().any(|s| s.peer == sid));
 }
+
+#[tokio::test]
+async fn messages_can_be_deleted_for_me_or_for_everyone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, _) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    let texts = |n: &Node, p| -> Vec<String> {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect()
+    };
+    for t in ["keep", "oops", "also mine"] {
+        alice.send_text(&bob_id, t).unwrap();
+        next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    }
+    let id_of = |n: &Node, p, t: &str| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| e.text == t)
+            .unwrap()
+            .message_id()
+    };
+    // Both sides know the message by the same id.
+    assert_eq!(id_of(&alice, &bob_id, "oops"), id_of(&bob, &a_id, "oops"));
+
+    // For everyone: gone on both sides.
+    let oops = id_of(&alice, &bob_id, "oops");
+    assert_eq!(alice.delete_messages(&bob_id, &[oops], true), 1);
+    next(&mut brx, |e| {
+        matches!(e, Event::MessagesDeleted { count: 1, .. })
+    })
+    .await;
+    assert_eq!(texts(&bob, &a_id), ["keep", "also mine"]);
+
+    // For me: only here.
+    let mine = id_of(&alice, &bob_id, "also mine");
+    alice.delete_messages(&bob_id, &[mine], false);
+    assert_eq!(texts(&alice, &bob_id), ["keep"]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(texts(&bob, &a_id), ["keep", "also mine"]);
+
+    // Bob can't delete Alice's messages for her.
+    let keep = id_of(&bob, &a_id, "keep");
+    bob.delete_messages(&a_id, &[keep], true);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(texts(&alice, &bob_id), ["keep"]);
+    assert!(
+        texts(&bob, &a_id).iter().all(|t| t != "keep"),
+        "but gone for him"
+    );
+}

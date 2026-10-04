@@ -132,6 +132,7 @@ fn generate() -> String {
         sent_ms: 1_791_000_000_000,
         body: "threnody".into(),
         expires_in_s: None,
+        id: 0,
     };
     let m1 = cb.seal(&text).unwrap();
     assert_eq!(ca.open(&m1).unwrap(), text);

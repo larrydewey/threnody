@@ -165,6 +165,7 @@ class ChatActivity : Activity() {
         val peer = when (e) {
             is NodeEvent.Message -> e.peer
             is NodeEvent.MessageRequest -> e.peer
+            is NodeEvent.MessagesDeleted -> e.peer
             is NodeEvent.File -> e.peer
             is NodeEvent.Connected -> e.peer
             is NodeEvent.Disconnected -> e.peer
@@ -199,7 +200,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(ULong.MAX_VALUE, true, me, it, false, null, false, 0u, 0u), sending = true) }
+            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, recipients = 0u, deliveredTo = 0u), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         runOnUiThread {
@@ -389,11 +390,41 @@ class ChatActivity : Activity() {
             alpha = 0.7f
             gravity = Gravity.END
         }, matchWrap)
+        if (!item.sending) {
+            body.setOnLongClickListener { deleteMessage(e); true }
+        }
         return LinearLayout(this).apply {
             gravity = if (outgoing) Gravity.END else Gravity.START
             setPadding(if (outgoing) dp(48) else 0, dp(3), if (outgoing) 0 else dp(48), dp(3))
             addView(body, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
+    }
+
+    /** Delete for me, or (our own 1:1 messages) for everyone. */
+    private fun deleteMessage(e: HistoryEntry) {
+        val g = group
+        val forEveryone = g == null && e.outgoing && e.device == myDevice && e.id != 0uL
+        val options = if (forEveryone) arrayOf("Delete for me", "Delete for everyone") else arrayOf("Delete for me")
+        AlertDialog.Builder(this)
+            .setTitle("Delete message?")
+            .setItems(options) { _, i ->
+                val everyone = i == 1
+                worker.execute {
+                    run("delete") {
+                        when {
+                            g != null -> node.deleteGroupEntry(g, e.atMs, e.device)
+                            e.id != 0uL -> node.deleteMessages(device, listOf(e.id), everyone)
+                            else -> node.deleteEntry(device, e.atMs, e.device)
+                        }
+                    }
+                    if (everyone) runOnUiThread {
+                        Toast.makeText(this, "Deleted. Their devices delete it too, if they're running a current version.",
+                            Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun time(ms: Long) = DateFormat.getTimeFormat(this).format(Date(ms))

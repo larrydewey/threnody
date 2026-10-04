@@ -191,6 +191,7 @@ async fn contacts_can_seal_to_a_sibling_they_never_met() {
         sent_ms: 0,
         body: "hi phone".into(),
         expires_in_s: None,
+        id: 0,
     };
     bob.node.send_offline(&pid, &text).unwrap();
     wait_for(|| laptop.node.held_messages() == 1).await;
@@ -276,6 +277,27 @@ async fn history_follows_us_across_our_devices() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(texts(&phone.node, &bid).len(), 4);
     assert_eq!(texts(&laptop.node, &bid).len(), 4);
+
+    // Deleting "for me" on one device deletes on the others too.
+    let conv = laptop.node.conversation_for(&bid);
+    let id = laptop
+        .node
+        .history(conv)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.text == "from the laptop")
+        .unwrap()
+        .message_id();
+    laptop.node.delete_messages(&bid, &[id], false);
+    wait_for(|| texts(&phone.node, &bid).len() == 3).await;
+    assert!(
+        texts(&phone.node, &bid)
+            .iter()
+            .all(|(_, t)| t != "from the laptop")
+    );
+    // Bob keeps it: that was only for us.
+    assert_eq!(texts(&bob.node, &laptop.node.identity()).len(), 4);
 }
 
 #[tokio::test]
@@ -345,4 +367,55 @@ async fn a_verified_contacts_new_device_starts_unverified() {
         contacts.get(&lid).unwrap().verified,
         "the old device stays verified"
     );
+}
+
+#[tokio::test]
+async fn deleting_in_a_chat_between_our_own_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    // As on the user's devices: the phone's account, the laptop joins.
+    let code = phone.node.create_link_code(phone.addr.clone());
+    laptop.node.link_with(&code).await.unwrap();
+    let (lid, pid) = (laptop.node.identity(), phone.node.identity());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    laptop.node.send_text(&pid, "self-destruct").unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::Message { .. })).await;
+    let on = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|e| e.text == "self-destruct")
+            .count()
+    };
+    assert_eq!(on(&phone.node, &lid), 1);
+    let id = laptop
+        .node
+        .history(laptop.node.conversation_for(&pid))
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.text == "self-destruct")
+        .unwrap()
+        .message_id();
+    eprintln!(
+        "supports: {}",
+        laptop
+            .node
+            .supports(&pid, threnody_core::message::FEATURE_DELETE)
+    );
+    eprintln!(
+        "phone entry ids: {:?}",
+        phone
+            .node
+            .history(phone.node.conversation_for(&lid))
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| (e.message_id(), e.remote_id, e.local_id))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(laptop.node.delete_messages(&pid, &[id], true), 1);
+    wait_for(|| on(&phone.node, &lid) == 0).await;
 }

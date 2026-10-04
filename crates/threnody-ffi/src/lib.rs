@@ -76,6 +76,9 @@ pub struct HistoryEntry {
     /// An outgoing message a device of the recipient acknowledged (for a
     /// group, every recipient did).
     pub delivered: bool,
+    /// The id to delete it by (`delete_messages`); 0 = none, use
+    /// `delete_entry` with `at_ms` and `device`.
+    pub id: u64,
     /// For outgoing group messages: how many members it went to, and how
     /// many acknowledged their copy (forwarded or mailbox copies don't
     /// count until the member itself acknowledges).
@@ -173,10 +176,18 @@ pub enum NodeEvent {
         text: String,
         offline: bool,
     },
+    /// `id` is the sender's id for it: pass it to `record_received_file`.
     File {
         peer: String,
         name: String,
         data: Vec<u8>,
+        id: u64,
+    },
+    /// `peer` deleted messages (its own, for everyone; or, from our own
+    /// device, ones we deleted there): reload its conversation.
+    MessagesDeleted {
+        peer: String,
+        count: u32,
     },
     ApprovalChanged {
         peer: String,
@@ -325,6 +336,7 @@ fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntr
                 location: f.location.clone(),
             }),
             delivered: e.delivered,
+            id: e.message_id(),
             recipients: e.recipients,
             delivered_to: u32::try_from(e.delivered_to.len()).unwrap_or(u32::MAX),
         })
@@ -364,11 +376,16 @@ fn convert(e: Event) -> NodeEvent {
         },
         Event::Message {
             peer,
-            msg: AppMessage::File { name, data, .. },
+            msg: AppMessage::File { name, data, id, .. },
         } => NodeEvent::File {
             peer: fp(&peer),
             name,
             data,
+            id,
+        },
+        Event::MessagesDeleted { peer, count } => NodeEvent::MessagesDeleted {
+            peer: fp(&peer),
+            count: u32::try_from(count).unwrap_or(u32::MAX),
         },
         Event::ApprovalChanged { peer, mutual, .. } => NodeEvent::ApprovalChanged {
             peer: fp(&peer),
@@ -421,6 +438,27 @@ impl ThrenodyNode {
         self.groups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Deletes the entry at `at_ms` from `device` (a fingerprint) in `conv`.
+    pub(crate) fn delete_any(
+        &self,
+        conv: threnody_core::history::ConversationId,
+        at_ms: u64,
+        device: &str,
+    ) -> u32 {
+        let dev = self.node.history(conv).ok().and_then(|h| {
+            h.entries()
+                .iter()
+                .find(|e| {
+                    e.at_ms == at_ms
+                        && PublicIdentity::from_bytes(&e.device).is_ok_and(|d| fp(&d) == device)
+                })
+                .map(|e| e.device)
+        });
+        dev.map_or(0, |d| {
+            u32::try_from(self.node.delete_entry(conv, at_ms, d)).unwrap_or(u32::MAX)
+        })
     }
 
     fn queued(&self) -> MutexGuard<'_, VecDeque<NodeEvent>> {
@@ -605,18 +643,37 @@ impl ThrenodyNode {
         name: String,
         size: u64,
         location: Option<String>,
+        id: u64,
     ) -> Result<()> {
         let p = self.resolve(&peer)?;
-        self.node.record_file(
+        self.node.record_received_file(
             &p,
-            false,
             FileNote {
                 name,
                 size,
                 location,
             },
+            id,
         );
         Ok(())
+    }
+
+    /// Deletes messages (by `HistoryEntry.id`) with `peer`, here and on
+    /// our other devices; with `everyone`, our own among them also on
+    /// `peer`'s devices that support it. Returns how many went here.
+    pub fn delete_messages(&self, peer: String, ids: Vec<u64>, everyone: bool) -> Result<u32> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        let n = self.node.delete_messages(&p, &ids, everyone);
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
+    /// Deletes one entry without an id (older messages, group messages)
+    /// from `peer`'s conversation, on this device.
+    pub fn delete_entry(&self, peer: String, at_ms: u64, device: String) -> Result<u32> {
+        let p = self.resolve(&peer)?;
+        let conv = self.node.conversation_for(&p);
+        Ok(self.delete_any(conv, at_ms, &device))
     }
 
     /// The largest file `send_file` accepts.
@@ -1102,7 +1159,7 @@ mod tests {
                 .send_file(bob_fp.clone(), "big".into(), too_big, None)
                 .is_err()
         );
-        bob.record_received_file(alice.device_fingerprint(), "notes.txt".into(), 10, None)
+        bob.record_received_file(alice.device_fingerprint(), "notes.txt".into(), 10, None, 0)
             .unwrap();
         alice.mark_verified(bob_fp.clone()).unwrap();
         assert!(
@@ -1498,6 +1555,7 @@ mod tests {
             sent_ms: 0,
             name: n.into(),
             data: vec![7u8; 400_000],
+            id: 0,
         };
         alice.node.send(&b_id, file("to-bob")).unwrap();
         bob.node.send(&a_id, file("to-alice")).unwrap();

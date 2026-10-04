@@ -208,7 +208,7 @@ object Threnody {
                     say("* ${short(e.peer)} sent ${e.name} (${e.data.size} bytes)")
                     val uri = saveDownload(ctx, e.name, e.data)
                     try {
-                        node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), uri?.toString())
+                        node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), uri?.toString(), e.id)
                     } catch (x: Exception) {
                         say("! recording ${e.name}: ${x.message}")
                     }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
-use threnody_core::message::{FEATURE_ACKS, MAX_ACK_IDS};
+use threnody_core::message::{FEATURE_ACKS, FEATURES, MAX_ACK_IDS};
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
@@ -159,6 +159,12 @@ pub enum Event {
         via: PublicIdentity,
         msg: AppMessage,
     },
+    /// `peer` deleted messages: ours on its behalf (its own other device),
+    /// or its own for everyone. `count` entries went from our history.
+    MessagesDeleted {
+        peer: PublicIdentity,
+        count: usize,
+    },
     /// A message from someone we haven't accepted yet (see
     /// `Node::accept_contact`). It is in history, but shouldn't be shown
     /// with the user's conversations or notified as one.
@@ -282,6 +288,8 @@ pub(crate) struct Shared {
     next_id: AtomicU64,
     /// Acknowledgement bookkeeping for user content (see `delivery`).
     pub(crate) delivery: Mutex<Delivery>,
+    /// What each peer's latest `Hello` said it supports.
+    pub(crate) peer_features: Mutex<HashMap<PublicIdentity, u64>>,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
 }
@@ -436,6 +444,7 @@ impl Node {
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
+            peer_features: Mutex::new(HashMap::new()),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -714,7 +723,7 @@ impl Node {
     }
 
     /// Sends `msg` tracked (acknowledged, resent if lost) whatever its kind.
-    pub(crate) fn send_tracked(&self, peer: &PublicIdentity, msg: AppMessage) -> Result<()> {
+    pub fn send_tracked(&self, peer: &PublicIdentity, msg: AppMessage) -> Result<()> {
         self.queue(peer, msg, Tag::NONE, true)
     }
 
@@ -727,6 +736,13 @@ impl Node {
             msg
         };
         h.tx.send(msg).map_err(|_| NetError::Closed)
+    }
+
+    /// Whether `peer` said (in its latest session) it supports `feature`.
+    pub fn supports(&self, peer: &PublicIdentity, feature: u64) -> bool {
+        lock(&self.shared.peer_features)
+            .get(peer)
+            .is_some_and(|f| f & feature != 0)
     }
 
     /// How many messages to `peer` are waiting for an acknowledgement.
@@ -906,9 +922,7 @@ where
     // Each side's first message is its Hello, so the other learns its
     // features before anything else.
     let mut pending: VecDeque<AppMessage> = VecDeque::new();
-    pending.push_back(AppMessage::Hello {
-        features: FEATURE_ACKS,
-    });
+    pending.push_back(AppMessage::Hello { features: FEATURES });
     pending.push_back(AppMessage::Approval {
         approved: local_approved,
     });
@@ -986,10 +1000,12 @@ where
                     // reliable stream it can only mean tampering or a broken peer.
                     let opened = chan.open(&frame)?;
                     if peer_acks.is_none() {
-                        peer_acks = Some(matches!(
-                            opened,
-                            AppMessage::Hello { features } if features & FEATURE_ACKS != 0
-                        ));
+                        let features = match opened {
+                            AppMessage::Hello { features } => features,
+                            _ => 0,
+                        };
+                        lock(&shared.peer_features).insert(peer, features);
+                        peer_acks = Some(features & FEATURE_ACKS != 0);
                     }
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
@@ -1011,6 +1027,7 @@ where
                     };
                     let Some(msg) = msg else { continue };
                     match msg {
+                        AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }

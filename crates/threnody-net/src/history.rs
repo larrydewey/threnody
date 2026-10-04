@@ -5,6 +5,8 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
+use threnody_core::message::FEATURE_DELETE;
+
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
@@ -49,6 +51,115 @@ impl Node {
                     .iter()
                     .any(|o| o.account == Some(a) && o.accepted && !o.blocked)
             })
+    }
+
+    /// Deletes messages (by [`Entry::message_id`]) from `peer`'s
+    /// conversation, here and on our other devices. With `everyone`, our
+    /// own messages among them are also deleted on the devices of `peer`'s
+    /// account that support it. Returns how many entries went here.
+    pub fn delete_messages(&self, peer: &PublicIdentity, ids: &[u64], everyone: bool) -> usize {
+        let conv = self.conversation_for(peer);
+        let me = *self.identity().as_bytes();
+        let ours: Vec<u64> = self
+            .history(conv)
+            .map(|h| {
+                h.entries()
+                    .iter()
+                    .filter(|e| e.outgoing && e.device == me && ids.contains(&e.local_id))
+                    .map(|e| e.local_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let gone = self.delete_local(conv, ids);
+        let msg = |ids: Vec<u64>| AppMessage::Delete {
+            conversation: conv.to_bytes(),
+            ids,
+        };
+        // Our other devices delete the same, whatever they are.
+        for s in self.sessions() {
+            if self.is_own_device(&s.peer) && self.supports(&s.peer, FEATURE_DELETE) {
+                let _ = self.send_tracked(&s.peer, msg(ids.to_vec()));
+            }
+        }
+        if everyone && !ours.is_empty() {
+            let devices: Vec<PublicIdentity> = match self.account_of(peer) {
+                Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
+                None => vec![*peer],
+            };
+            for d in devices {
+                if !self.supports(&d, FEATURE_DELETE) {
+                    continue;
+                }
+                if self.send_tracked(&d, msg(ours.clone())).is_err() && self.can_send_offline(&d) {
+                    let _ = self.send_offline(&d, &msg(ours.clone()));
+                }
+            }
+        }
+        gone
+    }
+
+    fn delete_local(&self, conv: ConversationId, ids: &[u64]) -> usize {
+        self.shared
+            .home
+            .delete_entries(self.identity_ref(), conv, now_ms(), |e| {
+                let id = e.message_id();
+                id != 0 && ids.contains(&id)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Deletes entries by time and device (for entries without an id, such
+    /// as older ones or group messages): only here and on our devices'
+    /// own copies, never for others.
+    pub fn delete_entry(&self, conv: ConversationId, at_ms: u64, device: [u8; 32]) -> usize {
+        self.shared
+            .home
+            .delete_entries(self.identity_ref(), conv, now_ms(), |e| {
+                e.at_ms == at_ms && e.device == device
+            })
+            .unwrap_or(0)
+    }
+
+    /// Handles a `Delete` from `from`: one of our devices deleting in a
+    /// conversation, or a peer taking back its own messages.
+    pub(crate) fn on_delete(&self, from: &PublicIdentity, conversation: &[u8], ids: &[u64]) {
+        let gone = if self.is_own_device(from) {
+            match ConversationId::from_bytes(conversation) {
+                // Our sibling's chat with *us* is our chat with it.
+                Some(ConversationId::Peer(k)) if k == *self.identity().as_bytes() => {
+                    self.delete_local(self.conversation_for(from), ids)
+                }
+                Some(conv) => self.delete_local(conv, ids),
+                None => 0,
+            }
+        } else {
+            // Only messages that device's account sent us.
+            let conv = self.conversation_for(from);
+            let senders: Vec<[u8; 32]> = match self.account_of(from) {
+                Some(a) => a
+                    .state()
+                    .devices
+                    .iter()
+                    .map(|(d, _)| *d.as_bytes())
+                    .collect(),
+                None => vec![*from.as_bytes()],
+            };
+            self.shared
+                .home
+                .delete_entries(self.identity_ref(), conv, now_ms(), |e| {
+                    !e.outgoing
+                        && senders.contains(&e.device)
+                        && e.remote_id != 0
+                        && ids.contains(&e.remote_id)
+                })
+                .unwrap_or(0)
+        };
+        if gone > 0 {
+            self.emit(Event::MessagesDeleted {
+                peer: *from,
+                count: gone,
+            });
+        }
     }
 
     /// Accepts `peer`'s message requests (every device of its account):
@@ -141,10 +252,13 @@ impl Node {
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
         let timer = self.effective_timer(conv);
+        // The message carries its history id, so we can delete it later.
+        let local_id = local_id();
         let msg = AppMessage::Text {
             sent_ms: now_ms(),
             body: body.to_owned(),
             expires_in_s: timer,
+            id: local_id,
         };
         let devices: Vec<PublicIdentity> = match self.account_of(peer) {
             Some(a) if !self.is_own_device(peer) => {
@@ -152,7 +266,6 @@ impl Node {
             }
             _ => vec![*peer],
         };
-        let local_id = local_id();
         let mut r = SendReport::default();
         for d in &devices {
             let tag = Tag {
@@ -188,6 +301,7 @@ impl Node {
                 delivered: false,
                 recipients: 0,
                 delivered_to: Vec::new(),
+                remote_id: 0,
             },
         );
         Ok(r)
@@ -215,6 +329,7 @@ impl Node {
             sent_ms: now_ms(),
             name: name.to_owned(),
             data,
+            id: local_id,
         };
         self.send_tagged(
             peer,
@@ -233,6 +348,7 @@ impl Node {
                 location,
             },
             local_id,
+            0,
         );
         Ok(())
     }
@@ -356,6 +472,21 @@ impl Node {
         offline: bool,
         timer: Option<u32>,
     ) {
+        self.record_with_id(conv, device, outgoing, text, offline, timer, 0);
+    }
+
+    /// [`Node::record`] for an incoming message with the sender's id.
+    #[allow(clippy::too_many_arguments)]
+    fn record_with_id(
+        &self,
+        conv: ConversationId,
+        device: [u8; 32],
+        outgoing: bool,
+        text: &str,
+        offline: bool,
+        timer: Option<u32>,
+        remote_id: u64,
+    ) {
         let now = now_ms();
         let entry = Entry {
             at_ms: now,
@@ -369,6 +500,7 @@ impl Node {
             delivered: false,
             recipients: 0,
             delivered_to: Vec::new(),
+            remote_id,
         };
         let _ = self
             .shared
@@ -381,10 +513,23 @@ impl Node {
     /// disappearing-message timer. Sending through [`Node::send_file`]
     /// records it already.
     pub fn record_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote) {
-        self.append_file(peer, outgoing, file, 0);
+        self.append_file(peer, outgoing, file, 0, 0);
     }
 
-    fn append_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote, local_id: u64) {
+    /// Records a received file with the sender's id for it (from the
+    /// `File` message), so a later delete-for-everyone can find it.
+    pub fn record_received_file(&self, peer: &PublicIdentity, file: FileNote, remote_id: u64) {
+        self.append_file(peer, false, file, 0, remote_id);
+    }
+
+    fn append_file(
+        &self,
+        peer: &PublicIdentity,
+        outgoing: bool,
+        file: FileNote,
+        local_id: u64,
+        remote_id: u64,
+    ) {
         let conv = self.conversation_for(peer);
         let timer = self.effective_timer(conv);
         let now = now_ms();
@@ -407,6 +552,7 @@ impl Node {
                 delivered: false,
                 recipients: 0,
                 delivered_to: Vec::new(),
+                remote_id,
             },
         );
     }
@@ -414,7 +560,10 @@ impl Node {
     /// Records an incoming text, adopting the sender's timer setting.
     pub(crate) fn record_incoming(&self, from: &PublicIdentity, msg: &AppMessage, offline: bool) {
         let AppMessage::Text {
-            body, expires_in_s, ..
+            body,
+            expires_in_s,
+            id,
+            ..
         } = msg
         else {
             return;
@@ -430,7 +579,15 @@ impl Node {
                 secs: *expires_in_s,
             });
         }
-        self.record(conv, *from.as_bytes(), false, body, offline, *expires_in_s);
+        self.record_with_id(
+            conv,
+            *from.as_bytes(),
+            false,
+            body,
+            offline,
+            *expires_in_s,
+            *id,
+        );
     }
 
     /// Starts the background sweep of expired history.

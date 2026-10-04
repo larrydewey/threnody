@@ -35,8 +35,8 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
            / Direct / Tracked / Ack
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 = acknowledgements); absent = 0
-Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint }    ; sent_ms, body, disappear after (s)
-File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr }      ; sent_ms, data (≤ 8 MiB), name
+Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint }  ; sent_ms, body, disappear after (s), sender's message id
+File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint }    ; sent_ms, data (≤ 8 MiB), name, sender's message id
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
 TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D)
@@ -49,6 +49,7 @@ Account  = { 0 => 11, 2 => bstr .cbor AccountMsg }        ; Appendix J
 Direct   = { 0 => 12, 2 => bstr .cbor DirectMsg }         ; Appendix L
 Tracked  = { 0 => 13, 2 => bstr .cbor AppMessage, 5 => uint }  ; inner message (not Tracked or Ack), id
 Ack      = { 0 => 14, 2 => bstr }                          ; acknowledged ids, 8 bytes each (big-endian), ≤ 512
+Delete   = { 0 => 15, 2 => bstr, 3 => bstr }               ; message ids (8 bytes each, ≤ 512), conversation id
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),
@@ -64,6 +65,17 @@ When both sides set bit 1, text, files, group messages and mailbox messages trav
 An outgoing text or file in history carries a random local id (history key 7), and its tracked copies carry the same id as a tag. When any device of the recipient's account acknowledges one, the history entry is marked delivered (key 8), and the node emits `Delivered`. Apps show this as a second tick. A group message's entry records how many members it went to (key 9) and the devices that acknowledged their copy (key 10), and it is delivered once all have. Only a member's own acknowledgement counts, not a mailbox's or a forwarder's. A forwarder that delivers a copy reports the member's acknowledgement back with a group `Receipt` (Appendix F).
 
 Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The exception is messages over 64 KiB (files), which are resent only within one run.
+
+## Deleting messages
+
+Texts and files carry the sender's message id (its history entry's local id). The receiver records it with the entry (history key 11).
+
+`Delete` asks the receiver to delete messages by those ids. It's only sent to peers whose `Hello` has feature bit 2. Receivers honour it in two cases:
+
+- **From a peer:** only for messages that peer's account sent ("delete for everyone"). Anything else is ignored.
+- **From one of our own devices:** for any messages in the named conversation. Our devices delete together, whether for me or for everyone. A sibling's chat with *us* is mapped to our chat with it.
+
+It's tracked like user content, so it's resent if lost. Deletion is a request: a modified client can keep a copy, and so can a screenshot. Group messages carry no ids yet, so in groups only "delete for me" exists, on that device.
 
 ## Padding (spec §9, layer 1)
 

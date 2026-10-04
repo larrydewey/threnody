@@ -20,6 +20,10 @@ pub const MAX_FILE: usize = 8 * 1024 * 1024;
 /// `Hello` feature bit: this side acknowledges `Tracked` messages with
 /// `Ack` and accepts them (so the other side may send both).
 pub const FEATURE_ACKS: u64 = 1;
+/// `Hello` feature bit: this side understands `Delete` (so it can be sent).
+pub const FEATURE_DELETE: u64 = 2;
+/// Every feature this implementation has.
+pub const FEATURES: u64 = FEATURE_ACKS | FEATURE_DELETE;
 /// Most ids one `Ack` carries.
 pub const MAX_ACK_IDS: usize = 512;
 
@@ -35,11 +39,16 @@ pub enum AppMessage {
         /// Disappearing-message timer (spec §6.1): both sides delete the
         /// message this many seconds after sending.
         expires_in_s: Option<u32>,
+        /// The sender's id for this message, so it can later be deleted
+        /// for everyone (0 = none).
+        id: u64,
     },
     File {
         sent_ms: u64,
         name: String,
         data: Vec<u8>,
+        /// As for `Text`.
+        id: u64,
     },
     /// Our current mesh/tunnel approval of the peer (spec §5.2). Sent at
     /// session start and whenever it changes.
@@ -69,6 +78,14 @@ pub enum AppMessage {
     Tracked { id: u64, inner: Box<AppMessage> },
     /// Acknowledges `Tracked` messages by id.
     Ack(Vec<u64>),
+    /// Delete these messages (by the sender's `id`s). From a peer: its own
+    /// messages, "delete for everyone". From one of our devices: any
+    /// messages in `conversation`, which it deleted. Only sent to peers
+    /// whose `Hello` has [`FEATURE_DELETE`].
+    Delete {
+        conversation: Vec<u8>,
+        ids: Vec<u64>,
+    },
 }
 
 mod kind {
@@ -87,6 +104,7 @@ mod kind {
     pub const DIRECT: u64 = 12;
     pub const TRACKED: u64 = 13;
     pub const ACK: u64 = 14;
+    pub const DELETE: u64 = 15;
 }
 
 impl AppMessage {
@@ -111,6 +129,15 @@ impl AppMessage {
                     Ok(())
                 });
             }
+            Self::Delete { conversation, ids } => {
+                let packed: Vec<u8> = ids.iter().flat_map(|i| i.to_be_bytes()).collect();
+                return cbor::to_vec(packed.len() + conversation.len() + 24, |e| {
+                    e.map_len(3)?.u8(0)?.uint(kind::DELETE)?;
+                    e.u8(2)?.bytes(&packed)?;
+                    e.u8(3)?.bytes(conversation)?;
+                    Ok(())
+                });
+            }
             _ => {}
         }
         cbor::to_vec(self.size_hint(), |e| {
@@ -123,7 +150,9 @@ impl AppMessage {
                         e.u8(5)?.uint(*features)?;
                     }
                 }
-                Self::Tracked { .. } | Self::Ack(_) => unreachable!("encoded above"),
+                Self::Tracked { .. } | Self::Ack(_) | Self::Delete { .. } => {
+                    unreachable!("encoded above")
+                }
                 Self::Cover => {
                     e.map_len(1)?.u8(0)?.uint(kind::COVER)?;
                 }
@@ -131,8 +160,9 @@ impl AppMessage {
                     sent_ms,
                     body,
                     expires_in_s,
+                    id,
                 } => {
-                    e.map_len(3 + usize::from(expires_in_s.is_some()))?
+                    e.map_len(3 + usize::from(expires_in_s.is_some()) + usize::from(*id != 0))?
                         .u8(0)?
                         .uint(kind::TEXT)?;
                     e.u8(1)?.uint(*sent_ms)?;
@@ -140,16 +170,25 @@ impl AppMessage {
                     if let Some(x) = expires_in_s {
                         e.u8(4)?.u32(*x)?;
                     }
+                    if *id != 0 {
+                        e.u8(5)?.uint(*id)?;
+                    }
                 }
                 Self::File {
                     sent_ms,
                     name,
                     data,
+                    id,
                 } => {
-                    e.map_len(4)?.u8(0)?.uint(kind::FILE)?;
+                    e.map_len(4 + usize::from(*id != 0))?
+                        .u8(0)?
+                        .uint(kind::FILE)?;
                     e.u8(1)?.uint(*sent_ms)?;
                     e.u8(2)?.bytes(data)?;
                     e.u8(3)?.str(name)?;
+                    if *id != 0 {
+                        e.u8(5)?.uint(*id)?;
+                    }
                 }
                 Self::TunnelOffer { wg_public, port } => {
                     e.map_len(3)?.u8(0)?.uint(kind::TUNNEL_OFFER)?;
@@ -225,6 +264,7 @@ impl AppMessage {
         let (mut k, mut ts, mut text, mut bytes, mut flag, mut name, mut port, mut expiry) =
             (None, None, None, None, None, None, None, None);
         let mut five = None;
+        let mut conv = None;
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -236,6 +276,7 @@ impl AppMessage {
                 },
                 3 => match d.peek_major() {
                     Some(const_cbor::Major::Text) => name = Some(d.str()?.to_owned()),
+                    Some(const_cbor::Major::Bytes) => conv = Some(d.bytes()?.to_vec()),
                     _ => port = Some(d.u16()?),
                 },
                 4 => expiry = Some(d.u32()?),
@@ -259,6 +300,21 @@ impl AppMessage {
                     inner: Box::new(inner),
                 }
             }
+            kind::DELETE => {
+                let packed = required(bytes, "deleted ids")?;
+                if packed.len() % 8 != 0 || packed.len() / 8 > MAX_ACK_IDS {
+                    return Err(Error::Malformed("delete"));
+                }
+                Self::Delete {
+                    conversation: required(conv, "conversation")?,
+                    ids: packed
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| u64::from_be_bytes(*c))
+                        .collect(),
+                }
+            }
             kind::ACK => {
                 let packed = required(bytes, "acknowledged ids")?;
                 if packed.len() % 8 != 0 || packed.len() / 8 > MAX_ACK_IDS {
@@ -278,6 +334,7 @@ impl AppMessage {
                 sent_ms: ts.unwrap_or(0),
                 body: required(text, "text body")?,
                 expires_in_s: expiry,
+                id: five.unwrap_or(0),
             },
             kind::FILE => {
                 let data = required(bytes, "file data")?;
@@ -288,6 +345,7 @@ impl AppMessage {
                     sent_ms: ts.unwrap_or(0),
                     name: required(name, "file name")?,
                     data,
+                    id: five.unwrap_or(0),
                 }
             }
             kind::GROUP
@@ -377,25 +435,33 @@ mod tests {
                     sent_ms: 1,
                     name: "big".into(),
                     data: vec![3; MAX_FILE],
+                    id: 0,
                 }),
             },
             AppMessage::Ack(vec![]),
             AppMessage::Ack(vec![1, u64::MAX]),
+            AppMessage::Delete {
+                conversation: vec![0; 33],
+                ids: vec![7, u64::MAX],
+            },
             AppMessage::Cover,
             AppMessage::Text {
                 sent_ms: 42,
                 body: "héllo".into(),
                 expires_in_s: None,
+                id: 0,
             },
             AppMessage::Text {
                 sent_ms: 43,
                 body: "gone soon".into(),
                 expires_in_s: Some(30),
+                id: 0,
             },
             AppMessage::File {
                 sent_ms: 1,
                 name: "a.txt".into(),
                 data: vec![0, 1, 2],
+                id: 0,
             },
             AppMessage::Approval { approved: true },
             AppMessage::TunnelOffer {

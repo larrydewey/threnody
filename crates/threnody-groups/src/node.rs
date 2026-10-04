@@ -233,6 +233,7 @@ impl GroupNode {
                 delivered: recipients == 0,
                 recipients: u32::try_from(recipients).unwrap_or(u32::MAX),
                 delivered_to: Vec::new(),
+                remote_id: 0,
             },
         );
         Ok(())

@@ -88,6 +88,21 @@ pub struct Entry {
     /// devices that acknowledged it so far.
     pub recipients: u32,
     pub delivered_to: Vec<[u8; 32]>,
+    /// For incoming entries: the sender's id for the message (0 = none),
+    /// which a later "delete for everyone" names.
+    pub remote_id: u64,
+}
+
+impl Entry {
+    /// The id other devices know this message by: ours if we sent it, the
+    /// sender's otherwise (0 = none).
+    pub fn message_id(&self) -> u64 {
+        if self.outgoing {
+            self.local_id
+        } else {
+            self.remote_id
+        }
+    }
 }
 
 /// A file sent or received. The contents aren't kept here, only where the
@@ -203,7 +218,8 @@ impl History {
                         + usize::from(e.local_id != 0)
                         + usize::from(e.delivered)
                         + usize::from(e.recipients != 0)
-                        + usize::from(!e.delivered_to.is_empty()),
+                        + usize::from(!e.delivered_to.is_empty())
+                        + usize::from(e.remote_id != 0),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -233,6 +249,9 @@ impl History {
                 if !e.delivered_to.is_empty() {
                     enc.u8(10)?.bytes(&e.delivered_to.concat())?;
                 }
+                if e.remote_id != 0 {
+                    enc.u8(11)?.u64(e.remote_id)?;
+                }
             }
             Ok(())
         })
@@ -251,6 +270,7 @@ impl History {
                             (None, None, None, None, None, None, None);
                         let (mut local_id, mut delivered) = (0, false);
                         let (mut recipients, mut delivered_to) = (0, Vec::new());
+                        let mut remote_id = 0;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -270,6 +290,7 @@ impl History {
                                     }
                                     delivered_to = b.as_chunks::<32>().0.to_vec();
                                 }
+                                11 => remote_id = d.u64()?,
                                 _ => return Ok(false),
                             }
                             Ok(true)
@@ -286,6 +307,7 @@ impl History {
                             delivered,
                             recipients,
                             delivered_to,
+                            remote_id,
                         });
                     }
                 }
@@ -440,6 +462,25 @@ impl Home {
         Ok(true)
     }
 
+    /// Deletes the entries `pick` chooses from a conversation; returns how
+    /// many went.
+    pub fn delete_entries(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Result<usize> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let before = h.entries.len();
+        h.entries.retain(|e| !pick(e));
+        let gone = before - h.entries.len();
+        if gone > 0 {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(gone)
+    }
+
     /// Deletes a conversation's history.
     pub fn delete_history(&self, c: ConversationId) -> Result<()> {
         self.remove_state(&c.state_name())
@@ -493,6 +534,7 @@ mod tests {
             delivered: false,
             recipients: 0,
             delivered_to: Vec::new(),
+            remote_id: 0,
         }
     }
 

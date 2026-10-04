@@ -52,6 +52,7 @@ Type a line to send it to the current peer. Commands:
   /name <peer> <name>                   set a local name
   /approve [peer]   /revoke [peer]      mesh / tunnel approval
   /requests   /accept <peer>   /block <peer>   /delete <peer>   message requests
+  /del <n> [all]                        delete message n of the last /history (all: for everyone)
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
   /file <path>                          send a file to the current peer
@@ -74,6 +75,8 @@ struct Ui {
     tunnels: Option<Tunnels>,
     discovery: Option<std::net::SocketAddr>,
     groups: GroupUi,
+    /// What the last /history showed, numbered from 1: /del refers to it.
+    shown: std::cell::RefCell<(Option<PublicIdentity>, Vec<threnody_core::history::Entry>)>,
     #[cfg(all(feature = "ble", target_os = "linux"))]
     ble_seen: std::sync::Arc<std::sync::Mutex<Vec<crate::ble::Found>>>,
     wifi_direct: bool,
@@ -145,6 +148,7 @@ pub async fn run(opts: Options) -> Result<()> {
         tunnels,
         discovery: None,
         groups,
+        shown: std::cell::RefCell::new((None, Vec::new())),
         #[cfg(all(feature = "ble", target_os = "linux"))]
         ble_seen: std::sync::Arc::default(),
         wifi_direct: opts.wifi_direct,
@@ -337,7 +341,9 @@ impl Ui {
         if h.entries().is_empty() {
             println!("  no history with {}", self.name(&peer));
         }
-        for e in h.recent(n) {
+        *self.shown.borrow_mut() = (Some(peer), h.recent(n).to_vec());
+        for (i, e) in h.recent(n).iter().enumerate() {
+            print!("{:>3}", i + 1);
             let who = if e.outgoing {
                 "me".to_owned()
             } else {
@@ -499,6 +505,9 @@ impl Ui {
                 self.groups.connected(&self.node, &name, &peer);
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
+            Event::MessagesDeleted { peer, count } => {
+                println!("* {} deleted {count} message(s)", self.name(&peer));
+            }
             Event::MessageRequest { peer, msg } => {
                 let what = match &msg {
                     AppMessage::Text { body, .. } => format!("{body:?}"),
@@ -741,6 +750,41 @@ impl Ui {
                     }
                 });
                 println!("* named {}", self.name(&key));
+            }
+            "del" => {
+                let mut it = arg.unwrap_or("").split_whitespace();
+                let n: usize = it
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| anyhow!("usage: /del <n> [all] (n from /history)"))?;
+                let everyone = it.next() == Some("all");
+                // Exactly the message the last /history numbered `n`.
+                let (peer, shown) = self.shown.borrow().clone();
+                let peer =
+                    peer.ok_or_else(|| anyhow!("run /history first; /del uses its numbers"))?;
+                let conv = self.node.conversation_for(&peer);
+                let e = shown
+                    .get(n.wrapping_sub(1))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("no message {n} in the last /history"))?;
+                if everyone && !e.outgoing {
+                    bail!("only your own messages can be deleted for everyone");
+                }
+                let e = &e;
+                let gone = if e.message_id() != 0 {
+                    self.node
+                        .delete_messages(&peer, &[e.message_id()], everyone)
+                } else {
+                    self.node.delete_entry(conv, e.at_ms, e.device)
+                };
+                println!(
+                    "* deleted {gone} message(s){}",
+                    if everyone {
+                        " here and for everyone who supports it"
+                    } else {
+                        ""
+                    }
+                );
             }
             "requests" => {
                 let pending: Vec<_> = self

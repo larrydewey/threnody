@@ -412,6 +412,10 @@ impl Node {
         if let Ok((from, body)) = opened
             && let Ok(msg) = AppMessage::decode(&body)
         {
+            if let AppMessage::Delete { conversation, ids } = &msg {
+                self.on_delete(&from, conversation, ids);
+                return;
+            }
             self.record_incoming(&from, &msg, true);
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {
                 self.emit(Event::OfflineMessage { from, via, msg });

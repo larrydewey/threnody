@@ -225,6 +225,12 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
+    /// Deletes one message from a group's history on this device.
+    pub fn delete_group_entry(&self, group: String, at_ms: u64, device: String) -> Result<u32> {
+        let g = self.group_id(&group)?;
+        Ok(self.delete_any(ConversationId::Group(g), at_ms, &device))
+    }
+
     /// The last `limit` messages in a group (oldest first).
     pub fn group_history(&self, group: String, limit: u32) -> Result<Vec<HistoryEntry>> {
         let g = self.group_id(&group)?;

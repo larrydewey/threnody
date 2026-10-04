@@ -79,6 +79,7 @@ fn text(s: &str) -> AppMessage {
         sent_ms: 0,
         body: s.into(),
         expires_in_s: None,
+        id: 0,
     }
 }
 

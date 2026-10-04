@@ -270,6 +270,7 @@ mod tests {
             sent_ms: 0,
             body: s.into(),
             expires_in_s: None,
+            id: 0,
         }
     }
 
@@ -320,6 +321,7 @@ mod tests {
                 sent_ms: 0,
                 name: "big".into(),
                 data: vec![0; MAX_PERSISTED],
+                id: 0,
             },
             Tag::NONE,
         );
@@ -358,6 +360,7 @@ mod tests {
             sent_ms: 0,
             name: "f".into(),
             data: vec![0; 8 * 1024 * 1024],
+            id: 0,
         };
         for _ in 0..6 {
             d.track(&p, big.clone(), Tag::NONE);

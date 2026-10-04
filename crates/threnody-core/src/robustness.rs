@@ -63,12 +63,14 @@ fn parsers_survive_mutated_input() {
             sent_ms: 1,
             body: "x".into(),
             expires_in_s: None,
+            id: 0,
         })
         .unwrap();
     let app = AppMessage::File {
         sent_ms: 9,
         name: "n".into(),
         data: vec![1, 2, 3],
+        id: 0,
     }
     .encode()
     .unwrap();
@@ -105,7 +107,8 @@ fn parsers_survive_mutated_input() {
         AppMessage::Text {
             sent_ms: 1,
             body: "x".into(),
-            expires_in_s: None
+            expires_in_s: None,
+            id: 0,
         }
     );
 }
