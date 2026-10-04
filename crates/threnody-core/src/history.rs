@@ -65,8 +65,13 @@ pub struct Entry {
     /// For outgoing entries: a local id the delivery acknowledgements
     /// refer to (0 = none).
     pub local_id: u64,
-    /// An outgoing message the recipient acknowledged (Appendix C).
+    /// An outgoing message the recipient acknowledged (Appendix C); for a
+    /// group, every recipient.
     pub delivered: bool,
+    /// For outgoing group messages: how many members it went to, and the
+    /// devices that acknowledged it so far.
+    pub recipients: u32,
+    pub delivered_to: Vec<[u8; 32]>,
 }
 
 /// A file sent or received. The contents aren't kept here, only where the
@@ -139,7 +144,9 @@ impl History {
                     5 + usize::from(e.expires_at_ms.is_some())
                         + usize::from(e.file.is_some())
                         + usize::from(e.local_id != 0)
-                        + usize::from(e.delivered),
+                        + usize::from(e.delivered)
+                        + usize::from(e.recipients != 0)
+                        + usize::from(!e.delivered_to.is_empty()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -163,6 +170,12 @@ impl History {
                 if e.delivered {
                     enc.u8(8)?.bool(true)?;
                 }
+                if e.recipients != 0 {
+                    enc.u8(9)?.u32(e.recipients)?;
+                }
+                if !e.delivered_to.is_empty() {
+                    enc.u8(10)?.bytes(&e.delivered_to.concat())?;
+                }
             }
             Ok(())
         })
@@ -180,6 +193,7 @@ impl History {
                         let (mut at, mut out, mut dev, mut text, mut off, mut exp, mut file) =
                             (None, None, None, None, None, None, None);
                         let (mut local_id, mut delivered) = (0, false);
+                        let (mut recipients, mut delivered_to) = (0, Vec::new());
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -191,6 +205,14 @@ impl History {
                                 6 => file = Some(decode_file(d)?),
                                 7 => local_id = d.u64()?,
                                 8 => delivered = d.bool()?,
+                                9 => recipients = d.u32()?,
+                                10 => {
+                                    let b = d.bytes()?;
+                                    if b.len() % 32 != 0 {
+                                        return Err(Error::Malformed("delivered devices"));
+                                    }
+                                    delivered_to = b.as_chunks::<32>().0.to_vec();
+                                }
                                 _ => return Ok(false),
                             }
                             Ok(true)
@@ -205,6 +227,8 @@ impl History {
                             file,
                             local_id,
                             delivered,
+                            recipients,
+                            delivered_to,
                         });
                     }
                 }
@@ -278,13 +302,15 @@ impl Home {
         Ok(h)
     }
 
-    /// Marks the outgoing entry with `local_id` delivered; returns false if
-    /// there is none (or it already was).
+    /// Records that `device` acknowledged the outgoing entry `local_id`.
+    /// A 1:1 entry is then delivered; a group entry once every recipient
+    /// has acknowledged. Returns false if nothing changed.
     pub fn mark_delivered(
         &self,
         identity: &Identity,
         c: ConversationId,
         local_id: u64,
+        device: [u8; 32],
         now_ms: u64,
     ) -> Result<bool> {
         if local_id == 0 {
@@ -295,11 +321,18 @@ impl Home {
             .entries
             .iter_mut()
             .rev()
-            .find(|e| e.outgoing && e.local_id == local_id && !e.delivered)
+            .find(|e| e.outgoing && e.local_id == local_id)
         else {
             return Ok(false);
         };
-        e.delivered = true;
+        match c {
+            ConversationId::Peer(_) if !e.delivered => e.delivered = true,
+            ConversationId::Group(_) if !e.delivered_to.contains(&device) => {
+                e.delivered_to.push(device);
+                e.delivered = e.delivered_to.len() >= e.recipients as usize;
+            }
+            _ => return Ok(false),
+        }
         self.save_history(identity, c, &h)?;
         Ok(true)
     }
@@ -379,6 +412,8 @@ mod tests {
             file: None,
             local_id: 0,
             delivered: false,
+            recipients: 0,
+            delivered_to: Vec::new(),
         }
     }
 
@@ -444,12 +479,40 @@ mod tests {
         };
         assert!(sent.outgoing);
         home.append_history(&id, acct, sent, 200).unwrap();
-        assert!(!home.mark_delivered(&id, acct, 78, 201).unwrap());
-        assert!(home.mark_delivered(&id, acct, 77, 201).unwrap());
-        assert!(!home.mark_delivered(&id, acct, 77, 201).unwrap(), "once");
+        assert!(!home.mark_delivered(&id, acct, 78, [1; 32], 201).unwrap());
+        assert!(home.mark_delivered(&id, acct, 77, [1; 32], 201).unwrap());
+        assert!(
+            !home.mark_delivered(&id, acct, 77, [2; 32], 201).unwrap(),
+            "once"
+        );
         let h = home.load_history(&id, acct, 201).unwrap();
         let e = h.entries().last().unwrap();
         assert!(e.delivered && e.local_id == 77);
+
+        // A group entry is delivered once every recipient acknowledged.
+        let g = ConversationId::Group([3; 16]);
+        let to_two = Entry {
+            local_id: 5,
+            recipients: 2,
+            ..entry(300, "to the group", None)
+        };
+        home.append_history(&id, g, to_two, 300).unwrap();
+        let get = || {
+            home.load_history(&id, g, 301)
+                .unwrap()
+                .entries()
+                .last()
+                .cloned()
+                .unwrap()
+        };
+        assert!(home.mark_delivered(&id, g, 5, [1; 32], 301).unwrap());
+        assert!(
+            !home.mark_delivered(&id, g, 5, [1; 32], 301).unwrap(),
+            "same device twice"
+        );
+        assert!(!get().delivered && get().delivered_to == [[1; 32]]);
+        assert!(home.mark_delivered(&id, g, 5, [2; 32], 301).unwrap());
+        assert!(get().delivered && get().delivered_to.len() == 2 && get().recipients == 2);
     }
 
     #[test]

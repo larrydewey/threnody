@@ -18,6 +18,7 @@ pub mod node;
 pub mod onion;
 pub mod relay;
 
+pub use delivery::Tag;
 pub use direct::DirectOffer;
 pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};

@@ -59,8 +59,14 @@ pub struct HistoryEntry {
     pub disappearing: bool,
     /// Set when the entry is a file transfer (then `text` is empty).
     pub file: Option<FileInfo>,
-    /// An outgoing message a device of the recipient acknowledged.
+    /// An outgoing message a device of the recipient acknowledged (for a
+    /// group, every recipient did).
     pub delivered: bool,
+    /// For outgoing group messages: how many members it went to, and how
+    /// many acknowledged their copy (forwarded or mailbox copies don't
+    /// count until the member itself acknowledges).
+    pub recipients: u32,
+    pub delivered_to: u32,
 }
 
 /// A file in history: its name, size and where the app saved it.
@@ -169,10 +175,11 @@ pub enum NodeEvent {
     WifiDirectRequested {
         peer: String,
     },
-    /// A device of `peer`'s account acknowledged one of our messages:
-    /// reload its conversation's history to show it delivered.
+    /// `peer` acknowledged one of our messages: reload the history of its
+    /// conversation (`group` if set, else the 1:1 one with `peer`).
     Delivered {
         peer: String,
+        group: Option<String>,
     },
     /// We joined a group (after accepting, or automatically when a
     /// mutually approved contact invited us).
@@ -275,6 +282,8 @@ fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntr
                 location: f.location.clone(),
             }),
             delivered: e.delivered,
+            recipients: e.recipients,
+            delivered_to: u32::try_from(e.delivered_to.len()).unwrap_or(u32::MAX),
         })
         .collect()
 }
@@ -335,7 +344,10 @@ fn convert(e: Event) -> NodeEvent {
             device: fp(&device),
         },
         Event::ThisDeviceRemoved => NodeEvent::ThisDeviceRemoved,
-        Event::Delivered { peer, .. } => NodeEvent::Delivered { peer: fp(&peer) },
+        Event::Delivered { peer, group, .. } => NodeEvent::Delivered {
+            peer: fp(&peer),
+            group: group.map(|g| g.iter().map(|b| format!("{b:02x}")).collect()),
+        },
         Event::WifiDirectOffer { peer, offer } => NodeEvent::WifiDirectOffer {
             peer: fp(&peer),
             ssid: offer.ssid,
@@ -1140,6 +1152,33 @@ mod tests {
         }
         assert_eq!(bob.group_history(g.clone(), 10).unwrap()[0].text, "hi all");
         assert!(carol.group_history(g.clone(), 10).unwrap()[0].outgoing);
+        // Alice reached Carol's copy for Bob, not Bob: one of two counted.
+        let mine = &carol.group_history(g.clone(), 10).unwrap()[0];
+        assert_eq!(mine.recipients, 2);
+        all.until(
+            2,
+            |e| matches!(e, NodeEvent::Delivered { group: Some(x), .. } if *x == g),
+        );
+        let mine = &carol.group_history(g.clone(), 10).unwrap()[0];
+        assert!(mine.delivered_to == 1 && !mine.delivered, "{mine:?}");
+        // The owner reaches both directly: delivered.
+        alice
+            .send_group_text(g.clone(), "from the owner".into())
+            .unwrap();
+        for i in [1, 2] {
+            all.until(
+                i,
+                |e| matches!(e, NodeEvent::GroupMessage { text, .. } if text == "from the owner"),
+            );
+        }
+        all.until(0, |e| matches!(e, NodeEvent::Delivered { .. }));
+        all.until(0, |e| matches!(e, NodeEvent::Delivered { .. }));
+        let sent = alice.group_history(g.clone(), 10).unwrap();
+        let sent = sent.last().unwrap();
+        assert!(
+            sent.delivered && sent.delivered_to == 2 && sent.recipients == 2,
+            "{sent:?}"
+        );
 
         // Store and forward: Bob is away when Carol writes; Alice holds
         // her message until he is back.

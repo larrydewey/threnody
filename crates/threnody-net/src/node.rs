@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::account::LinkState;
-use crate::delivery::{Delivery, trackable};
+use crate::delivery::{Delivery, Tag, trackable};
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
@@ -153,13 +153,14 @@ pub enum Event {
         via: PublicIdentity,
         msg: AppMessage,
     },
-    /// A mailbox reported what it did with our deposit for `to`.
-    /// A device of `peer`'s account acknowledged an outgoing message: the
-    /// history entry with `local_id` is now marked delivered.
+    /// `peer` acknowledged an outgoing message: the history entry
+    /// `local_id` (in `group`, else the 1:1 conversation) changed.
     Delivered {
         peer: PublicIdentity,
         local_id: u64,
+        group: Option<[u8; 16]>,
     },
+    /// A mailbox reported what it did with our deposit for `to`.
     DepositReceipt {
         mailbox: PublicIdentity,
         to: PublicIdentity,
@@ -646,21 +647,16 @@ impl Node {
     /// group and mailbox messages) is kept until the peer acknowledges it
     /// and sent again in the next session if this one dies first.
     pub fn send(&self, peer: &PublicIdentity, msg: AppMessage) -> Result<()> {
-        self.send_tagged(peer, msg, 0)
+        self.send_tagged(peer, msg, Tag::NONE)
     }
 
-    /// [`Node::send`], marking history entry `local_id` delivered on
-    /// acknowledgement.
-    pub(crate) fn send_tagged(
-        &self,
-        peer: &PublicIdentity,
-        msg: AppMessage,
-        local_id: u64,
-    ) -> Result<()> {
+    /// [`Node::send`], marking the history entry `tag` names delivered
+    /// when the peer acknowledges.
+    pub fn send_tagged(&self, peer: &PublicIdentity, msg: AppMessage, tag: Tag) -> Result<()> {
         let sessions = lock(&self.shared.sessions);
         let h = sessions.get(peer).ok_or(NetError::Closed)?;
         let msg = if trackable(&msg) {
-            self.shared.delivery(|d| d.track(peer, msg, local_id))
+            self.shared.delivery(|d| d.track(peer, msg, tag))
         } else {
             msg
         };
@@ -862,7 +858,7 @@ where
         // Held deliveries leave the mailbox store now; tracking keeps them
         // until the peer has them.
         let held = node.mailbox_for(&peer);
-        shared.delivery(|d| pending.extend(held.into_iter().map(|m| d.track(&peer, m, 0))));
+        shared.delivery(|d| pending.extend(held.into_iter().map(|m| d.track(&peer, m, Tag::NONE))));
     }
     let result: Result<()> = async {
         loop {
@@ -928,8 +924,8 @@ where
                             shared.delivery(|d| d.first_delivery(&peer, id)).then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
-                            for local_id in shared.delivery(|d| d.acked(&peer, &ids)) {
-                                node.mark_delivered(&peer, local_id);
+                            for tag in shared.delivery(|d| d.acked(&peer, &ids)) {
+                                node.mark_delivered(&peer, tag);
                             }
                             None
                         }

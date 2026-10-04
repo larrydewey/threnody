@@ -14,10 +14,10 @@
 //! A forwarder delivers the same way but never forwards again, so a
 //! message crosses at most one forwarding member.
 
-use threnody_core::history::ConversationId;
+use threnody_core::history::{ConversationId, Entry};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
-use threnody_net::Node;
+use threnody_net::{Node, Tag};
 
 use crate::{GroupError, GroupEvent, GroupId, GroupWire, Groups, Output};
 
@@ -27,6 +27,7 @@ const STATE: &str = "groups";
 const INVITES: &str = "group-invites";
 const HELD: &str = "group-held";
 const VERSION: u8 = 1;
+const HELD_VERSION: u8 = 2;
 /// Messages held for one member; the oldest are dropped first. Messages
 /// from more than a few epochs back can't be read anyway.
 pub const MAX_HELD_PER_MEMBER: usize = 200;
@@ -71,8 +72,9 @@ pub enum Update {
 pub struct GroupNode {
     groups: Groups,
     invites: Vec<Invite>,
-    /// Encoded `GroupWire::Message`s waiting for their member to connect.
-    held: Vec<(PublicIdentity, Vec<u8>)>,
+    /// Encoded `GroupWire::Message`s waiting for their member to connect,
+    /// with the local id of the history entry they belong to (0 = none).
+    held: Vec<(PublicIdentity, Vec<u8>, u64)>,
     home: Home,
     identity: Identity,
 }
@@ -111,7 +113,7 @@ impl GroupNode {
 
     /// How many messages are waiting for `member` to connect.
     pub fn held_for(&self, member: &PublicIdentity) -> usize {
-        self.held.iter().filter(|(p, _)| p == member).count()
+        self.held.iter().filter(|(p, ..)| p == member).count()
     }
 
     /// Creates a group that we own.
@@ -183,17 +185,29 @@ impl GroupNode {
         Ok(updates)
     }
 
-    /// Sends text to every other member and records it in the group's history.
+    /// Sends text to every other member and records it in the group's
+    /// history, to be marked as members acknowledge their copies.
     pub fn send_text(&mut self, node: &Node, group: &GroupId, text: &str) -> Result<()> {
+        let recipients = self.members(group)?.len().saturating_sub(1);
         let out = self.groups.send_text(group, text)?;
-        self.apply(node, out, true);
-        node.record(
+        let local_id = threnody_net::history::local_id();
+        self.apply_tagged(node, out, true, local_id);
+        let now = threnody_core::now_ms();
+        node.append(
             ConversationId::Group(*group),
-            *node.identity().as_bytes(),
-            true,
-            text,
-            false,
-            None,
+            Entry {
+                at_ms: now,
+                outgoing: true,
+                device: *node.identity().as_bytes(),
+                text: text.to_owned(),
+                offline: false,
+                expires_at_ms: None,
+                file: None,
+                local_id,
+                delivered: recipients == 0,
+                recipients: u32::try_from(recipients).unwrap_or(u32::MAX),
+                delivered_to: Vec::new(),
+            },
         );
         Ok(())
     }
@@ -214,16 +228,22 @@ impl GroupNode {
 
     /// Sends what was held for `peer`, who just connected.
     pub fn connected(&mut self, node: &Node, peer: &PublicIdentity) {
-        if !self.held.iter().any(|(p, _)| p == peer) {
+        if !self.held.iter().any(|(p, ..)| p == peer) {
             return;
         }
         let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|(p, _)| p == peer);
+            .partition(|(p, ..)| p == peer);
         self.held = rest;
-        for (p, bytes) in mine {
-            if node.send(&p, AppMessage::Group(bytes.clone())).is_err() {
-                self.held.push((p, bytes));
+        for (p, bytes, local_id) in mine {
+            let tag = GroupWire::decode(&bytes)
+                .map(|w| tag(local_id, w.group()))
+                .unwrap_or(Tag::NONE);
+            if node
+                .send_tagged(&p, AppMessage::Group(bytes.clone()), tag)
+                .is_err()
+            {
+                self.held.push((p, bytes, local_id));
             }
         }
         self.save_held();
@@ -258,12 +278,23 @@ impl GroupNode {
 
     /// Persists, delivers `out`, and turns its events into updates.
     fn apply(&mut self, node: &Node, out: Output, may_forward: bool) -> Vec<Update> {
+        self.apply_tagged(node, out, may_forward, 0)
+    }
+
+    /// [`Self::apply`], with copies tagged for history entry `local_id`.
+    fn apply_tagged(
+        &mut self,
+        node: &Node,
+        out: Output,
+        may_forward: bool,
+        local_id: u64,
+    ) -> Vec<Update> {
         // Persist before anything leaves: a crash must not lose an epoch
         // that peers have already moved to.
         let _ = self.save();
         let held = self.held.len();
         for o in out.send {
-            self.deliver(node, o.to, o.wire, may_forward);
+            self.deliver(node, o.to, o.wire, may_forward, local_id);
         }
         if self.held.len() != held {
             self.save_held();
@@ -275,10 +306,22 @@ impl GroupNode {
         updates
     }
 
-    fn deliver(&mut self, node: &Node, to: PublicIdentity, wire: GroupWire, may_forward: bool) {
+    /// Only a copy the member acknowledges itself counts towards the
+    /// entry's delivery; mailboxes and forwarders aren't the member.
+    fn deliver(
+        &mut self,
+        node: &Node,
+        to: PublicIdentity,
+        wire: GroupWire,
+        may_forward: bool,
+        local_id: u64,
+    ) {
         let Ok(bytes) = wire.encode() else { return };
         let msg = AppMessage::Group(bytes.clone());
-        if node.send(&to, msg.clone()).is_ok() {
+        if node
+            .send_tagged(&to, msg.clone(), tag(local_id, wire.group()))
+            .is_ok()
+        {
             return;
         }
         if node.can_send_offline(&to) && node.send_offline(&to, &msg).is_ok() {
@@ -299,7 +342,7 @@ impl GroupNode {
             }
         }
         // Hold it for when they connect, and try to make that happen.
-        self.held.push((to, bytes));
+        self.held.push((to, bytes, local_id));
         let mine: Vec<usize> = (0..self.held.len())
             .filter(|&i| self.held[i].0 == to)
             .collect();
@@ -378,6 +421,17 @@ impl GroupNode {
     }
 }
 
+fn tag(local_id: u64, group: &GroupId) -> Tag {
+    if local_id == 0 {
+        Tag::NONE
+    } else {
+        Tag {
+            local_id,
+            group: Some(*group),
+        }
+    }
+}
+
 /// Every device of `peer`'s account except ours (just `peer` without one).
 fn account_devices(node: &Node, peer: &PublicIdentity) -> Vec<PublicIdentity> {
     let me = node.identity();
@@ -395,7 +449,7 @@ fn account_devices(node: &Node, peer: &PublicIdentity) -> Vec<PublicIdentity> {
 
 // Local state, inside encrypted state files:
 //   invites = VERSION || * ( group (16) | inviter (32) | name len (u16 LE) | name )
-//   held    = VERSION || * ( member (32) | len (u32 LE) | GroupWire bytes )
+//   held    = HELD_VERSION || * ( member (32) | local id (u64 BE) | len (u32 LE) | GroupWire bytes )
 
 fn encode_invites(invites: &[Invite]) -> Vec<u8> {
     let mut out = vec![VERSION];
@@ -433,30 +487,32 @@ fn decode_invites(b: &[u8]) -> Vec<Invite> {
     out
 }
 
-fn encode_held(held: &[(PublicIdentity, Vec<u8>)]) -> Vec<u8> {
-    let mut out = vec![VERSION];
-    for (p, b) in held {
+fn encode_held(held: &[(PublicIdentity, Vec<u8>, u64)]) -> Vec<u8> {
+    let mut out = vec![HELD_VERSION];
+    for (p, b, local_id) in held {
         out.extend_from_slice(p.as_bytes());
+        out.extend_from_slice(&local_id.to_be_bytes());
         out.extend_from_slice(&u32::try_from(b.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(b);
     }
     out
 }
 
-fn decode_held(b: &[u8]) -> Vec<(PublicIdentity, Vec<u8>)> {
+fn decode_held(b: &[u8]) -> Vec<(PublicIdentity, Vec<u8>, u64)> {
     let mut out = Vec::new();
-    let Some((&VERSION, mut rest)) = b.split_first() else {
+    let Some((&HELD_VERSION, mut rest)) = b.split_first() else {
         return out;
     };
-    while let Some((head, r)) = rest.split_at_checked(36) {
-        let len = u32::from_le_bytes([head[32], head[33], head[34], head[35]]) as usize;
+    while let Some((head, r)) = rest.split_at_checked(44) {
+        let len = u32::from_le_bytes([head[40], head[41], head[42], head[43]]) as usize;
         let Some((msg, r)) = r.split_at_checked(len) else {
             break;
         };
         rest = r;
         let peer: [u8; 32] = head[..32].try_into().unwrap_or_default();
+        let local_id = u64::from_be_bytes(head[32..40].try_into().unwrap_or_default());
         if let Ok(p) = PublicIdentity::from_bytes(&peer) {
-            out.push((p, msg.to_vec()));
+            out.push((p, msg.to_vec(), local_id));
         }
     }
     out
@@ -484,7 +540,7 @@ mod tests {
         let b = encode_invites(&invites);
         assert_eq!(decode_invites(&b), invites);
         assert_eq!(decode_invites(&b[..b.len() - 1]), invites[..1]);
-        let held = vec![(p, vec![1, 2, 3]), (p, vec![])];
+        let held = vec![(p, vec![1, 2, 3], 9), (p, vec![], 0)];
         let b = encode_held(&held);
         assert_eq!(decode_held(&b), held);
         assert_eq!(decode_held(&b[..b.len() - 2]), held[..1]);

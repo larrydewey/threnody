@@ -155,6 +155,7 @@ class ChatActivity : Activity() {
                 is NodeEvent.GroupMembersChanged -> e.group == g
                 is NodeEvent.GroupJoined -> e.group == g
                 is NodeEvent.GroupLeft -> e.group == g
+                is NodeEvent.Delivered -> e.group == g
                 else -> false
             }
         }
@@ -193,7 +194,7 @@ class ChatActivity : Activity() {
         }
         val me = node.deviceFingerprint()
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(ULong.MAX_VALUE, true, me, it, false, null, false), sending = true) }
+            pending.map { Item(HistoryEntry(ULong.MAX_VALUE, true, me, it, false, null, false, 0u, 0u), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         runOnUiThread {
@@ -338,16 +339,17 @@ class ChatActivity : Activity() {
             Formatter.formatShortFileSize(this, file.size.toLong()) + " · " + time +
                 if (uri != null && !outgoing) " · in Downloads" else ""
         }
-        // Ticks for 1:1 messages: one once sent, two once a device of the
-        // contact acknowledged it. Group messages go to many, so no ticks.
+        // One tick once sent, two once delivered: to a device of the
+        // contact, or to every member of a group (with a count until then).
         val tick = when {
-            !outgoing || item.sending || group != null -> ""
+            !outgoing || item.sending -> ""
             e.delivered -> " ✓✓"
+            group != null && e.deliveredTo > 0u -> " ✓ ${e.deliveredTo}/${e.recipients}"
             else -> " ✓"
         }
         body.addView(TextView(this).apply {
             text = meta + (if (e.disappearing) " · ⏱" else "") + tick
-            contentDescription = text.toString().replace("✓✓", "delivered").replace("✓", "sent")
+            contentDescription = text.toString().replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
             textSize = 11f
             setTextColor(fg)
             alpha = 0.7f

@@ -5,11 +5,12 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
+use crate::delivery::Tag;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node};
 
 /// A random non-zero id for an outgoing history entry.
-fn local_id() -> u64 {
+pub fn local_id() -> u64 {
     u64::from_le_bytes(threnody_core::crypto::random_bytes()).max(1)
 }
 
@@ -54,7 +55,11 @@ impl Node {
         let local_id = local_id();
         let mut r = SendReport::default();
         for d in &devices {
-            if self.send_tagged(d, msg.clone(), local_id).is_ok() {
+            let tag = Tag {
+                local_id,
+                group: None,
+            };
+            if self.send_tagged(d, msg.clone(), tag).is_ok() {
                 r.live += 1;
             } else if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
                 r.sealed += 1;
@@ -81,6 +86,8 @@ impl Node {
                 file: None,
                 local_id,
                 delivered: false,
+                recipients: 0,
+                delivered_to: Vec::new(),
             },
         );
         Ok(r)
@@ -108,7 +115,14 @@ impl Node {
             name: name.to_owned(),
             data,
         };
-        self.send_tagged(peer, msg, local_id)?;
+        self.send_tagged(
+            peer,
+            msg,
+            Tag {
+                local_id,
+                group: None,
+            },
+        )?;
         self.append_file(
             peer,
             true,
@@ -122,23 +136,30 @@ impl Node {
         Ok(())
     }
 
-    /// Marks the entry `local_id` in `peer`'s conversation delivered and
-    /// tells the app (once, whichever device acknowledged first).
-    pub(crate) fn mark_delivered(&self, peer: &PublicIdentity, local_id: u64) {
-        let conv = self.conversation_for(peer);
-        if let Ok(true) =
-            self.shared
-                .home
-                .mark_delivered(self.identity_ref(), conv, local_id, now_ms())
-        {
+    /// Records `peer`'s acknowledgement of the entry `tag` names, and
+    /// tells the app if that changed anything.
+    pub(crate) fn mark_delivered(&self, peer: &PublicIdentity, tag: Tag) {
+        let conv = match tag.group {
+            Some(g) => ConversationId::Group(g),
+            None => self.conversation_for(peer),
+        };
+        if let Ok(true) = self.shared.home.mark_delivered(
+            self.identity_ref(),
+            conv,
+            tag.local_id,
+            *peer.as_bytes(),
+            now_ms(),
+        ) {
             self.emit(Event::Delivered {
                 peer: *peer,
-                local_id,
+                local_id: tag.local_id,
+                group: tag.group,
             });
         }
     }
 
-    fn append(&self, conv: ConversationId, entry: Entry) {
+    /// Appends an entry to a conversation's history.
+    pub fn append(&self, conv: ConversationId, entry: Entry) {
         let now = entry.at_ms;
         let _ = self
             .shared
@@ -186,6 +207,8 @@ impl Node {
             file: None,
             local_id: 0,
             delivered: false,
+            recipients: 0,
+            delivered_to: Vec::new(),
         };
         let _ = self
             .shared
@@ -222,6 +245,8 @@ impl Node {
                 file: Some(file),
                 local_id,
                 delivered: false,
+                recipients: 0,
+                delivered_to: Vec::new(),
             },
         );
     }
