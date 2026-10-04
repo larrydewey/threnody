@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+pub mod history;
 pub mod mailbox;
 pub mod node;
 pub mod onion;

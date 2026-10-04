@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use threnody_core::store::{Home, Lookup};
-use threnody_core::{AppMessage, Fingerprint, PublicIdentity, now_ms, safety_number};
+use threnody_core::{AppMessage, Fingerprint, PublicIdentity, safety_number};
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -39,6 +39,16 @@ pub struct ContactInfo {
     pub verified: bool,
     pub account: Option<String>,
     pub connected: bool,
+}
+
+/// One stored message.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct HistoryEntry {
+    pub at_ms: u64,
+    pub outgoing: bool,
+    pub device: String,
+    pub text: String,
+    pub disappearing: bool,
 }
 
 /// Things the app should react to.
@@ -239,31 +249,40 @@ impl ThrenodyNode {
     }
 
     /// Sends text to every device of `peer`'s account: live where
-    /// connected, sealed for mailboxes otherwise. Returns devices reached.
+    /// connected, sealed for mailboxes otherwise; recorded in history.
+    /// Returns how many devices it reached.
     pub fn send_text(&self, peer: String, text: String) -> Result<u32> {
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();
-        let msg = AppMessage::Text {
-            sent_ms: now_ms(),
-            body: text,
-        };
-        let devices: Vec<PublicIdentity> = match self.node.account_of(&p) {
-            Some(a) if !self.node.is_own_device(&p) => {
-                a.state().devices.iter().map(|(d, _)| *d).collect()
-            }
-            _ => vec![p],
-        };
-        let reached = devices
+        let r = self.node.send_text(&p, &text).map_err(fail)?;
+        Ok(u32::try_from(r.live + r.sealed).unwrap_or(u32::MAX))
+    }
+
+    /// The last `limit` messages with `peer` (oldest first).
+    pub fn history(&self, peer: String, limit: u32) -> Result<Vec<HistoryEntry>> {
+        let p = self.resolve(&peer)?;
+        let h = self
+            .node
+            .history(self.node.conversation_for(&p))
+            .map_err(fail)?;
+        Ok(h.recent(limit as usize)
             .iter()
-            .filter(|d| {
-                self.node.send(d, msg.clone()).is_ok()
-                    || (self.node.can_send_offline(d) && self.node.send_offline(d, &msg).is_ok())
+            .map(|e| HistoryEntry {
+                at_ms: e.at_ms,
+                outgoing: e.outgoing,
+                device: PublicIdentity::from_bytes(&e.device)
+                    .map(|d| fp(&d))
+                    .unwrap_or_default(),
+                text: e.text.clone(),
+                disappearing: e.expires_at_ms.is_some(),
             })
-            .count();
-        if reached == 0 {
-            return Err(fail(format!("{peer} is not reachable")));
-        }
-        Ok(u32::try_from(reached).unwrap_or(u32::MAX))
+            .collect())
+    }
+
+    /// Sets the disappearing-message timer with `peer` (`None` = off).
+    pub fn set_disappearing(&self, peer: String, seconds: Option<u32>) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node.set_timer(&p, seconds).map_err(fail)
     }
 
     pub fn set_approval(&self, peer: String, approved: bool) -> Result<()> {
@@ -392,6 +411,13 @@ mod tests {
             contacts
                 .iter()
                 .any(|c| c.fingerprint == bob_fp && c.mutually_approved && c.connected)
+        );
+        let h = alice.history(bob_fp.clone(), 10).unwrap();
+        assert_eq!(h.len(), 1);
+        assert!(h[0].outgoing && h[0].text == "hello from an app");
+        assert_eq!(
+            bob.history(alice.device_fingerprint(), 10).unwrap()[0].text,
+            "hello from an app"
         );
         assert_eq!(
             alice.safety_number(bob_fp).unwrap(),

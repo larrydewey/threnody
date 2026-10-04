@@ -131,6 +131,7 @@ fn generate() -> String {
     let text = AppMessage::Text {
         sent_ms: 1_791_000_000_000,
         body: "threnody".into(),
+        expires_in_s: None,
     };
     let m1 = cb.seal(&text).unwrap();
     assert_eq!(ca.open(&m1).unwrap(), text);

@@ -412,6 +412,7 @@ impl Node {
         if let Ok((from, body)) = opened
             && let Ok(msg) = AppMessage::decode(&body)
         {
+            self.record_incoming(&from, &msg, true);
             self.emit(Event::OfflineMessage { from, via, msg });
         }
     }

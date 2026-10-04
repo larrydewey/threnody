@@ -91,12 +91,14 @@ mod tests {
             .seal(&AppMessage::Text {
                 sent_ms: 1,
                 body: "a".into(),
+                expires_in_s: None,
             })
             .unwrap();
         let longer = ca
             .seal(&AppMessage::Text {
                 sent_ms: 1,
                 body: "a".repeat(150),
+                expires_in_s: None,
             })
             .unwrap();
         assert_eq!(

@@ -49,6 +49,8 @@ Type a line to send it to the current peer. Commands:
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
   /devices   /device add   /device remove <name>   your account's devices
+  /history [peer] [n]                   recent messages (stored encrypted)
+  /disappear <30s|10m|1h|1d|off>        disappearing messages with the current peer
   /quit
 Groups (MLS, post-quantum X-Wing ciphersuite):";
 
@@ -241,43 +243,47 @@ impl Ui {
         }
     }
 
-    /// Sends `msg` to every device of `peer`'s account (Appendix J): over
-    /// live sessions where possible, otherwise sealed per device.
-    fn send_to_account(&self, peer: PublicIdentity, msg: &AppMessage) -> Result<()> {
-        let devices: Vec<PublicIdentity> = match self.node.account_of(&peer) {
-            Some(a) if !self.node.is_own_device(&peer) => {
-                a.state().devices.iter().map(|(d, _)| *d).collect()
-            }
-            _ => vec![peer],
-        };
-        let mut live = 0;
-        let mut sealed = 0;
-        let mut failed = Vec::new();
-        for d in &devices {
-            if self.node.send(d, msg.clone()).is_ok() {
-                live += 1;
-            } else if self.node.can_send_offline(d) && self.node.send_offline(d, msg).is_ok() {
-                sealed += 1;
-            } else {
-                failed.push(*d);
-            }
-        }
-        if devices.len() > 1 || sealed > 0 {
+    /// Sends text to every device of `peer`'s account (Appendix J): live
+    /// where connected, sealed for mailboxes otherwise; recorded in history.
+    fn send_to_account(&self, peer: PublicIdentity, body: &str) -> Result<()> {
+        let r = self.node.send_text(&peer, body)?;
+        if r.live + r.sealed + r.unreachable > 1 || r.sealed > 0 {
             println!(
-                "* to {} device(s): {live} live, {sealed} sealed for mailboxes{}",
-                devices.len(),
-                if failed.is_empty() {
+                "* to {} device(s): {} live, {} sealed for mailboxes{}",
+                r.live + r.sealed + r.unreachable,
+                r.live,
+                r.sealed,
+                if r.unreachable == 0 {
                     String::new()
                 } else {
-                    format!(", {} unreachable", failed.len())
+                    format!(", {} unreachable", r.unreachable)
                 }
             );
         }
-        if live + sealed == 0 {
-            bail!(
-                "{} is not reachable (no session, no prekeys); try /relay",
-                self.name(&peer)
-            );
+        Ok(())
+    }
+
+    fn show_history(&self, peer: PublicIdentity, n: usize) -> Result<()> {
+        let conv = self.node.conversation_for(&peer);
+        let h = self.node.history(conv)?;
+        if let Some(t) = h.timer_s {
+            println!("  (messages disappear after {})", human_secs(t));
+        }
+        if h.entries().is_empty() {
+            println!("  no history with {}", self.name(&peer));
+        }
+        for e in h.recent(n) {
+            let who = if e.outgoing {
+                "me".to_owned()
+            } else {
+                PublicIdentity::from_bytes(&e.device).map_or_else(|_| "?".into(), |d| self.name(&d))
+            };
+            let mark = match (e.offline, e.expires_at_ms) {
+                (_, Some(_)) => " (disappearing)",
+                (true, None) => " (offline)",
+                _ => "",
+            };
+            println!("  [{}] <{who}> {}{mark}", clock(e.at_ms), e.text);
         }
         Ok(())
     }
@@ -454,6 +460,14 @@ impl Ui {
             Event::ContactsSynced { from } => {
                 println!("* contacts updated from {}", self.name(&from))
             }
+            Event::TimerChanged { peer, secs } => match secs {
+                Some(t) => println!(
+                    "* {} set messages to disappear after {}",
+                    self.name(&peer),
+                    human_secs(t)
+                ),
+                None => println!("* {} turned disappearing messages off", self.name(&peer)),
+            },
             Event::ThisDeviceRemoved => {
                 println!("! THIS DEVICE WAS REMOVED from its account; peers will refuse it")
             }
@@ -472,11 +486,7 @@ impl Ui {
             let peer = self
                 .current
                 .ok_or_else(|| anyhow!("no current peer; /connect or /to first"))?;
-            let msg = AppMessage::Text {
-                sent_ms: now_ms(),
-                body: line.to_owned(),
-            };
-            self.send_to_account(peer, &msg)?;
+            self.send_to_account(peer, line)?;
             return Ok(false);
         };
         let mut parts = cmd.splitn(2, ' ');
@@ -609,6 +619,37 @@ impl Ui {
             }
             "status" => self.status(),
             "devices" => self.devices(),
+            "history" | "hist" => {
+                let mut it = arg.unwrap_or("").split_whitespace();
+                let (who, n) = match (it.next(), it.next()) {
+                    (Some(w), Some(n)) => (Some(w), n.parse().unwrap_or(20)),
+                    (Some(w), None) if w.parse::<usize>().is_ok() => {
+                        (None, w.parse().unwrap_or(20))
+                    }
+                    (w, _) => (w, 20),
+                };
+                let p = self.resolve_peer(who)?;
+                self.show_history(p, n)?;
+            }
+            "disappear" => {
+                let p = self.resolve_peer(None)?;
+                let secs = match arg {
+                    None | Some("off") => None,
+                    Some(a) => Some(
+                        parse_duration(a)
+                            .ok_or_else(|| anyhow!("usage: /disappear <30s|10m|1h|1d|off>"))?,
+                    ),
+                };
+                self.node.set_timer(&p, secs)?;
+                match secs {
+                    Some(t) => println!(
+                        "* new messages with {} disappear after {}",
+                        self.name(&p),
+                        human_secs(t)
+                    ),
+                    None => println!("* disappearing messages off for {}", self.name(&p)),
+                }
+            }
             "device" => {
                 let a = arg.unwrap_or("");
                 match a.split_once(' ').map_or((a, ""), |(x, y)| (x, y.trim())) {
@@ -826,5 +867,54 @@ mod tests {
             save_download(dir.path(), ".bashrc", b"z").unwrap(),
             dir.path().join("bashrc")
         );
+    }
+}
+
+/// `30s`, `10m`, `2h`, `1d` or plain seconds.
+fn parse_duration(a: &str) -> Option<u32> {
+    let a = a.trim();
+    let (num, mult) = match a.chars().last()? {
+        's' => (&a[..a.len() - 1], 1),
+        'm' => (&a[..a.len() - 1], 60),
+        'h' => (&a[..a.len() - 1], 3600),
+        'd' => (&a[..a.len() - 1], 86_400),
+        c if c.is_ascii_digit() => (a, 1),
+        _ => return None,
+    };
+    num.parse::<u32>()
+        .ok()?
+        .checked_mul(mult)
+        .filter(|s| *s > 0)
+}
+
+fn human_secs(s: u32) -> String {
+    match s {
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// `HH:MM` (UTC) for a Unix-ms time.
+fn clock(ms: u64) -> String {
+    let secs = ms / 1000;
+    format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn durations_parse_and_print() {
+        assert_eq!(parse_duration("30s"), Some(30));
+        assert_eq!(parse_duration("10m"), Some(600));
+        assert_eq!(parse_duration("1d"), Some(86_400));
+        assert_eq!(parse_duration("45"), Some(45));
+        assert_eq!(parse_duration("0s"), None);
+        assert_eq!(parse_duration("soon"), None);
+        assert_eq!(human_secs(7200), "2h");
+        assert_eq!(human_secs(90), "90s");
     }
 }

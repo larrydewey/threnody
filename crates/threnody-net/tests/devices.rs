@@ -190,6 +190,7 @@ async fn contacts_can_seal_to_a_sibling_they_never_met() {
     let text = AppMessage::Text {
         sent_ms: 0,
         body: "hi phone".into(),
+        expires_in_s: None,
     };
     bob.node.send_offline(&pid, &text).unwrap();
     wait_for(|| laptop.node.held_messages() == 1).await;

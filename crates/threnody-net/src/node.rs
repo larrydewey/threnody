@@ -129,6 +129,11 @@ pub enum Event {
     },
     /// This device was removed from its account.
     ThisDeviceRemoved,
+    /// A peer changed the conversation's disappearing-message timer.
+    TimerChanged {
+        peer: PublicIdentity,
+        secs: Option<u32>,
+    },
     /// A sealed message from `from`, delivered by mailbox `via` (Appendix H).
     OfflineMessage {
         from: PublicIdentity,
@@ -198,7 +203,7 @@ struct SessionHandle {
 
 pub(crate) struct Shared {
     identity: Identity,
-    home: Home,
+    pub(crate) home: Home,
     pub(crate) contacts: Mutex<Contacts>,
     sessions: Mutex<HashMap<PublicIdentity, SessionHandle>>,
     events: mpsc::UnboundedSender<Event>,
@@ -337,12 +342,11 @@ impl Node {
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
         };
-        Ok((
-            Self {
-                shared: Arc::new(shared),
-            },
-            rx,
-        ))
+        let node = Self {
+            shared: Arc::new(shared),
+        };
+        node.start_history_sweep();
+        Ok((node, rx))
     }
 
     pub(crate) fn emit(&self, e: Event) {
@@ -802,6 +806,7 @@ where
                             }
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
+                            node.record_incoming(&peer, &msg, false);
                             shared.emit(Event::Message { peer, msg });
                         }
                     }

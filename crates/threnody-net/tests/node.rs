@@ -64,6 +64,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             AppMessage::Text {
                 sent_ms: 1,
                 body: "hi bob".into(),
+                expires_in_s: None,
             },
         )
         .unwrap();
@@ -75,7 +76,8 @@ async fn chat_and_mutual_approval_over_tcp() {
         msg,
         AppMessage::Text {
             sent_ms: 1,
-            body: "hi bob".into()
+            body: "hi bob".into(),
+            expires_in_s: None
         }
     );
 
@@ -84,6 +86,7 @@ async fn chat_and_mutual_approval_over_tcp() {
         AppMessage::Text {
             sent_ms: 2,
             body: "hi alice".into(),
+            expires_in_s: None,
         },
     )
     .unwrap();
@@ -160,6 +163,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
             AppMessage::Text {
                 sent_ms: 3,
                 body: "steady".into(),
+                expires_in_s: None,
             },
         )
         .unwrap();
@@ -171,7 +175,8 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
         msg,
         AppMessage::Text {
             sent_ms: 3,
-            body: "steady".into()
+            body: "steady".into(),
+            expires_in_s: None
         }
     );
 }
@@ -243,6 +248,7 @@ async fn no_tunnel_without_mutual_approval() {
             AppMessage::Text {
                 sent_ms: 0,
                 body: "sync".into(),
+                expires_in_s: None,
             },
         )
         .unwrap();

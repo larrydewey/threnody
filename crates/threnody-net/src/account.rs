@@ -18,6 +18,7 @@ use threnody_core::account::{
     AccountBook, AccountChain, AccountId, Action, Link, LinkCode, Observed, link_proof,
 };
 use threnody_core::cbor::{self, finish, read_map, required};
+use threnody_core::history::ConversationId;
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 use tokio::sync::oneshot;
 
@@ -331,6 +332,17 @@ impl Node {
         }
         if changed {
             self.shared.save_contacts(&contacts);
+        }
+        drop(contacts);
+        // History recorded per device before the account was known joins
+        // the account's conversation.
+        for (d, _) in &chain.state().devices {
+            let _ = self.shared.home.merge_history(
+                self.identity_ref(),
+                ConversationId::Peer(*d.as_bytes()),
+                ConversationId::Peer(id.0),
+                now_ms(),
+            );
         }
     }
 

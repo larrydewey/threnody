@@ -25,6 +25,9 @@ pub enum AppMessage {
     Text {
         sent_ms: u64,
         body: String,
+        /// Disappearing-message timer (spec §6.1): both sides delete the
+        /// message this many seconds after sending.
+        expires_in_s: Option<u32>,
     },
     File {
         sent_ms: u64,
@@ -33,17 +36,12 @@ pub enum AppMessage {
     },
     /// Our current mesh/tunnel approval of the peer (spec §5.2). Sent at
     /// session start and whenever it changes.
-    Approval {
-        approved: bool,
-    },
+    Approval { approved: bool },
     /// Cover traffic: indistinguishable on the wire, discarded on receipt.
     Cover,
     /// Offer a WireGuard tunnel (spec §8). Only sent and honoured between
     /// mutually approved peers; the preshared key comes from the session.
-    TunnelOffer {
-        wg_public: [u8; 32],
-        port: u16,
-    },
+    TunnelOffer { wg_public: [u8; 32], port: u16 },
     /// An opaque group-layer message (MLS, see `threnody-groups`).
     Group(Vec<u8>),
     /// An opaque relay-circuit message (see `threnody-net::relay`).
@@ -83,10 +81,19 @@ impl AppMessage {
                 Self::Cover => {
                     e.map_len(1)?.u8(0)?.uint(kind::COVER)?;
                 }
-                Self::Text { sent_ms, body } => {
-                    e.map_len(3)?.u8(0)?.uint(kind::TEXT)?;
+                Self::Text {
+                    sent_ms,
+                    body,
+                    expires_in_s,
+                } => {
+                    e.map_len(3 + usize::from(expires_in_s.is_some()))?
+                        .u8(0)?
+                        .uint(kind::TEXT)?;
                     e.u8(1)?.uint(*sent_ms)?;
                     e.u8(2)?.str(body)?;
+                    if let Some(x) = expires_in_s {
+                        e.u8(4)?.u32(*x)?;
+                    }
                 }
                 Self::File {
                     sent_ms,
@@ -151,8 +158,8 @@ impl AppMessage {
 
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut k, mut ts, mut text, mut bytes, mut flag, mut name, mut port) =
-            (None, None, None, None, None, None, None);
+        let (mut k, mut ts, mut text, mut bytes, mut flag, mut name, mut port, mut expiry) =
+            (None, None, None, None, None, None, None, None);
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -166,6 +173,7 @@ impl AppMessage {
                     Some(const_cbor::Major::Text) => name = Some(d.str()?.to_owned()),
                     _ => port = Some(d.u16()?),
                 },
+                4 => expiry = Some(d.u32()?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -177,6 +185,7 @@ impl AppMessage {
             kind::TEXT => Self::Text {
                 sent_ms: ts.unwrap_or(0),
                 body: required(text, "text body")?,
+                expires_in_s: expiry,
             },
             kind::FILE => {
                 let data = required(bytes, "file data")?;
@@ -265,6 +274,12 @@ mod tests {
             AppMessage::Text {
                 sent_ms: 42,
                 body: "héllo".into(),
+                expires_in_s: None,
+            },
+            AppMessage::Text {
+                sent_ms: 43,
+                body: "gone soon".into(),
+                expires_in_s: Some(30),
             },
             AppMessage::File {
                 sent_ms: 1,

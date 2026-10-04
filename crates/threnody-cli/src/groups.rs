@@ -1,6 +1,7 @@
 //! `/group` commands: MLS groups delivered over the node's 1:1 sessions.
 
 use anyhow::{Result, anyhow, bail};
+use threnody_core::history::ConversationId;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_groups::{GroupEvent, GroupId, GroupWire, Groups, Output};
@@ -170,6 +171,14 @@ impl GroupUi {
             }
             GroupEvent::Text { group, from, text } => {
                 println!("[{}] <{}> {text}", self.label(&group), name(&from));
+                node.record(
+                    ConversationId::Group(group),
+                    *from.as_bytes(),
+                    false,
+                    &text,
+                    false,
+                    None,
+                );
             }
         }
     }
@@ -310,6 +319,14 @@ impl GroupUi {
         let g = self.find(g)?;
         let out = self.groups.send_text(&g, text)?;
         self.apply(node, name, out);
+        node.record(
+            ConversationId::Group(g),
+            *node.identity().as_bytes(),
+            true,
+            text,
+            false,
+            None,
+        );
         Ok(())
     }
 }

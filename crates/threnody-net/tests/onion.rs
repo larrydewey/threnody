@@ -67,6 +67,7 @@ fn text(s: &str) -> AppMessage {
     AppMessage::Text {
         sent_ms: 0,
         body: s.into(),
+        expires_in_s: None,
     }
 }
 

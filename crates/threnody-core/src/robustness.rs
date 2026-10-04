@@ -62,6 +62,7 @@ fn parsers_survive_mutated_input() {
         .seal(&AppMessage::Text {
             sent_ms: 1,
             body: "x".into(),
+            expires_in_s: None,
         })
         .unwrap();
     let app = AppMessage::File {
@@ -103,7 +104,8 @@ fn parsers_survive_mutated_input() {
         cb.open(&text).unwrap(),
         AppMessage::Text {
             sent_ms: 1,
-            body: "x".into()
+            body: "x".into(),
+            expires_in_s: None
         }
     );
 }

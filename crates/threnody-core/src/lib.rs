@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod error;
 pub mod handshake;
+pub mod history;
 pub mod identity;
 pub mod message;
 pub mod onion;

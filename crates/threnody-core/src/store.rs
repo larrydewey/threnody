@@ -176,6 +176,14 @@ impl Home {
         write_private(&self.dir, &path, &out)
     }
 
+    /// Deletes a state file (no error if absent).
+    pub fn remove_state(&self, name: &str) -> Result<()> {
+        match fs::remove_file(self.state_path(name)?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Loads state written by [`Home::save_state`]; `Ok(None)` if absent.
     pub fn load_state(
         &self,

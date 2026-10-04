@@ -34,7 +34,7 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
 Hello    = { 0 => 0 }
-Text     = { 0 => 1, 1 => uint, 2 => tstr }                 ; sent_ms, body
+Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint }    ; sent_ms, body, disappear after (s)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr }      ; sent_ms, data (≤ 8 MiB), name
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
@@ -63,6 +63,8 @@ Before encryption, an `AppMessage` is padded ISO/IEC 7816-4 style: a `0x80` byte
 On stream transports, each frame is prefixed with its length as a `u32` in big-endian byte order. The maximum is 16 MiB plus 4 KiB.
 
 ## Local storage
+
+All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
 
 Both files are written with mode 0600 inside a directory with mode 0700.
 

@@ -24,6 +24,8 @@ threnody --home ~/.thr-a run --no-listen -c 'threnody://<fingerprint>@192.0.2.7:
 
 Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/onion <peer> [min-relays]` builds an onion circuit (two relays by default) so no single relay learns both ends.
 
+`/history [peer] [n]` shows recent messages, which are stored encrypted. `/disappear 1h` (or `30s`, `10m`, `1d`, `off`) sets disappearing messages with the current peer, and the peer adopts the same timer.
+
 To add a device to your account, run `/device add` on a device you already have. It prints a one-time code (and a QR code). Then run `threnody link '<code>'` on the new device. `/devices` lists your devices and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices.
 
 ```
@@ -80,10 +82,10 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync, account-wide offline keys and group invites; history not synced |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
-| §6.1 1:1 text + files | ✅ (disappearing messages not yet) |
+| §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message) |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
-| §6.4 Local-first store | ✅ identity and contacts (message history, sync and backup not yet) |
+| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history (sync between devices and backups not yet) |
 | §7 Transports | ✅ TCP/IP, private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes; ❌ BLE, Wi-Fi Direct |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |
