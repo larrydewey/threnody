@@ -220,3 +220,62 @@ async fn cycles_without_a_path_are_refused_promptly() {
         "search did not terminate promptly"
     );
 }
+
+#[tokio::test]
+async fn bluetooth_only_device_reaches_ip_peer_through_a_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut phone, mut laptop, mut server) = (
+        spawn(&dir, "phone").await,
+        spawn(&dir, "laptop").await,
+        spawn(&dir, "server").await,
+    );
+    // phone <-> laptop over a non-IP byte stream (as over Bluetooth).
+    let (p_end, l_end) = tokio::io::duplex(1 << 16);
+    let l = laptop.node.clone();
+    tokio::spawn(async move { l.accept_stream(l_end, "ble", "AA:BB".into()).await });
+    let lid = phone
+        .node
+        .connect_stream(p_end, "ble", "CC:DD".into(), None)
+        .await
+        .unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::Connected { .. })).await;
+    phone.node.set_approval(&lid, true).unwrap();
+    laptop
+        .node
+        .set_approval(&phone.node.identity(), true)
+        .unwrap();
+    next(&mut phone.rx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    // laptop <-> server over TCP.
+    link(&mut laptop, &mut server, true).await;
+
+    // The phone holds only an invite whose address it cannot reach.
+    let sid = server.node.identity();
+    let got = phone
+        .node
+        .reach(Some("127.0.0.1:1"), Some(sid.fingerprint()))
+        .await
+        .unwrap();
+    assert_eq!(got, sid);
+    let s = phone
+        .node
+        .sessions()
+        .into_iter()
+        .find(|s| s.peer == sid)
+        .unwrap();
+    assert_eq!(s.via, Some(lid));
+
+    phone
+        .node
+        .send(&sid, text("over the radio and the wire"))
+        .unwrap();
+    let e = next(&mut server.rx, |e| matches!(e, Event::Message { .. })).await;
+    assert!(matches!(e, Event::Message { peer, .. } if peer == phone.node.identity()));
+
+    // Without a fingerprint there is nothing to relay to.
+    assert!(phone.node.reach(Some("127.0.0.1:1"), None).await.is_err());
+    // reach_peer reuses the live session.
+    phone.node.reach_peer(&sid).await.unwrap();
+}

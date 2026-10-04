@@ -56,10 +56,21 @@ The default `MAX_TTL` of 3 allows up to three relays between the endpoints.
 
 Relays learn who the destination is (its fingerprint), which neighbour a circuit came from, and when and how much traffic flows. Message contents stay hidden, and so does everything inside the end-to-end ratchet: headers, counters and keys. Hiding the communicating pair from relays requires layered (onion) encryption of the `Open` request. That belongs to the onion-routing layer of spec §9, not to v1 circuits.
 
+## Transports
+
+Circuits are made of sessions, and a session can run over any link: TCP, Bluetooth LE (Appendix K), or anything an app bridges in through `attach_link`. A phone that only has a Bluetooth link to a laptop can therefore reach peers the laptop reaches over IP. The relay forwards between its Bluetooth session and its TCP session like any other pair.
+
+`Node::reach(addr, pin)` tries `addr` directly and then falls back to a circuit to `pin`. `Node::reach_peer(peer)` reuses a live session, or else tries the contact's last address and then relays. Apps use these through the FFI:
+
+- `connect` accepts an invite link, a contact or a bare fingerprint, and falls back to relays.
+- `send_text` tries to reach a peer that has no session (for up to 15 s) before falling back to sealed mailbox delivery.
+
+Tested with a Pixel 8a linked to a laptop only by Bluetooth. The phone opened the invite of a second node listening on the laptop's `127.0.0.1`, an address the phone cannot reach. The session ran end to end through the laptop, and messages went both ways.
+
 ## CLI
 
 - **`/relay <contact|fingerprint|invite>`** opens a relayed session.
-- **`/connect <contact>`** falls back to relays when the direct dial fails or no address is known.
+- **`/connect <contact|invite>`** falls back to relays when the direct dial fails or no address is known. For an invite, the relay goes to the fingerprint in the link.
 - **Group fan-out** tries a relay for members without a live session.
 - **`/peers`** shows `relay through <neighbour>` for relayed sessions.
 

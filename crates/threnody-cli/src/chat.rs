@@ -228,15 +228,21 @@ impl Ui {
         let node = self.node.clone();
         let t = t.to_owned();
         tokio::spawn(async move {
-            let direct = match resolved {
-                Ok((addr, pin)) => node.connect(&addr, pin).await.map_err(anyhow::Error::from),
-                Err(e) => Err(e),
+            let (direct, pin) = match resolved {
+                Ok((addr, pin)) => (
+                    node.connect(&addr, pin).await.map_err(anyhow::Error::from),
+                    pin,
+                ),
+                Err(e) => (Err(e), None),
             };
             let Err(e) = direct else { return };
-            match known {
-                Some(key) => {
+            // An invite link names the peer, so it can be reached through
+            // relays even before it is a contact.
+            let relay_to = known.map(|k| k.fingerprint()).or(pin);
+            match relay_to {
+                Some(fp) => {
                     println!("* {t}: direct path failed ({e:#}); trying relays");
-                    if let Err(e) = node.connect_relayed(key.fingerprint()).await {
+                    if let Err(e) = node.connect_relayed(fp).await {
                         println!("! connect {t}: {e:#}");
                     }
                 }

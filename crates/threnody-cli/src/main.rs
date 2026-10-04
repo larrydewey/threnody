@@ -92,7 +92,7 @@ enum Cmd {
         /// when idle. Hides message timing at a bandwidth cost.
         #[arg(long, value_name = "MS")]
         constant_rate_ms: Option<u64>,
-        /// Also accept sessions over Bluetooth LE (advertise + listen).
+        /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
         ble: bool,
         /// Do not send or listen for LAN discovery beacons.

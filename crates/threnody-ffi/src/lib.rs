@@ -279,28 +279,49 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
-    /// Connects to an invite link or `host:port`; returns the peer's fingerprint.
+    /// Connects to an invite link, `host:port`, contact or fingerprint;
+    /// returns the peer's fingerprint. When the direct path fails (or
+    /// there is none), it goes through approved relays, whatever links
+    /// they are on (spec §7.3).
     pub fn connect(&self, target: String) -> Result<String> {
-        let (addr, pin) = match target.strip_prefix("threnody://") {
-            Some(rest) => {
-                let (f, a) = rest
-                    .split_once('@')
-                    .ok_or_else(|| fail("bad invite link"))?;
-                (a.to_owned(), Some(f.parse::<Fingerprint>().map_err(fail)?))
-            }
-            None => (target, None),
+        let (addr, pin) = if let Some(rest) = target.strip_prefix("threnody://") {
+            let (f, a) = rest
+                .split_once('@')
+                .ok_or_else(|| fail("bad invite link"))?;
+            (
+                Some(a.to_owned()),
+                Some(f.parse::<Fingerprint>().map_err(fail)?),
+            )
+        } else if let Ok(f) = target.parse::<Fingerprint>() {
+            let addr = self
+                .node
+                .contacts()
+                .iter()
+                .find(|c| c.key.fingerprint() == f)
+                .and_then(|c| c.last_addr.clone());
+            (addr, Some(f))
+        } else if let Lookup::Found(c) = self.node.contacts().find(&target) {
+            (c.last_addr.clone(), Some(c.key.fingerprint()))
+        } else {
+            (Some(target), None)
         };
         self.rt
-            .block_on(self.node.connect(&addr, pin))
+            .block_on(self.node.reach(addr.as_deref(), pin))
             .map(|p| fp(&p))
             .map_err(fail)
     }
 
     /// Sends text to every device of `peer`'s account: live where
-    /// connected, sealed for mailboxes otherwise; recorded in history.
+    /// connected (reaching `peer` through relays if need be), sealed for
+    /// mailboxes otherwise; recorded in history.
     /// Returns how many devices it reached.
     pub fn send_text(&self, peer: String, text: String) -> Result<u32> {
         let p = self.resolve(&peer)?;
+        // No session: try to reach it (directly or through relays) before
+        // falling back to sealed delivery.
+        let _ = self.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), self.node.reach_peer(&p)).await
+        });
         let _guard = self.rt.enter();
         let r = self.node.send_text(&p, &text).map_err(fail)?;
         Ok(u32::try_from(r.live + r.sealed).unwrap_or(u32::MAX))

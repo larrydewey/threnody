@@ -449,6 +449,41 @@ impl Node {
         Ok(peer)
     }
 
+    /// Connects directly to `addr` if one is given, falling back to relays
+    /// when that fails or there is no address (spec §7.3). Relaying needs
+    /// the destination's fingerprint, `pin`, which a direct dial also
+    /// enforces.
+    pub async fn reach(
+        &self,
+        addr: Option<&str>,
+        pin: Option<Fingerprint>,
+    ) -> Result<PublicIdentity> {
+        let direct = match addr {
+            Some(a) => self.connect(a, pin).await,
+            None => Err(NetError::NoRoute("no address".into())),
+        };
+        match (direct, pin) {
+            (Ok(p), _) => Ok(p),
+            (Err(NetError::IdentityMismatch { expected, got }), _) => {
+                Err(NetError::IdentityMismatch { expected, got })
+            }
+            (Err(_), Some(fp)) => self.connect_relayed(fp).await,
+            (Err(e), None) => Err(e),
+        }
+    }
+
+    /// Makes sure there is a session with `peer`: an existing one, a
+    /// direct dial to its last known address, or a relayed circuit.
+    pub async fn reach_peer(&self, peer: &PublicIdentity) -> Result<()> {
+        if self.sessions().iter().any(|s| s.peer == *peer) {
+            return Ok(());
+        }
+        let addr = self.contacts().get(peer).and_then(|c| c.last_addr.clone());
+        self.reach(addr.as_deref(), Some(peer.fingerprint()))
+            .await
+            .map(|_| ())
+    }
+
     async fn extend_from_origin(
         &self,
         dest: Fingerprint,
