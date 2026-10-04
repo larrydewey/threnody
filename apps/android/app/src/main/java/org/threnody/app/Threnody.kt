@@ -176,6 +176,8 @@ object Threnody {
                 connected = devices.any { it.connected },
                 approved = devices.any { it.mutuallyApproved },
                 verified = devices.all { it.verified },
+                unverified = devices.filter { !it.verified }.map { it.fingerprint },
+                anyVerified = devices.any { it.verified },
                 devices = devices.map { it.fingerprint },
             )
         }
@@ -230,6 +232,17 @@ object Threnody {
                     say("* ${short(e.peer)} asks for a Wi-Fi Direct link")
                     WifiDirect.host(ctx, node, e.peer)
                 }
+                is NodeEvent.AccountChanged -> {
+                    say("· $e")
+                    // A verified contact gained a device we haven't verified.
+                    if (e.added.isNotEmpty() && e.account != node.accountFingerprint()) {
+                        val c = conversations(node).firstOrNull { c -> e.added.any { it in c.devices } }
+                        if (c != null && c.anyVerified) {
+                            ThrenodyService.notifyMessage(ctx, c.key, c.device, "Safety alert: ${c.title}",
+                                "${c.title} added a device you haven't verified. Compare safety numbers.")
+                        }
+                    }
+                }
                 else -> say("· $e")
             }
             for (l in listeners) l(e)
@@ -270,6 +283,10 @@ data class Conversation(
     val connected: Boolean,
     val approved: Boolean,
     val verified: Boolean,
+    /** Devices whose safety number hasn't been compared. */
+    val unverified: List<String>,
+    /** Some device was verified: an unverified one is new (a safety alert). */
+    val anyVerified: Boolean,
     /** Every device of the account that we know. */
     val devices: List<String>,
 ) {

@@ -314,3 +314,35 @@ async fn renaming_a_device_reaches_siblings_and_contacts() {
     assert!(laptop.node.rename_device(&pid, " \n ").is_err());
     let _ = (&mut bob.rx, &mut phone.rx);
 }
+
+#[tokio::test]
+async fn a_verified_contacts_new_device_starts_unverified() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let lid = laptop.node.identity();
+    bob.node
+        .update_contacts(|c| c.get_mut(&lid).unwrap().verified = true);
+
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    next(
+        &mut bob.rx,
+        |e| matches!(e, Event::AccountChanged { added, .. } if added.contains(&pid)),
+    )
+    .await;
+    let contacts = bob.node.contacts();
+    let new = contacts.get(&pid).expect("bob knows the new device");
+    assert!(!new.verified, "a new device is never verified for us");
+    assert!(
+        new.local_approved,
+        "approval carries over to the account's devices"
+    );
+    assert!(
+        contacts.get(&lid).unwrap().verified,
+        "the old device stays verified"
+    );
+}

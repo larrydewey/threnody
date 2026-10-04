@@ -217,19 +217,33 @@ class ChatActivity : Activity() {
         bar.subtitle.visibility = View.VISIBLE
         bar.subtitle.text = listOfNotNull(
             if (c?.connected == true) "connected" else "not connected",
-            if (c?.verified == true) "verified" else null,
+            if (c?.verified == true) "verified" else "⚠ not verified",
             c?.devices?.size?.takeIf { it > 1 }?.let { "$it devices" },
         ).joinToString(" · ")
+        bar.subtitle.setTextColor(color(if (c?.verified == true) R.color.muted else R.color.warning))
         clearBanner()
         if (c == null) return
-        if (!c.approved) {
-            banner(
-                "Approve ${c.title} once you trust them. Mutually approved contacts find each other " +
-                    "nearby, relay for each other and hold each other's messages while offline.",
-                "Approve" to { setApproval(true) },
+        when {
+            // Someone we'd verified now has a device we haven't: a key we
+            // don't know is in the conversation.
+            !c.verified && c.anyVerified -> banner(
+                "⚠ ${c.title} added a device you haven't verified. Until you compare its safety number, " +
+                    "someone else could be reading as them.",
+                "Compare" to { safety() },
+                warning = true,
             )
-        } else if (!c.verified) {
-            banner("Compare safety numbers with ${c.title} to make sure no one is in the middle.", "Compare" to { safety() })
+            !c.approved -> banner(
+                "Approve ${c.title} once you trust them, and compare safety numbers to make sure no one is in " +
+                    "the middle. Mutually approved contacts find each other nearby, relay for each other and " +
+                    "hold each other's messages while offline.",
+                "Approve" to { setApproval(true) },
+                "Compare" to { safety() },
+            )
+            !c.verified -> banner(
+                "⚠ Not verified. Compare safety numbers with ${c.title} to make sure no one is in the middle.",
+                "Compare" to { safety() },
+                warning = true,
+            )
         }
     }
 
@@ -270,9 +284,9 @@ class ChatActivity : Activity() {
         banner.visibility = View.GONE
     }
 
-    private fun banner(text: String, vararg actions: Pair<String, () -> Unit>) {
+    private fun banner(text: String, vararg actions: Pair<String, () -> Unit>, warning: Boolean = false) {
         banner.visibility = View.VISIBLE
-        banner.addView(label(text, 14f, R.color.muted), matchWrap)
+        banner.addView(label(text, 14f, if (warning) R.color.warning else R.color.muted), matchWrap)
         if (actions.isEmpty()) return
         val row = LinearLayout(this)
         for ((name, onClick) in actions) {
@@ -586,9 +600,12 @@ class ChatActivity : Activity() {
             .show()
     }
 
+    /** Compares safety numbers, device by device: an unverified one first. */
     private fun safety() {
+        val target = convo?.unverified?.firstOrNull() ?: device
+        val many = (convo?.devices?.size ?: 1) > 1
         worker.execute {
-            val number = try { node.safetyNumber(device) } catch (e: Exception) { return@execute }
+            val number = try { node.safetyNumber(target) } catch (e: Exception) { return@execute }
             // Twelve groups of five digits, three per line.
             val pretty = number.filter { it.isDigit() }.chunked(5).chunked(3).joinToString("\n") { it.joinToString("  ") }
             runOnUiThread {
@@ -599,11 +616,19 @@ class ChatActivity : Activity() {
                     setPadding(dp(24), dp(16), dp(24), 0)
                 }
                 AlertDialog.Builder(this)
-                    .setTitle("Safety number")
-                    .setMessage("Compare this with the number on ${convo?.title?.let { "$it's" } ?: "their"} screen, in person or on a call. " +
-                        "If they match, no one is intercepting your messages.")
+                    .setTitle(if (many) "Safety number: device ${Threnody.short(target)}" else "Safety number")
+                    .setMessage("Compare this with the number on ${convo?.title?.let { "$it's" } ?: "their"} " +
+                        (if (many) "device ${Threnody.short(target)} " else "") +
+                        "screen, in person or on a call. If they match, no one is intercepting your messages.")
                     .setView(view)
-                    .setPositiveButton("They match") { _, _ -> worker.execute { run("verify") { node.markVerified(device) } } }
+                    .setPositiveButton("They match") { _, _ ->
+                        worker.execute {
+                            run("verify") { node.markVerified(target) }
+                            // More devices to check? Offer the next one.
+                            val more = Threnody.conversations(node).firstOrNull { it.key == key }?.unverified?.isNotEmpty() == true
+                            if (more) runOnUiThread { safety() }
+                        }
+                    }
                     .setNegativeButton("Not now", null)
                     .show()
             }

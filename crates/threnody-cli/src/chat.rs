@@ -601,8 +601,23 @@ impl Ui {
                 removed,
             } => {
                 let a = account.fingerprint().to_string();
+                // Did we verify any device of this account? Then a new one is a
+                // key we haven't checked in a conversation we trusted.
+                let verified_before = account != self.node.account().id()
+                    && self.node.contacts().iter().any(|c| {
+                        c.account == Some(account) && c.verified && !added.contains(&c.key)
+                    });
                 for d in added {
-                    println!("* account {} added device {}", &a[..9], self.name(&d));
+                    if verified_before {
+                        println!(
+                            "! SAFETY: account {} added device {} that you haven't verified — /safety {} before trusting it",
+                            &a[..9],
+                            self.name(&d),
+                            &d.fingerprint().to_string()[..9]
+                        );
+                    } else {
+                        println!("* account {} added device {}", &a[..9], self.name(&d));
+                    }
                 }
                 for d in removed {
                     println!(
