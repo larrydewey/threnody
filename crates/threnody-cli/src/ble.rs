@@ -65,6 +65,105 @@ pub async fn scan(secs: u64) -> Result<Vec<Found>> {
     Ok(list)
 }
 
+/// Largest L2CAP SDU we send. Android delivers an SDU to the app only once
+/// it is complete and stalls on large ones (a 33 KB SDU never arrived on a
+/// Pixel 8a; 10 KB did), so writes are cut to this size.
+pub const MAX_SDU: usize = 4096;
+/// The receive MTU we offer, so peers can send us SDUs as large as ours
+/// (the default, 672 bytes, slows phone-to-laptop transfers).
+const RECV_MTU: u16 = MAX_SDU as u16;
+
+/// An L2CAP stream whose writes never exceed [`MAX_SDU`].
+pub struct SduLimit<S>(S);
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for SduLimit<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for SduLimit<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let n = buf.len().min(MAX_SDU);
+        std::pin::Pin::new(&mut self.0).poll_write(cx, &buf[..n])
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+type Ours = std::sync::Mutex<HashMap<Address, std::time::Instant>>;
+
+/// Devices we have opened Threnody channels with over Bluetooth, and when.
+fn ours() -> &'static Ours {
+    static OURS: std::sync::OnceLock<Ours> = std::sync::OnceLock::new();
+    OURS.get_or_init(Default::default)
+}
+
+/// A fresh channel may still be in its handshake; leave it alone this long.
+const LINK_GRACE: Duration = Duration::from_secs(30);
+
+fn remember(addr: Address) {
+    ours()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(addr, std::time::Instant::now());
+}
+
+/// Drops LE links to our peers that no longer carry a session. A lingering
+/// link (left by a peer whose app was killed) can stop the controller from
+/// advertising, so nobody could reconnect. Only touches devices we ran
+/// Threnody sessions with; other Bluetooth devices are left alone.
+async fn sweep_links(node: &Node, adapter: &bluer::Adapter) {
+    let addrs: Vec<Address> = ours()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, t)| t.elapsed() > LINK_GRACE)
+        .map(|(a, _)| *a)
+        .collect();
+    let live: Vec<String> = node
+        .sessions()
+        .into_iter()
+        .filter(|s| s.transport == "ble")
+        .map(|s| s.remote)
+        .collect();
+    for addr in addrs {
+        if live.contains(&addr.to_string()) {
+            continue;
+        }
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
+        if dev.is_connected().await.unwrap_or(false) {
+            let _ = dev.disconnect().await;
+        }
+        ours()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&addr);
+    }
+}
+
 /// How often the advertised beacon is replaced: well inside one discovery
 /// epoch, so peers always see a current tag and a fresh nonce.
 const REFRESH: Duration = Duration::from_secs(EPOCH_SECS / 5);
@@ -82,7 +181,10 @@ pub async fn connect(
     expect: Option<threnody_core::Fingerprint>,
 ) -> Result<PublicIdentity> {
     let target = SocketAddr::new(f.addr, f.addr_type, f.psm);
-    let stream = tokio::time::timeout(Duration::from_secs(20), Stream::connect(target))
+    let socket = bluer::l2cap::Socket::<Stream>::new_stream()?;
+    socket.set_recv_mtu(RECV_MTU).ok();
+    socket.bind(SocketAddr::new(Address::any(), f.addr_type, 0))?;
+    let stream = tokio::time::timeout(Duration::from_secs(20), socket.connect(target))
         .await
         .map_err(|_| anyhow!("Bluetooth connection timed out"))?
         .with_context(|| format!("L2CAP connect to {} psm {}", f.addr, f.psm))?;
@@ -96,8 +198,9 @@ pub async fn connect(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    remember(f.addr);
     Ok(node
-        .connect_stream(stream, "ble", f.addr.to_string(), expect)
+        .connect_stream(SduLimit(stream), "ble", f.addr.to_string(), expect)
         .await?)
 }
 
@@ -128,6 +231,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
     let listener = StreamListener::bind(SocketAddr::new(Address::any(), AddressType::LePublic, 0))
         .await
         .context("binding an LE L2CAP channel")?;
+    listener.as_ref().set_recv_mtu(RECV_MTU).ok();
     let psm = listener.as_ref().local_addr()?.psm;
     let uuid: bluer::Uuid = BLE_SERVICE_UUID.parse()?;
     let advert = move |node: &Node| Advertisement {
@@ -165,10 +269,21 @@ pub async fn listen(node: &Node) -> Result<Listening> {
             let Ok((stream, sa)) = listener.accept().await else {
                 break;
             };
+            remember(sa.addr);
             let node = n.clone();
             tokio::spawn(async move {
-                let _ = node.accept_stream(stream, "ble", sa.addr.to_string()).await;
+                let _ = node
+                    .accept_stream(SduLimit(stream), "ble", sa.addr.to_string())
+                    .await;
             });
+        }
+    }));
+
+    let (n, a) = (node.clone(), adapter.clone());
+    tasks.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            sweep_links(&n, &a).await;
         }
     }));
 

@@ -154,7 +154,7 @@ impl Node {
         let candidates: Vec<_> = contacts
             .iter()
             .filter(|c| c.mutually_approved())
-            .filter_map(|c| c.discovery_key.as_ref().map(|k| (&c.key, k)))
+            .flat_map(|c| c.recognition_keys().map(move |k| (&c.key, k)))
             .collect();
         let found = recognise(data, candidates, now_ms() / 1000);
         let sessions = self.sessions();
@@ -219,7 +219,7 @@ impl Node {
                 let candidates: Vec<_> = contacts
                     .iter()
                     .filter(|c| c.mutually_approved())
-                    .filter_map(|c| c.discovery_key.as_ref().map(|k| (&c.key, k)))
+                    .flat_map(|c| c.recognition_keys().map(move |k| (&c.key, k)))
                     .collect();
                 for (peer, port) in recognise(&buf[..n], candidates, now_ms() / 1000) {
                     let addr = SocketAddr::new(src.ip(), port);

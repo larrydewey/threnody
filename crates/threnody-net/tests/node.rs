@@ -512,10 +512,86 @@ async fn bluetooth_beacons_pick_exactly_one_dialer() {
     // A long silence restarts the clock.
     assert_eq!(heard(other, t0 + Duration::from_secs(300)), None);
 
+    // Two sessions that started at once leave each side with the other's
+    // key as "latest"; recent keys still match.
+    let a_id = alice.identity();
+    alice.update_contacts(|c| {
+        let c = c.get_mut(&bob_id).unwrap();
+        c.set_discovery_key([1; 32]);
+        c.set_discovery_key([2; 32]);
+    });
+    bob.update_contacts(|c| {
+        let c = c.get_mut(&a_id).unwrap();
+        c.set_discovery_key([2; 32]);
+        c.set_discovery_key([1; 32]);
+    });
+    let recognises = |n: &Node, b: &[u8], peer| {
+        let keys: Vec<_> = n
+            .contacts()
+            .get(&peer)
+            .unwrap()
+            .recognition_keys()
+            .copied()
+            .collect();
+        keys.iter().any(|k| {
+            !threnody_core::discovery::recognise(b, [(&peer, k)], threnody_core::now_ms() / 1000)
+                .is_empty()
+        })
+    };
+    assert!(recognises(&bob, &alice.ble_beacon(0x81), a_id));
+    assert!(recognises(&alice, &bob.ble_beacon(0x82), bob_id));
+
     // Strangers learn nothing they can act on.
     assert_eq!(carol.ble_heard(&alice.ble_beacon(0x81)), None);
     assert_eq!(
         threnody_core::discovery::beacon_port(&alice.ble_beacon(0x81)),
         Some(0x81)
     );
+}
+
+#[tokio::test]
+async fn wifi_direct_offers_only_between_approved_neighbours() {
+    use threnody_net::DirectOffer;
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    let offer = DirectOffer {
+        ssid: "DIRECT-th-test".into(),
+        passphrase: "a long passphrase".into(),
+        addr: "192.168.49.1:7450".into(),
+    };
+    // Not yet approved: refused locally.
+    assert!(alice.offer_wifi_direct(&bob_id, offer.clone()).is_err());
+    assert!(alice.request_wifi_direct(&bob_id).is_err());
+
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    next(&mut brx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+
+    alice.request_wifi_direct(&bob_id).unwrap();
+    let e = next(&mut brx, |e| matches!(e, Event::WifiDirectRequested { .. })).await;
+    assert!(matches!(e, Event::WifiDirectRequested { peer } if peer == alice.identity()));
+
+    bob.offer_wifi_direct(&alice.identity(), offer.clone())
+        .unwrap();
+    let e = next(&mut arx, |e| matches!(e, Event::WifiDirectOffer { .. })).await;
+    let Event::WifiDirectOffer { peer, offer: got } = e else {
+        unreachable!()
+    };
+    assert_eq!((peer, got), (bob_id, offer.clone()));
+
+    // Bad offers are refused before they leave.
+    let mut bad = offer;
+    bad.passphrase = "short".into();
+    assert!(bob.offer_wifi_direct(&alice.identity(), bad).is_err());
 }

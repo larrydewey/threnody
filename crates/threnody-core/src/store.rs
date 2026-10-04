@@ -247,6 +247,9 @@ fn write_private(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// A known peer. Identity is the key; everything else is local metadata.
+/// Previous discovery keys kept per contact (see [`Contact::discovery_older`]).
+pub const MAX_OLD_DISCOVERY_KEYS: usize = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contact {
     pub key: PublicIdentity,
@@ -263,6 +266,11 @@ pub struct Contact {
     /// Pairwise LAN discovery key from the latest mutually approved
     /// session (see `discovery`). Cleared on revocation.
     pub discovery_key: Option<[u8; 32]>,
+    /// The previous few discovery keys, still accepted when recognising
+    /// beacons. Two sessions that start at once (both sides dialing) can
+    /// leave each side with a different "latest" key; keeping recent ones
+    /// means both still recognise each other. Cleared on revocation.
+    pub discovery_older: Vec<[u8; 32]>,
     /// Account this device belongs to (Appendix J), once its chain is known.
     pub account: Option<AccountId>,
     /// When the approval or verification flags last changed (own-device
@@ -282,9 +290,33 @@ impl Contact {
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             discovery_key: None,
+            discovery_older: Vec::new(),
             account: None,
             approval_changed_ms: 0,
         }
+    }
+
+    /// Installs the discovery key from a new session, keeping the previous
+    /// [`MAX_OLD_DISCOVERY_KEYS`] for recognition.
+    pub fn set_discovery_key(&mut self, k: [u8; 32]) {
+        if let Some(cur) = self.discovery_key.replace(k)
+            && cur != k
+        {
+            self.discovery_older.retain(|o| *o != cur && *o != k);
+            self.discovery_older.insert(0, cur);
+            self.discovery_older.truncate(MAX_OLD_DISCOVERY_KEYS);
+        }
+    }
+
+    /// Forgets every discovery key (revocation, or not ours to share).
+    pub fn clear_discovery_keys(&mut self) {
+        self.discovery_key = None;
+        self.discovery_older.clear();
+    }
+
+    /// Keys to recognise this peer's beacons with: current first.
+    pub fn recognition_keys(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.discovery_key.iter().chain(&self.discovery_older)
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -379,7 +411,7 @@ impl Contacts {
     pub fn sync_snapshot(&self) -> Result<Vec<u8>> {
         let mut c = self.clone();
         for x in &mut c.list {
-            x.discovery_key = None;
+            x.clear_discovery_keys();
             x.remote_approved = false;
         }
         c.encode()
@@ -395,7 +427,7 @@ impl Contacts {
             match self.get_mut(&o.key) {
                 None => {
                     let mut c = o;
-                    c.discovery_key = None;
+                    c.clear_discovery_keys();
                     c.remote_approved = false;
                     c.first_seen_ms = now_ms;
                     self.list.push(c);
@@ -436,6 +468,7 @@ impl Contacts {
                     + usize::from(c.petname.is_some())
                     + usize::from(c.last_addr.is_some())
                     + usize::from(c.discovery_key.is_some())
+                    + usize::from(!c.discovery_older.is_empty())
                     + usize::from(c.account.is_some())
                     + 1;
                 e.map_len(n)?;
@@ -458,6 +491,12 @@ impl Contacts {
                     e.u8(9)?.bytes(&a.0)?;
                 }
                 e.u8(10)?.u64(c.approval_changed_ms)?;
+                if !c.discovery_older.is_empty() {
+                    e.u8(11)?.array_len(c.discovery_older.len())?;
+                    for k in &c.discovery_older {
+                        e.bytes(k)?;
+                    }
+                }
             }
             Ok(())
         })
@@ -496,6 +535,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         first_seen_ms: 0,
         last_seen_ms: 0,
         discovery_key: None,
+        discovery_older: Vec::new(),
         account: None,
         approval_changed_ms: 0,
     };
@@ -512,6 +552,14 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             8 => c.discovery_key = Some(fixed_bytes::<32>(d)?),
             9 => c.account = Some(AccountId(fixed_bytes::<32>(d)?)),
             10 => c.approval_changed_ms = d.u64()?,
+            11 => {
+                for _ in 0..d.array_len()? {
+                    let k = fixed_bytes::<32>(d)?;
+                    if c.discovery_older.len() < MAX_OLD_DISCOVERY_KEYS {
+                        c.discovery_older.push(k);
+                    }
+                }
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -672,5 +720,23 @@ mod passphrase_tests {
         home.change_passphrase(Some(b"hunter2"), None).unwrap();
         assert!(!home.identity_is_sealed().unwrap());
         assert_eq!(home.load_identity(None).unwrap().public(), id.public());
+    }
+
+    #[test]
+    fn recent_discovery_keys_are_kept_and_cleared_together() {
+        let mut c = Contact::new(Identity::generate().public(), 0);
+        for k in 1..=4u8 {
+            c.set_discovery_key([k; 32]);
+        }
+        c.set_discovery_key([4; 32]);
+        assert_eq!(c.discovery_key, Some([4; 32]));
+        assert_eq!(c.discovery_older, vec![[3; 32], [2; 32]]);
+        assert_eq!(c.recognition_keys().count(), 3);
+        let mut book = Contacts::default();
+        book.list.push(c.clone());
+        let back = Contacts::decode(&book.encode().unwrap()).unwrap();
+        assert_eq!(back.list[0], c);
+        c.clear_discovery_keys();
+        assert_eq!(c.recognition_keys().count(), 0);
     }
 }

@@ -353,7 +353,7 @@ impl Node {
             if let Some(c) = contacts.get_mut(device) {
                 c.local_approved = false;
                 c.remote_approved = false;
-                c.discovery_key = None;
+                c.clear_discovery_keys();
                 c.approval_changed_ms = now_ms();
             }
             self.shared.save_contacts(&contacts);

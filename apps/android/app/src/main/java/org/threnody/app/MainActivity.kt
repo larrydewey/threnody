@@ -70,6 +70,11 @@ object Threnody {
                 }
                 is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
                 is NodeEvent.File -> say("* ${short(e.peer)} sent ${e.name} (${e.data.size} bytes)")
+                is NodeEvent.WifiDirectOffer -> WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
+                is NodeEvent.WifiDirectRequested -> {
+                    say("* ${short(e.peer)} asks for a Wi-Fi Direct link")
+                    WifiDirect.host(ctx, node, e.peer)
+                }
                 else -> say("· $e")
             }
         }
@@ -97,17 +102,19 @@ class MainActivity : Activity() {
         val header = TextView(this).apply { setTextIsSelectable(true); textSize = 13f }
         val target = EditText(this).apply { hint = "threnody://… invite or host:port" }
         val connect = Button(this).apply { text = "Connect" }
-        val message = EditText(this).apply { hint = "message" }
+        val message = EditText(this).apply { hint = "message"; maxLines = 4 }
         val send = Button(this).apply { text = "Send" }
         val approve = Button(this).apply { text = "Approve current peer" }
         val bluetooth = Button(this).apply { text = "Start Bluetooth" }
         val scan = Button(this).apply { text = "Scan Bluetooth" }
+        val direct = Button(this).apply { text = "Wi-Fi Direct with current peer" }
+        val leave = Button(this).apply { text = "Leave Wi-Fi Direct" }
         log = TextView(this).apply {
             movementMethod = ScrollingMovementMethod()
             setTextIsSelectable(true)
             textSize = 13f
         }
-        for (v in listOf(header, target, connect, message, send, approve, bluetooth, scan)) {
+        for (v in listOf(header, target, connect, message, send, approve, bluetooth, scan, direct, leave)) {
             root.addView(v, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
         root.addView(log, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -165,6 +172,12 @@ class MainActivity : Activity() {
             if (Bluetooth.permitted(this)) startBluetooth()
             else requestPermissions(Bluetooth.permissions, 1)
         }
+        direct.setOnClickListener {
+            val peer = current ?: return@setOnClickListener say("! no peer yet")
+            if (WifiDirect.permitted(this)) WifiDirect.host(applicationContext, node, peer)
+            else requestPermissions(arrayOf(WifiDirect.permission), 4)
+        }
+        leave.setOnClickListener { WifiDirect.leave(applicationContext) }
         approve.setOnClickListener {
             val peer = current ?: return@setOnClickListener say("! no peer yet")
             worker.execute {
@@ -176,7 +189,7 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (code == 3) return
+        if (code == 3 || code == 4) return
         if (results.isEmpty() || results.any { it != PackageManager.PERMISSION_GRANTED }) {
             say("! Bluetooth permission denied")
         } else if (code == 2) scanBluetooth() else startBluetooth()

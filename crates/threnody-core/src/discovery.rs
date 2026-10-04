@@ -137,7 +137,8 @@ pub fn recognise<'a>(
                 let want = tag(key, peer, e, nonce, port);
                 tags.as_chunks::<TAG_LEN>().0.contains(&want)
             });
-        if hit {
+        // A peer may be listed once per key it is known by.
+        if hit && !found.iter().any(|(p, _)| p == peer) {
             found.push((*peer, port));
         }
     }

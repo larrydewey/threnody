@@ -13,4 +13,6 @@ Tested on a Pixel 8a (Android API 37) over Wi-Fi with the desktop CLI: `threnody
 
 If Bluetooth permissions are granted, the app listens, advertises a private beacon, and connects to approved contacts it hears, all on its own. Otherwise tap **Start Bluetooth** to grant them and start. It listens on an LE L2CAP channel and advertises it (Appendix K). To connect by hand to a device that isn't a contact yet, a Linux machine can `/ble scan` and `/ble connect`. The other way round, run `threnody run --ble` on Linux, tap **Scan Bluetooth**, type `ble 1` (the number the scan printed) and tap **Connect**. Both directions were tested with a Pixel 8a.
 
+**Wi-Fi Direct with current peer** creates a Wi-Fi Direct group and offers it to the current peer over the existing session (Appendix L). The peer joins, and the session moves to the faster link. A request from a peer does the same automatically. **Leave Wi-Fi Direct** closes the group. These need the nearby-devices permission.
+
 The node is a process-wide singleton, so rotating the screen or recreating the Activity doesn't drop sessions. A foreground service (type `remoteMessaging`, with an ongoing notification) keeps the process alive in the background. Messages that arrive while the app isn't visible show up as notifications.

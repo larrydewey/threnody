@@ -93,6 +93,19 @@ pub enum NodeEvent {
         device: String,
     },
     ThisDeviceRemoved,
+    /// A nearby approved peer created a Wi-Fi Direct group for us: join
+    /// it (network name + passphrase), then `connect` to
+    /// `threnody://<peer>@<addr>`.
+    WifiDirectOffer {
+        peer: String,
+        ssid: String,
+        passphrase: String,
+        addr: String,
+    },
+    /// A nearby approved peer asks us to create a group and offer it.
+    WifiDirectRequested {
+        peer: String,
+    },
     /// Anything else, described for logs.
     Other {
         description: String,
@@ -202,6 +215,13 @@ fn convert(e: Event) -> NodeEvent {
             device: fp(&device),
         },
         Event::ThisDeviceRemoved => NodeEvent::ThisDeviceRemoved,
+        Event::WifiDirectOffer { peer, offer } => NodeEvent::WifiDirectOffer {
+            peer: fp(&peer),
+            ssid: offer.ssid,
+            passphrase: offer.passphrase,
+            addr: offer.addr,
+        },
+        Event::WifiDirectRequested { peer } => NodeEvent::WifiDirectRequested { peer: fp(&peer) },
         other => NodeEvent::Other {
             description: format!("{other:?}"),
         },
@@ -493,6 +513,34 @@ impl ThrenodyNode {
         })
     }
 
+    /// Offers `peer` (a nearby, mutually approved contact) the Wi-Fi Direct
+    /// group we created; `addr` is where we listen inside it.
+    pub fn offer_wifi_direct(
+        &self,
+        peer: String,
+        ssid: String,
+        passphrase: String,
+        addr: String,
+    ) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node
+            .offer_wifi_direct(
+                &p,
+                threnody_net::DirectOffer {
+                    ssid,
+                    passphrase,
+                    addr,
+                },
+            )
+            .map_err(fail)
+    }
+
+    /// Asks `peer` to create a Wi-Fi Direct group and offer it to us.
+    pub fn request_wifi_direct(&self, peer: String) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node.request_wifi_direct(&p).map_err(fail)
+    }
+
     /// Waits up to `timeout_ms` for the next event.
     pub fn next_event(&self, timeout_ms: u32) -> Option<NodeEvent> {
         let mut rx = self
@@ -640,5 +688,63 @@ mod tests {
         // A protected identity needs its passphrase.
         drop(bob);
         assert!(ThrenodyNode::open(dir.path().join("b").display().to_string(), None).is_err());
+    }
+
+    /// Large frames over a slow, chunked, back-pressured link (like an
+    /// L2CAP channel), in both directions at once.
+    #[test]
+    fn large_frames_cross_a_slow_link_both_ways() {
+        use std::sync::mpsc::{SyncSender, sync_channel};
+        struct Radio(SyncSender<Vec<u8>>);
+        impl ByteLink for Radio {
+            fn send(&self, data: Vec<u8>) -> bool {
+                // Blocks when the "air" is full, as a socket write would.
+                data.chunks(247).all(|c| self.0.send(c.to_vec()).is_ok())
+            }
+            fn disconnect(&self) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let alice = ThrenodyNode::open(dir.path().join("a").display().to_string(), None).unwrap();
+        let bob = ThrenodyNode::open(dir.path().join("b").display().to_string(), None).unwrap();
+        let (a_tx, a_rx) = sync_channel::<Vec<u8>>(16);
+        let (b_tx, b_rx) = sync_channel::<Vec<u8>>(16);
+        let ha = alice
+            .attach_link(Arc::new(Radio(a_tx)), true, "ble".into(), "b".into(), None)
+            .unwrap();
+        let hb = bob
+            .attach_link(Arc::new(Radio(b_tx)), false, "ble".into(), "a".into(), None)
+            .unwrap();
+        std::thread::spawn(move || {
+            for c in a_rx {
+                hb.receive(c);
+            }
+        });
+        std::thread::spawn(move || {
+            for c in b_rx {
+                ha.receive(c);
+            }
+        });
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        let (a_id, b_id) = (alice.node.identity(), bob.node.identity());
+        let file = |n: &str| AppMessage::File {
+            sent_ms: 0,
+            name: n.into(),
+            data: vec![7u8; 400_000],
+        };
+        alice.node.send(&b_id, file("to-bob")).unwrap();
+        bob.node.send(&a_id, file("to-alice")).unwrap();
+        alice
+            .send_text(bob.device_fingerprint(), "after".into())
+            .unwrap();
+        let got = |n: &ThrenodyNode, name: &str| {
+            let e = wait(n, |e| matches!(e, NodeEvent::File { .. }));
+            assert!(
+                matches!(e, NodeEvent::File { name: x, data, .. } if x == name && data.len() == 400_000)
+            );
+        };
+        got(&bob, "to-bob");
+        got(&alice, "to-alice");
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
     }
 }

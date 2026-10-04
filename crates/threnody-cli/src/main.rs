@@ -6,6 +6,7 @@ mod chat;
 mod groups;
 mod target;
 mod tunnel;
+mod wifidirect;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -95,6 +96,10 @@ enum Cmd {
         /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
         ble: bool,
+        /// Join Wi-Fi Direct groups that approved contacts offer (through
+        /// NetworkManager; the Wi-Fi interface leaves its network meanwhile).
+        #[arg(long)]
+        wifi_direct: bool,
         /// Do not send or listen for LAN discovery beacons.
         #[arg(long)]
         no_discover: bool,
@@ -418,6 +423,7 @@ fn main() -> Result<()> {
             no_discover,
             discover_port,
             ble,
+            wifi_direct,
         } => {
             let identity = load_identity(&home)?;
             let rt = tokio::runtime::Runtime::new()?;
@@ -430,6 +436,7 @@ fn main() -> Result<()> {
                 constant_rate: constant_rate_ms.map(std::time::Duration::from_millis),
                 discover: (!no_discover).then_some(discover_port),
                 ble,
+                wifi_direct,
                 tunnel: tunnel.map(|port| chat::TunnelOptions {
                     port,
                     iface: wg_iface,

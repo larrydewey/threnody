@@ -54,6 +54,8 @@ pub enum AppMessage {
     Onion(Vec<u8>),
     /// An opaque account / device-linking message (see `threnody-net::account`).
     Account(Vec<u8>),
+    /// An opaque Wi-Fi Direct link message (see `threnody-net::direct`).
+    Direct(Vec<u8>),
 }
 
 mod kind {
@@ -69,6 +71,7 @@ mod kind {
     pub const MAILBOX: u64 = 9;
     pub const ONION: u64 = 10;
     pub const ACCOUNT: u64 = 11;
+    pub const DIRECT: u64 = 12;
 }
 
 impl AppMessage {
@@ -132,6 +135,10 @@ impl AppMessage {
                 }
                 Self::Account(payload) => {
                     e.map_len(2)?.u8(0)?.uint(kind::ACCOUNT)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
+                Self::Direct(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::DIRECT)?;
                     e.u8(2)?.bytes(payload)?;
                 }
                 Self::Approval { approved } => {
@@ -203,7 +210,8 @@ impl AppMessage {
             | kind::PREKEYS
             | kind::MAILBOX
             | kind::ONION
-            | kind::ACCOUNT => {
+            | kind::ACCOUNT
+            | kind::DIRECT => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
                     return Err(Error::Malformed("message too large"));
@@ -214,6 +222,7 @@ impl AppMessage {
                     Some(kind::PREKEYS) => Self::Prekeys(p),
                     Some(kind::ONION) => Self::Onion(p),
                     Some(kind::ACCOUNT) => Self::Account(p),
+                    Some(kind::DIRECT) => Self::Direct(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -297,6 +306,7 @@ mod tests {
             AppMessage::Mailbox(vec![7]),
             AppMessage::Onion(vec![8]),
             AppMessage::Account(vec![9]),
+            AppMessage::Direct(vec![10]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }

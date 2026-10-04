@@ -2,7 +2,7 @@
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
 
-**Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Apps can embed a node through generated Kotlin, Swift and Python bindings. Over Bluetooth LE, approved contacts recognise each other's private beacons and connect without any taps. A Pixel 8a and a laptop have chatted this way, and the phone keeps its sessions while in the background. Relays work across transports, so a phone with only a Bluetooth link can reach peers that its contacts reach over IP. Wi-Fi Direct is still to come (see [Roadmap](#roadmap)).
+**Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Apps can embed a node through generated Kotlin, Swift and Python bindings. Over Bluetooth LE, approved contacts recognise each other's private beacons and connect without any taps. A Pixel 8a and a laptop have chatted this way, and the phone keeps its sessions while in the background. Relays work across transports, so a phone with only a Bluetooth link can reach peers that its contacts reach over IP. Sessions over Bluetooth can be upgraded to Wi-Fi Direct for bandwidth.
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
@@ -22,7 +22,7 @@ threnody --home ~/.thr-a init
 threnody --home ~/.thr-a run --no-listen -c 'threnody://<fingerprint>@192.0.2.7:7450'
 ```
 
-Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/ble scan` finds nearby Threnody devices over Bluetooth LE, and `/ble connect <n>` opens a session over the radio (Linux, BlueZ). `run --ble` makes a Linux machine advertise a private beacon, accept Bluetooth sessions, and connect to approved contacts it hears. The Android sample app advertises after you tap *Start Bluetooth*, and it can scan and dial.
+Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/ble scan` finds nearby Threnody devices over Bluetooth LE, and `/ble connect <n>` opens a session over the radio (Linux, BlueZ). `run --ble` makes a Linux machine advertise a private beacon, accept Bluetooth sessions, and connect to approved contacts it hears. The Android sample app advertises after you tap *Start Bluetooth*, and it can scan and dial. With `run --wifi-direct`, `/wifi-direct request` asks the current (nearby, approved) peer to host a Wi-Fi Direct group, and the laptop joins it through NetworkManager. The session then moves to the faster link.
 
 `/onion <peer> [min-relays]` builds an onion circuit (two relays by default) so no single relay learns both ends.
 
@@ -70,6 +70,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix I: onion circuits](docs/appendix-i-onion.md)
 - [Appendix J: accounts and multiple devices](docs/appendix-j-devices.md)
 - [Appendix K: Bluetooth LE transport](docs/appendix-k-bluetooth.md)
+- [Appendix L: Wi-Fi Direct link upgrade](docs/appendix-l-wifi-direct.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
@@ -89,7 +90,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history (sync between devices and backups not yet) |
-| §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes; ❌ Wi-Fi Direct |
+| §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |
 | §10 Status indicators | ✅ `/status` |
@@ -101,7 +102,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 1. **Hardening (remaining).** OS keystores, ratchet persistence across reconnects, and an external audit.
 2. **Groups (remaining).** Store-and-forward via members, and more admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
-4. **Mesh (remaining).** Wi-Fi Direct.
+4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.
 6. **Mobile (remaining).** A sample Android app is in [`apps/android`](apps/android) and has been tested on a Pixel 8a. It keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
 

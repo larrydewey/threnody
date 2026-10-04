@@ -26,6 +26,8 @@ pub struct Options {
     pub discover: Option<u16>,
     /// Advertise and accept sessions over Bluetooth LE.
     pub ble: bool,
+    /// Join Wi-Fi Direct groups that approved contacts offer.
+    pub wifi_direct: bool,
 }
 
 pub struct TunnelOptions {
@@ -52,6 +54,7 @@ Type a line to send it to the current peer. Commands:
   /status                               transports and protection level
   /devices   /device add   /device remove <name>   your account's devices
   /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
+  /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
   /history [peer] [n]                   recent messages (stored encrypted)
   /disappear <30s|10m|1h|1d|off>        disappearing messages with the current peer
   /quit
@@ -67,10 +70,15 @@ struct Ui {
     groups: GroupUi,
     #[cfg(all(feature = "ble", target_os = "linux"))]
     ble_seen: std::sync::Arc<std::sync::Mutex<Vec<crate::ble::Found>>>,
+    wifi_direct: bool,
+    /// NetworkManager profiles of Wi-Fi Direct groups we joined.
+    joined: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    scratch: PathBuf,
 }
 
 pub async fn run(opts: Options) -> Result<()> {
     let downloads = opts.home.dir().join("downloads");
+    let opts_dir = opts.home.dir().to_path_buf();
     let groups = GroupUi::load(&opts.home, &opts.identity).context("loading groups")?;
     let tunnels = opts
         .tunnel
@@ -131,6 +139,9 @@ pub async fn run(opts: Options) -> Result<()> {
         groups,
         #[cfg(all(feature = "ble", target_os = "linux"))]
         ble_seen: std::sync::Arc::default(),
+        wifi_direct: opts.wifi_direct,
+        joined: std::sync::Arc::default(),
+        scratch: opts_dir,
     };
     if let (Some(port), Some(tcp)) = (opts.discover, listen_addr) {
         let cfg = DiscoveryConfig {
@@ -193,6 +204,7 @@ pub async fn run(opts: Options) -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    ui.leave_wifi_direct().await;
     Ok(())
 }
 
@@ -352,6 +364,60 @@ impl Ui {
         });
     }
 
+    /// Joins an offered Wi-Fi Direct group and opens a session over it,
+    /// pinning the peer; the new session replaces the slower one.
+    fn wifi_direct_offer(&self, peer: PublicIdentity, offer: threnody_net::DirectOffer) {
+        let who = self.name(&peer);
+        if !self.wifi_direct {
+            println!(
+                "* {who} offers a Wi-Fi Direct link ({}); run with --wifi-direct to join",
+                offer.ssid
+            );
+            return;
+        }
+        println!(
+            "* {who} offers a Wi-Fi Direct link ({}); joining…",
+            offer.ssid
+        );
+        let (node, joined, scratch) = (
+            self.node.clone(),
+            std::sync::Arc::clone(&self.joined),
+            self.scratch.clone(),
+        );
+        tokio::spawn(async move {
+            match crate::wifidirect::join(&offer, &scratch).await {
+                Ok(name) => {
+                    joined
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(name);
+                }
+                Err(e) => {
+                    println!("! Wi-Fi Direct join: {e:#}");
+                    return;
+                }
+            }
+            if let Err(e) = node.connect(&offer.addr, Some(peer.fingerprint())).await {
+                println!("! Wi-Fi Direct connect to {}: {e:#}", offer.addr);
+            }
+        });
+    }
+
+    async fn leave_wifi_direct(&self) {
+        let names = std::mem::take(
+            &mut *self
+                .joined
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for n in names {
+            match crate::wifidirect::leave(&n).await {
+                Ok(()) => println!("* left Wi-Fi Direct group ({n})"),
+                Err(e) => println!("! leaving {n}: {e:#}"),
+            }
+        }
+    }
+
     fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Connected {
@@ -428,6 +494,11 @@ impl Ui {
                     if mutual { " — mutually approved" } else { "" }
                 );
             }
+            Event::WifiDirectOffer { peer, offer } => self.wifi_direct_offer(peer, offer),
+            Event::WifiDirectRequested { peer } => println!(
+                "* {} asked for a Wi-Fi Direct link; this device can only join groups, not host them",
+                self.name(&peer)
+            ),
             Event::Disconnected { peer, reason } => {
                 // Keep `current`: plain lines then go out as sealed messages.
                 println!("* {} disconnected ({reason})", self.name(&peer));
@@ -660,6 +731,18 @@ impl Ui {
                 self.node.set_policy(p);
                 println!("* policy: {p:?}");
             }
+            "wifi-direct" | "wd" => match arg.unwrap_or("request") {
+                "request" => {
+                    let peer = self.current.ok_or_else(|| anyhow!("no current peer"))?;
+                    if !self.wifi_direct {
+                        println!("  note: run with --wifi-direct to join the group offered back");
+                    }
+                    self.node.request_wifi_direct(&peer)?;
+                    println!("* asked {} for a Wi-Fi Direct link", self.name(&peer));
+                }
+                "leave" => self.leave_wifi_direct().await,
+                _ => bail!("usage: /wifi-direct [request|leave]"),
+            },
             "status" => self.status(),
             "devices" => self.devices(),
             #[cfg(all(feature = "ble", target_os = "linux"))]

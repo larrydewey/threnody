@@ -129,6 +129,17 @@ pub enum Event {
     },
     /// This device was removed from its account.
     ThisDeviceRemoved,
+    /// A nearby approved peer created a Wi-Fi Direct group for us: join
+    /// it, then connect to `offer.addr` pinning `peer`.
+    WifiDirectOffer {
+        peer: PublicIdentity,
+        offer: crate::direct::DirectOffer,
+    },
+    /// A nearby approved peer asks us to create a Wi-Fi Direct group and
+    /// offer it ([`Node::offer_wifi_direct`]).
+    WifiDirectRequested {
+        peer: PublicIdentity,
+    },
     /// A peer changed the conversation's disappearing-message timer.
     TimerChanged {
         peer: PublicIdentity,
@@ -614,7 +625,7 @@ impl Node {
                 c.local_approved = approved;
                 c.approval_changed_ms = now_ms();
                 if !approved {
-                    c.discovery_key = None;
+                    c.clear_discovery_keys();
                 }
             }
             self.shared.save_contacts(&contacts);
@@ -716,7 +727,11 @@ impl Node {
                 node.drop_circuits_of(&peer);
                 node.drop_onion_circuits_of(&peer);
             }
-            node.shared.emit(Event::Disconnected { peer, reason });
+            // A replaced session (e.g. Bluetooth upgraded to Wi-Fi Direct)
+            // is not a disconnection: the peer is still connected.
+            if current {
+                node.shared.emit(Event::Disconnected { peer, reason });
+            }
         });
     }
 }
@@ -785,7 +800,7 @@ where
                 let key = *chan.export(DISCOVERY_CONTEXT);
                 let mut contacts = lock(&shared.contacts);
                 if let Some(c) = contacts.get_mut(&peer) {
-                    c.discovery_key = Some(key);
+                    c.set_discovery_key(key);
                 }
                 shared.save_contacts(&contacts);
                 discovery_keyed = true;
@@ -844,7 +859,7 @@ where
                                     prekeys_sent = false;
                                     let mut contacts = lock(&shared.contacts);
                                     if let Some(c) = contacts.get_mut(&peer) {
-                                        c.discovery_key = None;
+                                        c.clear_discovery_keys();
                                     }
                                     shared.save_contacts(&contacts);
                                 }
@@ -869,6 +884,11 @@ where
                         AppMessage::Onion(payload) => {
                             if via.is_none() {
                                 node.on_onion(peer, &payload);
+                            }
+                        }
+                        AppMessage::Direct(payload) => {
+                            if via.is_none() {
+                                node.on_direct(peer, &payload);
                             }
                         }
                         AppMessage::Relay(payload) => {

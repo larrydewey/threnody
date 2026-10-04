@@ -15,7 +15,7 @@ path = "src/main.rs"
 threnody-core.workspace = true
 threnody-net.workspace = true
 threnody-groups.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 clap.workspace = true
 anyhow.workspace = true
 qrcode.workspace = true

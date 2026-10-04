@@ -39,6 +39,8 @@ object Bluetooth {
     const val SERVICE = "7e9f0e1c-3b5a-4c7e-9d2a-5f1e8b6c4a01"
     private val uuid = ParcelUuid(UUID.fromString(SERVICE))
     private const val REFRESH_MS = 60_000L
+    /** Must match `threnody-cli`'s `ble::MAX_SDU`. */
+    private const val MAX_SDU = 4096
 
     private val main = Handler(Looper.getMainLooper())
     private val dialer = Executors.newSingleThreadExecutor()
@@ -183,9 +185,21 @@ object Bluetooth {
     /** Bridges one Bluetooth socket into the node. */
     private fun attach(node: ThrenodyNode, sock: BluetoothSocket, outbound: Boolean, expect: String?) {
         val out = sock.outputStream
+        // BluetoothSocket truncates L2CAP writes larger than one packet
+        // (dropping the rest), and Android stalls on large SDUs, so write
+        // pieces of at most one packet and MAX_SDU bytes.
+        val packet = minOf(sock.maxTransmitPacketSize.takeIf { it > 0 } ?: 23, MAX_SDU)
         val link = object : ByteLink {
-            override fun send(data: ByteArray): Boolean =
-                try { out.write(data); out.flush(); true } catch (e: Exception) { false }
+            override fun send(data: ByteArray): Boolean = try {
+                var off = 0
+                while (off < data.size) {
+                    val n = minOf(packet, data.size - off)
+                    out.write(data, off, n)
+                    off += n
+                }
+                out.flush()
+                true
+            } catch (e: Exception) { false }
             override fun disconnect() { try { sock.close() } catch (_: Exception) {} }
         }
         val handle = try {
@@ -195,7 +209,9 @@ object Bluetooth {
             return Threnody.say("! Bluetooth attach: ${e.message}")
         }
         Thread {
-            val buf = ByteArray(16 * 1024)
+            // Reads return whole L2CAP SDUs, which can be up to 65535 bytes
+            // whatever maxReceivePacketSize says; a smaller buffer stalls.
+            val buf = ByteArray(65536)
             try {
                 val input = sock.inputStream
                 while (true) {
