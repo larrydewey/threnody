@@ -220,9 +220,35 @@ impl GroupUi {
                     bail!("usage: /group invite <group> <peer>")
                 };
                 let (g, p) = (self.find(g)?, resolve(p)?);
-                let out = self.groups.invite(&g, p)?;
-                println!("* invitation sent to {}", name(&p));
-                self.apply(node, name, out);
+                // Invite every device of the contact's account (Appendix J);
+                // MLS leaves stay per device.
+                let me = node.identity();
+                let devices: Vec<PublicIdentity> = node
+                    .account_of(&p)
+                    .map(|a| {
+                        a.state()
+                            .devices
+                            .iter()
+                            .map(|(d, _)| *d)
+                            .filter(|d| *d != me)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![p]);
+                let mut invited = 0;
+                for d in devices {
+                    match self.groups.invite(&g, d) {
+                        Ok(out) => {
+                            invited += 1;
+                            println!("* invitation sent to {}", name(&d));
+                            self.apply(node, name, out);
+                        }
+                        Err(threnody_groups::GroupError::AlreadyMember(_)) => {}
+                        Err(e) => println!("! {}: {e}", name(&d)),
+                    }
+                }
+                if invited == 0 {
+                    bail!("every device of {} is already in the group", name(&p));
+                }
             }
             "accept" => {
                 if self.pending.is_empty() {

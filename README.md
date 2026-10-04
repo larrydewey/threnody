@@ -77,7 +77,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.4 Formal verification | ✅ Tamarin, 33 lemmas: handshake, ratchet, sealed messages, onion hops, device linking and account chains; `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
-| §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync; groups and history not yet shared across devices |
+| §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync, account-wide offline keys and group invites; history not synced |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
 | §6.1 1:1 text + files | ✅ (disappearing messages not yet) |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence |

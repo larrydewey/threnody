@@ -168,3 +168,49 @@ async fn removing_a_device_revokes_it_everywhere() {
     .await;
     assert!(bob.node.sessions().iter().all(|s| s.peer != pid));
 }
+
+#[tokio::test]
+async fn contacts_can_seal_to_a_sibling_they_never_met() {
+    use threnody_core::AppMessage;
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+
+    // Bob never met the phone, but gets its shared bundle via the laptop.
+    wait_for(|| bob.node.can_send_offline(&pid)).await;
+
+    // The phone goes away; Bob seals to it; the laptop holds it.
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    let text = AppMessage::Text {
+        sent_ms: 0,
+        body: "hi phone".into(),
+    };
+    bob.node.send_offline(&pid, &text).unwrap();
+    wait_for(|| laptop.node.held_messages() == 1).await;
+
+    // The phone comes back (same home), connects to the laptop, and reads it.
+    let home = threnody_core::store::Home::new(dir.path().join("phone"));
+    let identity = home.load_identity(None).unwrap();
+    let (phone2, mut prx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    phone2.connect(&laptop.addr, None).await.unwrap();
+    let Event::OfflineMessage { from, msg, .. } =
+        next(&mut prx, |e| matches!(e, Event::OfflineMessage { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!((from, msg), (bob.node.identity(), text));
+    let _ = (&mut laptop.rx, &mut phone.rx);
+}

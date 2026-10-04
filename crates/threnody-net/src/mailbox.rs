@@ -248,20 +248,82 @@ impl Node {
             .collect()
     }
 
-    /// A fresh prekey bundle for `peer`, encoded for `AppMessage::Prekeys`.
-    pub(crate) fn prekeys_for(&self, peer: &PublicIdentity) -> Option<AppMessage> {
+    /// Prekeys to hand a mutually approved `peer`: a fresh bundle of ours,
+    /// plus the shared bundles our sibling devices gave us (Appendix J).
+    pub(crate) fn prekeys_for(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
+        let mut out = Vec::new();
+        {
+            let mut store = lock(&self.shared.prekeys);
+            let bundle = store.bundle_for(self.identity_ref(), peer, now_ms());
+            self.shared.persist_prekeys(&store);
+            out.extend(bundle.encode().ok().map(AppMessage::Prekeys));
+        }
+        let siblings: Vec<_> = lock(&self.shared.siblings)
+            .iter()
+            .filter(|(d, b)| *d != peer.as_bytes() && b.expiry_ms > now_ms())
+            .filter_map(|(_, b)| b.encode().ok())
+            .collect();
+        out.extend(siblings.into_iter().map(AppMessage::Prekeys));
+        out
+    }
+
+    /// Our shared bundle, for one of our own devices to pass on.
+    pub(crate) fn shared_bundle(&self) -> Option<Vec<u8>> {
         let mut store = lock(&self.shared.prekeys);
-        let bundle = store.bundle_for(self.identity_ref(), peer, now_ms());
+        let b = store.shared_bundle(self.identity_ref(), now_ms());
         self.shared.persist_prekeys(&store);
-        bundle.encode().ok().map(AppMessage::Prekeys)
+        b.encode().ok()
+    }
+
+    /// A sibling device's shared bundle, received from that device itself.
+    pub(crate) fn on_sibling_bundle(&self, from: PublicIdentity, bytes: &[u8]) {
+        let Ok(b) = threnody_core::prekey::PrekeyBundle::decode(bytes) else {
+            return;
+        };
+        if b.owner != from || !self.is_own_device(&from) || b.verify(&from, now_ms()).is_err() {
+            return;
+        }
+        // Pass it on to connected contacts right away.
+        if let Ok(fwd) = b.encode() {
+            for s in self.sessions() {
+                if !self.is_own_device(&s.peer)
+                    && s.peer != self.identity()
+                    && self.shared.mutual(&s.peer)
+                {
+                    let _ = self.send(&s.peer, AppMessage::Prekeys(fwd.clone()));
+                }
+            }
+        }
+        let mut sib = lock(&self.shared.siblings);
+        sib.insert(*from.as_bytes(), b);
+        let encoded: Vec<Vec<u8>> = sib.values().filter_map(|b| b.encode().ok()).collect();
+        drop(sib);
+        self.shared
+            .save_state("siblings", encode_bundle_list(&encoded));
     }
 
     pub(crate) fn on_prekeys(&self, from: PublicIdentity, payload: &[u8]) {
         let Ok(bundle) = threnody_core::prekey::PrekeyBundle::decode(payload) else {
             return;
         };
+        let owner = bundle.owner;
         let mut book = lock(&self.shared.bundles);
-        if book.insert(&from, bundle, now_ms()).is_ok() {
+        let stored = if owner == from {
+            book.insert(&from, bundle, now_ms()).is_ok()
+        } else {
+            // Forwarded by a sibling: `from` must be mutually approved and in
+            // the same account as the owner, and the owner not revoked.
+            let same_account = self
+                .account_of(&from)
+                .is_some_and(|a| a.state().has(&from) && a.state().has(&owner));
+            same_account
+                && self.shared.mutual(&from)
+                && !self.is_revoked(&owner)
+                && book
+                    .offer_forwarded(&owner, bundle, now_ms())
+                    .unwrap_or(false)
+        };
+        if stored {
             self.shared.persist_bundles(&book);
         }
     }
@@ -358,6 +420,30 @@ impl Node {
     pub fn held_messages(&self) -> usize {
         lock(&self.shared.mailbox).held_for()
     }
+}
+
+fn encode_bundle_list(parts: &[Vec<u8>]) -> threnody_core::Result<Vec<u8>> {
+    cbor::to_vec(parts.iter().map(Vec::len).sum::<usize>() + 16, |e| {
+        e.array_len(parts.len())?;
+        for p in parts {
+            e.bytes(p)?;
+        }
+        Ok(())
+    })
+}
+
+/// Decodes the persisted sibling bundles.
+pub(crate) fn decode_bundle_list(
+    b: &[u8],
+) -> threnody_core::Result<HashMap<[u8; 32], threnody_core::prekey::PrekeyBundle>> {
+    let mut dec = Decoder::new(b);
+    let mut out = HashMap::new();
+    for _ in 0..dec.array_len()? {
+        let bundle = threnody_core::prekey::PrekeyBundle::decode(dec.bytes()?)?;
+        out.insert(*bundle.owner.as_bytes(), bundle);
+    }
+    finish(&dec)?;
+    Ok(out)
 }
 
 #[cfg(test)]

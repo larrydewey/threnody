@@ -73,6 +73,26 @@ existing device E                                  new device N
 - **Sending.** A message to an account goes to every device: over live sessions where possible, otherwise sealed (Appendix H) for each device with a prekey bundle.
 - **Display.** Incoming messages show the account, with the sending device's name.
 
+## Offline keys across an account
+
+A contact may never have met some of an account's devices. To let it seal messages to them anyway (Appendix H), the account's devices share keys with each other:
+
+- **Shared bundles.** Each device gives its siblings a *shared bundle*. This is its signed prekey without one-time prekeys, because those are reserved per contact.
+- **Forwarding.** Siblings forward these bundles alongside their own prekeys (`AppMessage::Prekeys`) to their mutually approved contacts.
+- **Acceptance.** A contact accepts a forwarded bundle for device D from peer P only if all of these hold:
+  - P is mutually approved;
+  - P and D are in the same account, according to the chain P presented;
+  - D hasn't been revoked;
+  - the bundle's signature by D verifies.
+- **No downgrades.** A forwarded bundle never replaces a direct bundle from D that still has one-time prekeys.
+- **Forward secrecy cost.** Messages sealed to a forwarded bundle use the signed prekey only, so their forward secrecy begins when that prekey retires (Appendix H, SPK-only mode).
+
+A sibling that is online, and mutually approved with the sender, also acts as a mailbox for the absent device.
+
+## Groups
+
+MLS leaves stay per device. `/group invite` sends a key-package request to every device in the contact's account; each device accepts on its own.
+
 ## Properties (proved in `proofs/devices.spthy`)
 
 - **Chain authority.** Every device in an account's current set was added by a link signed by a device already in the set (and by itself), unless one of those signing devices was compromised. An attacker who controls no device can't add one.
@@ -81,5 +101,5 @@ existing device E                                  new device N
 ## Not yet done
 
 - Gathering co-signatures for thresholds above 1, so removals need several devices.
-- Groups across devices. MLS leaves stay per device, so add each device to a group separately.
+- Devices added to an account after a group was created must be invited to it separately.
 - Syncing message history between devices.

@@ -10,7 +10,7 @@ use std::time::Duration;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
-use threnody_core::prekey::{BundleBook, PrekeyStore};
+use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, SecureChannel, now_ms};
@@ -215,6 +215,8 @@ pub(crate) struct Shared {
     pub(crate) account: Mutex<AccountChain>,
     pub(crate) accounts: Mutex<AccountBook>,
     pub(crate) linking: Mutex<LinkState>,
+    /// Shared prekey bundles of our own other devices, to forward.
+    pub(crate) siblings: Mutex<HashMap<[u8; 32], PrekeyBundle>>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
 }
@@ -297,6 +299,10 @@ impl Node {
                 chain
             }
         };
+        let siblings = match cfg.home.load_state(&cfg.identity, "siblings")? {
+            Some(b) => crate::mailbox::decode_bundle_list(&b)?,
+            None => HashMap::new(),
+        };
         let accounts = match cfg.home.load_state(&cfg.identity, "accounts")? {
             Some(b) => AccountBook::decode(&b)?,
             None => AccountBook::default(),
@@ -327,6 +333,7 @@ impl Node {
             account: Mutex::new(account),
             accounts: Mutex::new(accounts),
             linking: Mutex::new(LinkState::default()),
+            siblings: Mutex::new(siblings),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
         };

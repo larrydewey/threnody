@@ -228,6 +228,29 @@ impl PrekeyStore {
         self.seen.retain(|_, until| *until > now_ms);
     }
 
+    /// A bundle with the signed prekey only, for sibling devices to pass
+    /// on to their contacts (Appendix J). Without one-time prekeys, forward
+    /// secrecy for messages sealed to it starts when the SPK retires.
+    pub fn shared_bundle(&mut self, identity: &Identity, now_ms: u64) -> PrekeyBundle {
+        self.maintain(now_ms);
+        let owner = identity.public();
+        let expiry_ms = self.current.expiry_ms();
+        let spk = self.current.secret.public().clone();
+        PrekeyBundle {
+            owner,
+            spk_id: self.current.id,
+            spk_sig: identity.sign(&spk_sig_input(
+                &owner,
+                self.current.id,
+                spk.as_bytes(),
+                expiry_ms,
+            )),
+            spk,
+            expiry_ms,
+            opks: vec![],
+        }
+    }
+
     /// A fresh bundle for `peer`, with one-time prekeys reserved for it.
     pub fn bundle_for(
         &mut self,
@@ -464,6 +487,26 @@ impl BundleBook {
         bundle.verify(from, now_ms)?;
         self.bundles.insert(*from.as_bytes(), bundle);
         Ok(())
+    }
+
+    /// Stores a bundle a sibling of `owner` forwarded. It never replaces a
+    /// direct bundle that still has one-time prekeys, only an absent,
+    /// expired or older SPK-only one. Returns true if stored.
+    pub fn offer_forwarded(
+        &mut self,
+        owner: &PublicIdentity,
+        bundle: PrekeyBundle,
+        now_ms: u64,
+    ) -> Result<bool> {
+        bundle.verify(owner, now_ms)?;
+        let keep_existing = self.bundles.get(owner.as_bytes()).is_some_and(|b| {
+            b.expiry_ms > now_ms && (!b.opks.is_empty() || b.expiry_ms >= bundle.expiry_ms)
+        });
+        if keep_existing {
+            return Ok(false);
+        }
+        self.bundles.insert(*owner.as_bytes(), bundle);
+        Ok(true)
     }
 
     pub fn has(&self, peer: &PublicIdentity, now_ms: u64) -> bool {
@@ -745,6 +788,25 @@ mod tests {
         bad[last] ^= 1;
         assert!(store.open(&bob.public(), &bad, NOW, known(&alice)).is_err());
         store.open(&bob.public(), &s2, NOW, known(&alice)).unwrap();
+    }
+
+    #[test]
+    fn shared_bundles_seal_spk_only() {
+        let (alice, bob) = (Identity::generate(), Identity::generate());
+        let mut store = PrekeyStore::new(NOW);
+        let shared = store.shared_bundle(&bob, NOW);
+        assert!(shared.opks.is_empty());
+        let mut book = BundleBook::default();
+        book.insert(&bob.public(), shared, NOW).unwrap();
+        let sealed = book
+            .seal(&alice, &bob.public(), b"via a sibling", NOW)
+            .unwrap();
+        let (_, body) = store
+            .open(&bob.public(), &sealed, NOW, |k| {
+                (k == alice.public().as_bytes()).then(|| alice.public())
+            })
+            .unwrap();
+        assert_eq!(body, b"via a sibling");
     }
 
     #[test]

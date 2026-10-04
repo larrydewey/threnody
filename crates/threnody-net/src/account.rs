@@ -8,6 +8,7 @@
 //! op 4 link-consent { 2: link signed by both }                   new -> existing
 //! op 5 contact-sync { 1: contact snapshot }                      own devices only
 //! op 6 link-refused {}                                           existing -> new
+//! op 7 sibling-bundle { 1: shared prekey bundle }                own devices only
 //! ```
 
 use std::time::{Duration, Instant};
@@ -34,6 +35,7 @@ enum AccountMsg {
     LinkConsent { link: Vec<u8> },
     ContactSync(Vec<u8>),
     LinkRefused,
+    SiblingBundle(Vec<u8>),
 }
 
 impl AccountMsg {
@@ -59,6 +61,9 @@ impl AccountMsg {
                 }
                 Self::LinkRefused => {
                     e.map_len(1)?.u8(0)?.u8(6)?;
+                }
+                Self::SiblingBundle(b) => {
+                    e.map_len(2)?.u8(0)?.u8(7)?.u8(1)?.bytes(b)?;
                 }
             }
             Ok(())
@@ -96,6 +101,7 @@ impl AccountMsg {
             },
             5 => Self::ContactSync(required(one, "snapshot")?),
             6 => Self::LinkRefused,
+            7 => Self::SiblingBundle(required(one, "bundle")?),
             other => return Err(threnody_core::Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -152,6 +158,14 @@ impl Node {
         }
         if self.is_own_device(peer) {
             out.extend(self.contact_sync_message());
+            if let Some(b) = self.shared_bundle() {
+                out.extend(
+                    AccountMsg::SiblingBundle(b)
+                        .encode()
+                        .ok()
+                        .map(AppMessage::Account),
+                );
+            }
         }
         out
     }
@@ -217,6 +231,7 @@ impl Node {
             AccountMsg::LinkRequest { proof, name } => self.on_link_request(from, proof, &name),
             AccountMsg::LinkOffer { chain, link } => self.on_link_offer(from, &chain, &link),
             AccountMsg::LinkConsent { link } => self.on_link_consent(from, &link),
+            AccountMsg::SiblingBundle(b) => self.on_sibling_bundle(from, &b),
             AccountMsg::LinkRefused => {
                 let mut st = lock(&self.shared.linking);
                 if st.joining.as_ref().is_some_and(|(e, _)| *e == from)
@@ -406,6 +421,16 @@ impl Node {
         // Through the normal path, so the peer device hears it too.
         for d in to_approve {
             let _ = self.set_approval(&d, true);
+        }
+        // Siblings need our shared bundle to forward to their contacts.
+        if let Some(b) = self.shared_bundle()
+            && let Ok(m) = AccountMsg::SiblingBundle(b).encode()
+        {
+            for s in self.sessions() {
+                if self.is_own_device(&s.peer) {
+                    let _ = self.send(&s.peer, AppMessage::Account(m.clone()));
+                }
+            }
         }
     }
 
