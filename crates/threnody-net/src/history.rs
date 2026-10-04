@@ -8,6 +8,11 @@ use threnody_core::{AppMessage, PublicIdentity, now_ms};
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node};
 
+/// A random non-zero id for an outgoing history entry.
+fn local_id() -> u64 {
+    u64::from_le_bytes(threnody_core::crypto::random_bytes()).max(1)
+}
+
 /// How often expired messages are swept from disk.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
@@ -46,9 +51,10 @@ impl Node {
             }
             _ => vec![*peer],
         };
+        let local_id = local_id();
         let mut r = SendReport::default();
         for d in &devices {
-            if self.send(d, msg.clone()).is_ok() {
+            if self.send_tagged(d, msg.clone(), local_id).is_ok() {
                 r.live += 1;
             } else if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
                 r.sealed += 1;
@@ -62,8 +68,82 @@ impl Node {
                 peer.fingerprint()
             )));
         }
-        self.record(conv, *self.identity().as_bytes(), true, body, false, timer);
+        let now = now_ms();
+        self.append(
+            conv,
+            Entry {
+                at_ms: now,
+                outgoing: true,
+                device: *self.identity().as_bytes(),
+                text: body.to_owned(),
+                offline: false,
+                expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
+                file: None,
+                local_id,
+                delivered: false,
+            },
+        );
         Ok(r)
+    }
+
+    /// Sends a file to `peer` (who must be reachable live: files aren't
+    /// sealed for mailboxes) and records it in history with `location`,
+    /// where it lives on this device.
+    pub fn send_file(
+        &self,
+        peer: &PublicIdentity,
+        name: &str,
+        data: Vec<u8>,
+        location: Option<String>,
+    ) -> Result<()> {
+        if data.len() > threnody_core::message::MAX_FILE {
+            return Err(NetError::Protocol(threnody_core::Error::Malformed(
+                "file too large",
+            )));
+        }
+        let local_id = local_id();
+        let size = data.len() as u64;
+        let msg = AppMessage::File {
+            sent_ms: now_ms(),
+            name: name.to_owned(),
+            data,
+        };
+        self.send_tagged(peer, msg, local_id)?;
+        self.append_file(
+            peer,
+            true,
+            FileNote {
+                name: name.to_owned(),
+                size,
+                location,
+            },
+            local_id,
+        );
+        Ok(())
+    }
+
+    /// Marks the entry `local_id` in `peer`'s conversation delivered and
+    /// tells the app (once, whichever device acknowledged first).
+    pub(crate) fn mark_delivered(&self, peer: &PublicIdentity, local_id: u64) {
+        let conv = self.conversation_for(peer);
+        if let Ok(true) =
+            self.shared
+                .home
+                .mark_delivered(self.identity_ref(), conv, local_id, now_ms())
+        {
+            self.emit(Event::Delivered {
+                peer: *peer,
+                local_id,
+            });
+        }
+    }
+
+    fn append(&self, conv: ConversationId, entry: Entry) {
+        let now = entry.at_ms;
+        let _ = self
+            .shared
+            .home
+            .append_history(self.identity_ref(), conv, entry, now);
     }
 
     /// Sets the disappearing-message timer for the conversation with
@@ -104,6 +184,8 @@ impl Node {
             offline,
             expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
             file: None,
+            local_id: 0,
+            delivered: false,
         };
         let _ = self
             .shared
@@ -111,10 +193,15 @@ impl Node {
             .append_history(self.identity_ref(), conv, entry, now);
     }
 
-    /// Records a file sent to or received from `peer`'s conversation, with
-    /// where the app saved it. It follows the conversation's
-    /// disappearing-message timer.
+    /// Records a file received from (or sent to) `peer`'s conversation,
+    /// with where the app saved it. It follows the conversation's
+    /// disappearing-message timer. Sending through [`Node::send_file`]
+    /// records it already.
     pub fn record_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote) {
+        self.append_file(peer, outgoing, file, 0);
+    }
+
+    fn append_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote, local_id: u64) {
         let conv = self.conversation_for(peer);
         let timer = self.history(conv).map(|h| h.timer_s).unwrap_or(None);
         let now = now_ms();
@@ -123,19 +210,20 @@ impl Node {
         } else {
             *peer.as_bytes()
         };
-        let entry = Entry {
-            at_ms: now,
-            outgoing,
-            device,
-            text: String::new(),
-            offline: false,
-            expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
-            file: Some(file),
-        };
-        let _ = self
-            .shared
-            .home
-            .append_history(self.identity_ref(), conv, entry, now);
+        self.append(
+            conv,
+            Entry {
+                at_ms: now,
+                outgoing,
+                device,
+                text: String::new(),
+                offline: false,
+                expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
+                file: Some(file),
+                local_id,
+                delivered: false,
+            },
+        );
     }
 
     /// Records an incoming text, adopting the sender's timer setting.

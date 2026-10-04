@@ -26,7 +26,7 @@ pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
 pub const RECENT_IDS: usize = 4096;
 /// Messages larger than this (files) are resent only within one run.
 pub const MAX_PERSISTED: usize = 64 * 1024;
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Whether a message is user content worth acknowledging and resending.
 pub fn trackable(m: &AppMessage) -> bool {
@@ -47,7 +47,9 @@ struct Recent {
 
 #[derive(Default)]
 pub(crate) struct Delivery {
-    unacked: HashMap<PublicIdentity, VecDeque<(u64, AppMessage, usize)>>,
+    /// Per peer: (id, message, size, tag). The tag is the history entry's
+    /// local id to mark delivered on acknowledgement (0 = none).
+    unacked: HashMap<PublicIdentity, VecDeque<(u64, AppMessage, usize, u64)>>,
     delivered: HashMap<PublicIdentity, Recent>,
     /// Changed since last saved.
     pub unacked_dirty: bool,
@@ -59,17 +61,18 @@ impl Delivery {
     pub fn load(unacked: &[u8], delivered: &[u8]) -> Self {
         let mut d = Self::default();
         if let Some((&VERSION, mut rest)) = unacked.split_first() {
-            while let Some((head, r)) = rest.split_at_checked(44) {
-                let len = u32::from_le_bytes([head[40], head[41], head[42], head[43]]) as usize;
+            while let Some((head, r)) = rest.split_at_checked(52) {
+                let len = u32::from_le_bytes([head[48], head[49], head[50], head[51]]) as usize;
                 let Some((msg, r)) = r.split_at_checked(len) else {
                     break;
                 };
                 rest = r;
                 let peer: [u8; 32] = head[..32].try_into().unwrap_or_default();
                 let id = u64::from_be_bytes(head[32..40].try_into().unwrap_or_default());
+                let tag = u64::from_be_bytes(head[40..48].try_into().unwrap_or_default());
                 if let (Ok(p), Ok(m)) = (PublicIdentity::from_bytes(&peer), AppMessage::decode(msg))
                 {
-                    d.unacked.entry(p).or_default().push_back((id, m, len));
+                    d.unacked.entry(p).or_default().push_back((id, m, len, tag));
                 }
             }
         }
@@ -99,17 +102,18 @@ impl Delivery {
         d
     }
 
-    /// `VERSION || * ( peer (32) | id (u64 BE) | len (u32 LE) | AppMessage )`
+    /// `VERSION || * ( peer (32) | id (u64 BE) | tag (u64 BE) | len (u32 LE) | AppMessage )`
     pub fn encode_unacked(&self) -> Vec<u8> {
         let mut out = vec![VERSION];
         for (p, q) in &self.unacked {
-            for (id, m, len) in q {
+            for (id, m, len, tag) in q {
                 if *len > MAX_PERSISTED {
                     continue;
                 }
                 let Ok(b) = m.encode() else { continue };
                 out.extend_from_slice(p.as_bytes());
                 out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&tag.to_be_bytes());
                 out.extend_from_slice(&u32::try_from(b.len()).unwrap_or(u32::MAX).to_le_bytes());
                 out.extend_from_slice(&b);
             }
@@ -134,16 +138,17 @@ impl Delivery {
         out
     }
 
-    /// Wraps `m` for `peer` and keeps it until acknowledged.
-    pub fn track(&mut self, peer: &PublicIdentity, m: AppMessage) -> AppMessage {
+    /// Wraps `m` for `peer` and keeps it until acknowledged; `tag` is
+    /// returned by [`Delivery::acked`] then.
+    pub fn track(&mut self, peer: &PublicIdentity, m: AppMessage, tag: u64) -> AppMessage {
         let id = u64::from_le_bytes(random_bytes());
         let len = m.encoded_len_hint();
         self.unacked_dirty |= len <= MAX_PERSISTED;
         let q = self.unacked.entry(*peer).or_default();
-        q.push_back((id, m.clone(), len));
-        let mut bytes: usize = q.iter().map(|(.., l)| l).sum();
+        q.push_back((id, m.clone(), len, tag));
+        let mut bytes: usize = q.iter().map(|(_, _, l, _)| l).sum();
         while q.len() > MAX_UNACKED || (bytes > MAX_UNACKED_BYTES && q.len() > 1) {
-            if let Some((.., l)) = q.pop_front() {
+            if let Some((_, _, l, _)) = q.pop_front() {
                 bytes -= l;
             }
         }
@@ -157,7 +162,7 @@ impl Delivery {
     pub fn resend(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
         self.unacked.get(peer).map_or_else(Vec::new, |q| {
             q.iter()
-                .map(|(id, m, _)| AppMessage::Tracked {
+                .map(|(id, m, ..)| AppMessage::Tracked {
                     id: *id,
                     inner: Box::new(m.clone()),
                 })
@@ -165,15 +170,24 @@ impl Delivery {
         })
     }
 
-    pub fn acked(&mut self, peer: &PublicIdentity, ids: &[u64]) {
+    /// Drops what `peer` acknowledged; returns the non-zero tags.
+    pub fn acked(&mut self, peer: &PublicIdentity, ids: &[u64]) -> Vec<u64> {
+        let mut tags = Vec::new();
         if let Some(q) = self.unacked.get_mut(peer) {
             let before = q.len();
-            q.retain(|(id, ..)| !ids.contains(id));
+            q.retain(|(id, _, _, tag)| {
+                let hit = ids.contains(id);
+                if hit && *tag != 0 {
+                    tags.push(*tag);
+                }
+                !hit
+            });
             self.unacked_dirty |= q.len() != before;
             if q.is_empty() {
                 self.unacked.remove(peer);
             }
         }
+        tags
     }
 
     /// The peer doesn't acknowledge: what was sent plain can't be tracked.
@@ -219,13 +233,14 @@ mod tests {
     fn tracks_until_acked_and_delivers_once() {
         let p = Identity::generate().public();
         let mut d = Delivery::default();
-        let AppMessage::Tracked { id, .. } = d.track(&p, text("a")) else {
+        let AppMessage::Tracked { id, .. } = d.track(&p, text("a"), 5) else {
             panic!()
         };
-        d.track(&p, text("b"));
+        d.track(&p, text("b"), 0);
         assert_eq!(d.unacked(&p), 2);
         assert_eq!(d.resend(&p).len(), 2);
-        d.acked(&p, &[id]);
+        assert_eq!(d.acked(&p, &[id]), [5]);
+        assert!(d.acked(&p, &[id]).is_empty(), "only once");
         assert_eq!(d.unacked(&p), 1);
         assert!(d.first_delivery(&p, 9) && !d.first_delivery(&p, 9));
         for i in 0..RECENT_IDS as u64 {
@@ -238,8 +253,8 @@ mod tests {
     fn state_survives_a_restart_except_files() {
         let p = Identity::generate().public();
         let mut d = Delivery::default();
-        d.track(&p, text("keep me"));
-        d.track(&p, AppMessage::Group(vec![1; 100]));
+        d.track(&p, text("keep me"), 0);
+        d.track(&p, AppMessage::Group(vec![1; 100]), 0);
         d.track(
             &p,
             AppMessage::File {
@@ -247,6 +262,7 @@ mod tests {
                 name: "big".into(),
                 data: vec![0; MAX_PERSISTED],
             },
+            0,
         );
         d.first_delivery(&p, 42);
         assert!(d.unacked_dirty && d.delivered_dirty);
@@ -268,7 +284,7 @@ mod tests {
         let p = Identity::generate().public();
         let mut d = Delivery::default();
         for i in 0..MAX_UNACKED + 10 {
-            d.track(&p, text(&i.to_string()));
+            d.track(&p, text(&i.to_string()), 0);
         }
         assert_eq!(d.unacked(&p), MAX_UNACKED);
         let big = AppMessage::File {
@@ -277,7 +293,7 @@ mod tests {
             data: vec![0; 8 * 1024 * 1024],
         };
         for _ in 0..6 {
-            d.track(&p, big.clone());
+            d.track(&p, big.clone(), 0);
         }
         assert!(d.unacked(&p) <= 4, "byte cap");
         assert!(trackable(&big) && !trackable(&AppMessage::Cover));

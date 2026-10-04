@@ -164,6 +164,7 @@ class ChatActivity : Activity() {
             is NodeEvent.Connected -> e.peer
             is NodeEvent.Disconnected -> e.peer
             is NodeEvent.ApprovalChanged -> e.peer
+            is NodeEvent.Delivered -> e.peer
             is NodeEvent.AccountChanged -> return true
             else -> return false
         }
@@ -192,7 +193,7 @@ class ChatActivity : Activity() {
         }
         val me = node.deviceFingerprint()
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(ULong.MAX_VALUE, true, me, it, false, null), sending = true) }
+            pending.map { Item(HistoryEntry(ULong.MAX_VALUE, true, me, it, false, null, false), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         runOnUiThread {
@@ -337,8 +338,16 @@ class ChatActivity : Activity() {
             Formatter.formatShortFileSize(this, file.size.toLong()) + " · " + time +
                 if (uri != null && !outgoing) " · in Downloads" else ""
         }
+        // Ticks for 1:1 messages: one once sent, two once a device of the
+        // contact acknowledged it. Group messages go to many, so no ticks.
+        val tick = when {
+            !outgoing || item.sending || group != null -> ""
+            e.delivered -> " ✓✓"
+            else -> " ✓"
+        }
         body.addView(TextView(this).apply {
-            text = meta + if (e.disappearing) " · ⏱" else ""
+            text = meta + (if (e.disappearing) " · ⏱" else "") + tick
+            contentDescription = text.toString().replace("✓✓", "delivered").replace("✓", "sent")
             textSize = 11f
             setTextColor(fg)
             alpha = 0.7f

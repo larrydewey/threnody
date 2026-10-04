@@ -62,6 +62,11 @@ pub struct Entry {
     pub expires_at_ms: Option<u64>,
     /// Set when the entry records a file transfer (then `text` is empty).
     pub file: Option<FileNote>,
+    /// For outgoing entries: a local id the delivery acknowledgements
+    /// refer to (0 = none).
+    pub local_id: u64,
+    /// An outgoing message the recipient acknowledged (Appendix C).
+    pub delivered: bool,
 }
 
 /// A file sent or received. The contents aren't kept here, only where the
@@ -131,7 +136,10 @@ impl History {
             enc.u8(2)?.array_len(self.entries.len())?;
             for e in &self.entries {
                 enc.map_len(
-                    5 + usize::from(e.expires_at_ms.is_some()) + usize::from(e.file.is_some()),
+                    5 + usize::from(e.expires_at_ms.is_some())
+                        + usize::from(e.file.is_some())
+                        + usize::from(e.local_id != 0)
+                        + usize::from(e.delivered),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -149,6 +157,12 @@ impl History {
                         enc.u8(2)?.str(l)?;
                     }
                 }
+                if e.local_id != 0 {
+                    enc.u8(7)?.u64(e.local_id)?;
+                }
+                if e.delivered {
+                    enc.u8(8)?.bool(true)?;
+                }
             }
             Ok(())
         })
@@ -165,6 +179,7 @@ impl History {
                     for _ in 0..d.array_len()? {
                         let (mut at, mut out, mut dev, mut text, mut off, mut exp, mut file) =
                             (None, None, None, None, None, None, None);
+                        let (mut local_id, mut delivered) = (0, false);
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -174,6 +189,8 @@ impl History {
                                 4 => off = Some(d.bool()?),
                                 5 => exp = Some(d.u64()?),
                                 6 => file = Some(decode_file(d)?),
+                                7 => local_id = d.u64()?,
+                                8 => delivered = d.bool()?,
                                 _ => return Ok(false),
                             }
                             Ok(true)
@@ -186,6 +203,8 @@ impl History {
                             offline: off.unwrap_or(false),
                             expires_at_ms: exp,
                             file,
+                            local_id,
+                            delivered,
                         });
                     }
                 }
@@ -257,6 +276,32 @@ impl Home {
         h.push(e, now_ms);
         self.save_history(identity, c, &h)?;
         Ok(h)
+    }
+
+    /// Marks the outgoing entry with `local_id` delivered; returns false if
+    /// there is none (or it already was).
+    pub fn mark_delivered(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        local_id: u64,
+        now_ms: u64,
+    ) -> Result<bool> {
+        if local_id == 0 {
+            return Ok(false);
+        }
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let Some(e) = h
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.outgoing && e.local_id == local_id && !e.delivered)
+        else {
+            return Ok(false);
+        };
+        e.delivered = true;
+        self.save_history(identity, c, &h)?;
+        Ok(true)
     }
 
     /// Moves `from`'s history into `into` (keeping time order) and deletes
@@ -332,6 +377,8 @@ mod tests {
             offline: false,
             expires_at_ms: exp,
             file: None,
+            local_id: 0,
+            delivered: false,
         }
     }
 
@@ -390,6 +437,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(home.sweep_history(&id, 10), 1);
+
+        let sent = Entry {
+            local_id: 77,
+            ..entry(200, "sent", None)
+        };
+        assert!(sent.outgoing);
+        home.append_history(&id, acct, sent, 200).unwrap();
+        assert!(!home.mark_delivered(&id, acct, 78, 201).unwrap());
+        assert!(home.mark_delivered(&id, acct, 77, 201).unwrap());
+        assert!(!home.mark_delivered(&id, acct, 77, 201).unwrap(), "once");
+        let h = home.load_history(&id, acct, 201).unwrap();
+        let e = h.entries().last().unwrap();
+        assert!(e.delivered && e.local_id == 77);
     }
 
     #[test]

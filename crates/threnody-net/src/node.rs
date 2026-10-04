@@ -154,6 +154,12 @@ pub enum Event {
         msg: AppMessage,
     },
     /// A mailbox reported what it did with our deposit for `to`.
+    /// A device of `peer`'s account acknowledged an outgoing message: the
+    /// history entry with `local_id` is now marked delivered.
+    Delivered {
+        peer: PublicIdentity,
+        local_id: u64,
+    },
     DepositReceipt {
         mailbox: PublicIdentity,
         to: PublicIdentity,
@@ -640,10 +646,21 @@ impl Node {
     /// group and mailbox messages) is kept until the peer acknowledges it
     /// and sent again in the next session if this one dies first.
     pub fn send(&self, peer: &PublicIdentity, msg: AppMessage) -> Result<()> {
+        self.send_tagged(peer, msg, 0)
+    }
+
+    /// [`Node::send`], marking history entry `local_id` delivered on
+    /// acknowledgement.
+    pub(crate) fn send_tagged(
+        &self,
+        peer: &PublicIdentity,
+        msg: AppMessage,
+        local_id: u64,
+    ) -> Result<()> {
         let sessions = lock(&self.shared.sessions);
         let h = sessions.get(peer).ok_or(NetError::Closed)?;
         let msg = if trackable(&msg) {
-            self.shared.delivery(|d| d.track(peer, msg))
+            self.shared.delivery(|d| d.track(peer, msg, local_id))
         } else {
             msg
         };
@@ -845,7 +862,7 @@ where
         // Held deliveries leave the mailbox store now; tracking keeps them
         // until the peer has them.
         let held = node.mailbox_for(&peer);
-        shared.delivery(|d| pending.extend(held.into_iter().map(|m| d.track(&peer, m))));
+        shared.delivery(|d| pending.extend(held.into_iter().map(|m| d.track(&peer, m, 0))));
     }
     let result: Result<()> = async {
         loop {
@@ -911,7 +928,9 @@ where
                             shared.delivery(|d| d.first_delivery(&peer, id)).then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
-                            shared.delivery(|d| d.acked(&peer, &ids));
+                            for local_id in shared.delivery(|d| d.acked(&peer, &ids)) {
+                                node.mark_delivered(&peer, local_id);
+                            }
                             None
                         }
                         m => Some(m),

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use threnody_core::history::FileNote;
 use threnody_core::store::Home;
-use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, now_ms, safety_number};
+use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, safety_number};
 use threnody_net::mailbox::DepositStatus;
 use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -336,11 +336,15 @@ impl Ui {
             } else {
                 PublicIdentity::from_bytes(&e.device).map_or_else(|_| "?".into(), |d| self.name(&d))
             };
-            let mark = match (e.offline, e.expires_at_ms) {
+            let mut mark = match (e.offline, e.expires_at_ms) {
                 (_, Some(_)) => " (disappearing)",
                 (true, None) => " (offline)",
                 _ => "",
-            };
+            }
+            .to_owned();
+            if e.delivered {
+                mark.push_str(" ✓✓");
+            }
             match &e.file {
                 Some(f) => println!(
                     "  [{}] <{who}> file {} ({} bytes){}{mark}",
@@ -489,6 +493,8 @@ impl Ui {
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
             Event::OfflineMessage { from, via, msg } => self.show_message(from, msg, Some(via)),
+            // Shown as ✓✓ in /history; too chatty to print live.
+            Event::Delivered { .. } => {}
             Event::DepositReceipt {
                 mailbox,
                 to,
@@ -732,25 +738,10 @@ impl Ui {
                     .file_name()
                     .map_or("file".into(), |n| n.to_string_lossy().into_owned());
                 let len = data.len();
-                self.node.send(
-                    &peer,
-                    AppMessage::File {
-                        sent_ms: now_ms(),
-                        name: name.clone(),
-                        data,
-                    },
-                )?;
-                self.node.record_file(
-                    &peer,
-                    true,
-                    FileNote {
-                        name,
-                        size: len as u64,
-                        location: std::fs::canonicalize(path)
-                            .ok()
-                            .map(|p| p.display().to_string()),
-                    },
-                );
+                let location = std::fs::canonicalize(path)
+                    .ok()
+                    .map(|p| p.display().to_string());
+                self.node.send_file(&peer, &name, data, location)?;
                 println!("* sent {len} bytes to {}", self.name(&peer));
             }
             "drop" => {

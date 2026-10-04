@@ -15,7 +15,7 @@ The API is small and **blocking**. Each node owns a Tokio runtime, so call it fr
 | `listen(addr)`, `invite_link(addr)`, `connect(link)` | Reach peers. |
 | `send_text(peer, text)` | Sends to every device of the peer's account. Uses live sessions where possible, otherwise sealed for mailboxes. |
 | `send_file(peer, name, data, location?)`, `record_received_file(…)` | Sends a file, reaching the peer first, and records it in history with where the app keeps it. Record received files once they are saved. |
-| `history(peer, n)`, `set_disappearing(peer, secs?)` | Stored messages (text or file entries) and the disappearing-message timer. |
+| `history(peer, n)`, `set_disappearing(peer, secs?)` | Stored messages (text or file entries, with `delivered` once acknowledged) and the disappearing-message timer. A `Delivered` event says when to reload. |
 | `set_approval`, `set_name`, `contacts()`, `safety_number(peer)`, `mark_verified(peer)` | Manage trust. |
 | `reconnect()` | Dials mutually approved contacts that aren't connected. Call it on start and when the network returns. |
 | `create_group`, `groups()`, `invite_to_group`, `remove_from_group`, `send_group_text`, `group_history` | MLS groups (Appendix F). Invitations from mutually approved contacts are accepted automatically. Others arrive as `GroupInvited` and wait for `accept_group_invite` or `decline_group_invite`. |

@@ -59,6 +59,8 @@ pub struct HistoryEntry {
     pub disappearing: bool,
     /// Set when the entry is a file transfer (then `text` is empty).
     pub file: Option<FileInfo>,
+    /// An outgoing message a device of the recipient acknowledged.
+    pub delivered: bool,
 }
 
 /// A file in history: its name, size and where the app saved it.
@@ -167,6 +169,11 @@ pub enum NodeEvent {
     WifiDirectRequested {
         peer: String,
     },
+    /// A device of `peer`'s account acknowledged one of our messages:
+    /// reload its conversation's history to show it delivered.
+    Delivered {
+        peer: String,
+    },
     /// We joined a group (after accepting, or automatically when a
     /// mutually approved contact invited us).
     GroupJoined {
@@ -267,6 +274,7 @@ fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntr
                 size: f.size,
                 location: f.location.clone(),
             }),
+            delivered: e.delivered,
         })
         .collect()
 }
@@ -327,6 +335,7 @@ fn convert(e: Event) -> NodeEvent {
             device: fp(&device),
         },
         Event::ThisDeviceRemoved => NodeEvent::ThisDeviceRemoved,
+        Event::Delivered { peer, .. } => NodeEvent::Delivered { peer: fp(&peer) },
         Event::WifiDirectOffer { peer, offer } => NodeEvent::WifiDirectOffer {
             peer: fp(&peer),
             ssid: offer.ssid,
@@ -517,26 +526,7 @@ impl ThrenodyNode {
         // Files aren't sealed for mailboxes: they need a live session.
         self.try_reach(&p);
         let _guard = self.rt.enter();
-        self.node
-            .send(
-                &p,
-                AppMessage::File {
-                    sent_ms: threnody_core::now_ms(),
-                    name: name.clone(),
-                    data: data.clone(),
-                },
-            )
-            .map_err(fail)?;
-        self.node.record_file(
-            &p,
-            true,
-            FileNote {
-                name,
-                size: data.len() as u64,
-                location,
-            },
-        );
-        Ok(())
+        self.node.send_file(&p, &name, data, location).map_err(fail)
     }
 
     /// Records a received file (from a `File` event) in history once the
@@ -897,6 +887,20 @@ mod tests {
         assert!(h[0].outgoing && h[0].text == "hello from an app");
         let f = h[1].file.as_ref().unwrap();
         assert!(h[1].outgoing && f.name == "notes.txt" && f.size == 10);
+        // Bob acknowledged both (the Delivered events went by above).
+        for _ in 0..100 {
+            if alice
+                .history(bob_fp.clone(), 10)
+                .unwrap()
+                .iter()
+                .all(|e| e.delivered)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let h = alice.history(bob_fp.clone(), 10).unwrap();
+        assert!(h.iter().all(|e| e.delivered), "{h:?}");
         assert_eq!(f.location.as_deref(), Some("/tmp/notes.txt"));
         let hb = bob.history(alice.device_fingerprint(), 10).unwrap();
         assert!(!hb[1].outgoing && hb[1].file.as_ref().is_some_and(|f| f.name == "notes.txt"));

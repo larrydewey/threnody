@@ -61,6 +61,8 @@ Each side's first message in a session is its `Hello`, and its feature bits say 
 
 When both sides set bit 1, text, files, group messages and mailbox messages travel as `Tracked { id, inner }`, with a random 64-bit id. The sender keeps each one until an `Ack` names its id. If the session ends first, even one that only looked alive, the sender sends it again at the start of the next session with that peer. The receiver acknowledges every copy, but delivers only the first: it remembers the last 4,096 ids per peer. The sender keeps at most 256 messages or 32 MiB per peer, dropping the oldest first. Tracked messages wait until the peer's first message shows whether it supports acknowledgements. If it doesn't, they go out plain and are not tracked.
 
+An outgoing text or file in history carries a random local id (history key 7), and its tracked copies carry the same id as a tag. When any device of the recipient's account acknowledges one, the history entry is marked delivered (key 8), and the node emits `Delivered`. Apps show this as a second tick. Group messages go to many members and aren't marked.
+
 Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The exception is messages over 64 KiB (files), which are resent only within one run.
 
 ## Padding (spec §9, layer 1)
@@ -77,7 +79,7 @@ On stream transports, each frame is prefixed with its length as a `u32` in big-e
 
 ## Local storage
 
-All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A file transfer is stored as an entry with empty text and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location }`). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
+All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A file transfer is stored as an entry with empty text and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location }`). Outgoing entries may have a local id (key 7) and a delivered flag (key 8, see *Acknowledgements*). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
 
 Both files are written with mode 0600 inside a directory with mode 0700.
 

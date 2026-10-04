@@ -277,3 +277,52 @@ async fn unacknowledged_messages_survive_a_restart() {
     next(&mut brx, |e| is_text(e, "before the crash")).await;
     wait_for(|| alice.unacked(&b) == 0).await;
 }
+
+#[tokio::test]
+async fn history_marks_messages_delivered_when_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b = bob.identity();
+    let (cut_a, _) = lossy_link(&alice, &bob).await;
+    let conv = alice.conversation_for(&b);
+    let last = |a: &Node| a.history(conv).unwrap().entries().last().cloned().unwrap();
+
+    alice.send_text(&b, "tick").unwrap();
+    let e = next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
+    let entry = last(&alice);
+    assert!(entry.delivered && entry.text == "tick");
+    assert!(
+        matches!(e, Event::Delivered { peer, local_id } if peer == b && local_id == entry.local_id)
+    );
+
+    alice
+        .send_file(&b, "a.txt", vec![1, 2, 3], Some("/tmp/a.txt".into()))
+        .unwrap();
+    next(&mut brx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: AppMessage::File { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
+    let entry = last(&alice);
+    assert!(entry.delivered && entry.file.is_some_and(|f| f.size == 3));
+
+    // Lost on a dead link: not delivered until the resend is acknowledged.
+    cut_a.store(true, Ordering::SeqCst);
+    alice.send_text(&b, "later").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!last(&alice).delivered);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    alice
+        .connect(&addr.to_string(), Some(b.fingerprint()))
+        .await
+        .unwrap();
+    next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
+    assert!(last(&alice).delivered);
+}
