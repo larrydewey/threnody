@@ -11,6 +11,7 @@ The API is small and **blocking**. Each node owns a Tokio runtime, so call it fr
 | Call | Purpose |
 |---|---|
 | `ThrenodyNode.open(home, passphrase?)` | Opens a node, creating it on first use. The passphrase seals a new identity. |
+| `identity_is_sealed(home)`, `change_passphrase(home, current?, new?)` | Before opening: check whether an identity is sealed, and seal, reseal or unseal it. For example, the Android app keeps a random passphrase under the Keystore. |
 | `listen(addr)`, `invite_link(addr)`, `connect(link)` | Reach peers. |
 | `send_text(peer, text)` | Sends to every device of the peer's account. Uses live sessions where possible, otherwise sealed for mailboxes. |
 | `send_file(peer, name, data, location?)`, `record_received_file(…)` | Sends a file, reaching the peer first, and records it in history with where the app keeps it. Record received files once they are saved. |

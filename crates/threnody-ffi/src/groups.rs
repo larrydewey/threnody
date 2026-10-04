@@ -13,6 +13,9 @@ use threnody_net::Node;
 use crate::{HistoryEntry, NodeEvent, Result, ThrenodyNode, fail, fp, history_entries};
 
 const STATE: &str = "groups";
+/// Invitations waiting for consent, so they survive a restart.
+const INVITES: &str = "group-invites";
+const INVITES_VERSION: u8 = 1;
 
 /// A group this device belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -37,8 +40,7 @@ pub struct GroupInvite {
 
 pub(crate) struct GroupState {
     groups: Groups,
-    /// Invitations from contacts we haven't mutually approved. Kept in
-    /// memory only: after a restart the owner invites again.
+    /// Invitations from contacts we haven't mutually approved.
     pending: Vec<(GroupId, String, PublicIdentity)>,
     home: Home,
     identity: Identity,
@@ -51,9 +53,15 @@ impl GroupState {
             Some(b) => Groups::restore(identity, &b).map_err(fail)?,
             None => Groups::new(identity),
         };
+        let pending = home
+            .load_state(identity, INVITES)
+            .ok()
+            .flatten()
+            .map(|b| decode_invites(&b))
+            .unwrap_or_default();
         Ok(Self {
             groups,
-            pending: Vec::new(),
+            pending,
             home: Home::new(home.dir()),
             identity: Identity::from_seed(&identity.seed()),
         })
@@ -63,6 +71,12 @@ impl GroupState {
         if let Ok(b) = self.groups.export() {
             let _ = self.home.save_state(&self.identity, STATE, &b);
         }
+    }
+
+    fn save_invites(&self) {
+        let _ = self
+            .home
+            .save_state(&self.identity, INVITES, &encode_invites(&self.pending));
     }
 
     /// Persists, sends `out` and turns its events into app events.
@@ -114,6 +128,7 @@ impl GroupState {
                 self.pending
                     .retain(|(g, _, p)| !(*g == group && *p == peer));
                 self.pending.push((group, name.clone(), peer));
+                self.save_invites();
                 NodeEvent::GroupInvited {
                     group: hex(&group),
                     name,
@@ -148,6 +163,45 @@ impl GroupState {
             }
         });
     }
+}
+
+/// `version, then per invitation: group (16) | inviter (32) | name length
+/// (u16 LE) | name`. Local only, inside an encrypted state file.
+fn encode_invites(pending: &[(GroupId, String, PublicIdentity)]) -> Vec<u8> {
+    let mut out = vec![INVITES_VERSION];
+    for (g, name, peer) in pending {
+        let name = &name.as_bytes()[..name.len().min(usize::from(u16::MAX))];
+        out.extend_from_slice(g);
+        out.extend_from_slice(peer.as_bytes());
+        out.extend_from_slice(&u16::try_from(name.len()).unwrap_or(u16::MAX).to_le_bytes());
+        out.extend_from_slice(name);
+    }
+    out
+}
+
+fn decode_invites(b: &[u8]) -> Vec<(GroupId, String, PublicIdentity)> {
+    let mut out = Vec::new();
+    let Some((&INVITES_VERSION, mut rest)) = b.split_first() else {
+        return out;
+    };
+    while rest.len() >= 50 {
+        let (g, r) = rest.split_at(16);
+        let (p, r) = r.split_at(32);
+        let (len, r) = r.split_at(2);
+        let len = usize::from(u16::from_le_bytes([len[0], len[1]]));
+        if r.len() < len {
+            break;
+        }
+        let (name, r) = r.split_at(len);
+        rest = r;
+        let (Ok(g), Ok(p)) = (<GroupId>::try_from(g), <[u8; 32]>::try_from(p)) else {
+            break;
+        };
+        if let Ok(peer) = PublicIdentity::from_bytes(&p) {
+            out.push((g, String::from_utf8_lossy(name).into_owned(), peer));
+        }
+    }
+    out
 }
 
 fn hex(g: &GroupId) -> String {
@@ -293,14 +347,18 @@ impl ThrenodyNode {
                 .iter()
                 .position(|(x, ..)| *x == g)
                 .ok_or_else(|| fail("no invitation to that group"))?;
-            st.pending.remove(i).2
+            let peer = st.pending.remove(i).2;
+            st.save_invites();
+            peer
         };
         self.group_op(|gs| gs.accept_invite(&g, peer))
     }
 
     pub fn decline_group_invite(&self, group: String) -> Result<()> {
         let g = self.group_id(&group)?;
-        self.group_state().pending.retain(|(x, ..)| *x != g);
+        let mut st = self.group_state();
+        st.pending.retain(|(x, ..)| *x != g);
+        st.save_invites();
         Ok(())
     }
 
@@ -347,5 +405,25 @@ impl ThrenodyNode {
         let g = self.group_id(&group)?;
         let h = self.node.history(ConversationId::Group(g)).map_err(fail)?;
         Ok(history_entries(h.recent(limit as usize)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invites_round_trip_and_tolerate_damage() {
+        let peer = Identity::generate().public();
+        let pending = vec![
+            ([1; 16], "book club".to_owned(), peer),
+            ([2; 16], String::new(), peer),
+        ];
+        let b = encode_invites(&pending);
+        assert_eq!(decode_invites(&b), pending);
+        // A cut-off record is dropped, earlier ones kept.
+        assert_eq!(decode_invites(&b[..b.len() - 1]), pending[..1]);
+        assert!(decode_invites(&[]).is_empty());
+        assert!(decode_invites(&[9, 0, 0]).is_empty(), "unknown version");
     }
 }

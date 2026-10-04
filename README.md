@@ -94,12 +94,12 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |
 | §10 Status indicators | ✅ `/status` |
-| §3.1 Platform keystore | software fallback: 0600 files plus optional Argon2id passphrase |
+| §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: 0600 files plus an optional Argon2id passphrase |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
 
 ## Roadmap
 
-1. **Hardening (remaining).** OS keystores, ratchet persistence across reconnects, and an external audit.
+1. **Hardening (remaining).** Desktop and iOS keystores, ratchet persistence across reconnects, and an external audit.
 2. **Groups (remaining).** Store-and-forward via members, and more admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.

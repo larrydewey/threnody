@@ -70,7 +70,7 @@ class LogActivity : Activity() {
             node = n
             runOnUiThread {
                 header.text = "device  ${n.deviceFingerprint()}\naccount ${n.accountFingerprint()}\n" +
-                    "listen  ${Threnody.listenAddr}"
+                    "listen  ${Threnody.listenAddr}\nkey     ${KeyVault.describe()}"
             }
         }
     }

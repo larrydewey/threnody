@@ -36,7 +36,7 @@ object Threnody {
     @Volatile var visible = 0
 
     @Synchronized
-    fun start(ctx: Context): ThrenodyNode = instance ?: ThrenodyNode.open(ctx.filesDir.resolve("threnody").path, null).also {
+    fun start(ctx: Context): ThrenodyNode = instance ?: open(ctx).also {
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
         say("listening on $listenAddr")
@@ -57,6 +57,12 @@ object Threnody {
                 node.reconnect()
             }
         })
+    }
+
+    /** Opens the node, its identity sealed under the Android Keystore. */
+    private fun open(ctx: Context): ThrenodyNode {
+        val home = ctx.filesDir.resolve("threnody").path
+        return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home))
     }
 
     /** Subscribes to node events (called on the event thread); returns an unsubscriber. */

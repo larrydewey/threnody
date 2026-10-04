@@ -7,7 +7,8 @@ An app on [`threnody-ffi`](../../crates/threnody-ffi), built on the platform alo
 - **Groups.** *New group* under **+** creates an MLS group that you own. You can invite contacts, see members, and remove them as the owner. Members' messages show who sent them. Invitations from mutually approved contacts are accepted automatically. Others appear in the list with **Join** and **Decline**.
 - **Trust.** A banner asks you to approve new contacts, then to compare safety numbers. The contact menu has rename, approve or revoke, the safety number, disappearing messages and Wi-Fi Direct.
 - **Invites.** *My invite* shows a QR code and link to share or copy. The app opens `threnody://` invites and `threnody-link://` device codes, so scanning a QR code with the camera opens the app. The overflow menu links a new device or joins another device's account.
-- **Diagnostics.** The node's event log, plus manual Bluetooth scan and dial for testing transports.
+- **Key protection.** The identity file is sealed (Argon2id) with a random passphrase. That passphrase is stored encrypted under an AES key in the Android Keystore, in StrongBox where the phone has it, else the TEE. Everything else the node stores is encrypted under the identity, so a copy of the app's files is useless off the phone. An identity from an earlier version is sealed on the first start after updating. The key needs no unlock, so the background service can restart on its own.
+- **Diagnostics.** The node's event log, where the key is kept, and manual Bluetooth scan and dial for testing transports.
 
 The layout is edge to edge and pads for the system bars and keyboard, whether the phone uses gesture navigation or three-button navigation (which sits on the side in landscape). It follows the system light or dark theme.
 
@@ -31,4 +32,4 @@ The node is a process-wide singleton, so rotating the screen or recreating the A
 
 The UI flows were tested on an API 35 emulator against the desktop CLI: invites by deep link, chat both ways, approval, safety numbers, files both ways (and still listed after a restart), notifications, and redialing after a restart. For groups, the tests covered creating one, inviting an approved contact, joining an unapproved contact's group or declining it, chatting both ways and removing a member. They also covered light and dark themes, and portrait and landscape with three-button navigation.
 
-A group member who has no session with another member reaches them through an approved relay (Appendix G). Without one, the message isn't delivered. Group invitations waiting for consent are kept in memory only, so after a restart the owner invites again.
+A group member who has no session with another member reaches them through an approved relay (Appendix G). Without one, the message isn't delivered.

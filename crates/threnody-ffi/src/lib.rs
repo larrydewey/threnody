@@ -90,6 +90,29 @@ pub fn qr_matrix(text: String) -> Result<QrMatrix> {
     })
 }
 
+/// Whether the identity in `home` is sealed with a passphrase (false when
+/// there is no identity yet). Call before `open` to decide what to pass.
+#[uniffi::export]
+pub fn identity_is_sealed(home: String) -> Result<bool> {
+    let home = Home::new(home);
+    if !home.has_identity() {
+        return Ok(false);
+    }
+    home.identity_is_sealed().map_err(fail)
+}
+
+/// Adds, changes or removes (`new = None`) the passphrase sealing the
+/// identity in `home`. Use it while no node has `home` open.
+#[uniffi::export]
+pub fn change_passphrase(home: String, current: Option<String>, new: Option<String>) -> Result<()> {
+    Home::new(home)
+        .change_passphrase(
+            current.as_deref().map(str::as_bytes),
+            new.as_deref().map(str::as_bytes),
+        )
+        .map_err(fail)
+}
+
 /// An approved contact heard over Bluetooth that this device should dial.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct BleDial {
@@ -877,7 +900,7 @@ mod tests {
             "hello from an app"
         );
         assert_eq!(
-            alice.safety_number(bob_fp).unwrap(),
+            alice.safety_number(bob_fp.clone()).unwrap(),
             bob.safety_number(alice.device_fingerprint()).unwrap()
         );
         alice.shutdown();
@@ -941,7 +964,27 @@ mod tests {
 
         // A protected identity needs its passphrase.
         drop(bob);
-        assert!(ThrenodyNode::open(dir.path().join("b").display().to_string(), None).is_err());
+        let b_home = dir.path().join("b").display().to_string();
+        assert!(ThrenodyNode::open(b_home.clone(), None).is_err());
+        assert!(identity_is_sealed(b_home.clone()).unwrap());
+        assert!(!identity_is_sealed(dir.path().join("nobody").display().to_string()).unwrap());
+
+        // Sealing an existing identity keeps it (as an app does when it
+        // moves the key under the platform keystore).
+        let a_home = dir.path().join("a").display().to_string();
+        let a_fp = alice.device_fingerprint();
+        drop(alice);
+        assert!(!identity_is_sealed(a_home.clone()).unwrap());
+        change_passphrase(a_home.clone(), None, Some("from keystore".into())).unwrap();
+        assert!(identity_is_sealed(a_home.clone()).unwrap());
+        assert!(change_passphrase(a_home.clone(), Some("wrong".into()), None).is_err());
+        let alice = ThrenodyNode::open(a_home, Some("from keystore".into())).unwrap();
+        assert_eq!(alice.device_fingerprint(), a_fp);
+        assert_eq!(
+            alice.history(bob_fp.clone(), 10).unwrap()[0].text,
+            "hello from an app",
+            "state still readable"
+        );
     }
 
     /// Pumps several nodes' events (every node must run for group
@@ -1045,6 +1088,14 @@ mod tests {
             |e| matches!(e, NodeEvent::GroupInvited { from, .. } if *from == a_fp),
         );
         assert_eq!(carol.group_invites().len(), 1);
+        // The invitation survives Carol restarting before she answers.
+        drop(all);
+        carol.shutdown();
+        drop(carol);
+        let carol = open("c");
+        assert_eq!(carol.group_invites()[0].name, "climbing");
+        carol.connect(alice.invite_link(addr.clone())).unwrap();
+        let mut all = Pump::new(&[&*alice, &*bob, &*carol]);
         carol.accept_group_invite(g[..6].into()).unwrap();
         all.until(2, |e| matches!(e, NodeEvent::GroupJoined { .. }));
         all.until(1, |e| matches!(e, NodeEvent::GroupMembersChanged { added, .. } if *added == [c_fp.clone()]));
