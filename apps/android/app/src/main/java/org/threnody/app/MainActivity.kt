@@ -169,6 +169,7 @@ class MainActivity : Activity() {
 
     private fun add(anchor: View) {
         PopupMenu(this, anchor).apply {
+            menu.add("Scan a QR code").setOnMenuItemClickListener { scan(); true }
             menu.add("Add a contact").setOnMenuItemClickListener { addContact(null); true }
             menu.add("New group").setOnMenuItemClickListener { newGroup(); true }
             show()
@@ -344,13 +345,66 @@ class MainActivity : Activity() {
     }
 
     private fun addContact(prefill: String?) {
-        val field = input("threnody://… or host:port", prefill)
+        // A copied invite (say, from the camera app) fills itself in.
+        val field = input("threnody://… or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
         AlertDialog.Builder(this)
             .setTitle("Add a contact")
-            .setMessage("Paste their invite link. You'll check their safety number together later.")
+            .setMessage("Scan or paste their invite. You'll check their safety number together later.")
             .setView(padded(field))
             .setPositiveButton("Connect") { _, _ -> connect(field.text.toString().trim()) }
+            .setNeutralButton("Scan") { _, _ -> scan() }
             .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun scan() {
+        @Suppress("DEPRECATION") // the result API needs AndroidX
+        startActivityForResult(Intent(this, ScanActivity::class.java), SCAN)
+    }
+
+    @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != SCAN || resultCode != RESULT_OK) return
+        val text = data?.getStringExtra(ScanActivity.RESULT)?.trim() ?: return
+        when {
+            text.startsWith("threnody://") -> addContact(text)
+            text.startsWith("threnody-link://") -> joinAccount(text)
+            else -> failed("That QR code isn't a Threnody invite or link code.")
+        }
+    }
+
+    /** A Threnody invite or link code on the clipboard, if any. */
+    private fun copiedLink(): String? = try {
+        getSystemService(ClipboardManager::class.java)?.primaryClip
+            ?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
+            ?.takeIf { it.startsWith("threnody://") || it.startsWith("threnody-link://") }
+    } catch (_: SecurityException) {
+        null
+    }
+
+    /** The copied link last offered, so it's offered once. */
+    private var offered: String? = null
+
+    // The clipboard can only be read while the window has focus.
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus) return
+        val link = copiedLink() ?: return
+        val n = node ?: return
+        if (link == offered) return
+        // Not our own invite or link code (say, just copied from "My invite").
+        if (link.contains(n.deviceFingerprint().replace("-", ""))) return
+        offered = link
+        val invite = link.startsWith("threnody://")
+        AlertDialog.Builder(this)
+            .setTitle(if (invite) "Add the copied invite?" else "Join with the copied link code?")
+            .setMessage(link)
+            .setPositiveButton(if (invite) "Connect" else "Continue") { _, _ ->
+                if (invite) connect(link) else joinAccount(link)
+            }
+            .setNegativeButton("Not now", null)
             .show()
     }
 
@@ -371,6 +425,8 @@ class MainActivity : Activity() {
 
     private fun joinAccount(prefill: String?) {
         val field = input("threnody-link://…", prefill)
+        val prefilled = prefill ?: copiedLink()?.takeIf { it.startsWith("threnody-link://") }
+        field.setText(prefilled ?: "")
         AlertDialog.Builder(this)
             .setTitle("Join another device's account")
             .setMessage("This device becomes part of that account: your contacts see both as you. " +
@@ -411,5 +467,9 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         worker.shutdown()
         super.onDestroy()
+    }
+
+    companion object {
+        private const val SCAN = 1
     }
 }

@@ -8,6 +8,8 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import uniffi.threnody_ffi.ContactInfo
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
@@ -43,6 +45,38 @@ object Threnody {
         pump(ctx.applicationContext, it)
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)
+    }
+
+    private val redialer = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "threnody-redial").apply { isDaemon = true }
+    }
+    /** Seconds between redial attempts; the last repeats. */
+    private val redialDelays = longArrayOf(3, 10, 30, 60, 120, 300)
+    @Volatile private var redialing = false
+
+    /**
+     * After an approved contact's session ends, redials with backoff until
+     * every approved contact is connected again. A session can end without
+     * any network change (a Wi-Fi Direct group closing, a peer restarting),
+     * so the network callback alone isn't enough.
+     */
+    @Synchronized
+    private fun redialSoon(node: ThrenodyNode) {
+        if (redialing) return
+        redialing = true
+        fun attempt(n: Int) {
+            redialer.schedule({
+                val missing = node.contacts().any { it.mutuallyApproved && !it.connected }
+                if (!missing) {
+                    redialing = false
+                    return@schedule
+                }
+                say("* redialing approved contacts")
+                node.reconnect()
+                attempt(n + 1)
+            }, redialDelays[minOf(n, redialDelays.size - 1)], TimeUnit.SECONDS)
+        }
+        attempt(0)
     }
 
     /**
@@ -112,7 +146,10 @@ object Threnody {
             val e = node.nextEvent(1000u) ?: continue
             when (e) {
                 is NodeEvent.Connected -> say("* connected ${short(e.peer)}" + (e.via?.let { " via ${short(it)}" } ?: ""))
-                is NodeEvent.Disconnected -> say("* ${short(e.peer)} disconnected (${e.reason})")
+                is NodeEvent.Disconnected -> {
+                    say("* ${short(e.peer)} disconnected (${e.reason})")
+                    if (node.contacts().any { it.fingerprint == e.peer && it.mutuallyApproved }) redialSoon(node)
+                }
                 is NodeEvent.Message -> {
                     say("<${short(e.peer)}> ${e.text}")
                     val contacts = node.contacts()

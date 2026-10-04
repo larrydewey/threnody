@@ -98,6 +98,21 @@ pub fn qr_matrix(text: String) -> Result<QrMatrix> {
     })
 }
 
+/// Looks for a QR code in a greyscale image (a camera frame's luma
+/// plane: `width` × `height` pixels, rows `row_stride` bytes apart) and
+/// returns the text of the first one that decodes.
+#[uniffi::export]
+pub fn decode_qr(width: u32, height: u32, row_stride: u32, luma: Vec<u8>) -> Option<String> {
+    let (w, h, stride) = (width as usize, height as usize, row_stride as usize);
+    if w == 0 || h == 0 || stride < w || luma.len() < stride * (h - 1) + w {
+        return None;
+    }
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| luma[y * stride + x]);
+    img.detect_grids()
+        .into_iter()
+        .find_map(|g| g.decode().ok().map(|(_, text)| text))
+}
+
 /// Whether the identity in `home` is sealed with a passphrase (false when
 /// there is no identity yet). Call before `open` to decide what to pass.
 #[uniffi::export]
@@ -832,6 +847,55 @@ mod tests {
             }
         }
         panic!("event did not arrive");
+    }
+
+    /// Renders `text` as a QR code into a `w`×`h` greyscale frame with
+    /// `scale`-pixel modules, offset and with some noise, as a camera sees it.
+    fn frame(text: &str, w: usize, h: usize, scale: usize, stride: usize) -> Vec<u8> {
+        let q = qr_matrix(text.into()).unwrap();
+        let n = q.size as usize;
+        // Uneven light (a gradient) and sensor noise (±8, from an LCG).
+        let mut seed = 0x2545_f491_u32;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 16) as usize % 17
+        };
+        let mut img = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                img[y * stride + x] = (150 + (x + y) / 16 + noise()).min(255) as u8;
+            }
+        }
+        let (ox, oy) = (37, 23);
+        for y in 0..n * scale {
+            for x in 0..n * scale {
+                if q.dark[(y / scale) * n + x / scale] {
+                    img[(oy + y) * stride + ox + x] = (30 + noise()) as u8;
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn qr_codes_decode_from_camera_frames() {
+        let link = "threnody://Q3XRE4SF7Q5CWSTAFB7MZ58T6BJBCN55@192.168.100.107:7450";
+        let (w, h, stride) = (640, 480, 704);
+        let img = frame(link, w, h, 6, stride);
+        assert_eq!(
+            decode_qr(w as u32, h as u32, stride as u32, img.clone()).as_deref(),
+            Some(link)
+        );
+        // No code, or a truncated buffer: nothing, and no panic.
+        assert_eq!(
+            decode_qr(w as u32, h as u32, stride as u32, vec![128; stride * h]),
+            None
+        );
+        assert_eq!(
+            decode_qr(w as u32, h as u32, stride as u32, img[..1000].to_vec()),
+            None
+        );
+        assert_eq!(decode_qr(0, 0, 0, vec![]), None);
     }
 
     #[test]

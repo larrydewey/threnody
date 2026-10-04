@@ -164,6 +164,20 @@ async fn sweep_links(node: &Node, adapter: &bluer::Adapter) {
     }
 }
 
+/// Aborts a pending LE connection to `addr` (BlueZ `Device.Disconnect`
+/// also cancels one that is still being made).
+async fn cancel_connect(addr: Address) {
+    let Ok(session) = bluer::Session::new().await else {
+        return;
+    };
+    let Ok(adapter) = session.default_adapter().await else {
+        return;
+    };
+    if let Ok(dev) = adapter.device(addr) {
+        let _ = dev.disconnect().await;
+    }
+}
+
 /// How often the advertised beacon is replaced: well inside one discovery
 /// epoch, so peers always see a current tag and a fresh nonce.
 const REFRESH: Duration = Duration::from_secs(EPOCH_SECS / 5);
@@ -184,10 +198,17 @@ pub async fn connect(
     let socket = bluer::l2cap::Socket::<Stream>::new_stream()?;
     socket.set_recv_mtu(RECV_MTU).ok();
     socket.bind(SocketAddr::new(Address::any(), f.addr_type, 0))?;
-    let stream = tokio::time::timeout(Duration::from_secs(20), socket.connect(target))
-        .await
-        .map_err(|_| anyhow!("Bluetooth connection timed out"))?
-        .with_context(|| format!("L2CAP connect to {} psm {}", f.addr, f.psm))?;
+    let stream = match tokio::time::timeout(Duration::from_secs(20), socket.connect(target)).await {
+        Ok(r) => r.with_context(|| format!("L2CAP connect to {} psm {}", f.addr, f.psm))?,
+        Err(_) => {
+            // Dropping the socket should cancel the LE connection attempt,
+            // but some controllers (seen on MediaTek) stay "initiating" and
+            // then refuse to scan (EBUSY) until power-cycled. Cancel it
+            // through BlueZ too.
+            cancel_connect(f.addr).await;
+            return Err(anyhow!("Bluetooth connection timed out"));
+        }
+    };
     // The kernel can report a non-blocking LE connect as done before the
     // channel exists (writes then fail with ENOTCONN). Wait until the
     // channel is really up: its send MTU is only known once connected.

@@ -27,6 +27,7 @@ thiserror.workspace = true
 qrcode.workspace = true
 threnody-groups = { workspace = true, features = ["node"] }
 uniffi = "0.32"
+rqrr = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
