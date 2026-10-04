@@ -440,6 +440,11 @@ impl Home {
         Ok(true)
     }
 
+    /// Deletes a conversation's history.
+    pub fn delete_history(&self, c: ConversationId) -> Result<()> {
+        self.remove_state(&c.state_name())
+    }
+
     /// Every conversation with stored history.
     pub fn conversations(&self) -> Vec<ConversationId> {
         let Ok(rd) = std::fs::read_dir(self.dir()) else {

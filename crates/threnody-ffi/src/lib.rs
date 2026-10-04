@@ -50,6 +50,9 @@ pub struct ContactInfo {
     pub verified: bool,
     pub account: Option<String>,
     pub connected: bool,
+    /// We want its messages (else they're requests); see `accept_contact`.
+    pub accepted: bool,
+    pub blocked: bool,
 }
 
 /// A device of our account.
@@ -200,6 +203,13 @@ pub enum NodeEvent {
     /// A nearby approved peer asks us to create a group and offer it.
     WifiDirectRequested {
         peer: String,
+    },
+    /// A message from someone not accepted yet (it's in history): show it
+    /// among requests, not conversations. `text` or `file` (a name).
+    MessageRequest {
+        peer: String,
+        text: Option<String>,
+        file: Option<String>,
     },
     /// `peer` acknowledged one of our messages: reload the history of its
     /// conversation (`group` if set, else the 1:1 one with `peer`).
@@ -377,6 +387,14 @@ fn convert(e: Event) -> NodeEvent {
             device: fp(&device),
         },
         Event::ThisDeviceRemoved => NodeEvent::ThisDeviceRemoved,
+        Event::MessageRequest { peer, msg } => NodeEvent::MessageRequest {
+            peer: fp(&peer),
+            text: text_of(&msg),
+            file: match msg {
+                AppMessage::File { name, .. } => Some(name),
+                _ => None,
+            },
+        },
         Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
             from: fp(&from),
             added: u32::try_from(added).unwrap_or(u32::MAX),
@@ -637,6 +655,25 @@ impl ThrenodyNode {
         self.node.set_timer(&p, seconds).map_err(fail)
     }
 
+    /// Accepts `peer`'s message requests (its whole account).
+    pub fn accept_contact(&self, peer: String) -> Result<()> {
+        self.node.accept_contact(&self.resolve(&peer)?);
+        Ok(())
+    }
+
+    /// Blocks `peer` (its whole account): sessions refused, conversation
+    /// deleted. Approving it again unblocks.
+    pub fn block_contact(&self, peer: String) -> Result<()> {
+        self.node.block_contact(&self.resolve(&peer)?);
+        Ok(())
+    }
+
+    /// Deletes a message request; they can write again as a new request.
+    pub fn delete_request(&self, peer: String) -> Result<()> {
+        self.node.delete_request(&self.resolve(&peer)?);
+        Ok(())
+    }
+
     pub fn set_approval(&self, peer: String, approved: bool) -> Result<()> {
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();
@@ -665,6 +702,8 @@ impl ThrenodyNode {
                 verified: c.verified,
                 account: c.account.map(|a| a.fingerprint().to_string()),
                 connected: live.contains(&c.key),
+                accepted: self.node.is_accepted(&c.key),
+                blocked: c.blocked,
             })
             .collect()
     }
@@ -1020,6 +1059,22 @@ mod tests {
         alice
             .send_text(bob_fp.clone(), "hello from an app".into())
             .unwrap();
+        // Bob never contacted Alice: her first message is a request.
+        let e = wait(&bob, |e| matches!(e, NodeEvent::MessageRequest { .. }));
+        assert_eq!(
+            e,
+            NodeEvent::MessageRequest {
+                peer: alice.device_fingerprint(),
+                text: Some("hello from an app".into()),
+                file: None,
+            }
+        );
+        assert!(bob.contacts().iter().any(|c| !c.accepted));
+        bob.accept_contact(alice.device_fingerprint()).unwrap();
+        assert!(bob.contacts().iter().all(|c| c.accepted));
+        alice
+            .send_text(bob_fp.clone(), "hello from an app".into())
+            .unwrap();
         let e = wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
         assert_eq!(
             e,
@@ -1068,10 +1123,10 @@ mod tests {
                 .any(|c| c.fingerprint == bob_fp && c.mutually_approved && c.connected)
         );
         let h = alice.history(bob_fp.clone(), 10).unwrap();
-        assert_eq!(h.len(), 2);
+        assert_eq!(h.len(), 3, "the request, the same text again, the file");
         assert!(h[0].outgoing && h[0].text == "hello from an app");
-        let f = h[1].file.as_ref().unwrap();
-        assert!(h[1].outgoing && f.name == "notes.txt" && f.size == 10);
+        let f = h[2].file.as_ref().unwrap();
+        assert!(h[2].outgoing && f.name == "notes.txt" && f.size == 10);
         // Bob acknowledged both (the Delivered events went by above).
         for _ in 0..100 {
             if alice
@@ -1088,7 +1143,7 @@ mod tests {
         assert!(h.iter().all(|e| e.delivered), "{h:?}");
         assert_eq!(f.location.as_deref(), Some("/tmp/notes.txt"));
         let hb = bob.history(alice.device_fingerprint(), 10).unwrap();
-        assert!(!hb[1].outgoing && hb[1].file.as_ref().is_some_and(|f| f.name == "notes.txt"));
+        assert!(!hb[2].outgoing && hb[2].file.as_ref().is_some_and(|f| f.name == "notes.txt"));
         assert_eq!(
             bob.history(alice.device_fingerprint(), 10).unwrap()[0].text,
             "hello from an app"
@@ -1436,6 +1491,8 @@ mod tests {
         });
         wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
         wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        // Bob answered Alice's call: he accepts her before she writes.
+        bob.accept_contact(alice.device_fingerprint()).unwrap();
         let (a_id, b_id) = (alice.node.identity(), bob.node.identity());
         let file = |n: &str| AppMessage::File {
             sent_ms: 0,

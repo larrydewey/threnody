@@ -99,6 +99,7 @@ async fn one_relay_carries_an_end_to_end_session() {
         .unwrap();
     assert_eq!((s.transport, s.via), ("relay", Some(b.node.identity())));
 
+    c.node.accept_contact(&a.node.identity()); // else a's messages are requests
     a.node.send(&cid, text("through b")).unwrap();
     let Event::Message { peer, msg } =
         next(&mut c.rx, |e| matches!(e, Event::Message { .. })).await
@@ -128,6 +129,7 @@ async fn two_relays_in_a_chain() {
     link(&mut d, &mut c, true).await;
     let cid = c.node.identity();
     a.node.connect_relayed(cid.fingerprint()).await.unwrap();
+    c.node.accept_contact(&a.node.identity());
     a.node.send(&cid, text("two hops")).unwrap();
     next(
         &mut c.rx,
@@ -267,6 +269,7 @@ async fn bluetooth_only_device_reaches_ip_peer_through_a_relay() {
         .unwrap();
     assert_eq!(s.via, Some(lid));
 
+    server.node.accept_contact(&phone.node.identity()); // else a request
     phone
         .node
         .send(&sid, text("over the radio and the wire"))

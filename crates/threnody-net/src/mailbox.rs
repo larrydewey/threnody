@@ -413,7 +413,11 @@ impl Node {
             && let Ok(msg) = AppMessage::decode(&body)
         {
             self.record_incoming(&from, &msg, true);
-            self.emit(Event::OfflineMessage { from, via, msg });
+            if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {
+                self.emit(Event::OfflineMessage { from, via, msg });
+            } else {
+                self.emit(Event::MessageRequest { peer: from, msg });
+            }
         }
     }
 

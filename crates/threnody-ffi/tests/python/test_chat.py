@@ -20,6 +20,8 @@ with tempfile.TemporaryDirectory() as d:
     bob_fp = alice.connect(bob.invite_link(addr))
     assert bob_fp == bob.device_fingerprint()
     wait(bob, NodeEvent.CONNECTED)
+    # Bob wants Alice's messages; otherwise they'd arrive as requests.
+    bob.accept_contact(alice.device_fingerprint())
 
     assert alice.send_text(bob_fp, "hello from Python") == 1
     msg = wait(bob, NodeEvent.MESSAGE)

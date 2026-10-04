@@ -37,6 +37,8 @@ To add a device to your account, run `/device add [host:port]` on a device you a
 /policy anyone|contacts|approved   /status   /quit
 ```
 
+**Message requests.** Messages from someone you haven't accepted are kept apart as requests. You accept someone by approving them, dialing their invite, or writing to them. `/requests` lists them, `/accept <peer>` takes them in, `/block <peer>` refuses that sender from then on and deletes the conversation, and `/delete <peer>` discards the request.
+
 You can also manage contacts outside a session with `threnody contacts | name | approve | revoke | verify | forget`.
 
 **Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. `--policy approved` only accepts mutually approved contacts.

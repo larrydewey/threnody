@@ -177,6 +177,8 @@ object Threnody {
                 approved = devices.any { it.mutuallyApproved },
                 verified = devices.all { it.verified },
                 unverified = devices.filter { !it.verified }.map { it.fingerprint },
+                accepted = devices.any { it.accepted },
+                blocked = devices.any { it.blocked },
                 anyVerified = devices.any { it.verified },
                 devices = devices.map { it.fingerprint },
             )
@@ -231,6 +233,14 @@ object Threnody {
                 is NodeEvent.WifiDirectRequested -> {
                     say("* ${short(e.peer)} asks for a Wi-Fi Direct link")
                     WifiDirect.host(ctx, node, e.peer)
+                }
+                is NodeEvent.MessageRequest -> {
+                    say("* message request from ${short(e.peer)}")
+                    val k = key(node.contacts(), e.peer)
+                    if (visible == 0 || e.peer !in visibleChat) {
+                        // Not even who: a stranger's name can be a message in itself.
+                        ThrenodyService.notifyMessage(ctx, k, e.peer, "Threnody", "New message request")
+                    }
                 }
                 is NodeEvent.AccountChanged -> {
                     say("· $e")
@@ -287,6 +297,9 @@ data class Conversation(
     val unverified: List<String>,
     /** Some device was verified: an unverified one is new (a safety alert). */
     val anyVerified: Boolean,
+    /** We want their messages; otherwise this is a message request. */
+    val accepted: Boolean,
+    val blocked: Boolean,
     /** Every device of the account that we know. */
     val devices: List<String>,
 ) {

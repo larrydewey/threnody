@@ -276,6 +276,12 @@ pub struct Contact {
     /// When the approval or verification flags last changed (own-device
     /// sync merges these last-writer-wins).
     pub approval_changed_ms: u64,
+    /// We want messages from this peer: we contacted it, wrote to it,
+    /// approved it, or accepted its message request. Until then its
+    /// messages are requests.
+    pub accepted: bool,
+    /// Refused: no sessions, no messages.
+    pub blocked: bool,
 }
 
 impl Contact {
@@ -293,6 +299,8 @@ impl Contact {
             discovery_older: Vec::new(),
             account: None,
             approval_changed_ms: 0,
+            accepted: false,
+            blocked: false,
         }
     }
 
@@ -452,6 +460,15 @@ impl Contacts {
                         c.account = o.account;
                         changed = true;
                     }
+                    // Accepting or blocking on one device does on all.
+                    if o.accepted && !c.accepted {
+                        c.accepted = true;
+                        changed = true;
+                    }
+                    if o.blocked && !c.blocked {
+                        c.blocked = true;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -470,7 +487,8 @@ impl Contacts {
                     + usize::from(c.discovery_key.is_some())
                     + usize::from(!c.discovery_older.is_empty())
                     + usize::from(c.account.is_some())
-                    + 1;
+                    + usize::from(c.blocked)
+                    + 2;
                 e.map_len(n)?;
                 e.u8(0)?.bytes(c.key.as_bytes())?;
                 if let Some(p) = &c.petname {
@@ -496,6 +514,10 @@ impl Contacts {
                     for k in &c.discovery_older {
                         e.bytes(k)?;
                     }
+                }
+                e.u8(12)?.bool(c.accepted)?;
+                if c.blocked {
+                    e.u8(13)?.bool(true)?;
                 }
             }
             Ok(())
@@ -538,6 +560,9 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         discovery_older: Vec::new(),
         account: None,
         approval_changed_ms: 0,
+        // Contacts saved before message requests existed were wanted.
+        accepted: true,
+        blocked: false,
     };
     read_map(d, |k, d| {
         match k {
@@ -552,6 +577,8 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             8 => c.discovery_key = Some(fixed_bytes::<32>(d)?),
             9 => c.account = Some(AccountId(fixed_bytes::<32>(d)?)),
             10 => c.approval_changed_ms = d.u64()?,
+            12 => c.accepted = d.bool()?,
+            13 => c.blocked = d.bool()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -590,6 +617,8 @@ mod tests {
         ct.discovery_key = Some([4; 32]);
         ct.account = Some(AccountId([5; 32]));
         ct.approval_changed_ms = 77;
+        ct.blocked = true;
+        assert!(!ct.accepted, "new contacts start as message requests");
         home.save_contacts(&c).unwrap();
         let loaded = home.load_contacts().unwrap();
         assert_eq!(loaded, c);

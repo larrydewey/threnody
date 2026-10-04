@@ -51,6 +51,7 @@ Type a line to send it to the current peer. Commands:
   /contacts                             contact book
   /name <peer> <name>                   set a local name
   /approve [peer]   /revoke [peer]      mesh / tunnel approval
+  /requests   /accept <peer>   /block <peer>   /delete <peer>   message requests
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
   /file <path>                          send a file to the current peer
@@ -498,6 +499,18 @@ impl Ui {
                 self.groups.connected(&self.node, &name, &peer);
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
+            Event::MessageRequest { peer, msg } => {
+                let what = match &msg {
+                    AppMessage::Text { body, .. } => format!("{body:?}"),
+                    AppMessage::File { name, .. } => format!("a file ({name})"),
+                    _ => "a message".into(),
+                };
+                println!(
+                    "? message request from {}: {what} — /accept {p}, /block {p} or /delete {p}",
+                    self.name(&peer),
+                    p = &peer.fingerprint().to_string()[..9]
+                );
+            }
             Event::OfflineMessage { from, via, msg } => self.show_message(from, msg, Some(via)),
             // A member acknowledged a group message we forwarded: send the
             // sender a receipt.
@@ -728,6 +741,46 @@ impl Ui {
                     }
                 });
                 println!("* named {}", self.name(&key));
+            }
+            "requests" => {
+                let pending: Vec<_> = self
+                    .node
+                    .contacts()
+                    .iter()
+                    .filter(|c| !c.accepted && !c.blocked && !self.node.is_own_device(&c.key))
+                    .map(|c| c.key)
+                    .collect();
+                if pending.is_empty() {
+                    println!("  no message requests");
+                }
+                for p in pending {
+                    let n = self
+                        .node
+                        .history(self.node.conversation_for(&p))
+                        .map_or(0, |h| h.entries().len());
+                    println!("  {}  {n} message(s)", self.name(&p));
+                }
+            }
+            "accept" | "block" | "delete" => {
+                let p = self.resolve_peer(arg)?;
+                let who = self.name(&p);
+                match verb {
+                    "accept" => {
+                        self.node.accept_contact(&p);
+                        println!("* accepted {who}; their messages show normally now");
+                        self.show_history(p, 20)?;
+                    }
+                    "block" => {
+                        self.node.block_contact(&p);
+                        println!(
+                            "* blocked {who}: no sessions or messages from them, conversation deleted"
+                        );
+                    }
+                    _ => {
+                        self.node.delete_request(&p);
+                        println!("* deleted the request from {who}");
+                    }
+                }
             }
             "approve" | "revoke" => {
                 let p = self.resolve_peer(arg)?;

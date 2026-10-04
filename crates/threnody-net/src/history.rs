@@ -30,6 +30,92 @@ pub struct SendReport {
 }
 
 impl Node {
+    /// Whether we want `peer`'s messages: we accepted it, or another device
+    /// of its account, or it's ours. Blocked peers never are.
+    pub fn is_accepted(&self, peer: &PublicIdentity) -> bool {
+        if self.is_own_device(peer) {
+            return true;
+        }
+        let contacts = lock(&self.shared.contacts);
+        let Some(c) = contacts.get(peer) else {
+            return false;
+        };
+        if c.blocked {
+            return false;
+        }
+        c.accepted
+            || c.account.is_some_and(|a| {
+                contacts
+                    .iter()
+                    .any(|o| o.account == Some(a) && o.accepted && !o.blocked)
+            })
+    }
+
+    /// Accepts `peer`'s message requests (every device of its account):
+    /// its messages show as a conversation from now on.
+    pub fn accept_contact(&self, peer: &PublicIdentity) {
+        // Accepting in advance (before they've connected) works too.
+        self.update_contacts(|c| c.observe(*peer, None, now_ms()));
+        self.mark_contacts(peer, |c| c.accepted = true);
+    }
+
+    /// Blocks `peer` and every device of its account: their sessions end
+    /// and are refused, and our conversation with them is deleted.
+    pub fn block_contact(&self, peer: &PublicIdentity) {
+        let conv = self.conversation_for(peer);
+        let devices = self.mark_contacts(peer, |c| {
+            c.blocked = true;
+            c.accepted = false;
+            c.local_approved = false;
+        });
+        for d in devices {
+            self.disconnect(&d);
+        }
+        let _ = self.shared.home.delete_history(conv);
+    }
+
+    /// Deletes a message request: the contact and the conversation go, and
+    /// they can write again (as a new request).
+    pub fn delete_request(&self, peer: &PublicIdentity) {
+        let conv = self.conversation_for(peer);
+        let devices = self.mark_contacts(peer, |_| {});
+        self.update_contacts(|c| {
+            for d in &devices {
+                if c.get(d).is_some_and(|x| !x.accepted) {
+                    c.remove(d);
+                }
+            }
+        });
+        for d in devices {
+            self.disconnect(&d);
+        }
+        let _ = self.shared.home.delete_history(conv);
+    }
+
+    /// Applies `f` to `peer` and the other devices of its account; returns them.
+    fn mark_contacts(
+        &self,
+        peer: &PublicIdentity,
+        f: impl Fn(&mut threnody_core::store::Contact),
+    ) -> Vec<PublicIdentity> {
+        let account = lock(&self.shared.contacts)
+            .get(peer)
+            .and_then(|c| c.account);
+        self.update_contacts(|cs| {
+            let keys: Vec<PublicIdentity> = cs
+                .iter()
+                .filter(|c| c.key == *peer || (account.is_some() && c.account == account))
+                .map(|c| c.key)
+                .collect();
+            for k in &keys {
+                if let Some(c) = cs.get_mut(k) {
+                    f(c);
+                }
+            }
+            keys
+        })
+    }
+
     /// The conversation a peer device belongs to: its account if known,
     /// otherwise the device itself.
     pub fn conversation_for(&self, peer: &PublicIdentity) -> ConversationId {
@@ -51,6 +137,8 @@ impl Node {
     /// connected, sealed for mailboxes otherwise), applying and recording
     /// the conversation's disappearing-message timer.
     pub fn send_text(&self, peer: &PublicIdentity, body: &str) -> Result<SendReport> {
+        // Writing to someone accepts them.
+        self.accept_contact(peer);
         let conv = self.conversation_for(peer);
         let timer = self.effective_timer(conv);
         let msg = AppMessage::Text {
@@ -120,6 +208,7 @@ impl Node {
                 "file too large",
             )));
         }
+        self.accept_contact(peer);
         let local_id = local_id();
         let size = data.len() as u64;
         let msg = AppMessage::File {

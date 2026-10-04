@@ -138,6 +138,8 @@ async fn lossy_link(a: &Node, b: &Node) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
         .await
         .unwrap();
     accept.await.unwrap().unwrap();
+    // `b` wants `a`'s messages (else they'd be requests).
+    b.accept_contact(&a.identity());
     (cut_a, cut_b)
 }
 

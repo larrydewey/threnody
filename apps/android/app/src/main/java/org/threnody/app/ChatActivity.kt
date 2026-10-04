@@ -164,6 +164,7 @@ class ChatActivity : Activity() {
         }
         val peer = when (e) {
             is NodeEvent.Message -> e.peer
+            is NodeEvent.MessageRequest -> e.peer
             is NodeEvent.File -> e.peer
             is NodeEvent.Connected -> e.peer
             is NodeEvent.Disconnected -> e.peer
@@ -223,6 +224,18 @@ class ChatActivity : Activity() {
         bar.subtitle.setTextColor(color(if (c?.verified == true) R.color.muted else R.color.warning))
         clearBanner()
         if (c == null) return
+        composeBar.visibility = if (c.accepted) View.VISIBLE else View.GONE
+        if (!c.accepted) {
+            banner(
+                "${c.title} wants to message you. They can't tell whether you've read this. " +
+                    "Accept to reply; block to stop them for good.",
+                "Accept" to { request("accept") },
+                "Block" to { request("block") },
+                "Delete" to { request("delete") },
+                warning = true,
+            )
+            return
+        }
         when {
             // Someone we'd verified now has a device we haven't: a key we
             // don't know is in the conversation.
@@ -566,6 +579,20 @@ class ChatActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    /** Answers a message request: accept, block or delete. */
+    private fun request(what: String) {
+        worker.execute {
+            run(what) {
+                when (what) {
+                    "accept" -> node.acceptContact(device)
+                    "block" -> node.blockContact(device)
+                    else -> node.deleteRequest(device)
+                }
+            }
+            if (what != "accept") runOnUiThread { finish() }
+        }
     }
 
     private fun declineGroup() {

@@ -159,6 +159,13 @@ pub enum Event {
         via: PublicIdentity,
         msg: AppMessage,
     },
+    /// A message from someone we haven't accepted yet (see
+    /// `Node::accept_contact`). It is in history, but shouldn't be shown
+    /// with the user's conversations or notified as one.
+    MessageRequest {
+        peer: PublicIdentity,
+        msg: AppMessage,
+    },
     /// `peer` acknowledged an outgoing message: the history entry
     /// `local_id` (in `group`, else the 1:1 conversation) changed.
     ///
@@ -675,6 +682,12 @@ impl Node {
             )));
         }
         let contacts = lock(&self.shared.contacts);
+        if contacts.get(peer).is_some_and(|c| c.blocked) {
+            return Err(NetError::Refused(format!(
+                "{} (blocked)",
+                peer.fingerprint()
+            )));
+        }
         let ok = match self.policy() {
             AcceptPolicy::Anyone => true,
             AcceptPolicy::ContactsOnly => contacts.get(peer).is_some(),
@@ -730,7 +743,11 @@ impl Node {
             if let Some(c) = contacts.get_mut(peer) {
                 c.local_approved = approved;
                 c.approval_changed_ms = now_ms();
-                if !approved {
+                if approved {
+                    // Approving is the strongest way of accepting.
+                    c.accepted = true;
+                    c.blocked = false;
+                } else {
                     c.clear_discovery_keys();
                 }
             }
@@ -786,6 +803,10 @@ impl Node {
             let mut contacts = lock(&self.shared.contacts);
             // Only remember dialable addresses: an inbound source port is ephemeral.
             let is_new = contacts.observe(peer, dialed, now_ms());
+            // We dialed them: we want to hear from them.
+            if outbound && let Some(c) = contacts.get_mut(&peer) {
+                c.accepted = true;
+            }
             self.shared.save_contacts(&contacts);
             is_new
         };
@@ -1057,7 +1078,11 @@ where
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
                             node.record_incoming(&peer, &msg, false);
-                            shared.emit(Event::Message { peer, msg });
+                            if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
+                                shared.emit(Event::Message { peer, msg });
+                            } else {
+                                shared.emit(Event::MessageRequest { peer, msg });
+                            }
                         }
                     }
                 }

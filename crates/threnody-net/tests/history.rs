@@ -41,6 +41,7 @@ async fn history_records_both_sides_and_disappearing_messages_vanish() {
     let bid = a.connect(&baddr, None).await.unwrap();
     let aid = a.identity();
     next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    b.accept_contact(&aid); // else a's messages are requests
 
     a.send_text(&bid, "stays").unwrap();
     next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
@@ -94,6 +95,8 @@ async fn messages_disappear_by_default_unless_turned_off() {
     let (bob, mut brx, addr) = spawn(&dir, "bob").await;
     let bob_id = alice.connect(&addr, None).await.unwrap();
     let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id); // else alice's messages are requests
     let week = threnody_net::history::DEFAULT_TIMER_S;
     assert_eq!(alice.timer(&bob_id), Some(week), "on by default");
 
@@ -132,4 +135,59 @@ async fn messages_disappear_by_default_unless_turned_off() {
     bob.set_default_timer(None);
     let carol = threnody_core::Identity::generate().public();
     assert_eq!(bob.timer(&carol), None);
+}
+
+#[tokio::test]
+async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stranger, _srx, _) = spawn(&dir, "stranger").await;
+    let (me, mut rx, addr) = spawn(&dir, "me").await;
+    let my_id = stranger.connect(&addr, None).await.unwrap();
+    let sid = stranger.identity();
+
+    // We never contacted them: a request, kept in history.
+    stranger.send_text(&my_id, "hi, it's me").unwrap();
+    let e = next(&mut rx, |e| {
+        matches!(e, Event::MessageRequest { .. } | Event::Message { .. })
+    })
+    .await;
+    assert!(matches!(e, Event::MessageRequest { peer, .. } if peer == sid));
+    assert!(!me.is_accepted(&sid));
+    assert_eq!(
+        me.history(me.conversation_for(&sid))
+            .unwrap()
+            .entries()
+            .len(),
+        1
+    );
+    // They, having written to us, accepted us.
+    assert!(stranger.is_accepted(&my_id));
+
+    me.accept_contact(&sid);
+    stranger.send_text(&my_id, "now a conversation").unwrap();
+    let e = next(&mut rx, |e| {
+        matches!(e, Event::MessageRequest { .. } | Event::Message { .. })
+    })
+    .await;
+    assert!(matches!(e, Event::Message { .. }));
+
+    // Blocked: the conversation goes and they can't come back.
+    me.block_contact(&sid);
+    assert!(
+        me.history(me.conversation_for(&sid))
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    assert!(!me.is_accepted(&sid));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = stranger.connect(&addr, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(me.sessions().iter().all(|s| s.peer != sid), "refused");
+    // Approving them again lifts the block.
+    me.set_approval(&sid, true).unwrap();
+    assert!(me.is_accepted(&sid));
+    stranger.connect(&addr, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(me.sessions().iter().any(|s| s.peer == sid));
 }

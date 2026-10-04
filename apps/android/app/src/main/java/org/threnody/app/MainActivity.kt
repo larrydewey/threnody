@@ -104,7 +104,13 @@ class MainActivity : Activity() {
     /** Reloads the list (on the worker thread). */
     private fun refresh() {
         val n = node ?: return
-        val contacts = Threnody.conversations(n).map { c ->
+        val all = Threnody.conversations(n).filter { !it.blocked }
+        // Someone we haven't accepted, who wrote to us: a request.
+        val requests = all.filter { !it.accepted }.mapNotNull { c ->
+            val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null } ?: return@mapNotNull null
+            Row(c.title, c.key, "Message request · tap to review", Long.MAX_VALUE, null) { openChat(c.key, c.device) }
+        }
+        val contacts = all.filter { it.accepted }.map { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
             Row(c.title, c.key, last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
                 last?.atMs?.toLong() ?: 0, c.connected) { openChat(c.key, c.device) }
@@ -119,7 +125,7 @@ class MainActivity : Activity() {
         val invites = n.groupInvites().map { i ->
             Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null) { openGroup(i.group) }
         }
-        val rows = invites + (contacts + groups).sortedByDescending { it.atMs }
+        val rows = requests + invites + (contacts + groups).sortedByDescending { it.atMs }
         runOnUiThread { show(rows) }
     }
 

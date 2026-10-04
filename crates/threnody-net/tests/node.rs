@@ -68,10 +68,13 @@ async fn chat_and_mutual_approval_over_tcp() {
             },
         )
         .unwrap();
-    let Event::Message { msg, .. } = next(&mut brx, |e| matches!(e, Event::Message { .. })).await
+    // Bob never contacted Alice, so her first message is a request.
+    let Event::MessageRequest { msg, .. } =
+        next(&mut brx, |e| matches!(e, Event::MessageRequest { .. })).await
     else {
         unreachable!()
     };
+    bob.accept_contact(&alice.identity());
     assert_eq!(
         msg,
         AppMessage::Text {
@@ -157,6 +160,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
     let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, rate);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     alice
         .send(
             &bob_id,
@@ -188,6 +192,7 @@ async fn cover_traffic_can_be_switched_on_and_off_live() {
     let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     let say = |s: &str| AppMessage::Text {
         sent_ms: 0,
         body: s.into(),
@@ -216,6 +221,7 @@ async fn tunnels_follow_mutual_approval() {
     let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     alice.set_approval(&bob_id, true).unwrap();
     bob.set_approval(&alice.identity(), true).unwrap();
 
@@ -269,6 +275,7 @@ async fn no_tunnel_without_mutual_approval() {
     let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     alice.set_approval(&bob_id, true).unwrap();
     alice
         .send(
@@ -381,6 +388,7 @@ async fn revocation_clears_discovery_keys() {
     let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     alice.set_approval(&bob_id, true).unwrap();
     bob.set_approval(&alice.identity(), true).unwrap();
     next(&mut arx, |e| {
@@ -432,6 +440,7 @@ async fn sessions_run_over_any_byte_stream() {
         .await
         .unwrap();
     assert_eq!(accept.await.unwrap().unwrap(), alice.identity());
+    bob.accept_contact(&alice.identity());
     let s = alice
         .sessions()
         .into_iter()
@@ -462,6 +471,7 @@ async fn bluetooth_beacons_pick_exactly_one_dialer() {
     let (carol, _crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     alice.set_approval(&bob_id, true).unwrap();
     bob.set_approval(&alice.identity(), true).unwrap();
     next(&mut arx, |e| {
@@ -585,6 +595,7 @@ async fn wifi_direct_offers_only_between_approved_neighbours() {
     let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity()); // else alice's messages are requests
     next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
     let offer = DirectOffer {
         ssid: "DIRECT-th-test".into(),

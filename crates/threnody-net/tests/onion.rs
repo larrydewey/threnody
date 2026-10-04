@@ -113,6 +113,7 @@ async fn two_relay_onion_circuit_carries_a_session() {
     // r1 has no link to c at all, so it cannot have learned it.
     assert!(r1.node.sessions().iter().all(|s| s.peer != cid));
 
+    c.node.accept_contact(&a.node.identity()); // else a's messages are requests
     a.node.send(&cid, text("through two relays")).unwrap();
     next(
         &mut c.rx,

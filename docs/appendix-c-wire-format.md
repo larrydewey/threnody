@@ -97,5 +97,8 @@ Contact = {
   ? 8 => bstr .size 32,  ; LAN discovery key (Appendix E)
   ? 9 => bstr .size 32,  ; account id (Appendix J)
   10 => uint,            ; approval changed (ms), for own-device sync
+  ? 11 => [* bstr .size 32], ; previous discovery keys
+  ? 12 => bool,          ; accepted: we want their messages (absent = true, for contacts from before requests)
+  ? 13 => bool,          ; blocked
 }
 ```
