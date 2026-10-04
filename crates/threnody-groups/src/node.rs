@@ -188,6 +188,27 @@ impl GroupNode {
         Ok(updates)
     }
 
+    /// Leaves a group: a member asks the owner to remove it, the owner
+    /// removes everyone. Either way the group is gone here at once.
+    pub fn leave(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
+        let me = node.identity();
+        let owned = self
+            .groups
+            .list()
+            .iter()
+            .any(|(g, _, o, _)| g == group && *o == me);
+        let out = if owned {
+            self.groups.disband(group)?
+        } else {
+            self.groups.leave(group)?
+        };
+        // Copies held for this group's members are moot now.
+        self.held
+            .retain(|(_, b, _)| GroupWire::decode(b).map_or(true, |w| w.group() != group));
+        self.save_held();
+        Ok(self.apply(node, out, true))
+    }
+
     /// Sends text to every other member and records it in the group's
     /// history, to be marked as members acknowledge their copies.
     pub fn send_text(&mut self, node: &Node, group: &GroupId, text: &str) -> Result<()> {

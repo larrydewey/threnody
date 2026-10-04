@@ -6,7 +6,8 @@
 //!               ? 4: member bstr .size 32, ? 5: reference uint }
 //! kind: 1 key-package request, 2 key package, 3 welcome, 4 MLS message,
 //!       5 forward (an MLS message for another member),
-//!       6 receipt (that member acknowledged a forwarded message)
+//!       6 receipt (that member acknowledged a forwarded message),
+//!       7 leave (a member asks the owner to remove it)
 //! ```
 
 use const_cbor::Decoder;
@@ -48,6 +49,8 @@ pub enum GroupWire {
         member: [u8; 32],
         reference: u64,
     },
+    /// To the owner: remove me (the sender) from the group.
+    Leave { group: GroupId },
 }
 
 impl GroupWire {
@@ -58,7 +61,8 @@ impl GroupWire {
             | Self::Welcome { group, .. }
             | Self::Message { group, .. }
             | Self::Forward { group, .. }
-            | Self::Receipt { group, .. } => group,
+            | Self::Receipt { group, .. }
+            | Self::Leave { group } => group,
         }
     }
 
@@ -84,6 +88,7 @@ impl GroupWire {
             Self::Receipt {
                 member, reference, ..
             } => (6, None, None, Some(member), *reference),
+            Self::Leave { .. } => (7, None, None, None, 0),
         };
         let size = payload.map_or(0, <[u8]>::len) + name.map_or(0, str::len) + 48;
         cbor::to_vec(size, |e| {
@@ -158,6 +163,7 @@ impl GroupWire {
                 member: required(to, "receipt member")?,
                 reference,
             },
+            7 => Self::Leave { group },
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -205,6 +211,7 @@ mod tests {
                 member: [8; 32],
                 reference: 3,
             },
+            GroupWire::Leave { group: g },
         ] {
             assert_eq!(GroupWire::decode(&m.encode().unwrap()).unwrap(), m);
         }

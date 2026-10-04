@@ -191,6 +191,16 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Leaves a group (a member asks the owner to remove it) or, for the
+    /// owner, deletes it for everyone. Its history stays.
+    pub fn leave_group(&self, group: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        let updates = self.group_node().leave(&self.node, &g).map_err(fail)?;
+        self.queue_updates(updates);
+        Ok(())
+    }
+
     /// Sends text to every other member (recorded in the group's history).
     /// Members we can't reach get it through another member, or once
     /// they connect.

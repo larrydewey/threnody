@@ -400,6 +400,79 @@ impl Groups {
         })
     }
 
+    /// Leaves a group we don't own: asks the owner to remove us (it commits
+    /// the removal for everyone) and forgets the group here at once.
+    pub fn leave(&mut self, group: &GroupId) -> Result<Output> {
+        let owner = self.group(group)?.owner;
+        if owner == self.me {
+            return Err(GroupError::Unexpected(
+                "the owner deletes the group instead",
+            ));
+        }
+        self.forget(group)?;
+        Ok(Output {
+            send: vec![Outgoing {
+                to: owner,
+                wire: GroupWire::Leave { group: *group },
+            }],
+            events: vec![GroupEvent::Left { group: *group }],
+        })
+    }
+
+    /// Deletes a group we own: one commit removes every other member (each
+    /// sees `Left`), then we forget it.
+    pub fn disband(&mut self, group: &GroupId) -> Result<Output> {
+        let me = self.me;
+        let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+        if g.owner != me {
+            return Err(GroupError::NotOwner);
+        }
+        let others: Vec<(LeafNodeIndex, PublicIdentity)> = g
+            .mls
+            .members()
+            .filter_map(|m| {
+                identity_of(&m.credential, &m.signature_key)
+                    .ok()
+                    .filter(|p| *p != me)
+                    .map(|p| (m.index, p))
+            })
+            .collect();
+        let mut send = Vec::new();
+        if !others.is_empty() {
+            let indices: Vec<LeafNodeIndex> = others.iter().map(|(i, _)| *i).collect();
+            let (commit, _, _) = g
+                .mls
+                .remove_members(&self.provider, &self.signer, &indices)
+                .map_err(mls)?;
+            g.mls.merge_pending_commit(&self.provider).map_err(mls)?;
+            let message = commit.tls_serialize_detached().map_err(mls)?;
+            send = others
+                .into_iter()
+                .map(|(_, to)| Outgoing {
+                    to,
+                    wire: GroupWire::Message {
+                        group: *group,
+                        message: message.clone(),
+                    },
+                })
+                .collect();
+        }
+        self.forget(group)?;
+        Ok(Output {
+            send,
+            events: vec![GroupEvent::Left { group: *group }],
+        })
+    }
+
+    /// Drops a group and its MLS secrets from our state.
+    fn forget(&mut self, group: &GroupId) -> Result<()> {
+        if let Some(mut g) = self.groups.remove(group) {
+            g.mls.delete(self.provider.storage()).map_err(mls)?;
+        }
+        self.pending_adds.retain(|(g, _)| g != group);
+        Ok(())
+    }
+
     /// Encrypts `text` for the group and fans it out to every other member.
     pub fn send_text(&mut self, group: &GroupId, text: &str) -> Result<Output> {
         let recipients = self.members_of(self.group(group)?);
@@ -451,6 +524,19 @@ impl Groups {
             } => self.on_forward(from, group, to, message),
             // Delivery bookkeeping, not group state: see `node::GroupNode`.
             GroupWire::Receipt { .. } => Ok(Output::default()),
+            GroupWire::Leave { group } => {
+                // Only the owner commits; it removes a member who asks.
+                if self.group(&group)?.owner != self.me {
+                    return Err(GroupError::NotOwner);
+                }
+                if from == self.me {
+                    return Err(GroupError::Unexpected("leave request from ourselves"));
+                }
+                // The leaver has already forgotten the group.
+                let mut out = self.remove(&group, &from)?;
+                out.send.retain(|o| o.to != from);
+                Ok(out)
+            }
         }
     }
 

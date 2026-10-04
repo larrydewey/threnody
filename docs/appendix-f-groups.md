@@ -26,6 +26,7 @@ GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (3
   5 Forward            sender -> a reachable member (MlsMessage, member = the one to deliver it to,
                        reference = the sender's id for a receipt, or absent)
   6 Receipt            forwarder -> sender      (member = who acknowledged, reference)
+  7 Leave              member -> owner          (remove me)
 ```
 
 The sender fans every message out to each other member. The groups use the pure-ciphertext wire format, so commits are encrypted too. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
@@ -58,6 +59,7 @@ Spec §6.2 leaves admin semantics to the application layer.
   3. The owner completes adds only for key packages it asked for, and only when the key package comes from the identity it invited.
   4. The owner commits the add, sends the Welcome to the new member, and sends the commit to the existing members.
 - **Joining checks.** On a Welcome, the joiner checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members.
+- **Leaving.** A member leaves by sending the owner `Leave` and forgetting the group at once. The owner commits its removal for the remaining members. An owner can't leave, but deleting the group removes every other member in one commit and then forgets it.
 - **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it.
 - **Past epochs.** Application messages from up to five past epochs are still accepted, to tolerate reordering around commits.
 
@@ -76,12 +78,13 @@ The key is derived from the identity seed, so group secrets are only as accessib
 ```
 /group new <name>                 /group invite <group> <peer>
 /group accept [n]                 /group decline [n]
-/group remove <group> <peer>      /groups
+/group remove <group> <peer>      /group leave <group>
+/groups
 /g <group> <text>
 ```
 
 ## Not yet done
 
 - **Secure deletion.** Each save rewrites the whole state file atomically. Old epoch secrets are gone from the file system's view, but not necessarily from the storage medium (spec §16 secure deletion).
-- **More committers.** Admin roles beyond a single owner, and self-removal ("leave" proposals committed by the owner).
+- **More committers.** Admin roles beyond a single owner.
 - **Ciphersuite version.** openmls's X-Wing HPKE implements X-Wing draft-06, while the 1:1 protocol uses draft-11. Both are hybrid; they will converge once the MLS PQ ciphersuite draft settles.

@@ -14,6 +14,7 @@ pub const HELP: &str = "\
   /group accept [n]                     accept a pending invitation
   /group decline [n]                    decline a pending invitation
   /group remove <group> <peer>          remove a member (owner only)
+  /group leave <group>                  leave (or, as owner, delete) a group
   /groups                               list groups and members
   /g <group> <text>                     send to a group";
 
@@ -224,6 +225,15 @@ impl GroupUi {
                 let (g, p) = (self.find(g)?, resolve(p)?);
                 let updates = self.groups.remove(node, &g, &p)?;
                 self.show(name, updates);
+            }
+            "leave" | "delete" => {
+                let g = self.find(
+                    it.next()
+                        .ok_or_else(|| anyhow!("usage: /group leave <group>"))?,
+                )?;
+                let label = self.label(&g);
+                self.groups.leave(node, &g)?;
+                println!("* left {label}");
             }
             "list" => self.list(name),
             other => bail!("unknown /group {other}; try /help"),

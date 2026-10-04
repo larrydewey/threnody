@@ -326,3 +326,54 @@ fn members_forward_messages_for_each_other() {
         Err(GroupError::UnknownGroup)
     ));
 }
+
+#[test]
+fn members_leave_and_owners_delete() {
+    let (a, b, c) = (
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+    );
+    let (pa, pb, pc) = (a.public(), b.public(), c.public());
+    let mut net = Net::new(&[&a, &b, &c]);
+    let g = net.node(&pa).create("team").unwrap();
+    for p in [pb, pc] {
+        let out = net.node(&pa).invite(&g, p).unwrap();
+        net.deliver(pa, out);
+    }
+    net.take(&pa);
+    net.take(&pb);
+
+    // The owner can't just leave; a member can.
+    assert!(net.node(&pa).leave(&g).is_err());
+    let out = net.node(&pc).leave(&g).unwrap();
+    assert!(out.events.contains(&GroupEvent::Left { group: g }));
+    assert!(net.node(&pc).list().is_empty(), "forgotten at once");
+    net.deliver(pc, out);
+    assert!(net.take(&pb).contains(&GroupEvent::MemberRemoved {
+        group: g,
+        member: pc
+    }));
+    let members = |n: &mut Net, p: &PublicIdentity| n.node(p).list()[0].3.len();
+    assert_eq!(members(&mut net, &pa), 2);
+    assert_eq!(members(&mut net, &pb), 2);
+    // A leave request only works on the owner, from a member.
+    assert!(
+        net.node(&pb)
+            .handle(pa, GroupWire::Leave { group: g })
+            .is_err()
+    );
+    assert!(
+        net.node(&pa)
+            .handle(pc, GroupWire::Leave { group: g })
+            .is_err()
+    );
+
+    // Deleting removes everyone; nothing survives a restart.
+    let out = net.node(&pa).disband(&g).unwrap();
+    net.deliver(pa, out);
+    assert!(net.take(&pb).contains(&GroupEvent::Left { group: g }));
+    assert!(net.node(&pa).list().is_empty() && net.node(&pb).list().is_empty());
+    let saved = net.node(&pa).export().unwrap();
+    assert!(Groups::restore(&a, &saved).unwrap().list().is_empty());
+}

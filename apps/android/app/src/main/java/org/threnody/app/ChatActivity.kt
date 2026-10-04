@@ -462,6 +462,7 @@ class ChatActivity : Activity() {
         PopupMenu(this, anchor).apply {
             menu.add("Members").setOnMenuItemClickListener { members(); true }
             if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
+            menu.add(if (g.owned) "Delete group" else "Leave group").setOnMenuItemClickListener { leaveGroup(); true }
             show()
         }
     }
@@ -532,6 +533,24 @@ class ChatActivity : Activity() {
                     .show()
             }
         }
+    }
+
+    private fun leaveGroup() {
+        val g = info ?: return
+        AlertDialog.Builder(this)
+            .setTitle(if (g.owned) "Delete ${g.name}?" else "Leave ${g.name}?")
+            .setMessage(
+                if (g.owned) "Everyone is removed and the group ends. Its history stays on your devices."
+                else "You stop receiving its messages. Its history stays on your devices; the owner can invite you again.",
+            )
+            .setPositiveButton(if (g.owned) "Delete" else "Leave") { _, _ ->
+                worker.execute {
+                    run(if (g.owned) "delete the group" else "leave") { node.leaveGroup(g.id) }
+                    runOnUiThread { finish() }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun declineGroup() {
