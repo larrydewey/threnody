@@ -3057,9 +3057,11 @@ dependencies = [
 name = "threnody-ffi"
 version = "0.1.0"
 dependencies = [
+ "qrcode",
  "tempfile",
  "thiserror",
  "threnody-core",
+ "threnody-groups",
  "threnody-net",
  "tokio",
  "uniffi",

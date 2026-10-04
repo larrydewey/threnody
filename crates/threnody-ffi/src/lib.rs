@@ -5,9 +5,11 @@
 //! node's own Tokio runtime, so apps call it from a background thread and
 //! drain events with [`ThrenodyNode::next_event`].
 
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use threnody_core::history::FileNote;
 use threnody_core::store::{Home, Lookup};
 use threnody_core::{AppMessage, Fingerprint, PublicIdentity, safety_number};
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
@@ -15,6 +17,11 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 uniffi::setup_scaffolding!();
+
+mod groups;
+
+use groups::GroupState;
+pub use groups::{GroupInfo, GroupInvite};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ThrenodyError {
@@ -50,6 +57,37 @@ pub struct HistoryEntry {
     pub device: String,
     pub text: String,
     pub disappearing: bool,
+    /// Set when the entry is a file transfer (then `text` is empty).
+    pub file: Option<FileInfo>,
+}
+
+/// A file in history: its name, size and where the app saved it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FileInfo {
+    pub name: String,
+    pub size: u64,
+    pub location: Option<String>,
+}
+
+/// A QR code as a square of modules, row by row (`true` = dark).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct QrMatrix {
+    pub size: u32,
+    pub dark: Vec<bool>,
+}
+
+/// Encodes `text` (an invite link or link code) as a QR code for apps to draw.
+#[uniffi::export]
+pub fn qr_matrix(text: String) -> Result<QrMatrix> {
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(fail)?;
+    Ok(QrMatrix {
+        size: u32::try_from(code.width()).map_err(fail)?,
+        dark: code
+            .to_colors()
+            .into_iter()
+            .map(|c| c == qrcode::Color::Dark)
+            .collect(),
+    })
 }
 
 /// An approved contact heard over Bluetooth that this device should dial.
@@ -106,6 +144,34 @@ pub enum NodeEvent {
     WifiDirectRequested {
         peer: String,
     },
+    /// We joined a group (after accepting, or automatically when a
+    /// mutually approved contact invited us).
+    GroupJoined {
+        group: String,
+        name: String,
+        owner: String,
+    },
+    /// Someone who isn't a mutually approved contact invites us: ask the
+    /// user, then `accept_group_invite` or `decline_group_invite`.
+    GroupInvited {
+        group: String,
+        name: String,
+        from: String,
+    },
+    GroupMembersChanged {
+        group: String,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+    /// The owner removed us.
+    GroupLeft {
+        group: String,
+    },
+    GroupMessage {
+        group: String,
+        from: String,
+        text: String,
+    },
     /// Anything else, described for logs.
     Other {
         description: String,
@@ -157,6 +223,29 @@ pub struct ThrenodyNode {
     rt: Runtime,
     node: Node,
     events: Mutex<UnboundedReceiver<Event>>,
+    groups: Mutex<GroupState>,
+    /// Events produced while handling another (group traffic), not yet returned.
+    queued: Mutex<VecDeque<NodeEvent>>,
+}
+
+fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntry> {
+    entries
+        .iter()
+        .map(|e| HistoryEntry {
+            at_ms: e.at_ms,
+            outgoing: e.outgoing,
+            device: PublicIdentity::from_bytes(&e.device)
+                .map(|d| fp(&d))
+                .unwrap_or_default(),
+            text: e.text.clone(),
+            disappearing: e.expires_at_ms.is_some(),
+            file: e.file.as_ref().map(|f| FileInfo {
+                name: f.name.clone(),
+                size: f.size,
+                location: f.location.clone(),
+            }),
+        })
+        .collect()
 }
 
 fn fp(p: &PublicIdentity) -> String {
@@ -229,6 +318,26 @@ fn convert(e: Event) -> NodeEvent {
 }
 
 impl ThrenodyNode {
+    fn group_state(&self) -> MutexGuard<'_, GroupState> {
+        self.groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn queued(&self) -> MutexGuard<'_, VecDeque<NodeEvent>> {
+        self.queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Tries for a while to get a session with `p` (directly or through
+    /// relays); callers find out whether it worked when they send.
+    fn try_reach(&self, p: &PublicIdentity) {
+        let _ = self.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), self.node.reach_peer(p)).await
+        });
+    }
+
     fn resolve(&self, peer: &str) -> Result<PublicIdentity> {
         match self.node.contacts().find(peer) {
             Lookup::Found(c) => Ok(c.key),
@@ -257,6 +366,7 @@ impl ThrenodyNode {
             .enable_all()
             .build()
             .map_err(fail)?;
+        let groups = GroupState::load(&home, &identity)?;
         let (node, events) = {
             let _guard = rt.enter();
             Node::new(NodeConfig {
@@ -272,6 +382,8 @@ impl ThrenodyNode {
             rt,
             node,
             events: Mutex::new(events),
+            groups: Mutex::new(groups),
+            queued: Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -331,20 +443,104 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
+    /// Dials every mutually approved contact that isn't connected, at its
+    /// last known address or through relays. Returns at once; sessions
+    /// show up as `Connected` events. Apps call it on start and when the
+    /// network comes back.
+    pub fn reconnect(&self) {
+        let live: Vec<PublicIdentity> = self.node.sessions().iter().map(|s| s.peer).collect();
+        for c in self.node.contacts().iter() {
+            if !c.mutually_approved() || live.contains(&c.key) {
+                continue;
+            }
+            let (node, peer) = (self.node.clone(), c.key);
+            self.rt.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(30), node.reach_peer(&peer)).await;
+            });
+        }
+    }
+
     /// Sends text to every device of `peer`'s account: live where
     /// connected (reaching `peer` through relays if need be), sealed for
     /// mailboxes otherwise; recorded in history.
     /// Returns how many devices it reached.
     pub fn send_text(&self, peer: String, text: String) -> Result<u32> {
         let p = self.resolve(&peer)?;
-        // No session: try to reach it (directly or through relays) before
-        // falling back to sealed delivery.
-        let _ = self.rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(15), self.node.reach_peer(&p)).await
-        });
+        // No session: try to reach it before falling back to sealed delivery.
+        self.try_reach(&p);
         let _guard = self.rt.enter();
         let r = self.node.send_text(&p, &text).map_err(fail)?;
         Ok(u32::try_from(r.live + r.sealed).unwrap_or(u32::MAX))
+    }
+
+    /// Sends a file (at most `max_file_size` bytes) to `peer`, reaching
+    /// them directly or through relays; fails if they can't be reached.
+    /// It is recorded in history with `location`, where the file lives on
+    /// this device (a path or URI).
+    pub fn send_file(
+        &self,
+        peer: String,
+        name: String,
+        data: Vec<u8>,
+        location: Option<String>,
+    ) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        if data.len() > threnody_core::message::MAX_FILE {
+            return Err(fail(format!(
+                "file larger than {} bytes",
+                threnody_core::message::MAX_FILE
+            )));
+        }
+        // Files aren't sealed for mailboxes: they need a live session.
+        self.try_reach(&p);
+        let _guard = self.rt.enter();
+        self.node
+            .send(
+                &p,
+                AppMessage::File {
+                    sent_ms: threnody_core::now_ms(),
+                    name: name.clone(),
+                    data: data.clone(),
+                },
+            )
+            .map_err(fail)?;
+        self.node.record_file(
+            &p,
+            true,
+            FileNote {
+                name,
+                size: data.len() as u64,
+                location,
+            },
+        );
+        Ok(())
+    }
+
+    /// Records a received file (from a `File` event) in history once the
+    /// app has saved it at `location`.
+    pub fn record_received_file(
+        &self,
+        peer: String,
+        name: String,
+        size: u64,
+        location: Option<String>,
+    ) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node.record_file(
+            &p,
+            false,
+            FileNote {
+                name,
+                size,
+                location,
+            },
+        );
+        Ok(())
+    }
+
+    /// The largest file `send_file` accepts.
+    pub fn max_file_size(&self) -> u64 {
+        threnody_core::message::MAX_FILE as u64
     }
 
     /// The last `limit` messages with `peer` (oldest first).
@@ -354,18 +550,7 @@ impl ThrenodyNode {
             .node
             .history(self.node.conversation_for(&p))
             .map_err(fail)?;
-        Ok(h.recent(limit as usize)
-            .iter()
-            .map(|e| HistoryEntry {
-                at_ms: e.at_ms,
-                outgoing: e.outgoing,
-                device: PublicIdentity::from_bytes(&e.device)
-                    .map(|d| fp(&d))
-                    .unwrap_or_default(),
-                text: e.text.clone(),
-                disappearing: e.expires_at_ms.is_some(),
-            })
-            .collect())
+        Ok(history_entries(h.recent(limit as usize)))
     }
 
     /// Sets the disappearing-message timer with `peer` (`None` = off).
@@ -410,6 +595,17 @@ impl ThrenodyNode {
     pub fn safety_number(&self, peer: String) -> Result<String> {
         let p = self.resolve(&peer)?;
         Ok(safety_number(&self.node.identity(), &p))
+    }
+
+    /// Records that the safety number with `peer` was compared out of band.
+    pub fn mark_verified(&self, peer: String) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node.update_contacts(|c| {
+            if let Some(c) = c.get_mut(&p) {
+                c.verified = true;
+            }
+        });
+        Ok(())
     }
 
     /// A one-time code for a new device to join this account.
@@ -543,18 +739,36 @@ impl ThrenodyNode {
 
     /// Waits up to `timeout_ms` for the next event.
     pub fn next_event(&self, timeout_ms: u32) -> Option<NodeEvent> {
-        let mut rx = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Build the timer inside the runtime (it needs the reactor).
-        self.rt
-            .block_on(async {
-                tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), rx.recv()).await
-            })
-            .ok()
-            .flatten()
-            .map(convert)
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            if let Some(e) = self.queued().pop_front() {
+                return Some(e);
+            }
+            let next = {
+                let mut rx = self
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Build the timer inside the runtime (it needs the reactor).
+                self.rt
+                    .block_on(async { tokio::time::timeout_at(deadline, rx.recv()).await })
+                    .ok()
+                    .flatten()?
+            };
+            // Group traffic goes to the MLS engine; what it yields is queued.
+            match next {
+                Event::Message {
+                    peer,
+                    msg: AppMessage::Group(payload),
+                }
+                | Event::OfflineMessage {
+                    from: peer,
+                    msg: AppMessage::Group(payload),
+                    ..
+                } => self.group_incoming(peer, &payload),
+                other => return Some(convert(other)),
+            }
+        }
     }
 
     /// Stops listening and closes every session.
@@ -576,6 +790,14 @@ mod tests {
             }
         }
         panic!("event did not arrive");
+    }
+
+    #[test]
+    fn qr_matrix_is_square() {
+        let q = qr_matrix("threnody://ABC@192.0.2.7:7450".into()).unwrap();
+        assert!(q.size >= 21);
+        assert_eq!(q.dark.len(), (q.size * q.size) as usize);
+        assert!(q.dark[0], "finder pattern corner is dark");
     }
 
     #[test]
@@ -604,6 +826,33 @@ mod tests {
                 offline: false
             }
         );
+        alice
+            .send_file(
+                bob_fp.clone(),
+                "notes.txt".into(),
+                b"some notes".to_vec(),
+                Some("/tmp/notes.txt".into()),
+            )
+            .unwrap();
+        let f = wait(&bob, |e| matches!(e, NodeEvent::File { .. }));
+        assert!(
+            matches!(f, NodeEvent::File { name, data, .. } if name == "notes.txt" && data == b"some notes")
+        );
+        let too_big = vec![0u8; usize::try_from(alice.max_file_size()).unwrap() + 1];
+        assert!(
+            alice
+                .send_file(bob_fp.clone(), "big".into(), too_big, None)
+                .is_err()
+        );
+        bob.record_received_file(alice.device_fingerprint(), "notes.txt".into(), 10, None)
+            .unwrap();
+        alice.mark_verified(bob_fp.clone()).unwrap();
+        assert!(
+            alice
+                .contacts()
+                .iter()
+                .any(|c| c.fingerprint == bob_fp && c.verified)
+        );
         alice.set_approval(bob_fp.clone(), true).unwrap();
         bob.set_approval(alice.device_fingerprint(), true).unwrap();
         wait(&alice, |e| {
@@ -616,8 +865,13 @@ mod tests {
                 .any(|c| c.fingerprint == bob_fp && c.mutually_approved && c.connected)
         );
         let h = alice.history(bob_fp.clone(), 10).unwrap();
-        assert_eq!(h.len(), 1);
+        assert_eq!(h.len(), 2);
         assert!(h[0].outgoing && h[0].text == "hello from an app");
+        let f = h[1].file.as_ref().unwrap();
+        assert!(h[1].outgoing && f.name == "notes.txt" && f.size == 10);
+        assert_eq!(f.location.as_deref(), Some("/tmp/notes.txt"));
+        let hb = bob.history(alice.device_fingerprint(), 10).unwrap();
+        assert!(!hb[1].outgoing && hb[1].file.as_ref().is_some_and(|f| f.name == "notes.txt"));
         assert_eq!(
             bob.history(alice.device_fingerprint(), 10).unwrap()[0].text,
             "hello from an app"
@@ -688,6 +942,151 @@ mod tests {
         // A protected identity needs its passphrase.
         drop(bob);
         assert!(ThrenodyNode::open(dir.path().join("b").display().to_string(), None).is_err());
+    }
+
+    /// Pumps several nodes' events (every node must run for group
+    /// handshakes to progress), keeping each node's events until asked for.
+    struct Pump<'a> {
+        nodes: Vec<&'a ThrenodyNode>,
+        seen: Vec<VecDeque<NodeEvent>>,
+    }
+
+    impl<'a> Pump<'a> {
+        fn new(nodes: &[&'a ThrenodyNode]) -> Self {
+            Self {
+                nodes: nodes.to_vec(),
+                seen: vec![VecDeque::new(); nodes.len()],
+            }
+        }
+
+        /// The first event of node `target` matching `pred` (earlier ones are dropped).
+        fn until(&mut self, target: usize, pred: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
+            for _ in 0..400 {
+                while let Some(e) = self.seen[target].pop_front() {
+                    if pred(&e) {
+                        return e;
+                    }
+                }
+                for (i, n) in self.nodes.iter().enumerate() {
+                    if let Some(e) = n.next_event(5) {
+                        self.seen[i].push_back(e);
+                    }
+                }
+            }
+            panic!("event did not arrive");
+        }
+    }
+
+    #[test]
+    fn reconnect_redials_approved_contacts_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        let alice = ThrenodyNode::open(path("a"), None).unwrap();
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let bob = ThrenodyNode::open(path("b"), None).unwrap();
+        let a_fp = bob.connect(alice.invite_link(addr)).unwrap();
+        let b_fp = bob.device_fingerprint();
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp.clone(), true).unwrap();
+        wait(&bob, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+
+        bob.shutdown();
+        drop(bob);
+        let bob = ThrenodyNode::open(path("b"), None).unwrap();
+        assert!(bob.contacts().iter().all(|c| !c.connected));
+        bob.reconnect();
+        let e = wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        assert!(matches!(e, NodeEvent::Connected { peer, .. } if peer == a_fp));
+    }
+
+    #[test]
+    fn groups_invite_chat_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let open =
+            |n: &str| ThrenodyNode::open(dir.path().join(n).display().to_string(), None).unwrap();
+        let (alice, bob, carol) = (open("a"), open("b"), open("c"));
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let a_fp = alice.device_fingerprint();
+        for n in [&bob, &carol] {
+            n.connect(alice.invite_link(addr.clone())).unwrap();
+        }
+        let mut all = Pump::new(&[&*alice, &*bob, &*carol]);
+        let (b_fp, c_fp) = (bob.device_fingerprint(), carol.device_fingerprint());
+        all.until(
+            0,
+            |e| matches!(e, NodeEvent::Connected { peer, .. } if *peer == c_fp),
+        );
+        // Bob approves Alice mutually, so he joins without asking.
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp.clone(), true).unwrap();
+        all.until(1, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+
+        let g = alice.create_group("climbing".into()).unwrap();
+        alice.invite_to_group(g.clone(), b_fp.clone()).unwrap();
+        let joined = all.until(1, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+        assert_eq!(
+            joined,
+            NodeEvent::GroupJoined {
+                group: g.clone(),
+                name: "climbing".into(),
+                owner: a_fp.clone()
+            }
+        );
+
+        // Carol isn't approved: she is asked first.
+        alice.invite_to_group(g.clone(), c_fp.clone()).unwrap();
+        all.until(
+            2,
+            |e| matches!(e, NodeEvent::GroupInvited { from, .. } if *from == a_fp),
+        );
+        assert_eq!(carol.group_invites().len(), 1);
+        carol.accept_group_invite(g[..6].into()).unwrap();
+        all.until(2, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+        all.until(1, |e| matches!(e, NodeEvent::GroupMembersChanged { added, .. } if *added == [c_fp.clone()]));
+        assert!(carol.group_invites().is_empty());
+        let info = &bob.groups()[0];
+        assert_eq!(info.members.len(), 3);
+        assert!(!info.owned && alice.groups()[0].owned);
+
+        // Carol has no session with Bob: her messages reach him through
+        // Alice once Alice and Carol approve each other.
+        alice.set_approval(c_fp.clone(), true).unwrap();
+        carol.set_approval(a_fp.clone(), true).unwrap();
+        all.until(2, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+        carol.send_group_text(g.clone(), "hi all".into()).unwrap();
+        for i in [0, 1] {
+            let m = all.until(i, |e| matches!(e, NodeEvent::GroupMessage { .. }));
+            assert_eq!(
+                m,
+                NodeEvent::GroupMessage {
+                    group: g.clone(),
+                    from: c_fp.clone(),
+                    text: "hi all".into()
+                }
+            );
+        }
+        assert_eq!(bob.group_history(g.clone(), 10).unwrap()[0].text, "hi all");
+        assert!(carol.group_history(g.clone(), 10).unwrap()[0].outgoing);
+
+        // Only the owner removes members.
+        assert!(bob.remove_from_group(g.clone(), c_fp.clone()).is_err());
+        alice.remove_from_group(g.clone(), c_fp.clone()).unwrap();
+        all.until(2, |e| matches!(e, NodeEvent::GroupLeft { .. }));
+        all.until(1, |e| matches!(e, NodeEvent::GroupMembersChanged { removed, .. } if *removed == [c_fp.clone()]));
+        assert!(carol.groups().is_empty());
+
+        // Groups survive a restart.
+        drop(all);
+        bob.shutdown();
+        drop(bob);
+        assert_eq!(open("b").groups()[0].members.len(), 2);
     }
 
     /// Large frames over a slow, chunked, back-pressured link (like an

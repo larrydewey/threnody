@@ -60,6 +60,18 @@ pub struct Entry {
     pub text: String,
     pub offline: bool,
     pub expires_at_ms: Option<u64>,
+    /// Set when the entry records a file transfer (then `text` is empty).
+    pub file: Option<FileNote>,
+}
+
+/// A file sent or received. The contents aren't kept here, only where the
+/// app stored them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileNote {
+    pub name: String,
+    pub size: u64,
+    /// A local path or platform URI for the saved file, if any.
+    pub location: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -101,7 +113,13 @@ impl History {
         let size: usize = self
             .entries
             .iter()
-            .map(|e| e.text.len() + 80)
+            .map(|e| {
+                e.text.len()
+                    + 80
+                    + e.file.as_ref().map_or(0, |f| {
+                        f.name.len() + f.location.as_ref().map_or(0, String::len) + 32
+                    })
+            })
             .sum::<usize>()
             + 32;
         cbor::to_vec(size, |enc| {
@@ -112,7 +130,9 @@ impl History {
             }
             enc.u8(2)?.array_len(self.entries.len())?;
             for e in &self.entries {
-                enc.map_len(5 + usize::from(e.expires_at_ms.is_some()))?;
+                enc.map_len(
+                    5 + usize::from(e.expires_at_ms.is_some()) + usize::from(e.file.is_some()),
+                )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
                 enc.u8(2)?.bytes(&e.device)?;
@@ -120,6 +140,14 @@ impl History {
                 enc.u8(4)?.bool(e.offline)?;
                 if let Some(x) = e.expires_at_ms {
                     enc.u8(5)?.u64(x)?;
+                }
+                if let Some(f) = &e.file {
+                    enc.u8(6)?.map_len(2 + usize::from(f.location.is_some()))?;
+                    enc.u8(0)?.str(&f.name)?;
+                    enc.u8(1)?.u64(f.size)?;
+                    if let Some(l) = &f.location {
+                        enc.u8(2)?.str(l)?;
+                    }
                 }
             }
             Ok(())
@@ -135,8 +163,8 @@ impl History {
                 1 => timer = Some(d.u32()?),
                 2 => {
                     for _ in 0..d.array_len()? {
-                        let (mut at, mut out, mut dev, mut text, mut off, mut exp) =
-                            (None, None, None, None, None, None);
+                        let (mut at, mut out, mut dev, mut text, mut off, mut exp, mut file) =
+                            (None, None, None, None, None, None, None);
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -145,6 +173,7 @@ impl History {
                                 3 => text = Some(d.str()?.to_owned()),
                                 4 => off = Some(d.bool()?),
                                 5 => exp = Some(d.u64()?),
+                                6 => file = Some(decode_file(d)?),
                                 _ => return Ok(false),
                             }
                             Ok(true)
@@ -156,6 +185,7 @@ impl History {
                             text: required(text, "text")?,
                             offline: off.unwrap_or(false),
                             expires_at_ms: exp,
+                            file,
                         });
                     }
                 }
@@ -172,6 +202,24 @@ impl History {
             entries,
         })
     }
+}
+
+fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
+    let (mut name, mut size, mut location) = (None, None, None);
+    read_map(d, |k, d| {
+        match k {
+            0 => name = Some(d.str()?.to_owned()),
+            1 => size = Some(d.u64()?),
+            2 => location = Some(d.str()?.to_owned()),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    Ok(FileNote {
+        name: required(name, "file name")?,
+        size: required(size, "file size")?,
+        location,
+    })
 }
 
 impl Home {
@@ -283,6 +331,7 @@ mod tests {
             text: text.into(),
             offline: false,
             expires_at_ms: exp,
+            file: None,
         }
     }
 
@@ -355,6 +404,28 @@ mod tests {
         assert_eq!(h.entries().len(), MAX_ENTRIES);
         assert_eq!(h.entries()[0].at_ms, 5, "oldest dropped first");
         assert_eq!(h.recent(2).len(), 2);
+        h.push(
+            Entry {
+                file: Some(FileNote {
+                    name: "photo.jpg".into(),
+                    size: 1234,
+                    location: Some("content://media/1".into()),
+                }),
+                ..entry(MAX_ENTRIES as u64 + 6, "", None)
+            },
+            0,
+        );
+        h.push(
+            Entry {
+                file: Some(FileNote {
+                    name: "notes.txt".into(),
+                    size: 0,
+                    location: None,
+                }),
+                ..entry(MAX_ENTRIES as u64 + 7, "", None)
+            },
+            0,
+        );
         let again = History::decode(&h.encode().unwrap()).unwrap();
         assert_eq!(again, h);
     }

@@ -64,7 +64,7 @@ On stream transports, each frame is prefixed with its length as a `u32` in big-e
 
 ## Local storage
 
-All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
+All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A file transfer is stored as an entry with empty text and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location }`). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
 
 Both files are written with mode 0600 inside a directory with mode 0700.
 

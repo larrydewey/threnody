@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use threnody_core::history::{ConversationId, Entry, History};
+use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::error::{NetError, Result};
@@ -103,6 +103,34 @@ impl Node {
             text: text.to_owned(),
             offline,
             expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
+            file: None,
+        };
+        let _ = self
+            .shared
+            .home
+            .append_history(self.identity_ref(), conv, entry, now);
+    }
+
+    /// Records a file sent to or received from `peer`'s conversation, with
+    /// where the app saved it. It follows the conversation's
+    /// disappearing-message timer.
+    pub fn record_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote) {
+        let conv = self.conversation_for(peer);
+        let timer = self.history(conv).map(|h| h.timer_s).unwrap_or(None);
+        let now = now_ms();
+        let device = if outgoing {
+            *self.identity().as_bytes()
+        } else {
+            *peer.as_bytes()
+        };
+        let entry = Entry {
+            at_ms: now,
+            outgoing,
+            device,
+            text: String::new(),
+            offline: false,
+            expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
+            file: Some(file),
         };
         let _ = self
             .shared

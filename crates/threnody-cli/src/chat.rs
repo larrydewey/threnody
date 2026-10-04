@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use threnody_core::history::FileNote;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, now_ms, safety_number};
 use threnody_net::mailbox::DepositStatus;
@@ -272,7 +273,8 @@ impl Ui {
         match msg {
             AppMessage::Text { body, .. } => println!("<{who}> {body}"),
             AppMessage::File { name, data, .. } => {
-                match save_download(&self.downloads, &name, &data) {
+                let saved = save_download(&self.downloads, &name, &data);
+                match &saved {
                     Ok(p) => println!(
                         "* {who} sent {name} ({} bytes) -> {}",
                         data.len(),
@@ -280,6 +282,15 @@ impl Ui {
                     ),
                     Err(e) => println!("! could not save file from {who}: {e:#}"),
                 }
+                self.node.record_file(
+                    &peer,
+                    false,
+                    FileNote {
+                        name,
+                        size: data.len() as u64,
+                        location: saved.ok().map(|p| p.display().to_string()),
+                    },
+                );
             }
             AppMessage::Group(payload) => {
                 let node = self.node.clone();
@@ -330,7 +341,18 @@ impl Ui {
                 (true, None) => " (offline)",
                 _ => "",
             };
-            println!("  [{}] <{who}> {}{mark}", clock(e.at_ms), e.text);
+            match &e.file {
+                Some(f) => println!(
+                    "  [{}] <{who}> file {} ({} bytes){}{mark}",
+                    clock(e.at_ms),
+                    f.name,
+                    f.size,
+                    f.location
+                        .as_ref()
+                        .map_or_else(String::new, |l| format!(" at {l}"))
+                ),
+                None => println!("  [{}] <{who}> {}{mark}", clock(e.at_ms), e.text),
+            }
         }
         Ok(())
     }
@@ -711,10 +733,21 @@ impl Ui {
                     &peer,
                     AppMessage::File {
                         sent_ms: now_ms(),
-                        name,
+                        name: name.clone(),
                         data,
                     },
                 )?;
+                self.node.record_file(
+                    &peer,
+                    true,
+                    FileNote {
+                        name,
+                        size: len as u64,
+                        location: std::fs::canonicalize(path)
+                            .ok()
+                            .map(|p| p.display().to_string()),
+                    },
+                );
                 println!("* sent {len} bytes to {}", self.name(&peer));
             }
             "drop" => {

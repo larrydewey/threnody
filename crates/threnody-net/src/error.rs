@@ -8,7 +8,7 @@ pub enum NetError {
     Protocol(#[from] threnody_core::Error),
     #[error("frame exceeds maximum size")]
     FrameTooLarge,
-    #[error("peer closed the connection during the handshake")]
+    #[error("connection closed (or peer not connected)")]
     Closed,
     #[error("handshake timed out")]
     Timeout,
