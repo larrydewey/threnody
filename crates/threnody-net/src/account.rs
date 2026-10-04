@@ -624,7 +624,9 @@ impl Node {
                 device: me,
                 name: match &link.action {
                     Action::Add { name, .. } => name.clone(),
-                    Action::Remove { .. } => return Err(NetError::Refused("not an add".into())),
+                    Action::Remove { .. } | Action::Rename { .. } => {
+                        return Err(NetError::Refused("not an add".into()));
+                    }
                 },
             });
             if expected.body()? != link.body()? || !chain.state().has(&from) {
@@ -674,6 +676,35 @@ impl Node {
         } else {
             self.revoke_device(device);
         }
+        Ok(())
+    }
+
+    /// Renames a device of our account (any of them, including this one)
+    /// and tells every peer; contacts see the new name too.
+    pub fn rename_device(&self, device: &PublicIdentity, name: &str) -> Result<()> {
+        let name = threnody_core::account::clean_name(name.trim());
+        if name.is_empty() {
+            return Err(NetError::Refused("empty device name".into()));
+        }
+        {
+            let mut own = lock(&self.shared.account);
+            if !own.state().has(device) {
+                return Err(NetError::Refused("not a device of this account".into()));
+            }
+            let mut link = own.propose(Action::Rename {
+                device: *device,
+                name,
+            });
+            link.sign(self.identity_ref())?;
+            own.append(link)?;
+        }
+        self.persist_account();
+        self.broadcast_chain();
+        self.emit(Event::AccountChanged {
+            account: self.account().id(),
+            added: vec![],
+            removed: vec![],
+        });
         Ok(())
     }
 

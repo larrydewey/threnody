@@ -277,3 +277,40 @@ async fn history_follows_us_across_our_devices() {
     assert_eq!(texts(&phone.node, &bid).len(), 4);
     assert_eq!(texts(&laptop.node, &bid).len(), 4);
 }
+
+#[tokio::test]
+async fn renaming_a_device_reaches_siblings_and_contacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::DeviceLinked { .. })).await;
+    let pid = phone.node.identity();
+
+    // The laptop names the phone; the phone and Bob learn it.
+    laptop.node.rename_device(&pid, "Pixel 8a").unwrap();
+    let name = |n: &Node| n.account().state().name_of(&pid).map(str::to_owned);
+    wait_for(|| name(&phone.node).as_deref() == Some("Pixel 8a")).await;
+    let account = laptop.node.account().id();
+    wait_for(|| {
+        bob.node
+            .known_accounts()
+            .get(&account)
+            .and_then(|c| c.state().name_of(&pid).map(str::to_owned))
+            .as_deref()
+            == Some("Pixel 8a")
+    })
+    .await;
+    // Only devices of the account, and real names.
+    assert!(
+        laptop
+            .node
+            .rename_device(&bob.node.identity(), "x")
+            .is_err()
+    );
+    assert!(laptop.node.rename_device(&pid, " \n ").is_err());
+    let _ = (&mut bob.rx, &mut phone.rx);
+}

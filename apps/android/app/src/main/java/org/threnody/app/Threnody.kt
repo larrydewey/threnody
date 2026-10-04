@@ -45,6 +45,25 @@ object Threnody {
         pump(ctx.applicationContext, it)
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)
+        nameThisDevice(it)
+    }
+
+    /**
+     * New identities are called "device"; give this one the phone's model
+     * name (its siblings and contacts see it). A name the user chose stays.
+     */
+    private fun nameThisDevice(node: ThrenodyNode) {
+        val me = node.devices().firstOrNull { it.thisDevice } ?: return
+        if (me.name != "device") return
+        val model = listOf(android.os.Build.MANUFACTURER, android.os.Build.MODEL)
+            .let { (maker, model) -> if (model.startsWith(maker, ignoreCase = true)) model else "$maker $model" }
+            .replaceFirstChar { it.uppercase() }
+        try {
+            node.renameDevice(me.fingerprint, model)
+            say("* named this device \"$model\"")
+        } catch (e: Exception) {
+            say("! naming this device: ${e.message}")
+        }
     }
 
     private val redialer = Executors.newSingleThreadScheduledExecutor { r ->

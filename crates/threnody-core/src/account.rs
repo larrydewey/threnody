@@ -44,6 +44,11 @@ pub enum Action {
     Remove {
         device: PublicIdentity,
     },
+    /// A new display name for a current device; membership is unchanged.
+    Rename {
+        device: PublicIdentity,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +142,11 @@ fn encode_action(e: &mut Encoder<'_>, a: &Action) -> core::result::Result<(), co
             e.map_len(2)?.u8(0)?.u8(2)?;
             e.u8(1)?.bytes(device.as_bytes())?;
         }
+        Action::Rename { device, name } => {
+            e.map_len(3)?.u8(0)?.u8(3)?;
+            e.u8(1)?.bytes(device.as_bytes())?;
+            e.u8(2)?.str(name)?;
+        }
     }
     Ok(())
 }
@@ -153,15 +163,23 @@ fn decode_action(d: &mut Decoder<'_>) -> Result<Action> {
         Ok(true)
     })?;
     let device = PublicIdentity::from_bytes(&required(device, "device key")?)?;
-    Ok(match required(op, "account action")? {
-        1 => {
-            let name = required(name, "device name")?;
-            if name.chars().count() > MAX_DEVICE_NAME || name.chars().any(char::is_control) {
-                return Err(Error::Malformed("device name"));
-            }
-            Action::Add { device, name }
+    let checked = |name: Option<String>| -> Result<String> {
+        let name = required(name, "device name")?;
+        if name.chars().count() > MAX_DEVICE_NAME || name.chars().any(char::is_control) {
+            return Err(Error::Malformed("device name"));
         }
+        Ok(name)
+    };
+    Ok(match required(op, "account action")? {
+        1 => Action::Add {
+            device,
+            name: checked(name)?,
+        },
         2 => Action::Remove { device },
+        3 => Action::Rename {
+            device,
+            name: checked(name)?,
+        },
         other => return Err(Error::UnexpectedType(u64::from(other))),
     })
 }
@@ -401,6 +419,15 @@ fn apply(st: &mut AccountState, link: &Link) -> Result<()> {
             st.devices.retain(|(d, _)| d != device);
             st.removed.push(*device);
         }
+        Action::Rename { device, name } => {
+            if clean_name(name) != *name {
+                return Err(Error::Malformed("device name"));
+            }
+            let Some((_, n)) = st.devices.iter_mut().find(|(d, _)| d == device) else {
+                return Err(Error::Malformed("renaming a device not in the account"));
+            };
+            n.clone_from(name);
+        }
     }
     st.threshold = link.threshold;
     st.seq = link.seq;
@@ -408,7 +435,9 @@ fn apply(st: &mut AccountState, link: &Link) -> Result<()> {
     Ok(())
 }
 
-fn clean_name(name: &str) -> String {
+/// A device name as the chain stores it: no control characters, at most
+/// [`MAX_DEVICE_NAME`] characters.
+pub fn clean_name(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_control())
         .take(MAX_DEVICE_NAME)
@@ -603,6 +632,46 @@ mod tests {
         }
         link.sign(new)?;
         chain.append(link)
+    }
+
+    #[test]
+    fn devices_can_be_renamed_by_the_account_only() {
+        let (a, b, outsider) = (
+            Identity::generate(),
+            Identity::generate(),
+            Identity::generate(),
+        );
+        let mut chain = AccountChain::genesis(&a, "device").unwrap();
+        add(&mut chain, &[&a], &b, "opaque").unwrap();
+        let id = chain.id();
+        let rename = |chain: &AccountChain, d: &Identity, name: &str| {
+            chain.propose(Action::Rename {
+                device: d.public(),
+                name: name.into(),
+            })
+        };
+        // Either device may rename either device.
+        let mut l = rename(&chain, &a, "Pixel 8a");
+        l.sign(&b).unwrap();
+        chain.append(l).unwrap();
+        assert_eq!(chain.state().name_of(&a.public()), Some("Pixel 8a"));
+        assert_eq!(chain.state().devices.len(), 2, "membership unchanged");
+        assert_eq!(chain.id(), id);
+        // It survives the wire, and old links still verify.
+        let again = AccountChain::decode(&chain.encode().unwrap()).unwrap();
+        assert_eq!(again.state().name_of(&a.public()), Some("Pixel 8a"));
+        assert!(again.extends(&chain) && chain.extends(&again));
+        // Not by an outsider, not of an outsider, not with a bad name.
+        let mut l = rename(&chain, &b, "evil");
+        l.sign(&outsider).unwrap();
+        assert!(chain.clone().append(l).is_err());
+        let mut l = rename(&chain, &outsider, "ghost");
+        l.sign(&a).unwrap();
+        assert!(chain.clone().append(l).is_err());
+        let mut l = rename(&chain, &b, "bad\nname");
+        l.sign(&a).unwrap();
+        assert!(chain.clone().append(l).is_err(), "control characters");
+        assert_eq!(clean_name("bad\nname"), "badname");
     }
 
     #[test]

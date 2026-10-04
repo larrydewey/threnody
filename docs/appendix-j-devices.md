@@ -12,6 +12,7 @@ An account is a hash-linked list of signed changes to its device set:
 Link   = { 0: seq u64, 1: prev (32), 2: threshold u8, 3: action, 4: [ Sig ] }
 action = { 0: 1 add,    1: device key (32), 2: name tstr }
        / { 0: 2 remove, 1: device key (32) }
+       / { 0: 3 rename, 1: device key (32), 2: name tstr }
 Sig    = { 0: device key (32), 1: signature (64) }
 body   = Link without field 4
 sig    = Sign(device, L("account link") || L(body))
@@ -29,6 +30,7 @@ A chain is valid if, applying links in order:
 4. **Add** also needs a signature from the device being added (proof of possession and consent), and that device must not already be in the set.
 5. **Remove** names a current device and may not leave the set empty.
 6. **No re-adding.** A device that has been removed can never be added again.
+7. **Rename** names a current device and gives it a new display name (at most 64 characters, no control characters). It changes no membership, so it leaves the properties below untouched. Peers running a version from before renames reject a chain that contains one, so update every device first.
 
 v1 always writes threshold 1, so every current device is an equal peer. Verifiers already enforce thresholds above 1, so raising it later needs no change to the format.
 
@@ -59,6 +61,8 @@ existing device E                                  new device N
 - **Signing.** E sends the current chain and a proposed `Add(N)` link that E has already signed (`LinkOffer`). N checks that the proposal is exactly the next link adding N on top of that chain, then countersigns it (`LinkConsent`).
 - **Refusal.** A wrong or expired code gets an explicit `LinkRefused`, so N fails at once instead of waiting.
 - **Aftermath.** E then broadcasts the new chain to every session.
+
+Apps name a device on creation: the CLI uses the host name, and the Android app uses the phone's model (it renames a device still called "device"). `/device rename <device> <name>` and the app's *Devices* screen rename any device of the account.
 
 ## Own devices
 

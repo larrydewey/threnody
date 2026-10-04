@@ -49,6 +49,14 @@ pub struct ContactInfo {
     pub connected: bool,
 }
 
+/// A device of our account.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceInfo {
+    pub fingerprint: String,
+    pub name: String,
+    pub this_device: bool,
+}
+
 /// One stored message.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct HistoryEntry {
@@ -657,6 +665,38 @@ impl ThrenodyNode {
             }
         });
         Ok(())
+    }
+
+    /// The devices of our account, in the order they joined.
+    pub fn devices(&self) -> Vec<DeviceInfo> {
+        let me = self.node.identity();
+        self.node
+            .account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, name)| DeviceInfo {
+                fingerprint: fp(d),
+                name: name.clone(),
+                this_device: *d == me,
+            })
+            .collect()
+    }
+
+    /// Renames a device of our account (`device` = fingerprint, or ours);
+    /// every sibling and contact learns the name.
+    pub fn rename_device(&self, device: String, name: String) -> Result<()> {
+        let d = self
+            .node
+            .account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, _)| *d)
+            .find(|d| fp(d) == device || d.fingerprint().compact() == device)
+            .ok_or_else(|| fail("not a device of this account"))?;
+        let _guard = self.rt.enter();
+        self.node.rename_device(&d, &name).map_err(fail)
     }
 
     /// A one-time code for a new device to join this account.

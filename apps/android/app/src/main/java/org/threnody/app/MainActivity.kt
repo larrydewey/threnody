@@ -254,6 +254,7 @@ class MainActivity : Activity() {
 
     private fun more(anchor: View) {
         PopupMenu(this, anchor).apply {
+            menu.add("Devices").setOnMenuItemClickListener { devices(); true }
             menu.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
             menu.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
             menu.add("Diagnostics").setOnMenuItemClickListener {
@@ -288,6 +289,50 @@ class MainActivity : Activity() {
             link,
             "Device ${n.deviceFingerprint()}",
         )
+    }
+
+    /** This account's devices; tap one to rename it. */
+    private fun devices() {
+        val n = node ?: return
+        worker.execute {
+            val list = n.devices()
+            runOnUiThread {
+                val labels = list.map { d ->
+                    d.name + (if (d.thisDevice) " (this device)" else "") + "\n" + Threnody.short(d.fingerprint)
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Your devices")
+                    .setItems(labels.toTypedArray()) { _, i -> renameDevice(list[i].fingerprint, list[i].name) }
+                    .setPositiveButton("Link a new device") { _, _ -> linkDevice() }
+                    .setNegativeButton("Close", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun renameDevice(fingerprint: String, current: String) {
+        val field = input("Name", current).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Rename device")
+            .setMessage("Your other devices and your contacts see this name.")
+            .setView(padded(field))
+            .setPositiveButton("Save") { _, _ ->
+                val name = field.text.toString().trim()
+                val n = node ?: return@setPositiveButton
+                if (name.isEmpty()) return@setPositiveButton
+                worker.execute {
+                    try {
+                        n.renameDevice(fingerprint, name)
+                        runOnUiThread { Toast.makeText(this, "Renamed to $name", Toast.LENGTH_SHORT).show() }
+                    } catch (e: Exception) {
+                        runOnUiThread { failed("Couldn't rename: ${e.message}") }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun linkDevice() {

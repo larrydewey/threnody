@@ -53,7 +53,7 @@ Type a line to send it to the current peer. Commands:
   /drop [peer]                          close a session
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
-  /devices   /device add [host:port]   /device remove <name>   your account's devices
+  /devices   /device add [host:port]   /device rename <name> <new>   /device remove <name>
   /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
   /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
   /history [peer] [n]                   recent messages (stored encrypted)
@@ -848,6 +848,27 @@ impl Ui {
                         println!(
                             "  The code works once, for 10 minutes. Never share it with anyone else."
                         );
+                    }
+                    ("rename", rest) if rest.contains(' ') => {
+                        let (who, name) = rest.split_once(' ').unwrap_or_default();
+                        let own = self.node.account();
+                        let target = own
+                            .state()
+                            .devices
+                            .iter()
+                            .find(|(d, n)| {
+                                n == who
+                                    || threnody_core::identity::fingerprint_matches_prefix(
+                                        &d.fingerprint(),
+                                        who,
+                                    )
+                            })
+                            .map(|(d, _)| *d)
+                            .ok_or_else(|| {
+                                anyhow!("no device {who:?} in your account; see /devices")
+                            })?;
+                        self.node.rename_device(&target, name)?;
+                        println!("* renamed {who} to {:?}", name.trim());
                     }
                     ("remove", who) if !who.is_empty() => {
                         let own = self.node.account();
