@@ -1,6 +1,15 @@
 package org.threnody.app
 
+import android.Manifest
 import android.app.Activity
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
+import android.content.pm.PackageManager
+import android.os.ParcelUuid
 import android.net.ConnectivityManager
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
@@ -11,7 +20,9 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.net.Inet4Address
+import java.util.UUID
 import java.util.concurrent.Executors
+import uniffi.threnody_ffi.ByteLink
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
 
@@ -36,6 +47,7 @@ class MainActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var node: ThrenodyNode
     private lateinit var log: TextView
+    private var bleServer: BluetoothServerSocket? = null
     private var current: String? = null
     @Volatile private var running = true
 
@@ -51,12 +63,13 @@ class MainActivity : Activity() {
         val message = EditText(this).apply { hint = "message" }
         val send = Button(this).apply { text = "Send" }
         val approve = Button(this).apply { text = "Approve current peer" }
+        val bluetooth = Button(this).apply { text = "Start Bluetooth" }
         log = TextView(this).apply {
             movementMethod = ScrollingMovementMethod()
             setTextIsSelectable(true)
             textSize = 13f
         }
-        for (v in listOf(header, target, connect, message, send, approve)) {
+        for (v in listOf(header, target, connect, message, send, approve, bluetooth)) {
             root.addView(v, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
         root.addView(log, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -97,6 +110,11 @@ class MainActivity : Activity() {
                 catch (e: Exception) { say("! send: ${e.message}") }
             }
         }
+        bluetooth.setOnClickListener {
+            val needed = arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
+                .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+            if (needed.isEmpty()) startBluetooth() else requestPermissions(needed.toTypedArray(), 1)
+        }
         approve.setOnClickListener {
             val peer = current ?: return@setOnClickListener say("! no peer yet")
             worker.execute {
@@ -104,6 +122,73 @@ class MainActivity : Activity() {
                 catch (e: Exception) { say("! approve: ${e.message}") }
             }
         }
+    }
+
+    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(code, perms, results)
+        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) startBluetooth()
+        else say("! Bluetooth permission denied")
+    }
+
+    /**
+     * Listens on an L2CAP channel and advertises its PSM under the Threnody
+     * service UUID. The channel is "insecure" at the Bluetooth layer on
+     * purpose: no pairing is needed, the Threnody handshake authenticates.
+     */
+    @Suppress("MissingPermission")
+    private fun startBluetooth() {
+        if (bleServer != null) return say("* Bluetooth already on")
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+            ?: return say("! no Bluetooth adapter")
+        val server = try { adapter.listenUsingInsecureL2capChannel() }
+            catch (e: Exception) { return say("! L2CAP listen: ${e.message}") }
+        bleServer = server
+        val psm = server.psm
+        val data = AdvertiseData.Builder()
+            .addServiceData(ParcelUuid(UUID.fromString(BLE_SERVICE)), byteArrayOf((psm and 0xff).toByte(), (psm shr 8).toByte()))
+            .setIncludeDeviceName(false)
+            .build()
+        val settings = AdvertiseSettings.Builder()
+            .setConnectable(true)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .build()
+        adapter.bluetoothLeAdvertiser?.startAdvertising(settings, data, object : AdvertiseCallback() {
+            override fun onStartSuccess(s: AdvertiseSettings?) = say("* Bluetooth: advertising, L2CAP psm $psm")
+            override fun onStartFailure(code: Int) = say("! Bluetooth advertise failed ($code)")
+        }) ?: say("! BLE advertising not supported")
+        Thread {
+            while (running) {
+                val sock = try { server.accept() } catch (e: Exception) { break }
+                say("* Bluetooth link from ${sock.remoteDevice.address}")
+                attach(sock)
+            }
+        }.start()
+    }
+
+    /** Bridges one Bluetooth socket into the node. */
+    private fun attach(sock: BluetoothSocket) {
+        val out = sock.outputStream
+        val link = object : ByteLink {
+            override fun send(data: ByteArray): Boolean =
+                try { out.write(data); out.flush(); true } catch (e: Exception) { false }
+            override fun disconnect() { try { sock.close() } catch (_: Exception) {} }
+        }
+        val handle = node.attachLink(link, false, "ble", sock.remoteDevice.address, null)
+        Thread {
+            val buf = ByteArray(16 * 1024)
+            try {
+                val input = sock.inputStream
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    handle.receive(buf.copyOf(n))
+                }
+            } catch (_: Exception) {
+            } finally {
+                handle.closed()
+            }
+        }.start()
     }
 
     private fun pollEvents() = Thread {
@@ -127,6 +212,11 @@ class MainActivity : Activity() {
     }
 
     private fun short(fp: String) = fp.take(9)
+
+    companion object {
+        /** Must match `threnody_net::discovery::BLE_SERVICE_UUID`. */
+        const val BLE_SERVICE = "7e9f0e1c-3b5a-4c7e-9d2a-5f1e8b6c4a01"
+    }
 
     private fun say(line: String) = runOnUiThread { log.append(line + "\n") }
 

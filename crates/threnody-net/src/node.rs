@@ -172,6 +172,8 @@ pub struct SessionInfo {
     pub via: Option<PublicIdentity>,
     /// The handshake transcript hash (public; binds link proofs).
     pub session_id: [u8; 32],
+    /// Human-readable remote end (IP:port, Bluetooth address, …).
+    pub remote: String,
 }
 
 /// How a session reaches its peer.
@@ -182,15 +184,25 @@ enum Route {
     Relay(PublicIdentity),
     /// An onion circuit (Appendix I) whose first hop is this neighbour.
     Onion(PublicIdentity),
+    /// A direct link over another transport, e.g. Bluetooth LE.
+    Link {
+        transport: &'static str,
+        remote: String,
+    },
 }
 
 impl Route {
     /// `(dialed address, first hop, transport label)`.
-    fn into_parts(self) -> (Option<String>, Option<PublicIdentity>, &'static str) {
+    /// `(dialed address, first hop, transport label, remote description)`.
+    fn into_parts(
+        self,
+        addr: SocketAddr,
+    ) -> (Option<String>, Option<PublicIdentity>, &'static str, String) {
         match self {
-            Self::Direct(dialed) => (dialed, None, "tcp"),
-            Self::Relay(v) => (None, Some(v), "relay"),
-            Self::Onion(v) => (None, Some(v), "onion"),
+            Self::Direct(dialed) => (dialed, None, "tcp", addr.to_string()),
+            Self::Relay(v) => (None, Some(v), "relay", addr.to_string()),
+            Self::Onion(v) => (None, Some(v), "onion", addr.to_string()),
+            Self::Link { transport, remote } => (None, None, transport, remote),
         }
     }
 }
@@ -445,6 +457,63 @@ impl Node {
         Ok(peer)
     }
 
+    /// Authenticates over an already-connected byte stream from any
+    /// transport (e.g. a Bluetooth LE L2CAP channel) as the initiator.
+    /// `remote` describes the other end for display.
+    pub async fn connect_stream<S>(
+        &self,
+        mut stream: S,
+        transport: &'static str,
+        remote: String,
+        expect: Option<Fingerprint>,
+    ) -> Result<PublicIdentity>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;
+        let peer = *chan.peer();
+        if let Some(want) = expect
+            && peer.fingerprint() != want
+        {
+            return Err(NetError::IdentityMismatch {
+                expected: want.to_string(),
+                got: peer.fingerprint().to_string(),
+            });
+        }
+        self.spawn_session(
+            stream,
+            chan,
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            true,
+            Route::Link { transport, remote },
+        );
+        Ok(peer)
+    }
+
+    /// Accepts a session over an already-connected byte stream (responder),
+    /// applying the accept policy.
+    pub async fn accept_stream<S>(
+        &self,
+        mut stream: S,
+        transport: &'static str,
+        remote: String,
+    ) -> Result<PublicIdentity>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
+        self.check_policy(chan.peer())?;
+        let peer = *chan.peer();
+        self.spawn_session(
+            stream,
+            chan,
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            false,
+            Route::Link { transport, remote },
+        );
+        Ok(peer)
+    }
+
     /// Stops listening, discovery and every session. Persisted state
     /// stays on disk; the node can be recreated from the same home.
     pub fn shutdown(&self) {
@@ -590,7 +659,7 @@ impl Node {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (dialed, via, transport) = route.into_parts();
+        let (dialed, via, transport, remote) = route.into_parts(addr);
         let peer = *chan.peer();
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -610,6 +679,7 @@ impl Node {
             outbound,
             via,
             session_id: *chan.session_id(),
+            remote,
         };
         // A newer session to the same peer replaces the old one; dropping
         // the old handle's sender ends its task.

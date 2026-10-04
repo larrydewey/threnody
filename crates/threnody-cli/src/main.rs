@@ -1,5 +1,7 @@
 //! `threnody`: command-line client for the Threnody protocol.
 
+#[cfg(all(feature = "ble", target_os = "linux"))]
+mod ble;
 mod chat;
 mod groups;
 mod target;

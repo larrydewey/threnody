@@ -49,6 +49,7 @@ Type a line to send it to the current peer. Commands:
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
   /devices   /device add   /device remove <name>   your account's devices
+  /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
   /history [peer] [n]                   recent messages (stored encrypted)
   /disappear <30s|10m|1h|1d|off>        disappearing messages with the current peer
   /quit
@@ -62,6 +63,8 @@ struct Ui {
     tunnels: Option<Tunnels>,
     discovery: Option<std::net::SocketAddr>,
     groups: GroupUi,
+    #[cfg(all(feature = "ble", target_os = "linux"))]
+    ble_seen: std::sync::Arc<std::sync::Mutex<Vec<crate::ble::Found>>>,
 }
 
 pub async fn run(opts: Options) -> Result<()> {
@@ -124,6 +127,8 @@ pub async fn run(opts: Options) -> Result<()> {
         tunnels,
         discovery: None,
         groups,
+        #[cfg(all(feature = "ble", target_os = "linux"))]
+        ble_seen: std::sync::Arc::default(),
     };
     if let (Some(port), Some(tcp)) = (opts.discover, listen_addr) {
         let cfg = DiscoveryConfig {
@@ -343,7 +348,15 @@ impl Ui {
                             suite.name()
                         );
                     }
-                    None => println!("* connected to {who} at {addr} [tcp, {}]", suite.name()),
+                    None => {
+                        let (t, r) = self
+                            .node
+                            .sessions()
+                            .into_iter()
+                            .find(|s| s.peer == peer)
+                            .map_or(("tcp", addr.to_string()), |s| (s.transport, s.remote));
+                        println!("* connected to {who} at {r} [{t}, {}]", suite.name());
+                    }
                 }
                 if new_contact {
                     println!("  new contact (trust on first use). Compare safety numbers: /safety");
@@ -521,7 +534,7 @@ impl Ui {
                             format!("onion circuit, {end} {}", self.name(&v))
                         }
                         Some(v) => format!("relay through {}", self.name(&v)),
-                        None => format!("{} {}", i.transport, i.addr),
+                        None => format!("{} {}", i.transport, i.remote),
                     };
                     println!(
                         "  {} via {path} ({dir}, {})",
@@ -619,6 +632,8 @@ impl Ui {
             }
             "status" => self.status(),
             "devices" => self.devices(),
+            #[cfg(all(feature = "ble", target_os = "linux"))]
+            "ble" => self.ble(arg.unwrap_or("scan")),
             "history" | "hist" => {
                 let mut it = arg.unwrap_or("").split_whitespace();
                 let (who, n) = match (it.next(), it.next()) {
@@ -743,6 +758,74 @@ impl Ui {
             other => bail!("unknown command /{other}; try /help"),
         }
         Ok(false)
+    }
+
+    #[cfg(all(feature = "ble", target_os = "linux"))]
+    fn ble(&self, args: &str) {
+        let mut it = args.split_whitespace();
+        let seen = std::sync::Arc::clone(&self.ble_seen);
+        match (it.next(), it.next()) {
+            (Some("scan") | None, secs) => {
+                let secs = secs.and_then(|s| s.parse().ok()).unwrap_or(8);
+                println!("* scanning Bluetooth LE for {secs}s…");
+                tokio::spawn(async move {
+                    match crate::ble::scan(secs).await {
+                        Ok(found) => {
+                            if found.is_empty() {
+                                println!("* no Threnody devices nearby");
+                            }
+                            for (i, f) in found.iter().enumerate() {
+                                println!(
+                                    "  {}: {} {} psm {} rssi {}",
+                                    i + 1,
+                                    f.addr,
+                                    f.name.as_deref().unwrap_or("-"),
+                                    f.psm,
+                                    f.rssi.map_or("?".into(), |r| r.to_string())
+                                );
+                            }
+                            if !found.is_empty() {
+                                println!("  /ble connect <n> to open a session");
+                            }
+                            *seen
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = found;
+                        }
+                        Err(e) => println!("! Bluetooth scan: {e:#}"),
+                    }
+                });
+            }
+            (Some("connect"), Some(which)) => {
+                let list = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let f = which
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| list.get(n.wrapping_sub(1)).cloned())
+                    .or_else(|| {
+                        list.iter()
+                            .find(|f| f.addr.to_string().eq_ignore_ascii_case(which))
+                            .cloned()
+                    });
+                let Some(f) = f else {
+                    println!("! no such device; /ble scan first");
+                    return;
+                };
+                let node = self.node.clone();
+                println!(
+                    "* connecting to {} over Bluetooth LE (psm {})…",
+                    f.addr, f.psm
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = crate::ble::connect(&node, &f).await {
+                        println!("! Bluetooth connect: {e:#}");
+                    }
+                });
+            }
+            _ => println!("! usage: /ble scan [secs] | /ble connect <n|address>"),
+        }
     }
 
     fn devices(&self) {

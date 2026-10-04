@@ -384,3 +384,44 @@ async fn revocation_clears_discovery_keys() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn sessions_run_over_any_byte_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let (a_end, b_end) = tokio::io::duplex(1 << 16);
+    let bob2 = bob.clone();
+    let accept =
+        tokio::spawn(async move { bob2.accept_stream(b_end, "ble", "AA:BB".into()).await });
+    let bid = alice
+        .connect_stream(
+            a_end,
+            "ble",
+            "CC:DD".into(),
+            Some(bob.identity().fingerprint()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accept.await.unwrap().unwrap(), alice.identity());
+    let s = alice
+        .sessions()
+        .into_iter()
+        .find(|s| s.peer == bid)
+        .unwrap();
+    assert_eq!(
+        (s.transport, s.remote.as_str(), s.via),
+        ("ble", "CC:DD", None)
+    );
+    alice
+        .send(
+            &bid,
+            AppMessage::Text {
+                sent_ms: 0,
+                body: "over a pipe".into(),
+                expires_in_s: None,
+            },
+        )
+        .unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+}

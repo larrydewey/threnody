@@ -22,6 +22,15 @@ qrcode.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true
 
+[features]
+default = ["ble"]
+# Bluetooth LE transport via BlueZ (Linux only).
+ble = ["dep:bluer", "dep:futures-util"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 

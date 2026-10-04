@@ -12,6 +12,10 @@ use tokio::net::UdpSocket;
 use crate::error::Result;
 use crate::node::{Event, Node};
 
+/// Bluetooth LE service UUID for Threnody. Devices advertise service data
+/// under it: the L2CAP PSM they listen on, as a little-endian u16.
+pub const BLE_SERVICE_UUID: &str = "7e9f0e1c-3b5a-4c7e-9d2a-5f1e8b6c4a01";
+
 /// Default multicast group and port for beacons (organisation-local scope).
 pub const DEFAULT_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 84, 86);
 pub const DEFAULT_PORT: u16 = 7451;

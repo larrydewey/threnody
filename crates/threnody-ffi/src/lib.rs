@@ -92,6 +92,46 @@ pub enum NodeEvent {
     },
 }
 
+/// A platform byte pipe (e.g. an Android Bluetooth L2CAP socket),
+/// implemented in Kotlin / Swift. Called from a Rust worker thread.
+#[uniffi::export(with_foreign)]
+pub trait ByteLink: Send + Sync {
+    /// Writes bytes to the remote end; returns false once the link is dead.
+    fn send(&self, data: Vec<u8>) -> bool;
+    /// Closes the link (Rust is done with it). Not `close`: that clashes
+    /// with `AutoCloseable.close` in the generated Kotlin.
+    fn disconnect(&self);
+}
+
+/// The app's handle for feeding a link's received bytes into the node.
+#[derive(uniffi::Object)]
+pub struct LinkHandle {
+    tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+}
+
+#[uniffi::export]
+impl LinkHandle {
+    /// Bytes read from the platform socket.
+    pub fn receive(&self, data: Vec<u8>) {
+        if let Some(tx) = self
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = tx.send(data);
+        }
+    }
+
+    /// The platform socket hit end-of-stream or an error.
+    pub fn closed(&self) {
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct ThrenodyNode {
     rt: Runtime,
@@ -339,6 +379,71 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
+    /// Runs a session over a platform byte pipe. `outbound` picks the
+    /// handshake role (the side that opened the connection initiates).
+    /// `transport` labels it ("ble", …); `expect` pins a fingerprint.
+    /// The outcome arrives as a `Connected` (or `Other`) event.
+    pub fn attach_link(
+        &self,
+        link: Arc<dyn ByteLink>,
+        outbound: bool,
+        transport: String,
+        remote: String,
+        expect: Option<String>,
+    ) -> Result<Arc<LinkHandle>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let expect = expect
+            .map(|f| f.parse::<Fingerprint>())
+            .transpose()
+            .map_err(fail)?;
+        let label: &'static str = match transport.as_str() {
+            "ble" => "ble",
+            "wifi-direct" => "wifi-direct",
+            _ => "link",
+        };
+        let (ours, theirs) = tokio::io::duplex(1 << 18);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let handle = Arc::new(LinkHandle {
+            tx: Mutex::new(Some(tx)),
+        });
+        // Pump: session bytes -> platform, platform bytes -> session.
+        let pump_link = Arc::clone(&link);
+        self.rt.spawn(async move {
+            let (mut rd, mut wr) = tokio::io::split(ours);
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                tokio::select! {
+                    n = rd.read(&mut buf) => {
+                        let Ok(n) = n else { break };
+                        if n == 0 { break }
+                        let data = buf[..n].to_vec();
+                        let l = Arc::clone(&pump_link);
+                        let ok = tokio::task::spawn_blocking(move || l.send(data)).await.unwrap_or(false);
+                        if !ok { break }
+                    }
+                    inbound = rx.recv() => match inbound {
+                        Some(d) => if wr.write_all(&d).await.is_err() { break },
+                        None => break,
+                    },
+                }
+            }
+            let l = Arc::clone(&pump_link);
+            let _ = tokio::task::spawn_blocking(move || l.disconnect()).await;
+        });
+        let node = self.node.clone();
+        self.rt.spawn(async move {
+            let r = if outbound {
+                node.connect_stream(theirs, label, remote, expect).await
+            } else {
+                node.accept_stream(theirs, label, remote).await
+            };
+            if r.is_err() {
+                link.disconnect();
+            }
+        });
+        Ok(handle)
+    }
+
     /// Waits up to `timeout_ms` for the next event.
     pub fn next_event(&self, timeout_ms: u32) -> Option<NodeEvent> {
         let mut rx = self
@@ -426,6 +531,62 @@ mod tests {
         );
         alice.shutdown();
         bob.shutdown();
+
+        // A session over a foreign byte pipe (as Android's L2CAP sockets use).
+        struct Pipe(Mutex<Option<Arc<LinkHandle>>>);
+        impl ByteLink for Pipe {
+            fn send(&self, data: Vec<u8>) -> bool {
+                match self.0.lock().unwrap().as_ref() {
+                    Some(h) => {
+                        h.receive(data);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            fn disconnect(&self) {
+                if let Some(h) = self.0.lock().unwrap().take() {
+                    h.closed();
+                }
+            }
+        }
+        let (to_bob, to_alice) = (
+            Arc::new(Pipe(Mutex::new(None))),
+            Arc::new(Pipe(Mutex::new(None))),
+        );
+        let ha = alice
+            .attach_link(
+                to_bob.clone(),
+                true,
+                "ble".into(),
+                "bob-radio".into(),
+                Some(bob.device_fingerprint()),
+            )
+            .unwrap();
+        let hb = bob
+            .attach_link(
+                to_alice.clone(),
+                false,
+                "ble".into(),
+                "alice-radio".into(),
+                None,
+            )
+            .unwrap();
+        *to_bob.0.lock().unwrap() = Some(hb);
+        *to_alice.0.lock().unwrap() = Some(ha);
+        let e = wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        assert_eq!(
+            e,
+            NodeEvent::Connected {
+                peer: alice.device_fingerprint(),
+                via: None
+            }
+        );
+        alice
+            .send_text(bob.device_fingerprint(), "over the radio".into())
+            .unwrap();
+        let m = wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        assert!(matches!(m, NodeEvent::Message { text, .. } if text == "over the radio"));
 
         // A protected identity needs its passphrase.
         drop(bob);
