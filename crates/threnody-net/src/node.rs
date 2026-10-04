@@ -194,6 +194,9 @@ pub enum Event {
         mailbox: PublicIdentity,
         to: PublicIdentity,
         status: crate::mailbox::DepositStatus,
+        /// Left over an onion circuit, so the mailbox didn't learn who
+        /// sent it.
+        anonymous: bool,
     },
     /// An automatic dial (e.g. after discovery) failed.
     DialFailed {

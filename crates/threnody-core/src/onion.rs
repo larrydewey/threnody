@@ -31,6 +31,11 @@ pub enum Cmd {
     Begin = 4,
     Data = 5,
     End = 6,
+    /// Origin to last hop: leave a sealed message in its mailbox.
+    /// `to (32) || total_len (u32 BE) || first bytes`, continued in `Data`.
+    Deposit = 7,
+    /// Last hop to origin: `status (1)`, as in a mailbox receipt.
+    Deposited = 8,
 }
 
 impl Cmd {
@@ -42,6 +47,8 @@ impl Cmd {
             4 => Self::Begin,
             5 => Self::Data,
             6 => Self::End,
+            7 => Self::Deposit,
+            8 => Self::Deposited,
             _ => return None,
         })
     }

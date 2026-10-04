@@ -64,16 +64,28 @@ Mailbox = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status }
 op: 1 deposit, 2 deliver, 3 receipt (status 0 declined, 1 held, 2 delivered now)
 ```
 
-- **Depositing.** If A has no session with B, A sends `deposit { to: id_B, sealed }` to every live, mutually approved neighbour except B.
-- **Holding.** A neighbour R accepts a deposit only if R is mutually approved with both A and B. It holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days.
+- **Depositing.** If A has no session with B, A leaves the sealed message with every live, mutually approved neighbour except B. By default A deposits anonymously, as described below, and skips mailboxes that no circuit can reach. If no circuit can reach any mailbox, A sends `deposit { to: id_B, sealed }` directly.
+- **Holding.** A neighbour R accepts a direct deposit only if R is mutually approved with both A and B. It accepts an anonymous deposit only if R is mutually approved with B.
+- **Storage limits.** R holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days.
 - **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, then deletes its copy.
 - **Receipts.** Every deposit is answered with a receipt, so the sender knows whether each mailbox holds the message, delivered it immediately, or declined it.
 - **Duplicates.** B ignores duplicates by `h`, so depositing with several neighbours is safe.
 
-Mailboxes see that A sent something to B, when, and roughly how large. They never see the contents or the sender's signature. A malicious mailbox can drop or delay messages, but cannot alter or forge them.
+### Anonymous deposits
+
+A mailbox that takes a direct deposit learns that A wrote to B. To hide A, the deposit travels over an onion circuit (Appendix I) whose last hop is the mailbox M:
+
+1. A picks a path `R1, R2, M`. R1 is a live, mutually approved neighbour, R2 is another mutually approved contact, and neither is M or B.
+2. A builds the circuit and sends `DEPOSIT` to M: `to (32) ‖ total_len (u32 BE) ‖ first bytes`. The rest of the sealed message follows in `DATA` cells.
+3. Once `total_len` bytes have arrived, M holds or delivers the message exactly as it would a direct deposit. It answers `DEPOSITED` with the status byte, then tears the circuit down.
+
+M only sees R2, so it learns that someone sent something to B, but not who. M declines a `DEPOSIT` if the circuit already carries a stream or another deposit, if `total_len` exceeds 16 MiB, or if the neighbour carrying the circuit has already passed 30 anonymous deposits in the current minute. That neighbour is the only party M can hold responsible.
+
+Anonymous deposits are on by default. With onion routing turned off (`--no-onion` or the app's toggle), deposits are direct. If every circuit to a mailbox fails, A deposits with that mailbox directly rather than lose the message. With only one mailbox and no other contacts there is no path, so the deposit is direct.
+
+Mailboxes see that B received something, when, and roughly how large. A mailbox taking a direct deposit also sees that A sent it. They never see the contents or the sender's signature. A malicious mailbox can drop or delay messages, but cannot alter or forge them.
 
 ## Not yet done
 
 - End-to-end read receipts. Mailbox receipts only report what the mailbox did with the message.
-- Onion-routed deposits, which would hide A from the mailbox.
 - Prekey bundles fetched through relays from contacts that have not handed one out yet.

@@ -41,7 +41,7 @@ To add a device to your account, run `/device add [host:port]` on a device you a
 
 You can also manage contacts outside a session with `threnody contacts | name | approve | revoke | verify | forget`.
 
-**Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. `--policy approved` only accepts mutually approved contacts.
+**Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. Messages left in mailboxes for offline contacts go over such circuits too, so the mailbox doesn't learn who sent them. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. `--policy approved` only accepts mutually approved contacts.
 
 While listening, nodes send private UDP beacons that only mutually approved peers can recognise, and reconnect to each other automatically. Use `--no-discover` to turn this off. See [Appendix E](docs/appendix-e-discovery.md).
 
@@ -94,7 +94,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices (backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
-| §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), each only off when switched off; ❌ volunteer relay directories, onion-routed mailbox deposits |
+| §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), onion-routed mailbox deposits, each only off when switched off; ❌ volunteer relay directories |
 | §10 Status indicators | ✅ `/status` |
 | §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: sealed with a key in the system keyring by default, or a passphrase; 0600 files without either |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
@@ -105,7 +105,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 2. **Groups (remaining).** More admin roles and self-removal, and files in groups.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
-5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.
+5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, and anonymous and selective-disclosure identities.
 6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
 
 ## Development

@@ -553,11 +553,15 @@ impl Ui {
                 mailbox,
                 to,
                 status,
+                anonymous,
             } => {
                 let (m, t) = (self.name(&mailbox), self.name(&to));
+                let how = if anonymous { " (sender hidden)" } else { "" };
                 match status {
-                    DepositStatus::Held => println!("* {m} is holding your message for {t}"),
-                    DepositStatus::Delivered => println!("* {m} delivered your message to {t}"),
+                    DepositStatus::Held => println!("* {m} is holding your message for {t}{how}"),
+                    DepositStatus::Delivered => {
+                        println!("* {m} delivered your message to {t}{how}")
+                    }
                     DepositStatus::Declined => println!(
                         "! {m} declined to hold your message for {t} (it needs mutual approval with both of you)"
                     ),

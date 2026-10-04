@@ -29,6 +29,17 @@ pub enum DepositStatus {
     Delivered = 2,
 }
 
+impl DepositStatus {
+    pub(crate) fn from_wire(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Declined,
+            1 => Self::Held,
+            2 => Self::Delivered,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MailboxMsg {
     Deposit { to: [u8; 32], sealed: Vec<u8> },
@@ -219,6 +230,49 @@ impl Node {
             .filter(|s| s.via.is_none() && s.peer != *dest && self.shared.mutual(&s.peer))
             .map(|s| s.peer)
             .collect();
+        // Hide who deposits: through an onion circuit, wherever one reaches
+        // the mailbox. Only with no circuit anywhere do we deposit directly.
+        let handle = tokio::runtime::Handle::try_current().ok();
+        let hidden: Vec<PublicIdentity> = match &handle {
+            Some(_) if self.prefer_onion() => mailboxes
+                .iter()
+                .filter(|m| {
+                    !self
+                        .onion_paths(m.fingerprint(), &[dest.fingerprint()], 2)
+                        .is_empty()
+                })
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let (Some(handle), false) = (handle, hidden.is_empty()) {
+            let MailboxMsg::Deposit { sealed, .. } = &deposit else {
+                unreachable!()
+            };
+            let sealed = std::sync::Arc::new(sealed.clone());
+            for m in &hidden {
+                let (node, m, dest, sealed) = (self.clone(), *m, *dest, sealed.clone());
+                let deposit = MailboxMsg::Deposit {
+                    to: *dest.as_bytes(),
+                    sealed: sealed.to_vec(),
+                };
+                handle.spawn(async move {
+                    match node.onion_deposit(&m, &dest, &sealed).await {
+                        Ok(status) => node.emit(Event::DepositReceipt {
+                            mailbox: m,
+                            to: dest,
+                            status,
+                            anonymous: true,
+                        }),
+                        // Every circuit failed: deliver it rather than lose it.
+                        Err(_) => {
+                            node.mailbox_send(&m, &deposit);
+                        }
+                    }
+                });
+            }
+            return Ok(hidden.len());
+        }
         let n = mailboxes
             .iter()
             .filter(|m| self.mailbox_send(m, &deposit))
@@ -354,6 +408,7 @@ impl Node {
                         mailbox: from,
                         to,
                         status,
+                        anonymous: false,
                     });
                 }
             }
@@ -368,10 +423,20 @@ impl Node {
         to: [u8; 32],
         sealed: Vec<u8>,
     ) -> DepositStatus {
+        if !self.shared.mutual(from) {
+            return DepositStatus::Declined;
+        }
+        self.store_deposit(to, sealed)
+    }
+
+    /// Holds or forwards a deposit for our mutually approved contact `to`.
+    /// The depositor is either a mutual neighbour or anonymous, arriving
+    /// over an onion circuit a mutual neighbour carried to us.
+    pub(crate) fn store_deposit(&self, to: [u8; 32], sealed: Vec<u8>) -> DepositStatus {
         let Ok(dest) = PublicIdentity::from_bytes(&to) else {
             return DepositStatus::Declined;
         };
-        if !self.shared.mutual(from) || !self.shared.mutual(&dest) {
+        if !self.shared.mutual(&dest) {
             return DepositStatus::Declined;
         }
         if self.sessions().iter().any(|s| s.peer == dest) {

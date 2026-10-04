@@ -10,7 +10,7 @@
 //! named inside an EXTEND cell readable by the last relay alone.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
@@ -27,6 +27,13 @@ use crate::node::{Node, lock};
 /// Most circuits one neighbour may hold through us.
 pub const MAX_CIRCUITS_PER_PEER: usize = 64;
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an anonymous deposit may take once its circuit is up.
+const DEPOSIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Anonymous deposits we accept per neighbour per minute: the depositor is
+/// hidden, so the neighbour that carried the circuit is what we limit.
+pub const MAX_DEPOSITS_PER_MINUTE: u32 = 30;
+/// `to (32) || total_len (u32 BE)` before the sealed bytes.
+const DEPOSIT_HEAD: usize = 36;
 
 #[derive(Debug, PartialEq, Eq)]
 enum OnionMsg {
@@ -123,6 +130,14 @@ struct RelayHop {
     keys: HopKeys,
     next: Option<Link>,
     endpoint: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// An anonymous mailbox deposit being received.
+    deposit: Option<PendingDeposit>,
+}
+
+struct PendingDeposit {
+    to: [u8; 32],
+    total: usize,
+    sealed: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -137,6 +152,20 @@ pub(crate) struct OnionState {
     origins: HashMap<Link, mpsc::UnboundedSender<Cell>>,
     /// Our first-hop CREATEs awaiting CREATED.
     creating: HashMap<Link, oneshot::Sender<CreatedFields>>,
+    /// Per neighbour: start of the current minute and deposits in it.
+    deposit_rate: HashMap<PublicIdentity, (Instant, u32)>,
+}
+
+impl OnionState {
+    fn deposit_allowed(&mut self, from: PublicIdentity) -> bool {
+        let now = Instant::now();
+        let (start, n) = self.deposit_rate.entry(from).or_insert((now, 0));
+        if now.duration_since(*start) >= Duration::from_secs(60) {
+            (*start, *n) = (now, 0);
+        }
+        *n += 1;
+        *n <= MAX_DEPOSITS_PER_MINUTE
+    }
 }
 
 impl Node {
@@ -182,6 +211,7 @@ impl Node {
                 keys,
                 next: None,
                 endpoint: None,
+                deposit: None,
             },
         );
         let id = *self.identity().as_bytes();
@@ -320,18 +350,85 @@ impl Node {
                 }
             }
             Cmd::Begin => self.onion_endpoint(up),
+            Cmd::Deposit => self.onion_deposit_start(up, &p.data),
             Cmd::Data => {
-                if let Some(tx) = lock(&self.shared.onion)
-                    .hops
-                    .get(&up)
-                    .and_then(|h| h.endpoint.clone())
-                {
+                let mut st = lock(&self.shared.onion);
+                let Some(hop) = st.hops.get_mut(&up) else {
+                    return;
+                };
+                if let Some(d) = &mut hop.deposit {
+                    d.sealed.extend_from_slice(&p.data);
+                    drop(st);
+                    self.onion_deposit_check(up);
+                } else if let Some(tx) = hop.endpoint.clone() {
+                    drop(st);
                     let _ = tx.send(p.data);
                 }
             }
             Cmd::End => self.onion_destroy(up, true),
-            Cmd::Extended | Cmd::ExtendFailed => {}
+            Cmd::Extended | Cmd::ExtendFailed | Cmd::Deposited => {}
         }
+    }
+
+    /// We are the circuit's last hop and a mailbox: someone, hidden from us,
+    /// leaves a sealed message for one of our contacts.
+    fn onion_deposit_start(&self, up: Link, data: &[u8]) {
+        let started = {
+            let mut st = lock(&self.shared.onion);
+            let free = st
+                .hops
+                .get(&up)
+                .is_some_and(|h| h.next.is_none() && h.endpoint.is_none() && h.deposit.is_none());
+            let head = data.get(..DEPOSIT_HEAD).and_then(|h| {
+                let to: [u8; 32] = h[..32].try_into().ok()?;
+                let total = u32::from_be_bytes(h[32..].try_into().ok()?) as usize;
+                (total <= crate::mailbox::MAX_HELD_BYTES).then_some((to, total))
+            });
+            match head {
+                Some((to, total)) if free && st.deposit_allowed(up.0) => {
+                    if let Some(h) = st.hops.get_mut(&up) {
+                        h.deposit = Some(PendingDeposit {
+                            to,
+                            total,
+                            sealed: data[DEPOSIT_HEAD..].to_vec(),
+                        });
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+        if started {
+            self.onion_deposit_check(up);
+        } else {
+            self.onion_deposited(up, crate::mailbox::DepositStatus::Declined);
+        }
+    }
+
+    /// Stores a deposit once all of it has arrived.
+    fn onion_deposit_check(&self, up: Link) {
+        let done = {
+            let mut st = lock(&self.shared.onion);
+            let Some(hop) = st.hops.get_mut(&up) else {
+                return;
+            };
+            match &hop.deposit {
+                Some(d) if d.sealed.len() >= d.total => hop.deposit.take(),
+                _ => return,
+            }
+        };
+        let Some(d) = done else { return };
+        let status = if d.sealed.len() == d.total {
+            self.store_deposit(d.to, d.sealed)
+        } else {
+            crate::mailbox::DepositStatus::Declined
+        };
+        self.onion_deposited(up, status);
+    }
+
+    fn onion_deposited(&self, up: Link, status: crate::mailbox::DepositStatus) {
+        self.onion_reply(up, &Payload::new(Cmd::Deposited, vec![status as u8]));
+        self.onion_destroy(up, true);
     }
 
     /// We are the circuit's destination: attach a session to the stream.
@@ -444,39 +541,10 @@ impl Node {
         dest: Fingerprint,
         min_relays: usize,
     ) -> Result<PublicIdentity> {
-        let me = self.identity();
-        if dest == me.fingerprint() {
+        if dest == self.identity().fingerprint() {
             return Err(NetError::NoRoute("ourselves".into()));
         }
-        let firsts: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .filter(|s| {
-                s.via.is_none() && s.peer.fingerprint() != dest && self.shared.mutual(&s.peer)
-            })
-            .map(|s| s.peer)
-            .collect();
-        let middles: Vec<PublicIdentity> = self
-            .contacts()
-            .iter()
-            .filter(|c| c.mutually_approved() && c.fingerprint() != dest && c.key != me)
-            .map(|c| c.key)
-            .collect();
-        let mut paths: Vec<Vec<Fingerprint>> = Vec::new();
-        for r1 in &firsts {
-            for r2 in middles.iter().filter(|m| *m != r1) {
-                paths.push(vec![r1.fingerprint(), r2.fingerprint(), dest]);
-            }
-        }
-        if min_relays <= 1 {
-            paths.extend(firsts.iter().map(|r1| vec![r1.fingerprint(), dest]));
-        }
-        for path in paths {
-            let first = firsts
-                .iter()
-                .find(|p| p.fingerprint() == path[0])
-                .copied()
-                .ok_or(NetError::Closed)?;
+        for (first, path) in self.onion_paths(dest, &[], min_relays) {
             if let Ok(peer) = self.try_onion_path(first, &path).await {
                 return Ok(peer);
             }
@@ -486,11 +554,51 @@ impl Node {
         )))
     }
 
-    async fn try_onion_path(
+    /// Candidate circuits to `dest`, each as its first hop (a live direct
+    /// session) and the path: two relays among our mutually approved
+    /// contacts, or one when `min_relays` allows. Nobody in `avoid` relays.
+    pub(crate) fn onion_paths(
+        &self,
+        dest: Fingerprint,
+        avoid: &[Fingerprint],
+        min_relays: usize,
+    ) -> Vec<(PublicIdentity, Vec<Fingerprint>)> {
+        let me = self.identity();
+        let ok = |p: &PublicIdentity| {
+            let fp = p.fingerprint();
+            fp != dest && !avoid.contains(&fp) && *p != me
+        };
+        let firsts: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .filter(|s| s.via.is_none() && ok(&s.peer) && self.shared.mutual(&s.peer))
+            .map(|s| s.peer)
+            .collect();
+        let middles: Vec<PublicIdentity> = self
+            .contacts()
+            .iter()
+            .filter(|c| c.mutually_approved() && ok(&c.key))
+            .map(|c| c.key)
+            .collect();
+        let mut paths = Vec::new();
+        for r1 in &firsts {
+            for r2 in middles.iter().filter(|m| *m != r1) {
+                paths.push((*r1, vec![r1.fingerprint(), r2.fingerprint(), dest]));
+            }
+        }
+        if min_relays <= 1 {
+            paths.extend(firsts.iter().map(|r1| (*r1, vec![r1.fingerprint(), dest])));
+        }
+        paths
+    }
+
+    /// Builds a circuit along `path`, `first` being its first hop. Returns
+    /// the link circuit id, the hop keys and the backward cells.
+    async fn build_circuit(
         &self,
         first: PublicIdentity,
         path: &[Fingerprint],
-    ) -> Result<PublicIdentity> {
+    ) -> Result<(u64, OnionPath, mpsc::UnboundedReceiver<Cell>)> {
         let circ = u64::from_le_bytes(random_bytes());
         let link = (first, circ);
         let (tx, mut rx) = mpsc::unbounded_channel::<Cell>();
@@ -545,28 +653,125 @@ impl Node {
                     .map_err(|_| NetError::Closed)?;
                 onion.push(st.finish(&id, &p.data[32..32 + 1120], &sig)?);
             }
-            let last = onion.len() - 1;
-            let begin = onion.wrap(last, &Payload::new(Cmd::Begin, vec![]))?;
-            if !self.onion_send(
-                &first,
-                &OnionMsg::Cell {
-                    circ,
-                    cell: begin.to_vec(),
-                },
-            ) {
-                return Err(NetError::Closed);
-            }
             Ok(onion)
         }
         .await;
-        let mut onion = match result {
-            Ok(o) => o,
+        match result {
+            Ok(onion) => Ok((circ, onion, rx)),
             Err(e) => {
                 self.onion_destroy(link, false);
                 self.onion_send(&first, &OnionMsg::Destroy { circ });
-                return Err(e);
+                Err(e)
             }
-        };
+        }
+    }
+
+    /// Leaves `sealed` for `to` in the mailbox at the end of `path`, which
+    /// sees the circuit's last relay rather than us.
+    async fn try_onion_deposit(
+        &self,
+        first: PublicIdentity,
+        path: &[Fingerprint],
+        to: &PublicIdentity,
+        sealed: &[u8],
+    ) -> Result<crate::mailbox::DepositStatus> {
+        let (circ, mut onion, mut rx) = self.build_circuit(first, path).await?;
+        let result = async {
+            let last = onion.len() - 1;
+            let mut head = to.as_bytes().to_vec();
+            head.extend_from_slice(
+                &u32::try_from(sealed.len())
+                    .map_err(|_| NetError::Closed)?
+                    .to_be_bytes(),
+            );
+            let split = sealed.len().min(MAX_DATA - DEPOSIT_HEAD);
+            head.extend_from_slice(&sealed[..split]);
+            let cells = std::iter::once(Payload::new(Cmd::Deposit, head)).chain(
+                sealed[split..]
+                    .chunks(MAX_DATA)
+                    .map(|c| Payload::new(Cmd::Data, c.to_vec())),
+            );
+            for p in cells {
+                let cell = onion.wrap(last, &p)?;
+                if !self.onion_send(
+                    &first,
+                    &OnionMsg::Cell {
+                        circ,
+                        cell: cell.to_vec(),
+                    },
+                ) {
+                    return Err(NetError::Closed);
+                }
+            }
+            tokio::time::timeout(DEPOSIT_TIMEOUT, async {
+                while let Some(back) = rx.recv().await {
+                    if let Ok((h, p)) = onion.unwrap(back)
+                        && h == last
+                        && p.cmd == Cmd::Deposited
+                        && let Some(status) = p
+                            .data
+                            .first()
+                            .and_then(|b| crate::mailbox::DepositStatus::from_wire(*b))
+                    {
+                        return Ok(status);
+                    }
+                }
+                Err(NetError::Closed)
+            })
+            .await
+            .map_err(|_| NetError::Timeout)?
+        }
+        .await;
+        self.onion_destroy((first, circ), false);
+        self.onion_send(&first, &OnionMsg::Destroy { circ });
+        result
+    }
+
+    /// Tries anonymous deposits with mailbox `mailbox` until one gets an
+    /// answer.
+    pub(crate) async fn onion_deposit(
+        &self,
+        mailbox: &PublicIdentity,
+        to: &PublicIdentity,
+        sealed: &[u8],
+    ) -> Result<crate::mailbox::DepositStatus> {
+        let paths = self.onion_paths(mailbox.fingerprint(), &[to.fingerprint()], 2);
+        for (first, path) in paths {
+            if let Ok(status) = self.try_onion_deposit(first, &path, to, sealed).await {
+                return Ok(status);
+            }
+        }
+        Err(NetError::NoRoute(format!(
+            "{} (no onion path to this mailbox)",
+            mailbox.fingerprint()
+        )))
+    }
+
+    async fn try_onion_path(
+        &self,
+        first: PublicIdentity,
+        path: &[Fingerprint],
+    ) -> Result<PublicIdentity> {
+        let (circ, mut onion, mut rx) = self.build_circuit(first, path).await?;
+        let link = (first, circ);
+        let last = onion.len() - 1;
+        let begun = onion
+            .wrap(last, &Payload::new(Cmd::Begin, vec![]))
+            .ok()
+            .is_some_and(|begin| {
+                self.onion_send(
+                    &first,
+                    &OnionMsg::Cell {
+                        circ,
+                        cell: begin.to_vec(),
+                    },
+                )
+            });
+        if !begun {
+            self.onion_destroy(link, false);
+            self.onion_send(&first, &OnionMsg::Destroy { circ });
+            return Err(NetError::Closed);
+        }
 
         // Stream pump between the end-to-end session and the circuit.
         let (ours, theirs) = tokio::io::duplex(1 << 20);
@@ -617,6 +822,20 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_deposits_are_rate_limited_per_neighbour() {
+        let mut st = OnionState::default();
+        let (x, y) = (
+            threnody_core::Identity::generate().public(),
+            threnody_core::Identity::generate().public(),
+        );
+        for _ in 0..MAX_DEPOSITS_PER_MINUTE {
+            assert!(st.deposit_allowed(x));
+        }
+        assert!(!st.deposit_allowed(x));
+        assert!(st.deposit_allowed(y));
+    }
 
     #[test]
     fn onion_messages_round_trip() {

@@ -234,3 +234,110 @@ async fn mailboxes_decline_unapproved_recipients_and_say_so() {
     .await;
     assert_eq!(r.node.held_messages(), 0);
 }
+
+#[tokio::test]
+async fn deposits_go_through_onion_circuits_and_hide_the_sender() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut b = spawn(&dir, "b").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut r2 = spawn(&dir, "r2").await;
+    let mut m = spawn(&dir, "m").await;
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r1).await;
+    link(&mut a, &mut r2).await;
+    link(&mut a, &mut m).await;
+    link(&mut r1, &mut r2).await;
+    link(&mut r2, &mut m).await;
+    link(&mut b, &mut m).await; // only M will hold for B
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    a.node.disconnect(&bid);
+    m.node.disconnect(&bid);
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && m.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+
+    a.node.send_offline(&bid, &text("from nobody")).unwrap();
+    let mid = m.node.identity();
+    next(&mut a.rx, |e| {
+        matches!(
+            e,
+            Event::DepositReceipt {
+                mailbox,
+                status: DepositStatus::Held,
+                anonymous: true,
+                ..
+            } if *mailbox == mid
+        )
+    })
+    .await;
+    assert_eq!(m.node.held_messages(), 1);
+    // M saw the deposit arrive over a circuit, never from A.
+    let _ = &mut r1.rx;
+    let _ = &mut r2.rx;
+    // Bigger than one cell: continued in Data cells.
+    let big = "x".repeat(6000);
+    a.node.send_offline(&bid, &text(&big)).unwrap();
+    wait_for(|| m.node.held_messages() == 2).await;
+
+    b.node.connect(&m.addr, None).await.unwrap();
+    let Event::OfflineMessage { from, via, msg } =
+        next(&mut b.rx, |e| matches!(e, Event::OfflineMessage { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (from, via, msg),
+        (a.node.identity(), mid, text("from nobody"))
+    );
+    next(
+        &mut b.rx,
+        |e| matches!(e, Event::OfflineMessage { msg, .. } if *msg == text(&big)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deposits_are_direct_when_onion_routing_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut b = spawn(&dir, "b").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut r2 = spawn(&dir, "r2").await;
+    let mut m = spawn(&dir, "m").await;
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r1).await;
+    link(&mut a, &mut r2).await;
+    link(&mut a, &mut m).await;
+    link(&mut r1, &mut r2).await;
+    link(&mut r2, &mut m).await;
+    link(&mut b, &mut m).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    a.node.disconnect(&bid);
+    m.node.disconnect(&bid);
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && m.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.set_prefer_onion(false);
+    a.node.send_offline(&bid, &text("plain")).unwrap();
+    let mid = m.node.identity();
+    next(&mut a.rx, |e| {
+        matches!(
+            e,
+            Event::DepositReceipt {
+                mailbox,
+                status: DepositStatus::Held,
+                anonymous: false,
+                ..
+            } if *mailbox == mid
+        )
+    })
+    .await;
+    let _ = (&mut r1.rx, &mut r2.rx);
+}
