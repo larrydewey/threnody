@@ -59,10 +59,18 @@ class ThrenodyService : Service() {
         /** One notification per conversation [key], opening [open] above the list. */
         private fun post(ctx: Context, key: String, title: String, text: String, open: Intent) {
             channels(ctx)
+            // On the lock screen: only that something arrived, not who or what.
+            val public = Notification.Builder(ctx, CHANNEL_MESSAGES)
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle("Threnody")
+                .setContentText("New message")
+                .build()
             val n = Notification.Builder(ctx, CHANNEL_MESSAGES)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentTitle(title)
                 .setContentText(text)
+                .setVisibility(Notification.VISIBILITY_PRIVATE)
+                .setPublicVersion(public)
                 .setContentIntent(
                     // Back from the chat leads to the conversation list.
                     TaskStackBuilder.create(ctx)

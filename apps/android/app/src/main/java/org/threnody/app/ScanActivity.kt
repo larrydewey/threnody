@@ -46,6 +46,7 @@ class ScanActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Privacy.apply(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val bar = TopBar(this) { finish() }.apply {
             title.text = "Scan a QR code"

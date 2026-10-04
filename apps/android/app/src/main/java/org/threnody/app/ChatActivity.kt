@@ -58,6 +58,7 @@ class ChatActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Privacy.apply(this)
         group = intent.getStringExtra(GROUP)
         key = group ?: intent.getStringExtra(KEY) ?: return finish()
         device = intent.getStringExtra(DEVICE) ?: key

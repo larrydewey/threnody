@@ -38,6 +38,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Privacy.apply(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val bar = TopBar(this, null).apply {
             title.text = "Threnody"
@@ -255,6 +256,20 @@ class MainActivity : Activity() {
     private fun more(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add("Devices").setOnMenuItemClickListener { devices(); true }
+            menu.add("Screen security").apply {
+                isCheckable = true
+                isChecked = Privacy.screenSecurity(this@MainActivity)
+                setOnMenuItemClickListener {
+                    val on = !Privacy.screenSecurity(this@MainActivity)
+                    Privacy.setScreenSecurity(this@MainActivity, on)
+                    Toast.makeText(
+                        this@MainActivity,
+                        if (on) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    true
+                }
+            }
             menu.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
             menu.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
             menu.add("Diagnostics").setOnMenuItemClickListener {

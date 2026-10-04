@@ -170,7 +170,8 @@ object Threnody {
                     if (node.contacts().any { it.fingerprint == e.peer && it.mutuallyApproved }) redialSoon(node)
                 }
                 is NodeEvent.Message -> {
-                    say("<${short(e.peer)}> ${e.text}")
+                    // The log is for transports, not content.
+                    say("* message from ${short(e.peer)} (${e.text.length} chars)")
                     val contacts = node.contacts()
                     val k = key(contacts, e.peer)
                     if (visible == 0 || e.peer !in visibleChat) {
@@ -193,7 +194,7 @@ object Threnody {
                     }
                 }
                 is NodeEvent.GroupMessage -> {
-                    say("[${e.group.take(6)}] <${short(e.from)}> ${e.text}")
+                    say("* group ${e.group.take(6)}: message from ${short(e.from)} (${e.text.length} chars)")
                     // Our own other device's messages aren't news.
                     if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
