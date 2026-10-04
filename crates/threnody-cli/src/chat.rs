@@ -1127,9 +1127,19 @@ fn human_secs(s: u32) -> String {
 }
 
 /// `HH:MM` (UTC) for a Unix-ms time.
+/// `HH:MM` in local time, with the date if it isn't today.
 fn clock(ms: u64) -> String {
-    let secs = ms / 1000;
-    format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
+    let tz = jiff::tz::TimeZone::system();
+    let Ok(t) = jiff::Timestamp::from_millisecond(i64::try_from(ms).unwrap_or(i64::MAX)) else {
+        return "?".into();
+    };
+    let t = t.to_zoned(tz.clone());
+    let today = jiff::Timestamp::now().to_zoned(tz).date();
+    if t.date() == today {
+        t.strftime("%H:%M").to_string()
+    } else {
+        t.strftime("%b %-d %H:%M").to_string()
+    }
 }
 
 #[cfg(test)]

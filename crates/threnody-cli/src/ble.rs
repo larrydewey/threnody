@@ -287,10 +287,43 @@ pub async fn listen(node: &Node) -> Result<Listening> {
         }
     }));
 
+    // Scanning can fail to start (BlueZ may still be finishing a previous
+    // scan, say after a restart) or stop; keep trying, backing off.
     let n = node.clone();
     tasks.push(tokio::spawn(async move {
-        if let Err(e) = auto_dial(&n, &adapter, uuid).await {
-            eprintln!("! Bluetooth scanning stopped: {e:#}");
+        let mut wait = Duration::from_secs(2);
+        let mut failing = false;
+        let mut failures = 0u32;
+        loop {
+            let started = std::time::Instant::now();
+            let r = auto_dial(&n, &adapter, uuid).await;
+            if started.elapsed() > Duration::from_secs(60) {
+                // It ran for a while: report a new failure, retry soon.
+                wait = Duration::from_secs(2);
+                failing = false;
+            }
+            match r {
+                Err(e) if !failing => {
+                    eprintln!("! Bluetooth scanning stopped ({e:#}); retrying");
+                    failing = true;
+                    failures = 1;
+                }
+                Err(_) => {
+                    failures += 1;
+                    // Seen with a MediaTek controller: BlueZ answers
+                    // "InProgress" until the adapter is power-cycled. That
+                    // would drop the user's other devices, so only say how.
+                    if failures == 5 {
+                        eprintln!(
+                            "! Bluetooth still can't scan; contacts can still reach this laptop. \
+                             If it persists: bluetoothctl power off && bluetoothctl power on"
+                        );
+                    }
+                }
+                Ok(()) => failing = false,
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(60));
         }
     }));
     Ok(Listening { psm, tasks })
