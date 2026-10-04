@@ -86,7 +86,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync, account-wide offline keys and group invites; history not synced |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
-| §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message) |
+| §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers (sync between devices and backups not yet) |
@@ -100,7 +100,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 ## Roadmap
 
 1. **Hardening (remaining).** Desktop and iOS keystores, ratchet persistence across reconnects, and an external audit.
-2. **Groups (remaining).** More admin roles and self-removal, files in groups, and acknowledgements so a copy sent on a dying session is resent.
+2. **Groups (remaining).** More admin roles and self-removal, and files in groups.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.

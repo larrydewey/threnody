@@ -6,6 +6,7 @@
 //! reliable byte stream, so Bluetooth sockets and Wi-Fi Direct links slot in.
 
 pub mod account;
+pub mod delivery;
 pub mod direct;
 pub mod discovery;
 pub mod error;

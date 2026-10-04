@@ -33,7 +33,8 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
-Hello    = { 0 => 0 }
+           / Direct / Tracked / Ack
+Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 = acknowledgements); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint }    ; sent_ms, body, disappear after (s)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr }      ; sent_ms, data (≤ 8 MiB), name
 Approval = { 0 => 3, 2 => bool }
@@ -45,10 +46,22 @@ Prekeys  = { 0 => 8, 2 => bstr .cbor PrekeyBundle }       ; Appendix H
 Mailbox  = { 0 => 9, 2 => bstr .cbor MailboxMsg }         ; Appendix H
 Onion    = { 0 => 10, 2 => bstr .cbor OnionMsg }          ; Appendix I
 Account  = { 0 => 11, 2 => bstr .cbor AccountMsg }        ; Appendix J
+Direct   = { 0 => 12, 2 => bstr .cbor DirectMsg }         ; Appendix L
+Tracked  = { 0 => 13, 2 => bstr .cbor AppMessage, 5 => uint }  ; inner message (not Tracked or Ack), id
+Ack      = { 0 => 14, 2 => bstr }                          ; acknowledged ids, 8 bytes each (big-endian), ≤ 512
 
-GroupWire = { 0 => 1..4, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr }
-          ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message), group id, payload, name
+GroupWire = { 0 => 1..5, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32 }
+          ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward),
+          ; group id, payload, name, member to forward to
 ```
+
+## Acknowledgements
+
+Each side's first message in a session is its `Hello`, and its feature bits say what it supports. Before this, only the initiator sent `Hello`, and peers ignored a `Hello` from the responder. Bit 1 means the side acknowledges `Tracked` messages and accepts `Tracked` and `Ack`. A peer that lacks it would drop the session on either kind, so neither is ever sent to it.
+
+When both sides set bit 1, text, files, group messages and mailbox messages travel as `Tracked { id, inner }`, with a random 64-bit id. The sender keeps each one until an `Ack` names its id. If the session ends first, even one that only looked alive, the sender sends it again at the start of the next session with that peer. The receiver acknowledges every copy, but delivers only the first: it remembers the last 4,096 ids per peer. The sender keeps at most 256 messages or 32 MiB per peer, dropping the oldest first. Tracked messages wait until the peer's first message shows whether it supports acknowledgements. If it doesn't, they go out plain and are not tracked.
+
+Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The exception is messages over 64 KiB (files), which are resent only within one run.
 
 ## Padding (spec §9, layer 1)
 
@@ -64,7 +77,7 @@ On stream transports, each frame is prefixed with its length as a `u32` in big-e
 
 ## Local storage
 
-All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A file transfer is stored as an entry with empty text and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location }`). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
+All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A file transfer is stored as an entry with empty text and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location }`). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
 
 Both files are written with mode 0600 inside a directory with mode 0700.
 

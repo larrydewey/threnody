@@ -83,8 +83,8 @@ mod tests {
         assert_eq!(*ca.export(b"x"), *cb.export(b"x"));
         assert_ne!(*ca.export(b"x"), *ca.export(b"y"));
 
-        let hello = ca.seal(&AppMessage::Hello).unwrap();
-        assert_eq!(cb.open(&hello).unwrap(), AppMessage::Hello);
+        let hello = ca.seal(&AppMessage::Hello { features: 0 }).unwrap();
+        assert_eq!(cb.open(&hello).unwrap(), AppMessage::Hello { features: 0 });
         assert!(cb.can_send());
 
         let short = ca

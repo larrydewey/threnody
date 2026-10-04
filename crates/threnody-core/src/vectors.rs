@@ -126,8 +126,8 @@ fn generate() -> String {
 
     let mut ca = SecureChannel::from(ea);
     let mut cb = SecureChannel::from(eb);
-    let m0 = ca.seal(&AppMessage::Hello).unwrap();
-    assert_eq!(cb.open(&m0).unwrap(), AppMessage::Hello);
+    let m0 = ca.seal(&AppMessage::Hello { features: 0 }).unwrap();
+    assert_eq!(cb.open(&m0).unwrap(), AppMessage::Hello { features: 0 });
     let text = AppMessage::Text {
         sent_ms: 1_791_000_000_000,
         body: "threnody".into(),

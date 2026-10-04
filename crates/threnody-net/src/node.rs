@@ -10,6 +10,7 @@ use std::time::Duration;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
+use threnody_core::message::{FEATURE_ACKS, MAX_ACK_IDS};
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
@@ -20,6 +21,7 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::account::LinkState;
+use crate::delivery::{Delivery, trackable};
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
@@ -248,6 +250,8 @@ pub(crate) struct Shared {
     pub(crate) ble: Mutex<crate::discovery::BleState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
+    /// Acknowledgement bookkeeping for user content (see `delivery`).
+    pub(crate) delivery: Mutex<Delivery>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -281,6 +285,19 @@ impl Shared {
         if let Err(e) = r {
             eprintln!("threnody: failed to save {name}: {e}");
         }
+    }
+
+    /// Runs `f` on the acknowledgement state and saves what it changed.
+    pub(crate) fn delivery<R>(&self, f: impl FnOnce(&mut Delivery) -> R) -> R {
+        let mut d = lock(&self.delivery);
+        let r = f(&mut d);
+        if std::mem::take(&mut d.unacked_dirty) {
+            self.save_state("unacked", Ok(d.encode_unacked()));
+        }
+        if std::mem::take(&mut d.delivered_dirty) {
+            self.save_state("delivered-ids", Ok(d.encode_delivered()));
+        }
+        r
     }
 
     pub(crate) fn persist_prekeys(&self, p: &PrekeyStore) {
@@ -340,6 +357,16 @@ impl Node {
             Some(b) => MailboxStore::decode(&b)?,
             None => MailboxStore::default(),
         };
+        let delivery = {
+            let load = |n| {
+                cfg.home
+                    .load_state(&cfg.identity, n)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            };
+            Delivery::load(&load("unacked"), &load("delivered-ids"))
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let tunnel = cfg
             .tunnel_port
@@ -366,6 +393,7 @@ impl Node {
             siblings: Mutex::new(siblings),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
+            delivery: Mutex::new(delivery),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -608,11 +636,23 @@ impl Node {
         }
     }
 
-    /// Queues a message to a connected peer.
+    /// Queues a message to a connected peer. User content (text, files,
+    /// group and mailbox messages) is kept until the peer acknowledges it
+    /// and sent again in the next session if this one dies first.
     pub fn send(&self, peer: &PublicIdentity, msg: AppMessage) -> Result<()> {
         let sessions = lock(&self.shared.sessions);
         let h = sessions.get(peer).ok_or(NetError::Closed)?;
+        let msg = if trackable(&msg) {
+            self.shared.delivery(|d| d.track(peer, msg))
+        } else {
+            msg
+        };
         h.tx.send(msg).map_err(|_| NetError::Closed)
+    }
+
+    /// How many messages to `peer` are waiting for an acknowledgement.
+    pub fn unacked(&self, peer: &PublicIdentity) -> usize {
+        lock(&self.shared.delivery).unacked(peer)
     }
 
     /// Sets our approval of `peer`, persists it and tells the peer if online.
@@ -694,6 +734,10 @@ impl Node {
             session_id: *chan.session_id(),
             remote,
         };
+        // Whatever the last session didn't get acknowledged goes first.
+        for m in lock(&self.shared.delivery).resend(&peer) {
+            let _ = tx.send(m);
+        }
         // A newer session to the same peer replaces the old one; dropping
         // the old handle's sender ends its task.
         lock(&self.shared.sessions).insert(peer, SessionHandle { id, tx, info });
@@ -772,13 +816,18 @@ where
         .get(&peer)
         .is_some_and(|c| c.local_approved);
     // Responder cannot send until the initiator's first ratchet message.
+    // Each side's first message is its Hello, so the other learns its
+    // features before anything else.
     let mut pending: VecDeque<AppMessage> = VecDeque::new();
-    if chan.can_send() {
-        pending.push_back(AppMessage::Hello);
-    }
+    pending.push_back(AppMessage::Hello {
+        features: FEATURE_ACKS,
+    });
     pending.push_back(AppMessage::Approval {
         approved: local_approved,
     });
+    // Whether the peer acknowledges `Tracked` messages: known from its
+    // first message. Until then, tracked messages wait.
+    let mut peer_acks: Option<bool> = None;
 
     let mut ticker = shared.constant_rate.map(|d| {
         let mut t = tokio::time::interval(d);
@@ -792,7 +841,12 @@ where
     // Our account chain (and, for own devices, our contacts), then anything
     // mailboxes held for this peer.
     pending.extend(node.account_hello(&peer));
-    pending.extend(node.mailbox_for(&peer));
+    {
+        // Held deliveries leave the mailbox store now; tracking keeps them
+        // until the peer has them.
+        let held = node.mailbox_for(&peer);
+        shared.delivery(|d| pending.extend(held.into_iter().map(|m| d.track(&peer, m))));
+    }
     let result: Result<()> = async {
         loop {
             // Refresh the pairwise LAN discovery key once per session.
@@ -821,9 +875,14 @@ where
                 offered = true;
             }
             if ticker.is_none() && chan.can_send() {
+                let mut waiting = VecDeque::new();
                 while let Some(m) = pending.pop_front() {
-                    write_frame(&mut wr, &chan.seal(&m)?).await?;
+                    match ready(shared, &peer, m, peer_acks) {
+                        Ok(m) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                        Err(m) => waiting.push_back(m),
+                    }
                 }
+                pending = waiting;
             }
             tokio::select! {
                 frame = inbox.recv() => {
@@ -834,8 +893,35 @@ where
                     };
                     // Any authentication failure ends the session: on a
                     // reliable stream it can only mean tampering or a broken peer.
-                    match chan.open(&frame)? {
-                        AppMessage::Hello | AppMessage::Cover => {}
+                    let opened = chan.open(&frame)?;
+                    if peer_acks.is_none() {
+                        peer_acks = Some(matches!(
+                            opened,
+                            AppMessage::Hello { features } if features & FEATURE_ACKS != 0
+                        ));
+                    }
+                    let msg = match opened {
+                        AppMessage::Tracked { id, inner } => {
+                            // Acknowledge every copy (the last ack may have
+                            // been lost), deliver only the first.
+                            match pending.back_mut() {
+                                Some(AppMessage::Ack(ids)) if ids.len() < MAX_ACK_IDS => ids.push(id),
+                                _ => pending.push_back(AppMessage::Ack(vec![id])),
+                            }
+                            shared.delivery(|d| d.first_delivery(&peer, id)).then_some(*inner)
+                        }
+                        AppMessage::Ack(ids) => {
+                            shared.delivery(|d| d.acked(&peer, &ids));
+                            None
+                        }
+                        m => Some(m),
+                    };
+                    let Some(msg) = msg else { continue };
+                    match msg {
+                        AppMessage::Hello { .. }
+                        | AppMessage::Cover
+                        | AppMessage::Tracked { .. }
+                        | AppMessage::Ack(_) => {}
                         AppMessage::Approval { approved } => {
                             let changed = {
                                 let mut contacts = lock(&shared.contacts);
@@ -909,7 +995,18 @@ where
                 },
                 () = tick(&mut ticker) => {
                     if chan.can_send() {
-                        let m = pending.pop_front().unwrap_or(AppMessage::Cover);
+                        // The first message that can go now, else cover.
+                        let mut m = AppMessage::Cover;
+                        for _ in 0..pending.len() {
+                            let Some(next) = pending.pop_front() else { break };
+                            match ready(shared, &peer, next, peer_acks) {
+                                Ok(r) => {
+                                    m = r;
+                                    break;
+                                }
+                                Err(w) => pending.push_back(w),
+                            }
+                        }
                         write_frame(&mut wr, &chan.seal(&m)?).await?;
                     }
                 }
@@ -919,6 +1016,24 @@ where
     .await;
     reader.abort();
     result
+}
+
+/// What to send for `m` now: tracked messages wait until we know whether
+/// the peer acknowledges them, and go out plain (untracked) if it doesn't.
+fn ready(
+    shared: &Shared,
+    peer: &PublicIdentity,
+    m: AppMessage,
+    peer_acks: Option<bool>,
+) -> std::result::Result<AppMessage, AppMessage> {
+    match (m, peer_acks) {
+        (m @ AppMessage::Tracked { .. }, None) => Err(m),
+        (AppMessage::Tracked { id, inner }, Some(false)) => {
+            shared.delivery(|d| d.forget(peer, id));
+            Ok(*inner)
+        }
+        (m, _) => Ok(m),
+    }
 }
 
 /// Waits for the next constant-rate tick, or forever when rate limiting is off.

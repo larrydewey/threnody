@@ -17,11 +17,18 @@ pub const PAD_MIN: usize = 256;
 pub const PAD_STEP_MAX: usize = 64 * 1024;
 /// Largest file a single message may carry.
 pub const MAX_FILE: usize = 8 * 1024 * 1024;
+/// `Hello` feature bit: this side acknowledges `Tracked` messages with
+/// `Ack` and accepts them (so the other side may send both).
+pub const FEATURE_ACKS: u64 = 1;
+/// Most ids one `Ack` carries.
+pub const MAX_ACK_IDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppMessage {
-    /// Opens the responder's sending chain; carries no user content.
-    Hello,
+    /// The first message each side sends: opens the responder's sending
+    /// chain, and says which optional features this side supports
+    /// (`FEATURE_*` bits; 0 encodes exactly as before features existed).
+    Hello { features: u64 },
     Text {
         sent_ms: u64,
         body: String,
@@ -56,6 +63,12 @@ pub enum AppMessage {
     Account(Vec<u8>),
     /// An opaque Wi-Fi Direct link message (see `threnody-net::direct`).
     Direct(Vec<u8>),
+    /// `inner`, which the receiver acknowledges by `id` and delivers once
+    /// even if it arrives again. Only sent to peers whose `Hello` has
+    /// [`FEATURE_ACKS`]; never nested.
+    Tracked { id: u64, inner: Box<AppMessage> },
+    /// Acknowledges `Tracked` messages by id.
+    Ack(Vec<u64>),
 }
 
 mod kind {
@@ -72,15 +85,45 @@ mod kind {
     pub const ONION: u64 = 10;
     pub const ACCOUNT: u64 = 11;
     pub const DIRECT: u64 = 12;
+    pub const TRACKED: u64 = 13;
+    pub const ACK: u64 = 14;
 }
 
 impl AppMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
+        // These wrap bytes built first, so the (retried) encoder below
+        // never re-encodes them.
+        match self {
+            Self::Tracked { id, inner } => {
+                let inner = inner.encode()?;
+                return cbor::to_vec(inner.len() + 32, |e| {
+                    e.map_len(3)?.u8(0)?.uint(kind::TRACKED)?;
+                    e.u8(2)?.bytes(&inner)?;
+                    e.u8(5)?.uint(*id)?;
+                    Ok(())
+                });
+            }
+            Self::Ack(ids) => {
+                let packed: Vec<u8> = ids.iter().flat_map(|i| i.to_be_bytes()).collect();
+                return cbor::to_vec(packed.len() + 16, |e| {
+                    e.map_len(2)?.u8(0)?.uint(kind::ACK)?;
+                    e.u8(2)?.bytes(&packed)?;
+                    Ok(())
+                });
+            }
+            _ => {}
+        }
         cbor::to_vec(self.size_hint(), |e| {
             match self {
-                Self::Hello => {
-                    e.map_len(1)?.u8(0)?.uint(kind::HELLO)?;
+                Self::Hello { features } => {
+                    e.map_len(1 + usize::from(*features != 0))?
+                        .u8(0)?
+                        .uint(kind::HELLO)?;
+                    if *features != 0 {
+                        e.u8(5)?.uint(*features)?;
+                    }
                 }
+                Self::Tracked { .. } | Self::Ack(_) => unreachable!("encoded above"),
                 Self::Cover => {
                     e.map_len(1)?.u8(0)?.uint(kind::COVER)?;
                 }
@@ -150,6 +193,11 @@ impl AppMessage {
         })
     }
 
+    /// Roughly how many bytes this message encodes to.
+    pub fn encoded_len_hint(&self) -> usize {
+        self.size_hint()
+    }
+
     fn size_hint(&self) -> usize {
         match self {
             Self::Text { body, .. } => body.len() + 32,
@@ -159,14 +207,24 @@ impl AppMessage {
             | Self::Prekeys(p)
             | Self::Mailbox(p)
             | Self::Onion(p) => p.len() + 16,
+            Self::Tracked { inner, .. } => inner.size_hint() + 32,
+            Self::Ack(ids) => ids.len() * 8 + 16,
             _ => 16,
         }
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
+        Self::decode_at(b, false)
+    }
+
+    /// `inside` is true for the message inside a `Tracked`, which may not
+    /// be a wrapper itself. That is checked before decoding any deeper, so
+    /// nesting can't recurse.
+    fn decode_at(b: &[u8], inside: bool) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut k, mut ts, mut text, mut bytes, mut flag, mut name, mut port, mut expiry) =
             (None, None, None, None, None, None, None, None);
+        let mut five = None;
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -181,13 +239,40 @@ impl AppMessage {
                     _ => port = Some(d.u16()?),
                 },
                 4 => expiry = Some(d.u32()?),
+                5 => five = Some(d.u64()?),
                 _ => return Ok(false),
             }
             Ok(true)
         })?;
         finish(&dec)?;
+        if inside && matches!(k, Some(kind::TRACKED | kind::ACK)) {
+            return Err(Error::Malformed("nested tracked message"));
+        }
         Ok(match required(k, "message kind")? {
-            kind::HELLO => Self::Hello,
+            kind::HELLO => Self::Hello {
+                features: five.unwrap_or(0),
+            },
+            kind::TRACKED => {
+                let inner = Self::decode_at(&required(bytes, "tracked message")?, true)?;
+                Self::Tracked {
+                    id: required(five, "message id")?,
+                    inner: Box::new(inner),
+                }
+            }
+            kind::ACK => {
+                let packed = required(bytes, "acknowledged ids")?;
+                if packed.len() % 8 != 0 || packed.len() / 8 > MAX_ACK_IDS {
+                    return Err(Error::Malformed("ack"));
+                }
+                Self::Ack(
+                    packed
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| u64::from_be_bytes(*c))
+                        .collect(),
+                )
+            }
             kind::COVER => Self::Cover,
             kind::TEXT => Self::Text {
                 sent_ms: ts.unwrap_or(0),
@@ -278,7 +363,24 @@ mod tests {
     #[test]
     fn messages_round_trip() {
         for m in [
-            AppMessage::Hello,
+            AppMessage::Hello { features: 0 },
+            AppMessage::Hello {
+                features: FEATURE_ACKS,
+            },
+            AppMessage::Tracked {
+                id: u64::MAX,
+                inner: Box::new(AppMessage::Group(vec![1])),
+            },
+            AppMessage::Tracked {
+                id: 7,
+                inner: Box::new(AppMessage::File {
+                    sent_ms: 1,
+                    name: "big".into(),
+                    data: vec![3; MAX_FILE],
+                }),
+            },
+            AppMessage::Ack(vec![]),
+            AppMessage::Ack(vec![1, u64::MAX]),
             AppMessage::Cover,
             AppMessage::Text {
                 sent_ms: 42,
@@ -310,6 +412,56 @@ mod tests {
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn hello_without_features_is_unchanged_and_tracking_is_bounded() {
+        // Old peers sent (and expect) exactly this.
+        assert_eq!(
+            AppMessage::Hello { features: 0 }.encode().unwrap(),
+            [0xa1, 0, 0]
+        );
+        let ack = |n: usize| AppMessage::Ack((0..n as u64).collect()).encode().unwrap();
+        assert!(AppMessage::decode(&ack(MAX_ACK_IDS)).is_ok());
+        assert!(AppMessage::decode(&ack(MAX_ACK_IDS + 1)).is_err());
+        let nested = AppMessage::Tracked {
+            id: 1,
+            inner: Box::new(AppMessage::Tracked {
+                id: 2,
+                inner: Box::new(AppMessage::Cover),
+            }),
+        };
+        assert!(AppMessage::decode(&nested.encode().unwrap()).is_err());
+        let acked = AppMessage::Tracked {
+            id: 1,
+            inner: Box::new(AppMessage::Ack(vec![1])),
+        };
+        assert!(AppMessage::decode(&acked.encode().unwrap()).is_err());
+        // Deep nesting is refused at the second level, without recursing.
+        let mut deep = AppMessage::Cover;
+        for i in 0..10_000 {
+            deep = AppMessage::Tracked {
+                id: i,
+                inner: Box::new(deep),
+            };
+        }
+        let deep = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || deep.encode().unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        let r = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || AppMessage::decode(&deep).is_err())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(r);
+        // A tracked message needs its id.
+        let mut no_id = acked.encode().unwrap();
+        no_id[0] = 0xa2;
+        assert!(AppMessage::decode(&no_id).is_err());
     }
 
     #[test]

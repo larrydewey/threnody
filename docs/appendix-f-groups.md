@@ -32,7 +32,7 @@ The sender fans every message out to each other member. The groups use the pure-
 
 Members need not be contacts of each other, or online together. Each copy goes to its member by the first of these that works:
 
-1. The live session with that member.
+1. The live session with that member. Sessions acknowledge group messages end to end, and resend them in the next session if the current one dies first (Appendix C, *Acknowledgements*).
 2. Sealed for the member's mailboxes (Appendix H), when we hold their prekeys.
 3. Forwarded by another member we have a session with, the owner first. The `Forward` carries the same MLS ciphertext and names the member to deliver it to. This applies to MLS messages only, never to key packages or Welcomes.
 4. Held by us and sent when the member next connects. Meanwhile we try to reach them through relays (Appendix G).
@@ -79,6 +79,5 @@ The key is derived from the identity seed, so group secrets are only as accessib
 ## Not yet done
 
 - **Secure deletion.** Each save rewrites the whole state file atomically. Old epoch secrets are gone from the file system's view, but not necessarily from the storage medium (spec §16 secure deletion).
-- **Acknowledgements.** A copy sent on a session that has just died, before either end noticed, is lost: sessions don't acknowledge application messages yet.
 - **More committers.** Admin roles beyond a single owner, and self-removal ("leave" proposals committed by the owner).
 - **Ciphersuite version.** openmls's X-Wing HPKE implements X-Wing draft-06, while the 1:1 protocol uses draft-11. Both are hybrid; they will converge once the MLS PQ ciphersuite draft settles.

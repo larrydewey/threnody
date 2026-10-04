@@ -56,7 +56,7 @@ fn parsers_survive_mutated_input() {
     let eb = resp.finish(&hs3).unwrap();
     let mut ca = SecureChannel::from(ea);
     let mut cb = SecureChannel::from(eb);
-    let hello = ca.seal(&AppMessage::Hello).unwrap();
+    let hello = ca.seal(&AppMessage::Hello { features: 0 }).unwrap();
     cb.open(&hello).unwrap();
     let text = ca
         .seal(&AppMessage::Text {
