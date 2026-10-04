@@ -91,6 +91,8 @@ pub struct Entry {
     /// For incoming entries: the sender's id for the message (0 = none),
     /// which a later "delete for everyone" names.
     pub remote_id: u64,
+    /// When the text was last edited (0 = never).
+    pub edited_ms: u64,
 }
 
 impl Entry {
@@ -219,7 +221,8 @@ impl History {
                         + usize::from(e.delivered)
                         + usize::from(e.recipients != 0)
                         + usize::from(!e.delivered_to.is_empty())
-                        + usize::from(e.remote_id != 0),
+                        + usize::from(e.remote_id != 0)
+                        + usize::from(e.edited_ms != 0),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -252,6 +255,9 @@ impl History {
                 if e.remote_id != 0 {
                     enc.u8(11)?.u64(e.remote_id)?;
                 }
+                if e.edited_ms != 0 {
+                    enc.u8(12)?.u64(e.edited_ms)?;
+                }
             }
             Ok(())
         })
@@ -270,7 +276,7 @@ impl History {
                             (None, None, None, None, None, None, None);
                         let (mut local_id, mut delivered) = (0, false);
                         let (mut recipients, mut delivered_to) = (0, Vec::new());
-                        let mut remote_id = 0;
+                        let (mut remote_id, mut edited_ms) = (0, 0);
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -291,6 +297,7 @@ impl History {
                                     delivered_to = b.as_chunks::<32>().0.to_vec();
                                 }
                                 11 => remote_id = d.u64()?,
+                                12 => edited_ms = d.u64()?,
                                 _ => return Ok(false),
                             }
                             Ok(true)
@@ -308,6 +315,7 @@ impl History {
                             recipients,
                             delivered_to,
                             remote_id,
+                            edited_ms,
                         });
                     }
                 }
@@ -481,6 +489,28 @@ impl Home {
         Ok(gone)
     }
 
+    /// Replaces the text of the entries `pick` chooses; returns how many.
+    pub fn edit_entries(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        body: &str,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Result<usize> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let mut n = 0;
+        for e in h.entries.iter_mut().filter(|e| e.file.is_none() && pick(e)) {
+            e.text = body.to_owned();
+            e.edited_ms = now_ms;
+            n += 1;
+        }
+        if n > 0 {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(n)
+    }
+
     /// Deletes a conversation's history.
     pub fn delete_history(&self, c: ConversationId) -> Result<()> {
         self.remove_state(&c.state_name())
@@ -535,6 +565,7 @@ mod tests {
             recipients: 0,
             delivered_to: Vec::new(),
             remote_id: 0,
+            edited_ms: 0,
         }
     }
 

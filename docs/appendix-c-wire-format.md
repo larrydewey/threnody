@@ -50,6 +50,7 @@ Direct   = { 0 => 12, 2 => bstr .cbor DirectMsg }         ; Appendix L
 Tracked  = { 0 => 13, 2 => bstr .cbor AppMessage, 5 => uint }  ; inner message (not Tracked or Ack), id
 Ack      = { 0 => 14, 2 => bstr }                          ; acknowledged ids, 8 bytes each (big-endian), ≤ 512
 Delete   = { 0 => 15, 2 => bstr, 3 => bstr }               ; message ids (8 bytes each, ≤ 512), conversation id
+Edit     = { 0 => 16, 2 => tstr, 3 => bstr, 5 => uint }    ; new text, conversation id, message id
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),
@@ -66,7 +67,7 @@ An outgoing text or file in history carries a random local id (history key 7), a
 
 Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The exception is messages over 64 KiB (files), which are resent only within one run.
 
-## Deleting messages
+## Deleting and editing messages
 
 Texts and files carry the sender's message id (its history entry's local id). The receiver records it with the entry (history key 11).
 
@@ -75,7 +76,7 @@ Texts and files carry the sender's message id (its history entry's local id). Th
 - **From a peer:** only for messages that peer's account sent ("delete for everyone"). Anything else is ignored.
 - **From one of our own devices:** for any messages in the named conversation. Our devices delete together, whether for me or for everyone. A sibling's chat with *us* is mapped to our chat with it.
 
-It's tracked like user content, so it's resent if lost. Deletion is a request: a modified client can keep a copy, and so can a screenshot. Group messages carry no ids yet, so in groups only "delete for me" exists, on that device.
+`Edit` replaces a message's text, under the same rules and with feature bit 4. The entry keeps its place and is marked edited (history key 12, the time of the edit). Only text can be edited, not files. Both messages are tracked like user content, so they're resent if lost. Deletion is a request: a modified client can keep a copy, and so can a screenshot. Group messages carry no ids yet, so in groups only "delete for me" exists, on that device.
 
 ## Padding (spec §9, layer 1)
 

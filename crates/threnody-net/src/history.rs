@@ -5,7 +5,7 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
-use threnody_core::message::FEATURE_DELETE;
+use threnody_core::message::{FEATURE_DELETE, FEATURE_EDIT};
 
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
@@ -162,6 +162,91 @@ impl Node {
         }
     }
 
+    /// Edits one of our own messages to `peer` (by its id): here, on our
+    /// other devices, and on the devices of `peer`'s account that support
+    /// it. Returns false if there's no such message of ours.
+    pub fn edit_message(&self, peer: &PublicIdentity, id: u64, body: &str) -> bool {
+        let conv = self.conversation_for(peer);
+        let me = *self.identity().as_bytes();
+        let n = self
+            .shared
+            .home
+            .edit_entries(self.identity_ref(), conv, now_ms(), body, |e| {
+                e.outgoing && e.device == me && e.local_id == id && id != 0
+            })
+            .unwrap_or(0);
+        if n == 0 {
+            return false;
+        }
+        let msg = AppMessage::Edit {
+            conversation: conv.to_bytes(),
+            id,
+            body: body.to_owned(),
+        };
+        let mut targets: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .map(|s| s.peer)
+            .filter(|p| self.is_own_device(p))
+            .collect();
+        match self.account_of(peer) {
+            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
+            None => targets.push(*peer),
+        }
+        targets.sort_unstable_by_key(|p| *p.as_bytes());
+        targets.dedup();
+        for d in targets {
+            if d == self.identity() || !self.supports(&d, FEATURE_EDIT) {
+                continue;
+            }
+            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
+                let _ = self.send_offline(&d, &msg);
+            }
+        }
+        true
+    }
+
+    /// Handles an `Edit` from `from`: one of our devices editing our own
+    /// message, or a peer editing a message its account sent us.
+    pub(crate) fn on_edit(&self, from: &PublicIdentity, conversation: &[u8], id: u64, body: &str) {
+        let n = if self.is_own_device(from) {
+            let conv = match ConversationId::from_bytes(conversation) {
+                Some(ConversationId::Peer(k)) if k == *self.identity().as_bytes() => {
+                    self.conversation_for(from)
+                }
+                Some(c) => c,
+                None => return,
+            };
+            // Our message, as any of our devices knows it.
+            self.shared
+                .home
+                .edit_entries(self.identity_ref(), conv, now_ms(), body, |e| {
+                    e.message_id() == id && id != 0
+                })
+                .unwrap_or(0)
+        } else {
+            let conv = self.conversation_for(from);
+            let senders: Vec<[u8; 32]> = match self.account_of(from) {
+                Some(a) => a
+                    .state()
+                    .devices
+                    .iter()
+                    .map(|(d, _)| *d.as_bytes())
+                    .collect(),
+                None => vec![*from.as_bytes()],
+            };
+            self.shared
+                .home
+                .edit_entries(self.identity_ref(), conv, now_ms(), body, |e| {
+                    !e.outgoing && senders.contains(&e.device) && e.remote_id == id && id != 0
+                })
+                .unwrap_or(0)
+        };
+        if n > 0 {
+            self.emit(Event::MessageEdited { peer: *from, id });
+        }
+    }
+
     /// Accepts `peer`'s message requests (every device of its account):
     /// its messages show as a conversation from now on.
     pub fn accept_contact(&self, peer: &PublicIdentity) {
@@ -302,6 +387,7 @@ impl Node {
                 recipients: 0,
                 delivered_to: Vec::new(),
                 remote_id: 0,
+                edited_ms: 0,
             },
         );
         Ok(r)
@@ -501,6 +587,7 @@ impl Node {
             recipients: 0,
             delivered_to: Vec::new(),
             remote_id,
+            edited_ms: 0,
         };
         let _ = self
             .shared
@@ -553,6 +640,7 @@ impl Node {
                 recipients: 0,
                 delivered_to: Vec::new(),
                 remote_id,
+                edited_ms: 0,
             },
         );
     }

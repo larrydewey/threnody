@@ -251,3 +251,37 @@ async fn messages_can_be_deleted_for_me_or_for_everyone() {
         "but gone for him"
     );
 }
+
+#[tokio::test]
+async fn senders_can_edit_their_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, _) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    alice.send_text(&bob_id, "see you at 7").unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    let last = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
+    let id = last(&alice, &bob_id).message_id();
+
+    assert!(alice.edit_message(&bob_id, id, "see you at 8"));
+    next(&mut brx, |e| matches!(e, Event::MessageEdited { .. })).await;
+    let theirs = last(&bob, &a_id);
+    assert_eq!(theirs.text, "see you at 8");
+    assert!(theirs.edited_ms != 0 && last(&alice, &bob_id).edited_ms != 0);
+
+    // Bob can't rewrite what Alice said, nor can anyone edit a message
+    // that isn't theirs.
+    assert!(!bob.edit_message(&a_id, id, "see you never"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(last(&alice, &bob_id).text, "see you at 8");
+}

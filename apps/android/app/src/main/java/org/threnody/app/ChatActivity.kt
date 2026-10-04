@@ -166,6 +166,7 @@ class ChatActivity : Activity() {
             is NodeEvent.Message -> e.peer
             is NodeEvent.MessageRequest -> e.peer
             is NodeEvent.MessagesDeleted -> e.peer
+            is NodeEvent.MessageEdited -> e.peer
             is NodeEvent.File -> e.peer
             is NodeEvent.Connected -> e.peer
             is NodeEvent.Disconnected -> e.peer
@@ -200,7 +201,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, recipients = 0u, deliveredTo = 0u), sending = true) }
+            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         runOnUiThread {
@@ -383,7 +384,7 @@ class ChatActivity : Activity() {
             else -> " ✓"
         }
         body.addView(TextView(this).apply {
-            text = meta + (if (e.disappearing) " · ⏱" else "") + tick
+            text = meta + (if (e.edited) " · edited" else "") + (if (e.disappearing) " · ⏱" else "") + tick
             contentDescription = text.toString().replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
             textSize = 11f
             setTextColor(fg)
@@ -403,12 +404,17 @@ class ChatActivity : Activity() {
     /** Delete for me, or (our own 1:1 messages) for everyone. */
     private fun deleteMessage(e: HistoryEntry) {
         val g = group
-        val forEveryone = g == null && e.outgoing && e.device == myDevice && e.id != 0uL
-        val options = if (forEveryone) arrayOf("Delete for me", "Delete for everyone") else arrayOf("Delete for me")
+        val mine = g == null && e.outgoing && e.device == myDevice && e.id != 0uL
+        val canEdit = mine && e.file == null
+        val options = buildList {
+            if (canEdit) add("Edit")
+            add("Delete for me")
+            if (mine) add("Delete for everyone")
+        }
         AlertDialog.Builder(this)
-            .setTitle("Delete message?")
-            .setItems(options) { _, i ->
-                val everyone = i == 1
+            .setItems(options.toTypedArray()) { _, i ->
+                if (options[i] == "Edit") return@setItems editMessage(e)
+                val everyone = options[i] == "Delete for everyone"
                 worker.execute {
                     run("delete") {
                         when {
@@ -422,6 +428,26 @@ class ChatActivity : Activity() {
                             Toast.LENGTH_LONG).show()
                     }
                 }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun editMessage(e: HistoryEntry) {
+        val field = EditText(this).apply {
+            setText(e.text)
+            setSelection(e.text.length)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Edit message")
+            .setMessage("They see it marked as edited, if they're running a current version.")
+            .setView(LinearLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(field, matchWrap) })
+            .setPositiveButton("Save") { _, _ ->
+                val body = field.text.toString().trim()
+                if (body.isEmpty() || body == e.text) return@setPositiveButton
+                worker.execute { run("edit") { node.editMessage(device, e.id, body) } }
             }
             .setNegativeButton("Cancel", null)
             .show()

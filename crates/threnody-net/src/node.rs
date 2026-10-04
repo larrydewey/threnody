@@ -159,6 +159,11 @@ pub enum Event {
         via: PublicIdentity,
         msg: AppMessage,
     },
+    /// `peer` edited a message (its own; or, from our own device, ours).
+    MessageEdited {
+        peer: PublicIdentity,
+        id: u64,
+    },
     /// `peer` deleted messages: ours on its behalf (its own other device),
     /// or its own for everyone. `count` entries went from our history.
     MessagesDeleted {
@@ -1028,6 +1033,7 @@ where
                     let Some(msg) = msg else { continue };
                     match msg {
                         AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
+                        AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }

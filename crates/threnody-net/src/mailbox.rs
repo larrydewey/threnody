@@ -416,6 +416,15 @@ impl Node {
                 self.on_delete(&from, conversation, ids);
                 return;
             }
+            if let AppMessage::Edit {
+                conversation,
+                id,
+                body,
+            } = &msg
+            {
+                self.on_edit(&from, conversation, *id, body);
+                return;
+            }
             self.record_incoming(&from, &msg, true);
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {
                 self.emit(Event::OfflineMessage { from, via, msg });

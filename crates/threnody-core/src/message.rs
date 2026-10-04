@@ -22,8 +22,10 @@ pub const MAX_FILE: usize = 8 * 1024 * 1024;
 pub const FEATURE_ACKS: u64 = 1;
 /// `Hello` feature bit: this side understands `Delete` (so it can be sent).
 pub const FEATURE_DELETE: u64 = 2;
+/// `Hello` feature bit: this side understands `Edit`.
+pub const FEATURE_EDIT: u64 = 4;
 /// Every feature this implementation has.
-pub const FEATURES: u64 = FEATURE_ACKS | FEATURE_DELETE;
+pub const FEATURES: u64 = FEATURE_ACKS | FEATURE_DELETE | FEATURE_EDIT;
 /// Most ids one `Ack` carries.
 pub const MAX_ACK_IDS: usize = 512;
 
@@ -86,6 +88,14 @@ pub enum AppMessage {
         conversation: Vec<u8>,
         ids: Vec<u64>,
     },
+    /// Replace the text of message `id` (the sender's own; or, from one of
+    /// our devices, in `conversation`). Only sent to peers whose `Hello`
+    /// has [`FEATURE_EDIT`].
+    Edit {
+        conversation: Vec<u8>,
+        id: u64,
+        body: String,
+    },
 }
 
 mod kind {
@@ -105,6 +115,7 @@ mod kind {
     pub const TRACKED: u64 = 13;
     pub const ACK: u64 = 14;
     pub const DELETE: u64 = 15;
+    pub const EDIT: u64 = 16;
 }
 
 impl AppMessage {
@@ -129,6 +140,19 @@ impl AppMessage {
                     Ok(())
                 });
             }
+            Self::Edit {
+                conversation,
+                id,
+                body,
+            } => {
+                return cbor::to_vec(body.len() + conversation.len() + 32, |e| {
+                    e.map_len(4)?.u8(0)?.uint(kind::EDIT)?;
+                    e.u8(2)?.str(body)?;
+                    e.u8(3)?.bytes(conversation)?;
+                    e.u8(5)?.uint(*id)?;
+                    Ok(())
+                });
+            }
             Self::Delete { conversation, ids } => {
                 let packed: Vec<u8> = ids.iter().flat_map(|i| i.to_be_bytes()).collect();
                 return cbor::to_vec(packed.len() + conversation.len() + 24, |e| {
@@ -150,7 +174,7 @@ impl AppMessage {
                         e.u8(5)?.uint(*features)?;
                     }
                 }
-                Self::Tracked { .. } | Self::Ack(_) | Self::Delete { .. } => {
+                Self::Tracked { .. } | Self::Ack(_) | Self::Delete { .. } | Self::Edit { .. } => {
                     unreachable!("encoded above")
                 }
                 Self::Cover => {
@@ -300,6 +324,11 @@ impl AppMessage {
                     inner: Box::new(inner),
                 }
             }
+            kind::EDIT => Self::Edit {
+                conversation: required(conv, "conversation")?,
+                id: required(five, "message id")?,
+                body: required(text, "text body")?,
+            },
             kind::DELETE => {
                 let packed = required(bytes, "deleted ids")?;
                 if packed.len() % 8 != 0 || packed.len() / 8 > MAX_ACK_IDS {
@@ -443,6 +472,11 @@ mod tests {
             AppMessage::Delete {
                 conversation: vec![0; 33],
                 ids: vec![7, u64::MAX],
+            },
+            AppMessage::Edit {
+                conversation: vec![1; 17],
+                id: 9,
+                body: "better wording".into(),
             },
             AppMessage::Cover,
             AppMessage::Text {

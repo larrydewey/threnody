@@ -416,6 +416,16 @@ async fn deleting_in_a_chat_between_our_own_devices() {
             .map(|e| (e.message_id(), e.remote_id, e.local_id))
             .collect::<Vec<_>>()
     );
+    // Edits reach the sibling too.
+    assert!(laptop.node.edit_message(&pid, id, "self-destruct, edited"));
+    let text = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .last()
+            .map(|e| e.text.clone())
+    };
+    wait_for(|| text(&phone.node, &lid).as_deref() == Some("self-destruct, edited")).await;
     assert_eq!(laptop.node.delete_messages(&pid, &[id], true), 1);
-    wait_for(|| on(&phone.node, &lid) == 0).await;
+    wait_for(|| text(&phone.node, &lid).is_none()).await;
 }

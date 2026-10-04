@@ -53,6 +53,7 @@ Type a line to send it to the current peer. Commands:
   /approve [peer]   /revoke [peer]      mesh / tunnel approval
   /requests   /accept <peer>   /block <peer>   /delete <peer>   message requests
   /del <n> [all]                        delete message n of the last /history (all: for everyone)
+  /edit <n> <text>                      edit your message n of the last /history
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
   /file <path>                          send a file to the current peer
@@ -355,6 +356,9 @@ impl Ui {
                 _ => "",
             }
             .to_owned();
+            if e.edited_ms != 0 {
+                mark.push_str(" (edited)");
+            }
             if e.delivered {
                 mark.push_str(" ✓✓");
             }
@@ -505,6 +509,12 @@ impl Ui {
                 self.groups.connected(&self.node, &name, &peer);
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
+            Event::MessageEdited { peer, .. } => {
+                println!(
+                    "* {} edited a message (/history to see it)",
+                    self.name(&peer)
+                );
+            }
             Event::MessagesDeleted { peer, count } => {
                 println!("* {} deleted {count} message(s)", self.name(&peer));
             }
@@ -750,6 +760,28 @@ impl Ui {
                     }
                 });
                 println!("* named {}", self.name(&key));
+            }
+            "edit" => {
+                let (n, body) = arg
+                    .and_then(|a| a.split_once(' '))
+                    .ok_or_else(|| anyhow!("usage: /edit <n> <new text> (n from /history)"))?;
+                let n: usize = n
+                    .parse()
+                    .map_err(|_| anyhow!("usage: /edit <n> <new text>"))?;
+                let (peer, shown) = self.shown.borrow().clone();
+                let peer =
+                    peer.ok_or_else(|| anyhow!("run /history first; /edit uses its numbers"))?;
+                let e = shown
+                    .get(n.wrapping_sub(1))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("no message {n} in the last /history"))?;
+                if !e.outgoing || e.file.is_some() || e.local_id == 0 {
+                    bail!("only your own text messages can be edited");
+                }
+                if !self.node.edit_message(&peer, e.local_id, body.trim()) {
+                    bail!("that message is gone");
+                }
+                println!("* edited");
             }
             "del" => {
                 let mut it = arg.unwrap_or("").split_whitespace();

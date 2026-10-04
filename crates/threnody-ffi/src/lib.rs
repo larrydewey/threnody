@@ -79,6 +79,8 @@ pub struct HistoryEntry {
     /// The id to delete it by (`delete_messages`); 0 = none, use
     /// `delete_entry` with `at_ms` and `device`.
     pub id: u64,
+    /// The text was edited after sending.
+    pub edited: bool,
     /// For outgoing group messages: how many members it went to, and how
     /// many acknowledged their copy (forwarded or mailbox copies don't
     /// count until the member itself acknowledges).
@@ -182,6 +184,10 @@ pub enum NodeEvent {
         name: String,
         data: Vec<u8>,
         id: u64,
+    },
+    /// `peer` edited a message: reload its conversation.
+    MessageEdited {
+        peer: String,
     },
     /// `peer` deleted messages (its own, for everyone; or, from our own
     /// device, ones we deleted there): reload its conversation.
@@ -337,6 +343,7 @@ fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntr
             }),
             delivered: e.delivered,
             id: e.message_id(),
+            edited: e.edited_ms != 0,
             recipients: e.recipients,
             delivered_to: u32::try_from(e.delivered_to.len()).unwrap_or(u32::MAX),
         })
@@ -383,6 +390,7 @@ fn convert(e: Event) -> NodeEvent {
             data,
             id,
         },
+        Event::MessageEdited { peer, .. } => NodeEvent::MessageEdited { peer: fp(&peer) },
         Event::MessagesDeleted { peer, count } => NodeEvent::MessagesDeleted {
             peer: fp(&peer),
             count: u32::try_from(count).unwrap_or(u32::MAX),
@@ -666,6 +674,14 @@ impl ThrenodyNode {
         let _guard = self.rt.enter();
         let n = self.node.delete_messages(&p, &ids, everyone);
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
+    /// Edits our own text message `id` to `peer`, everywhere that supports
+    /// it. False if there's no such message of ours.
+    pub fn edit_message(&self, peer: String, id: u64, body: String) -> Result<bool> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        Ok(self.node.edit_message(&p, id, &body))
     }
 
     /// Deletes one entry without an id (older messages, group messages)
