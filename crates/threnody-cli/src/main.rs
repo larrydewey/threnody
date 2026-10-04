@@ -50,13 +50,14 @@ enum Cmd {
         /// Replace an existing identity. Contacts will no longer recognise you.
         #[arg(long)]
         force: bool,
-        /// Protect the identity key with a passphrase (Argon2id).
-        #[arg(long, conflicts_with = "keyring")]
+        /// Protect the identity key with a passphrase (Argon2id) instead of
+        /// the system keyring.
+        #[arg(long, conflicts_with = "no_keyring")]
         passphrase: bool,
-        /// Protect the identity key with a random passphrase kept in the
-        /// system keyring (Secret Service, Keychain, Credential Manager).
+        /// Store the identity key unprotected instead of sealing it with a
+        /// key kept in the system keyring (the default when there is one).
         #[arg(long)]
-        keyring: bool,
+        no_keyring: bool,
     },
     /// Keep the identity's key in the system keyring, or stop doing so.
     Keyring {
@@ -349,7 +350,7 @@ fn main() -> Result<()> {
         Cmd::Init {
             force,
             passphrase,
-            keyring: use_keyring,
+            no_keyring,
         } => {
             if home.has_identity() && !force {
                 bail!(
@@ -357,10 +358,30 @@ fn main() -> Result<()> {
                     home.dir().display()
                 );
             }
-            let pw = if use_keyring {
-                Some(keyring::create(&home)?)
+            // By default the identity is sealed with a key in the system
+            // keyring; without one, it is stored unprotected as before.
+            let pw = if passphrase {
+                Some(new_passphrase()?)
+            } else if no_keyring {
+                None
             } else {
-                passphrase.then(new_passphrase).transpose()?
+                match keyring::create(&home) {
+                    Ok(pw) => {
+                        println!(
+                            "The identity key is sealed with a key kept in the system keyring."
+                        );
+                        Some(pw)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "No system keyring ({e:#}); the identity key is stored unprotected."
+                        );
+                        eprintln!(
+                            "Use `threnody init --passphrase` to protect it with a passphrase."
+                        );
+                        None
+                    }
+                }
             };
             let id = home.create_identity(pw.as_ref().map(|p| p.as_bytes()))?;
             println!("Created identity in {}", home.dir().display());
