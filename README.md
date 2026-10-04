@@ -43,7 +43,7 @@ You can also manage contacts outside a session with `threnody contacts | name | 
 
 While listening, nodes send private UDP beacons that only mutually approved peers can recognise, and reconnect to each other automatically. Use `--no-discover` to turn this off. See [Appendix E](docs/appendix-e-discovery.md).
 
-`threnody init --passphrase` seals the identity key with Argon2id. `threnody passphrase` adds, changes or removes the passphrase. `$THRENODY_PASSPHRASE` supplies it non-interactively.
+`threnody init --keyring` seals the identity key (Argon2id) with a random key kept in the system keyring: the Secret Service on Linux (GNOME Keyring, KWallet, KeePassXC), the Keychain on macOS, or the Credential Manager on Windows. A copy of the data directory is then useless without your unlocked keyring. `threnody keyring on|off|status` moves an existing identity into or out of the keyring. Alternatively, `threnody init --passphrase` seals it with a passphrase you type, and `threnody passphrase` adds, changes or removes it. `$THRENODY_PASSPHRASE` supplies it non-interactively.
 
 `--tunnel [PORT]` builds WireGuard tunnels to mutually approved peers. Each pair's preshared key comes from its Threnody session, which makes the tunnels post-quantum hybrid. The node keeps `<home>/wireguard/thr0.conf` current: bring the interface up with `sudo wg-quick up …`, then add `--wg-apply` to push changes live. See [Appendix D](docs/appendix-d-tunnels.md).
 
@@ -94,12 +94,12 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ padding, constant-rate + cover, onion circuits (≥ 2 relays, fixed-size cells); ❌ volunteer relay directories, local-first preference |
 | §10 Status indicators | ✅ `/status` |
-| §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: 0600 files plus an optional Argon2id passphrase |
+| §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: sealed with a key in the system keyring (`--keyring`) or a passphrase; 0600 files otherwise |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
 
 ## Roadmap
 
-1. **Hardening (remaining).** Desktop and iOS keystores, ratchet persistence across reconnects, and an external audit.
+1. **Hardening (remaining).** An iOS keystore, ratchet persistence across reconnects, and an external audit.
 2. **Groups (remaining).** More admin roles and self-removal, and files in groups.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.

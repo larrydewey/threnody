@@ -4,6 +4,7 @@
 mod ble;
 mod chat;
 mod groups;
+mod keyring;
 mod target;
 mod tunnel;
 mod wifidirect;
@@ -16,6 +17,17 @@ use clap::{Parser, Subcommand, ValueEnum};
 use threnody_core::store::{Contact, Home, Lookup};
 use threnody_core::{Identity, safety_number};
 use threnody_net::AcceptPolicy;
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KeyringAction {
+    /// Seal the identity under a key kept in the keyring.
+    On,
+    /// Remove the keyring key and store the identity unprotected (set a
+    /// passphrase afterwards with `threnody passphrase`).
+    Off,
+    /// Say how the identity is protected.
+    Status,
+}
 
 #[derive(Parser)]
 #[command(
@@ -39,8 +51,17 @@ enum Cmd {
         #[arg(long)]
         force: bool,
         /// Protect the identity key with a passphrase (Argon2id).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "keyring")]
         passphrase: bool,
+        /// Protect the identity key with a random passphrase kept in the
+        /// system keyring (Secret Service, Keychain, Credential Manager).
+        #[arg(long)]
+        keyring: bool,
+    },
+    /// Keep the identity's key in the system keyring, or stop doing so.
+    Keyring {
+        #[arg(value_enum, default_value_t = KeyringAction::Status)]
+        action: KeyringAction,
     },
     /// Add, change or remove the identity passphrase.
     Passphrase {
@@ -172,11 +193,86 @@ pub fn load_identity(home: &Home) -> Result<Identity> {
     if !home.identity_is_sealed()? {
         return home.load_identity(None).context("loading identity");
     }
+    if let Some(pw) = keyring::get(home) {
+        match home.load_identity(Some(pw.as_bytes())) {
+            Err(threnody_core::Error::Decrypt) => {
+                eprintln!(
+                    "The keyring's key no longer opens this identity; asking for the passphrase."
+                );
+            }
+            r => return r.context("loading identity"),
+        }
+    }
     let pw = read_passphrase("Passphrase: ")?;
     match home.load_identity(Some(pw.as_bytes())) {
         Err(threnody_core::Error::Decrypt) => bail!("wrong passphrase"),
         r => r.context("loading identity"),
     }
+}
+
+/// The passphrase the identity is sealed with now: the keyring's if it
+/// opens it, else asked for. `None` if the identity isn't sealed.
+fn current_passphrase(home: &Home) -> Result<Option<zeroize_string::Secret>> {
+    if !home.identity_is_sealed()? {
+        return Ok(None);
+    }
+    if let Some(pw) = keyring::get(home)
+        && home.load_identity(Some(pw.as_bytes())).is_ok()
+    {
+        return Ok(Some(pw));
+    }
+    Ok(Some(read_passphrase("Current passphrase: ")?))
+}
+
+fn keyring_command(home: &Home, action: KeyringAction) -> Result<()> {
+    if !home.has_identity() {
+        bail!(
+            "no identity in {}; run `threnody init` first",
+            home.dir().display()
+        );
+    }
+    let change =
+        |current: Option<zeroize_string::Secret>, new: Option<&zeroize_string::Secret>| match home
+            .change_passphrase(
+                current.as_ref().map(|p| p.as_bytes()),
+                new.map(|p| p.as_bytes()),
+            ) {
+            Err(threnody_core::Error::Decrypt) => bail!("wrong passphrase"),
+            r => Ok(r?),
+        };
+    match action {
+        KeyringAction::On => {
+            let current = current_passphrase(home)?;
+            let new = keyring::create(home)?;
+            if let Err(e) = change(current, Some(&new)) {
+                keyring::delete(home);
+                return Err(e);
+            }
+            println!("The identity is now sealed with a key kept in the system keyring.");
+        }
+        KeyringAction::Off => {
+            let current = current_passphrase(home)?;
+            change(current, None)?;
+            keyring::delete(home);
+            println!("Keyring key removed; the identity is stored unprotected.");
+            println!("Run `threnody passphrase` to protect it with a passphrase instead.");
+        }
+        KeyringAction::Status => {
+            let sealed = home.identity_is_sealed()?;
+            let opens = keyring::get(home)
+                .is_some_and(|pw| home.load_identity(Some(pw.as_bytes())).is_ok());
+            println!(
+                "{}",
+                match (sealed, opens) {
+                    (true, true) => "Sealed with a key kept in the system keyring.",
+                    (true, false) => "Sealed with a passphrase.",
+                    (false, _) =>
+                        "Not protected: anyone who can read the data directory has the key.",
+                }
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reads a passphrase from `$THRENODY_PASSPHRASE` or the terminal.
@@ -250,24 +346,29 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = Home::new(cli.home.unwrap_or_else(default_home));
     match cli.cmd {
-        Cmd::Init { force, passphrase } => {
+        Cmd::Init {
+            force,
+            passphrase,
+            keyring: use_keyring,
+        } => {
             if home.has_identity() && !force {
                 bail!(
                     "identity already exists in {} (use --force to replace)",
                     home.dir().display()
                 );
             }
-            let pw = passphrase.then(new_passphrase).transpose()?;
+            let pw = if use_keyring {
+                Some(keyring::create(&home)?)
+            } else {
+                passphrase.then(new_passphrase).transpose()?
+            };
             let id = home.create_identity(pw.as_ref().map(|p| p.as_bytes()))?;
             println!("Created identity in {}", home.dir().display());
             println!("Fingerprint: {}", id.public().fingerprint());
         }
+        Cmd::Keyring { action } => keyring_command(&home, action)?,
         Cmd::Passphrase { remove } => {
-            let current = if home.identity_is_sealed()? {
-                Some(read_passphrase("Current passphrase: ")?)
-            } else {
-                None
-            };
+            let current = current_passphrase(&home)?;
             let new = if remove {
                 None
             } else {
@@ -280,6 +381,8 @@ fn main() -> Result<()> {
                 Err(threnody_core::Error::Decrypt) => bail!("wrong passphrase"),
                 r => r?,
             }
+            // A passphrase of the user's own replaces the keyring's.
+            keyring::delete(&home);
             println!(
                 "{}",
                 if remove {
