@@ -2,7 +2,7 @@
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
 
-**Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Bluetooth / Wi-Fi Direct and mobile are still to come (see [Roadmap](#roadmap)).
+**Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Apps can embed a node through generated Kotlin, Swift and Python bindings. Bluetooth / Wi-Fi Direct transports are still to come (see [Roadmap](#roadmap)).
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
@@ -50,6 +50,7 @@ While listening, nodes send private UDP beacons that only mutually approved peer
 | `threnody-core` | Sans-IO protocol: identity and fingerprints, the hybrid KEM, the handshake, the ratchet, the CBOR wire format (via [`const-cbor`](https://crates.io/crates/const-cbor)), padding, and the contact/identity store |
 | `threnody-net` | Stream framing, the async handshake driver, and `Node` (sessions, trust policy, approval exchange, constant-rate mode). The TCP transport works today, and the session driver works over any byte stream. |
 | `threnody-groups` | MLS groups on openmls with the X-Wing ciphersuite. Credentials are bound to Threnody identities, the group owner is the only committer, and messages travel as sans-IO fan-out over the 1:1 sessions |
+| `threnody-ffi` | UniFFI bindings (Kotlin, Swift, Python) for embedding a node in apps; see [its README](crates/threnody-ffi/README.md) |
 | `threnody-cli` | The `threnody` binary |
 
 The normative details that the spec deferred are written up in [`docs/`](docs/):
@@ -97,7 +98,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** BLE / Wi-Fi Direct transports with the same beacon scheme.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.
-6. **Mobile.** UniFFI bindings for iOS and Android. The core is sans-IO, so this is mostly glue code.
+6. **Mobile (remaining).** Sample Android and iOS apps on top of `threnody-ffi`, and background delivery that respects each platform's limits.
 
 ## Development
 
@@ -105,6 +106,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 cargo test                    # unit, vector, mutation and TCP integration tests
 cargo clippy --all-targets
 cargo +nightly fuzz run envelope   # see fuzz/README.md
+crates/threnody-ffi/bindings.sh    # generate bindings, run the Python binding test
 ```
 
 ## License
