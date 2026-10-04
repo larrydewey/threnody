@@ -55,6 +55,7 @@ object Threnody {
         val node = instance ?: return
         node.setCoverTraffic(Privacy.coverMs(ctx))
         node.setOnionFirst(Privacy.onionFirst(ctx))
+        node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
     }
 
     /**

@@ -86,3 +86,50 @@ async fn history_records_both_sides_and_disappearing_messages_vanish() {
         Some(1)
     );
 }
+
+#[tokio::test]
+async fn messages_disappear_by_default_unless_turned_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, _) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    let week = threnody_net::history::DEFAULT_TIMER_S;
+    assert_eq!(alice.timer(&bob_id), Some(week), "on by default");
+
+    alice.send_text(&bob_id, "goes in a week").unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    let last = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
+    let mine = last(&alice, &bob_id);
+    let left = mine.expires_at_ms.unwrap() - mine.at_ms;
+    assert_eq!(left, u64::from(week) * 1000);
+    assert!(
+        last(&bob, &a_id).expires_at_ms.is_some(),
+        "the receiver applies it too"
+    );
+
+    // Turned off for this chat: the next message stays, and Bob follows.
+    alice.set_timer(&bob_id, None).unwrap();
+    assert_eq!(alice.timer(&bob_id), None);
+    alice.send_text(&bob_id, "stays").unwrap();
+    next(&mut brx, |e| {
+        matches!(e, Event::TimerChanged { secs: None, .. })
+    })
+    .await;
+    assert_eq!(bob.timer(&a_id), None);
+    assert!(last(&bob, &a_id).expires_at_ms.is_none());
+
+    // A custom timer, and a default turned off for chats without one.
+    alice.set_timer(&bob_id, Some(30)).unwrap();
+    assert_eq!(alice.timer(&bob_id), Some(30));
+    bob.set_default_timer(None);
+    let carol = threnody_core::Identity::generate().public();
+    assert_eq!(bob.timer(&carol), None);
+}

@@ -616,6 +616,21 @@ impl ThrenodyNode {
         Ok(history_entries(h.recent(limit as usize)))
     }
 
+    /// The disappearing timer messages with `peer` get now (`None` = off):
+    /// its own setting, else the default.
+    pub fn disappearing(&self, peer: String) -> Result<Option<u32>> {
+        Ok(self.node.timer(&self.resolve(&peer)?))
+    }
+
+    /// The timer for chats without their own (on by default: a week).
+    pub fn default_disappearing(&self) -> Option<u32> {
+        self.node.default_timer()
+    }
+
+    pub fn set_default_disappearing(&self, seconds: Option<u32>) {
+        self.node.set_default_timer(seconds);
+    }
+
     /// Sets the disappearing-message timer with `peer` (`None` = off).
     pub fn set_disappearing(&self, peer: String, seconds: Option<u32>) -> Result<()> {
         let p = self.resolve(&peer)?;

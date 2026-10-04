@@ -225,7 +225,9 @@ impl GroupNode {
                 device: *node.identity().as_bytes(),
                 text: text.to_owned(),
                 offline: false,
-                expires_at_ms: None,
+                expires_at_ms: node
+                    .effective_timer(ConversationId::Group(*group))
+                    .map(|s| now + u64::from(s) * 1000),
                 file: None,
                 local_id,
                 delivered: recipients == 0,
@@ -478,13 +480,14 @@ impl GroupNode {
             GroupEvent::Text { group, from, text } => {
                 // What our other devices send to the group is ours too.
                 let ours = node.is_own_device(&from);
+                let timer = node.effective_timer(ConversationId::Group(group));
                 node.record(
                     ConversationId::Group(group),
                     *from.as_bytes(),
                     ours,
                     &text,
                     false,
-                    None,
+                    timer,
                 );
                 Update::Text {
                     group,

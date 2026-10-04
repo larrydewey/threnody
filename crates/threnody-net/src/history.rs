@@ -9,6 +9,10 @@ use crate::delivery::Tag;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 
+/// Messages disappear after a week unless a conversation (or the user's
+/// default) says otherwise.
+pub const DEFAULT_TIMER_S: u32 = 7 * 24 * 3600;
+
 /// A random non-zero id for an outgoing history entry.
 pub fn local_id() -> u64 {
     u64::from_le_bytes(threnody_core::crypto::random_bytes()).max(1)
@@ -48,7 +52,7 @@ impl Node {
     /// the conversation's disappearing-message timer.
     pub fn send_text(&self, peer: &PublicIdentity, body: &str) -> Result<SendReport> {
         let conv = self.conversation_for(peer);
-        let timer = self.history(conv).map(|h| h.timer_s).unwrap_or(None);
+        let timer = self.effective_timer(conv);
         let msg = AppMessage::Text {
             sent_ms: now_ms(),
             body: body.to_owned(),
@@ -197,13 +201,53 @@ impl Node {
     /// Sets the disappearing-message timer for the conversation with
     /// `peer` (`None` turns it off). Applies to messages sent from now on.
     pub fn set_timer(&self, peer: &PublicIdentity, secs: Option<u32>) -> Result<()> {
-        let conv = self.conversation_for(peer);
+        self.set_conversation_timer(self.conversation_for(peer), secs)
+    }
+
+    /// [`Node::set_timer`] for any conversation (groups too: their timer
+    /// applies on this device).
+    pub fn set_conversation_timer(&self, conv: ConversationId, secs: Option<u32>) -> Result<()> {
         let mut h = self.history(conv)?;
-        h.timer_s = secs;
+        // 0 records "off on purpose", unlike no setting (the default).
+        h.timer_s = Some(secs.unwrap_or(0));
         self.shared
             .home
             .save_history(self.identity_ref(), conv, &h)
             .map_err(NetError::from)
+    }
+
+    /// The timer messages in `peer`'s conversation get now.
+    pub fn timer(&self, peer: &PublicIdentity) -> Option<u32> {
+        self.effective_timer(self.conversation_for(peer))
+    }
+
+    /// A conversation's own setting, else the default
+    /// ([`Node::set_default_timer`]).
+    pub fn effective_timer(&self, conv: ConversationId) -> Option<u32> {
+        match self.history(conv).ok().and_then(|h| h.timer_s) {
+            Some(0) => None,
+            Some(t) => Some(t),
+            None => self.default_timer(),
+        }
+    }
+
+    /// The disappearing timer for conversations that haven't set one: on by
+    /// default ([`DEFAULT_TIMER_S`]), like every protection.
+    pub fn default_timer(&self) -> Option<u32> {
+        match self
+            .shared
+            .default_timer
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            t => Some(t),
+        }
+    }
+
+    pub fn set_default_timer(&self, secs: Option<u32>) {
+        self.shared
+            .default_timer
+            .store(secs.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn history(&self, conv: ConversationId) -> Result<History> {
@@ -253,7 +297,7 @@ impl Node {
 
     fn append_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote, local_id: u64) {
         let conv = self.conversation_for(peer);
-        let timer = self.history(conv).map(|h| h.timer_s).unwrap_or(None);
+        let timer = self.effective_timer(conv);
         let now = now_ms();
         let device = if outgoing {
             *self.identity().as_bytes()
@@ -287,10 +331,10 @@ impl Node {
             return;
         };
         let conv = self.conversation_for(from);
-        if let Ok(mut h) = self.history(conv)
-            && h.timer_s != *expires_in_s
+        if self.effective_timer(conv) != *expires_in_s
+            && let Ok(mut h) = self.history(conv)
         {
-            h.timer_s = *expires_in_s;
+            h.timer_s = Some(expires_in_s.unwrap_or(0));
             let _ = self.shared.home.save_history(self.identity_ref(), conv, &h);
             self.emit(Event::TimerChanged {
                 peer: *from,

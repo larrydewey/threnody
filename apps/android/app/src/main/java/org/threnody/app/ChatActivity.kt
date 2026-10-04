@@ -462,6 +462,7 @@ class ChatActivity : Activity() {
         PopupMenu(this, anchor).apply {
             menu.add("Members").setOnMenuItemClickListener { members(); true }
             if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
+            menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
             menu.add(if (g.owned) "Delete group" else "Leave group").setOnMenuItemClickListener { leaveGroup(); true }
             show()
         }
@@ -620,18 +621,34 @@ class ChatActivity : Activity() {
             .show()
     }
 
+    /** Sets this conversation's disappearing timer (any of the choices, or off). */
     private fun disappearing() {
-        val choices = listOf("Off" to null, "30 seconds" to 30u, "5 minutes" to 300u, "1 hour" to 3600u,
-            "1 day" to 86_400u, "1 week" to 604_800u)
-        AlertDialog.Builder(this)
-            .setTitle("Disappearing messages")
-            .setItems(choices.map { it.first }.toTypedArray()) { _, i ->
-                worker.execute {
-                    run("timer") { node.setDisappearing(device, choices[i].second) }
-                    runOnUiThread { Toast.makeText(this, "New messages: ${choices[i].first.lowercase()}", Toast.LENGTH_SHORT).show() }
-                }
+        val choices = Privacy.TIMERS
+        worker.execute {
+            val g = group
+            val current = try {
+                if (g != null) node.groupDisappearing(g) else node.disappearing(device)
+            } catch (_: Exception) { null }
+            val checked = choices.indexOfFirst { it.second == current }
+            runOnUiThread {
+                AlertDialog.Builder(this)
+                    .setTitle("Disappearing messages")
+                    .setSingleChoiceItems(choices.map { it.first }.toTypedArray(), checked) { d, i ->
+                        d.dismiss()
+                        worker.execute {
+                            run("timer") {
+                                if (g != null) node.setGroupDisappearing(g, choices[i].second)
+                                else node.setDisappearing(device, choices[i].second)
+                            }
+                            runOnUiThread {
+                                Toast.makeText(this, "New messages: ${choices[i].first.lowercase()}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
             }
-            .show()
+        }
     }
 
     private fun wifiDirect() {

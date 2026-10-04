@@ -126,6 +126,10 @@ enum Cmd {
         /// Dial contacts directly instead of through onion circuits first.
         #[arg(long)]
         no_onion: bool,
+        /// How long messages last in chats that haven't set their own timer
+        /// (`30s`, `10m`, `1h`, `1d`, `1w`), or `off`. A week by default.
+        #[arg(long, value_name = "TIME", default_value = "1w")]
+        disappear_default: String,
         /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
         ble: bool,
@@ -554,6 +558,7 @@ fn main() -> Result<()> {
             constant_rate_ms,
             no_cover,
             no_onion,
+            disappear_default,
             tunnel,
             wg_iface,
             wg_apply,
@@ -573,6 +578,12 @@ fn main() -> Result<()> {
                 constant_rate: (!no_cover)
                     .then(|| std::time::Duration::from_millis(constant_rate_ms.max(10))),
                 onion_first: !no_onion,
+                default_timer: match disappear_default.as_str() {
+                    "off" => None,
+                    t => Some(chat::parse_duration(t).ok_or_else(|| {
+                        anyhow::anyhow!("--disappear-default: expected 30s, 10m, 1h, 1d, 1w or off")
+                    })?),
+                },
                 discover: (!no_discover).then_some(discover_port),
                 ble,
                 wifi_direct,

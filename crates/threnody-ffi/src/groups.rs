@@ -212,6 +212,19 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
+    /// A group's disappearing timer on this device (`None` = off).
+    pub fn group_disappearing(&self, group: String) -> Result<Option<u32>> {
+        let g = self.group_id(&group)?;
+        Ok(self.node.effective_timer(ConversationId::Group(g)))
+    }
+
+    pub fn set_group_disappearing(&self, group: String, seconds: Option<u32>) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.node
+            .set_conversation_timer(ConversationId::Group(g), seconds)
+            .map_err(fail)
+    }
+
     /// The last `limit` messages in a group (oldest first).
     pub fn group_history(&self, group: String, limit: u32) -> Result<Vec<HistoryEntry>> {
         let g = self.group_id(&group)?;

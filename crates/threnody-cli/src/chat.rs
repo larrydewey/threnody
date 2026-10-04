@@ -24,6 +24,8 @@ pub struct Options {
     pub constant_rate: Option<Duration>,
     /// Reach contacts through onion circuits first when possible.
     pub onion_first: bool,
+    /// Disappearing timer for conversations that haven't set one.
+    pub default_timer: Option<u32>,
     pub tunnel: Option<TunnelOptions>,
     /// UDP port for LAN discovery; `None` disables it.
     pub discover: Option<u16>,
@@ -104,6 +106,7 @@ pub async fn run(opts: Options) -> Result<()> {
         tunnel_port: opts.tunnel.as_ref().map(|t| t.port),
     })?;
     node.set_prefer_onion(opts.onion_first);
+    node.set_default_timer(opts.default_timer);
     println!("Threnody — you are {}", node.identity().fingerprint());
     if groups.count() > 0 {
         println!("{} group(s) restored. /groups to list", groups.count());
@@ -327,7 +330,7 @@ impl Ui {
     fn show_history(&self, peer: PublicIdentity, n: usize) -> Result<()> {
         let conv = self.node.conversation_for(&peer);
         let h = self.node.history(conv)?;
-        if let Some(t) = h.timer_s {
+        if let Some(t) = self.node.timer(&peer) {
             println!("  (messages disappear after {})", human_secs(t));
         }
         if h.entries().is_empty() {
@@ -1077,6 +1080,13 @@ impl Ui {
         } else {
             "direct first (--no-onion)"
         };
+        match self.node.default_timer() {
+            Some(t) => println!(
+                "  disappear    after {} unless a chat says otherwise (/disappear)",
+                human_secs(t)
+            ),
+            None => println!("  disappear    off by default (--disappear-default)"),
+        }
         println!(
             "  metadata     padding: on; timing: {rate}; routing: {onion}; carrying {} circuit(s) for others",
             self.node.onion_hops()
@@ -1145,13 +1155,14 @@ mod tests {
 }
 
 /// `30s`, `10m`, `2h`, `1d` or plain seconds.
-fn parse_duration(a: &str) -> Option<u32> {
+pub fn parse_duration(a: &str) -> Option<u32> {
     let a = a.trim();
     let (num, mult) = match a.chars().last()? {
         's' => (&a[..a.len() - 1], 1),
         'm' => (&a[..a.len() - 1], 60),
         'h' => (&a[..a.len() - 1], 3600),
         'd' => (&a[..a.len() - 1], 86_400),
+        'w' => (&a[..a.len() - 1], 7 * 86_400),
         c if c.is_ascii_digit() => (a, 1),
         _ => return None,
     };
@@ -1223,6 +1234,7 @@ mod duration_tests {
         assert_eq!(parse_duration("30s"), Some(30));
         assert_eq!(parse_duration("10m"), Some(600));
         assert_eq!(parse_duration("1d"), Some(86_400));
+        assert_eq!(parse_duration("1w"), Some(604_800));
         assert_eq!(parse_duration("45"), Some(45));
         assert_eq!(parse_duration("0s"), None);
         assert_eq!(parse_duration("soon"), None);

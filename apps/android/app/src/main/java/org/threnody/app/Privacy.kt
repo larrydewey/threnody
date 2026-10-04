@@ -27,6 +27,22 @@ object Privacy {
 
     @Volatile var metered = false
 
+    private const val TIMER = "default_timer"
+    /** Disappearing-timer choices, in seconds (null = off). */
+    val TIMERS = listOf<Pair<String, UInt?>>(
+        "Off" to null, "30 seconds" to 30u, "5 minutes" to 300u, "1 hour" to 3600u,
+        "1 day" to 86_400u, "1 week" to 604_800u, "4 weeks" to 2_419_200u,
+    )
+
+    /** Timer for chats without their own: a week unless changed (0 = off). */
+    fun defaultTimer(ctx: Context): UInt? =
+        prefs(ctx).getLong(TIMER, 604_800L).takeIf { it > 0 }?.toUInt()
+
+    fun setDefaultTimer(ctx: Context, secs: UInt?) {
+        prefs(ctx).edit().putLong(TIMER, secs?.toLong() ?: 0L).apply()
+        Threnody.applyPrivacy(ctx)
+    }
+
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)

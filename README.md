@@ -26,7 +26,7 @@ Inside `run`, any line you type goes to the current peer. The available commands
 
 `/onion <peer> [min-relays]` builds an onion circuit (two relays by default) so no single relay learns both ends.
 
-`/history [peer] [n]` shows recent messages, which are stored encrypted. `/disappear 1h` (or `30s`, `10m`, `1d`, `off`) sets disappearing messages with the current peer, and the peer adopts the same timer.
+`/history [peer] [n]` shows recent messages, which are stored encrypted. Messages disappear after a week by default. `/disappear 1h` (or `30s`, `10m`, `1d`, `1w`, `off`) sets the timer for the current chat, and the peer adopts the same timer. `--disappear-default <time|off>` changes the default for chats that haven't chosen one.
 
 To add a device to your account, run `/device add [host:port]` on a device you already have. It prints a one-time code (and a QR code) with this machine's LAN address, or the one given. Then run `threnody link '<code>'` on the new device. `/devices` lists your devices, `/device rename <name> <new name>` renames one, and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices. Your devices share your message history, and a new device gets it all when linked.
 

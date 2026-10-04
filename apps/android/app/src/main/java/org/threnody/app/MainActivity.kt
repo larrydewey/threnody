@@ -276,6 +276,7 @@ class MainActivity : Activity() {
                 if (it) "Contacts are reached through onion circuits when possible"
                 else "Contacts are dialed directly: the network sees who you talk to"
             }
+            menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {
                 isCheckable = true
                 isChecked = Privacy.screenSecurity(this@MainActivity)
@@ -324,6 +325,21 @@ class MainActivity : Activity() {
             link,
             "Device ${n.deviceFingerprint()}",
         )
+    }
+
+    /** The disappearing timer for chats that haven't chosen their own. */
+    private fun defaultTimer() {
+        val choices = Privacy.TIMERS
+        val checked = choices.indexOfFirst { it.second == Privacy.defaultTimer(this) }
+        AlertDialog.Builder(this)
+            .setTitle("Default disappearing timer")
+            .setSingleChoiceItems(choices.map { it.first }.toTypedArray(), checked) { d, i ->
+                d.dismiss()
+                Privacy.setDefaultTimer(this, choices[i].second)
+                Toast.makeText(this, "New chats: ${choices[i].first.lowercase()}", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /** This account's devices; tap one to rename it. */

@@ -255,6 +255,8 @@ pub(crate) struct Shared {
     constant_rate: tokio::sync::watch::Sender<Option<Duration>>,
     /// Dial contacts through onion circuits first when possible.
     pub(crate) prefer_onion: std::sync::atomic::AtomicBool,
+    /// Disappearing timer (s) for conversations without one; 0 = off.
+    pub(crate) default_timer: std::sync::atomic::AtomicU32,
     tunnel: Option<(u16, [u8; 32])>,
     /// WireGuard keys peers offered us, for clean removal on revocation.
     tunnel_peers: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
@@ -410,6 +412,7 @@ impl Node {
             policy: Mutex::new(cfg.policy),
             constant_rate: tokio::sync::watch::Sender::new(cfg.constant_rate),
             prefer_onion: std::sync::atomic::AtomicBool::new(true),
+            default_timer: std::sync::atomic::AtomicU32::new(crate::history::DEFAULT_TIMER_S),
             tunnel,
             tunnel_peers: Mutex::new(HashMap::new()),
             relay: Mutex::new(RelayState::default()),
