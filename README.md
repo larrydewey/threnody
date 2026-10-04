@@ -100,7 +100,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** BLE / Wi-Fi Direct transports with the same beacon scheme.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, onion-routed mailbox deposits, and anonymous and selective-disclosure identities.
-6. **Mobile (remaining).** Sample Android and iOS apps on top of `threnody-ffi`, and background delivery that respects each platform's limits.
+6. **Mobile (remaining).** A sample Android app is in [`apps/android`](apps/android) and has been tested on a Pixel 8a. Still to do: an iOS sample, and background delivery that respects each platform's limits.
 
 ## Development
 

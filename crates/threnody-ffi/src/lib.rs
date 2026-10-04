@@ -18,13 +18,14 @@ uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ThrenodyError {
-    #[error("{message}")]
-    Failed { message: String },
+    // Not `message`: that would clash with `Throwable.message` in Kotlin.
+    #[error("{reason}")]
+    Failed { reason: String },
 }
 
 fn fail(e: impl std::fmt::Display) -> ThrenodyError {
     ThrenodyError::Failed {
-        message: e.to_string(),
+        reason: e.to_string(),
     }
 }
 

@@ -1,0 +1,5 @@
+build/
+.gradle/
+local.properties
+app/src/main/jniLibs/
+app/src/main/java/uniffi/
