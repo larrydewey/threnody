@@ -3,7 +3,7 @@
 A desktop messenger on [`threnody-ffi`](../../crates/threnody-ffi), the API the [Android app](../android) uses, written with GTK 4 and libadwaita. It follows the Android app's design and wording, laid out for a desktop: conversations on the left and the open chat on the right. Narrow windows show one pane at a time.
 
 ```sh
-apps/linux/install.sh               # build, then install for this user (~/.local)
+apps/linux/install.sh               # build, then install for this user (~/.local); quits and restarts a running copy
 cargo run -p threnody-desktop       # or run it from the source tree
 ```
 
