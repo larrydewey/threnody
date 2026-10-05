@@ -27,10 +27,22 @@ So two contacts meet only on the same network (LAN discovery, Appendix E), over 
 
 ## Overview
 
+0. **Asking the router first.** Before anything else, the node asks its router to forward its port (section 0). When that works and the public address is known, contacts simply dial it, with no DHT at all.
 1. **UDP transport.** Sessions also run over QUIC on the same port number as TCP (UDP 7450). NAT hole punching works with UDP. QUIC only carries bytes: the Threnody handshake (Appendix A) and ratchet (B) run inside one QUIC stream, unchanged.
 2. **Learning your own addresses** (candidates): your public address and port as seen from outside, your LAN addresses, and global IPv6 addresses.
 3. **Rendezvous through the public BitTorrent DHT** (Mainline, BEP 5 and BEP 44). Each node stores its current candidates for each mutually approved contact, encrypted under a key only the two of them share. The record is stored under a storage key that rotates.
 4. **Hole punching.** Both sides send probes to each other's candidates, which opens a path through both NATs and firewalls. Then one side starts the QUIC connection.
+
+## 0. Router port mapping
+
+Most home routers let a device on the network request a port forward, using UPnP IGD, NAT-PMP or its successor PCP (RFC 6887).
+
+- **Requesting the mapping.** A node asks its router to forward TCP and UDP 7450 to itself, renewing before the lease ends. It removes the mapping on shutdown, and makes no request when the setting is off.
+- **Learning the public address.** The router reports the public address in its answer. Session peers confirm it with `Observed` messages (section 2).
+- **Remembering it.** A contact who was told the address while connected (in the session, so never in the clear) remembers it as that contact's *home address*. A phone that left home Wi-Fi then dials the remembered address first.
+- **When the DHT is still needed:** only when the remembered address fails, for example because the address changed or the router refused the mapping.
+
+This covers the common case of a phone reaching a home computer cheaply, with nothing published anywhere. It doesn't help two phones on mobile data, whose carriers do the NAT and offer no mapping. That case is what sections 1 to 4 are for.
 
 ## 1. QUIC transport
 
@@ -125,12 +137,23 @@ Once either side sees the other's fresh candidates:
 
 ## Settings
 
-The feature will have a toggle: *Reach contacts over the internet* in the app, and `--no-rendezvous` in the CLI. It's off for anonymous identities.
+The feature will have a toggle: *Reach contacts over the internet* in the app, and `--no-rendezvous` in the CLI. It covers router port mapping, DHT rendezvous and hole punching.
 
-**Decision needed before release:** whether it's on by default. It is what makes mobile data work. But it adds DHT participation, which shows your IP address to strangers on that network, though not who you talk to. The project's rule is that protections default on. This is a reachability feature with a privacy cost, so the default is the user's call.
+**Decided (2026-10-05): on by default.** It is what makes mobile data work, and the cost is stated above. The DHT shows your IP address to strangers on that network, but not who you talk to. Anyone who prefers can turn it off. Anonymous identities have it off, since a direct path shows their address to the peer.
+
+## Later: relays take over most of this
+
+Once a volunteer relay network has critical mass (spec §9 layer 2; "volunteer relay directories" in the README), reachability changes:
+
+- **Relays become the default path.** A device behind NAT keeps one outgoing connection to a relay, and contacts reach it there, as Tor onion services do. That also hides each side's IP address from the other, which a direct path can't, so it suits anonymous identities too.
+- **Rendezvous remains, in a smaller role.** A contact still has to learn which relay to use, through a relay directory or, as a fallback, the DHT records described here.
+- **Direct paths stay as an option** for bandwidth (photos and files), lower delay, and not depending on volunteers' capacity.
+
+So DHT rendezvous is the bridge to a relay network, and afterwards a fallback. The record format and key schedule here are meant to carry a relay's address as a candidate too (a new candidate kind), so the same rendezvous serves both.
 
 ## Work plan
 
+0. **Router port mapping:** UPnP IGD, NAT-PMP and PCP, lease renewal, removal on shutdown, and remembered home addresses. This is the first release slice: on its own it gets a phone on mobile data to a home computer.
 1. **QUIC transport:** the endpoint on UDP 7450, dialing and accepting into the existing session code, invites with the UDP flag, keepalives. Tests over loopback.
 2. **Observed addresses:** the `Observed` session message, candidate gathering, symmetric-NAT detection.
 3. **DHT records:** key derivation, record format, publishing and polling (the `mainline` crate), padding, and epochs. Unit tests for the key schedule; tests against a local DHT testnet.
@@ -142,5 +165,6 @@ The feature will have a toggle: *Reach contacts over the internet* in the app, a
 - `quinn` (QUIC), with `rustls` on the `ring` backend.
 - `rcgen`, for the throwaway certificate.
 - `mainline`, for the DHT client and BEP 44 storage.
+- A small UPnP IGD / NAT-PMP / PCP client, written here or from a crate (to be chosen).
 
 All are Rust, pure or with `ring`, and build for Android.
