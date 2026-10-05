@@ -19,6 +19,7 @@ pub mod onion;
 pub mod persona;
 pub mod prekey;
 pub mod ratchet;
+pub mod rendezvous;
 #[cfg(test)]
 mod robustness;
 pub mod sealed;

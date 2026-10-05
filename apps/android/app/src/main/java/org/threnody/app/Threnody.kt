@@ -39,9 +39,16 @@ object Threnody {
     @Volatile var visibleChat: Set<String> = emptySet()
     /** Number of started Activities; zero means the app is in the background. */
     @Volatile var visible = 0
+        set(v) {
+            val was = field > 0
+            field = v
+            // Contacts are looked for more often while the app is open.
+            if ((v > 0) != was) instance?.setForeground(v > 0)
+        }
 
     @Synchronized
     fun start(ctx: Context): ThrenodyNode = instance ?: open(ctx).also {
+        debuggable = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
         say("listening on $listenAddr")
@@ -166,6 +173,7 @@ object Threnody {
         node.setOnionFirst(Privacy.onionFirst(ctx))
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
         node.setStripMetadata(Privacy.stripMetadata(ctx))
+        node.setReachInternet(Privacy.reachInternet(ctx))
     }
 
     /** What a notification or the chat list says for a file. */
@@ -243,6 +251,7 @@ object Threnody {
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 say("* network available; reconnecting to approved contacts")
+                node.networkChanged()
                 node.reconnect()
                 for (n in personaNodes.values) n.reconnect()
             }
@@ -277,7 +286,11 @@ object Threnody {
         log.toString()
     }
 
+    /** Debug builds also copy the log to logcat, for testing over adb. */
+    @Volatile private var debuggable = false
+
     fun say(line: String) {
+        if (debuggable) android.util.Log.d("Threnody", line)
         val l = synchronized(log) {
             log.append(line).append('\n')
             logListener

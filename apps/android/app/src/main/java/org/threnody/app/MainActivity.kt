@@ -326,6 +326,12 @@ class MainActivity : Activity() {
                 if (it) "Photos are sent without location, camera or time details"
                 else "Photos are sent with their metadata, which can include where they were taken"
             }
+            toggle("Reach contacts over the internet", Privacy.reachInternet(this@MainActivity),
+                { Privacy.setReachInternet(this@MainActivity, it) }) {
+                if (it) "Contacts can be reached on mobile data and other networks. " +
+                    "Strangers in the public DHT see this phone's IP address, not who you talk to"
+                else "Contacts are reached only nearby, through relays, or at addresses you dial"
+            }
             menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {
                 isCheckable = true

@@ -1,6 +1,6 @@
-# Appendix N: Reaching Contacts Across the Internet (draft)
+# Appendix N: Reaching Contacts Across the Internet
 
-Status: **planned for 0.3.0, not implemented.** This is the design to build. Details may change during implementation, and this document will be updated to match.
+Status: **sections 1 to 4 are implemented** (QUIC, candidates, DHT rendezvous, hole punching) for 0.3.0. Router port mapping (section 0) is not built yet. Field test, 2026-10-05: a Pixel 8a on AT&T LTE (carrier-grade NAT, Wi-Fi and Bluetooth off) and a laptop behind a home router found each other through the public DHT and connected directly over QUIC through both NATs, about two minutes after the phone left Wi-Fi.
 
 ## The problem
 
@@ -50,7 +50,8 @@ This covers the common case of a phone reaching a home computer cheaply, with no
 - **TLS is only a wrapper.** QUIC requires TLS, so each node uses a throwaway self-signed certificate, and certificates aren't checked. The Threnody handshake inside the stream authenticates both identities and pins fingerprints, exactly as over TCP, so QUIC's own encryption adds a layer without being relied on. ALPN is `threnody/1`.
 - **One stream per session.** A session uses one bidirectional QUIC stream, handed to the existing `connect_stream` / `accept_stream`. Framing, padding and cover traffic (Appendix C) are unchanged.
 - **Keeping the path open.** NAT mappings expire, often within 30 s for UDP, so idle sessions need keepalives. Cover traffic (one frame every 2 s, or 10 s on mobile data) already keeps the path open. With cover traffic off, a QUIC keepalive every 15 s does instead.
-- **Invites can say "UDP too"** with a new optional flag. Dialing tries QUIC and TCP together and keeps whichever completes first.
+- **Dialing an address falls back to QUIC** when TCP fails, so an address that only answers on UDP still works. (An invite flag for "UDP too" isn't needed for that and isn't implemented.)
+- **Dead TCP sessions are noticed within about a minute** (TCP keepalive every 10 s after 30 s idle, and a 60 s limit on unacknowledged writes). A phone that leaves Wi-Fi sends nothing, and until its old session ends the other side neither publishes for it correctly nor punches toward it.
 
 ## 2. Candidates
 
@@ -58,12 +59,14 @@ A node gathers its candidates as follows:
 
 - **Reflexive (as seen from outside).**
   - Every session peer reports, inside the encrypted session, the address and port it sees us at: a new `Observed` message.
-  - DHT responses include the requester's public address (BEP 42), so DHT queries provide one too. No STUN server is needed.
+  - DHT nodes report the address they see a query come from (the `ip` field of BEP 42). The node pings a few DHT nodes *from its QUIC socket* (a few well-known ones plus some from its routing table), so the answer is the outside address and port of that very socket. No STUN server is needed. Libtorrent-based nodes answer with `ip`; some others don't. If none answers, the DHT client's own view of our IP, with our port, is used as a guess (many NATs keep the port).
   - A candidate that two independent observers agree on is trusted. One that changes for each destination marks this NAT as symmetric.
 - **Local:** the LAN interfaces' addresses, for two devices behind the same NAT that can't see each other's discovery beacons.
 - **IPv6:** global unicast addresses. With IPv6 there's no NAT to cross, only a firewall, and probing usually opens it. Many mobile carriers are IPv6-first, so this alone covers a large share of mobile cases.
 
-Candidates are re-gathered whenever the network changes (Android's network callback, or a changed interface list) and every 10 minutes.
+Candidates are re-gathered whenever the network changes (Android's network callback) and every 10 minutes, or every 30 seconds while the outside address is still unknown.
+
+The QUIC socket carries these pings and the probes as well as QUIC. A wrapper around the socket takes them out before the QUIC endpoint sees them: probes have the QUIC fixed bit clear (QUIC "bit greasing" is turned off, so no peer clears it), and DHT replies are bencoded dictionaries marked as replies.
 
 ## 3. Rendezvous in the Mainline DHT
 
@@ -95,21 +98,23 @@ flags: 1 symmetric NAT suspected
 Every record is padded to the same length, so its size doesn't reveal how many candidates a node has.
 
 - **Publishing.**
-  - For each mutually approved contact without a live session, a node publishes its record when its candidates change, and otherwise every 30 minutes.
-  - When it wants to reach a contact (a message is waiting, or the user opened the chat), it sets `seeking_until` to two minutes ahead and republishes at once.
+  - For each mutually approved contact, connected or not, a node publishes its record when its candidates change, and otherwise every 30 minutes. Records stay current even during a session: a session can die unnoticed, and an old record sends the contact to an old address.
+  - When it wants to reach a contact (a message is waiting, the user opened the chat, or it starts punching), it sets `seeking_until` to two minutes ahead and republishes at once.
+  - DHT write tokens are bound to the writer's IP address. After a network change the node leaves the DHT and joins again from the new address; otherwise its writes are silently refused for several minutes. It also rejoins after two publishing rounds in which every write failed.
 - **Watching.** A node polls the records of contacts it has no session with.
-  - It polls every 2 minutes while the app is open or a contact is being sought, and every 15 minutes in the background.
-  - A record that is newer, or says it's seeking us, starts hole punching (section 4).
+  - It polls every minute while the app is open, every 15 seconds while it is seeking a contact, and every 15 minutes in the background.
+  - A record that is newer than the last one acted on starts hole punching (section 4). A record that can't be acted on yet (backing off, too many punches) stays "new".
 - **Cost.** One DHT read or write takes a few round trips and a few kilobytes. Polling ten contacts every 15 minutes is under 1 MB a day.
 
 ## 4. Hole punching
 
 Once either side sees the other's fresh candidates:
 
-1. **Both sides probe.** For 30 seconds, each side sends a small UDP probe to every candidate of the other, once a second, from its QUIC socket. Probes are a random 32-byte nonce with a keyed tag (as LAN beacons are), so only the intended contact recognises them. Sending a probe opens this side's NAT mapping and firewall for replies from that address.
-2. **The smaller identity dials.** When a probe arrives, or after 3 seconds, the device with the smaller identity key starts a QUIC connection to each candidate in turn: IPv6, then local, then reflexive. As LAN discovery does, it pins the expected fingerprint.
-3. **The handshake decides.** The Threnody handshake inside the QUIC stream authenticates both sides. A probe from anyone else can at most cause a connection attempt that then fails.
-4. **Fallback.** If nothing connects within 30 s, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. The node backs off before punching that contact again: 2, 5, then 15 minutes.
+1. **Both sides probe.** Each side sends a small UDP probe to every candidate of the other (at most 8), once a second, from its QUIC socket. Probes are a 16-byte nonce and a 16-byte tag keyed with `D` (as LAN beacons are), so only the intended contact recognises them. Sending a probe opens this side's NAT mapping and firewall for replies from that address. A probe that arrives tells the receiver a path that works: its source address goes first in the receiver's list.
+2. **Overlapping in time.** Both sides must punch at once, but each only learns of the other through polling. So the side that starts (it found a new record) marks its own record as seeking the contact and keeps punching for two minutes; the contact, seeing a record that seeks it, joins in for 45 seconds, even while backing off. A probe from the contact also makes a node join in.
+3. **One side dials.** When a probe arrives, or after 3 seconds, the device with the smaller identity key dials every candidate at once over QUIC, retrying every 5 seconds; the first connection wins. As LAN discovery does, it pins the expected fingerprint.
+4. **The handshake decides.** The Threnody handshake inside the QUIC stream authenticates both sides. A probe from anyone else can at most cause a connection attempt that then fails.
+5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
 
 **Symmetric NAT.** With `flags & 1` set on exactly one side, the other side (which has a stable port) dials, and the symmetric side's probes open its own mapping toward that port. That usually works. When both sides are symmetric, the relay fallback applies.
 
@@ -137,7 +142,9 @@ Once either side sees the other's fresh candidates:
 
 ## Settings
 
-The feature will have a toggle: *Reach contacts over the internet* in the app, and `--no-rendezvous` in the CLI. It covers router port mapping, DHT rendezvous and hole punching.
+The feature has a toggle: *Reach contacts over the internet* in the app's menu, and `--no-rendezvous` in the CLI. It covers DHT rendezvous and hole punching (and, later, router port mapping). With it off, the node never joins the DHT. QUIC itself stays on: it carries sessions to addresses the user dials.
+
+The CLI's `/status` and the app's Diagnostics screen show whether the node is in the DHT, its addresses, and whether its NAT looks symmetric. Events (`Addresses`, `Punching`, `PunchFailed`, and diagnostic `ReachNote`s for records published and found) go to the CLI output and the app's diagnostic log.
 
 **Decided (2026-10-05): on by default.** It is what makes mobile data work, and the cost is stated above. The DHT shows your IP address to strangers on that network, but not who you talk to. Anyone who prefers can turn it off. Anonymous identities have it off, since a direct path shows their address to the peer.
 
@@ -153,18 +160,18 @@ So DHT rendezvous is the bridge to a relay network, and afterwards a fallback. T
 
 ## Work plan
 
-0. **Router port mapping:** UPnP IGD, NAT-PMP and PCP, lease renewal, removal on shutdown, and remembered home addresses. This is the first release slice: on its own it gets a phone on mobile data to a home computer.
-1. **QUIC transport:** the endpoint on UDP 7450, dialing and accepting into the existing session code, invites with the UDP flag, keepalives. Tests over loopback.
-2. **Observed addresses:** the `Observed` session message, candidate gathering, symmetric-NAT detection.
-3. **DHT records:** key derivation, record format, publishing and polling (the `mainline` crate), padding, and epochs. Unit tests for the key schedule; tests against a local DHT testnet.
-4. **Hole punching:** probes, the dialing rule, timeouts, fallback and backoff. Tests with network namespaces simulating cone and symmetric NATs.
-5. **Wiring:** the app toggle and status ("reachable directly", "via relay"), the CLI flag, `/status`, docs (Appendix C, N, README), and a field test from a phone on mobile data to a laptop at home.
+0. **Router port mapping:** UPnP IGD, NAT-PMP and PCP, lease renewal, removal on shutdown, and remembered home addresses. *Not built yet.*
+1. **QUIC transport:** done (`threnody-net` `quic`): the endpoint on the TCP port's number, dual-stack, dialing and accepting into the existing session code, keepalives, TCP-to-QUIC fallback. Tests over loopback.
+2. **Observed addresses:** done: the `Observed` session message (feature bit 32), candidate gathering, DHT pings for the outside address, symmetric-NAT detection.
+3. **DHT records:** done (`threnody-core` `rendezvous`, `threnody-net` `reach`): key derivation, record format, padding, publishing and polling with the `mainline` crate. Unit tests for keys and records; an end-to-end test against a local DHT testnet.
+4. **Hole punching:** done: probes, the dialing rule, overlap through seeking records, timeouts and backoff. Not yet tested with network namespaces simulating NAT types; tested in the field instead (above).
+5. **Wiring:** done: the app toggle, Diagnostics, foreground and network-change hooks, seeking when a chat opens or a message waits; the CLI flag and `/status`. Field test from a phone on mobile data to a laptop at home: passed.
 
 ## Dependencies
 
 - `quinn` (QUIC), with `rustls` on the `ring` backend.
 - `rcgen`, for the throwaway certificate.
 - `mainline`, for the DHT client and BEP 44 storage.
-- A small UPnP IGD / NAT-PMP / PCP client, written here or from a crate (to be chosen).
+- Later, for section 0: a small UPnP IGD / NAT-PMP / PCP client, written here or from a crate (to be chosen).
 
 All are Rust, pure or with `ring`, and build for Android.

@@ -31,8 +31,14 @@ pub const FEATURE_EDIT: u64 = 4;
 pub const FEATURE_IDENTITY: u64 = 8;
 /// The peer understands `AppMessage::React`.
 pub const FEATURE_REACT: u64 = 16;
-pub const FEATURES: u64 =
-    FEATURE_ACKS | FEATURE_DELETE | FEATURE_EDIT | FEATURE_IDENTITY | FEATURE_REACT;
+/// The peer understands `AppMessage::Observed`.
+pub const FEATURE_OBSERVED: u64 = 32;
+pub const FEATURES: u64 = FEATURE_ACKS
+    | FEATURE_DELETE
+    | FEATURE_EDIT
+    | FEATURE_IDENTITY
+    | FEATURE_REACT
+    | FEATURE_OBSERVED;
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -124,6 +130,10 @@ pub enum AppMessage {
         emoji: String,
         add: bool,
     },
+    /// The address and port the sender sees us at (Appendix N): our
+    /// outside address, for rendezvous. Only to a peer whose `Hello` has
+    /// [`FEATURE_OBSERVED`].
+    Observed { addr: std::net::SocketAddr },
 }
 
 mod kind {
@@ -146,6 +156,7 @@ mod kind {
     pub const EDIT: u64 = 16;
     pub const IDENTITY: u64 = 17;
     pub const REACT: u64 = 18;
+    pub const OBSERVED: u64 = 19;
 }
 
 impl AppMessage {
@@ -324,6 +335,14 @@ impl AppMessage {
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
+                }
+                Self::Observed { addr } => {
+                    e.map_len(3)?.u8(0)?.uint(kind::OBSERVED)?;
+                    match addr.ip() {
+                        std::net::IpAddr::V4(a) => e.u8(2)?.bytes(&a.octets())?,
+                        std::net::IpAddr::V6(a) => e.u8(2)?.bytes(&a.octets())?,
+                    };
+                    e.u8(3)?.u16(addr.port())?;
                 }
             }
             Ok(())
@@ -509,6 +528,19 @@ impl AppMessage {
             kind::APPROVAL => Self::Approval {
                 approved: required(flag, "approval flag")?,
             },
+            kind::OBSERVED => {
+                let b = required(bytes, "observed address")?;
+                let ip = match <[u8; 4]>::try_from(b.as_slice()) {
+                    Ok(v4) => std::net::IpAddr::from(v4),
+                    Err(_) => std::net::IpAddr::from(
+                        <[u8; 16]>::try_from(b.as_slice())
+                            .map_err(|_| Error::Malformed("observed address"))?,
+                    ),
+                };
+                Self::Observed {
+                    addr: std::net::SocketAddr::new(ip, required(port, "observed port")?),
+                }
+            }
             other => return Err(Error::UnexpectedType(other)),
         })
     }
@@ -553,6 +585,12 @@ mod tests {
     fn messages_round_trip() {
         for m in [
             AppMessage::Hello { features: 0 },
+            AppMessage::Observed {
+                addr: "203.0.113.9:7450".parse().unwrap(),
+            },
+            AppMessage::Observed {
+                addr: "[2001:db8::7]:61000".parse().unwrap(),
+            },
             AppMessage::Hello {
                 features: FEATURE_ACKS,
             },

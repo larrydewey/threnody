@@ -560,7 +560,11 @@ impl Node {
             };
             if self.send_tagged(d, msg.clone(), tag).is_ok() {
                 r.live += 1;
-            } else if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
+                continue;
+            }
+            // Try to reach it directly while the message waits.
+            self.seek(d);
+            if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
                 r.sealed += 1;
             } else {
                 r.unreachable += 1;

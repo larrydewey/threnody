@@ -15,6 +15,11 @@ import android.view.WindowManager
  *   when approved relays allow (spec §9 layer 2);
  * - photo metadata: location, camera and times are removed from images
  *   before they are sent.
+ *
+ * One connectivity setting, also on unless turned off: reaching contacts
+ * across the internet (Appendix N). Its cost is that strangers in the
+ * public DHT see this device's IP address, though not who it talks to.
+ * Anonymous identities never use it.
  */
 object Privacy {
     private const val PREFS = "privacy"
@@ -22,6 +27,7 @@ object Privacy {
     private const val COVER = "cover_traffic"
     private const val ONION = "onion_first"
     private const val STRIP = "strip_metadata"
+    private const val REACH = "reach_internet"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -51,6 +57,12 @@ object Privacy {
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
     fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
+    fun reachInternet(ctx: Context) = prefs(ctx).getBoolean(REACH, true)
+
+    fun setReachInternet(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(REACH, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
 
     fun setStripMetadata(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(STRIP, on).apply()

@@ -9,6 +9,7 @@ use threnody_core::store::Home;
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, safety_number};
 use threnody_net::history::OutgoingFile;
 use threnody_net::mailbox::DepositStatus;
+use threnody_net::reach::ReachConfig;
 use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -35,6 +36,8 @@ pub struct Options {
     pub tunnel: Option<TunnelOptions>,
     /// UDP port for LAN discovery; `None` disables it.
     pub discover: Option<u16>,
+    /// Reach contacts across the internet (DHT rendezvous, hole punching).
+    pub rendezvous: bool,
     /// Advertise and accept sessions over Bluetooth LE.
     pub ble: bool,
     /// Join Wi-Fi Direct groups that approved contacts offer.
@@ -164,6 +167,26 @@ pub async fn run(opts: Options) -> Result<()> {
         }
         None => None,
     };
+    node.set_reach(opts.rendezvous);
+    let quic_addr = match listen_addr {
+        Some(tcp) => listen_quic(&node, tcp).await,
+        None => None,
+    };
+    if let Some(q) = quic_addr {
+        // On loopback there is nobody to reach.
+        if node.reach_enabled() && !q.ip().is_loopback() {
+            match node.start_reach(ReachConfig::default()) {
+                Ok(()) => println!(
+                    "QUIC on udp/{}; reaching approved contacts across the internet \
+                     (public DHT rendezvous; --no-rendezvous turns it off)",
+                    q.port()
+                ),
+                Err(e) => println!("! internet reachability unavailable: {e}"),
+            }
+        } else {
+            println!("QUIC on udp/{}; internet rendezvous off", q.port());
+        }
+    }
     let mut ui = Ui {
         node,
         downloads,
@@ -803,6 +826,34 @@ impl Ui {
             Event::DialFailed { peer, addr, reason } => {
                 println!("! could not reach {} at {addr}: {reason}", self.name(&peer));
             }
+            Event::Addresses {
+                candidates,
+                symmetric,
+            } => {
+                let list: Vec<String> = candidates.iter().map(ToString::to_string).collect();
+                println!(
+                    "* internet addresses: {}{}",
+                    list.join(", "),
+                    if symmetric { " (symmetric NAT)" } else { "" }
+                );
+            }
+            Event::Punching {
+                peer,
+                targets,
+                dialing,
+            } => {
+                let list: Vec<String> = targets.iter().map(ToString::to_string).collect();
+                println!(
+                    "* opening a direct path to {} ({}): {}",
+                    self.name(&peer),
+                    if dialing { "dialing" } else { "probing" },
+                    list.join(", ")
+                );
+            }
+            Event::ReachNote { note } => println!("  · {note}"),
+            Event::PunchFailed { peer } => {
+                println!("* no direct path to {} yet", self.name(&peer));
+            }
             Event::AccountChanged {
                 account,
                 added,
@@ -892,6 +943,8 @@ impl Ui {
                 let p =
                     self.resolve_peer(Some(arg.ok_or_else(|| anyhow!("usage: /to <peer>"))?))?;
                 self.current = Some(p);
+                // Not connected: look for it across the internet now.
+                self.node.seek(&p);
                 println!("* messages now go to {}", self.name(&p));
             }
             "peers" => {
@@ -1467,9 +1520,39 @@ impl Ui {
             account.state().devices.len()
         );
         println!("  this device  {}", self.node.identity().fingerprint());
-        match self.listen_addr {
-            Some(a) => println!("  listening    tcp {a}"),
-            None => println!("  listening    no"),
+        match (self.listen_addr, self.node.quic_addr()) {
+            (Some(a), Some(q)) => println!("  listening    tcp {a}, quic {q}"),
+            (Some(a), None) => println!("  listening    tcp {a}"),
+            _ => println!("  listening    no"),
+        }
+        let r = self.node.reachability();
+        if r.enabled {
+            let cands: Vec<String> = r.candidates.iter().map(|c| c.addr.to_string()).collect();
+            println!(
+                "  internet     {}; addresses {}{}{}",
+                if r.online {
+                    "in the DHT"
+                } else {
+                    "joining the DHT"
+                },
+                if cands.is_empty() {
+                    "unknown yet".into()
+                } else {
+                    cands.join(", ")
+                },
+                if r.symmetric {
+                    "; symmetric NAT (direct paths unlikely)"
+                } else {
+                    ""
+                },
+                if r.punching.is_empty() {
+                    String::new()
+                } else {
+                    format!("; punching to {} contact(s)", r.punching.len())
+                }
+            );
+        } else {
+            println!("  internet     off (--no-rendezvous, or an anonymous identity)");
         }
         println!("  policy       {:?}", self.node.policy());
         println!(
@@ -1477,7 +1560,10 @@ impl Ui {
             if sessions.is_empty() {
                 "none active".into()
             } else {
-                format!("tcp ({} session(s))", sessions.len())
+                let mut kinds: Vec<&str> = sessions.iter().map(|s| s.transport).collect();
+                kinds.sort_unstable();
+                kinds.dedup();
+                format!("{} ({} session(s))", kinds.join(", "), sessions.len())
             }
         );
         let held = self.node.held_messages();
@@ -1722,4 +1808,22 @@ mod duration_tests {
         assert_eq!(human_secs(7200), "2h");
         assert_eq!(human_secs(90), "90s");
     }
+}
+
+/// Opens the QUIC endpoint on the TCP listener's port: on `[::]` (IPv4 and
+/// IPv6) when TCP listens on every address, else on the same address.
+async fn listen_quic(node: &Node, tcp: std::net::SocketAddr) -> Option<std::net::SocketAddr> {
+    let first = if tcp.ip().is_unspecified() {
+        format!("[::]:{}", tcp.port())
+    } else {
+        tcp.to_string()
+    };
+    let fallback = format!("0.0.0.0:{}", tcp.port());
+    for a in [first, fallback] {
+        if let Ok(q) = node.listen_quic(&a).await {
+            return Some(q);
+        }
+    }
+    println!("! QUIC unavailable on udp/{}", tcp.port());
+    None
 }

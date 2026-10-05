@@ -69,9 +69,16 @@ class LogActivity : Activity() {
         worker.execute {
             val n = Threnody.start(this)
             node = n
+            val r = n.reachability()
+            val internet = when {
+                !r.enabled -> "off"
+                else -> (if (r.online) "in the DHT" else "joining the DHT") +
+                    "; " + (r.addresses.joinToString(", ").ifEmpty { "addresses unknown yet" }) +
+                    (if (r.symmetric) "; symmetric NAT" else "")
+            }
             runOnUiThread {
                 header.text = "device  ${n.deviceFingerprint()}\naccount ${n.accountFingerprint()}\n" +
-                    "listen  ${Threnody.listenAddr}\nkey     ${KeyVault.describe()}"
+                    "listen  ${Threnody.listenAddr} (tcp + quic)\ninternet $internet\nkey     ${KeyVault.describe()}"
             }
         }
     }

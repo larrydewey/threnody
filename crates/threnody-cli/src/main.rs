@@ -148,6 +148,11 @@ enum Cmd {
         /// Do not send or listen for LAN discovery beacons.
         #[arg(long)]
         no_discover: bool,
+        /// Do not reach contacts across the internet: no rendezvous records
+        /// in the public DHT and no hole punching (Appendix N). Sessions
+        /// over QUIC still work on addresses you dial.
+        #[arg(long)]
+        no_rendezvous: bool,
         /// UDP port for LAN discovery beacons (multicast 239.255.84.86).
         #[arg(long, default_value_t = threnody_net::discovery::DEFAULT_PORT)]
         discover_port: u16,
@@ -637,6 +642,7 @@ fn main() -> Result<()> {
             wg_iface,
             wg_apply,
             no_discover,
+            no_rendezvous,
             discover_port,
             ble,
             wifi_direct,
@@ -674,6 +680,7 @@ fn main() -> Result<()> {
                     })?),
                 },
                 discover: (!no_discover && !persona).then_some(discover_port),
+                rendezvous: !no_rendezvous && !persona,
                 ble: ble && !persona,
                 wifi_direct: wifi_direct && !persona,
                 tunnel: tunnel.filter(|_| !persona).map(|port| chat::TunnelOptions {

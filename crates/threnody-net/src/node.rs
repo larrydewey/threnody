@@ -10,7 +10,7 @@ use std::time::Duration;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
-use threnody_core::message::{FEATURE_ACKS, FEATURES, MAX_ACK_IDS};
+use threnody_core::message::{FEATURE_ACKS, FEATURE_OBSERVED, FEATURES, MAX_ACK_IDS};
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
@@ -221,6 +221,28 @@ pub enum Event {
         addr: SocketAddr,
         reason: String,
     },
+    /// Our addresses for contacts across the internet changed (Appendix N).
+    Addresses {
+        candidates: Vec<SocketAddr>,
+        symmetric: bool,
+    },
+    /// Hole punching toward `peer` started at `targets`; `dialing` when
+    /// this side dials.
+    Punching {
+        peer: PublicIdentity,
+        targets: Vec<SocketAddr>,
+        dialing: bool,
+    },
+    /// What internet rendezvous is doing (records published and found),
+    /// for diagnostic logs.
+    ReachNote {
+        note: String,
+    },
+    /// Hole punching toward `peer` found no path; relays and mailboxes
+    /// still work.
+    PunchFailed {
+        peer: PublicIdentity,
+    },
     /// Mutual approval ended: remove the peer from the tunnel.
     TunnelDown {
         peer: PublicIdentity,
@@ -246,13 +268,15 @@ pub struct SessionInfo {
 }
 
 /// How a session reaches its peer.
-enum Route {
+pub(crate) enum Route {
     /// A direct link; `Some(addr)` when we dialed a reusable address.
     Direct(Option<String>),
     /// A relay circuit (Appendix G) through this neighbour.
     Relay(PublicIdentity),
     /// An onion circuit (Appendix I) whose first hop is this neighbour.
     Onion(PublicIdentity),
+    /// A direct QUIC connection (Appendix N).
+    Quic,
     /// A direct link over another transport, e.g. Bluetooth LE.
     Link {
         transport: &'static str,
@@ -261,7 +285,6 @@ enum Route {
 }
 
 impl Route {
-    /// `(dialed address, first hop, transport label)`.
     /// `(dialed address, first hop, transport label, remote description)`.
     fn into_parts(
         self,
@@ -271,6 +294,8 @@ impl Route {
             Self::Direct(dialed) => (dialed, None, "tcp", addr.to_string()),
             Self::Relay(v) => (None, Some(v), "relay", addr.to_string()),
             Self::Onion(v) => (None, Some(v), "onion", addr.to_string()),
+            // Punched paths are ephemeral: nothing to remember for redialing.
+            Self::Quic => (None, None, "quic", addr.to_string()),
             Self::Link { transport, remote } => (None, None, transport, remote),
         }
     }
@@ -324,6 +349,10 @@ pub(crate) struct Shared {
     pub(crate) peer_features: Mutex<HashMap<PublicIdentity, u64>>,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
+    /// The QUIC endpoint, once listening (see `quic`).
+    pub(crate) quic: Mutex<Option<Arc<crate::quic::Quic>>>,
+    /// Reaching contacts across the internet (see `reach`).
+    pub(crate) reach: crate::reach::ReachState,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -492,6 +521,8 @@ impl Node {
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
             peer_features: Mutex::new(HashMap::new()),
+            quic: Mutex::new(None),
+            reach: crate::reach::ReachState::new(!persona),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -587,7 +618,7 @@ impl Node {
     }
 
     async fn run_inbound(&self, mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
-        let _ = stream.set_nodelay(true);
+        tune_tcp(&stream);
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
         self.check_policy(chan.peer())?;
         self.spawn_session(stream, chan, addr, false, Route::Direct(None));
@@ -599,8 +630,23 @@ impl Node {
     /// invite); otherwise the outbound connection is itself the user's
     /// decision to trust on first use.
     pub async fn connect(&self, addr: &str, expect: Option<Fingerprint>) -> Result<PublicIdentity> {
-        let mut stream = TcpStream::connect(addr).await?;
-        let _ = stream.set_nodelay(true);
+        let mut stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                // The same address may still answer over QUIC (UDP).
+                if self.quic().is_some()
+                    && let Some(sa) = tokio::net::lookup_host(addr)
+                        .await
+                        .ok()
+                        .and_then(|mut a| a.next())
+                    && let Ok(peer) = self.connect_quic(sa, expect).await
+                {
+                    return Ok(peer);
+                }
+                return Err(e.into());
+            }
+        };
+        tune_tcp(&stream);
         let peer_addr = stream.peer_addr()?;
         let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;
         let peer = *chan.peer();
@@ -858,7 +904,7 @@ impl Node {
         r
     }
 
-    fn spawn_session<S>(
+    pub(crate) fn spawn_session<S>(
         &self,
         stream: S,
         chan: SecureChannel,
@@ -868,6 +914,8 @@ impl Node {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Over QUIC the peer's address is its outside address, worth telling it.
+        let observed = matches!(route, Route::Quic).then_some(addr);
         let (dialed, via, transport, remote) = route.into_parts(addr);
         let peer = *chan.peer();
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
@@ -911,7 +959,7 @@ impl Node {
 
         let node = self.clone();
         tokio::spawn(async move {
-            let reason = match run_session(&node, stream, chan, addr, via, rx).await {
+            let reason = match run_session(&node, stream, chan, addr, via, observed, rx).await {
                 Ok(()) => "closed".to_owned(),
                 Err(e) => e.to_string(),
             };
@@ -946,6 +994,7 @@ async fn run_session<S>(
     mut chan: SecureChannel,
     addr: SocketAddr,
     via: Option<PublicIdentity>,
+    observed: Option<SocketAddr>,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
 ) -> Result<()>
 where
@@ -1064,6 +1113,11 @@ where
                         lock(&shared.peer_features).insert(peer, features);
                         peer_acks = Some(features & FEATURE_ACKS != 0);
                         node.send_profile(&peer);
+                        if let Some(addr) = observed
+                            && features & FEATURE_OBSERVED != 0
+                        {
+                            pending.push_back(AppMessage::Observed { addr });
+                        }
                     }
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
@@ -1133,6 +1187,11 @@ where
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 });
+                            }
+                        }
+                        AppMessage::Observed { addr } => {
+                            if via.is_none() {
+                                node.on_observed(peer, addr);
                             }
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
@@ -1222,6 +1281,23 @@ async fn tick(t: &mut Option<tokio::time::Interval>) {
         }
         None => std::future::pending().await,
     }
+}
+
+/// No Nagle delay, and dead links noticed within about a minute: a phone
+/// that leaves Wi-Fi sends no FIN, and without this its session would look
+/// alive (and block reaching it another way) for many minutes.
+fn tune_tcp(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    #[cfg(unix)]
+    let ka = ka.with_retries(3);
+    let _ = sock.set_tcp_keepalive(&ka);
+    // Unacknowledged writes (cover traffic) fail after this long.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = sock.set_tcp_user_timeout(Some(Duration::from_secs(60)));
 }
 
 /// A default device name: the host name, else "device".

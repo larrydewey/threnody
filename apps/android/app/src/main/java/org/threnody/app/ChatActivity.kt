@@ -110,6 +110,8 @@ class ChatActivity : Activity() {
                 return@execute
             }
             refresh()
+            // Not connected: look for them across the internet now.
+            if (group == null) try { node.seek(device) } catch (_: Exception) {}
         }
     }
 

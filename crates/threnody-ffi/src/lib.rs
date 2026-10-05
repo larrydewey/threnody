@@ -65,6 +65,21 @@ pub struct ContactInfo {
 }
 
 /// A device of our account.
+/// Internet reachability (Appendix N), for status displays.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReachInfo {
+    pub enabled: bool,
+    /// Joined the public DHT.
+    pub online: bool,
+    /// Our addresses as contacts would dial them.
+    pub addresses: Vec<String>,
+    /// Our NAT gives a new outside port per destination: direct paths
+    /// are unlikely.
+    pub symmetric: bool,
+    /// Contacts being hole-punched right now.
+    pub punching: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceInfo {
     pub fingerprint: String,
@@ -670,12 +685,87 @@ impl ThrenodyNode {
         )
     }
 
-    /// Starts listening; returns the bound address.
+    /// Starts listening; returns the bound address. QUIC (UDP) listens on
+    /// the same port, for IPv4 and IPv6, and with it reaching contacts
+    /// across the internet starts (unless turned off; see `set_reach_internet`).
     pub fn listen(&self, addr: String) -> Result<String> {
-        self.rt
-            .block_on(self.node.listen(&addr))
-            .map(|a| a.to_string())
-            .map_err(fail)
+        let bound = self.rt.block_on(self.node.listen(&addr)).map_err(fail)?;
+        let quic = self.rt.block_on(async {
+            if !bound.ip().is_unspecified() {
+                return self.node.listen_quic(&bound.to_string()).await;
+            }
+            match self
+                .node
+                .listen_quic(&format!("[::]:{}", bound.port()))
+                .await
+            {
+                Ok(a) => Ok(a),
+                Err(_) => {
+                    self.node
+                        .listen_quic(&format!("0.0.0.0:{}", bound.port()))
+                        .await
+                }
+            }
+        });
+        // On loopback there is nobody to reach.
+        if quic.is_ok() && !bound.ip().is_loopback() {
+            let _guard = self.rt.enter();
+            let _ = self
+                .node
+                .start_reach(threnody_net::reach::ReachConfig::default());
+        }
+        Ok(bound.to_string())
+    }
+
+    /// Reach contacts across the internet: addresses published (encrypted,
+    /// for approved contacts only) in the public BitTorrent DHT, and hole
+    /// punching through both sides' routers. On by default; strangers in
+    /// the DHT see this device's IP address, not who it talks to. Always
+    /// off for anonymous identities.
+    pub fn set_reach_internet(&self, on: bool) {
+        let _guard = self.rt.enter();
+        self.node.set_reach(on);
+    }
+
+    pub fn reach_internet(&self) -> bool {
+        self.node.reach_enabled()
+    }
+
+    pub fn reachability(&self) -> ReachInfo {
+        let r = self.node.reachability();
+        ReachInfo {
+            enabled: r.enabled,
+            online: r.online,
+            addresses: r.candidates.iter().map(|c| c.addr.to_string()).collect(),
+            symmetric: r.symmetric,
+            punching: u32::try_from(r.punching.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Whether the app is in the foreground: contacts are looked for more
+    /// often then.
+    pub fn set_foreground(&self, on: bool) {
+        self.node.set_foreground(on);
+    }
+
+    /// The network changed (another Wi-Fi, mobile data): learn our
+    /// addresses again and look for contacts.
+    pub fn network_changed(&self) {
+        self.node.network_changed();
+    }
+
+    /// We want to reach `peer` (its chat is open): look for it across the
+    /// internet now.
+    pub fn seek(&self, peer: String) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let devices: Vec<PublicIdentity> = match self.node.account_of(&p) {
+            Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
+            None => vec![p],
+        };
+        for d in &devices {
+            self.node.seek(d);
+        }
+        Ok(())
     }
 
     /// Connects to an invite link, `host:port`, contact or fingerprint;
@@ -734,6 +824,7 @@ impl ThrenodyNode {
     pub fn send_text(&self, peer: String, text: String) -> Result<u32> {
         let p = self.resolve(&peer)?;
         // No session: try to reach it before falling back to sealed delivery.
+        self.node.seek(&p);
         self.try_reach(&p);
         let _guard = self.rt.enter();
         let r = self.node.send_text(&p, &text).map_err(fail)?;
