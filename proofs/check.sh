@@ -20,7 +20,12 @@ for model in *.spthy; do
     fi
     echo "== $model"
     echo "$results"
-    if grep -qvE ': verified \(' <<<"$results" || grep -q 'WARNING' <<<"$out"; then
+    if grep -qvE ': verified \(' <<<"$results"; then
+        status=1
+    fi
+    if grep -q 'WARNING' <<<"$out"; then
+        echo "$model: tamarin warned:" >&2
+        grep -A4 'WARNING' <<<"$out" >&2
         status=1
     fi
 done
