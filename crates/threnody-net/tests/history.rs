@@ -288,3 +288,52 @@ async fn senders_can_edit_their_messages() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(last(&alice, &bob_id).text, "see you at 8");
 }
+
+#[tokio::test]
+async fn reactions_several_per_person_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx, _) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let b = alice.connect(&addr, None).await.unwrap();
+    let a = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a);
+    alice.send_text(&b, "lunch?").unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    let last = |n: &Node, p: &threnody_core::PublicIdentity| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
+    let id = last(&bob, &a).message_id();
+    assert_eq!(id, last(&alice, &b).message_id());
+
+    // Bob reacts twice; Alice sees both, by Bob.
+    assert!(bob.react(&a, id, "👍", true));
+    assert!(bob.react(&a, id, "🍕", true));
+    for _ in 0..2 {
+        next(&mut arx, |e| matches!(e, Event::Reacted { .. })).await;
+    }
+    let bob_as = alice.reactor_of(&b);
+    let mut seen = last(&alice, &b).reactions;
+    seen.sort();
+    let mut want = vec![(bob_as, "👍".to_owned()), (bob_as, "🍕".to_owned())];
+    want.sort();
+    assert_eq!(seen, want);
+
+    // Alice reacts to her own message too; Bob takes one of his back.
+    assert!(alice.react(&b, id, "👍", true));
+    next(&mut brx, |e| matches!(e, Event::Reacted { .. })).await;
+    assert_eq!(last(&bob, &a).reactions.len(), 3);
+    assert!(bob.react(&a, id, "🍕", false));
+    next(&mut arx, |e| matches!(e, Event::Reacted { .. })).await;
+    let r = last(&alice, &b).reactions;
+    assert_eq!(r.len(), 2);
+    assert!(r.iter().all(|(_, e)| e == "👍"));
+    // No such message, or not an emoji: nothing happens.
+    assert!(!alice.react(&b, 12345, "👍", true));
+    assert!(!alice.react(&b, id, "", true));
+}

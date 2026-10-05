@@ -93,9 +93,46 @@ pub struct Entry {
     pub remote_id: u64,
     /// When the text was last edited (0 = never).
     pub edited_ms: u64,
+    /// Reactions: who (an account, or a device whose account isn't known)
+    /// and which emoji. Anyone may add several different ones.
+    pub reactions: Vec<([u8; 32], String)>,
+}
+
+/// Reaction limits: per person on one message, per message, and per emoji.
+pub const MAX_REACTIONS_EACH: usize = 16;
+pub const MAX_REACTIONS: usize = 256;
+pub const MAX_EMOJI_BYTES: usize = 32;
+
+/// Whether `emoji` is acceptable as a reaction: short, with no control or
+/// whitespace-only content.
+pub fn valid_emoji(emoji: &str) -> bool {
+    !emoji.trim().is_empty()
+        && emoji.len() <= MAX_EMOJI_BYTES
+        && !emoji.chars().any(char::is_control)
 }
 
 impl Entry {
+    /// Adds or removes `who`'s `emoji`; returns true if anything changed.
+    /// Adding beyond the limits is ignored.
+    pub fn react(&mut self, who: [u8; 32], emoji: &str, add: bool) -> bool {
+        let has = self.reactions.iter().any(|(w, e)| *w == who && e == emoji);
+        if add {
+            let mine = self.reactions.iter().filter(|(w, _)| *w == who).count();
+            if has
+                || !valid_emoji(emoji)
+                || mine >= MAX_REACTIONS_EACH
+                || self.reactions.len() >= MAX_REACTIONS
+            {
+                return false;
+            }
+            self.reactions.push((who, emoji.to_owned()));
+            true
+        } else {
+            self.reactions.retain(|(w, e)| !(*w == who && e == emoji));
+            has
+        }
+    }
+
     /// The id other devices know this message by: ours if we sent it, the
     /// sender's otherwise (0 = none).
     pub fn message_id(&self) -> u64 {
@@ -227,7 +264,8 @@ impl History {
                         + usize::from(e.recipients != 0)
                         + usize::from(!e.delivered_to.is_empty())
                         + usize::from(e.remote_id != 0)
-                        + usize::from(e.edited_ms != 0),
+                        + usize::from(e.edited_ms != 0)
+                        + usize::from(!e.reactions.is_empty()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -273,6 +311,12 @@ impl History {
                 if e.edited_ms != 0 {
                     enc.u8(12)?.u64(e.edited_ms)?;
                 }
+                if !e.reactions.is_empty() {
+                    enc.u8(13)?.array_len(e.reactions.len())?;
+                    for (who, emoji) in &e.reactions {
+                        enc.array_len(2)?.bytes(who)?.str(emoji)?;
+                    }
+                }
             }
             Ok(())
         })
@@ -292,6 +336,7 @@ impl History {
                         let (mut local_id, mut delivered) = (0, false);
                         let (mut recipients, mut delivered_to) = (0, Vec::new());
                         let (mut remote_id, mut edited_ms) = (0, 0);
+                        let mut reactions = Vec::new();
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -313,6 +358,18 @@ impl History {
                                 }
                                 11 => remote_id = d.u64()?,
                                 12 => edited_ms = d.u64()?,
+                                13 => {
+                                    for _ in 0..d.array_len()? {
+                                        if d.array_len()? != 2 {
+                                            return Err(Error::Malformed("reaction"));
+                                        }
+                                        let who = fixed_bytes::<32>(d)?;
+                                        let emoji = d.str()?.to_owned();
+                                        if reactions.len() < MAX_REACTIONS && valid_emoji(&emoji) {
+                                            reactions.push((who, emoji));
+                                        }
+                                    }
+                                }
                                 _ => return Ok(false),
                             }
                             Ok(true)
@@ -331,6 +388,7 @@ impl History {
                             delivered_to,
                             remote_id,
                             edited_ms,
+                            reactions,
                         });
                     }
                 }
@@ -508,6 +566,33 @@ impl Home {
         Ok(gone)
     }
 
+    /// Adds or removes `who`'s `emoji` on the entries `pick` chooses;
+    /// returns how many changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn react_entries(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        who: [u8; 32],
+        emoji: &str,
+        add: bool,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Result<usize> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let n = h
+            .entries
+            .iter_mut()
+            .filter(|e| pick(e))
+            .map(|e| e.react(who, emoji, add))
+            .filter(|changed| *changed)
+            .count();
+        if n > 0 {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(n)
+    }
+
     /// Replaces the text of the entries `pick` chooses; returns how many.
     pub fn edit_entries(
         &self,
@@ -585,6 +670,7 @@ mod tests {
             delivered_to: Vec::new(),
             remote_id: 0,
             edited_ms: 0,
+            reactions: Vec::new(),
         }
     }
 
@@ -775,5 +861,36 @@ mod tests {
         );
         let again = History::decode(&h.encode().unwrap()).unwrap();
         assert_eq!(again, h);
+    }
+
+    #[test]
+    fn reactions_are_several_per_person_within_limits() {
+        let mut e = entry(1, "hi", None);
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        assert!(e.react(a, "👍", true) && e.react(a, "❤️", true) && e.react(b, "👍", true));
+        assert!(!e.react(a, "👍", true), "no duplicates");
+        assert!(
+            !e.react(a, "", true) && !e.react(a, "\n", true) && !e.react(a, &"x".repeat(40), true)
+        );
+        assert_eq!(e.reactions.len(), 3);
+        assert!(e.react(a, "👍", false) && !e.react(a, "👍", false));
+        assert_eq!(
+            e.reactions,
+            vec![(a, "❤️".to_owned()), (b, "👍".to_owned())]
+        );
+        for i in 0..40 {
+            e.react(a, &format!("e{i}"), true);
+        }
+        assert_eq!(
+            e.reactions.iter().filter(|(w, _)| *w == a).count(),
+            MAX_REACTIONS_EACH
+        );
+        // They survive storage.
+        let mut h = History::default();
+        h.push(e.clone(), 0);
+        assert_eq!(
+            History::decode(&h.encode().unwrap()).unwrap().entries()[0].reactions,
+            e.reactions
+        );
     }
 }

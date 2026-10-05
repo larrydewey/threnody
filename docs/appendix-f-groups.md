@@ -36,13 +36,14 @@ The sender fans every message out to each other member. The groups use the pure-
 An MLS application message carries one of these:
 
 ```
-Content = text                         ; UTF-8, as the first versions sent
-        / 0xFF || { 0: kind, ? 1: text or file name, ? 2: file data,
-                    ? 3: flags, ? 4: caption, ? 5: album id }
-kind: 1 text, 2 file (at most 8 MiB, as in 1:1); flags: 1 sensitive
+Content = text                         ; UTF-8, as the first versions sent (no id)
+        / 0xFF || { 0: kind, ? 1: text, file name or emoji, ? 2: file data,
+                    ? 3: flags, ? 4: caption, ? 5: album id, ? 6: message id }
+kind: 1 text, 2 file (at most 8 MiB, as in 1:1), 3 reaction
+flags: 1 sensitive (file), 1 remove (reaction)
 ```
 
-A UTF-8 string never starts with the byte 0xFF, so plain text from older members still reads as text. Receivers save a file and record it in the group's history with where they saved it. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
+A UTF-8 string never starts with the byte 0xFF, so plain text from older members still reads as text. Text and files carry the sender's id for the message, which receivers record (history key 11). A reaction names a message by that id; members apply it under the reactor's account, as in 1:1 chats (Appendix C). Receivers save a file and record it in the group's history with where they saved it. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
 
 ### Reaching every member
 

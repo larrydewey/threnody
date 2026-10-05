@@ -95,6 +95,16 @@ pub struct HistoryEntry {
     /// count until the member itself acknowledges).
     pub recipients: u32,
     pub delivered_to: u32,
+    /// Reactions, one per emoji in the order first added.
+    pub reactions: Vec<ReactionInfo>,
+}
+
+/// One emoji on a message: how many reacted with it, and whether we did.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReactionInfo {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
 }
 
 /// A file in history: its name, size and where the app saved it.
@@ -299,7 +309,9 @@ pub enum NodeEvent {
     },
     /// A file from a group member: save it, then call
     /// `record_received_group_file`.
+    /// `id` is the sender's id for it: pass it to `record_received_group_file`.
     GroupFile {
+        id: u64,
         group: String,
         from: String,
         name: String,
@@ -308,6 +320,11 @@ pub enum NodeEvent {
         sensitive: bool,
         caption: String,
         album: u64,
+    },
+    /// `peer` changed reactions in our chat, or in `group`; reload it.
+    Reacted {
+        peer: String,
+        group: Option<String>,
     },
     /// `peer` changed what it shares of its profile; reload contacts.
     ProfileChanged {
@@ -381,10 +398,30 @@ pub struct ThrenodyNode {
     queued: Mutex<VecDeque<NodeEvent>>,
 }
 
-fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntry> {
+/// Groups an entry's reactions by emoji; `me` is our reactor id.
+fn reactions(e: &threnody_core::history::Entry, me: &[u8; 32]) -> Vec<ReactionInfo> {
+    let mut out: Vec<ReactionInfo> = Vec::new();
+    for (who, emoji) in &e.reactions {
+        match out.iter_mut().find(|r| r.emoji == *emoji) {
+            Some(r) => {
+                r.count += 1;
+                r.mine |= who == me;
+            }
+            None => out.push(ReactionInfo {
+                emoji: emoji.clone(),
+                count: 1,
+                mine: who == me,
+            }),
+        }
+    }
+    out
+}
+
+fn history_entries(entries: &[threnody_core::history::Entry], me: [u8; 32]) -> Vec<HistoryEntry> {
     entries
         .iter()
         .map(|e| HistoryEntry {
+            reactions: reactions(e, &me),
             at_ms: e.at_ms,
             outgoing: e.outgoing,
             device: PublicIdentity::from_bytes(&e.device)
@@ -491,6 +528,10 @@ fn convert(e: Event) -> NodeEvent {
             },
         },
         Event::ProfileChanged { peer } => NodeEvent::ProfileChanged { peer: fp(&peer) },
+        Event::Reacted { peer, .. } => NodeEvent::Reacted {
+            peer: fp(&peer),
+            group: None,
+        },
         Event::IdentityRevealed {
             peer,
             identity,
@@ -811,7 +852,8 @@ impl ThrenodyNode {
             .node
             .history(self.node.conversation_for(&p))
             .map_err(fail)?;
-        Ok(history_entries(h.recent(limit as usize)))
+        let me = self.node.reactor_of(&self.node.identity());
+        Ok(history_entries(h.recent(limit as usize), me))
     }
 
     /// The disappearing timer messages with `peer` get now (`None` = off):
@@ -852,6 +894,15 @@ impl ThrenodyNode {
     pub fn delete_request(&self, peer: String) -> Result<()> {
         self.node.delete_request(&self.resolve(&peer)?);
         Ok(())
+    }
+
+    /// Adds (or with `add` false, takes away) our `emoji` on message `id`
+    /// (`HistoryEntry.id`) in our chat with `peer`. Several emoji each are
+    /// fine. Returns false if there's no such message.
+    pub fn react(&self, peer: String, id: u64, emoji: String, add: bool) -> Result<bool> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        Ok(self.node.react(&p, id, &emoji, add))
     }
 
     /// Clears the messages with `peer`, here and on our other devices;
@@ -1738,6 +1789,7 @@ mod tests {
             .unwrap();
         for (i, member) in [(1, &bob), (2, &carol)] {
             let NodeEvent::GroupFile {
+                id,
                 group,
                 from,
                 name,
@@ -1761,13 +1813,50 @@ mod tests {
                 album,
             };
             member
-                .record_received_group_file(group, from, name, 3000, Some("/x".into()), options)
+                .record_received_group_file(group, from, name, 3000, Some("/x".into()), id, options)
                 .unwrap();
             let h = member.group_history(g.clone(), 10).unwrap();
             let f = h.last().unwrap().file.clone().unwrap();
             assert_eq!((f.name.as_str(), f.size), ("route.gpx", 3000));
             assert!(f.sensitive && h.last().unwrap().text == "tomorrow");
+            assert_eq!(
+                h.last().unwrap().id,
+                id,
+                "group messages carry the sender's id"
+            );
         }
+        // Bob reacts twice to Alice's file; everyone sees both, by Bob.
+        let id = bob.group_history(g.clone(), 10).unwrap().last().unwrap().id;
+        assert!(
+            bob.react_in_group(g.clone(), id, "👍".into(), true)
+                .unwrap()
+        );
+        assert!(
+            bob.react_in_group(g.clone(), id, "🎉".into(), true)
+                .unwrap()
+        );
+        for _ in 0..2 {
+            all.until(0, |e| {
+                matches!(e, NodeEvent::Reacted { group: Some(_), .. })
+            });
+        }
+        let mine = alice.group_history(g.clone(), 10).unwrap();
+        let r = &mine.last().unwrap().reactions;
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|x| x.count == 1 && !x.mine));
+        assert!(
+            bob.group_history(g.clone(), 10)
+                .unwrap()
+                .last()
+                .unwrap()
+                .reactions
+                .iter()
+                .all(|x| x.mine)
+        );
+        assert!(
+            !bob.react_in_group(g.clone(), 999, "👍".into(), true)
+                .unwrap()
+        );
         let h = alice.group_history(g.clone(), 10).unwrap();
         assert_eq!(h.last().unwrap().file.as_ref().unwrap().name, "route.gpx");
 

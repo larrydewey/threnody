@@ -60,6 +60,7 @@ Type a line to send it to the current peer. Commands:
   /requests   /accept <peer>   /block <peer>   /delete <peer>   message requests
   /del <n> [all]                        delete message n of the last /history (all: for everyone)
   /edit <n> <text>                      edit your message n of the last /history
+  /react <n> <emoji> [off]              react to message n of the last /history (again to take it back)
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
   /file [-s] <path>... [| caption]      send files (photos) to the current peer;
@@ -427,6 +428,27 @@ impl Ui {
             if e.delivered {
                 mark.push_str(" ✓✓");
             }
+            // Reactions as "👍2 ❤️": each emoji, with a count when several.
+            let mut counts: Vec<(&str, usize)> = Vec::new();
+            for (_, r) in &e.reactions {
+                match counts.iter_mut().find(|(x, _)| *x == r) {
+                    Some(c) => c.1 += 1,
+                    None => counts.push((r, 1)),
+                }
+            }
+            if !counts.is_empty() {
+                let shown: Vec<String> = counts
+                    .iter()
+                    .map(|(r, n)| {
+                        if *n > 1 {
+                            format!("{r}{n}")
+                        } else {
+                            (*r).to_owned()
+                        }
+                    })
+                    .collect();
+                mark.push_str(&format!("  [{}]", shown.join(" ")));
+            }
             match &e.file {
                 Some(f) => println!(
                     "  [{}] <{who}> file {}{} ({} bytes){}{}{mark}",
@@ -654,6 +676,9 @@ impl Ui {
                 .relayed(&self.node, &peer, &group, local_id, &origin),
             // Shown as ✓✓ in /history; too chatty to print live.
             Event::Delivered { .. } => {}
+            Event::Reacted { peer, .. } => {
+                println!("* {} reacted (see /history)", self.name(&peer));
+            }
             Event::ProfileChanged { peer } => {
                 let shown = self
                     .node
@@ -911,6 +936,29 @@ impl Ui {
                     }
                 });
                 println!("* named {}", self.name(&key));
+            }
+            "react" => {
+                let mut it = arg.unwrap_or("").split_whitespace();
+                let usage = || anyhow!("usage: /react <n> <emoji> [off] (n from /history)");
+                let n: usize = it.next().and_then(|n| n.parse().ok()).ok_or_else(usage)?;
+                let emoji = it.next().ok_or_else(usage)?;
+                let (peer, shown) = self.shown.borrow().clone();
+                let peer =
+                    peer.ok_or_else(|| anyhow!("run /history first; /react uses its numbers"))?;
+                let e = shown
+                    .get(n.wrapping_sub(1))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("no message {n} in the last /history"))?;
+                // Toggles, unless `off` says to remove.
+                let me = self.node.reactor_of(&self.node.identity());
+                let add = it.next() != Some("off")
+                    && !e.reactions.iter().any(|(w, r)| *w == me && r == emoji);
+                if e.message_id() == 0 || !self.node.react(&peer, e.message_id(), emoji, add) {
+                    bail!(
+                        "that message can't take reactions (it's gone, or too old to have an id)"
+                    );
+                }
+                println!("* {} {emoji}", if add { "reacted" } else { "took back" });
             }
             "edit" => {
                 let (n, body) = arg

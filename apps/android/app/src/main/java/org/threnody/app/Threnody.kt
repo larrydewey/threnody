@@ -361,7 +361,7 @@ object Threnody {
                     say("* group ${e.group.take(6)}: ${short(e.from)} sent a file (${e.data.size} bytes)")
                     val location = keep(ctx, e.name, e.data, persona)
                     try {
-                        node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location,
+                        node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location, e.id,
                             FileOptions(e.sensitive, e.caption, e.album))
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")

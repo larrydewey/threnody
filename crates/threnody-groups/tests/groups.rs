@@ -96,6 +96,7 @@ fn create_invite_chat_and_remove() {
         sensitive: true,
         caption: "the route".into(),
         album: 3,
+        id: 0,
     };
     let out = net.node(&pc).send(&g, &file).unwrap();
     net.deliver(pc, out);
@@ -108,6 +109,7 @@ fn create_invite_chat_and_remove() {
             sensitive: true,
             caption: "the route".into(),
             album: 3,
+            id: 0,
         }));
     }
 
@@ -118,7 +120,8 @@ fn create_invite_chat_and_remove() {
         assert!(net.take(&p).contains(&GroupEvent::Text {
             group: g,
             from: pb,
-            text: "hello group".into()
+            text: "hello group".into(),
+            id: 0
         }));
     }
 
@@ -150,7 +153,8 @@ fn create_invite_chat_and_remove() {
     assert!(net.take(&pb).contains(&GroupEvent::Text {
         group: g,
         from: pa,
-        text: "after".into()
+        text: "after".into(),
+        id: 0
     }));
 }
 
@@ -263,7 +267,8 @@ fn groups_survive_export_and_restore() {
     assert!(net.take(&pa).contains(&GroupEvent::Text {
         group: g,
         from: pb,
-        text: "still here".into()
+        text: "still here".into(),
+        id: 0
     }));
     let (_, name, owner, members) = net.node(&pb).list().pop().unwrap();
     assert_eq!((name.as_str(), owner, members.len()), ("persist", pa, 2));
@@ -311,7 +316,8 @@ fn members_forward_messages_for_each_other() {
     assert!(net.take(&pb).contains(&GroupEvent::Text {
         group: g,
         from: pc,
-        text: "via alice".into()
+        text: "via alice".into(),
+        id: 0
     }));
 
     // Only members forward, only to members, and never to themselves.

@@ -29,7 +29,12 @@ pub const FEATURE_EDIT: u64 = 4;
 /// Every feature this implementation has.
 /// The peer understands `AppMessage::Identity` (profiles, reveals).
 pub const FEATURE_IDENTITY: u64 = 8;
-pub const FEATURES: u64 = FEATURE_ACKS | FEATURE_DELETE | FEATURE_EDIT | FEATURE_IDENTITY;
+/// The peer understands `AppMessage::React`.
+pub const FEATURE_REACT: u64 = 16;
+pub const FEATURES: u64 =
+    FEATURE_ACKS | FEATURE_DELETE | FEATURE_EDIT | FEATURE_IDENTITY | FEATURE_REACT;
+/// `React` flag (key 6): take the reaction away.
+const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
 pub const MAX_ACK_IDS: usize = 512;
 
@@ -109,6 +114,16 @@ pub enum AppMessage {
         id: u64,
         body: String,
     },
+    /// Add (or with `add` false, take away) the sender's `emoji` on message
+    /// `id`, whoever sent it (or, from one of our devices, in
+    /// `conversation`). Only sent to peers whose `Hello` has
+    /// [`FEATURE_REACT`].
+    React {
+        conversation: Vec<u8>,
+        id: u64,
+        emoji: String,
+        add: bool,
+    },
 }
 
 mod kind {
@@ -130,6 +145,7 @@ mod kind {
     pub const DELETE: u64 = 15;
     pub const EDIT: u64 = 16;
     pub const IDENTITY: u64 = 17;
+    pub const REACT: u64 = 18;
 }
 
 impl AppMessage {
@@ -167,6 +183,25 @@ impl AppMessage {
                     Ok(())
                 });
             }
+            Self::React {
+                conversation,
+                id,
+                emoji,
+                add,
+            } => {
+                return cbor::to_vec(emoji.len() + conversation.len() + 40, |e| {
+                    e.map_len(4 + usize::from(!*add))?
+                        .u8(0)?
+                        .uint(kind::REACT)?;
+                    e.u8(2)?.str(emoji)?;
+                    e.u8(3)?.bytes(conversation)?;
+                    e.u8(5)?.uint(*id)?;
+                    if !*add {
+                        e.u8(6)?.uint(REACT_REMOVE)?;
+                    }
+                    Ok(())
+                });
+            }
             Self::Delete { conversation, ids } => {
                 let packed: Vec<u8> = ids.iter().flat_map(|i| i.to_be_bytes()).collect();
                 return cbor::to_vec(packed.len() + conversation.len() + 24, |e| {
@@ -188,7 +223,11 @@ impl AppMessage {
                         e.u8(5)?.uint(*features)?;
                     }
                 }
-                Self::Tracked { .. } | Self::Ack(_) | Self::Delete { .. } | Self::Edit { .. } => {
+                Self::Tracked { .. }
+                | Self::Ack(_)
+                | Self::Delete { .. }
+                | Self::Edit { .. }
+                | Self::React { .. } => {
                     unreachable!("encoded above")
                 }
                 Self::Cover => {
@@ -375,6 +414,18 @@ impl AppMessage {
                 id: required(five, "message id")?,
                 body: required(text, "text body")?,
             },
+            kind::REACT => {
+                let emoji = required(text, "emoji")?;
+                if !crate::history::valid_emoji(&emoji) {
+                    return Err(Error::Malformed("emoji"));
+                }
+                Self::React {
+                    conversation: required(conv, "conversation")?,
+                    id: required(five, "message id")?,
+                    emoji,
+                    add: flags & REACT_REMOVE == 0,
+                }
+            }
             kind::DELETE => {
                 let packed = required(bytes, "deleted ids")?;
                 if packed.len() % 8 != 0 || packed.len() / 8 > MAX_ACK_IDS {
@@ -562,6 +613,18 @@ mod tests {
                 sensitive: true,
                 caption: "from the summit".into(),
                 album: u64::MAX,
+            },
+            AppMessage::React {
+                conversation: vec![1; 33],
+                id: 7,
+                emoji: "👍🏽".into(),
+                add: true,
+            },
+            AppMessage::React {
+                conversation: vec![2; 17],
+                id: u64::MAX,
+                emoji: "❤️".into(),
+                add: false,
             },
             AppMessage::Approval { approved: true },
             AppMessage::TunnelOffer {

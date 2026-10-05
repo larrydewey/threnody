@@ -170,6 +170,7 @@ class ChatActivity : Activity() {
                 is NodeEvent.GroupJoined -> e.group == g
                 is NodeEvent.GroupLeft -> e.group == g
                 is NodeEvent.Delivered -> e.group == g
+                is NodeEvent.Reacted -> e.group == g
                 else -> false
             }
         }
@@ -184,6 +185,7 @@ class ChatActivity : Activity() {
             is NodeEvent.ApprovalChanged -> e.peer
             is NodeEvent.Delivered -> e.peer
             is NodeEvent.ProfileChanged -> e.peer
+            is NodeEvent.Reacted -> if (e.group == null) e.peer else return false
             is NodeEvent.IdentityRevealed -> e.peer
             is NodeEvent.AccountChanged -> return true
             else -> return false
@@ -218,7 +220,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u), sending = true) }
+            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList()), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         runOnUiThread {
@@ -464,7 +466,6 @@ class ChatActivity : Activity() {
                     text = e.text
                     textSize = 16f
                     setTextColor(fg)
-                    setTextIsSelectable(true)
                     setPadding(dp(10), dp(4), dp(10), 0)
                 })
             }
@@ -474,7 +475,6 @@ class ChatActivity : Activity() {
                 text = e.text
                 textSize = 16f
                 setTextColor(fg)
-                setTextIsSelectable(true)
             })
             time
         } else {
@@ -494,7 +494,6 @@ class ChatActivity : Activity() {
                     text = e.text
                     textSize = 16f
                     setTextColor(fg)
-                    setTextIsSelectable(true)
                 })
             }
             Formatter.formatShortFileSize(this, run.sumOf { it.entry.file?.size ?: 0uL }.toLong()) + " · " + time +
@@ -511,6 +510,7 @@ class ChatActivity : Activity() {
             group != null && e.deliveredTo > 0u -> " ✓ ${e.deliveredTo}/${e.recipients}"
             else -> " ✓"
         }
+        reactionChips(e, fg)?.let { body.addView(it, matchWrap) }
         body.addView(TextView(this).apply {
             text = meta + (if (e.edited) " · edited" else "") + (if (e.disappearing) " · ⏱" else "") + tick
             contentDescription = text.toString().replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
@@ -524,7 +524,7 @@ class ChatActivity : Activity() {
             body.setOnLongClickListener(longPress)
             // Photos take the long press too, not just the bubble's edge.
             fun all(v: View) {
-                if (v is ImageView || (v is TextView && v.hasOnClickListeners())) v.setOnLongClickListener(longPress)
+                if (v is ImageView || v is TextView) v.setOnLongClickListener(longPress)
                 if (v is android.view.ViewGroup) for (i in 0 until v.childCount) all(v.getChildAt(i))
             }
             all(body)
@@ -543,14 +543,47 @@ class ChatActivity : Activity() {
         val mine = g == null && e.outgoing && e.device == myDevice && entries.all { it.id != 0uL }
         val canEdit = mine && e.file == null
         val options = buildList {
+            // Text isn't selectable in the bubble (it would take the long
+            // press), so copying is offered here.
+            if (e.text.isNotEmpty()) {
+                add("Copy text")
+                add("Select text")
+            }
             if (canEdit) add("Edit")
             add("Delete for me")
             if (mine) add("Delete for everyone")
         }
-        AlertDialog.Builder(this)
-            .setItems(options.toTypedArray()) { _, i ->
-                if (options[i] == "Edit") return@setItems editMessage(e)
-                val everyone = options[i] == "Delete for everyone"
+        lateinit var dialog: AlertDialog
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(4))
+        }
+        // Reactions first: a row of quick ones, and any other emoji.
+        if (e.id != 0uL) {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val have = e.reactions.filter { it.mine }.map { it.emoji }.toSet()
+            for (emoji in QUICK_REACTIONS + "＋") {
+                row.addView(label(emoji, 24f).apply {
+                    gravity = Gravity.CENTER
+                    contentDescription = if (emoji == "＋") "Another reaction" else "React $emoji"
+                    if (emoji in have) background = rounded(color(R.color.divider), dp(20).toFloat())
+                    setOnClickListener {
+                        dialog.dismiss()
+                        if (emoji == "＋") otherReaction(e) else react(e, emoji, emoji !in have)
+                    }
+                }, LinearLayout.LayoutParams(0, dp(48), 1f))
+            }
+            box.addView(row, matchWrap)
+        }
+        fun pick(option: String) {
+                if (option == "Edit") return editMessage(e)
+                if (option == "Copy text") {
+                    getSystemService(android.content.ClipboardManager::class.java)
+                        ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
+                    return
+                }
+                if (option == "Select text") return selectText(e.text)
+                val everyone = option == "Delete for everyone"
                 worker.execute {
                     run("delete") {
                         when {
@@ -565,9 +598,90 @@ class ChatActivity : Activity() {
                             Toast.LENGTH_LONG).show()
                     }
                 }
+        }
+        for (option in options) {
+            box.addView(label(option, 16f).apply {
+                minHeight = dp(48)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), 0, dp(8), 0)
+                background = getDrawable(android.R.drawable.list_selector_background)
+                setOnClickListener {
+                    dialog.dismiss()
+                    pick(option)
+                }
+            }, matchWrap)
+        }
+        dialog = AlertDialog.Builder(this)
+            .setView(box)
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Shows a message's text where any part of it can be selected and copied. */
+    private fun selectText(text: String) {
+        val view = TextView(this).apply {
+            this.text = text
+            textSize = 16f
+            setTextColor(color(R.color.text))
+            setTextIsSelectable(true)
+            setPadding(dp(24), dp(16), dp(24), dp(8))
+        }
+        AlertDialog.Builder(this)
+            .setView(android.widget.ScrollView(this).apply { addView(view) })
+            .setPositiveButton("Done", null)
+            .show()
+    }
+
+    /** Adds or takes away our reaction (several per message are fine). */
+    private fun react(e: HistoryEntry, emoji: String, add: Boolean) {
+        val g = group
+        worker.execute {
+            run("react") {
+                val ok = if (g != null) node.reactInGroup(g, e.id, emoji, add) else node.react(device, e.id, emoji, add)
+                if (!ok) throw IllegalStateException("that message is gone")
+            }
+        }
+    }
+
+    /** Any emoji, from the keyboard's emoji panel. */
+    private fun otherReaction(e: HistoryEntry) {
+        val field = EditText(this).apply {
+            hint = "An emoji"
+            textSize = 24f
+            isSingleLine = true
+        }
+        AlertDialog.Builder(this)
+            .setTitle("React with")
+            .setView(LinearLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(field, matchWrap) })
+            .setPositiveButton("React") { _, _ ->
+                val emoji = field.text.toString().trim()
+                if (emoji.isNotEmpty()) react(e, emoji, true)
             }
             .setNegativeButton("Cancel", null)
             .show()
+        field.requestFocus()
+    }
+
+    /** Reactions under a message: one chip per emoji; ours stand out and tap to take back. */
+    private fun reactionChips(e: HistoryEntry, fg: Int): View? {
+        if (e.reactions.isEmpty()) return null
+        val row = android.widget.HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+        val chips = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(4), 0, 0) }
+        for (r in e.reactions) {
+            chips.addView(TextView(this).apply {
+                text = if (r.count > 1u) "${r.emoji} ${r.count}" else r.emoji
+                textSize = 14f
+                setTextColor(fg)
+                setPadding(dp(8), dp(2), dp(8), dp(2))
+                background = rounded(color(if (r.mine) R.color.accent else R.color.divider), dp(12).toFloat()).apply {
+                    alpha = if (r.mine) 90 else 255
+                }
+                contentDescription = "${r.emoji}, ${r.count}" + if (r.mine) ", yours: tap to take back" else ", tap to add yours"
+                setOnClickListener { react(e, r.emoji, !r.mine) }
+            }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(4) })
+        }
+        row.addView(chips)
+        return row
     }
 
     private fun editMessage(e: HistoryEntry) {
@@ -1015,7 +1129,6 @@ class ChatActivity : Activity() {
                 val view = label(pretty, 20f).apply {
                     typeface = Typeface.MONOSPACE
                     gravity = Gravity.CENTER
-                    setTextIsSelectable(true)
                     setPadding(dp(24), dp(16), dp(24), 0)
                 }
                 AlertDialog.Builder(this)
@@ -1109,6 +1222,7 @@ class ChatActivity : Activity() {
         const val GROUP = "group"
         const val PERSONA = "persona"
         private const val PICK_FILE = 1
+        private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2

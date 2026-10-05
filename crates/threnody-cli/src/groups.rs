@@ -132,6 +132,7 @@ impl GroupUi {
                     sensitive,
                     caption,
                     album,
+                    id,
                 } => {
                     let who = if ours {
                         format!("me, on {}", name(&from))
@@ -159,7 +160,11 @@ impl GroupUi {
                         sensitive,
                         album,
                     };
-                    self.groups.record_file(node, &group, &from, note, &caption);
+                    self.groups
+                        .record_file(node, &group, &from, note, &caption, id);
+                }
+                Update::Reacted { group, from } => {
+                    println!("[{}] * {} reacted", self.label(&group), name(&from));
                 }
             }
         }

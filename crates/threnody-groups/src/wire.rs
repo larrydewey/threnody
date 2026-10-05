@@ -172,22 +172,37 @@ impl GroupWire {
 /// What a member sends inside an MLS application message.
 ///
 /// ```text
-/// Content = text (UTF-8, as first sent)
-///         / 0xFF || { 0: kind uint, ? 1: text or name tstr, ? 2: data bstr,
-///                     ? 3: flags uint, ? 4: caption tstr, ? 5: album uint }
-/// kind: 1 text, 2 file; flags: 1 sensitive
+/// Content = text (UTF-8, as first sent; no id)
+///         / 0xFF || { 0: kind uint, ? 1: text, file name or emoji tstr,
+///                     ? 2: data bstr, ? 3: flags uint, ? 4: caption tstr,
+///                     ? 5: album uint, ? 6: message id uint }
+/// kind: 1 text, 2 file, 3 reaction
+/// flags: 1 sensitive (file), 1 remove (reaction)
 /// ```
 ///
-/// 0xFF never starts UTF-8, so plain text stays as it was.
+/// 0xFF never starts UTF-8, so plain text stays as it was. Text and files
+/// carry the sender's id for the message; a reaction names the message
+/// it's for by that id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Content {
-    Text(String),
+    Text {
+        text: String,
+        id: u64,
+    },
     File {
         name: String,
         data: Vec<u8>,
         sensitive: bool,
         caption: String,
         album: u64,
+        id: u64,
+    },
+    /// Add (or with `add` false, take away) the sender's `emoji` on
+    /// message `id`.
+    React {
+        id: u64,
+        emoji: String,
+        add: bool,
     },
 }
 
@@ -195,51 +210,81 @@ const TAGGED: u8 = 0xFF;
 
 impl Content {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        match self {
-            Self::Text(t) => Ok(t.as_bytes().to_vec()),
+        // (kind, text, data, flags, caption, album, id)
+        let (kind, text, data, flags, caption, album, id): (
+            u8,
+            &str,
+            Option<&[u8]>,
+            u64,
+            &str,
+            u64,
+            u64,
+        ) = match self {
+            // Without an id, exactly as the first versions sent it.
+            Self::Text { text, id: 0 } => return Ok(text.as_bytes().to_vec()),
+            Self::Text { text, id } => (1, text, None, 0, "", 0, *id),
             Self::File {
                 name,
                 data,
                 sensitive,
                 caption,
                 album,
-            } => {
-                let size = name.len() + data.len() + caption.len() + 40;
-                let body = cbor::to_vec(size, |e| {
-                    e.map_len(
-                        3 + usize::from(*sensitive)
-                            + usize::from(!caption.is_empty())
-                            + usize::from(*album != 0),
-                    )?;
-                    e.u8(0)?.u8(2)?;
-                    e.u8(1)?.str(name)?;
-                    e.u8(2)?.bytes(data)?;
-                    if *sensitive {
-                        e.u8(3)?.u8(1)?;
-                    }
-                    if !caption.is_empty() {
-                        e.u8(4)?.str(caption)?;
-                    }
-                    if *album != 0 {
-                        e.u8(5)?.u64(*album)?;
-                    }
-                    Ok(())
-                })?;
-                let mut out = Vec::with_capacity(body.len() + 1);
-                out.push(TAGGED);
-                out.extend_from_slice(&body);
-                Ok(out)
+                id,
+            } => (
+                2,
+                name,
+                Some(data),
+                u64::from(*sensitive),
+                caption,
+                *album,
+                *id,
+            ),
+            Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id),
+        };
+        let size = text.len() + data.map_or(0, <[u8]>::len) + caption.len() + 48;
+        let body = cbor::to_vec(size, |e| {
+            e.map_len(
+                2 + usize::from(data.is_some())
+                    + usize::from(flags != 0)
+                    + usize::from(!caption.is_empty())
+                    + usize::from(album != 0)
+                    + usize::from(id != 0),
+            )?;
+            e.u8(0)?.u8(kind)?;
+            e.u8(1)?.str(text)?;
+            if let Some(d) = data {
+                e.u8(2)?.bytes(d)?;
             }
-        }
+            if flags != 0 {
+                e.u8(3)?.u64(flags)?;
+            }
+            if !caption.is_empty() {
+                e.u8(4)?.str(caption)?;
+            }
+            if album != 0 {
+                e.u8(5)?.u64(album)?;
+            }
+            if id != 0 {
+                e.u8(6)?.u64(id)?;
+            }
+            Ok(())
+        })?;
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(TAGGED);
+        out.extend_from_slice(&body);
+        Ok(out)
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
         let Some((&TAGGED, rest)) = b.split_first() else {
-            return Ok(Self::Text(String::from_utf8_lossy(b).into_owned()));
+            return Ok(Self::Text {
+                text: String::from_utf8_lossy(b).into_owned(),
+                id: 0,
+            });
         };
         let mut dec = Decoder::new(rest);
         let (mut kind, mut text, mut data) = (None, None, None);
-        let (mut flags, mut caption, mut album) = (0, String::new(), 0);
+        let (mut flags, mut caption, mut album, mut id) = (0, String::new(), 0, 0);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -248,20 +293,36 @@ impl Content {
                 3 => flags = d.u64()?,
                 4 => caption = d.str()?.to_owned(),
                 5 => album = d.u64()?,
+                6 => id = d.u64()?,
                 _ => return Ok(false),
             }
             Ok(true)
         })?;
         finish(&dec)?;
         Ok(match required(kind, "content kind")? {
-            1 => Self::Text(text.unwrap_or_default()),
+            1 => Self::Text {
+                text: text.unwrap_or_default(),
+                id,
+            },
             2 => Self::File {
                 name: required(text, "file name")?,
                 data: required(data, "file data")?,
                 sensitive: flags & 1 != 0,
                 caption,
                 album,
+                id,
             },
+            3 => {
+                let emoji = required(text, "emoji")?;
+                if id == 0 || !threnody_core::history::valid_emoji(&emoji) {
+                    return Err(Error::Malformed("reaction"));
+                }
+                Self::React {
+                    id,
+                    emoji,
+                    add: flags & 1 == 0,
+                }
+            }
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -274,14 +335,35 @@ mod tests {
     #[test]
     fn content_round_trips_and_plain_text_still_reads() {
         for c in [
-            Content::Text("hello".into()),
-            Content::Text(String::new()),
+            Content::Text {
+                text: "hello".into(),
+                id: 0,
+            },
+            Content::Text {
+                text: String::new(),
+                id: 0,
+            },
+            Content::Text {
+                text: "with an id".into(),
+                id: 42,
+            },
+            Content::React {
+                id: 42,
+                emoji: "🎉".into(),
+                add: true,
+            },
+            Content::React {
+                id: 42,
+                emoji: "🎉".into(),
+                add: false,
+            },
             Content::File {
                 name: "a.txt".into(),
                 data: vec![0xFF; 3000],
                 sensitive: false,
                 caption: String::new(),
                 album: 0,
+                id: 0,
             },
             Content::File {
                 name: "IMG.jpg".into(),
@@ -289,19 +371,26 @@ mod tests {
                 sensitive: true,
                 caption: "look".into(),
                 album: 5,
+                id: 9,
             },
         ] {
             assert_eq!(Content::decode(&c.encode().unwrap()).unwrap(), c);
         }
         assert_eq!(
             Content::decode("hi ✓".as_bytes()).unwrap(),
-            Content::Text("hi ✓".into())
+            Content::Text {
+                text: "hi ✓".into(),
+                id: 0
+            }
         );
         // A tagged text, as a later sender might write it.
         let tagged = [&[TAGGED][..], &[0xa2, 0, 1, 1, 0x62, b'o', b'k']].concat();
         assert_eq!(
             Content::decode(&tagged).unwrap(),
-            Content::Text("ok".into())
+            Content::Text {
+                text: "ok".into(),
+                id: 0
+            }
         );
         assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());
         assert!(Content::decode(&[TAGGED]).is_err());

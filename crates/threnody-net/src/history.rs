@@ -5,7 +5,7 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
-use threnody_core::message::{FEATURE_DELETE, FEATURE_EDIT};
+use threnody_core::message::{FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT};
 
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
@@ -223,6 +223,134 @@ impl Node {
             }
         }
         true
+    }
+
+    /// Who reacts, as reactions record it: an account (so a person's
+    /// devices are one reactor), else the device.
+    pub fn reactor_of(&self, peer: &PublicIdentity) -> [u8; 32] {
+        if *peer == self.identity() || self.is_own_device(peer) {
+            return self.account().id().0;
+        }
+        self.account_of(peer)
+            .map(|a| a.id().0)
+            .or_else(|| {
+                lock(&self.shared.contacts)
+                    .get(peer)
+                    .and_then(|c| c.account)
+                    .map(|a| a.0)
+            })
+            .unwrap_or(*peer.as_bytes())
+    }
+
+    /// Adds (or with `add` false, takes away) our `emoji` on message `id`
+    /// in our conversation with `peer`, whoever sent it; tells their
+    /// devices and ours. Returns false if there's no such message.
+    pub fn react(&self, peer: &PublicIdentity, id: u64, emoji: &str, add: bool) -> bool {
+        if id == 0 || !threnody_core::history::valid_emoji(emoji) {
+            return false;
+        }
+        let conv = self.conversation_for(peer);
+        let me = self.reactor_of(&self.identity());
+        let found = self
+            .shared
+            .home
+            .load_history(self.identity_ref(), conv, now_ms())
+            .is_ok_and(|h| h.entries().iter().any(|e| e.message_id() == id));
+        if !found {
+            return false;
+        }
+        let _ = self.shared.home.react_entries(
+            self.identity_ref(),
+            conv,
+            now_ms(),
+            me,
+            emoji,
+            add,
+            |e| e.message_id() == id,
+        );
+        let msg = AppMessage::React {
+            conversation: conv.to_bytes(),
+            id,
+            emoji: emoji.to_owned(),
+            add,
+        };
+        let mut targets: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .map(|s| s.peer)
+            .filter(|p| self.is_own_device(p))
+            .collect();
+        match self.account_of(peer) {
+            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
+            None => targets.push(*peer),
+        }
+        targets.sort_unstable_by_key(|p| *p.as_bytes());
+        targets.dedup();
+        for d in targets {
+            if d == self.identity() || !self.supports(&d, FEATURE_REACT) {
+                continue;
+            }
+            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
+                let _ = self.send_offline(&d, &msg);
+            }
+        }
+        true
+    }
+
+    /// Adds or takes away `who`'s `emoji` on message `id` in `conv` (used
+    /// for groups, whose reactions travel inside MLS). Returns true if it
+    /// changed anything.
+    pub fn apply_reaction(
+        &self,
+        conv: ConversationId,
+        who: [u8; 32],
+        id: u64,
+        emoji: &str,
+        add: bool,
+    ) -> bool {
+        id != 0
+            && self
+                .shared
+                .home
+                .react_entries(self.identity_ref(), conv, now_ms(), who, emoji, add, |e| {
+                    e.message_id() == id
+                })
+                .unwrap_or(0)
+                > 0
+    }
+
+    /// Handles a `React` from `from`: a peer reacting in our conversation,
+    /// or one of our devices reacting (in `conversation`) as us.
+    pub(crate) fn on_react(
+        &self,
+        from: &PublicIdentity,
+        conversation: &[u8],
+        id: u64,
+        emoji: &str,
+        add: bool,
+    ) {
+        let conv = if self.is_own_device(from) {
+            match ConversationId::from_bytes(conversation) {
+                Some(ConversationId::Peer(k)) if k == *self.identity().as_bytes() => {
+                    self.conversation_for(from)
+                }
+                Some(c) => c,
+                None => return,
+            }
+        } else {
+            self.conversation_for(from)
+        };
+        let who = self.reactor_of(from);
+        let n = self
+            .shared
+            .home
+            .react_entries(self.identity_ref(), conv, now_ms(), who, emoji, add, |e| {
+                e.message_id() == id && id != 0
+            })
+            .unwrap_or(0);
+        if n > 0 {
+            self.emit(Event::Reacted { peer: *from, id });
+        }
     }
 
     /// Handles an `Edit` from `from`: one of our devices editing our own
@@ -461,6 +589,7 @@ impl Node {
                 delivered_to: Vec::new(),
                 remote_id: 0,
                 edited_ms: 0,
+                reactions: Vec::new(),
             },
         );
         Ok(r)
@@ -660,7 +789,7 @@ impl Node {
 
     /// [`Node::record`] for an incoming message with the sender's id.
     #[allow(clippy::too_many_arguments)]
-    fn record_with_id(
+    pub fn record_with_id(
         &self,
         conv: ConversationId,
         device: [u8; 32],
@@ -685,6 +814,7 @@ impl Node {
             delivered_to: Vec::new(),
             remote_id,
             edited_ms: 0,
+            reactions: Vec::new(),
         };
         let _ = self
             .shared
@@ -746,6 +876,7 @@ impl Node {
                 delivered_to: Vec::new(),
                 remote_id,
                 edited_ms: 0,
+                reactions: Vec::new(),
             },
         );
     }

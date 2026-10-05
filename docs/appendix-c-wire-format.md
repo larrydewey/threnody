@@ -33,8 +33,8 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
-           / Direct / Tracked / Ack / Delete / Edit / Identity
-Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity); absent = 0
+           / Direct / Tracked / Ack / Delete / Edit / Identity / React
+Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint }  ; sent_ms, body, disappear after (s), sender's message id
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
              ? 6 => uint, ? 7 => tstr, ? 8 => uint }                   ; flags (1 = sensitive), caption, album id
@@ -53,6 +53,7 @@ Ack      = { 0 => 14, 2 => bstr }                          ; acknowledged ids, 8
 Delete   = { 0 => 15, 2 => bstr, 3 => bstr }               ; message ids (8 bytes each, ≤ 512), conversation id
 Edit     = { 0 => 16, 2 => tstr, 3 => bstr, 5 => uint }    ; new text, conversation id, message id
 Identity = { 0 => 17, 2 => bstr .cbor IdentityMsg }       ; profile or revealed identity, Appendix M
+React    = { 0 => 18, 2 => tstr, 3 => bstr, 5 => uint, ? 6 => uint }  ; emoji, conversation id, message id, flags (1 = remove)
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),
@@ -79,6 +80,10 @@ Texts and files carry the sender's message id (its history entry's local id). Th
 - **From one of our own devices:** for any messages in the named conversation. Our devices delete together, whether for me or for everyone. A sibling's chat with *us* is mapped to our chat with it.
 
 `Edit` replaces a message's text, under the same rules and with feature bit 4. The entry keeps its place and is marked edited (history key 12, the time of the edit). Only text can be edited, not files. Both messages are tracked like user content, so they're resent if lost. Deletion is a request: a modified client can keep a copy, and so can a screenshot. Group messages carry no ids yet, so in groups only "delete for me" exists, on that device.
+
+### Reactions
+
+`React` adds or removes one emoji on a message, named by the same id as `Edit` and `Delete` use: the message's local id on the side that sent it, recorded as the remote id (history key 11) on the other. Anyone in the conversation may react to any message, with several different emoji each. Each history entry keeps the set of reactions (key 13: `[* [reactor (32), emoji]]`). The reactor is the account (or, until it's known, the device), so a person's devices count as one. A person may put at most 16 emoji on a message, and a message holds at most 256. An emoji is at most 32 bytes, with no control characters. Like `Edit`, a reaction goes to the peer's devices and to our own (with the conversation id), as tracked messages, only to devices whose `Hello` has feature bit 16. In groups, reactions travel inside MLS (Appendix F).
 
 ### Photos and files
 

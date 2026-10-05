@@ -112,10 +112,12 @@ pub enum GroupEvent {
     },
     /// We were removed, or the group was otherwise closed for us.
     Left { group: GroupId },
+    /// `id` is the sender's id for the message (0 from older members).
     Text {
         group: GroupId,
         from: PublicIdentity,
         text: String,
+        id: u64,
     },
     File {
         group: GroupId,
@@ -125,6 +127,15 @@ pub enum GroupEvent {
         sensitive: bool,
         caption: String,
         album: u64,
+        id: u64,
+    },
+    /// `from` added (or took away) its `emoji` on message `id`.
+    React {
+        group: GroupId,
+        from: PublicIdentity,
+        id: u64,
+        emoji: String,
+        add: bool,
     },
 }
 
@@ -488,7 +499,13 @@ impl Groups {
 
     /// Encrypts `text` for the group and fans it out to every other member.
     pub fn send_text(&mut self, group: &GroupId, text: &str) -> Result<Output> {
-        self.send(group, &Content::Text(text.to_owned()))
+        self.send(
+            group,
+            &Content::Text {
+                text: text.to_owned(),
+                id: 0,
+            },
+        )
     }
 
     /// Encrypts `content` for the group and fans it out to every other
@@ -747,10 +764,11 @@ impl Groups {
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app) => {
                 events.push(match Content::decode(&app.into_bytes())? {
-                    Content::Text(text) => GroupEvent::Text {
+                    Content::Text { text, id } => GroupEvent::Text {
                         group,
                         from: sender,
                         text,
+                        id,
                     },
                     Content::File {
                         name,
@@ -758,6 +776,7 @@ impl Groups {
                         sensitive,
                         caption,
                         album,
+                        id,
                     } => GroupEvent::File {
                         group,
                         from: sender,
@@ -766,6 +785,14 @@ impl Groups {
                         sensitive,
                         caption,
                         album,
+                        id,
+                    },
+                    Content::React { id, emoji, add } => GroupEvent::React {
+                        group,
+                        from: sender,
+                        id,
+                        emoji,
+                        add,
                     },
                 });
             }

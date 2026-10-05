@@ -135,6 +135,11 @@ pub enum Event {
         from: PublicIdentity,
         added: usize,
     },
+    /// `peer` (or one of our devices) changed reactions on message `id`.
+    Reacted {
+        peer: PublicIdentity,
+        id: u64,
+    },
     /// `peer` changed what it shares of its profile (see `Contact::profile`).
     ProfileChanged {
         peer: PublicIdentity,
@@ -1083,6 +1088,7 @@ where
                         AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
                         AppMessage::Identity(payload) => node.on_identity(peer, &payload),
+                        AppMessage::React { conversation, id, emoji, add } => node.on_react(&peer, &conversation, id, &emoji, add),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }

@@ -72,6 +72,10 @@ fn event(u: Update) -> NodeEvent {
             removed: vec![fp(&member)],
         },
         Update::Left { group } => NodeEvent::GroupLeft { group: hex(&group) },
+        Update::Reacted { group, from } => NodeEvent::Reacted {
+            peer: fp(&from),
+            group: Some(hex(&group)),
+        },
         Update::Text {
             group,
             from,
@@ -92,7 +96,9 @@ fn event(u: Update) -> NodeEvent {
             sensitive,
             caption,
             album,
+            id,
         } => NodeEvent::GroupFile {
+            id,
             group: hex(&group),
             from: fp(&from),
             name,
@@ -262,6 +268,7 @@ impl ThrenodyNode {
 
     /// Records a file from a `GroupFile` event in the group's history once
     /// the app has saved it at `location`.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_received_group_file(
         &self,
         group: String,
@@ -269,6 +276,7 @@ impl ThrenodyNode {
         name: String,
         size: u64,
         location: Option<String>,
+        id: u64,
         options: FileOptions,
     ) -> Result<()> {
         let g = self.group_id(&group)?;
@@ -292,8 +300,19 @@ impl ThrenodyNode {
                 album: options.album,
             },
             &options.caption,
+            id,
         );
         Ok(())
+    }
+
+    /// Adds (or takes away) our `emoji` on message `id` in `group`, for
+    /// every member. Returns false if there's no such message.
+    pub fn react_in_group(&self, group: String, id: u64, emoji: String, add: bool) -> Result<bool> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node()
+            .react(&self.node, &g, id, &emoji, add)
+            .map_err(fail)
     }
 
     /// Clears a group's messages on this device; members keep theirs.
@@ -326,6 +345,7 @@ impl ThrenodyNode {
     pub fn group_history(&self, group: String, limit: u32) -> Result<Vec<HistoryEntry>> {
         let g = self.group_id(&group)?;
         let h = self.node.history(ConversationId::Group(g)).map_err(fail)?;
-        Ok(history_entries(h.recent(limit as usize)))
+        let me = self.node.reactor_of(&self.node.identity());
+        Ok(history_entries(h.recent(limit as usize), me))
     }
 }

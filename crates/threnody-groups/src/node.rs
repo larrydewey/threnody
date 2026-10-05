@@ -72,7 +72,7 @@ pub enum Update {
         ours: bool,
     },
     /// A file from a member. Save it, then record it with
-    /// [`GroupNode::record_file`].
+    /// [`GroupNode::record_file`], passing `id`.
     File {
         group: GroupId,
         from: PublicIdentity,
@@ -82,6 +82,12 @@ pub enum Update {
         sensitive: bool,
         caption: String,
         album: u64,
+        id: u64,
+    },
+    /// `from` changed its reactions on a message in `group`.
+    Reacted {
+        group: GroupId,
+        from: PublicIdentity,
     },
 }
 
@@ -225,7 +231,37 @@ impl GroupNode {
     /// Sends text to every other member and records it in the group's
     /// history, to be marked as members acknowledge their copies.
     pub fn send_text(&mut self, node: &Node, group: &GroupId, text: &str) -> Result<()> {
-        self.send(node, group, &Content::Text(text.to_owned()), None)
+        let id = threnody_net::history::local_id();
+        let content = Content::Text {
+            text: text.to_owned(),
+            id,
+        };
+        self.send(node, group, &content, None, id)
+    }
+
+    /// Adds (or with `add` false, takes away) our `emoji` on message `id`
+    /// in `group`, for every member. Returns false if there's no such
+    /// message here.
+    pub fn react(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        id: u64,
+        emoji: &str,
+        add: bool,
+    ) -> Result<bool> {
+        let me = node.reactor_of(&node.identity());
+        if !node.apply_reaction(ConversationId::Group(*group), me, id, emoji, add) {
+            return Ok(false);
+        }
+        let content = Content::React {
+            id,
+            emoji: emoji.to_owned(),
+            add,
+        };
+        let out = self.groups.send(group, &content)?;
+        self.apply(node, out, true);
+        Ok(true)
     }
 
     /// Sends a file to every other member and records it (with
@@ -241,26 +277,30 @@ impl GroupNode {
             sensitive: file.sensitive,
             album: file.album,
         };
+        let id = threnody_net::history::local_id();
         let content = Content::File {
             name: file.name,
             data,
             sensitive: file.sensitive,
             caption: file.caption,
             album: file.album,
+            id,
         };
-        self.send(node, group, &content, Some(note))
+        self.send(node, group, &content, Some(note), id)
     }
 
+    /// Sends text or a file, recorded under `local_id` (also its id in
+    /// the content, which members' reactions name).
     fn send(
         &mut self,
         node: &Node,
         group: &GroupId,
         content: &Content,
         file: Option<FileNote>,
+        local_id: u64,
     ) -> Result<()> {
         let recipients = self.members(group)?.len().saturating_sub(1);
         let out = self.groups.send(group, content)?;
-        let local_id = threnody_net::history::local_id();
         self.apply_tagged(node, out, true, tag(local_id, group));
         let now = threnody_core::now_ms();
         node.append(
@@ -270,7 +310,8 @@ impl GroupNode {
                 outgoing: true,
                 device: *node.identity().as_bytes(),
                 text: match content {
-                    Content::Text(t) | Content::File { caption: t, .. } => t.clone(),
+                    Content::Text { text: t, .. } | Content::File { caption: t, .. } => t.clone(),
+                    Content::React { .. } => String::new(),
                 },
                 offline: false,
                 expires_at_ms: node
@@ -283,6 +324,7 @@ impl GroupNode {
                 delivered_to: Vec::new(),
                 remote_id: 0,
                 edited_ms: 0,
+                reactions: Vec::new(),
             },
         );
         Ok(())
@@ -297,6 +339,7 @@ impl GroupNode {
         from: &PublicIdentity,
         file: FileNote,
         caption: &str,
+        remote_id: u64,
     ) {
         let conv = ConversationId::Group(*group);
         let now = threnody_core::now_ms();
@@ -316,8 +359,9 @@ impl GroupNode {
                 delivered: false,
                 recipients: 0,
                 delivered_to: Vec::new(),
-                remote_id: 0,
+                remote_id,
                 edited_ms: 0,
+                reactions: Vec::new(),
             },
         );
     }
@@ -561,17 +605,23 @@ impl GroupNode {
             GroupEvent::MemberAdded { group, member } => Update::MemberAdded { group, member },
             GroupEvent::MemberRemoved { group, member } => Update::MemberRemoved { group, member },
             GroupEvent::Left { group } => Update::Left { group },
-            GroupEvent::Text { group, from, text } => {
+            GroupEvent::Text {
+                group,
+                from,
+                text,
+                id,
+            } => {
                 // What our other devices send to the group is ours too.
                 let ours = node.is_own_device(&from);
                 let timer = node.effective_timer(ConversationId::Group(group));
-                node.record(
+                node.record_with_id(
                     ConversationId::Group(group),
                     *from.as_bytes(),
                     ours,
                     &text,
                     false,
                     timer,
+                    id,
                 );
                 Update::Text {
                     group,
@@ -588,6 +638,7 @@ impl GroupNode {
                 sensitive,
                 caption,
                 album,
+                id,
             } => Update::File {
                 group,
                 from,
@@ -597,7 +648,19 @@ impl GroupNode {
                 sensitive,
                 caption,
                 album,
+                id,
             },
+            GroupEvent::React {
+                group,
+                from,
+                id,
+                emoji,
+                add,
+            } => {
+                let who = node.reactor_of(&from);
+                node.apply_reaction(ConversationId::Group(group), who, id, &emoji, add);
+                Update::Reacted { group, from }
+            }
         });
     }
 }
