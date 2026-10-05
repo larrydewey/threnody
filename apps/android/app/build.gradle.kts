@@ -13,7 +13,7 @@ android {
         // (major * 1000000 + minor * 1000 + patch), so a build from the
         // laptop installs over a release instead of being refused as a
         // downgrade.
-        versionName = System.getenv("THRENODY_VERSION") ?: "0.2.0"
+        versionName = System.getenv("THRENODY_VERSION") ?: "0.3.0"
         versionCode = System.getenv("THRENODY_VERSION_CODE")?.toInt()
             ?: versionName!!.substringBefore('-').split('.').map(String::toInt)
                 .let { (major, minor, patch) -> major * 1_000_000 + minor * 1_000 + patch }
