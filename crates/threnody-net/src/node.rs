@@ -536,6 +536,7 @@ impl Node {
             shared: Arc::new(shared),
         };
         node.start_history_sweep();
+        node.load_recovery();
         Ok((node, rx))
     }
 
@@ -1105,6 +1106,7 @@ where
     // the peer's `Paths` says how often it sends.
     let mut lease: Option<Duration> = None;
     let mut last_rx = tokio::time::Instant::now();
+    let setup_until = last_rx + SETUP_BURST;
     let mut heartbeat = tokio::time::interval(node.beat());
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut discovery_keyed = false;
@@ -1143,7 +1145,18 @@ where
                 && node.supports(&peer, FEATURE_PATHS)
                 && shared.mutual(&peer)
             {
-                pending.extend(node.paths_message());
+                // Ahead of everything but `Hello`: with cover traffic each
+                // message waits for a tick, and a short session must still
+                // get its lease and recovery paths across.
+                // Behind `Hello` and our `Approval`, though: the peer only
+                // takes paths from a peer it knows approves it.
+                if let Some(m) = node.paths_message() {
+                    let at = pending
+                        .iter()
+                        .rposition(|m| matches!(m, AppMessage::Hello { .. } | AppMessage::Approval { .. }))
+                        .map_or(0, |i| i + 1);
+                    pending.insert(at, m);
+                }
                 paths_sent = true;
             }
             // Hand a mutually approved peer fresh prekeys once per session.
@@ -1160,6 +1173,20 @@ where
             {
                 pending.push_back(AppMessage::TunnelOffer { wg_public, port });
                 offered = true;
+            }
+            // Session setup (features, approval, recovery paths) goes at
+            // once even under cover traffic: its timing is already visible
+            // from the handshake, and a session that dies young must still
+            // have its lease and paths.
+            if ticker.is_some() && chan.can_send() && setup_until > tokio::time::Instant::now() {
+                while matches!(
+                    pending.front(),
+                    Some(AppMessage::Hello { .. } | AppMessage::Approval { .. } | AppMessage::Paths(_))
+                ) {
+                    if let Some(m) = pending.pop_front() {
+                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                    }
+                }
             }
             if ticker.is_none() && chan.can_send() {
                 let mut waiting = VecDeque::new();
@@ -1366,6 +1393,10 @@ fn ready(
         (m, _) => Ok(m),
     }
 }
+
+/// How long after a session starts its setup messages skip the cover-traffic
+/// schedule.
+const SETUP_BURST: Duration = Duration::from_secs(5);
 
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;

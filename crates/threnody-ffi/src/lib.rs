@@ -750,30 +750,33 @@ impl ThrenodyNode {
 
     /// The default network changed (another Wi-Fi, mobile data). Call it
     /// the moment the platform says so: this side knows first, so it
-    /// redials through the standby path (`cellular`: the new default is
+    /// redials through the standby path (`to_standby`: the new default is
     /// the network the standby socket is bound to), tells contacts where
-    /// it is now, and punches.
-    pub fn network_changed(&self, cellular: bool) {
+    /// it is now, and punches. `mobile`: the new default is mobile data.
+    pub fn network_changed(&self, to_standby: bool, mobile: bool) {
         let _guard = self.rt.enter();
-        self.node.network_switched(cellular);
+        self.node.set_on_mobile(mobile);
+        self.node.network_switched(to_standby);
     }
 
     /// Makes the standby socket and returns its file descriptor; bind it
-    /// to the mobile network (`Network.bindSocket`), then call
-    /// `standby_bound`.
+    /// to the network that isn't the default (mobile data while on Wi-Fi,
+    /// or a Wi-Fi that just appeared while on mobile data) with
+    /// `Network.bindSocket`, then call `standby_bound`.
     pub fn standby_socket(&self) -> Result<i32> {
         self.node.standby_socket().map_err(fail)
     }
 
-    /// The standby socket is bound; `ipv6` are the mobile network's
-    /// global IPv6 addresses.
+    /// The standby socket is bound; `ipv6` are the standby network's
+    /// global IPv6 addresses. Binding a new one replaces the old (sessions
+    /// already running over the old one carry on).
     pub fn standby_bound(&self, ipv6: Vec<String>) -> Result<()> {
         let _guard = self.rt.enter();
         let ips = ipv6.iter().filter_map(|a| a.parse().ok()).collect();
         self.node.standby_bound(ips).map_err(fail)
     }
 
-    /// The mobile network went away.
+    /// The standby network went away (or became the default).
     pub fn standby_lost(&self) {
         self.node.standby_lost();
     }

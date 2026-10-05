@@ -123,29 +123,35 @@ Once either side sees the other's fresh candidates:
 Sections 2 to 4 find a contact by polling the DHT; after a network change that took about 1m45s in the field. Fast recovery prepares everything during a live session, so a break is repaired in under a second. It is driven by the platform telling the node, the moment it happens, that the default network changed.
 
 - **Paths.** On each direct session with a mutually approved contact, both sides send `Paths` (feature bit 64): their current candidates, their *standby* candidates (below), and their heartbeat. Both sides also export a per-session *recovery slot* key from the session (`"rendezvous recovery slot"`), naming one DHT record each side can write to if the session breaks.
-- **Lease.** Every session sends a frame at least every heartbeat: the cover-traffic interval, or an empty frame every 10 s when cover traffic is off. Silence for three heartbeats plus a second ends the session, so both sides notice a loss within seconds of each other. Only sessions that *fail* (errors, lease) start recovery; a session closed on purpose doesn't.
-- **Standby path.** While on Wi-Fi, the app keeps a second UDP socket bound to the mobile network (Rust makes it and hands its descriptor to Kotlin, which calls `Network.bindSocket`), opens a QUIC endpoint on it, and learns its outside address with a DHT ping. The standby addresses go to contacts in `Paths`. Both sides then keep a hole open between the contact's main socket and our standby socket:
+- **Lease.** Every session sends a frame at least every heartbeat: the cover-traffic interval, or an empty frame every 10 s when cover traffic is off. Silence for two heartbeats plus two seconds ends the session (about 6 s on Wi-Fi, 22 s on mobile data), so both sides notice a loss within seconds of each other. Only sessions that *fail* (errors, lease) start recovery; a session closed on purpose doesn't.
+- **Setup goes first.** `Hello`, `Approval` and `Paths` skip the cover-traffic schedule during a session's first 5 seconds (their timing is visible from the handshake anyway). Otherwise, at one frame per 10 s on mobile data, a session that died within half a minute never delivered its lease or paths.
+- **Kept across restarts.** Recovery slots and contacts' paths are saved, so an app that was killed and restarted writes its new addresses to the slots its contacts are watching.
+- **Standby path.** The app keeps a second UDP socket bound to whichever network is up but isn't the default: mobile data while on Wi-Fi, or a Wi-Fi that has just connected while on mobile data (Android switches to it a moment later, once it has checked it). While on Wi-Fi, that is a socket bound to the mobile network (Rust makes it and hands its descriptor to Kotlin, which calls `Network.bindSocket`), opens a QUIC endpoint on it, and learns its outside address with a DHT ping. The standby addresses go to contacts in `Paths`. Both sides then keep a hole open between the contact's main socket and our standby socket:
   - our standby socket probes the contact's addresses every 45 s, adapting: shorter when a refresh finds the outside port changed (the mapping had expired), slowly longer while it holds, between 20 s and 5 minutes;
-  - the contact's main socket probes our standby addresses every 20 s (home routers forget UDP mappings within a minute).
-  The standby path is kept warm only while it matters, since the probes cost mobile radio time: the app is open, a message came or went in the last ten minutes, or the Wi-Fi signal is below -72 dBm.
-- **The moving side acts first.** When Android reports that mobile data became the default network, the node dials every approved contact through its standby hole at once. If Wi-Fi is back, or there is no warm hole, it gathers its new addresses (DHT pings to cached nodes, no DNS: about 0.3–0.5 s), probes and dials the contact's known addresses, and writes its new addresses to each recovery slot (it rejoins the DHT from the new network first, starting from the nodes it knew).
+  - the contact's main socket probes our standby addresses every 20 s (home routers forget UDP mappings within a minute), or as rarely as our standby socket does when the contact is itself on mobile data, whose NAT keeps mappings longer.
+  A standby path on mobile data is kept warm only while it matters, since the probes cost mobile radio time: the app is open, a message came or went in the last ten minutes, or the Wi-Fi signal is below -72 dBm. A standby path on Wi-Fi is always warm.
+- **The moving side acts first.** When Android reports that the standby network became the default, the node dials every approved contact through its standby hole at once. If Wi-Fi is back, or there is no warm hole, it gathers its new addresses (DHT pings to cached nodes, no DNS: about 0.3–0.5 s), probes and dials the contact's known addresses, and writes its new addresses to each recovery slot (it rejoins the DHT from the new network first, starting from the nodes it knew).
 - **The other side.** Its session fails (an error, or the lease). It probes the contact's standby and last known addresses, reads the contact's recovery slot every 1.5 s for a minute, and probes whatever appears there. It leaves dialing to the side that moved; it dials itself only after 15 s without hearing that side's probes. When neither side moved (a path between them died), the smaller key dials as soon as it hears the other.
+- **Records stay findable.** A record is republished when the shared key changes (each session derives a new one, and the contact keeps only the last three), and a record written after our last failed attempt cuts the backoff short. New addresses from a record join a punch already running, which then dials at once.
+- **Bounded reads.** A DHT read takes the newest value that arrives within 3 s rather than waiting for the slowest node, and in the foreground contacts' records are read every 20 s (one read each; older keys and the previous hour only when that misses).
 - **Duplicates.** If both sides dial at once, both keep the session dialed by the smaller key when two sessions start within 5 s of each other. Keeping the newest instead made each side keep a different one and lose the other, over and over.
 
 **Measured** (2026-10-05, Pixel 8a on AT&T, laptop behind two home NATs), from Android's network-change callback to a session back up:
 
 | Case | Time |
 |---|---|
-| Wi-Fi off, standby hole warm, defaults | 0.5–0.9 s |
+| Wi-Fi off, standby hole warm, defaults | 0.5–1.0 s |
+| Wi-Fi back on (standby on the new Wi-Fi, ready before Android switched) | 0.17–0.19 s |
 | Standby hole gone stale (no refresh for 60–120 s) | about 8–9 s, via the probes and recovery slot |
+| App killed and restarted on mobile data | 14 s from launch |
 | Before fast recovery | about 1m45s |
 
 Android itself reported the change about 2.5 s after Wi-Fi was turned off. AT&T kept idle UDP mappings for between 60 and 120 s; the home router forgot them in under 60 s. The home network turned out to be behind two NATs, so router port mapping (section 0) would need both routers to cooperate there.
 
+An app starting after a long time away is found at the contact's next read of its record: within about 20 s while the contact's app is open, 15 minutes in the background.
+
 **Still to do:**
-- **Joining Wi-Fi.** When Wi-Fi becomes the default the session breaks and recovery takes the slower path (about 8–30 s). Android announces the new network a second or two before switching, while the old one still works: the node will send its new addresses over the old session then, so the contact probes before the switch.
-- **The other side on mobile data** can refresh its holes as rarely as the phone does, rather than every 20 s.
-- **On start**, publish and look for contacts at once rather than at the next poll.
+- **Two phones.** Everything above was measured between a phone and a laptop.
 - **A persistent relay circuit** to a reachable, always-on approved contact would carry a "here are my new addresses" message immediately (about 1–2 s instead of the recovery slot's 5–8 s), and reach a phone in the background. It needs such a contact with a stable public address.
 
 ## Privacy

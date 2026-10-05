@@ -272,48 +272,82 @@ object Threnody {
      */
     fun updateStandby() {
         val n = instance ?: return
-        val warm = forceWarm ?: (onWifi && (visible > 0 || wifiWeak ||
-            System.currentTimeMillis() - lastActivity < ACTIVE_MS))
+        // A standby on Wi-Fi (just joined, not default yet) costs nothing
+        // to keep warm; one on mobile data costs radio time.
+        val standbyWifi = standbyNet?.let { nets[it] } == true
+        val warm = forceWarm ?: (standbyWifi || (onWifi && (visible > 0 || wifiWeak ||
+            System.currentTimeMillis() - lastActivity < ACTIVE_MS)))
         n.setStandbyWarm(warm)
     }
 
+    /** The default network, as last reported. */
+    @Volatile private var defaultNet: Network? = null
+    /** The network the standby socket is bound to, if any. */
+    @Volatile private var standbyNet: Network? = null
+    /** Wi-Fi and mobile networks that are up: true for Wi-Fi. */
+    private val nets = java.util.concurrent.ConcurrentHashMap<Network, Boolean>()
+
     /**
-     * Keeps a socket bound to mobile data while Wi-Fi is the default
-     * network: the standby path that `network_changed` dials through when
-     * Wi-Fi goes.
+     * Keeps a socket bound to whichever network is up but isn't the
+     * default: mobile data while on Wi-Fi (for when Wi-Fi goes), or a Wi-Fi
+     * that just connected while on mobile data (Android switches to it a
+     * moment later; the path is ready by then). `network_changed` dials
+     * through it the moment it becomes the default.
      */
     private fun keepStandby(ctx: Context, node: ThrenodyNode) {
         val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return
-        val req = android.net.NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                try {
-                    val fd = node.standbySocket()
-                    android.os.ParcelFileDescriptor.fromFd(fd).use { network.bindSocket(it.fileDescriptor) }
-                    val v6 = cm.getLinkProperties(network)?.linkAddresses.orEmpty()
-                        .map { it.address }
-                        .filterIsInstance<java.net.Inet6Address>()
-                        .filter { !it.isLinkLocalAddress && !it.isSiteLocalAddress && !it.isLoopbackAddress }
-                        .mapNotNull { it.hostAddress?.substringBefore('%') }
-                    node.standbyBound(v6)
-                    say("* standby path on mobile data ready")
-                    updateStandby()
-                } catch (e: Exception) {
-                    say("! standby path: ${e.message}")
+        for ((transport, wifi) in listOf(
+            NetworkCapabilities.TRANSPORT_CELLULAR to false,
+            NetworkCapabilities.TRANSPORT_WIFI to true,
+        )) {
+            val req = android.net.NetworkRequest.Builder()
+                .addTransportType(transport)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    nets[network] = wifi
+                    chooseStandby(cm, node)
                 }
-            }
 
-            override fun onLost(network: Network) {
-                node.standbyLost()
-                say("* standby path gone")
-            }
-        })
+                override fun onLost(network: Network) {
+                    nets.remove(network)
+                    chooseStandby(cm, node)
+                }
+            })
+        }
         java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "threnody-standby").apply { isDaemon = true }
         }.scheduleWithFixedDelay({ updateStandby() }, 1, 1, TimeUnit.MINUTES)
+    }
+
+    /** Binds the standby socket to a network that is up and not the default. */
+    @Synchronized
+    private fun chooseStandby(cm: ConnectivityManager, node: ThrenodyNode) {
+        val want = nets.keys.firstOrNull { it != defaultNet }
+        if (want == standbyNet) return
+        standbyNet = want
+        if (want == null) {
+            node.standbyLost()
+            say("* no standby path")
+            updateStandby()
+            return
+        }
+        try {
+            val fd = node.standbySocket()
+            android.os.ParcelFileDescriptor.fromFd(fd).use { want.bindSocket(it.fileDescriptor) }
+            val v6 = cm.getLinkProperties(want)?.linkAddresses.orEmpty()
+                .map { it.address }
+                .filterIsInstance<java.net.Inet6Address>()
+                .filter { !it.isLinkLocalAddress && !it.isSiteLocalAddress && !it.isLoopbackAddress }
+                .mapNotNull { it.hostAddress?.substringBefore('%') }
+            node.standbyBound(v6)
+            say("* standby path on ${if (nets[want] == true) "Wi-Fi" else "mobile data"} ready")
+        } catch (e: Exception) {
+            standbyNet = null
+            say("! standby path: ${e.message}")
+        }
+        updateStandby()
     }
 
     /**
@@ -327,9 +361,12 @@ object Threnody {
                 val caps = cm.getNetworkCapabilities(network)
                 val cellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
                 onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-                // First, before anything else: this side knows it moved.
-                node.networkChanged(cellular)
-                updateStandby()
+                defaultNet = network
+                // First, before anything else: this side knows it moved,
+                // and may already have a path open on the new network.
+                node.networkChanged(network == standbyNet, cellular)
+                // The standby moves to the other network, if one is up.
+                chooseStandby(cm, node)
                 say("* network available (${if (cellular) "mobile data" else if (onWifi) "Wi-Fi" else "other"}); reconnecting")
                 node.reconnect()
                 for (n in personaNodes.values) n.reconnect()

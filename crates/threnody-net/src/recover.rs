@@ -7,7 +7,7 @@
 //! - **Paths.** Each side tells the other its addresses, its standby
 //!   addresses and its heartbeat (`AppMessage::Paths`), and both derive a
 //!   per-session *recovery slot* in the DHT from the session keys.
-//! - **Lease.** Silence for three heartbeats ends the session at once, so
+//! - **Lease.** Silence for two heartbeats ends the session at once, so
 //!   both sides notice a loss within seconds of each other.
 //! - **Standby path.** A phone on Wi-Fi keeps a second socket bound to its
 //!   mobile network (the platform binds it), learns that socket's outside
@@ -46,8 +46,9 @@ const SLOT_POLL: Duration = Duration::from_millis(1500);
 /// The longest silence on a session when cover traffic is off: an empty
 /// frame goes out at least this often, so the lease means something.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
-/// Missed heartbeats before a session counts as lost.
-const LEASE_BEATS: u32 = 3;
+/// Missed heartbeats before a session counts as lost. QUIC and TCP
+/// retransmit, so a frame arrives late rather than not at all.
+const LEASE_BEATS: u32 = 2;
 /// First gap between keepalives from our standby socket (mobile radio
 /// time, so as rare as the mobile network allows). It adapts: shorter when
 /// a refresh finds the mapping expired, slowly longer while it holds.
@@ -62,9 +63,75 @@ const HOLE_KEEPALIVE: Duration = Duration::from_secs(20);
 const STANDBY_WAIT: Duration = Duration::from_millis(1500);
 /// The recovery slot record is per session, so it has no epochs.
 const SLOT_EPOCH: u64 = 0;
+/// State file for recovery slots and peers' paths, so a restarted app can
+/// still tell its contacts where it is.
+const STATE_NAME: &str = "recovery";
+/// Older entries aren't announced to on start.
+const ANNOUNCE_WITHIN_MS: u64 = 24 * 3600 * 1000;
+
+/// `count (u16) || { peer (32) || slot (32) || updated_ms (u64) || len (u16) || Paths }*`
+fn encode_peers(peers: &HashMap<PublicIdentity, PeerPaths>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let list: Vec<_> = peers
+        .iter()
+        .filter_map(|(p, pp)| Some((p, pp.slot?, pp)))
+        .filter_map(|(p, slot, pp)| Some((p, slot, pp, pp.theirs.encode().ok()?)))
+        .filter(|(.., b)| b.len() <= usize::from(u16::MAX))
+        .take(usize::from(u16::MAX))
+        .collect();
+    out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+    for (p, slot, pp, paths) in list {
+        out.extend_from_slice(p.as_bytes());
+        out.extend_from_slice(&slot);
+        out.extend_from_slice(&pp.updated_ms.to_be_bytes());
+        out.extend_from_slice(&(paths.len() as u16).to_be_bytes());
+        out.extend_from_slice(&paths);
+    }
+    out
+}
+
+fn decode_peers(b: &[u8]) -> HashMap<PublicIdentity, PeerPaths> {
+    fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        let (head, tail) = b.split_at_checked(n)?;
+        *b = tail;
+        Some(head)
+    }
+    let mut out = HashMap::new();
+    let mut b = b;
+    let Some(n) = take(&mut b, 2) else {
+        return out;
+    };
+    for _ in 0..u16::from_be_bytes([n[0], n[1]]) {
+        let entry = (|| {
+            let peer = PublicIdentity::from_bytes(take(&mut b, 32)?.try_into().ok()?).ok()?;
+            let slot: [u8; 32] = take(&mut b, 32)?.try_into().ok()?;
+            let updated_ms = u64::from_be_bytes(take(&mut b, 8)?.try_into().ok()?);
+            let len = take(&mut b, 2)?;
+            let theirs = Paths::decode(take(
+                &mut b,
+                usize::from(u16::from_be_bytes([len[0], len[1]])),
+            )?)
+            .ok()?;
+            Some((
+                peer,
+                PeerPaths {
+                    updated_ms,
+                    slot: Some(slot),
+                    theirs,
+                    remote: None,
+                },
+            ))
+        })();
+        let Some((peer, pp)) = entry else { break };
+        out.insert(peer, pp);
+    }
+    out
+}
 
 #[derive(Clone, Default)]
 struct PeerPaths {
+    /// When this was last updated (ms); kept across restarts.
+    updated_ms: u64,
     /// Key of this session's recovery slot (both sides derive it).
     slot: Option<[u8; 32]>,
     /// What the peer last told us.
@@ -93,6 +160,9 @@ pub(crate) struct RecoverState {
     adaptive: AtomicBool,
     /// The next keepalive round includes the standby socket's.
     force: AtomicBool,
+    /// Our default network is mobile data: its NAT keeps mappings long,
+    /// and refreshing them costs radio time.
+    on_mobile: AtomicBool,
     /// Wakes the keepalive loop (a hole to open now).
     kick: Notify,
     /// When the current recovery began, for the timings in the log.
@@ -109,6 +179,7 @@ impl RecoverState {
             keepalive_ms: AtomicU64::new(STANDBY_KEEPALIVE.as_millis() as u64),
             adaptive: AtomicBool::new(true),
             force: AtomicBool::new(false),
+            on_mobile: AtomicBool::new(false),
             kick: Notify::new(),
             t0: Mutex::default(),
         }
@@ -117,7 +188,7 @@ impl RecoverState {
 
 /// The lease for a peer whose heartbeat is `beat_ms`.
 pub(crate) fn lease_for(beat_ms: u64) -> Duration {
-    Duration::from_millis(beat_ms.clamp(500, 120_000)) * LEASE_BEATS + Duration::from_secs(1)
+    Duration::from_millis(beat_ms.clamp(500, 120_000)) * LEASE_BEATS + Duration::from_secs(2)
 }
 
 fn slot_key(slot: &[u8; 32], writer: &PublicIdentity) -> rendezvous::RecordKeys {
@@ -127,6 +198,18 @@ fn slot_key(slot: &[u8; 32], writer: &PublicIdentity) -> rendezvous::RecordKeys 
 impl Node {
     fn rec(&self) -> &RecoverState {
         &self.shared.recover
+    }
+
+    /// Loads recovery slots saved by an earlier run.
+    pub(crate) fn load_recovery(&self) {
+        if let Ok(Some(b)) = self.shared.home.load_state(self.identity_ref(), STATE_NAME) {
+            *lock(&self.rec().peers) = decode_peers(&b);
+        }
+    }
+
+    fn save_recovery(&self) {
+        let bytes = encode_peers(&lock(&self.rec().peers));
+        self.shared.save_state(STATE_NAME, Ok(bytes));
     }
 
     /// Logs a recovery step with the time since the recovery began.
@@ -192,12 +275,16 @@ impl Node {
         slot: [u8; 32],
         remote: Option<SocketAddr>,
     ) {
-        let mut peers = lock(&self.rec().peers);
-        let p = peers.entry(peer).or_default();
-        p.slot = Some(slot);
-        if remote.is_some() {
-            p.remote = remote.map(canonical);
+        {
+            let mut peers = lock(&self.rec().peers);
+            let p = peers.entry(peer).or_default();
+            p.slot = Some(slot);
+            p.updated_ms = now_ms();
+            if remote.is_some() {
+                p.remote = remote.map(canonical);
+            }
         }
+        self.save_recovery();
     }
 
     /// The peer's `Paths`; returns its lease.
@@ -212,8 +299,10 @@ impl Node {
             let p = peers.entry(peer).or_default();
             let changed = p.theirs.standby != paths.standby;
             p.theirs = paths;
+            p.updated_ms = now_ms();
             changed && !p.theirs.standby.is_empty()
         };
+        self.save_recovery();
         if new_standby {
             let addrs: Vec<String> = lock(&self.rec().peers)
                 .get(&peer)
@@ -298,7 +387,7 @@ impl Node {
                 return;
             }
             if let Some(dht) = self.dht()
-                && let Some(item) = dht.get_mutable_most_recent(&key, Some(&rk.salt)).await
+                && let Some(item) = crate::reach::get_latest(&dht, &key, &rk.salt).await
                 && let Ok(rec) = rendezvous::open_record(&rk, item.value())
                 && rec.issued_ms + 10_000 >= lost_ms
                 && rec.issued_ms > seen
@@ -316,9 +405,9 @@ impl Node {
     }
 
     /// The platform's default network changed. With `to_standby`, it is
-    /// now the network our standby socket is bound to (Wi-Fi went, mobile
-    /// data took over): dial every approved peer through its open standby
-    /// hole at once. In any case, learn our new addresses, write them to
+    /// now the network our standby socket is bound to (Wi-Fi went and
+    /// mobile data took over, or a Wi-Fi we already prepared took over):
+    /// dial every approved peer through its open standby hole at once. In any case, learn our new addresses, write them to
     /// every recovery slot and punch toward the peers we lost.
     pub fn network_switched(&self, to_standby: bool) {
         *lock(&self.rec().t0) = Some(Instant::now());
@@ -327,9 +416,10 @@ impl Node {
         } else {
             "network changed"
         });
+        let recent = now_ms().saturating_sub(ANNOUNCE_WITHIN_MS);
         let peers: Vec<(PublicIdentity, PeerPaths)> = lock(&self.rec().peers)
             .iter()
-            .filter(|(p, _)| self.shared.mutual(p))
+            .filter(|(p, pp)| self.shared.mutual(p) && pp.updated_ms >= recent)
             .map(|(p, pp)| (*p, pp.clone()))
             .collect();
         let standby = lock(&self.rec().standby).as_ref().map(|s| s.quic.clone());
@@ -341,7 +431,7 @@ impl Node {
                     .filter(|a| is_public(&a.ip()))
                     .collect();
                 for c in &pp.theirs.main {
-                    if c.kind != CandidateKind::Local && !targets.contains(&c.addr) {
+                    if !targets.contains(&c.addr) {
                         targets.push(c.addr);
                     }
                 }
@@ -493,6 +583,11 @@ impl Node {
         let node = self.clone();
         tokio::spawn(async move { node.learn_standby().await });
         Ok(())
+    }
+
+    /// Tells recovery whether the default network is mobile data.
+    pub fn set_on_mobile(&self, on: bool) {
+        self.rec().on_mobile.store(on, Ordering::Relaxed);
     }
 
     /// The standby network went away.
@@ -656,7 +751,14 @@ impl Node {
                     last_standby = Some(Instant::now());
                 }
             }
-            if !self.pause(HOLE_KEEPALIVE, &self.rec().kick).await {
+            // On mobile data our side of contacts' holes lasts as long as
+            // the standby socket's does: refresh it as rarely.
+            let gap = if self.rec().on_mobile.load(Ordering::Relaxed) {
+                Duration::from_millis(self.rec().keepalive_ms.load(Ordering::Relaxed))
+            } else {
+                HOLE_KEEPALIVE
+            };
+            if !self.pause(gap, &self.rec().kick).await {
                 break;
             }
         }
@@ -705,5 +807,37 @@ impl Node {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_peers_round_trip() {
+        let peer = threnody_core::Identity::generate().public();
+        let mut peers = HashMap::new();
+        peers.insert(
+            peer,
+            PeerPaths {
+                updated_ms: 42,
+                slot: Some([7; 32]),
+                theirs: Paths {
+                    main: vec![Candidate {
+                        kind: CandidateKind::Reflexive,
+                        addr: "203.0.113.4:7450".parse().unwrap(),
+                    }],
+                    standby: vec![],
+                    beat_ms: 2000,
+                },
+                remote: None,
+            },
+        );
+        let back = decode_peers(&encode_peers(&peers));
+        let pp = &back[&peer];
+        assert_eq!((pp.updated_ms, pp.slot), (42, Some([7; 32])));
+        assert_eq!(pp.theirs, peers[&peer].theirs);
+        assert!(decode_peers(&[0, 5, 1, 2]).is_empty());
     }
 }

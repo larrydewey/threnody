@@ -94,7 +94,7 @@ impl Default for ReachConfig {
         Self {
             bootstrap: None,
             reflectors: DEFAULT_REFLECTORS.iter().map(|s| (*s).to_owned()).collect(),
-            poll_foreground: Duration::from_secs(60),
+            poll_foreground: Duration::from_secs(20),
             poll_background: Duration::from_secs(900),
             poll_seeking: Duration::from_secs(15),
             republish: Duration::from_secs(1800),
@@ -139,6 +139,8 @@ struct Punch {
     lasts: Duration,
     /// A probe from the contact arrived.
     heard: Notify,
+    /// New addresses for the contact arrived: dial now.
+    retarget: Notify,
     we_dial: bool,
     /// With `we_dial`: wait this long before the first dial.
     dial_after: Duration,
@@ -148,7 +150,10 @@ struct Punch {
 }
 
 struct Published {
-    digest: (Vec<Candidate>, u64, Option<u64>, u64),
+    /// What was published: candidates, flags, seeking, epoch, and the
+    /// shared key it was published under (a new session changes the key;
+    /// the contact keeps only the last few).
+    digest: (Vec<Candidate>, u64, Option<u64>, u64, [u8; 32]),
     at: Instant,
 }
 
@@ -170,6 +175,8 @@ pub(crate) struct Inner {
     punches: HashMap<PublicIdentity, Arc<Punch>>,
     /// Failures so far and when punching may start again.
     backoff: HashMap<PublicIdentity, (usize, Instant)>,
+    /// When we last started punching each contact (ms).
+    last_punch: HashMap<PublicIdentity, u64>,
     /// Publishing rounds in a row where every write failed.
     put_failures: u32,
     /// DHT nodes to ping for our outside address, resolved and kept, so a
@@ -659,7 +666,7 @@ impl Node {
             let flags = if inner.symmetric { FLAG_SYMMETRIC } else { 0 };
             for (peer, keys) in self.approved() {
                 let seeking = inner.seeking.get(&peer).copied();
-                let digest = (inner.candidates.clone(), flags, seeking, ep);
+                let digest = (inner.candidates.clone(), flags, seeking, ep, keys[0]);
                 let fresh = inner
                     .published
                     .get(&peer)
@@ -761,9 +768,6 @@ impl Node {
     async fn poll_all(&self, dht: &AsyncDht, cfg: &ReachConfig) {
         let mut gets = JoinSet::new();
         for (peer, keys) in self.unreached() {
-            if lock(&self.rdv().inner).punches.contains_key(&peer) {
-                continue;
-            }
             let dht = dht.clone();
             gets.spawn(async move { (peer, fetch(&dht, &peer, &keys).await) });
         }
@@ -797,6 +801,19 @@ impl Node {
                 continue;
             }
             let urge = if seeking { Urge::Answer } else { Urge::Start };
+            {
+                // Written since our last attempt failed: the contact is
+                // (back) online, so don't wait out the backoff, unless
+                // attempts keep failing anyway.
+                let mut inner = lock(&self.rdv().inner);
+                let fresh = inner
+                    .last_punch
+                    .get(&peer)
+                    .is_some_and(|t| rec.issued_ms > *t);
+                if fresh && inner.backoff.get(&peer).is_some_and(|(n, _)| *n < 2) {
+                    inner.backoff.remove(&peer);
+                }
+            }
             // A record we couldn't act on (backing off, too busy) stays new.
             if self.punch(peer, &rec.list, rec.flags & FLAG_SYMMETRIC != 0, urge) {
                 lock(&self.rdv().inner).seen.insert(peer, rec.issued_ms);
@@ -835,15 +852,16 @@ impl Node {
                 .get(&peer)
                 .is_some_and(|(_, until)| Instant::now() < *until);
             let recovering = matches!(urge, Urge::Moved | Urge::Lost);
+            let running = inner.punches.contains_key(&peer);
             if targets.is_empty()
-                || (backing_off && urge == Urge::Start)
-                || (inner.punches.contains_key(&peer) && !recovering)
-                || (inner.punches.len() >= MAX_PUNCHES && !recovering)
+                || (backing_off && urge == Urge::Start && !running)
+                || (inner.punches.len() >= MAX_PUNCHES && !recovering && !running)
             {
                 return false;
             }
             if let Some(p) = inner.punches.get(&peer) {
-                // Already punching: aim it at the new places too.
+                // Already punching (say, toward where it was before it went
+                // away): aim it at the new places too, and dial now.
                 let mut t = lock(&p.targets);
                 for a in targets.iter().rev() {
                     if !t.contains(a) {
@@ -851,7 +869,7 @@ impl Node {
                     }
                 }
                 t.truncate(MAX_TARGETS);
-                p.heard.notify_one();
+                p.retarget.notify_one();
                 return true;
             }
             let lasts = match urge {
@@ -882,6 +900,7 @@ impl Node {
                 targets: Mutex::new(targets),
                 lasts,
                 heard: Notify::new(),
+                retarget: Notify::new(),
                 we_dial,
                 dial_after,
                 // On a loss neither side caused, the smaller key dials once
@@ -889,6 +908,7 @@ impl Node {
                 defer: urge == Urge::Lost && self.identity().as_bytes() > peer.as_bytes(),
             });
             inner.punches.insert(peer, p.clone());
+            inner.last_punch.insert(peer, now_ms());
             p
         };
         if urge == Urge::Start {
@@ -944,6 +964,14 @@ impl Node {
             }
             tokio::select! {
                 _ = tick.tick() => {}
+                () = punch.retarget.notified() => {
+                    // A dial to the old places may take seconds to fail.
+                    if let Some(h) = dialing.take() {
+                        h.abort();
+                    }
+                    next_dial = Instant::now();
+                    heard = None;
+                }
                 () = punch.heard.notified() => {
                     if punch.defer {
                         heard = Some(Instant::now());
@@ -1100,18 +1128,21 @@ async fn join_dht(cfg: &ReachConfig, warm: &[String]) -> std::io::Result<AsyncDh
 /// discovery keys, this epoch or the last.
 async fn fetch(dht: &AsyncDht, peer: &PublicIdentity, keys: &[[u8; 32]]) -> Option<Candidates> {
     let ep = epoch(now_ms() / 1000);
+    // Usually the record is under our current shared key and this hour:
+    // one read. Only if that misses, try the older keys and the last hour.
+    if let Some(d) = keys.first()
+        && let Some(c) = fetch_one(dht, peer, d, ep).await
+    {
+        return Some(c);
+    }
     let mut gets = JoinSet::new();
-    for d in keys {
+    for (i, d) in keys.iter().enumerate() {
         for e in [ep, ep.saturating_sub(1)] {
+            if i == 0 && e == ep {
+                continue;
+            }
             let (dht, d, peer) = (dht.clone(), *d, *peer);
-            gets.spawn(async move {
-                let rk = record_keys(&d, &peer, e);
-                let key = SigningKey::from_bytes(&rk.signing_seed)
-                    .verifying_key()
-                    .to_bytes();
-                let item = dht.get_mutable_most_recent(&key, Some(&rk.salt)).await?;
-                rendezvous::open_record(&rk, item.value()).ok()
-            });
+            gets.spawn(async move { fetch_one(&dht, &peer, &d, e).await });
         }
     }
     let mut best: Option<Candidates> = None;
@@ -1120,6 +1151,50 @@ async fn fetch(dht: &AsyncDht, peer: &PublicIdentity, keys: &[[u8; 32]]) -> Opti
             && best.as_ref().is_none_or(|b| c.issued_ms > b.issued_ms)
         {
             best = Some(c);
+        }
+    }
+    best
+}
+
+/// `peer`'s record under discovery key `d` in epoch `e`.
+async fn fetch_one(
+    dht: &AsyncDht,
+    peer: &PublicIdentity,
+    d: &[u8; 32],
+    e: u64,
+) -> Option<Candidates> {
+    let rk = record_keys(d, peer, e);
+    let key = SigningKey::from_bytes(&rk.signing_seed)
+        .verifying_key()
+        .to_bytes();
+    let item = get_latest(dht, &key, &rk.salt).await?;
+    rendezvous::open_record(&rk, item.value()).ok()
+}
+
+/// How long a DHT read collects answers. A full lookup can take many
+/// seconds when some nodes don't answer; the closest nodes usually answer
+/// within a second or two, and a later poll catches anything missed.
+const READ_WAIT: Duration = Duration::from_secs(3);
+
+/// The newest value stored under `key` and `salt` that arrives within
+/// [`READ_WAIT`].
+pub(crate) async fn get_latest(dht: &AsyncDht, key: &[u8; 32], salt: &[u8]) -> Option<MutableItem> {
+    use futures_lite::StreamExt;
+    let mut items = dht.get_mutable(key, Some(salt), None);
+    let mut best: Option<MutableItem> = None;
+    let deadline = tokio::time::sleep(READ_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            item = items.next() => match item {
+                Some(i) => {
+                    if best.as_ref().is_none_or(|b| i.seq() > b.seq()) {
+                        best = Some(i);
+                    }
+                }
+                None => break,
+            },
+            () = &mut deadline => break,
         }
     }
     best
