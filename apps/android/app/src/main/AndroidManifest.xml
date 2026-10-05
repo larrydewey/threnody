@@ -47,6 +47,9 @@
         <activity android:name=".ScanActivity" android:exported="false"
             android:parentActivityName=".MainActivity"
             android:screenOrientation="portrait" />
+        <activity android:name=".MediaActivity" android:exported="false"
+            android:parentActivityName=".ChatActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".ImageActivity" android:exported="false"
             android:parentActivityName=".ChatActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />

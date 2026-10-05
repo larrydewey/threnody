@@ -888,6 +888,7 @@ class ChatActivity : Activity() {
         if (group != null) return groupMenu(anchor)
         val c = convo
         PopupMenu(this, anchor).apply {
+            menu.add("Media, files and links").setOnMenuItemClickListener { media(c?.title); true }
             menu.add("Rename").setOnMenuItemClickListener { rename(); true }
             menu.add("Safety number").setOnMenuItemClickListener { safety(); true }
             if (c?.approved == true) {
@@ -919,6 +920,14 @@ class ChatActivity : Activity() {
             }
             show()
         }
+    }
+
+    private fun media(title: String?) {
+        startActivity(Intent(this, MediaActivity::class.java)
+            .putExtra(DEVICE, device)
+            .putExtra(GROUP, group)
+            .putExtra(PERSONA, persona)
+            .putExtra(MediaActivity.TITLE, title))
     }
 
     /** Proves to them that this anonymous identity is us. Can't be undone. */
@@ -973,6 +982,7 @@ class ChatActivity : Activity() {
     private fun groupMenu(anchor: View) {
         val g = info ?: return
         PopupMenu(this, anchor).apply {
+            menu.add("Media, files and links").setOnMenuItemClickListener { media(g.name); true }
             menu.add("Members").setOnMenuItemClickListener { members(); true }
             if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
