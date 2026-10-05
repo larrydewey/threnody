@@ -564,6 +564,15 @@ impl Node {
         Ok(fd)
     }
 
+    /// Standby networks are bound by file descriptor, which only Unix
+    /// platforms (Android) hand over.
+    #[cfg(not(unix))]
+    pub fn standby_socket(&self) -> Result<i32> {
+        Err(NetError::NotAllowed(
+            "standby networks need a Unix platform".into(),
+        ))
+    }
+
     /// The socket from [`Node::standby_socket`] is bound to the standby
     /// network, whose global IPv6 addresses are `ipv6`. Opens a QUIC
     /// endpoint on it and learns its outside address.

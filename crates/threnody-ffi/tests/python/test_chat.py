@@ -13,7 +13,9 @@ def wait(node, kind, timeout_s=20):
     raise AssertionError(f"no {kind.__name__} event")
 
 
-with tempfile.TemporaryDirectory() as d:
+# shutdown() doesn't wait for the nodes' tasks, which may still be saving
+# state as the directory is removed.
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
     alice = ThrenodyNode.open(f"{d}/alice", None)
     bob = ThrenodyNode.open(f"{d}/bob", "correct horse")
     addr = bob.listen("127.0.0.1:0")
@@ -41,4 +43,4 @@ with tempfile.TemporaryDirectory() as d:
     alice.shutdown()
     bob.shutdown()
     print("python bindings: ok")
-    sys.exit(0)
+sys.exit(0)

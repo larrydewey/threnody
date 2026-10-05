@@ -1105,6 +1105,9 @@ where
     // Silence longer than this ends the session (see `recover`): known once
     // the peer's `Paths` says how often it sends.
     let mut lease: Option<Duration> = None;
+    // `Paths` that arrived before approval was mutual (the peer's
+    // `Approval` can trail them), kept until it is.
+    let mut early_paths: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
     let mut heartbeat = tokio::time::interval(node.beat());
@@ -1137,6 +1140,11 @@ where
                     node.session_up(peer, slot, observed);
                 }
                 discovery_keyed = true;
+            }
+            if shared.mutual(&peer)
+                && let Some(payload) = early_paths.take()
+            {
+                lease = node.on_paths(peer, &payload).or(lease);
             }
             // Tell an approved peer how to find us if this session breaks.
             if !paths_sent
@@ -1307,7 +1315,11 @@ where
                         }
                         AppMessage::Paths(payload) => {
                             if via.is_none() {
-                                lease = node.on_paths(peer, &payload).or(lease);
+                                if shared.mutual(&peer) {
+                                    lease = node.on_paths(peer, &payload).or(lease);
+                                } else {
+                                    early_paths = Some(payload);
+                                }
                             }
                         }
                         AppMessage::Observed { addr } => {
