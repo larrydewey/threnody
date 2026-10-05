@@ -20,6 +20,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 uniffi::setup_scaffolding!();
 
 mod groups;
+mod persona;
+pub use persona::{PersonaRecord, ProfileAttr};
 
 pub use groups::{GroupInfo, GroupInvite};
 use threnody_groups::node::GroupNode;
@@ -54,6 +56,12 @@ pub struct ContactInfo {
     /// We want its messages (else they're requests); see `accept_contact`.
     pub accepted: bool,
     pub blocked: bool,
+    /// What it shares of its profile with us, as it describes itself.
+    pub shared_profile: Vec<ProfileAttr>,
+    /// The main identity it proved it is (it reached us as a persona),
+    /// and the invite it gave to reach that identity.
+    pub revealed: Option<String>,
+    pub revealed_invite: Option<String>,
 }
 
 /// A device of our account.
@@ -301,6 +309,17 @@ pub enum NodeEvent {
         caption: String,
         album: u64,
     },
+    /// `peer` changed what it shares of its profile; reload contacts.
+    ProfileChanged {
+        peer: String,
+    },
+    /// `peer` (a persona, to us) proved it is `identity`; `invite` reaches
+    /// that identity. Also kept as `ContactInfo::revealed`.
+    IdentityRevealed {
+        peer: String,
+        identity: String,
+        invite: Option<String>,
+    },
     /// Our own device `from` shared history; reload conversations.
     HistorySynced {
         from: String,
@@ -470,6 +489,16 @@ fn convert(e: Event) -> NodeEvent {
                 AppMessage::File { name, .. } => Some(name),
                 _ => None,
             },
+        },
+        Event::ProfileChanged { peer } => NodeEvent::ProfileChanged { peer: fp(&peer) },
+        Event::IdentityRevealed {
+            peer,
+            identity,
+            invite,
+        } => NodeEvent::IdentityRevealed {
+            peer: fp(&peer),
+            identity: fp(&identity),
+            invite,
         },
         Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
             from: fp(&from),
@@ -848,7 +877,15 @@ impl ThrenodyNode {
             .iter()
             .map(|c| ContactInfo {
                 fingerprint: fp(&c.key),
-                name: c.petname.clone(),
+                // Our name for it, else the name it shares once accepted.
+                name: c.petname.clone().or_else(|| {
+                    c.shared_name()
+                        .filter(|_| c.accepted && !c.blocked)
+                        .map(str::to_owned)
+                }),
+                shared_profile: persona::attrs(&c.profile),
+                revealed: c.revealed.as_ref().map(|(id, _)| fp(id)),
+                revealed_invite: c.revealed.as_ref().and_then(|(_, i)| i.clone()),
                 mutually_approved: c.mutually_approved(),
                 verified: c.verified,
                 account: c.account.map(|a| a.fingerprint().to_string()),
@@ -1188,6 +1225,75 @@ mod tests {
         assert!(q.size >= 21);
         assert_eq!(q.dark.len(), (q.size * q.size) as usize);
         assert!(q.dark[0], "finder pattern corner is dark");
+    }
+
+    #[test]
+    fn personas_share_profiles_and_reveal_through_apps() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = ThrenodyNode::open(dir.path().join("me").display().to_string(), None).unwrap();
+        let bob = ThrenodyNode::open(dir.path().join("b").display().to_string(), None).unwrap();
+        let addr = bob.listen("127.0.0.1:0".into()).unwrap();
+        let rec = me
+            .create_persona("market".into(), None, Some("pw".into()))
+            .unwrap();
+        assert_eq!(me.personas().unwrap(), vec![rec.clone()]);
+        let p = ThrenodyNode::open(rec.home.clone(), Some("pw".into())).unwrap();
+        assert!(p.is_persona() && !me.is_persona() && p.personas().is_err());
+        assert_ne!(p.device_fingerprint(), me.device_fingerprint());
+
+        let b_fp = p.connect(bob.invite_link(addr)).unwrap();
+        let p_fp = p.device_fingerprint();
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(p_fp.clone()).unwrap();
+        p.set_profile(vec![
+            ProfileAttr {
+                key: "name".into(),
+                value: "Stall 12".into(),
+            },
+            ProfileAttr {
+                key: "email".into(),
+                value: "s@example.org".into(),
+            },
+        ])
+        .unwrap();
+        p.set_shared_with(b_fp.clone(), vec!["name".into()])
+            .unwrap();
+        assert_eq!(
+            p.shared_with(b_fp.clone()).unwrap(),
+            vec!["name".to_owned()]
+        );
+        wait(&bob, |e| matches!(e, NodeEvent::ProfileChanged { .. }));
+        let seen = bob
+            .contacts()
+            .into_iter()
+            .find(|c| c.fingerprint == p_fp)
+            .unwrap();
+        assert_eq!(seen.name.as_deref(), Some("Stall 12"));
+        assert_eq!(seen.shared_profile.len(), 1);
+
+        me.reveal_through(p.clone(), b_fp, Some("threnody://ME@10.0.0.2:7450".into()))
+            .unwrap();
+        let e = wait(&bob, |e| matches!(e, NodeEvent::IdentityRevealed { .. }));
+        assert_eq!(
+            e,
+            NodeEvent::IdentityRevealed {
+                peer: p_fp.clone(),
+                identity: me.device_fingerprint(),
+                invite: Some("threnody://ME@10.0.0.2:7450".into()),
+            }
+        );
+        let seen = bob
+            .contacts()
+            .into_iter()
+            .find(|c| c.fingerprint == p_fp)
+            .unwrap();
+        assert_eq!(seen.revealed, Some(me.device_fingerprint()));
+
+        p.shutdown();
+        drop(p);
+        me.burn_persona(rec.id).unwrap();
+        assert!(me.personas().unwrap().is_empty());
+        assert!(!std::path::Path::new(&rec.home).exists());
     }
 
     #[test]

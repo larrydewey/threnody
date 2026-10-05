@@ -13,6 +13,7 @@ pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod history;
+pub mod identity;
 pub mod mailbox;
 pub mod node;
 pub mod onion;

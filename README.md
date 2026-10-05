@@ -43,6 +43,8 @@ You can also manage contacts outside a session with `threnody contacts | name | 
 
 **Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. Messages left in mailboxes for offline contacts go over such circuits too, so the mailbox doesn't learn who sent them. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. Photos lose their location and camera details before they're sent; `--keep-metadata` sends them as they are. `--policy approved` only accepts mutually approved contacts.
 
+**Anonymous identities.** `threnody persona new <label> [--burn-after 7d]` makes a separate identity, and `threnody --persona <label> run` uses it. It has its own keys, contacts and history, and nothing links it to you. `/profile set name …` and `/share <peer> name` choose what each contact sees of your profile; nothing is shared by default. As a persona, `/reveal <peer> <host:port>` proves to that peer who you are, with a signature that can't be taken back. `threnody persona burn <label>` deletes a persona and everything it kept.
+
 While listening, nodes send private UDP beacons that only mutually approved peers can recognise, and reconnect to each other automatically. Use `--no-discover` to turn this off. See [Appendix E](docs/appendix-e-discovery.md).
 
 `threnody init` seals the identity key (Argon2id) with a random key kept in the system keyring: the Secret Service on Linux (GNOME Keyring, KWallet, KeePassXC), the Keychain on macOS, or the Credential Manager on Windows. A copy of the data directory is then useless without your unlocked keyring. Without a keyring (say, on a headless server), or with `--no-keyring`, the key is stored unprotected. `threnody keyring on|off|status` moves an existing identity into or out of the keyring. Alternatively, `threnody init --passphrase` seals it with a passphrase you type, and `threnody passphrase` adds, changes or removes it. `$THRENODY_PASSPHRASE` supplies it non-interactively.
@@ -73,6 +75,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix J: accounts and multiple devices](docs/appendix-j-devices.md)
 - [Appendix K: Bluetooth LE transport](docs/appendix-k-bluetooth.md)
 - [Appendix L: Wi-Fi Direct link upgrade](docs/appendix-l-wifi-direct.md)
+- [Appendix M: anonymous identities and selective disclosure](docs/appendix-m-anonymity.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
@@ -85,7 +88,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.3 FS / PCS ratchet with hybrid PQ updates | ✅ KEM double ratchet with header encryption |
 | §3.4 Formal verification | ✅ Tamarin, 33 lemmas: handshake, ratchet, sealed messages, onion hops, device linking and account chains; `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
-| §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
+| §4.1 Anonymous mode, §4.3 selective disclosure | ✅ anonymous identities (personas) with their own keys, contacts and history, unlinkable to the main identity, optionally burning themselves, revealed only by a signed proof; profiles shared per contact, nothing by default ([Appendix M](docs/appendix-m-anonymity.md)); ❌ zero-knowledge credentials |
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync and history sync (with a backfill for newly linked devices), account-wide offline keys and group invites |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
 | §6.1 1:1 text + files | ✅ photos and albums with captions, a *sensitive* flag that shows them covered until opened, and metadata (location, camera) stripped before sending by default; including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
@@ -105,7 +108,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
-5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, and anonymous and selective-disclosure identities.
+5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts (which would also hide a persona's network address), and zero-knowledge credentials for selective disclosure.
 6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
 
 ## Development

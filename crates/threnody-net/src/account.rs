@@ -528,7 +528,7 @@ impl Node {
                 .position(|(c, _)| link_proof(&c.secret, &session_id, &from) == proof);
             pos.map(|p| st.codes.remove(p))
         };
-        if matched.is_none() || self.is_revoked(&from) {
+        if matched.is_none() || self.is_revoked(&from) || self.shared.persona {
             self.account_send(&from, &AccountMsg::LinkRefused);
             self.emit(Event::LinkRejected { device: from });
             return;
@@ -580,6 +580,9 @@ impl Node {
     /// Joins the account of the device that issued `code`. This device's
     /// own single-device account is replaced. Returns the account id.
     pub async fn link_with(&self, code: &LinkCode) -> Result<AccountId> {
+        if self.shared.persona {
+            return Err(NetError::NotAllowed("%s".into()));
+        }
         let existing = self.connect(&code.addr, Some(code.device)).await?;
         let session_id = self
             .sessions()
@@ -682,6 +685,9 @@ impl Node {
     /// Renames a device of our account (any of them, including this one)
     /// and tells every peer; contacts see the new name too.
     pub fn rename_device(&self, device: &PublicIdentity, name: &str) -> Result<()> {
+        if self.shared.persona {
+            return Err(NetError::NotAllowed("%s".into()));
+        }
         let name = threnody_core::account::clean_name(name.trim());
         if name.is_empty() {
             return Err(NetError::Refused("empty device name".into()));

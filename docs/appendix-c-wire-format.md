@@ -33,8 +33,8 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
-           / Direct / Tracked / Ack
-Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 = acknowledgements); absent = 0
+           / Direct / Tracked / Ack / Delete / Edit / Identity
+Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint }  ; sent_ms, body, disappear after (s), sender's message id
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
              ? 6 => uint, ? 7 => tstr, ? 8 => uint }                   ; flags (1 = sensitive), caption, album id
@@ -52,6 +52,7 @@ Tracked  = { 0 => 13, 2 => bstr .cbor AppMessage, 5 => uint }  ; inner message (
 Ack      = { 0 => 14, 2 => bstr }                          ; acknowledged ids, 8 bytes each (big-endian), ≤ 512
 Delete   = { 0 => 15, 2 => bstr, 3 => bstr }               ; message ids (8 bytes each, ≤ 512), conversation id
 Edit     = { 0 => 16, 2 => tstr, 3 => bstr, 5 => uint }    ; new text, conversation id, message id
+Identity = { 0 => 17, 2 => bstr .cbor IdentityMsg }       ; profile or revealed identity, Appendix M
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),

@@ -282,6 +282,14 @@ pub struct Contact {
     pub accepted: bool,
     /// Refused: no sessions, no messages.
     pub blocked: bool,
+    /// The attributes this peer shares with us (its profile, as it
+    /// describes itself; see `persona`).
+    pub profile: crate::persona::Profile,
+    /// Which of our profile's attributes we share with this peer.
+    pub shares: Vec<String>,
+    /// The main identity this peer (a persona) proved it belongs to, with
+    /// the invite it gave to reach it.
+    pub revealed: Option<(PublicIdentity, Option<String>)>,
 }
 
 impl Contact {
@@ -301,6 +309,9 @@ impl Contact {
             approval_changed_ms: 0,
             accepted: false,
             blocked: false,
+            profile: Vec::new(),
+            shares: Vec::new(),
+            revealed: None,
         }
     }
 
@@ -337,10 +348,24 @@ impl Contact {
     }
 
     pub fn label(&self) -> String {
-        match &self.petname {
+        // A stranger's chosen name isn't shown until they're accepted: it
+        // could be anything ("Mom").
+        let shared = self
+            .shared_name()
+            .filter(|_| self.accepted && !self.blocked);
+        match self.petname.as_deref().or(shared) {
             Some(n) => format!("{n} ({})", &self.fingerprint().to_string()[..9]),
             None => self.fingerprint().to_string(),
         }
+    }
+
+    /// The name this peer shares with us, if it does.
+    pub fn shared_name(&self) -> Option<&str> {
+        self.profile
+            .iter()
+            .find(|(k, _)| k == crate::persona::NAME)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.trim().is_empty())
     }
 }
 
@@ -488,6 +513,10 @@ impl Contacts {
                     + usize::from(!c.discovery_older.is_empty())
                     + usize::from(c.account.is_some())
                     + usize::from(c.blocked)
+                    + usize::from(!c.profile.is_empty())
+                    + usize::from(!c.shares.is_empty())
+                    + usize::from(c.revealed.is_some())
+                    + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
                     + 2;
                 e.map_len(n)?;
                 e.u8(0)?.bytes(c.key.as_bytes())?;
@@ -518,6 +547,24 @@ impl Contacts {
                 e.u8(12)?.bool(c.accepted)?;
                 if c.blocked {
                     e.u8(13)?.bool(true)?;
+                }
+                if !c.profile.is_empty() {
+                    e.u8(14)?.array_len(c.profile.len())?;
+                    for (k, v) in &c.profile {
+                        e.array_len(2)?.str(k)?.str(v)?;
+                    }
+                }
+                if !c.shares.is_empty() {
+                    e.u8(15)?.array_len(c.shares.len())?;
+                    for k in &c.shares {
+                        e.str(k)?;
+                    }
+                }
+                if let Some((id, invite)) = &c.revealed {
+                    e.u8(16)?.bytes(id.as_bytes())?;
+                    if let Some(i) = invite {
+                        e.u8(17)?.str(i)?;
+                    }
                 }
             }
             Ok(())
@@ -563,7 +610,11 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         // Contacts saved before message requests existed were wanted.
         accepted: true,
         blocked: false,
+        profile: Vec::new(),
+        shares: Vec::new(),
+        revealed: None,
     };
+    let (mut revealed, mut invite) = (None, None);
     read_map(d, |k, d| {
         match k {
             0 => key = Some(fixed_bytes::<32>(d)?),
@@ -579,6 +630,27 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             10 => c.approval_changed_ms = d.u64()?,
             12 => c.accepted = d.bool()?,
             13 => c.blocked = d.bool()?,
+            14 => {
+                for _ in 0..d.array_len()? {
+                    if d.array_len()? != 2 {
+                        return Err(Error::Malformed("profile attribute"));
+                    }
+                    let kv = (d.str()?.to_owned(), d.str()?.to_owned());
+                    if c.profile.len() < crate::persona::MAX_ATTRIBUTES {
+                        c.profile.push(kv);
+                    }
+                }
+            }
+            15 => {
+                for _ in 0..d.array_len()? {
+                    let k = d.str()?.to_owned();
+                    if c.shares.len() < crate::persona::MAX_ATTRIBUTES {
+                        c.shares.push(k);
+                    }
+                }
+            }
+            16 => revealed = Some(fixed_bytes::<32>(d)?),
+            17 => invite = Some(d.str()?.to_owned()),
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -592,6 +664,9 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         Ok(true)
     })?;
     c.key = PublicIdentity::from_bytes(&required(key, "contact key")?)?;
+    if let Some(r) = revealed {
+        c.revealed = Some((PublicIdentity::from_bytes(&r)?, invite));
+    }
     Ok(c)
 }
 

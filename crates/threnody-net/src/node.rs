@@ -135,6 +135,18 @@ pub enum Event {
         from: PublicIdentity,
         added: usize,
     },
+    /// `peer` changed what it shares of its profile (see `Contact::profile`).
+    ProfileChanged {
+        peer: PublicIdentity,
+    },
+    /// `peer` (a persona, to us) revealed its main identity, proven by a
+    /// signature from it; `invite` reaches it. Nothing is added: the user
+    /// decides.
+    IdentityRevealed {
+        peer: PublicIdentity,
+        identity: PublicIdentity,
+        invite: Option<String>,
+    },
     /// This device was removed from its account.
     ThisDeviceRemoved,
     /// A nearby approved peer created a Wi-Fi Direct group for us: join
@@ -276,6 +288,11 @@ pub(crate) struct Shared {
     constant_rate: tokio::sync::watch::Sender<Option<Duration>>,
     /// Dial contacts through onion circuits first when possible.
     pub(crate) prefer_onion: std::sync::atomic::AtomicBool,
+    /// An anonymous identity (`threnody_core::persona`): no device linking
+    /// or renaming, nothing that could tie it to another identity.
+    pub(crate) persona: bool,
+    /// Our profile attributes; each contact sees those shared with it.
+    pub(crate) profile: Mutex<threnody_core::persona::Profile>,
     /// Strip identifying metadata from images we send.
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
@@ -386,10 +403,22 @@ impl Node {
             Some(b) => BundleBook::decode(&b)?,
             None => BundleBook::default(),
         };
+        let persona = threnody_core::persona::is_persona(&cfg.home);
+        let profile = cfg
+            .home
+            .load_state(&cfg.identity, "profile")?
+            .map(|b| crate::identity::decode_profile(&b))
+            .unwrap_or_default();
         let account = match cfg.home.load_state(&cfg.identity, "account")? {
             Some(b) => AccountChain::decode(&b)?,
             None => {
-                let chain = AccountChain::genesis(&cfg.identity, &device_name())?;
+                // A persona's chain names nothing about the machine.
+                let name = if persona {
+                    "device".to_owned()
+                } else {
+                    device_name()
+                };
+                let chain = AccountChain::genesis(&cfg.identity, &name)?;
                 cfg.home
                     .save_state(&cfg.identity, "account", &chain.encode()?)?;
                 chain
@@ -437,6 +466,8 @@ impl Node {
             policy: Mutex::new(cfg.policy),
             constant_rate: tokio::sync::watch::Sender::new(cfg.constant_rate),
             prefer_onion: std::sync::atomic::AtomicBool::new(true),
+            persona,
+            profile: Mutex::new(profile),
             strip_metadata: std::sync::atomic::AtomicBool::new(true),
             default_timer: std::sync::atomic::AtomicU32::new(crate::history::DEFAULT_TIMER_S),
             tunnel,
@@ -1027,6 +1058,7 @@ where
                         };
                         lock(&shared.peer_features).insert(peer, features);
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        node.send_profile(&peer);
                     }
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
@@ -1050,6 +1082,7 @@ where
                     match msg {
                         AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
+                        AppMessage::Identity(payload) => node.on_identity(peer, &payload),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }

@@ -19,6 +19,9 @@ use crate::{describe_contact, find_contact, target};
 pub struct Options {
     pub home: Home,
     pub identity: Identity,
+    /// Running as an anonymous identity: the main identity, kept only to
+    /// sign a reveal.
+    pub main_identity: Option<Identity>,
     pub listen: Option<String>,
     pub connect: Vec<String>,
     pub policy: AcceptPolicy,
@@ -69,6 +72,9 @@ Type a line to send it to the current peer. Commands:
   /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
   /history [peer] [n]                   recent messages (stored encrypted)
   /disappear <30s|10m|1h|1d|off>        disappearing messages with the current peer
+  /profile [set <key> <value> | unset <key>]   your profile (shared with no one by default)
+  /share [peer] [key,key,…|none]        which profile details a contact sees
+  /reveal [peer] [host:port]            (anonymous identity) prove to them who you are
   /quit
 Groups (MLS, post-quantum X-Wing ciphersuite):";
 
@@ -88,6 +94,7 @@ struct Ui {
     /// NetworkManager profiles of Wi-Fi Direct groups we joined.
     joined: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     scratch: PathBuf,
+    main_identity: Option<Identity>,
 }
 
 pub async fn run(opts: Options) -> Result<()> {
@@ -118,7 +125,14 @@ pub async fn run(opts: Options) -> Result<()> {
     node.set_prefer_onion(opts.onion_first);
     node.set_strip_metadata(opts.strip_metadata);
     node.set_default_timer(opts.default_timer);
-    println!("Threnody — you are {}", node.identity().fingerprint());
+    if opts.main_identity.is_some() {
+        println!(
+            "Threnody — anonymous identity {}. Nothing links it to your main one unless you /reveal it.",
+            node.identity().fingerprint()
+        );
+    } else {
+        println!("Threnody — you are {}", node.identity().fingerprint());
+    }
     if groups.count() > 0 {
         println!("{} group(s) restored. /groups to list", groups.count());
     }
@@ -161,6 +175,7 @@ pub async fn run(opts: Options) -> Result<()> {
         wifi_direct: opts.wifi_direct,
         joined: std::sync::Arc::default(),
         scratch: opts_dir,
+        main_identity: opts.main_identity,
     };
     if let (Some(port), Some(tcp)) = (opts.discover, listen_addr) {
         let cfg = DiscoveryConfig {
@@ -432,6 +447,46 @@ impl Ui {
         Ok(())
     }
 
+    /// `/profile`, `/profile set <key> <value>`, `/profile unset <key>`.
+    fn profile_command(&self, arg: Option<&str>) -> Result<()> {
+        let mut profile = self.node.profile();
+        match arg.map(|a| a.splitn(3, ' ').collect::<Vec<_>>()).as_deref() {
+            None => {}
+            Some(["set", key, value]) => {
+                let value = value.trim().to_owned();
+                match profile.iter_mut().find(|(k, _)| k == key) {
+                    Some(kv) => kv.1 = value,
+                    None => profile.push(((*key).to_owned(), value)),
+                }
+                self.node.set_profile(profile.clone())?;
+            }
+            Some(["unset", key]) => {
+                profile.retain(|(k, _)| k != key);
+                self.node.set_profile(profile.clone())?;
+            }
+            _ => bail!("usage: /profile [set <key> <value> | unset <key>]"),
+        }
+        if profile.is_empty() {
+            println!("* your profile is empty. /profile set name <your name>");
+        }
+        for (k, v) in &profile {
+            let who: Vec<String> = self
+                .node
+                .contacts()
+                .iter()
+                .filter(|c| c.shares.contains(k))
+                .map(|c| c.label())
+                .collect();
+            let shown = if who.is_empty() {
+                "shared with no one".to_owned()
+            } else {
+                format!("shared with {}", who.join(", "))
+            };
+            println!("  {k}: {v}  ({shown})");
+        }
+        Ok(())
+    }
+
     /// A contact, a bare fingerprint, or an invite link's fingerprint.
     fn parse_destination(&self, q: &str) -> Result<Fingerprint> {
         match self.resolve_peer(Some(q)) {
@@ -597,6 +652,42 @@ impl Ui {
                 .relayed(&self.node, &peer, &group, local_id, &origin),
             // Shown as ✓✓ in /history; too chatty to print live.
             Event::Delivered { .. } => {}
+            Event::ProfileChanged { peer } => {
+                let shown = self
+                    .node
+                    .contacts()
+                    .get(&peer)
+                    .map(|c| c.profile.clone())
+                    .unwrap_or_default();
+                if shown.is_empty() {
+                    println!(
+                        "* {} no longer shares any profile details",
+                        self.name(&peer)
+                    );
+                } else {
+                    let list: Vec<String> =
+                        shown.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                    println!("* {} shares {}", self.name(&peer), list.join(", "));
+                }
+            }
+            Event::IdentityRevealed {
+                peer,
+                identity,
+                invite,
+            } => {
+                println!(
+                    "* {} revealed who they are: {} (proven by its signature)",
+                    self.name(&peer),
+                    identity.fingerprint()
+                );
+                match invite {
+                    Some(i) => println!("  to add them: /connect {i}"),
+                    None => println!(
+                        "  they gave no address; add them when you meet: {}",
+                        identity.fingerprint()
+                    ),
+                }
+            }
             Event::HistorySynced { from, added } => {
                 println!(
                     "* {added} message(s) synced from your device {}",
@@ -1000,6 +1091,62 @@ impl Ui {
                 };
                 let p = self.resolve_peer(who)?;
                 self.show_history(p, n)?;
+            }
+            "profile" => self.profile_command(arg)?,
+            "share" => {
+                // `/share`, `/share <peer>`, `/share <peer> <keys|none>`, or
+                // `/share <keys|none>` for the current peer.
+                let words: Vec<&str> = arg
+                    .map(|a| a.split_whitespace().collect())
+                    .unwrap_or_default();
+                let mine = self.node.profile();
+                let is_keys =
+                    |w: &str| w == "none" || w.split(',').all(|k| mine.iter().any(|(m, _)| m == k));
+                let (peer, keys) = match words.as_slice() {
+                    [] => (self.resolve_peer(None)?, None),
+                    [w] if is_keys(w) => (self.resolve_peer(None)?, Some(*w)),
+                    [p] => (self.resolve_peer(Some(p))?, None),
+                    [p, k] => (self.resolve_peer(Some(p))?, Some(*k)),
+                    _ => bail!("usage: /share [peer] [key,key,…|none]"),
+                };
+                if let Some(k) = keys {
+                    let keys: Vec<String> = if k == "none" {
+                        Vec::new()
+                    } else {
+                        k.split(',').map(str::to_owned).collect()
+                    };
+                    if let Some(bad) = keys.iter().find(|k| !mine.iter().any(|(m, _)| m == *k)) {
+                        bail!("your profile has no {bad:?}; /profile set {bad} <value> first");
+                    }
+                    self.node.set_shared_with(&peer, &keys)?;
+                }
+                let shared = self.node.shared_with(&peer);
+                if shared.is_empty() {
+                    println!("* {} sees none of your profile", self.name(&peer));
+                } else {
+                    println!("* {} sees your {}", self.name(&peer), shared.join(", "));
+                }
+            }
+            "reveal" => {
+                let main = self.main_identity.as_ref().ok_or_else(|| {
+                    anyhow!("/reveal is for anonymous identities (threnody --persona <id> run)")
+                })?;
+                let mut words = arg.unwrap_or("").split_whitespace();
+                let first = words.next();
+                // `/reveal host:port` (current peer) or `/reveal <peer> [host:port]`.
+                let (peer, addr) = match (first, words.next()) {
+                    (Some(a), None) if a.contains(':') => (self.resolve_peer(None)?, Some(a)),
+                    (p, a) => (self.resolve_peer(p)?, a),
+                };
+                let proof = threnody_core::persona::LinkProof::sign(main, &self.node.identity());
+                let invite =
+                    addr.map(|a| crate::target::invite_link(&main.public().fingerprint(), a));
+                self.node.reveal(&peer, proof, invite)?;
+                println!(
+                    "* revealed to {} that you are {}. This can't be taken back.",
+                    self.name(&peer),
+                    main.public().fingerprint()
+                );
             }
             "disappear" => {
                 let p = self.resolve_peer(None)?;
@@ -1436,7 +1583,7 @@ pub fn parse_duration(a: &str) -> Option<u32> {
         .filter(|s| *s > 0)
 }
 
-fn human_secs(s: u32) -> String {
+pub fn human_secs(s: u32) -> String {
     match s {
         s if s % 86_400 == 0 => format!("{}d", s / 86_400),
         s if s % 3600 == 0 => format!("{}h", s / 3600),

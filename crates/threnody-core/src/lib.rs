@@ -16,6 +16,7 @@ pub mod identity;
 pub mod media;
 pub mod message;
 pub mod onion;
+pub mod persona;
 pub mod prekey;
 pub mod ratchet;
 #[cfg(test)]

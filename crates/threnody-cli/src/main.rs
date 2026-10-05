@@ -43,6 +43,10 @@ struct Cli {
     /// Data directory (default: $THRENODY_HOME, else the platform data dir).
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+    /// Act as one of your anonymous identities (`threnody persona list`):
+    /// its own keys, contacts and history, unlinkable to yours.
+    #[arg(long, global = true, value_name = "ID|LABEL")]
+    persona: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -160,6 +164,35 @@ enum Cmd {
     },
     /// Show this device's WireGuard public key and overlay address.
     Tunnel,
+    /// Anonymous identities (personas): separate identities for people who
+    /// shouldn't be able to link you to your main one, or to each other.
+    Persona {
+        #[command(subcommand)]
+        action: PersonaCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PersonaCmd {
+    /// Make a new anonymous identity.
+    New {
+        /// Your own label for it (never sent).
+        #[arg(default_value = "anonymous")]
+        label: String,
+        /// Burn it (delete it and everything it kept) after this long:
+        /// `30m`, `12h`, `7d`, `4w`.
+        #[arg(long, value_name = "TIME")]
+        burn_after: Option<String>,
+        /// Store its key unprotected instead of sealing it with the keyring.
+        #[arg(long)]
+        no_keyring: bool,
+    },
+    /// List your anonymous identities.
+    List,
+    /// Delete an anonymous identity and everything it kept, for good.
+    Burn { persona: String },
+    /// Change an anonymous identity's label.
+    Rename { persona: String, label: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -364,8 +397,24 @@ pub fn describe_contact(c: &Contact) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let home = Home::new(cli.home.unwrap_or_else(default_home));
+    let main_home = Home::new(cli.home.unwrap_or_else(default_home));
+    if let Cmd::Persona { action } = cli.cmd {
+        return persona_command(&main_home, action);
+    }
+    // As a persona, every command works on the persona's own home; the
+    // main identity is kept only to sign a reveal (`/reveal`).
+    let (home, main_identity) = match &cli.persona {
+        Some(q) => {
+            let main = load_identity(&main_home)?;
+            let personas = threnody_core::persona::Personas::new(&main_home, &main);
+            personas.burn_expired(threnody_core::now_ms())?;
+            let info = find_persona(&personas.list()?, q)?;
+            (personas.home(&info.id)?, Some(main))
+        }
+        None => (main_home, None),
+    };
     match cli.cmd {
+        Cmd::Persona { .. } => unreachable!(),
         Cmd::Init {
             force,
             passphrase,
@@ -458,6 +507,9 @@ fn main() -> Result<()> {
                     chain.state().devices.len()
                 );
             }
+        }
+        Cmd::Link { .. } if main_identity.is_some() => {
+            bail!("an anonymous identity can't be linked with other devices")
         }
         Cmd::Link { code } => {
             let code: threnody_core::account::LinkCode =
@@ -573,10 +625,24 @@ fn main() -> Result<()> {
             wifi_direct,
         } => {
             let identity = load_identity(&home)?;
+            let persona = main_identity.is_some();
+            if persona && (ble || wifi_direct || tunnel.is_some()) {
+                eprintln!(
+                    "Bluetooth, Wi-Fi Direct and tunnels are off for anonymous identities: \
+                     each would show nearby devices or contacts who you are."
+                );
+            }
+            // Not the main identity's port, so the two aren't one service.
+            let listen = if persona && listen == "0.0.0.0:7450" {
+                "0.0.0.0:0".to_owned()
+            } else {
+                listen
+            };
             let rt = tokio::runtime::Runtime::new()?;
             let r = rt.block_on(chat::run(chat::Options {
                 home,
                 identity,
+                main_identity,
                 listen: (!no_listen).then_some(listen),
                 connect,
                 policy: policy.into(),
@@ -590,10 +656,10 @@ fn main() -> Result<()> {
                         anyhow::anyhow!("--disappear-default: expected 30s, 10m, 1h, 1d, 1w or off")
                     })?),
                 },
-                discover: (!no_discover).then_some(discover_port),
-                ble,
-                wifi_direct,
-                tunnel: tunnel.map(|port| chat::TunnelOptions {
+                discover: (!no_discover && !persona).then_some(discover_port),
+                ble: ble && !persona,
+                wifi_direct: wifi_direct && !persona,
+                tunnel: tunnel.filter(|_| !persona).map(|port| chat::TunnelOptions {
                     port,
                     iface: wg_iface,
                     apply: wg_apply,
@@ -602,6 +668,121 @@ fn main() -> Result<()> {
             // Don't wait on a stdin read still pending after a signal.
             rt.shutdown_timeout(std::time::Duration::from_secs(1));
             r?;
+        }
+    }
+    Ok(())
+}
+
+fn find_persona(
+    list: &[threnody_core::persona::PersonaInfo],
+    q: &str,
+) -> Result<threnody_core::persona::PersonaInfo> {
+    let hits: Vec<_> = list
+        .iter()
+        .filter(|p| p.id.starts_with(q) || p.label.to_lowercase().starts_with(&q.to_lowercase()))
+        .collect();
+    match hits.as_slice() {
+        [p] => Ok((*p).clone()),
+        [] => bail!("no anonymous identity matches {q:?}; see `threnody persona list`"),
+        _ => bail!("{q:?} matches several anonymous identities; use more of the id"),
+    }
+}
+
+/// A rough duration: "6 days", "3 hours", "a minute".
+fn about(ms: u64) -> String {
+    let s = ms / 1000;
+    let (n, unit) = match s {
+        0..60 => return "under a minute".into(),
+        60..3600 => (s / 60, "minute"),
+        3600..86_400 => (s / 3600, "hour"),
+        _ => (s / 86_400, "day"),
+    };
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
+fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
+    use threnody_core::persona::Personas;
+    let main = load_identity(main_home)?;
+    let personas = Personas::new(main_home, &main);
+    let now = threnody_core::now_ms();
+    for id in personas.burn_expired(now)? {
+        keyring::delete(&personas.home(&id)?);
+        println!("Burned expired anonymous identity {id}.");
+    }
+    match action {
+        PersonaCmd::New {
+            label,
+            burn_after,
+            no_keyring,
+        } => {
+            let expires = match burn_after {
+                Some(t) => {
+                    let secs = chat::parse_duration(&t).ok_or_else(|| {
+                        anyhow::anyhow!("--burn-after: expected 30m, 12h, 7d or 4w")
+                    })?;
+                    Some(now + u64::from(secs) * 1000)
+                }
+                None => None,
+            };
+            // Sealed like the main identity: with a keyring key of its own.
+            let (info, home, identity) = personas.create(&label, expires, None, now)?;
+            if !no_keyring {
+                match keyring::create(&home) {
+                    Ok(pw) => home.change_passphrase(None, Some(pw.as_bytes()))?,
+                    Err(e) => {
+                        eprintln!("No system keyring ({e:#}); its key is stored unprotected.")
+                    }
+                }
+            }
+            println!("Anonymous identity {} ({label})", info.id);
+            println!("Fingerprint: {}", identity.public().fingerprint());
+            if let Some(t) = info.expires_ms {
+                println!("Burns itself in {}.", about(t - now));
+            }
+            println!("Use it with: threnody --persona {} run", info.id);
+            println!(
+                "Invite with: threnody --persona {} invite <your-ip>:<port>",
+                info.id
+            );
+        }
+        PersonaCmd::List => {
+            let list = personas.list()?;
+            if list.is_empty() {
+                println!("No anonymous identities. `threnody persona new <label>` makes one.");
+            }
+            for p in list {
+                let fp = personas
+                    .home(&p.id)
+                    .ok()
+                    .and_then(|h| {
+                        let pw = keyring::get(&h);
+                        h.load_identity(pw.as_ref().map(|p| p.as_bytes())).ok()
+                    })
+                    .map_or_else(|| "?".to_owned(), |i| i.public().fingerprint().to_string());
+                let burns = p.expires_ms.map_or_else(String::new, |t| {
+                    format!(", burns in {}", about(t.saturating_sub(now)))
+                });
+                println!("{}  {:<20} {fp}{burns}", p.id, p.label);
+            }
+        }
+        PersonaCmd::Burn { persona } => {
+            let info = find_persona(&personas.list()?, &persona)?;
+            let home = personas.home(&info.id)?;
+            keyring::delete(&home);
+            personas.burn(&info.id)?;
+            println!(
+                "Burned {} ({}): its keys and everything it kept are gone.",
+                info.id, info.label
+            );
+        }
+        PersonaCmd::Rename { persona, label } => {
+            let info = find_persona(&personas.list()?, &persona)?;
+            personas.rename(&info.id, &label)?;
+            println!("Renamed {} to {label}.", info.id);
         }
     }
     Ok(())

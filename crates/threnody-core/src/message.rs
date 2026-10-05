@@ -27,7 +27,9 @@ pub const FEATURE_DELETE: u64 = 2;
 /// `Hello` feature bit: this side understands `Edit`.
 pub const FEATURE_EDIT: u64 = 4;
 /// Every feature this implementation has.
-pub const FEATURES: u64 = FEATURE_ACKS | FEATURE_DELETE | FEATURE_EDIT;
+/// The peer understands `AppMessage::Identity` (profiles, reveals).
+pub const FEATURE_IDENTITY: u64 = 8;
+pub const FEATURES: u64 = FEATURE_ACKS | FEATURE_DELETE | FEATURE_EDIT | FEATURE_IDENTITY;
 /// Most ids one `Ack` carries.
 pub const MAX_ACK_IDS: usize = 512;
 
@@ -83,6 +85,8 @@ pub enum AppMessage {
     Account(Vec<u8>),
     /// An opaque Wi-Fi Direct link message (see `threnody-net::direct`).
     Direct(Vec<u8>),
+    /// A profile or a revealed identity ([`crate::persona::IdentityMsg`]).
+    Identity(Vec<u8>),
     /// `inner`, which the receiver acknowledges by `id` and delivers once
     /// even if it arrives again. Only sent to peers whose `Hello` has
     /// [`FEATURE_ACKS`]; never nested.
@@ -125,6 +129,7 @@ mod kind {
     pub const ACK: u64 = 14;
     pub const DELETE: u64 = 15;
     pub const EDIT: u64 = 16;
+    pub const IDENTITY: u64 = 17;
 }
 
 impl AppMessage {
@@ -273,6 +278,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::DIRECT)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Identity(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::IDENTITY)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -300,7 +309,8 @@ impl AppMessage {
             | Self::Relay(p)
             | Self::Prekeys(p)
             | Self::Mailbox(p)
-            | Self::Onion(p) => p.len() + 16,
+            | Self::Onion(p)
+            | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
             _ => 16,
@@ -422,7 +432,8 @@ impl AppMessage {
             | kind::MAILBOX
             | kind::ONION
             | kind::ACCOUNT
-            | kind::DIRECT => {
+            | kind::DIRECT
+            | kind::IDENTITY => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
                     return Err(Error::Malformed("message too large"));
@@ -434,6 +445,7 @@ impl AppMessage {
                     Some(kind::ONION) => Self::Onion(p),
                     Some(kind::ACCOUNT) => Self::Account(p),
                     Some(kind::DIRECT) => Self::Direct(p),
+                    Some(kind::IDENTITY) => Self::Identity(p),
                     _ => Self::Mailbox(p),
                 }
             }
