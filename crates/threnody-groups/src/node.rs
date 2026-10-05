@@ -14,12 +14,12 @@
 //! A forwarder delivers the same way but never forwards again, so a
 //! message crosses at most one forwarding member.
 
-use threnody_core::history::{ConversationId, Entry};
+use threnody_core::history::{ConversationId, Entry, FileNote};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::{Node, Tag};
 
-use crate::{GroupError, GroupEvent, GroupId, GroupWire, Groups, Output};
+use crate::{Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, Output};
 
 type Result<T> = std::result::Result<T, GroupError>;
 
@@ -68,6 +68,15 @@ pub enum Update {
         group: GroupId,
         from: PublicIdentity,
         text: String,
+        ours: bool,
+    },
+    /// A file from a member. Save it, then record it with
+    /// [`GroupNode::record_file`].
+    File {
+        group: GroupId,
+        from: PublicIdentity,
+        name: String,
+        data: Vec<u8>,
         ours: bool,
     },
 }
@@ -212,8 +221,43 @@ impl GroupNode {
     /// Sends text to every other member and records it in the group's
     /// history, to be marked as members acknowledge their copies.
     pub fn send_text(&mut self, node: &Node, group: &GroupId, text: &str) -> Result<()> {
+        self.send(node, group, &Content::Text(text.to_owned()), None)
+    }
+
+    /// Sends a file to every other member and records it (with `location`,
+    /// where it is on this device) in the group's history.
+    pub fn send_file(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        name: &str,
+        data: Vec<u8>,
+        location: Option<String>,
+    ) -> Result<()> {
+        if data.len() > threnody_core::message::MAX_FILE {
+            return Err(GroupError::Unexpected("file too large"));
+        }
+        let note = FileNote {
+            name: name.to_owned(),
+            size: data.len() as u64,
+            location,
+        };
+        let content = Content::File {
+            name: name.to_owned(),
+            data,
+        };
+        self.send(node, group, &content, Some(note))
+    }
+
+    fn send(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        content: &Content,
+        file: Option<FileNote>,
+    ) -> Result<()> {
         let recipients = self.members(group)?.len().saturating_sub(1);
-        let out = self.groups.send_text(group, text)?;
+        let out = self.groups.send(group, content)?;
         let local_id = threnody_net::history::local_id();
         self.apply_tagged(node, out, true, tag(local_id, group));
         let now = threnody_core::now_ms();
@@ -223,12 +267,15 @@ impl GroupNode {
                 at_ms: now,
                 outgoing: true,
                 device: *node.identity().as_bytes(),
-                text: text.to_owned(),
+                text: match content {
+                    Content::Text(t) => t.clone(),
+                    Content::File { .. } => String::new(),
+                },
                 offline: false,
                 expires_at_ms: node
                     .effective_timer(ConversationId::Group(*group))
                     .map(|s| now + u64::from(s) * 1000),
-                file: None,
+                file,
                 local_id,
                 delivered: recipients == 0,
                 recipients: u32::try_from(recipients).unwrap_or(u32::MAX),
@@ -238,6 +285,33 @@ impl GroupNode {
             },
         );
         Ok(())
+    }
+
+    /// Records a file `from` sent to `group` (see [`Update::File`]), once
+    /// it has been saved at `file.location`.
+    pub fn record_file(&self, node: &Node, group: &GroupId, from: &PublicIdentity, file: FileNote) {
+        let conv = ConversationId::Group(*group);
+        let now = threnody_core::now_ms();
+        node.append(
+            conv,
+            Entry {
+                at_ms: now,
+                outgoing: node.is_own_device(from),
+                device: *from.as_bytes(),
+                text: String::new(),
+                offline: false,
+                expires_at_ms: node
+                    .effective_timer(conv)
+                    .map(|s| now + u64::from(s) * 1000),
+                file: Some(file),
+                local_id: 0,
+                delivered: false,
+                recipients: 0,
+                delivered_to: Vec::new(),
+                remote_id: 0,
+                edited_ms: 0,
+            },
+        );
     }
 
     /// Handles an `AppMessage::Group` payload from `from`.
@@ -498,6 +572,18 @@ impl GroupNode {
                     ours,
                 }
             }
+            GroupEvent::File {
+                group,
+                from,
+                name,
+                data,
+            } => Update::File {
+                group,
+                from,
+                name,
+                data,
+                ours: node.is_own_device(&from),
+            },
         });
     }
 }

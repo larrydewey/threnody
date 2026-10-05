@@ -29,7 +29,19 @@ GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (3
   7 Leave              member -> owner          (remove me)
 ```
 
-The sender fans every message out to each other member. The groups use the pure-ciphertext wire format, so commits are encrypted too. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
+The sender fans every message out to each other member. The groups use the pure-ciphertext wire format, so commits are encrypted too.
+
+### Message content
+
+An MLS application message carries one of these:
+
+```
+Content = text                         ; UTF-8, as the first versions sent
+        / 0xFF || { 0: kind, ? 1: text or file name, ? 2: file data }
+kind: 1 text, 2 file (at most 8 MiB, as in 1:1)
+```
+
+A UTF-8 string never starts with the byte 0xFF, so plain text from older members still reads as text. Receivers save a file and record it in the group's history with where they saved it. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
 
 ### Reaching every member
 
@@ -80,7 +92,7 @@ The key is derived from the identity seed, so group secrets are only as accessib
 /group accept [n]                 /group decline [n]
 /group remove <group> <peer>      /group leave <group>
 /groups
-/g <group> <text>
+/g <group> <text>                 /gfile <group> <path>
 ```
 
 ## Not yet done

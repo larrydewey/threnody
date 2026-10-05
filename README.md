@@ -89,7 +89,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync and history sync (with a backfill for newly linked devices), account-wide offline keys and group invites |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
 | §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
-| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
+| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; text and files; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices (backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
@@ -102,7 +102,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 ## Roadmap
 
 1. **Hardening (remaining).** An iOS keystore, ratchet persistence across reconnects, and an external audit.
-2. **Groups (remaining).** More admin roles and self-removal, and files in groups.
+2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts, and anonymous and selective-disclosure identities.

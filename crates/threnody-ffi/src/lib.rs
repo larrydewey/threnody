@@ -264,6 +264,15 @@ pub enum NodeEvent {
         text: String,
         ours: bool,
     },
+    /// A file from a group member: save it, then call
+    /// `record_received_group_file`.
+    GroupFile {
+        group: String,
+        from: String,
+        name: String,
+        data: Vec<u8>,
+        ours: bool,
+    },
     /// Our own device `from` shared history; reload conversations.
     HistorySynced {
         from: String,
@@ -1489,6 +1498,35 @@ mod tests {
             sent.delivered && sent.delivered_to == 2 && sent.recipients == 2,
             "{sent:?}"
         );
+
+        // Files go to the group the same way; each member saves, then records.
+        alice
+            .send_group_file(g.clone(), "route.gpx".into(), vec![7; 3000], None)
+            .unwrap();
+        for (i, member) in [(1, &bob), (2, &carol)] {
+            let NodeEvent::GroupFile {
+                group,
+                from,
+                name,
+                data,
+                ours,
+            } = all.until(i, |e| matches!(e, NodeEvent::GroupFile { .. }))
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (&group, &from, name.as_str(), data.len(), ours),
+                (&g, &a_fp, "route.gpx", 3000, false)
+            );
+            member
+                .record_received_group_file(group, from, name, 3000, Some("/x".into()))
+                .unwrap();
+            let h = member.group_history(g.clone(), 10).unwrap();
+            let f = h.last().unwrap().file.clone().unwrap();
+            assert_eq!((f.name.as_str(), f.size), ("route.gpx", 3000));
+        }
+        let h = alice.group_history(g.clone(), 10).unwrap();
+        assert_eq!(h.last().unwrap().file.as_ref().unwrap().name, "route.gpx");
 
         // Store and forward: Bob is away when Carol writes; Alice holds
         // her message until he is back.

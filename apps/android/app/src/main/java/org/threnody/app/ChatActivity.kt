@@ -122,12 +122,7 @@ class ChatActivity : Activity() {
             gravity = Gravity.BOTTOM
             setBackgroundColor(color(R.color.bar))
             setPadding(dp(4), dp(6), dp(4), dp(6))
-            // Groups carry text only.
-            if (group == null) {
-                addView(button(R.drawable.ic_attach, "Send a file", R.color.muted) { pickFile() }, LinearLayout.LayoutParams(dp(48), dp(48)))
-            } else {
-                setPadding(dp(12), dp(6), dp(4), dp(6))
-            }
+            addView(button(R.drawable.ic_attach, "Send a file", R.color.muted) { pickFile() }, LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             addView(button(R.drawable.ic_send, "Send", R.color.accent) { send() }, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
@@ -155,6 +150,7 @@ class ChatActivity : Activity() {
         group?.let { g ->
             return when (e) {
                 is NodeEvent.GroupMessage -> e.group == g
+                is NodeEvent.GroupFile -> e.group == g
                 is NodeEvent.GroupMembersChanged -> e.group == g
                 is NodeEvent.GroupJoined -> e.group == g
                 is NodeEvent.GroupLeft -> e.group == g
@@ -506,7 +502,9 @@ class ChatActivity : Activity() {
                         Formatter.formatShortFileSize(this, node.maxFileSize().toLong()))
                 }
                 val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@execute
-                node.sendFile(device, name, bytes, uri.toString())
+                val g = group
+                if (g != null) node.sendGroupFile(g, name, bytes, uri.toString())
+                else node.sendFile(device, name, bytes, uri.toString())
                 refresh()
             } catch (e: Exception) {
                 runOnUiThread { Toast.makeText(this, "Couldn't send file: ${e.message}", Toast.LENGTH_LONG).show() }

@@ -89,7 +89,8 @@ struct Ui {
 pub async fn run(opts: Options) -> Result<()> {
     let downloads = opts.home.dir().join("downloads");
     let opts_dir = opts.home.dir().to_path_buf();
-    let groups = GroupUi::load(&opts.home, &opts.identity).context("loading groups")?;
+    let groups =
+        GroupUi::load(&opts.home, &opts.identity, downloads.clone()).context("loading groups")?;
     let tunnels = opts
         .tunnel
         .as_ref()
@@ -1119,6 +1120,16 @@ impl Ui {
                     arg.ok_or_else(|| anyhow!("usage: /g <group> <text>"))?,
                 )?;
             }
+            "gfile" => {
+                let len = self
+                    .groups
+                    .send_file(
+                        &self.node,
+                        arg.ok_or_else(|| anyhow!("usage: /gfile <group> <path>"))?,
+                    )
+                    .await?;
+                println!("* sent {len} bytes to the group");
+            }
             other => bail!("unknown command /{other}; try /help"),
         }
         Ok(false)
@@ -1271,7 +1282,7 @@ impl Ui {
 
 /// Saves a received file under `dir` using only its final path component,
 /// never overwriting an existing file.
-fn save_download(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
+pub(crate) fn save_download(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let base: String = Path::new(name)
         .file_name()

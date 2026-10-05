@@ -90,6 +90,21 @@ fn create_invite_chat_and_remove() {
         assert_eq!((owner, members), (pa, want));
     }
 
+    let file = threnody_groups::Content::File {
+        name: "map.png".into(),
+        data: vec![0xFF; 5000],
+    };
+    let out = net.node(&pc).send(&g, &file).unwrap();
+    net.deliver(pc, out);
+    for p in [pa, pb] {
+        assert!(net.take(&p).contains(&GroupEvent::File {
+            group: g,
+            from: pc,
+            name: "map.png".into(),
+            data: vec![0xFF; 5000],
+        }));
+    }
+
     let out = net.node(&pb).send_text(&g, "hello group").unwrap();
     assert_eq!(out.send.len(), 2, "fan-out to the two other members");
     net.deliver(pb, out);

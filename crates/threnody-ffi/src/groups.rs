@@ -3,7 +3,7 @@
 //! through sessions, mailboxes, other members or relays.
 
 use threnody_core::PublicIdentity;
-use threnody_core::history::ConversationId;
+use threnody_core::history::{ConversationId, FileNote};
 use threnody_groups::GroupId;
 use threnody_groups::node::{Invite, Update};
 
@@ -77,6 +77,19 @@ fn event(u: Update) -> NodeEvent {
             group: hex(&group),
             from: fp(&from),
             text,
+            ours,
+        },
+        Update::File {
+            group,
+            from,
+            name,
+            data,
+            ours,
+        } => NodeEvent::GroupFile {
+            group: hex(&group),
+            from: fp(&from),
+            name,
+            data,
             ours,
         },
     }
@@ -210,6 +223,54 @@ impl ThrenodyNode {
         self.group_node()
             .send_text(&self.node, &g, &text)
             .map_err(fail)
+    }
+
+    /// Sends a file to every other member, recorded in the group's history
+    /// with `location` (where it is on this device).
+    pub fn send_group_file(
+        &self,
+        group: String,
+        name: String,
+        data: Vec<u8>,
+        location: Option<String>,
+    ) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node()
+            .send_file(&self.node, &g, &name, data, location)
+            .map_err(fail)
+    }
+
+    /// Records a file from a `GroupFile` event in the group's history once
+    /// the app has saved it at `location`.
+    pub fn record_received_group_file(
+        &self,
+        group: String,
+        from: String,
+        name: String,
+        size: u64,
+        location: Option<String>,
+    ) -> Result<()> {
+        let g = self.group_id(&group)?;
+        // Members needn't be contacts: find the sender among them.
+        let from = self
+            .group_node()
+            .list()
+            .into_iter()
+            .find(|(id, ..)| *id == g)
+            .and_then(|(.., members)| members.into_iter().find(|m| fp(m) == from))
+            .ok_or_else(|| fail(format!("{from} is not in this group")))?;
+        self.group_node().record_file(
+            &self.node,
+            &g,
+            &from,
+            FileNote {
+                name,
+                size,
+                location,
+            },
+        );
+        Ok(())
     }
 
     /// A group's disappearing timer on this device (`None` = off).

@@ -169,9 +169,98 @@ impl GroupWire {
     }
 }
 
+/// What a member sends inside an MLS application message.
+///
+/// ```text
+/// Content = text (UTF-8, as first sent)
+///         / 0xFF || { 0: kind uint, ? 1: text or name tstr, ? 2: data bstr }
+/// kind: 1 text, 2 file
+/// ```
+///
+/// 0xFF never starts UTF-8, so plain text stays as it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Content {
+    Text(String),
+    File { name: String, data: Vec<u8> },
+}
+
+const TAGGED: u8 = 0xFF;
+
+impl Content {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Text(t) => Ok(t.as_bytes().to_vec()),
+            Self::File { name, data } => {
+                let body = cbor::to_vec(name.len() + data.len() + 24, |e| {
+                    e.map_len(3)?.u8(0)?.u8(2)?;
+                    e.u8(1)?.str(name)?;
+                    e.u8(2)?.bytes(data)?;
+                    Ok(())
+                })?;
+                let mut out = Vec::with_capacity(body.len() + 1);
+                out.push(TAGGED);
+                out.extend_from_slice(&body);
+                Ok(out)
+            }
+        }
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        let Some((&TAGGED, rest)) = b.split_first() else {
+            return Ok(Self::Text(String::from_utf8_lossy(b).into_owned()));
+        };
+        let mut dec = Decoder::new(rest);
+        let (mut kind, mut text, mut data) = (None, None, None);
+        read_map(&mut dec, |k, d| {
+            match k {
+                0 => kind = Some(d.u8()?),
+                1 => text = Some(d.str()?.to_owned()),
+                2 => data = Some(d.bytes()?.to_vec()),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        Ok(match required(kind, "content kind")? {
+            1 => Self::Text(text.unwrap_or_default()),
+            2 => Self::File {
+                name: required(text, "file name")?,
+                data: required(data, "file data")?,
+            },
+            other => return Err(Error::UnexpectedType(u64::from(other))),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_round_trips_and_plain_text_still_reads() {
+        for c in [
+            Content::Text("hello".into()),
+            Content::Text(String::new()),
+            Content::File {
+                name: "a.txt".into(),
+                data: vec![0xFF; 3000],
+            },
+        ] {
+            assert_eq!(Content::decode(&c.encode().unwrap()).unwrap(), c);
+        }
+        assert_eq!(
+            Content::decode("hi ✓".as_bytes()).unwrap(),
+            Content::Text("hi ✓".into())
+        );
+        // A tagged text, as a later sender might write it.
+        let tagged = [&[TAGGED][..], &[0xa2, 0, 1, 1, 0x62, b'o', b'k']].concat();
+        assert_eq!(
+            Content::decode(&tagged).unwrap(),
+            Content::Text("ok".into())
+        );
+        assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());
+        assert!(Content::decode(&[TAGGED]).is_err());
+    }
 
     #[test]
     fn round_trips() {

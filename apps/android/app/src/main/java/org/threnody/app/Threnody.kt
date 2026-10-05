@@ -225,6 +225,19 @@ object Threnody {
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}")
                     }
                 }
+                is NodeEvent.GroupFile -> {
+                    say("* group ${e.group.take(6)}: ${short(e.from)} sent a file (${e.data.size} bytes)")
+                    val uri = saveDownload(ctx, e.name, e.data)
+                    try {
+                        node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), uri?.toString())
+                    } catch (x: Exception) {
+                        say("! recording ${e.name}: ${x.message}")
+                    }
+                    if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
+                        val group = node.groups().firstOrNull { it.id == e.group }
+                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: 📎 ${e.name}")
+                    }
+                }
                 is NodeEvent.GroupInvited -> {
                     say("* ${short(e.from)} invites us to group ${e.name}")
                     ThrenodyService.notifyGroup(ctx, e.group, e.name, "${nameOf(node, e.from)} invites you to join")

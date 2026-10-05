@@ -1,7 +1,10 @@
 //! `/group` commands: MLS groups on the shared [`GroupNode`], which
 //! persists them and delivers their traffic (Appendix F).
 
-use anyhow::{Result, anyhow, bail};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use threnody_core::history::FileNote;
 use threnody_core::store::Home;
 use threnody_core::{Identity, PublicIdentity};
 use threnody_groups::GroupId;
@@ -16,10 +19,12 @@ pub const HELP: &str = "\
   /group remove <group> <peer>          remove a member (owner only)
   /group leave <group>                  leave (or, as owner, delete) a group
   /groups                               list groups and members
-  /g <group> <text>                     send to a group";
+  /g <group> <text>                     send to a group
+  /gfile <group> <path>                 send a file to a group";
 
 pub struct GroupUi {
     groups: GroupNode,
+    downloads: PathBuf,
 }
 
 fn short(id: &GroupId) -> String {
@@ -28,9 +33,10 @@ fn short(id: &GroupId) -> String {
 
 impl GroupUi {
     /// Loads persisted groups for `identity` from `home`.
-    pub fn load(home: &Home, identity: &Identity) -> Result<Self> {
+    pub fn load(home: &Home, identity: &Identity, downloads: PathBuf) -> Result<Self> {
         Ok(Self {
             groups: GroupNode::load(home, identity)?,
+            downloads,
         })
     }
 
@@ -78,7 +84,7 @@ impl GroupUi {
         }
     }
 
-    fn show(&self, name: &dyn Fn(&PublicIdentity) -> String, updates: Vec<Update>) {
+    fn show(&self, node: &Node, name: &dyn Fn(&PublicIdentity) -> String, updates: Vec<Update>) {
         for u in updates {
             match u {
                 Update::Joined { group, owner, .. } => {
@@ -116,6 +122,35 @@ impl GroupUi {
                 } => {
                     println!("[{}] <{}> {text}", self.label(&group), name(&from));
                 }
+                Update::File {
+                    group,
+                    from,
+                    name: file,
+                    data,
+                    ours,
+                } => {
+                    let who = if ours {
+                        format!("me, on {}", name(&from))
+                    } else {
+                        name(&from)
+                    };
+                    let saved = crate::chat::save_download(&self.downloads, &file, &data);
+                    match &saved {
+                        Ok(p) => println!(
+                            "[{}] <{who}> sent {file} ({} bytes) -> {}",
+                            self.label(&group),
+                            data.len(),
+                            p.display()
+                        ),
+                        Err(e) => println!("! could not save {file} from {who}: {e:#}"),
+                    }
+                    let note = FileNote {
+                        name: file,
+                        size: data.len() as u64,
+                        location: saved.ok().map(|p| p.display().to_string()),
+                    };
+                    self.groups.record_file(node, &group, &from, note);
+                }
             }
         }
     }
@@ -129,7 +164,7 @@ impl GroupUi {
         payload: &[u8],
     ) {
         match self.groups.incoming(node, peer, payload) {
-            Ok(updates) => self.show(name, updates),
+            Ok(updates) => self.show(node, name, updates),
             Err(e) => println!("! group message from {}: {e}", name(&peer)),
         }
     }
@@ -210,7 +245,7 @@ impl GroupUi {
                 let g = self.pending(it.next())?;
                 println!("* accepting {}", self.label(&g));
                 let updates = self.groups.accept(node, &g)?;
-                self.show(name, updates);
+                self.show(node, name, updates);
             }
             "decline" => {
                 let g = self.pending(it.next())?;
@@ -224,7 +259,7 @@ impl GroupUi {
                 };
                 let (g, p) = (self.find(g)?, resolve(p)?);
                 let updates = self.groups.remove(node, &g, &p)?;
-                self.show(name, updates);
+                self.show(node, name, updates);
             }
             "leave" | "delete" => {
                 let g = self.find(
@@ -273,6 +308,27 @@ impl GroupUi {
                 name(&inv.from)
             );
         }
+    }
+
+    /// `/gfile <group> <path>`.
+    pub async fn send_file(&mut self, node: &Node, args: &str) -> Result<usize> {
+        let (g, path) = args
+            .split_once(' ')
+            .ok_or_else(|| anyhow!("usage: /gfile <group> <path>"))?;
+        let g = self.find(g)?;
+        let path = path.trim();
+        let data = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading {path}"))?;
+        let name = Path::new(path)
+            .file_name()
+            .map_or("file".into(), |n| n.to_string_lossy().into_owned());
+        let len = data.len();
+        let location = std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.display().to_string());
+        self.groups.send_file(node, &g, &name, data, location)?;
+        Ok(len)
     }
 
     /// `/g <group> <text>`.

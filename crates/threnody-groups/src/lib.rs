@@ -27,7 +27,7 @@ use openmls_traits::signatures::{Signer, SignerError};
 use threnody_core::crypto::random_bytes;
 use threnody_core::{Identity, PublicIdentity};
 
-pub use wire::{GroupId, GroupWire};
+pub use wire::{Content, GroupId, GroupWire};
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
 const STATE_VERSION: u8 = 1;
@@ -112,6 +112,12 @@ pub enum GroupEvent {
         group: GroupId,
         from: PublicIdentity,
         text: String,
+    },
+    File {
+        group: GroupId,
+        from: PublicIdentity,
+        name: String,
+        data: Vec<u8>,
     },
 }
 
@@ -475,11 +481,18 @@ impl Groups {
 
     /// Encrypts `text` for the group and fans it out to every other member.
     pub fn send_text(&mut self, group: &GroupId, text: &str) -> Result<Output> {
+        self.send(group, &Content::Text(text.to_owned()))
+    }
+
+    /// Encrypts `content` for the group and fans it out to every other
+    /// member.
+    pub fn send(&mut self, group: &GroupId, content: &Content) -> Result<Output> {
         let recipients = self.members_of(self.group(group)?);
+        let plain = content.encode()?;
         let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
         let out = g
             .mls
-            .create_message(&self.provider, &self.signer, text.as_bytes())
+            .create_message(&self.provider, &self.signer, &plain)
             .map_err(mls)?;
         let message = out.tls_serialize_detached().map_err(mls)?;
         let me = self.me;
@@ -726,11 +739,18 @@ impl Groups {
         let mut events = Vec::new();
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app) => {
-                let text = String::from_utf8_lossy(&app.into_bytes()).into_owned();
-                events.push(GroupEvent::Text {
-                    group,
-                    from: sender,
-                    text,
+                events.push(match Content::decode(&app.into_bytes())? {
+                    Content::Text(text) => GroupEvent::Text {
+                        group,
+                        from: sender,
+                        text,
+                    },
+                    Content::File { name, data } => GroupEvent::File {
+                        group,
+                        from: sender,
+                        name: truncate(&name),
+                        data,
+                    },
                 });
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
