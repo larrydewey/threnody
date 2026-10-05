@@ -8,6 +8,12 @@ updates:
     groups:
       cargo:
         update-types: [minor, patch]
+    # Major versions (the cryptography crates especially) change APIs and
+    # are upgraded deliberately. Security fixes still arrive as Dependabot
+    # security updates.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: gradle
     directory: /apps/android
     schedule:

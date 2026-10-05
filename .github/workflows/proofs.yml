@@ -22,19 +22,26 @@ jobs:
     timeout-minutes: 120
     env:
       TAMARIN: "1.12.0"
+      # Ubuntu's Maude (3.2) is one Tamarin doesn't support.
+      MAUDE: "3.5.1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Maude and Tamarin
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends maude graphviz
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends graphviz
+          gh release download "Maude$MAUDE" -R maude-lang/Maude \
+            --pattern "Maude-$MAUDE-linux-x86_64.zip" -D "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP/Maude-$MAUDE-linux-x86_64.zip" -d "$RUNNER_TEMP/maude"
+          chmod +x "$RUNNER_TEMP/maude/maude"
+          echo "$RUNNER_TEMP/maude" >> "$GITHUB_PATH"
+          echo "MAUDE_LIB=$RUNNER_TEMP/maude" >> "$GITHUB_ENV"
           gh release download "$TAMARIN" -R tamarin-prover/tamarin-prover \
             --pattern "tamarin-prover-$TAMARIN-linux64-ubuntu.tar.gz" -D "$RUNNER_TEMP"
           mkdir -p "$RUNNER_TEMP/tamarin"
           tar xzf "$RUNNER_TEMP"/tamarin-prover-*.tar.gz -C "$RUNNER_TEMP/tamarin"
           bin=$(dirname "$(find "$RUNNER_TEMP/tamarin" -name tamarin-prover -type f | head -1)")
           echo "$bin" >> "$GITHUB_PATH"
-          [[ -f /usr/share/maude/prelude.maude ]] && echo "MAUDE_LIB=/usr/share/maude" >> "$GITHUB_ENV" || true
-      - run: tamarin-prover --version
+      - run: maude --version && tamarin-prover --version
       - run: proofs/check.sh
