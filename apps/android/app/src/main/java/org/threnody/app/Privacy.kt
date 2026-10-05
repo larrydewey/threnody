@@ -12,13 +12,16 @@ import android.view.WindowManager
  * - cover traffic: each session sends a padded frame at a constant rate,
  *   so traffic doesn't show when messages are sent (spec §9 layer 1);
  * - onion first: contacts are reached through two-relay onion circuits
- *   when approved relays allow (spec §9 layer 2).
+ *   when approved relays allow (spec §9 layer 2);
+ * - photo metadata: location, camera and times are removed from images
+ *   before they are sent.
  */
 object Privacy {
     private const val PREFS = "privacy"
     private const val SCREEN = "screen_security"
     private const val COVER = "cover_traffic"
     private const val ONION = "onion_first"
+    private const val STRIP = "strip_metadata"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -47,6 +50,12 @@ object Privacy {
 
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
+    fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
+
+    fun setStripMetadata(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(STRIP, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
 
     fun setCoverTraffic(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(COVER, on).apply()

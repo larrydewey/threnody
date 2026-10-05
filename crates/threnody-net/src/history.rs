@@ -31,6 +31,26 @@ pub struct SendReport {
     pub unreachable: usize,
 }
 
+/// A file to send, with what goes with it.
+#[derive(Clone, Debug, Default)]
+pub struct OutgoingFile {
+    pub name: String,
+    pub data: Vec<u8>,
+    /// Where it is on this device, recorded in history.
+    pub location: Option<String>,
+    /// Show it covered until opened.
+    pub sensitive: bool,
+    /// Text sent with it (empty if none).
+    pub caption: String,
+    /// Shared by files sent together (0 = alone); see [`album_id`].
+    pub album: u64,
+}
+
+/// A fresh album id for files sent together.
+pub fn album_id() -> u64 {
+    local_id()
+}
+
 impl Node {
     /// Whether we want `peer`'s messages: we accepted it, or another device
     /// of its account, or it's ours. Blocked peers never are.
@@ -393,29 +413,49 @@ impl Node {
         Ok(r)
     }
 
-    /// Sends a file to `peer` (who must be reachable live: files aren't
-    /// sealed for mailboxes) and records it in history with `location`,
-    /// where it lives on this device.
-    pub fn send_file(
-        &self,
-        peer: &PublicIdentity,
-        name: &str,
-        data: Vec<u8>,
-        location: Option<String>,
-    ) -> Result<()> {
+    /// Makes file contents ready to send: images lose their metadata
+    /// unless that is switched off, and the size limit is checked.
+    pub fn prepare_file(&self, data: Vec<u8>) -> Result<Vec<u8>> {
+        let data = if self.strip_metadata() {
+            match threnody_core::media::strip(data)? {
+                threnody_core::media::Stripped::Image(d)
+                | threnody_core::media::Stripped::Unsupported(d) => d,
+            }
+        } else {
+            data
+        };
         if data.len() > threnody_core::message::MAX_FILE {
             return Err(NetError::Protocol(threnody_core::Error::Malformed(
                 "file too large",
             )));
         }
+        Ok(data)
+    }
+
+    /// Sends a file to `peer` (who must be reachable live: files aren't
+    /// sealed for mailboxes) and records it in history, with
+    /// `file.location`, where it lives on this device.
+    pub fn send_file(&self, peer: &PublicIdentity, file: OutgoingFile) -> Result<()> {
+        let OutgoingFile {
+            name,
+            data,
+            location,
+            sensitive,
+            caption,
+            album,
+        } = file;
+        let data = self.prepare_file(data)?;
         self.accept_contact(peer);
         let local_id = local_id();
         let size = data.len() as u64;
         let msg = AppMessage::File {
             sent_ms: now_ms(),
-            name: name.to_owned(),
+            name: name.clone(),
             data,
             id: local_id,
+            sensitive,
+            caption: caption.clone(),
+            album,
         };
         self.send_tagged(
             peer,
@@ -429,10 +469,13 @@ impl Node {
             peer,
             true,
             FileNote {
-                name: name.to_owned(),
+                name,
                 size,
                 location,
+                sensitive,
+                album,
             },
+            &caption,
             local_id,
             0,
         );
@@ -600,13 +643,20 @@ impl Node {
     /// disappearing-message timer. Sending through [`Node::send_file`]
     /// records it already.
     pub fn record_file(&self, peer: &PublicIdentity, outgoing: bool, file: FileNote) {
-        self.append_file(peer, outgoing, file, 0, 0);
+        self.append_file(peer, outgoing, file, "", 0, 0);
     }
 
-    /// Records a received file with the sender's id for it (from the
-    /// `File` message), so a later delete-for-everyone can find it.
-    pub fn record_received_file(&self, peer: &PublicIdentity, file: FileNote, remote_id: u64) {
-        self.append_file(peer, false, file, 0, remote_id);
+    /// Records a received file, with its caption and the sender's id for
+    /// it (from the `File` message, so a later delete-for-everyone can
+    /// find it).
+    pub fn record_received_file(
+        &self,
+        peer: &PublicIdentity,
+        file: FileNote,
+        caption: &str,
+        remote_id: u64,
+    ) {
+        self.append_file(peer, false, file, caption, 0, remote_id);
     }
 
     fn append_file(
@@ -614,6 +664,7 @@ impl Node {
         peer: &PublicIdentity,
         outgoing: bool,
         file: FileNote,
+        caption: &str,
         local_id: u64,
         remote_id: u64,
     ) {
@@ -631,7 +682,7 @@ impl Node {
                 at_ms: now,
                 outgoing,
                 device,
-                text: String::new(),
+                text: caption.to_owned(),
                 offline: false,
                 expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
                 file: Some(file),

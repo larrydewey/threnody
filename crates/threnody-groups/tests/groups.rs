@@ -93,6 +93,9 @@ fn create_invite_chat_and_remove() {
     let file = threnody_groups::Content::File {
         name: "map.png".into(),
         data: vec![0xFF; 5000],
+        sensitive: true,
+        caption: "the route".into(),
+        album: 3,
     };
     let out = net.node(&pc).send(&g, &file).unwrap();
     net.deliver(pc, out);
@@ -102,6 +105,9 @@ fn create_invite_chat_and_remove() {
             from: pc,
             name: "map.png".into(),
             data: vec![0xFF; 5000],
+            sensitive: true,
+            caption: "the route".into(),
+            album: 3,
         }));
     }
 

@@ -12,6 +12,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import uniffi.threnody_ffi.ContactInfo
+import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
 
@@ -48,6 +49,14 @@ object Threnody {
         applyPrivacy(ctx)
         redialOnNetwork(ctx.applicationContext, it)
         nameThisDevice(it)
+        sweepMedia(ctx.applicationContext, it)
+    }
+
+    /** Removes kept photos whose messages were deleted or disappeared. */
+    private fun sweepMedia(ctx: Context, node: ThrenodyNode) {
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "threnody-media-sweep").apply { isDaemon = true }
+        }.scheduleWithFixedDelay({ Media.sweep(ctx, node) }, 1, 5, java.util.concurrent.TimeUnit.MINUTES)
     }
 
     /** Applies the privacy settings (all on unless turned off) to the node. */
@@ -56,7 +65,20 @@ object Threnody {
         node.setCoverTraffic(Privacy.coverMs(ctx))
         node.setOnionFirst(Privacy.onionFirst(ctx))
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
+        node.setStripMetadata(Privacy.stripMetadata(ctx))
     }
+
+    /** What a notification or the chat list says for a file. */
+    fun fileLabel(name: String, sensitive: Boolean, caption: String): String = when {
+        sensitive && Media.isImage(name) -> "📷 Sensitive photo"
+        sensitive -> "📎 Sensitive file"
+        Media.isImage(name) -> "📷 " + caption.ifBlank { "Photo" }
+        else -> "📎 " + caption.ifBlank { name }
+    }
+
+    /** Keeps a received file: images privately, others in Downloads. */
+    private fun keep(ctx: Context, name: String, data: ByteArray): String? =
+        if (Media.isImage(name)) Media.savePrivate(ctx, name, data) else saveDownload(ctx, name, data)?.toString()
 
     /**
      * New identities are called "device"; give this one the phone's model
@@ -205,16 +227,18 @@ object Threnody {
                 }
                 is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
                 is NodeEvent.File -> {
-                    say("* ${short(e.peer)} sent ${e.name} (${e.data.size} bytes)")
-                    val uri = saveDownload(ctx, e.name, e.data)
+                    say("* ${short(e.peer)} sent a file (${e.data.size} bytes)")
+                    val location = keep(ctx, e.name, e.data)
                     try {
-                        node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), uri?.toString(), e.id)
+                        node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), location, e.id,
+                            FileOptions(e.sensitive, e.caption, e.album))
                     } catch (x: Exception) {
-                        say("! recording ${e.name}: ${x.message}")
+                        say("! recording a file: ${x.message}")
                     }
                     if (visible == 0 || e.peer !in visibleChat) {
                         val contacts = node.contacts()
-                        ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer), "📎 ${e.name}")
+                        ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer),
+                            fileLabel(e.name, e.sensitive, e.caption))
                     }
                 }
                 is NodeEvent.GroupMessage -> {
@@ -227,15 +251,17 @@ object Threnody {
                 }
                 is NodeEvent.GroupFile -> {
                     say("* group ${e.group.take(6)}: ${short(e.from)} sent a file (${e.data.size} bytes)")
-                    val uri = saveDownload(ctx, e.name, e.data)
+                    val location = keep(ctx, e.name, e.data)
                     try {
-                        node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), uri?.toString())
+                        node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location,
+                            FileOptions(e.sensitive, e.caption, e.album))
                     } catch (x: Exception) {
-                        say("! recording ${e.name}: ${x.message}")
+                        say("! recording a file: ${x.message}")
                     }
                     if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
-                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: 📎 ${e.name}")
+                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group",
+                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption)}")
                     }
                 }
                 is NodeEvent.GroupInvited -> {

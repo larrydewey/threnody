@@ -13,6 +13,7 @@ pub mod error;
 pub mod handshake;
 pub mod history;
 pub mod identity;
+pub mod media;
 pub mod message;
 pub mod onion;
 pub mod prekey;

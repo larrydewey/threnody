@@ -300,7 +300,15 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     );
 
     alice
-        .send_file(&b, "a.txt", vec![1, 2, 3], Some("/tmp/a.txt".into()))
+        .send_file(
+            &b,
+            threnody_net::history::OutgoingFile {
+                name: "a.txt".into(),
+                data: vec![1, 2, 3],
+                location: Some("/tmp/a.txt".into()),
+                ..Default::default()
+            },
+        )
         .unwrap();
     next(&mut brx, |e| {
         matches!(
@@ -315,6 +323,80 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
     let entry = last(&alice);
     assert!(entry.delivered && entry.file.is_some_and(|f| f.size == 3));
+
+    // A photo loses its location on the way, keeps its caption and flag.
+    let mut photo = vec![0xFF, 0xD8];
+    photo.extend([0xFF, 0xE1, 0, 17]);
+    photo.extend(b"Exif\0\0GPS 51.5N");
+    photo.extend([
+        0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 0x3F, 0, 0x12, 0x34, 0xFF, 0xD9,
+    ]);
+    let send_photo = |photo: Vec<u8>| {
+        alice
+            .send_file(
+                &b,
+                threnody_net::history::OutgoingFile {
+                    name: "IMG.jpg".into(),
+                    data: photo,
+                    sensitive: true,
+                    caption: "the view".into(),
+                    album: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    };
+    send_photo(photo.clone());
+    let Event::Message {
+        msg:
+            AppMessage::File {
+                data,
+                sensitive,
+                caption,
+                album,
+                ..
+            },
+        ..
+    } = next(&mut brx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: AppMessage::File { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(!data.windows(3).any(|w| w == b"GPS"), "metadata sent");
+    assert!(data.ends_with(&[0x12, 0x34, 0xFF, 0xD9]));
+    assert!(sensitive && caption == "the view" && album == 5);
+    assert_eq!(last(&alice).text, "the view");
+    // Switched off, it goes as it is.
+    alice.set_strip_metadata(false);
+    send_photo(photo.clone());
+    let Event::Message {
+        msg: AppMessage::File { data, .. },
+        ..
+    } = next(&mut brx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: AppMessage::File { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(data, photo);
+    while arx.try_recv().is_ok() {}
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while arx.try_recv().is_ok() {}
 
     // Lost on a dead link: not delivered until the resend is acknowledged.
     cut_a.store(true, Ordering::SeqCst);

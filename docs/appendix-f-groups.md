@@ -37,8 +37,9 @@ An MLS application message carries one of these:
 
 ```
 Content = text                         ; UTF-8, as the first versions sent
-        / 0xFF || { 0: kind, ? 1: text or file name, ? 2: file data }
-kind: 1 text, 2 file (at most 8 MiB, as in 1:1)
+        / 0xFF || { 0: kind, ? 1: text or file name, ? 2: file data,
+                    ? 3: flags, ? 4: caption, ? 5: album id }
+kind: 1 text, 2 file (at most 8 MiB, as in 1:1); flags: 1 sensitive
 ```
 
 A UTF-8 string never starts with the byte 0xFF, so plain text from older members still reads as text. Receivers save a file and record it in the group's history with where they saved it. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
@@ -92,7 +93,7 @@ The key is derived from the identity seed, so group secrets are only as accessib
 /group accept [n]                 /group decline [n]
 /group remove <group> <peer>      /group leave <group>
 /groups
-/g <group> <text>                 /gfile <group> <path>
+/g <group> <text>                 /gfile <group> [-s] <path>... [| caption]
 ```
 
 ## Not yet done

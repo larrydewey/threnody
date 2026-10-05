@@ -54,6 +54,10 @@ pub enum GroupError {
     Mls(String),
     #[error(transparent)]
     Core(#[from] threnody_core::Error),
+    /// The file couldn't be prepared to send (too large, or a damaged
+    /// image whose metadata couldn't be removed).
+    #[error("{0}")]
+    File(String),
 }
 
 fn mls<E: std::fmt::Debug>(e: E) -> GroupError {
@@ -118,6 +122,9 @@ pub enum GroupEvent {
         from: PublicIdentity,
         name: String,
         data: Vec<u8>,
+        sensitive: bool,
+        caption: String,
+        album: u64,
     },
 }
 
@@ -745,11 +752,20 @@ impl Groups {
                         from: sender,
                         text,
                     },
-                    Content::File { name, data } => GroupEvent::File {
+                    Content::File {
+                        name,
+                        data,
+                        sensitive,
+                        caption,
+                        album,
+                    } => GroupEvent::File {
                         group,
                         from: sender,
                         name: truncate(&name),
                         data,
+                        sensitive,
+                        caption,
+                        album,
                     },
                 });
             }

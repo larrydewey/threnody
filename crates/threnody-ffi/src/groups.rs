@@ -7,7 +7,11 @@ use threnody_core::history::{ConversationId, FileNote};
 use threnody_groups::GroupId;
 use threnody_groups::node::{Invite, Update};
 
-use crate::{HistoryEntry, NodeEvent, Result, ThrenodyNode, fail, fp, history_entries};
+use threnody_net::history::OutgoingFile;
+
+use crate::{
+    FileOptions, HistoryEntry, NodeEvent, Result, ThrenodyNode, fail, fp, history_entries,
+};
 
 /// A group this device belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -85,12 +89,18 @@ fn event(u: Update) -> NodeEvent {
             name,
             data,
             ours,
+            sensitive,
+            caption,
+            album,
         } => NodeEvent::GroupFile {
             group: hex(&group),
             from: fp(&from),
             name,
             data,
             ours,
+            sensitive,
+            caption,
+            album,
         },
     }
 }
@@ -233,11 +243,20 @@ impl ThrenodyNode {
         name: String,
         data: Vec<u8>,
         location: Option<String>,
+        options: FileOptions,
     ) -> Result<()> {
         let g = self.group_id(&group)?;
         let _guard = self.rt.enter();
+        let file = OutgoingFile {
+            name,
+            data,
+            location,
+            sensitive: options.sensitive,
+            caption: options.caption,
+            album: options.album,
+        };
         self.group_node()
-            .send_file(&self.node, &g, &name, data, location)
+            .send_file(&self.node, &g, file)
             .map_err(fail)
     }
 
@@ -250,6 +269,7 @@ impl ThrenodyNode {
         name: String,
         size: u64,
         location: Option<String>,
+        options: FileOptions,
     ) -> Result<()> {
         let g = self.group_id(&group)?;
         // Members needn't be contacts: find the sender among them.
@@ -268,7 +288,10 @@ impl ThrenodyNode {
                 name,
                 size,
                 location,
+                sensitive: options.sensitive,
+                album: options.album,
             },
+            &options.caption,
         );
         Ok(())
     }

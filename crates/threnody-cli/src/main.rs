@@ -126,6 +126,10 @@ enum Cmd {
         /// Dial contacts directly instead of through onion circuits first.
         #[arg(long)]
         no_onion: bool,
+        /// Send images with their metadata (location, camera, times)
+        /// instead of stripping it.
+        #[arg(long)]
+        keep_metadata: bool,
         /// How long messages last in chats that haven't set their own timer
         /// (`30s`, `10m`, `1h`, `1d`, `1w`), or `off`. A week by default.
         #[arg(long, value_name = "TIME", default_value = "1w")]
@@ -558,6 +562,7 @@ fn main() -> Result<()> {
             constant_rate_ms,
             no_cover,
             no_onion,
+            keep_metadata,
             disappear_default,
             tunnel,
             wg_iface,
@@ -578,6 +583,7 @@ fn main() -> Result<()> {
                 constant_rate: (!no_cover)
                     .then(|| std::time::Duration::from_millis(constant_rate_ms.max(10))),
                 onion_first: !no_onion,
+                strip_metadata: !keep_metadata,
                 default_timer: match disappear_default.as_str() {
                     "off" => None,
                     t => Some(chat::parse_duration(t).ok_or_else(|| {

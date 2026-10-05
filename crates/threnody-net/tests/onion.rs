@@ -127,6 +127,9 @@ async fn two_relay_onion_circuit_carries_a_session() {
         name: "f".into(),
         data: vec![42; 100_000],
         id: 0,
+        sensitive: false,
+        caption: String::new(),
+        album: 0,
     };
     c.node.send(&a.node.identity(), big.clone()).unwrap();
     next(

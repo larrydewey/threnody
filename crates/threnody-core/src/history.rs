@@ -115,6 +115,11 @@ pub struct FileNote {
     pub size: u64,
     /// A local path or platform URI for the saved file, if any.
     pub location: Option<String>,
+    /// Marked sensitive by its sender: shown covered until opened.
+    pub sensitive: bool,
+    /// Files sent together share an album id (0 = alone). An album's
+    /// caption is the text of its first entry.
+    pub album: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -233,11 +238,21 @@ impl History {
                     enc.u8(5)?.u64(x)?;
                 }
                 if let Some(f) = &e.file {
-                    enc.u8(6)?.map_len(2 + usize::from(f.location.is_some()))?;
+                    enc.u8(6)?.map_len(
+                        2 + usize::from(f.location.is_some())
+                            + usize::from(f.sensitive)
+                            + usize::from(f.album != 0),
+                    )?;
                     enc.u8(0)?.str(&f.name)?;
                     enc.u8(1)?.u64(f.size)?;
                     if let Some(l) = &f.location {
                         enc.u8(2)?.str(l)?;
+                    }
+                    if f.sensitive {
+                        enc.u8(3)?.bool(true)?;
+                    }
+                    if f.album != 0 {
+                        enc.u8(4)?.u64(f.album)?;
                     }
                 }
                 if e.local_id != 0 {
@@ -335,12 +350,14 @@ impl History {
 }
 
 fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
-    let (mut name, mut size, mut location) = (None, None, None);
+    let (mut name, mut size, mut location, mut sensitive, mut album) = (None, None, None, false, 0);
     read_map(d, |k, d| {
         match k {
             0 => name = Some(d.str()?.to_owned()),
             1 => size = Some(d.u64()?),
             2 => location = Some(d.str()?.to_owned()),
+            3 => sensitive = d.bool()?,
+            4 => album = d.u64()?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -349,6 +366,8 @@ fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
         name: required(name, "file name")?,
         size: required(size, "file size")?,
         location,
+        sensitive,
+        album,
     })
 }
 
@@ -734,6 +753,8 @@ mod tests {
                     name: "photo.jpg".into(),
                     size: 1234,
                     location: Some("content://media/1".into()),
+                    sensitive: true,
+                    album: 77,
                 }),
                 ..entry(MAX_ENTRIES as u64 + 6, "", None)
             },
@@ -745,6 +766,8 @@ mod tests {
                     name: "notes.txt".into(),
                     size: 0,
                     location: None,
+                    sensitive: false,
+                    album: 0,
                 }),
                 ..entry(MAX_ENTRIES as u64 + 7, "", None)
             },

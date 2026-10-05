@@ -12,6 +12,7 @@ use std::time::Duration;
 use threnody_core::history::FileNote;
 use threnody_core::store::{Home, Lookup};
 use threnody_core::{AppMessage, Fingerprint, PublicIdentity, safety_number};
+use threnody_net::history::OutgoingFile;
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -94,6 +95,26 @@ pub struct FileInfo {
     pub name: String,
     pub size: u64,
     pub location: Option<String>,
+    /// Marked sensitive by its sender: show it covered until opened.
+    pub sensitive: bool,
+    /// Files sent together share an album id (0 = alone); the caption is
+    /// the text of the album's first entry.
+    pub album: u64,
+}
+
+/// What goes with a file: whether it is sensitive, its caption, and the
+/// album it belongs to (0 = alone; see `album_id`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct FileOptions {
+    pub sensitive: bool,
+    pub caption: String,
+    pub album: u64,
+}
+
+/// A fresh album id for photos or files sent together.
+#[uniffi::export]
+pub fn album_id() -> u64 {
+    threnody_net::history::album_id()
 }
 
 /// A QR code as a square of modules, row by row (`true` = dark).
@@ -178,12 +199,16 @@ pub enum NodeEvent {
         text: String,
         offline: bool,
     },
-    /// `id` is the sender's id for it: pass it to `record_received_file`.
+    /// `id` is the sender's id for it: pass it to `record_received_file`,
+    /// with the caption, sensitivity and album.
     File {
         peer: String,
         name: String,
         data: Vec<u8>,
         id: u64,
+        sensitive: bool,
+        caption: String,
+        album: u64,
     },
     /// `peer` edited a message: reload its conversation.
     MessageEdited {
@@ -272,6 +297,9 @@ pub enum NodeEvent {
         name: String,
         data: Vec<u8>,
         ours: bool,
+        sensitive: bool,
+        caption: String,
+        album: u64,
     },
     /// Our own device `from` shared history; reload conversations.
     HistorySynced {
@@ -349,6 +377,8 @@ fn history_entries(entries: &[threnody_core::history::Entry]) -> Vec<HistoryEntr
                 name: f.name.clone(),
                 size: f.size,
                 location: f.location.clone(),
+                sensitive: f.sensitive,
+                album: f.album,
             }),
             delivered: e.delivered,
             id: e.message_id(),
@@ -392,12 +422,24 @@ fn convert(e: Event) -> NodeEvent {
         },
         Event::Message {
             peer,
-            msg: AppMessage::File { name, data, id, .. },
+            msg:
+                AppMessage::File {
+                    name,
+                    data,
+                    id,
+                    sensitive,
+                    caption,
+                    album,
+                    ..
+                },
         } => NodeEvent::File {
             peer: fp(&peer),
             name,
             data,
             id,
+            sensitive,
+            caption,
+            album,
         },
         Event::MessageEdited { peer, .. } => NodeEvent::MessageEdited { peer: fp(&peer) },
         Event::MessagesDeleted { peer, count } => NodeEvent::MessagesDeleted {
@@ -638,6 +680,7 @@ impl ThrenodyNode {
         name: String,
         data: Vec<u8>,
         location: Option<String>,
+        options: FileOptions,
     ) -> Result<()> {
         let p = self.resolve(&peer)?;
         if data.len() > threnody_core::message::MAX_FILE {
@@ -649,7 +692,19 @@ impl ThrenodyNode {
         // Files aren't sealed for mailboxes: they need a live session.
         self.try_reach(&p);
         let _guard = self.rt.enter();
-        self.node.send_file(&p, &name, data, location).map_err(fail)
+        self.node
+            .send_file(
+                &p,
+                OutgoingFile {
+                    name,
+                    data,
+                    location,
+                    sensitive: options.sensitive,
+                    caption: options.caption,
+                    album: options.album,
+                },
+            )
+            .map_err(fail)
     }
 
     /// Records a received file (from a `File` event) in history once the
@@ -661,6 +716,7 @@ impl ThrenodyNode {
         size: u64,
         location: Option<String>,
         id: u64,
+        options: FileOptions,
     ) -> Result<()> {
         let p = self.resolve(&peer)?;
         self.node.record_received_file(
@@ -669,10 +725,23 @@ impl ThrenodyNode {
                 name,
                 size,
                 location,
+                sensitive: options.sensitive,
+                album: options.album,
             },
+            &options.caption,
             id,
         );
         Ok(())
+    }
+
+    /// Whether images lose their metadata (location, camera, times)
+    /// before they are sent. On by default.
+    pub fn set_strip_metadata(&self, on: bool) {
+        self.node.set_strip_metadata(on);
+    }
+
+    pub fn strip_metadata(&self) -> bool {
+        self.node.strip_metadata()
     }
 
     /// Deletes messages (by `HistoryEntry.id`) with `peer`, here and on
@@ -1172,20 +1241,49 @@ mod tests {
                 "notes.txt".into(),
                 b"some notes".to_vec(),
                 Some("/tmp/notes.txt".into()),
+                FileOptions {
+                    sensitive: true,
+                    caption: "read these".into(),
+                    album: 0,
+                },
             )
             .unwrap();
         let f = wait(&bob, |e| matches!(e, NodeEvent::File { .. }));
         assert!(
-            matches!(f, NodeEvent::File { name, data, .. } if name == "notes.txt" && data == b"some notes")
+            matches!(f, NodeEvent::File { name, data, sensitive: true, caption, .. }
+                if name == "notes.txt" && data == b"some notes" && caption == "read these")
         );
         let too_big = vec![0u8; usize::try_from(alice.max_file_size()).unwrap() + 1];
         assert!(
             alice
-                .send_file(bob_fp.clone(), "big".into(), too_big, None)
+                .send_file(
+                    bob_fp.clone(),
+                    "big".into(),
+                    too_big,
+                    None,
+                    FileOptions::default()
+                )
                 .is_err()
         );
-        bob.record_received_file(alice.device_fingerprint(), "notes.txt".into(), 10, None, 0)
+        bob.record_received_file(
+            alice.device_fingerprint(),
+            "notes.txt".into(),
+            10,
+            None,
+            0,
+            FileOptions {
+                sensitive: true,
+                caption: "read these".into(),
+                album: 0,
+            },
+        )
+        .unwrap();
+        let last = bob
+            .history(alice.device_fingerprint(), 1)
+            .unwrap()
+            .pop()
             .unwrap();
+        assert!(last.text == "read these" && last.file.unwrap().sensitive);
         alice.mark_verified(bob_fp.clone()).unwrap();
         assert!(
             alice
@@ -1501,7 +1599,17 @@ mod tests {
 
         // Files go to the group the same way; each member saves, then records.
         alice
-            .send_group_file(g.clone(), "route.gpx".into(), vec![7; 3000], None)
+            .send_group_file(
+                g.clone(),
+                "route.gpx".into(),
+                vec![7; 3000],
+                None,
+                FileOptions {
+                    sensitive: true,
+                    caption: "tomorrow".into(),
+                    album: 0,
+                },
+            )
             .unwrap();
         for (i, member) in [(1, &bob), (2, &carol)] {
             let NodeEvent::GroupFile {
@@ -1510,6 +1618,9 @@ mod tests {
                 name,
                 data,
                 ours,
+                sensitive,
+                caption,
+                album,
             } = all.until(i, |e| matches!(e, NodeEvent::GroupFile { .. }))
             else {
                 unreachable!()
@@ -1518,12 +1629,19 @@ mod tests {
                 (&group, &from, name.as_str(), data.len(), ours),
                 (&g, &a_fp, "route.gpx", 3000, false)
             );
+            assert!(sensitive && caption == "tomorrow" && album == 0);
+            let options = FileOptions {
+                sensitive,
+                caption,
+                album,
+            };
             member
-                .record_received_group_file(group, from, name, 3000, Some("/x".into()))
+                .record_received_group_file(group, from, name, 3000, Some("/x".into()), options)
                 .unwrap();
             let h = member.group_history(g.clone(), 10).unwrap();
             let f = h.last().unwrap().file.clone().unwrap();
             assert_eq!((f.name.as_str(), f.size), ("route.gpx", 3000));
+            assert!(f.sensitive && h.last().unwrap().text == "tomorrow");
         }
         let h = alice.group_history(g.clone(), 10).unwrap();
         assert_eq!(h.last().unwrap().file.as_ref().unwrap().name, "route.gpx");
@@ -1610,6 +1728,9 @@ mod tests {
             name: n.into(),
             data: vec![7u8; 400_000],
             id: 0,
+            sensitive: false,
+            caption: String::new(),
+            album: 0,
         };
         alice.node.send(&b_id, file("to-bob")).unwrap();
         bob.node.send(&a_id, file("to-alice")).unwrap();

@@ -33,7 +33,7 @@ To add a device to your account, run `/device add [host:port]` on a device you a
 ```
 /connect <invite|contact|host:port>   /to <peer>   /peers   /contacts
 /name <peer> <name>   /approve [peer]   /revoke [peer]
-/safety [peer]   /verify [peer]   /file <path>   /drop [peer]
+/safety [peer]   /verify [peer]   /file [-s] <path>... [| caption]   /drop [peer]
 /policy anyone|contacts|approved   /status   /quit
 ```
 
@@ -41,7 +41,7 @@ To add a device to your account, run `/device add [host:port]` on a device you a
 
 You can also manage contacts outside a session with `threnody contacts | name | approve | revoke | verify | forget`.
 
-**Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. Messages left in mailboxes for offline contacts go over such circuits too, so the mailbox doesn't learn who sent them. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. `--policy approved` only accepts mutually approved contacts.
+**Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. Messages left in mailboxes for offline contacts go over such circuits too, so the mailbox doesn't learn who sent them. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. Photos lose their location and camera details before they're sent; `--keep-metadata` sends them as they are. `--policy approved` only accepts mutually approved contacts.
 
 While listening, nodes send private UDP beacons that only mutually approved peers can recognise, and reconnect to each other automatically. Use `--no-discover` to turn this off. See [Appendix E](docs/appendix-e-discovery.md).
 
@@ -88,8 +88,8 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §4.1 Anonymous mode, §4.3 selective disclosure | ❌ |
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync and history sync (with a backfill for newly linked devices), account-wide offline keys and group invites |
 | §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
-| §6.1 1:1 text + files | ✅ including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
-| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; text and files; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
+| §6.1 1:1 text + files | ✅ photos and albums with captions, a *sensitive* flag that shows them covered until opened, and metadata (location, camera) stripped before sending by default; including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
+| §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; text, files and photos; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices (backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |

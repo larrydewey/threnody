@@ -129,7 +129,7 @@ class MainActivity : Activity() {
         runOnUiThread { show(rows) }
     }
 
-    private fun preview(e: HistoryEntry) = e.file?.let { "📎 ${it.name}" } ?: e.text
+    private fun preview(e: HistoryEntry) = e.file?.let { Threnody.fileLabel(it.name, it.sensitive, e.text) } ?: e.text
 
     private fun show(rows: List<Row>) {
         list.removeAllViews()
@@ -281,6 +281,11 @@ class MainActivity : Activity() {
                 { Privacy.setOnionFirst(this@MainActivity, it) }) {
                 if (it) "Contacts are reached through onion circuits when possible"
                 else "Contacts are dialed directly: the network sees who you talk to"
+            }
+            toggle("Remove photo metadata", Privacy.stripMetadata(this@MainActivity),
+                { Privacy.setStripMetadata(this@MainActivity, it) }) {
+                if (it) "Photos are sent without location, camera or time details"
+                else "Photos are sent with their metadata, which can include where they were taken"
             }
             menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {

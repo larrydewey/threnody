@@ -71,6 +71,9 @@ fn parsers_survive_mutated_input() {
         name: "n".into(),
         data: vec![1, 2, 3],
         id: 0,
+        sensitive: false,
+        caption: String::new(),
+        album: 0,
     }
     .encode()
     .unwrap();

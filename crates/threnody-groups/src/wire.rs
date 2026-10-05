@@ -173,15 +173,22 @@ impl GroupWire {
 ///
 /// ```text
 /// Content = text (UTF-8, as first sent)
-///         / 0xFF || { 0: kind uint, ? 1: text or name tstr, ? 2: data bstr }
-/// kind: 1 text, 2 file
+///         / 0xFF || { 0: kind uint, ? 1: text or name tstr, ? 2: data bstr,
+///                     ? 3: flags uint, ? 4: caption tstr, ? 5: album uint }
+/// kind: 1 text, 2 file; flags: 1 sensitive
 /// ```
 ///
 /// 0xFF never starts UTF-8, so plain text stays as it was.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Content {
     Text(String),
-    File { name: String, data: Vec<u8> },
+    File {
+        name: String,
+        data: Vec<u8>,
+        sensitive: bool,
+        caption: String,
+        album: u64,
+    },
 }
 
 const TAGGED: u8 = 0xFF;
@@ -190,11 +197,32 @@ impl Content {
     pub fn encode(&self) -> Result<Vec<u8>> {
         match self {
             Self::Text(t) => Ok(t.as_bytes().to_vec()),
-            Self::File { name, data } => {
-                let body = cbor::to_vec(name.len() + data.len() + 24, |e| {
-                    e.map_len(3)?.u8(0)?.u8(2)?;
+            Self::File {
+                name,
+                data,
+                sensitive,
+                caption,
+                album,
+            } => {
+                let size = name.len() + data.len() + caption.len() + 40;
+                let body = cbor::to_vec(size, |e| {
+                    e.map_len(
+                        3 + usize::from(*sensitive)
+                            + usize::from(!caption.is_empty())
+                            + usize::from(*album != 0),
+                    )?;
+                    e.u8(0)?.u8(2)?;
                     e.u8(1)?.str(name)?;
                     e.u8(2)?.bytes(data)?;
+                    if *sensitive {
+                        e.u8(3)?.u8(1)?;
+                    }
+                    if !caption.is_empty() {
+                        e.u8(4)?.str(caption)?;
+                    }
+                    if *album != 0 {
+                        e.u8(5)?.u64(*album)?;
+                    }
                     Ok(())
                 })?;
                 let mut out = Vec::with_capacity(body.len() + 1);
@@ -211,11 +239,15 @@ impl Content {
         };
         let mut dec = Decoder::new(rest);
         let (mut kind, mut text, mut data) = (None, None, None);
+        let (mut flags, mut caption, mut album) = (0, String::new(), 0);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
                 1 => text = Some(d.str()?.to_owned()),
                 2 => data = Some(d.bytes()?.to_vec()),
+                3 => flags = d.u64()?,
+                4 => caption = d.str()?.to_owned(),
+                5 => album = d.u64()?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -226,6 +258,9 @@ impl Content {
             2 => Self::File {
                 name: required(text, "file name")?,
                 data: required(data, "file data")?,
+                sensitive: flags & 1 != 0,
+                caption,
+                album,
             },
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
@@ -244,6 +279,16 @@ mod tests {
             Content::File {
                 name: "a.txt".into(),
                 data: vec![0xFF; 3000],
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+            },
+            Content::File {
+                name: "IMG.jpg".into(),
+                data: vec![1; 10],
+                sensitive: true,
+                caption: "look".into(),
+                album: 5,
             },
         ] {
             assert_eq!(Content::decode(&c.encode().unwrap()).unwrap(), c);

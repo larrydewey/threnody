@@ -276,6 +276,8 @@ pub(crate) struct Shared {
     constant_rate: tokio::sync::watch::Sender<Option<Duration>>,
     /// Dial contacts through onion circuits first when possible.
     pub(crate) prefer_onion: std::sync::atomic::AtomicBool,
+    /// Strip identifying metadata from images we send.
+    pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
     pub(crate) default_timer: std::sync::atomic::AtomicU32,
     tunnel: Option<(u16, [u8; 32])>,
@@ -435,6 +437,7 @@ impl Node {
             policy: Mutex::new(cfg.policy),
             constant_rate: tokio::sync::watch::Sender::new(cfg.constant_rate),
             prefer_onion: std::sync::atomic::AtomicBool::new(true),
+            strip_metadata: std::sync::atomic::AtomicBool::new(true),
             default_timer: std::sync::atomic::AtomicU32::new(crate::history::DEFAULT_TIMER_S),
             tunnel,
             tunnel_peers: Mutex::new(HashMap::new()),
@@ -495,6 +498,16 @@ impl Node {
 
     pub fn set_prefer_onion(&self, on: bool) {
         self.shared.prefer_onion.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether images we send lose their metadata (location, camera,
+    /// times) first (on by default; see `threnody_core::media`).
+    pub fn strip_metadata(&self) -> bool {
+        self.shared.strip_metadata.load(Ordering::Relaxed)
+    }
+
+    pub fn set_strip_metadata(&self, on: bool) {
+        self.shared.strip_metadata.store(on, Ordering::Relaxed);
     }
 
     /// WireGuard listen port, when tunnels are enabled.

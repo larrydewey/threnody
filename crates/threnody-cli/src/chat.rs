@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use threnody_core::history::FileNote;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, safety_number};
+use threnody_net::history::OutgoingFile;
 use threnody_net::mailbox::DepositStatus;
 use threnody_net::{AcceptPolicy, DiscoveryConfig, Event, Node, NodeConfig};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +25,8 @@ pub struct Options {
     pub constant_rate: Option<Duration>,
     /// Reach contacts through onion circuits first when possible.
     pub onion_first: bool,
+    /// Strip metadata from images we send.
+    pub strip_metadata: bool,
     /// Disappearing timer for conversations that haven't set one.
     pub default_timer: Option<u32>,
     pub tunnel: Option<TunnelOptions>,
@@ -56,7 +59,8 @@ Type a line to send it to the current peer. Commands:
   /edit <n> <text>                      edit your message n of the last /history
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
-  /file <path>                          send a file to the current peer
+  /file [-s] <path>... [| caption]      send files (photos) to the current peer;
+                                        -s marks them sensitive
   /drop [peer]                          close a session
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
@@ -112,6 +116,7 @@ pub async fn run(opts: Options) -> Result<()> {
         tunnel_port: opts.tunnel.as_ref().map(|t| t.port),
     })?;
     node.set_prefer_onion(opts.onion_first);
+    node.set_strip_metadata(opts.strip_metadata);
     node.set_default_timer(opts.default_timer);
     println!("Threnody — you are {}", node.identity().fingerprint());
     if groups.count() > 0 {
@@ -312,24 +317,39 @@ impl Ui {
         };
         match msg {
             AppMessage::Text { body, .. } => println!("<{who}> {body}"),
-            AppMessage::File { name, data, .. } => {
+            AppMessage::File {
+                name,
+                data,
+                id,
+                sensitive,
+                caption,
+                album,
+                ..
+            } => {
                 let saved = save_download(&self.downloads, &name, &data);
+                let mark = if sensitive { " [sensitive]" } else { "" };
                 match &saved {
                     Ok(p) => println!(
-                        "* {who} sent {name} ({} bytes) -> {}",
+                        "* {who} sent {name}{mark} ({} bytes) -> {}",
                         data.len(),
                         p.display()
                     ),
                     Err(e) => println!("! could not save file from {who}: {e:#}"),
                 }
-                self.node.record_file(
+                if !caption.is_empty() {
+                    println!("<{who}> {caption}");
+                }
+                self.node.record_received_file(
                     &peer,
-                    false,
                     FileNote {
                         name,
                         size: data.len() as u64,
                         location: saved.ok().map(|p| p.display().to_string()),
+                        sensitive,
+                        album,
                     },
+                    &caption,
+                    id,
                 );
             }
             AppMessage::Group(payload) => {
@@ -392,13 +412,19 @@ impl Ui {
             }
             match &e.file {
                 Some(f) => println!(
-                    "  [{}] <{who}> file {} ({} bytes){}{mark}",
+                    "  [{}] <{who}> file {}{} ({} bytes){}{}{mark}",
                     clock(e.at_ms),
                     f.name,
+                    if f.sensitive { " [sensitive]" } else { "" },
                     f.size,
                     f.location
                         .as_ref()
-                        .map_or_else(String::new, |l| format!(" at {l}"))
+                        .map_or_else(String::new, |l| format!(" at {l}")),
+                    if e.text.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", e.text)
+                    }
                 ),
                 None => println!("  [{}] <{who}> {}{mark}", clock(e.at_ms), e.text),
             }
@@ -921,26 +947,17 @@ impl Ui {
                 println!("* marked {} verified", self.name(&p));
             }
             "file" => {
-                let path = arg.ok_or_else(|| anyhow!("usage: /file <path>"))?;
+                let arg = arg.ok_or_else(|| anyhow!("usage: /file [-s] <path>... [| caption]"))?;
                 let peer = self.current.ok_or_else(|| anyhow!("no current peer"))?;
-                let data = tokio::fs::read(path)
-                    .await
-                    .with_context(|| format!("reading {path}"))?;
-                if data.len() > threnody_core::message::MAX_FILE {
-                    bail!(
-                        "file larger than {} bytes",
-                        threnody_core::message::MAX_FILE
-                    );
+                let files = read_files(arg).await?;
+                let (n, len) = (
+                    files.len(),
+                    files.iter().map(|f| f.data.len()).sum::<usize>(),
+                );
+                for f in files {
+                    self.node.send_file(&peer, f)?;
                 }
-                let name = Path::new(path)
-                    .file_name()
-                    .map_or("file".into(), |n| n.to_string_lossy().into_owned());
-                let len = data.len();
-                let location = std::fs::canonicalize(path)
-                    .ok()
-                    .map(|p| p.display().to_string());
-                self.node.send_file(&peer, &name, data, location)?;
-                println!("* sent {len} bytes to {}", self.name(&peer));
+                println!("* sent {n} file(s), {len} bytes, to {}", self.name(&peer));
             }
             "drop" => {
                 let p = self.resolve_peer(arg)?;
@@ -1121,14 +1138,16 @@ impl Ui {
                 )?;
             }
             "gfile" => {
-                let len = self
+                let (n, len) = self
                     .groups
                     .send_file(
                         &self.node,
-                        arg.ok_or_else(|| anyhow!("usage: /gfile <group> <path>"))?,
+                        arg.ok_or_else(|| {
+                            anyhow!("usage: /gfile <group> [-s] <path>... [| caption]")
+                        })?,
                     )
                     .await?;
-                println!("* sent {len} bytes to the group");
+                println!("* sent {n} file(s), {len} bytes, to the group");
             }
             other => bail!("unknown command /{other}; try /help"),
         }
@@ -1277,7 +1296,66 @@ impl Ui {
             "  metadata     padding: on; timing: {rate}; routing: {onion}; carrying {} circuit(s) for others",
             self.node.onion_hops()
         );
+        println!(
+            "  images       {}",
+            if self.node.strip_metadata() {
+                "metadata stripped before sending"
+            } else {
+                "sent with their metadata (--keep-metadata)"
+            }
+        );
     }
+}
+
+/// Reads the files named by `/file` or `/gfile` arguments:
+/// `[-s] <path>... [| caption]`. A whole argument that names a file is one
+/// path (spaces and all); otherwise paths are split on spaces. Several
+/// files go as an album, the caption with the first.
+pub(crate) async fn read_files(arg: &str) -> Result<Vec<OutgoingFile>> {
+    let (paths, caption) = match arg.split_once('|') {
+        Some((p, c)) => (p.trim(), c.trim()),
+        None => (arg.trim(), ""),
+    };
+    let (sensitive, paths) = match paths.strip_prefix("-s ") {
+        Some(rest) => (true, rest.trim()),
+        None => (false, paths),
+    };
+    let paths: Vec<&str> = if Path::new(paths).is_file() {
+        vec![paths]
+    } else {
+        paths.split_whitespace().collect()
+    };
+    if paths.is_empty() {
+        bail!("usage: [-s] <path>... [| caption]");
+    }
+    let album = if paths.len() > 1 {
+        threnody_net::history::album_id()
+    } else {
+        0
+    };
+    let mut out = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        let data = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading {path}"))?;
+        out.push(OutgoingFile {
+            name: Path::new(path)
+                .file_name()
+                .map_or("file".into(), |n| n.to_string_lossy().into_owned()),
+            data,
+            location: std::fs::canonicalize(path)
+                .ok()
+                .map(|p| p.display().to_string()),
+            sensitive,
+            caption: if i == 0 {
+                caption.to_owned()
+            } else {
+                String::new()
+            },
+            album,
+        });
+    }
+    Ok(out)
 }
 
 /// Saves a received file under `dir` using only its final path component,

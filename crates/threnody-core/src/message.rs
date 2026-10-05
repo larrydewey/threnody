@@ -17,6 +17,8 @@ pub const PAD_MIN: usize = 256;
 pub const PAD_STEP_MAX: usize = 64 * 1024;
 /// Largest file a single message may carry.
 pub const MAX_FILE: usize = 8 * 1024 * 1024;
+/// `File` flag (key 6): the sender marked it sensitive.
+pub const FILE_SENSITIVE: u64 = 1;
 /// `Hello` feature bit: this side acknowledges `Tracked` messages with
 /// `Ack` and accepts them (so the other side may send both).
 pub const FEATURE_ACKS: u64 = 1;
@@ -51,6 +53,13 @@ pub enum AppMessage {
         data: Vec<u8>,
         /// As for `Text`.
         id: u64,
+        /// The sender marked it sensitive: show it covered until opened.
+        sensitive: bool,
+        /// Text sent with it, as with a photo (empty if none).
+        caption: String,
+        /// Files sent together share a random album id (0 = alone); the
+        /// caption comes with the first.
+        album: u64,
     },
     /// Our current mesh/tunnel approval of the peer (spec §5.2). Sent at
     /// session start and whenever it changes.
@@ -203,15 +212,32 @@ impl AppMessage {
                     name,
                     data,
                     id,
+                    sensitive,
+                    caption,
+                    album,
                 } => {
-                    e.map_len(4 + usize::from(*id != 0))?
-                        .u8(0)?
-                        .uint(kind::FILE)?;
+                    e.map_len(
+                        4 + usize::from(*id != 0)
+                            + usize::from(*sensitive)
+                            + usize::from(!caption.is_empty())
+                            + usize::from(*album != 0),
+                    )?
+                    .u8(0)?
+                    .uint(kind::FILE)?;
                     e.u8(1)?.uint(*sent_ms)?;
                     e.u8(2)?.bytes(data)?;
                     e.u8(3)?.str(name)?;
                     if *id != 0 {
                         e.u8(5)?.uint(*id)?;
+                    }
+                    if *sensitive {
+                        e.u8(6)?.uint(FILE_SENSITIVE)?;
+                    }
+                    if !caption.is_empty() {
+                        e.u8(7)?.str(caption)?;
+                    }
+                    if *album != 0 {
+                        e.u8(8)?.uint(*album)?;
                     }
                 }
                 Self::TunnelOffer { wg_public, port } => {
@@ -264,7 +290,12 @@ impl AppMessage {
     fn size_hint(&self) -> usize {
         match self {
             Self::Text { body, .. } => body.len() + 32,
-            Self::File { name, data, .. } => name.len() + data.len() + 48,
+            Self::File {
+                name,
+                data,
+                caption,
+                ..
+            } => name.len() + data.len() + caption.len() + 64,
             Self::Group(p)
             | Self::Relay(p)
             | Self::Prekeys(p)
@@ -289,6 +320,8 @@ impl AppMessage {
             (None, None, None, None, None, None, None, None);
         let mut five = None;
         let mut conv = None;
+        let mut flags = 0;
+        let (mut caption, mut album) = (None, 0);
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -305,6 +338,9 @@ impl AppMessage {
                 },
                 4 => expiry = Some(d.u32()?),
                 5 => five = Some(d.u64()?),
+                6 => flags = d.u64()?,
+                7 => caption = Some(d.str()?.to_owned()),
+                8 => album = d.u64()?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -375,6 +411,9 @@ impl AppMessage {
                     name: required(name, "file name")?,
                     data,
                     id: five.unwrap_or(0),
+                    sensitive: flags & FILE_SENSITIVE != 0,
+                    caption: caption.unwrap_or_default(),
+                    album,
                 }
             }
             kind::GROUP
@@ -465,6 +504,9 @@ mod tests {
                     name: "big".into(),
                     data: vec![3; MAX_FILE],
                     id: 0,
+                    sensitive: false,
+                    caption: String::new(),
+                    album: 0,
                 }),
             },
             AppMessage::Ack(vec![]),
@@ -496,6 +538,18 @@ mod tests {
                 name: "a.txt".into(),
                 data: vec![0, 1, 2],
                 id: 0,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+            },
+            AppMessage::File {
+                sent_ms: 2,
+                name: "IMG_1.jpg".into(),
+                data: vec![0xFF, 0xD8],
+                id: 9,
+                sensitive: true,
+                caption: "from the summit".into(),
+                album: u64::MAX,
             },
             AppMessage::Approval { approved: true },
             AppMessage::TunnelOffer {

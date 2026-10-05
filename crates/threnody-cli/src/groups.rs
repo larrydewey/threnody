@@ -1,9 +1,9 @@
 //! `/group` commands: MLS groups on the shared [`GroupNode`], which
 //! persists them and delivers their traffic (Appendix F).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use threnody_core::history::FileNote;
 use threnody_core::store::Home;
 use threnody_core::{Identity, PublicIdentity};
@@ -20,7 +20,8 @@ pub const HELP: &str = "\
   /group leave <group>                  leave (or, as owner, delete) a group
   /groups                               list groups and members
   /g <group> <text>                     send to a group
-  /gfile <group> <path>                 send a file to a group";
+  /gfile <group> [-s] <path>... [| caption]
+                                        send files (photos) to a group";
 
 pub struct GroupUi {
     groups: GroupNode,
@@ -128,6 +129,9 @@ impl GroupUi {
                     name: file,
                     data,
                     ours,
+                    sensitive,
+                    caption,
+                    album,
                 } => {
                     let who = if ours {
                         format!("me, on {}", name(&from))
@@ -135,21 +139,27 @@ impl GroupUi {
                         name(&from)
                     };
                     let saved = crate::chat::save_download(&self.downloads, &file, &data);
+                    let mark = if sensitive { " [sensitive]" } else { "" };
                     match &saved {
                         Ok(p) => println!(
-                            "[{}] <{who}> sent {file} ({} bytes) -> {}",
+                            "[{}] <{who}> sent {file}{mark} ({} bytes) -> {}",
                             self.label(&group),
                             data.len(),
                             p.display()
                         ),
                         Err(e) => println!("! could not save {file} from {who}: {e:#}"),
                     }
+                    if !caption.is_empty() {
+                        println!("[{}] <{who}> {caption}", self.label(&group));
+                    }
                     let note = FileNote {
                         name: file,
                         size: data.len() as u64,
                         location: saved.ok().map(|p| p.display().to_string()),
+                        sensitive,
+                        album,
                     };
-                    self.groups.record_file(node, &group, &from, note);
+                    self.groups.record_file(node, &group, &from, note, &caption);
                 }
             }
         }
@@ -310,25 +320,19 @@ impl GroupUi {
         }
     }
 
-    /// `/gfile <group> <path>`.
-    pub async fn send_file(&mut self, node: &Node, args: &str) -> Result<usize> {
-        let (g, path) = args
+    /// `/gfile <group> [-s] <path>... [| caption]`: returns the number of
+    /// files and bytes sent.
+    pub async fn send_file(&mut self, node: &Node, args: &str) -> Result<(usize, usize)> {
+        let (g, rest) = args
             .split_once(' ')
-            .ok_or_else(|| anyhow!("usage: /gfile <group> <path>"))?;
+            .ok_or_else(|| anyhow!("usage: /gfile <group> [-s] <path>... [| caption]"))?;
         let g = self.find(g)?;
-        let path = path.trim();
-        let data = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading {path}"))?;
-        let name = Path::new(path)
-            .file_name()
-            .map_or("file".into(), |n| n.to_string_lossy().into_owned());
-        let len = data.len();
-        let location = std::fs::canonicalize(path)
-            .ok()
-            .map(|p| p.display().to_string());
-        self.groups.send_file(node, &g, &name, data, location)?;
-        Ok(len)
+        let files = crate::chat::read_files(rest).await?;
+        let (n, len) = (files.len(), files.iter().map(|f| f.data.len()).sum());
+        for f in files {
+            self.groups.send_file(node, &g, f)?;
+        }
+        Ok((n, len))
     }
 
     /// `/g <group> <text>`.

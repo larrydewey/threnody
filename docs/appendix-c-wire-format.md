@@ -36,7 +36,8 @@ AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Rela
            / Direct / Tracked / Ack
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 = acknowledgements); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint }  ; sent_ms, body, disappear after (s), sender's message id
-File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint }    ; sent_ms, data (≤ 8 MiB), name, sender's message id
+File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
+             ? 6 => uint, ? 7 => tstr, ? 8 => uint }                   ; flags (1 = sensitive), caption, album id
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
 TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D)
@@ -78,6 +79,12 @@ Texts and files carry the sender's message id (its history entry's local id). Th
 
 `Edit` replaces a message's text, under the same rules and with feature bit 4. The entry keeps its place and is marked edited (history key 12, the time of the edit). Only text can be edited, not files. Both messages are tracked like user content, so they're resent if lost. Deletion is a request: a modified client can keep a copy, and so can a screenshot. Group messages carry no ids yet, so in groups only "delete for me" exists, on that device.
 
+### Photos and files
+
+A file can carry a caption (key 7), a sensitive flag (key 6, bit 1) and an album id (key 8). Files sent together, such as several photos, are sent as separate `File` messages with the same random album id, and the caption travels with the first. Receivers show an album as one message. A sensitive file is shown covered, and is not even decoded until the user opens it. The flag is the sender's request; a receiver can ignore it.
+
+Before a file is sent, the node removes identifying metadata from JPEG, PNG and WebP images (`threnody_core::media`). This covers EXIF (location, camera and serial numbers, times), XMP, IPTC, comments, text chunks, and data after the image such as a motion photo's video. The pixels are not re-encoded. Decoders still get what they need: colour profiles, transparency, animation, and a JPEG's orientation, rewritten as a minimal EXIF block. A damaged image of those types is refused rather than sent with its metadata. Apps convert other image formats (HEIC, AVIF) to JPEG before sending. This is on by default; `--keep-metadata` or the app's toggle turns it off.
+
 ## Padding (spec §9, layer 1)
 
 Before encryption, an `AppMessage` is padded ISO/IEC 7816-4 style: a `0x80` byte, then zeros. The total length is rounded up as follows:
@@ -92,7 +99,7 @@ On stream transports, each frame is prefixed with its length as a `u32` in big-e
 
 ## Local storage
 
-All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A conversation's timer (key 1) is absent until chosen, in which case it follows the node's default (a week unless changed). 0 means *off* on purpose, and any other value is seconds. A peer that turns its timer off sends messages without `expires_in_s`, and the other side records that as 0. A file transfer is stored as an entry with empty text and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location }`). Outgoing entries may have a local id (key 7) and a delivered flag (key 8, see *Acknowledgements*). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
+All local state other than the two files below is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (`hist-p-<account or device>` and `hist-g-<group>`). Message history keeps at most 10,000 entries per conversation. A conversation's timer (key 1) is absent until chosen, in which case it follows the node's default (a week unless changed). 0 means *off* on purpose, and any other value is seconds. A peer that turns its timer off sends messages without `expires_in_s`, and the other side records that as 0. A file transfer is stored as an entry whose text is its caption (usually empty) and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location, ? 3 => sensitive, ? 4 => album }`). Outgoing entries may have a local id (key 7) and a delivered flag (key 8, see *Acknowledgements*). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute.
 
 Both files are written with mode 0600 inside a directory with mode 0700.
 

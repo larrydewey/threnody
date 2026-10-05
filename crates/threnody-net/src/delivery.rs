@@ -322,6 +322,9 @@ mod tests {
                 name: "big".into(),
                 data: vec![0; MAX_PERSISTED],
                 id: 0,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
             },
             Tag::NONE,
         );
@@ -361,6 +364,9 @@ mod tests {
             name: "f".into(),
             data: vec![0; 8 * 1024 * 1024],
             id: 0,
+            sensitive: false,
+            caption: String::new(),
+            album: 0,
         };
         for _ in 0..6 {
             d.track(&p, big.clone(), Tag::NONE);

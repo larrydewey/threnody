@@ -16,6 +16,7 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
@@ -23,6 +24,7 @@ import android.widget.TextView
 import android.widget.Toast
 import java.util.Date
 import java.util.concurrent.Executors
+import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
@@ -109,20 +111,20 @@ class ChatActivity : Activity() {
             setTextColor(color(R.color.text))
             setHintTextColor(color(R.color.muted))
         }
-        fun button(res: Int, label: String, tint: Int, onClick: () -> Unit) = ImageButton(this).apply {
+        fun button(res: Int, label: String, tint: Int, onClick: (View) -> Unit) = ImageButton(this).apply {
             setImageResource(res)
             imageTintList = android.content.res.ColorStateList.valueOf(color(tint))
             contentDescription = label
             tooltipText = label
             background = getDrawable(android.R.drawable.list_selector_background)
-            setOnClickListener { onClick() }
+            setOnClickListener { onClick(it) }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.BOTTOM
             setBackgroundColor(color(R.color.bar))
             setPadding(dp(4), dp(6), dp(4), dp(6))
-            addView(button(R.drawable.ic_attach, "Send a file", R.color.muted) { pickFile() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(button(R.drawable.ic_attach, "Send photos or files", R.color.muted) { attach(it) }, LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             addView(button(R.drawable.ic_send, "Send", R.color.accent) { send() }, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
@@ -321,12 +323,12 @@ class ChatActivity : Activity() {
             messages.addView(label(text, 14f, R.color.muted).apply { gravity = Gravity.CENTER; setPadding(dp(24), dp(48), dp(24), 0) }, matchWrap)
         }
         var lastSender: String? = null
-        for (item in items) {
-            val e = item.entry
+        for (run in albums(items)) {
+            val e = run.first().entry
             // In groups, name the sender above the first of their run of messages.
             val sender = if (group != null && !e.outgoing && e.device != lastSender) names[e.device] else null
             lastSender = if (e.outgoing) null else e.device
-            messages.addView(bubble(item, sender))
+            messages.addView(bubble(run, sender))
         }
         if (atEnd || items.lastOrNull()?.sending == true) toBottom()
     }
@@ -334,7 +336,82 @@ class ChatActivity : Activity() {
     // Not fullScroll(): that moves focus to the last bubble, away from the compose field.
     private fun toBottom() = scroll.post { scroll.scrollTo(0, messages.height) }
 
-    private fun bubble(item: Item, sender: String?): View {
+    /** Consecutive files of one album from one sender go in one bubble. */
+    private fun albums(items: List<Item>): List<List<Item>> {
+        val out = mutableListOf<MutableList<Item>>()
+        for (item in items) {
+            val album = item.entry.file?.album ?: 0uL
+            val last = out.lastOrNull()?.last()?.entry
+            if (album != 0uL && last?.file?.album == album && last.device == item.entry.device) {
+                out.last().add(item)
+            } else {
+                out.add(mutableListOf(item))
+            }
+        }
+        return out
+    }
+
+    /** Photos of one message: one large, or a grid of several. */
+    private fun photos(run: List<Item>): View {
+        val files = run.mapNotNull { it.entry.file?.let { f -> f to it.entry } }
+        val width = minOf(dp(260), resources.displayMetrics.widthPixels - dp(120))
+        val single = files.size == 1
+        val side = if (single) width else (width - dp(4)) / 2
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for (row in files.chunked(if (single) 1 else 2)) {
+            val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for ((i, pair) in row.withIndex()) {
+                val (f, e) = pair
+                val cell = photo(f, e, side, if (single) dp(320) else side)
+                line.addView(cell, LinearLayout.LayoutParams(side, if (single) WRAP_CONTENT else side).apply {
+                    if (i == 1) marginStart = dp(4)
+                })
+            }
+            grid.addView(line, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { bottomMargin = dp(4) })
+        }
+        return grid
+    }
+
+    /**
+     * One photo. A sensitive one is an opaque cover: it isn't even decoded
+     * until opened, so nothing of it shows in the chat.
+     */
+    private fun photo(f: uniffi.threnody_ffi.FileInfo, e: HistoryEntry, width: Int, limit: Int): View {
+        val location = f.location
+        val open = View.OnClickListener {
+            if (location == null) return@OnClickListener
+            startActivity(Intent(this, ImageActivity::class.java)
+                .putExtra(ImageActivity.LOCATION, location)
+                .putExtra(ImageActivity.NAME, f.name)
+                .putExtra(ImageActivity.CAPTION, e.text))
+        }
+        if (f.sensitive || location == null) {
+            return label(if (location == null) "📷\nnot available" else "🔒\nSensitive photo\nTap to view", 14f, R.color.bubble_in).apply {
+                gravity = Gravity.CENTER
+                setTypeface(typeface, Typeface.BOLD)
+                // Opaque, in the text colour: unmistakably covered, in either theme.
+                background = rounded(color(R.color.text), dp(12).toFloat())
+                height = if (limit == width) width else dp(180)
+                contentDescription = if (location == null) "Photo not available" else "Sensitive photo, tap to view"
+                setOnClickListener(open)
+            }
+        }
+        val view = ImageView(this).apply {
+            adjustViewBounds = true
+            maxHeight = limit
+            scaleType = if (limit == width) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
+            background = rounded(color(R.color.surface), dp(12).toFloat())
+            clipToOutline = true
+            minimumHeight = dp(120)
+            contentDescription = e.text.ifBlank { "Photo" }
+            setOnClickListener(open)
+        }
+        Media.thumbnail(this, location, width) { b -> runOnUiThread { view.setImageBitmap(b); view.minimumHeight = 0 } }
+        return view
+    }
+
+    private fun bubble(run: List<Item>, sender: String?): View {
+        val item = run.first()
         val e = item.entry
         val outgoing = e.outgoing
         val fg = color(if (outgoing) R.color.on_bubble_out else R.color.text)
@@ -348,7 +425,21 @@ class ChatActivity : Activity() {
         }
         val file = e.file
         val time = if (item.sending) "sending…" else time(e.atMs.toLong())
-        val meta = if (file == null) {
+        val pictures = run.all { it.entry.file?.let { f -> Media.isImage(f.name) } == true }
+        val meta = if (file != null && pictures) {
+            body.setPadding(dp(4), dp(4), dp(4), dp(6))
+            body.addView(photos(run))
+            if (e.text.isNotBlank()) {
+                body.addView(TextView(this).apply {
+                    text = e.text
+                    textSize = 16f
+                    setTextColor(fg)
+                    setTextIsSelectable(true)
+                    setPadding(dp(10), dp(4), dp(10), 0)
+                })
+            }
+            time
+        } else if (file == null) {
             body.addView(TextView(this).apply {
                 text = e.text
                 textSize = 16f
@@ -357,16 +448,27 @@ class ChatActivity : Activity() {
             })
             time
         } else {
-            body.addView(TextView(this).apply {
-                text = "📎 ${file.name}"
-                textSize = 16f
-                setTextColor(fg)
-                setTypeface(typeface, Typeface.BOLD)
-            })
-            val uri = file.location?.let(Uri::parse)
-            if (uri != null) body.setOnClickListener { open(uri) }
-            Formatter.formatShortFileSize(this, file.size.toLong()) + " · " + time +
-                if (uri != null && !outgoing) " · in Downloads" else ""
+            for (r in run) {
+                val f = r.entry.file ?: continue
+                body.addView(TextView(this).apply {
+                    text = (if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name
+                    textSize = 16f
+                    setTextColor(fg)
+                    setTypeface(typeface, Typeface.BOLD)
+                    val uri = f.location?.let(Uri::parse)
+                    if (uri != null) setOnClickListener { open(uri) }
+                })
+            }
+            if (e.text.isNotBlank()) {
+                body.addView(TextView(this).apply {
+                    text = e.text
+                    textSize = 16f
+                    setTextColor(fg)
+                    setTextIsSelectable(true)
+                })
+            }
+            Formatter.formatShortFileSize(this, run.sumOf { it.entry.file?.size ?: 0uL }.toLong()) + " · " + time +
+                if (file.location != null && !outgoing) " · in Downloads" else ""
         }
         // One tick once sent, two once delivered: to a device of the
         // contact, or to every member of a group (with a count until then).
@@ -375,7 +477,7 @@ class ChatActivity : Activity() {
         val tick = when {
             !outgoing || item.sending -> ""
             elsewhere -> " · from your other device"
-            e.delivered -> " ✓✓"
+            run.all { it.entry.delivered } -> " ✓✓"
             group != null && e.deliveredTo > 0u -> " ✓ ${e.deliveredTo}/${e.recipients}"
             else -> " ✓"
         }
@@ -388,7 +490,14 @@ class ChatActivity : Activity() {
             gravity = Gravity.END
         }, matchWrap)
         if (!item.sending) {
-            body.setOnLongClickListener { deleteMessage(e); true }
+            val longPress = View.OnLongClickListener { deleteMessage(run.map { it.entry }); true }
+            body.setOnLongClickListener(longPress)
+            // Photos take the long press too, not just the bubble's edge.
+            fun all(v: View) {
+                if (v is ImageView || (v is TextView && v.hasOnClickListeners())) v.setOnLongClickListener(longPress)
+                if (v is android.view.ViewGroup) for (i in 0 until v.childCount) all(v.getChildAt(i))
+            }
+            all(body)
         }
         return LinearLayout(this).apply {
             gravity = if (outgoing) Gravity.END else Gravity.START
@@ -397,10 +506,11 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** Delete for me, or (our own 1:1 messages) for everyone. */
-    private fun deleteMessage(e: HistoryEntry) {
+    /** Delete for me, or (our own 1:1 messages) for everyone; an album goes whole. */
+    private fun deleteMessage(entries: List<HistoryEntry>) {
+        val e = entries.first()
         val g = group
-        val mine = g == null && e.outgoing && e.device == myDevice && e.id != 0uL
+        val mine = g == null && e.outgoing && e.device == myDevice && entries.all { it.id != 0uL }
         val canEdit = mine && e.file == null
         val options = buildList {
             if (canEdit) add("Edit")
@@ -414,11 +524,12 @@ class ChatActivity : Activity() {
                 worker.execute {
                     run("delete") {
                         when {
-                            g != null -> node.deleteGroupEntry(g, e.atMs, e.device)
-                            e.id != 0uL -> node.deleteMessages(device, listOf(e.id), everyone)
-                            else -> node.deleteEntry(device, e.atMs, e.device)
+                            g != null -> entries.forEach { node.deleteGroupEntry(g, it.atMs, it.device) }
+                            entries.all { it.id != 0uL } -> node.deleteMessages(device, entries.map { it.id }, everyone)
+                            else -> entries.forEach { node.deleteEntry(device, it.atMs, it.device) }
                         }
                     }
+                    entries.forEach { Media.forget(this, it.file?.location) }
                     if (everyone) runOnUiThread {
                         Toast.makeText(this, "Deleted. Their devices delete it too, if they're running a current version.",
                             Toast.LENGTH_LONG).show()
@@ -479,35 +590,143 @@ class ChatActivity : Activity() {
         }
     }
 
-    private fun pickFile() {
-        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), PICK_FILE)
+    private fun attach(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
+            menu.add("File").setOnMenuItemClickListener { pick(photos = false); true }
+        }.show()
     }
+
+    private fun pick(photos: Boolean) {
+        val intent = if (photos && android.os.Build.VERSION.SDK_INT >= 33) {
+            // The system photo picker: no storage permission needed.
+            Intent(android.provider.MediaStore.ACTION_PICK_IMAGES)
+                .putExtra(android.provider.MediaStore.EXTRA_PICK_IMAGES_MAX, MAX_PICK)
+        } else {
+            Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType(if (photos) "image/*" else "*/*")
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        startActivityForResult(intent, PICK_FILE)
+    }
+
+    /** A picked file, read and ready to send. */
+    private class Picked(val name: String, val data: ByteArray, val uri: Uri)
 
     @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        val uri = data?.data ?: return
-        if (requestCode != PICK_FILE || resultCode != RESULT_OK) return
-        // Keep access so the file can be opened from the chat later.
-        try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+        if (requestCode != PICK_FILE || resultCode != RESULT_OK || data == null) return
+        val clip = data.clipData
+        val uris = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri } else listOfNotNull(data.data)
+        if (uris.isEmpty()) return
         worker.execute {
             try {
-                val (name, size) = contentResolver.query(uri, null, null, null, null)?.use { c ->
-                    c.moveToFirst()
-                    c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) to
-                        c.getLong(c.getColumnIndexOrThrow(OpenableColumns.SIZE))
-                } ?: ("file" to -1L)
-                if (size > node.maxFileSize().toLong()) {
-                    throw IllegalArgumentException("files can be at most " +
-                        Formatter.formatShortFileSize(this, node.maxFileSize().toLong()))
+                val max = node.maxFileSize().toLong()
+                val picked = uris.take(MAX_PICK).map { uri ->
+                    // Keep access so a sent file can be opened from the chat later.
+                    try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+                    val (name, size) = contentResolver.query(uri, null, null, null, null)?.use { c ->
+                        c.moveToFirst()
+                        c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) to
+                            c.getLong(c.getColumnIndexOrThrow(OpenableColumns.SIZE))
+                    } ?: ("file" to -1L)
+                    if (size > max * 2) throw IllegalArgumentException("$name is too large")
+                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw IllegalArgumentException("couldn't read $name")
+                    val (n, d) = Media.prepare(this, name, bytes)
+                    if (d.size > max) {
+                        throw IllegalArgumentException("$n is larger than " + Formatter.formatShortFileSize(this, max))
+                    }
+                    Picked(n, d, uri)
                 }
-                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@execute
-                val g = group
-                if (g != null) node.sendGroupFile(g, name, bytes, uri.toString())
-                else node.sendFile(device, name, bytes, uri.toString())
-                refresh()
+                runOnUiThread { sendSheet(picked) }
             } catch (e: Exception) {
-                runOnUiThread { Toast.makeText(this, "Couldn't send file: ${e.message}", Toast.LENGTH_LONG).show() }
+                runOnUiThread { Toast.makeText(this, "Couldn't send: ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    /** Previews what's about to go, with a caption and the sensitive choice. */
+    private fun sendSheet(picked: List<Picked>) {
+        val images = picked.count { Media.isImage(it.name) }
+        val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (p in picked) {
+            val cell = if (Media.isImage(p.name)) {
+                ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    background = rounded(color(R.color.surface), dp(8).toFloat())
+                    clipToOutline = true
+                    contentDescription = p.name
+                    worker.execute {
+                        val b = Media.decode(android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)), dp(160))
+                        runOnUiThread { setImageBitmap(b) }
+                    }
+                }
+            } else {
+                label("📎\n${p.name}", 12f, R.color.text).apply {
+                    gravity = Gravity.CENTER
+                    background = rounded(color(R.color.surface), dp(8).toFloat())
+                }
+            }
+            strip.addView(cell, LinearLayout.LayoutParams(dp(80), dp(80)).apply { marginEnd = dp(6) })
+        }
+        val caption = EditText(this).apply {
+            hint = "Add a message"
+            setText(compose.text)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            maxLines = 4
+        }
+        val sensitive = android.widget.CheckBox(this).apply {
+            text = if (images > 0) "Sensitive: they see it covered until they tap it" else "Sensitive: shown covered until opened"
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(android.widget.HorizontalScrollView(this@ChatActivity).apply { addView(strip) }, matchWrap)
+            addView(caption, matchWrap)
+            addView(sensitive, matchWrap)
+            if (images > 0 && Privacy.stripMetadata(this@ChatActivity)) {
+                addView(label("Location and camera details are removed before sending.", 12f, R.color.muted), matchWrap)
+            }
+        }
+        val what = when {
+            images == picked.size -> if (images == 1) "1 photo" else "$images photos"
+            picked.size == 1 -> "1 file"
+            else -> "${picked.size} files"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Send $what")
+            .setView(android.widget.ScrollView(this).apply { addView(body) })
+            .setPositiveButton("Send") { _, _ ->
+                compose.setText("")
+                sendFiles(picked, caption.text.toString().trim(), sensitive.isChecked)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun sendFiles(picked: List<Picked>, caption: String, sensitive: Boolean) {
+        val album = if (picked.size > 1) uniffi.threnody_ffi.albumId() else 0uL
+        worker.execute {
+            val g = group
+            var failed: String? = null
+            for ((i, p) in picked.withIndex()) {
+                val options = FileOptions(sensitive, if (i == 0) caption else "", album)
+                // Keep our own copy of a photo privately, so the chat can show it.
+                val location = if (Media.isImage(p.name)) Media.savePrivate(this, p.name, p.data) else p.uri.toString()
+                try {
+                    if (g != null) node.sendGroupFile(g, p.name, p.data, location, options)
+                    else node.sendFile(device, p.name, p.data, location, options)
+                } catch (e: Exception) {
+                    Media.forget(this, location)
+                    failed = e.message
+                }
+                refresh()
+            }
+            if (failed != null) runOnUiThread {
+                Toast.makeText(this, "Couldn't send: $failed", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -787,6 +1006,8 @@ class ChatActivity : Activity() {
         const val DEVICE = "device"
         const val GROUP = "group"
         private const val PICK_FILE = 1
+        /** Most photos or files sent at once. */
+        private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2
     }
 }

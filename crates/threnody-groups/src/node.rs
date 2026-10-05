@@ -17,6 +17,7 @@
 use threnody_core::history::{ConversationId, Entry, FileNote};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
+use threnody_net::history::OutgoingFile;
 use threnody_net::{Node, Tag};
 
 use crate::{Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, Output};
@@ -78,6 +79,9 @@ pub enum Update {
         name: String,
         data: Vec<u8>,
         ours: bool,
+        sensitive: bool,
+        caption: String,
+        album: u64,
     },
 }
 
@@ -224,27 +228,25 @@ impl GroupNode {
         self.send(node, group, &Content::Text(text.to_owned()), None)
     }
 
-    /// Sends a file to every other member and records it (with `location`,
-    /// where it is on this device) in the group's history.
-    pub fn send_file(
-        &mut self,
-        node: &Node,
-        group: &GroupId,
-        name: &str,
-        data: Vec<u8>,
-        location: Option<String>,
-    ) -> Result<()> {
-        if data.len() > threnody_core::message::MAX_FILE {
-            return Err(GroupError::Unexpected("file too large"));
-        }
+    /// Sends a file to every other member and records it (with
+    /// `file.location`, where it is on this device) in the group's history.
+    pub fn send_file(&mut self, node: &Node, group: &GroupId, file: OutgoingFile) -> Result<()> {
+        let data = node
+            .prepare_file(file.data)
+            .map_err(|e| GroupError::File(e.to_string()))?;
         let note = FileNote {
-            name: name.to_owned(),
+            name: file.name.clone(),
             size: data.len() as u64,
-            location,
+            location: file.location,
+            sensitive: file.sensitive,
+            album: file.album,
         };
         let content = Content::File {
-            name: name.to_owned(),
+            name: file.name,
             data,
+            sensitive: file.sensitive,
+            caption: file.caption,
+            album: file.album,
         };
         self.send(node, group, &content, Some(note))
     }
@@ -268,8 +270,7 @@ impl GroupNode {
                 outgoing: true,
                 device: *node.identity().as_bytes(),
                 text: match content {
-                    Content::Text(t) => t.clone(),
-                    Content::File { .. } => String::new(),
+                    Content::Text(t) | Content::File { caption: t, .. } => t.clone(),
                 },
                 offline: false,
                 expires_at_ms: node
@@ -289,7 +290,14 @@ impl GroupNode {
 
     /// Records a file `from` sent to `group` (see [`Update::File`]), once
     /// it has been saved at `file.location`.
-    pub fn record_file(&self, node: &Node, group: &GroupId, from: &PublicIdentity, file: FileNote) {
+    pub fn record_file(
+        &self,
+        node: &Node,
+        group: &GroupId,
+        from: &PublicIdentity,
+        file: FileNote,
+        caption: &str,
+    ) {
         let conv = ConversationId::Group(*group);
         let now = threnody_core::now_ms();
         node.append(
@@ -298,7 +306,7 @@ impl GroupNode {
                 at_ms: now,
                 outgoing: node.is_own_device(from),
                 device: *from.as_bytes(),
-                text: String::new(),
+                text: caption.to_owned(),
                 offline: false,
                 expires_at_ms: node
                     .effective_timer(conv)
@@ -577,12 +585,18 @@ impl GroupNode {
                 from,
                 name,
                 data,
+                sensitive,
+                caption,
+                album,
             } => Update::File {
                 group,
                 from,
                 name,
                 data,
                 ours: node.is_own_device(&from),
+                sensitive,
+                caption,
+                album,
             },
         });
     }
