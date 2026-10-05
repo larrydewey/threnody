@@ -553,68 +553,37 @@ class ChatActivity : Activity() {
             add("Delete for me")
             if (mine) add("Delete for everyone")
         }
-        lateinit var dialog: AlertDialog
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(4))
-        }
-        // Reactions first: a row of quick ones, and any other emoji.
-        if (e.id != 0uL) {
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            val have = e.reactions.filter { it.mine }.map { it.emoji }.toSet()
-            for (emoji in QUICK_REACTIONS + "＋") {
-                row.addView(label(emoji, 24f).apply {
-                    gravity = Gravity.CENTER
-                    contentDescription = if (emoji == "＋") "Another reaction" else "React $emoji"
-                    if (emoji in have) background = rounded(color(R.color.divider), dp(20).toFloat())
-                    setOnClickListener {
-                        dialog.dismiss()
-                        if (emoji == "＋") otherReaction(e) else react(e, emoji, emoji !in have)
-                    }
-                }, LinearLayout.LayoutParams(0, dp(48), 1f))
-            }
-            box.addView(row, matchWrap)
-        }
         fun pick(option: String) {
-                if (option == "Edit") return editMessage(e)
-                if (option == "Copy text") {
-                    getSystemService(android.content.ClipboardManager::class.java)
-                        ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
-                    return
-                }
-                if (option == "Select text") return selectText(e.text)
-                val everyone = option == "Delete for everyone"
-                worker.execute {
-                    run("delete") {
-                        when {
-                            g != null -> entries.forEach { node.deleteGroupEntry(g, it.atMs, it.device) }
-                            entries.all { it.id != 0uL } -> node.deleteMessages(device, entries.map { it.id }, everyone)
-                            else -> entries.forEach { node.deleteEntry(device, it.atMs, it.device) }
-                        }
-                    }
-                    entries.forEach { Media.forget(this, it.file?.location) }
-                    if (everyone) runOnUiThread {
-                        Toast.makeText(this, "Deleted. Their devices delete it too, if they're running a current version.",
-                            Toast.LENGTH_LONG).show()
+            if (option == "Edit") return editMessage(e)
+            if (option == "Copy text") {
+                getSystemService(android.content.ClipboardManager::class.java)
+                    ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
+                return
+            }
+            if (option == "Select text") return selectText(e.text)
+            val everyone = option == "Delete for everyone"
+            worker.execute {
+                run("delete") {
+                    when {
+                        g != null -> entries.forEach { node.deleteGroupEntry(g, it.atMs, it.device) }
+                        entries.all { it.id != 0uL } -> node.deleteMessages(device, entries.map { it.id }, everyone)
+                        else -> entries.forEach { node.deleteEntry(device, it.atMs, it.device) }
                     }
                 }
-        }
-        for (option in options) {
-            box.addView(label(option, 16f).apply {
-                minHeight = dp(48)
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(8), 0, dp(8), 0)
-                background = getDrawable(android.R.drawable.list_selector_background)
-                setOnClickListener {
-                    dialog.dismiss()
-                    pick(option)
+                entries.forEach { Media.forget(this, it.file?.location) }
+                if (everyone) runOnUiThread {
+                    Toast.makeText(this, "Deleted. Their devices delete it too, if they're running a current version.",
+                        Toast.LENGTH_LONG).show()
                 }
-            }, matchWrap)
+            }
         }
-        dialog = AlertDialog.Builder(this)
-            .setView(box)
-            .setNegativeButton("Cancel", null)
-            .show()
+        // Reactions toggle in place (the panel stays open); actions close it.
+        ReactionPanel(
+            this,
+            mine = e.reactions.filter { it.mine }.map { it.emoji }.toSet(),
+            canReact = e.id != 0uL,
+            actions = options.map { option -> option to { pick(option) } },
+        ) { emoji, add -> react(e, emoji, add) }.show()
     }
 
     /** Shows a message's text where any part of it can be selected and copied. */
@@ -641,25 +610,6 @@ class ChatActivity : Activity() {
                 if (!ok) throw IllegalStateException("that message is gone")
             }
         }
-    }
-
-    /** Any emoji, from the keyboard's emoji panel. */
-    private fun otherReaction(e: HistoryEntry) {
-        val field = EditText(this).apply {
-            hint = "An emoji"
-            textSize = 24f
-            isSingleLine = true
-        }
-        AlertDialog.Builder(this)
-            .setTitle("React with")
-            .setView(LinearLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(field, matchWrap) })
-            .setPositiveButton("React") { _, _ ->
-                val emoji = field.text.toString().trim()
-                if (emoji.isNotEmpty()) react(e, emoji, true)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-        field.requestFocus()
     }
 
     /** Reactions under a message: one chip per emoji; ours stand out and tap to take back. */
@@ -1232,7 +1182,6 @@ class ChatActivity : Activity() {
         const val GROUP = "group"
         const val PERSONA = "persona"
         private const val PICK_FILE = 1
-        private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2

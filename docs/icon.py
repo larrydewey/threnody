@@ -72,7 +72,6 @@ open(os.path.join(res, "drawable/ic_launcher_foreground.xml"), "w").write(f'''<?
         android:translateY="1.5" />
     <path android:fillColor="#FFFFFFFF" android:pathData="{fmt(body)} {fmt(tail)}" />
 {bars_xml}
-  </group>
 </vector>
 '''.replace('android:translateY="1.5" />', '/>').replace(
     f'<path android:fillColor="#33000000" android:pathData="{fmt(body)} {fmt(tail)}"\n        />',
