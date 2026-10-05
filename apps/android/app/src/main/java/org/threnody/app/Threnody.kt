@@ -115,6 +115,8 @@ object Threnody {
         applyPrivacyTo(ctx, n)
         pump(ctx, n, rec.id)
         say("anonymous identity ${rec.id.take(6)} listening on port ${addr.substringAfterLast(':')}")
+        // The same directories as the main identity, through links of its own.
+        Thread { try { DirectoryUi.followMain(ctx, n) } catch (_: Exception) {} }.apply { isDaemon = true }.start()
         return n
     }
 
@@ -179,6 +181,7 @@ object Threnody {
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
         node.setStripMetadata(Privacy.stripMetadata(ctx))
         node.setReachInternet(Privacy.reachInternet(ctx))
+        node.setUseVolunteers(Privacy.useVolunteers(ctx))
     }
 
     /** What a notification or the chat list says for a file. */
@@ -544,6 +547,23 @@ object Threnody {
                     say("* ${short(e.from)} invites us to group ${e.name}")
                     ThrenodyService.notifyGroup(ctx, e.group, e.name, "${nameOf(node, e.from)} invites you to join", persona)
                 }
+                is NodeEvent.CredentialOffered -> {
+                    say("* ${short(e.offer.peer)} offers a credential (${e.offer.schema})")
+                    if (visible == 0 || e.offer.peer !in visibleChat) {
+                        val contacts = node.contacts()
+                        ThrenodyService.notifyMessage(ctx, key(contacts, e.offer.peer), e.offer.peer,
+                            nameOf(node, e.offer.peer), "Offers you a credential", persona)
+                    }
+                }
+                is NodeEvent.CredentialAsked -> {
+                    say("* ${short(e.ask.peer)} asks for a proof (${e.ask.schema})")
+                    if (visible == 0 || e.ask.peer !in visibleChat) {
+                        val contacts = node.contacts()
+                        ThrenodyService.notifyMessage(ctx, key(contacts, e.ask.peer), e.ask.peer,
+                            nameOf(node, e.ask.peer), "Asks you to prove something", persona)
+                    }
+                }
+                is NodeEvent.VolunteerNote -> say("* ${e.note}")
                 is NodeEvent.WifiDirectOffer -> WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
                 is NodeEvent.WifiDirectRequested -> {
                     say("* ${short(e.peer)} asks for a Wi-Fi Direct link")

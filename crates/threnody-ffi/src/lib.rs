@@ -21,7 +21,11 @@ uniffi::setup_scaffolding!();
 
 mod groups;
 mod persona;
+mod volunteer;
 pub use persona::{PersonaRecord, ProfileAttr};
+pub use volunteer::{
+    CredentialAskRecord, CredentialOfferRecord, CredentialRecord, DirectoryRecord,
+};
 
 pub use groups::{GroupInfo, GroupInvite};
 use threnody_groups::node::GroupNode;
@@ -357,6 +361,40 @@ pub enum NodeEvent {
         from: String,
         added: u32,
     },
+    /// Progress with relay directories or volunteering, for logs.
+    VolunteerNote {
+        note: String,
+    },
+    /// `peer` offers us a credential: `accept_credential_offer(id)` or
+    /// `decline_credential(id)`.
+    CredentialOffered {
+        offer: CredentialOfferRecord,
+    },
+    /// A credential we accepted arrived.
+    CredentialReceived {
+        peer: String,
+        schema: String,
+    },
+    /// `peer` asks us to prove attributes: `present_credential` or
+    /// `decline_credential`.
+    CredentialAsked {
+        ask: CredentialAskRecord,
+    },
+    /// `peer` proved attributes we asked for (exchange `id`). The
+    /// pseudonym is the same each time that credential is shown to us.
+    CredentialPresented {
+        id: u64,
+        peer: String,
+        issuer: String,
+        schema: String,
+        attributes: Vec<ProfileAttr>,
+        pseudonym: String,
+    },
+    CredentialFailed {
+        id: u64,
+        peer: String,
+        reason: String,
+    },
     /// Anything else, described for logs.
     Other {
         description: String,
@@ -556,6 +594,34 @@ fn convert(e: Event) -> NodeEvent {
             identity: fp(&identity),
             invite,
         },
+        Event::VolunteerNote { note } => NodeEvent::VolunteerNote { note },
+        Event::CredentialOffered { offer } => NodeEvent::CredentialOffered {
+            offer: volunteer::offer_record(offer),
+        },
+        Event::CredentialReceived { peer, schema } => NodeEvent::CredentialReceived {
+            peer: fp(&peer),
+            schema,
+        },
+        Event::CredentialAsked { ask } => NodeEvent::CredentialAsked {
+            ask: volunteer::ask_record(ask),
+        },
+        Event::CredentialPresented { peer, id, verified } => NodeEvent::CredentialPresented {
+            id,
+            peer: fp(&peer),
+            issuer: fp(&verified.issuer),
+            schema: verified.schema,
+            attributes: persona::attrs(&verified.attributes),
+            pseudonym: verified
+                .pseudonym
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        },
+        Event::CredentialFailed { peer, id, reason } => NodeEvent::CredentialFailed {
+            id,
+            peer: fp(&peer),
+            reason,
+        },
         Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
             from: fp(&from),
             added: u32::try_from(added).unwrap_or(u32::MAX),
@@ -619,7 +685,7 @@ impl ThrenodyNode {
         });
     }
 
-    fn resolve(&self, peer: &str) -> Result<PublicIdentity> {
+    pub(crate) fn resolve(&self, peer: &str) -> Result<PublicIdentity> {
         match self.node.contacts().find(peer) {
             Lookup::Found(c) => Ok(c.key),
             Lookup::None => Err(fail(format!("no contact matches {peer:?}"))),

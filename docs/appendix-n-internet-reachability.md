@@ -186,7 +186,7 @@ The CLI's `/status` and the app's Diagnostics screen show whether the node is in
 
 ## Later: relays take over most of this
 
-Once a volunteer relay network has critical mass (spec §9 layer 2; "volunteer relay directories" in the README), reachability changes:
+Volunteer relays and directories now exist (Appendix P), but circuits through them still end by dialing the destination's address. Once a volunteer relay network has critical mass, reachability can change further:
 
 - **Relays become the default path.** A device behind NAT keeps one outgoing connection to a relay, and contacts reach it there, as Tor onion services do. That also hides each side's IP address from the other, which a direct path can't, so it suits anonymous identities too.
 - **Rendezvous remains, in a smaller role.** A contact still has to learn which relay to use, through a relay directory or, as a fallback, the DHT records described here.

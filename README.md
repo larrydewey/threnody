@@ -4,11 +4,13 @@
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
 
-**Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake and ratchet are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Apps can embed a node through generated Kotlin, Swift and Python bindings. Over Bluetooth LE, approved contacts recognise each other's private beacons and connect without any taps. A Pixel 8a and a laptop have chatted this way, and the phone keeps its sessions while in the background. Relays work across transports, so a phone with only a Bluetooth link can reach peers that its contacts reach over IP. Sessions over Bluetooth can be upgraded to Wi-Fi Direct for bandwidth.
+**Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends, through approved contacts or through volunteer relays listed by directories you subscribe to, each paid with an anonymous token. Zero-knowledge credentials (BBS, with post-quantum-signed issuance) let someone prove chosen attributes another person vouched for, and nothing else. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake, ratchet, credentials and relay tokens are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Apps can embed a node through generated Kotlin, Swift and Python bindings. Over Bluetooth LE, approved contacts recognise each other's private beacons and connect without any taps. A Pixel 8a and a laptop have chatted this way, and the phone keeps its sessions while in the background. Relays work across transports, so a phone with only a Bluetooth link can reach peers that its contacts reach over IP. Sessions over Bluetooth can be upgraded to Wi-Fi Direct for bandwidth.
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
 ## Quick start
+
+For a graphical messenger on Linux, run `apps/linux/install.sh` and start Threnody from your app menu ([details](apps/linux/README.md)). It shares its identity with the CLI. The rest of this section uses the CLI.
 
 ```sh
 cargo build --release
@@ -27,6 +29,10 @@ threnody --home ~/.thr-a run --no-listen -c 'threnody://<fingerprint>@192.0.2.7:
 Inside `run`, any line you type goes to the current peer. The available commands are below. Groups use `/group new|invite|accept|decline|remove`, `/groups` and `/g <group> <text>`. `/relay <contact|fingerprint|invite>` reaches a peer through approved relays, and `/connect` falls back to relays when a direct dial fails. Text sent to a contact who isn't connected is sealed and left with mutual contacts, who deliver it when that contact returns. `/ble scan` finds nearby Threnody devices over Bluetooth LE, and `/ble connect <n>` opens a session over the radio (Linux, BlueZ). `run --ble` makes a Linux machine advertise a private beacon, accept Bluetooth sessions, and connect to approved contacts it hears. The Android sample app advertises after you tap *Start Bluetooth*, and it can scan and dial. With `run --wifi-direct`, `/wifi-direct request` asks the current (nearby, approved) peer to host a Wi-Fi Direct group, and the laptop joins it through NetworkManager. The session then moves to the faster link.
 
 `/onion <peer> [min-relays]` builds an onion circuit (two relays by default) so no single relay learns both ends.
+
+**Volunteer relays and directories.** Without enough approved contacts to relay through (a new user, or an anonymous identity), circuits can go through volunteer relays instead. `/dir add <threnody-dir://…>` subscribes to a relay directory. The client fetches its signed list of relays and anonymous tokens over a link that shows the directory an address, never who you are. When contacts can't make a path, contacts are then reached through two volunteer relays, each paid with a token it can't link to you or to your other circuits; `/vonion <peer>` does it on demand. A relay is used only if enough of your directories list it (`--directory-threshold`). `run --volunteer-relay <public host:port>` volunteers this machine as a relay, and `run --serve-directory <public host:port>` runs a directory and prints its link. See [Appendix P](docs/appendix-p-volunteer-relays.md).
+
+**Credentials.** Anyone can vouch for attributes of someone else with a zero-knowledge credential: `/cred offer <peer> <schema> key=value…`. The holder later proves just the attributes it chooses, `/cred present`, when a verifier asks with `/cred ask <peer> <schema> <keys>`. Proofs can't be linked to each other or to the issuance, except that each verifier sees a stable pseudonym of its own. See [Appendix O](docs/appendix-o-credentials.md).
 
 `/history [peer] [n]` shows recent messages, numbered and stored encrypted. `/del <n>` deletes message *n* of that list on all your devices, and `/del <n> all` deletes one of your own messages for everyone too. `/edit <n> <text>` edits one of your own messages everywhere. `/react <n> <emoji>` adds a reaction (several per message are fine; the same command again takes it back). Messages stay unless you choose a timer. `/disappear 1h` (or `30s`, `10m`, `1d`, `1w`, `off`) sets one for the current chat, and the peer adopts it. `--disappear-default <time>` sets one for chats that haven't chosen their own. `/clear [peer]` deletes your messages with someone but keeps them as a contact; `/forget <peer>`, or `threnody forget <peer>`, deletes the contact and the conversation. Both apply on all your devices.
 
@@ -62,6 +68,7 @@ While listening, nodes send private UDP beacons that only mutually approved peer
 | `threnody-groups` | MLS groups on openmls with the X-Wing ciphersuite. Credentials are bound to Threnody identities, the group owner is the only committer, and messages travel as sans-IO fan-out over the 1:1 sessions |
 | `threnody-ffi` | UniFFI bindings (Kotlin, Swift, Python) for embedding a node in apps; see [its README](crates/threnody-ffi/README.md) |
 | `threnody-cli` | The `threnody` binary |
+| `threnody-desktop` | A graphical messenger for the Linux desktop (GTK 4, libadwaita) in [`apps/linux`](apps/linux); see [its README](apps/linux/README.md) |
 
 The normative details that the spec deferred are written up in [`docs/`](docs/):
 
@@ -79,6 +86,8 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix L: Wi-Fi Direct link upgrade](docs/appendix-l-wifi-direct.md)
 - [Appendix M: anonymous identities and selective disclosure](docs/appendix-m-anonymity.md)
 - [Appendix N: reaching contacts across the internet](docs/appendix-n-internet-reachability.md) (0.3.0)
+- [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md)
+- [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
@@ -91,16 +100,16 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.3 FS / PCS ratchet with hybrid PQ updates | ✅ KEM double ratchet with header encryption |
 | §3.4 Formal verification | ✅ Tamarin, 33 lemmas: handshake, ratchet, sealed messages, onion hops, device linking and account chains; `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
-| §4.1 Anonymous mode, §4.3 selective disclosure | ✅ anonymous identities (personas) with their own keys, contacts and history, unlinkable to the main identity, optionally burning themselves, revealed only by a signed proof; profiles shared per contact, nothing by default ([Appendix M](docs/appendix-m-anonymity.md)); ❌ zero-knowledge credentials |
+| §4.1 Anonymous mode, §4.3 selective disclosure | ✅ anonymous identities (personas) with their own keys, contacts and history, unlinkable to the main identity, optionally burning themselves, revealed only by a signed proof; profiles shared per contact, nothing by default ([Appendix M](docs/appendix-m-anonymity.md)); zero-knowledge credentials: BBS selective disclosure with per-verifier pseudonyms, blind issuance, ML-DSA-signed issuer keys and receipts ([Appendix O](docs/appendix-o-credentials.md)) |
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync and history sync (with a backfill for newly linked devices), account-wide offline keys and group invites |
-| §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ (NFC, directories and web-of-trust not yet) |
+| §5 TOFU, out-of-band invites with pinned fingerprint, QR, safety numbers, mutual approval and revocation | ✅ relay directories ([Appendix P](docs/appendix-p-volunteer-relays.md)); NFC, handle directories and web-of-trust not yet |
 | §6.1 1:1 text + files | ✅ photos and albums with captions, a *sensitive* flag that shows them covered until opened, and metadata (location, camera) stripped before sending by default; including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; text, files and photos; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices (backups not yet) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
-| §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), onion-routed mailbox deposits, each only off when switched off; ❌ volunteer relay directories |
+| §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), onion-routed mailbox deposits, each only off when switched off; volunteer relays from subscribed directories (k-of-n listing, Ed25519 + ML-DSA signed), paid with unlinkable rate-limited tokens, entered without revealing who you are ([Appendix P](docs/appendix-p-volunteer-relays.md)) |
 | §10 Status indicators | ✅ `/status` |
 | §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: sealed with a key in the system keyring by default, or a passphrase; 0600 files without either |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
@@ -112,7 +121,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
-5. **Metadata (remaining).** Volunteer relay directories beyond your own contacts (which would also hide a persona's network address), and zero-knowledge credentials for selective disclosure.
+5. **Metadata (remaining).** Relays that hold a connection for a device behind NAT, as onion services do (Appendix N, "Later"), and cover traffic inside circuits.
 6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
 
 ## Development

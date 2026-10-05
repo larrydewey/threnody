@@ -1,0 +1,83 @@
+.bubble {
+  padding: 6px 10px 4px 10px;
+  border-radius: 14px;
+}
+.bubble.incoming {
+  background-color: alpha(currentColor, 0.08);
+  border-bottom-left-radius: 4px;
+}
+.bubble.outgoing {
+  background-color: alpha(@accent_bg_color, 0.22);
+  border-bottom-right-radius: 4px;
+}
+.bubble .message-text {
+  font-size: 1.02em;
+}
+.bubble-meta {
+  opacity: 0.6;
+  font-size: 0.8em;
+}
+.bubble .photo {
+  border-radius: 10px;
+}
+.bubble .file-row {
+  padding: 4px 0;
+}
+.sensitive-cover {
+  background-color: alpha(currentColor, 0.18);
+  border-radius: 10px;
+}
+.reaction {
+  min-height: 0;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.9em;
+}
+.reaction-pick {
+  font-size: 1.3em;
+  min-width: 32px;
+}
+.chat-banner {
+  padding: 10px 14px;
+  background-color: alpha(@accent_bg_color, 0.12);
+  border-bottom: 1px solid alpha(currentColor, 0.1);
+}
+.chat-banner.warning {
+  background-color: alpha(@warning_bg_color, 0.18);
+}
+windowtitle.warning .subtitle {
+  color: @warning_color;
+  opacity: 1;
+}
+.composer {
+  padding: 8px 10px;
+}
+.composer-frame {
+  border-radius: 18px;
+  background-color: alpha(currentColor, 0.07);
+}
+.composer-input,
+.composer-input text {
+  background: none;
+}
+.online-dot {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  background-color: #2ec27e;
+  border: 2px solid @window_bg_color;
+}
+.unread-badge {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+  font-size: 0.8em;
+  font-weight: bold;
+}
+.safety-number {
+  font-family: monospace;
+  font-size: 1.25em;
+  letter-spacing: 1px;
+}

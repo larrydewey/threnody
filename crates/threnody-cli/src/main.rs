@@ -166,6 +166,28 @@ enum Cmd {
         /// (needs CAP_NET_ADMIN; bring the interface up with wg-quick first).
         #[arg(long, requires = "tunnel")]
         wg_apply: bool,
+        /// Volunteer as a relay for strangers' onion circuits, reachable at
+        /// this public address (repeatable). Registers with your subscribed
+        /// directories (`/dir add`) and carries circuits paid with their
+        /// anonymous tokens (Appendix P).
+        #[arg(long = "volunteer-relay", value_name = "HOST:PORT")]
+        volunteer_relay: Vec<String>,
+        /// Run a relay directory reachable at this public address: list
+        /// relays that register and prove reachable, and issue anonymous
+        /// relay tokens. Prints the link to share.
+        #[arg(long, value_name = "HOST:PORT")]
+        serve_directory: Option<String>,
+        /// With --serve-directory: list relays only after `/directory list`.
+        #[arg(long, requires = "serve_directory")]
+        review_relays: bool,
+        /// Never route through volunteer relays, even with directories
+        /// subscribed.
+        #[arg(long)]
+        no_volunteers: bool,
+        /// How many subscribed directories must list a relay before it is
+        /// used (default: 1 with one subscription, else 2).
+        #[arg(long, value_name = "K", default_value_t = 0)]
+        directory_threshold: usize,
     },
     /// Show this device's WireGuard public key and overlay address.
     Tunnel,
@@ -646,9 +668,20 @@ fn main() -> Result<()> {
             discover_port,
             ble,
             wifi_direct,
+            volunteer_relay,
+            serve_directory,
+            review_relays,
+            no_volunteers,
+            directory_threshold,
         } => {
             let identity = load_identity(&home)?;
             let persona = main_identity.is_some();
+            if persona && (!volunteer_relay.is_empty() || serve_directory.is_some()) {
+                bail!(
+                    "anonymous identities can't volunteer or run a directory: both publish \
+                     the identity with this machine's address"
+                );
+            }
             if persona && (ble || wifi_direct || tunnel.is_some()) {
                 eprintln!(
                     "Bluetooth, Wi-Fi Direct and tunnels are off for anonymous identities: \
@@ -688,6 +721,10 @@ fn main() -> Result<()> {
                     iface: wg_iface,
                     apply: wg_apply,
                 }),
+                volunteer_relay,
+                serve_directory: serve_directory.map(|a| (a, review_relays)),
+                use_volunteers: !no_volunteers,
+                directory_threshold,
             }));
             // Don't wait on a stdin read still pending after a signal.
             rt.shutdown_timeout(std::time::Duration::from_secs(1));

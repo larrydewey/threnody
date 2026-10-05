@@ -33,8 +33,9 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
-           / Direct / Tracked / Ack / Delete / Edit / Identity / React
-Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react); absent = 0
+           / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
+Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
+                                                           ; 32 observed, 64 paths, 128 credentials); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint }  ; sent_ms, body, disappear after (s), sender's message id
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
              ? 6 => uint, ? 7 => tstr, ? 8 => uint }                   ; flags (1 = sensitive), caption, album id
@@ -54,6 +55,10 @@ Delete   = { 0 => 15, 2 => bstr, 3 => bstr }               ; message ids (8 byte
 Edit     = { 0 => 16, 2 => tstr, 3 => bstr, 5 => uint }    ; new text, conversation id, message id
 Identity = { 0 => 17, 2 => bstr .cbor IdentityMsg }       ; profile or revealed identity, Appendix M
 React    = { 0 => 18, 2 => tstr, 3 => bstr, 5 => uint, ? 6 => uint }  ; emoji, conversation id, message id, flags (1 = remove)
+Observed = { 0 => 19, 2 => bstr, 3 => uint }               ; address (4 or 16 bytes) and port we see the peer at, Appendix N
+Paths    = { 0 => 20, 2 => bstr .cbor Paths }             ; recovery paths and heartbeat, Appendix N
+Credential = { 0 => 21, 2 => bstr .cbor CredMsg }         ; credential issuance and presentation, Appendix O
+Directory  = { 0 => 22, 2 => bstr .cbor DirMsg }          ; relay directory requests, anonymous links only, Appendix P
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),

@@ -42,6 +42,7 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="threnody" />
                 <data android:scheme="threnody-link" />
+                <data android:scheme="threnody-dir" />
             </intent-filter>
         </activity>
         <activity android:name=".ChatActivity" android:exported="false"

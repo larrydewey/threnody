@@ -301,6 +301,11 @@ class MainActivity : Activity() {
                 true
             }
             menu.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
+            menu.add("Credentials").setOnMenuItemClickListener {
+                node?.let { CredentialUi.list(this@MainActivity, it, worker) }
+                true
+            }
+            menu.add("Relay directories").setOnMenuItemClickListener { DirectoryUi.show(this@MainActivity, worker); true }
             fun toggle(title: String, on: Boolean, set: (Boolean) -> Unit, says: (Boolean) -> String) =
                 menu.add(title).apply {
                     isCheckable = true
@@ -331,6 +336,11 @@ class MainActivity : Activity() {
                 if (it) "Contacts can be reached on mobile data and other networks. " +
                     "Strangers in the public DHT see this phone's IP address, not who you talk to"
                 else "Contacts are reached only nearby, through relays, or at addresses you dial"
+            }
+            toggle("Route through volunteer relays", Privacy.useVolunteers(this@MainActivity),
+                { Privacy.setUseVolunteers(this@MainActivity, it) }) {
+                if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
+                else "Only your own contacts relay for you"
             }
             menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {
@@ -664,7 +674,8 @@ class MainActivity : Activity() {
         when {
             text.startsWith("threnody://") -> addContact(text)
             text.startsWith("threnody-link://") -> joinAccount(text)
-            else -> failed("That QR code isn't a Threnody invite or link code.")
+            text.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, worker, text)
+            else -> failed("That QR code isn't a Threnody invite, link code or directory link.")
         }
     }
 
@@ -673,7 +684,7 @@ class MainActivity : Activity() {
         getSystemService(ClipboardManager::class.java)?.primaryClip
             ?.takeIf { it.itemCount > 0 }
             ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
-            ?.takeIf { it.startsWith("threnody://") || it.startsWith("threnody-link://") }
+            ?.takeIf { it.startsWith("threnody://") || it.startsWith("threnody-link://") || it.startsWith(DirectoryUi.SCHEME) }
     } catch (_: SecurityException) {
         null
     }
@@ -691,6 +702,15 @@ class MainActivity : Activity() {
         // Not our own invite or link code (say, just copied from "My invite").
         if (link.contains(n.deviceFingerprint().replace("-", ""))) return
         offered = link
+        if (link.startsWith(DirectoryUi.SCHEME)) {
+            AlertDialog.Builder(this)
+                .setTitle("Subscribe to the copied directory?")
+                .setMessage(link)
+                .setPositiveButton("Subscribe") { _, _ -> DirectoryUi.subscribe(this, worker, link) }
+                .setNegativeButton("Not now", null)
+                .show()
+            return
+        }
         val invite = link.startsWith("threnody://")
         AlertDialog.Builder(this)
             .setTitle(if (invite) "Add the copied invite?" else "Join with the copied link code?")
@@ -751,6 +771,7 @@ class MainActivity : Activity() {
         when {
             uri.startsWith("threnody://") -> addContact(uri)
             uri.startsWith("threnody-link://") -> joinAccount(uri)
+            uri.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, worker, uri)
         }
     }
 

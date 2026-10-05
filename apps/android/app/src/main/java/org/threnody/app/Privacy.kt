@@ -28,6 +28,7 @@ object Privacy {
     private const val ONION = "onion_first"
     private const val STRIP = "strip_metadata"
     private const val REACH = "reach_internet"
+    private const val VOLUNTEERS = "use_volunteers"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -58,6 +59,13 @@ object Privacy {
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
     fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
     fun reachInternet(ctx: Context) = prefs(ctx).getBoolean(REACH, true)
+    /** Route through volunteer relays from subscribed directories (Appendix P). */
+    fun useVolunteers(ctx: Context) = prefs(ctx).getBoolean(VOLUNTEERS, true)
+
+    fun setUseVolunteers(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(VOLUNTEERS, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
 
     fun setReachInternet(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(REACH, on).apply()

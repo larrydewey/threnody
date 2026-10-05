@@ -33,6 +33,15 @@ pub mod label {
     pub const ACCOUNT_FINGERPRINT: &str = "threnody v1 2026-10-03 account fingerprint";
     pub const SIG_ACCOUNT_LINK: &str = "threnody v1 2026-10-03 account link";
     pub const LINK_PROOF: &str = "threnody v1 2026-10-03 link proof";
+    pub const ISSUER_BBS_KEY: &str = "threnody v1 2026-10-05 issuer bbs key";
+    pub const ISSUER_MLDSA_KEY: &str = "threnody v1 2026-10-05 issuer ml-dsa key";
+    pub const SIG_ISSUER_KEY: &str = "threnody v1 2026-10-05 issuer key";
+    pub const ISSUER_ID: &str = "threnody v1 2026-10-05 issuer id";
+    pub const CREDENTIAL_RECEIPT: &str = "threnody v1 2026-10-05 credential receipt";
+    pub const PRESENTATION: &str = "threnody v1 2026-10-05 presentation binding";
+    pub const RELAY_TOKEN: &str = "threnody v1 2026-10-05 relay token binding";
+    pub const SIG_RELAY_DESCRIPTOR: &str = "threnody v1 2026-10-05 relay descriptor";
+    pub const SIG_DIRECTORY: &str = "threnody v1 2026-10-05 directory document";
 }
 
 /// Fills `out` from the KDF.

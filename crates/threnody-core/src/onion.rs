@@ -277,6 +277,111 @@ pub fn cell_from(bytes: &[u8]) -> Result<Cell> {
     Ok(Box::new(arr))
 }
 
+/// What an EXTEND cell asks for (Appendix I; the optional fields are
+/// Appendix P's):
+///
+/// ```text
+/// to (20) || e_pub (1216) [ || flags (1) [|| u16 len || addr] [|| u16 len || token] ]
+/// flags: 1 = addr present, 2 = token present
+/// ```
+///
+/// `addr` lets a volunteer relay dial the next hop by address (it need not
+/// be a contact); `token` pays the next hop if it is a volunteer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtendReq {
+    pub to: Fingerprint,
+    pub e_pub: Vec<u8>,
+    pub addr: Option<String>,
+    pub token: Option<Vec<u8>>,
+}
+
+const EXTEND_ADDR: u8 = 1;
+const EXTEND_TOKEN: u8 = 2;
+
+impl ExtendReq {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = self.to.0.to_vec();
+        out.extend_from_slice(&self.e_pub);
+        if self.addr.is_none() && self.token.is_none() {
+            return Ok(out);
+        }
+        let flags = u8::from(self.addr.is_some()) * EXTEND_ADDR
+            + u8::from(self.token.is_some()) * EXTEND_TOKEN;
+        out.push(flags);
+        for field in [
+            self.addr.as_ref().map(String::as_bytes),
+            self.token.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let len = u16::try_from(field.len()).map_err(|_| Error::Malformed("extend field"))?;
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(field);
+        }
+        if out.len() > MAX_DATA {
+            return Err(Error::Malformed("extend too long"));
+        }
+        Ok(out)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let pk = crate::crypto::hybrid::PUBLIC_LEN;
+        if data.len() < 20 + pk {
+            return Err(Error::Malformed("extend"));
+        }
+        let to = Fingerprint(
+            data[..20]
+                .try_into()
+                .map_err(|_| Error::Malformed("extend"))?,
+        );
+        let e_pub = data[20..20 + pk].to_vec();
+        let mut rest = &data[20 + pk..];
+        let mut req = Self {
+            to,
+            e_pub,
+            addr: None,
+            token: None,
+        };
+        let Some((&flags, tail)) = rest.split_first() else {
+            return Ok(req);
+        };
+        if flags & !(EXTEND_ADDR | EXTEND_TOKEN) != 0 {
+            return Err(Error::Malformed("extend flags"));
+        }
+        rest = tail;
+        let field = |rest: &mut &[u8]| -> Result<Vec<u8>> {
+            let (len, tail) = rest
+                .split_at_checked(2)
+                .ok_or(Error::Malformed("extend field"))?;
+            let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+            let (v, tail) = tail
+                .split_at_checked(len)
+                .ok_or(Error::Malformed("extend field"))?;
+            *rest = tail;
+            Ok(v.to_vec())
+        };
+        if flags & EXTEND_ADDR != 0 {
+            let a = String::from_utf8(field(&mut rest)?)
+                .map_err(|_| Error::Malformed("extend address"))?;
+            if a.is_empty()
+                || a.len() > 64
+                || a.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(Error::Malformed("extend address"));
+            }
+            req.addr = Some(a);
+        }
+        if flags & EXTEND_TOKEN != 0 {
+            req.token = Some(field(&mut rest)?);
+        }
+        if !rest.is_empty() {
+            return Err(Error::Malformed("extend trailing bytes"));
+        }
+        Ok(req)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +398,43 @@ mod tests {
             relays.push(rk);
         }
         (path, relays)
+    }
+
+    #[test]
+    fn extend_requests_round_trip() {
+        let (_, e_pub) = CreateState::new(Fingerprint([1; 20]));
+        let plain = ExtendReq {
+            to: Fingerprint([2; 20]),
+            e_pub: e_pub.clone(),
+            addr: None,
+            token: None,
+        };
+        // The plain form is exactly Appendix I's.
+        assert_eq!(plain.encode().unwrap().len(), 20 + e_pub.len());
+        for req in [
+            plain.clone(),
+            ExtendReq {
+                addr: Some("192.0.2.1:7450".into()),
+                ..plain.clone()
+            },
+            ExtendReq {
+                token: Some(vec![9; 500]),
+                ..plain.clone()
+            },
+            ExtendReq {
+                addr: Some("[2001:db8::1]:7450".into()),
+                token: Some(vec![9; 600]),
+                ..plain.clone()
+            },
+        ] {
+            let b = req.encode().unwrap();
+            assert!(b.len() <= MAX_DATA);
+            assert_eq!(ExtendReq::decode(&b).unwrap(), req);
+        }
+        let mut b = plain.encode().unwrap();
+        b.extend_from_slice(&[EXTEND_TOKEN, 0, 9, 1]);
+        assert!(ExtendReq::decode(&b).is_err());
+        assert!(ExtendReq::decode(&b[..100]).is_err());
     }
 
     #[test]

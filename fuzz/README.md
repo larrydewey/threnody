@@ -7,6 +7,8 @@ cargo +nightly fuzz run envelope
 cargo +nightly fuzz run handshake_respond
 cargo +nightly fuzz run handshake_finish
 cargo +nightly fuzz run app_message
+cargo +nightly fuzz run credential     # credential messages, presentations, relay tokens
+cargo +nightly fuzz run directory      # directory messages, documents, descriptors, EXTEND cells
 ```
 
 On stable Rust, `crates/threnody-core/src/robustness.rs` runs a seeded mutation test over the same parsers as part of `cargo test`.

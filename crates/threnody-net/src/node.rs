@@ -240,6 +240,35 @@ pub enum Event {
     ReachNote {
         note: String,
     },
+    /// Progress with relay directories or volunteering (Appendix P).
+    VolunteerNote {
+        note: String,
+    },
+    /// A peer offers us a credential (Appendix O): accept or decline it.
+    CredentialOffered {
+        offer: crate::cred::CredentialOffer,
+    },
+    /// A credential we accepted arrived and is kept.
+    CredentialReceived {
+        peer: PublicIdentity,
+        schema: String,
+    },
+    /// A peer asks us to prove attributes: present or decline.
+    CredentialAsked {
+        ask: crate::cred::CredentialAsk,
+    },
+    /// A peer proved attributes we asked for.
+    CredentialPresented {
+        peer: PublicIdentity,
+        id: u64,
+        verified: threnody_core::credential::Verified,
+    },
+    /// A credential exchange failed or was declined.
+    CredentialFailed {
+        peer: PublicIdentity,
+        id: u64,
+        reason: String,
+    },
     /// Hole punching toward `peer` found no path; relays and mailboxes
     /// still work.
     PunchFailed {
@@ -320,7 +349,7 @@ pub(crate) struct Shared {
     events: mpsc::UnboundedSender<Event>,
     policy: Mutex<AcceptPolicy>,
     /// The cover-traffic interval; sessions watch it (see `run_session`).
-    constant_rate: tokio::sync::watch::Sender<Option<Duration>>,
+    pub(crate) constant_rate: tokio::sync::watch::Sender<Option<Duration>>,
     /// Dial contacts through onion circuits first when possible.
     pub(crate) prefer_onion: std::sync::atomic::AtomicBool,
     /// An anonymous identity (`threnody_core::persona`): no device linking
@@ -360,6 +389,12 @@ pub(crate) struct Shared {
     pub(crate) reach: crate::reach::ReachState,
     /// Repairing lost sessions fast (see `recover`).
     pub(crate) recover: crate::recover::RecoverState,
+    /// Anonymous links (see `anon`).
+    pub(crate) anon: Mutex<crate::anon::AnonState>,
+    /// Directories, volunteering and relay tokens (see `volunteer`).
+    pub(crate) volunteer: crate::volunteer::VolunteerState,
+    /// Credentials held and exchanges in progress (see `cred`).
+    pub(crate) creds: Mutex<crate::cred::CredState>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -531,12 +566,18 @@ impl Node {
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
             recover: crate::recover::RecoverState::new(),
+            anon: Mutex::default(),
+            volunteer: crate::volunteer::VolunteerState::new(),
+            creds: Mutex::default(),
         };
         let node = Self {
             shared: Arc::new(shared),
         };
         node.start_history_sweep();
         node.load_recovery();
+        node.load_volunteer();
+        node.load_credentials();
+        node.start_directory_upkeep();
         Ok((node, rx))
     }
 
@@ -628,7 +669,15 @@ impl Node {
 
     async fn run_inbound(&self, mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
         tune_tcp(&stream);
-        let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
+        let first = tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, read_frame(&mut stream))
+            .await
+            .map_err(|_| NetError::Timeout)??
+            .ok_or(NetError::Closed)?;
+        // An anonymous link (Appendix P) announces itself before the handshake.
+        if first == crate::anon::MAGIC {
+            return self.accept_anon(stream, addr).await;
+        }
+        let chan = handshake::accept_first(&mut stream, &self.shared.identity, &first).await?;
         self.check_policy(chan.peer())?;
         self.spawn_session(stream, chan, addr, false, Route::Direct(None));
         Ok(())
@@ -1098,7 +1147,12 @@ where
         })
     };
     let mut rate = shared.constant_rate.subscribe();
-    let mut ticker = make_ticker(*rate.borrow_and_update());
+    // Inside a relay or onion circuit the links' cover traffic hides the
+    // timing (Appendix I); cover from this session too would send more
+    // cells than a constant-rate link carries, and the backlog would grow
+    // without end.
+    let inner = via.is_some();
+    let mut ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
 
     let mut offered = false;
     let mut paths_sent = false;
@@ -1328,6 +1382,9 @@ where
                             }
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
+                        AppMessage::Credential(payload) => node.on_credential(peer, &payload),
+                        // Directory traffic belongs on anonymous links only.
+                        AppMessage::Directory(_) => {}
                         AppMessage::Account(payload) => node.on_account(peer, &payload),
                         AppMessage::Mailbox(payload) => node.on_mailbox(peer, &payload),
                         AppMessage::Onion(payload) => {
@@ -1361,7 +1418,7 @@ where
                     None => return Ok(()), // replaced or disconnected locally
                 },
                 Ok(()) = rate.changed() => {
-                    ticker = make_ticker(*rate.borrow_and_update());
+                    ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
                 }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {

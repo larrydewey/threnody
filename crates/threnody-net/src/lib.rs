@@ -6,6 +6,8 @@
 //! reliable byte stream, so Bluetooth sockets and Wi-Fi Direct links slot in.
 
 pub mod account;
+mod anon;
+pub mod cred;
 pub mod delivery;
 pub mod direct;
 pub mod discovery;
@@ -22,9 +24,12 @@ pub mod reach;
 mod recover;
 pub mod relay;
 pub mod sync;
+pub mod volunteer;
 
+pub use cred::{CredentialAsk, CredentialInfo, CredentialOffer};
 pub use delivery::Tag;
 pub use direct::DirectOffer;
 pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};
 pub use node::{AcceptPolicy, Event, Node, NodeConfig, SessionInfo};
+pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};

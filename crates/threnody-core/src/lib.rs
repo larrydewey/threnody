@@ -7,7 +7,9 @@
 pub mod account;
 pub mod cbor;
 pub mod channel;
+pub mod credential;
 pub mod crypto;
+pub mod directory;
 pub mod discovery;
 pub mod error;
 pub mod handshake;

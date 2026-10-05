@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/threnody-core", "crates/threnody-net", "crates/threnody-groups", "crates/threnody-cli", "crates/threnody-ffi"]
+members = ["crates/threnody-core", "crates/threnody-net", "crates/threnody-groups", "crates/threnody-cli", "crates/threnody-ffi", "apps/linux"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -38,6 +38,9 @@ tempfile = "3"
 socket2 = { version = "0.6", features = ["all"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 rpassword = "7"
+# BBS signatures with blind issuance and per-verifier pseudonyms (IETF CFRG drafts).
+zkryptium = { version = "0.7.1", default-features = false, features = ["bbsplus_nym"] }
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

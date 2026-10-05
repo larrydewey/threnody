@@ -173,6 +173,9 @@ impl RelayState {
 /// How long an onion attempt may take before falling back to a direct
 /// dial.
 const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Circuits through volunteers cross anonymous links with cover traffic,
+/// which spaces every message: they take longer to build.
+const VOLUNTEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Node {
     fn relay_send(&self, to: &PublicIdentity, msg: &RelayMsg) -> bool {
@@ -470,6 +473,17 @@ impl Node {
             && self.onion_possible(fp)
             && let Ok(Ok(p)) =
                 tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
+        {
+            return Ok(p);
+        }
+        // Without enough approved contacts, through volunteer relays from
+        // our directories (Appendix P): the destination then sees a relay's
+        // address, not ours.
+        if let (Some(fp), Some(a)) = (pin, addr)
+            && self.prefer_onion()
+            && !self.volunteer_routes(fp, a, &[]).is_empty()
+            && let Ok(Ok(p)) =
+                tokio::time::timeout(VOLUNTEER_DIAL_TIMEOUT, self.connect_volunteer(fp, a)).await
         {
             return Ok(p);
         }

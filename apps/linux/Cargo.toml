@@ -1,0 +1,25 @@
+[package]
+name = "threnody-desktop"
+description = "Threnody messenger for the Linux desktop (GTK 4 and libadwaita)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "threnody-desktop"
+path = "src/main.rs"
+
+[dependencies]
+threnody-ffi = { path = "../../crates/threnody-ffi" }
+threnody-core.workspace = true
+# GTK 4.14 and libadwaita 1.5 are what Ubuntu 24.04 and Debian 13 ship.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+async-channel = "2.5"
+keyring = "4.2"
+zeroize.workspace = true
+
+[lints]
+workspace = true

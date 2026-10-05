@@ -11,6 +11,14 @@ pub fn invite_link(fp: &Fingerprint, addr: &str) -> String {
     format!("{SCHEME}{}@{addr}", fp.compact())
 }
 
+/// The address in an invite link, if `target` is one.
+pub fn invite_addr(target: &str) -> Option<String> {
+    target
+        .strip_prefix(SCHEME)
+        .and_then(|r| r.split_once('@'))
+        .map(|(_, a)| a.to_owned())
+}
+
 /// Resolves to `(address, pinned fingerprint)`.
 pub fn resolve(target: &str, contacts: &Contacts) -> Result<(String, Option<Fingerprint>)> {
     if let Some(rest) = target.strip_prefix(SCHEME) {

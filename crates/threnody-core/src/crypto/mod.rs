@@ -1,10 +1,12 @@
 //! Cryptographic building blocks. Nothing here is novel: the module only
-//! composes audited RustCrypto / dalek / BLAKE3 primitives with explicit
-//! domain separation.
+//! composes RustCrypto / dalek / BLAKE3 primitives with explicit domain
+//! separation. The BBS credentials in `crate::credential` use `zkryptium`,
+//! which follows IETF drafts and has not been audited.
 
 pub mod aead;
 pub mod hybrid;
 pub mod kdf;
+pub mod pqsig;
 pub mod rng;
 
 /// Returns `N` bytes from the OS CSPRNG.

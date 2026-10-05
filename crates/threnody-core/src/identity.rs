@@ -76,7 +76,7 @@ impl fmt::Debug for PublicIdentity {
     }
 }
 
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// 160-bit identity fingerprint, shown as 32 Crockford Base32 characters
 /// (spec §4.4).
@@ -122,7 +122,7 @@ impl fmt::Debug for Fingerprint {
 }
 
 /// Decodes one Crockford symbol, folding the usual confusables.
-fn crockford_value(c: u8) -> Option<u8> {
+pub(crate) fn crockford_value(c: u8) -> Option<u8> {
     let c = match c.to_ascii_uppercase() {
         b'O' => b'0',
         b'I' | b'L' => b'1',

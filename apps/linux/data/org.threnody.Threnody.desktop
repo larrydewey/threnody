@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Threnody
+GenericName=Messenger
+Comment=Encrypted, metadata-resistant messaging
+Exec=threnody-desktop %U
+Icon=org.threnody.Threnody
+Terminal=false
+Categories=Network;InstantMessaging;GTK;
+Keywords=chat;message;encrypted;private;
+MimeType=x-scheme-handler/threnody;x-scheme-handler/threnody-link;
+StartupNotify=true
+DBusActivatable=false
+X-GNOME-UsesNotifications=true

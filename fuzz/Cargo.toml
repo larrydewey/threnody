@@ -36,3 +36,15 @@ name = "app_message"
 path = "fuzz_targets/app_message.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "credential"
+path = "fuzz_targets/credential.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "directory"
+path = "fuzz_targets/directory.rs"
+test = false
+doc = false

@@ -37,9 +37,20 @@ pub async fn accept<S>(s: &mut S, identity: &Identity) -> Result<SecureChannel>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let hs1 = tokio::time::timeout(HANDSHAKE_TIMEOUT, next(s))
+        .await
+        .map_err(|_| NetError::Timeout)??;
+    accept_first(s, identity, &hs1).await
+}
+
+/// Runs the responder side when the initiator's first frame was already
+/// read (to tell an anonymous link from a session; see `anon`).
+pub async fn accept_first<S>(s: &mut S, identity: &Identity, hs1: &[u8]) -> Result<SecureChannel>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let hs1 = next(s).await?;
-        let (resp, hs2) = Responder::respond(identity, &hs1)?;
+        let (resp, hs2) = Responder::respond(identity, hs1)?;
         write_frame(s, &hs2).await?;
         let hs3 = next(s).await?;
         Ok(SecureChannel::from(resp.finish(&hs3)?))

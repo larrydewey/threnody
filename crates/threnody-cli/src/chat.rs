@@ -42,6 +42,13 @@ pub struct Options {
     pub ble: bool,
     /// Join Wi-Fi Direct groups that approved contacts offer.
     pub wifi_direct: bool,
+    /// Public addresses to volunteer as a relay at (none: don't).
+    pub volunteer_relay: Vec<String>,
+    /// Run a directory at this public address, reviewing relays if set.
+    pub serve_directory: Option<(String, bool)>,
+    /// Route through volunteer relays from subscribed directories.
+    pub use_volunteers: bool,
+    pub directory_threshold: usize,
 }
 
 pub struct TunnelOptions {
@@ -82,6 +89,18 @@ Type a line to send it to the current peer. Commands:
   /profile [set <key> <value> | unset <key>]   your profile (shared with no one by default)
   /share [peer] [key,key,…|none]        which profile details a contact sees
   /reveal [peer] [host:port]            (anonymous identity) prove to them who you are
+Volunteer relays and directories (Appendix P):
+  /dir [list]   /dir add <link>   /dir remove <id>   /dir refresh   /dir relays
+  /vonion <peer|invite>                 reach a peer through two volunteer relays
+  /volunteer <host:port>...|off         volunteer as a relay for strangers' circuits
+  /directory [relays|link]   /directory list|unlist <relay>   (when serving a directory)
+Credentials (Appendix O, zero-knowledge selective disclosure):
+  /cred [list]                          credentials you hold
+  /cred offer <peer> <schema> <key=value>... [days=N]   issue one to a peer
+  /cred offers   /cred accept <id>   /cred decline <id>   offers made to you
+  /cred ask <peer> <schema> <key,key,…> ask a peer to prove attributes
+  /cred asks   /cred present <id> <n> [key,key,…]   prove credential n (of /cred list)
+  /cred delete <n>
   /quit
 Groups (MLS, post-quantum X-Wing ciphersuite):";
 
@@ -130,6 +149,28 @@ pub async fn run(opts: Options) -> Result<()> {
         tunnel_port: opts.tunnel.as_ref().map(|t| t.port),
     })?;
     node.set_prefer_onion(opts.onion_first);
+    node.set_use_volunteers(opts.use_volunteers);
+    node.set_directory_threshold(opts.directory_threshold);
+    if let Some((addr, review)) = &opts.serve_directory {
+        let link = node.serve_directory(addr, *review)?;
+        println!("Serving a relay directory. Share this link with people who should use it:");
+        println!("  {link}");
+        if *review {
+            println!("  Relays wait for /directory list <relay> before they're listed.");
+        }
+    }
+    if !opts.volunteer_relay.is_empty() {
+        if node.directories().is_empty() {
+            println!(
+                "  note: subscribe to a directory (/dir add <link>) to be listed as a volunteer relay"
+            );
+        }
+        node.set_volunteer(Some(opts.volunteer_relay.clone()))?;
+        println!(
+            "Volunteering as a relay at {}",
+            opts.volunteer_relay.join(", ")
+        );
+    }
     node.set_strip_metadata(opts.strip_metadata);
     node.set_default_timer(opts.default_timer);
     if opts.main_identity.is_some() {
@@ -618,6 +659,286 @@ impl Ui {
         }
     }
 
+    async fn dir_command(&self, arg: Option<&str>) -> Result<()> {
+        let mut words = arg.unwrap_or("").split_whitespace();
+        match words.next().unwrap_or("list") {
+            "list" => {
+                let dirs = self.node.directories();
+                if dirs.is_empty() {
+                    println!("No directories. /dir add <threnody-dir://…> subscribes to one.");
+                }
+                for d in dirs {
+                    let until = d.valid_until_ms.map_or("no document".to_owned(), |t| {
+                        format!("valid until {}", fmt_time(t))
+                    });
+                    println!(
+                        "  {}  {} relays, {until}, {} token credential(s)\n    {}",
+                        threnody_core::directory::short_id(&d.issuer),
+                        d.relays,
+                        d.tokens,
+                        d.link
+                    );
+                }
+                let usable = self.node.volunteer_relays().len();
+                println!(
+                    "  {usable} volunteer relay(s) usable now; routing through them is {}",
+                    if self.node.use_volunteers() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            }
+            "add" => {
+                let link = words
+                    .next()
+                    .ok_or_else(|| anyhow!("usage: /dir add <threnody-dir://…>"))?;
+                println!("* subscribing (over an anonymous link)…");
+                let d = self.node.subscribe_directory(link).await?;
+                println!(
+                    "* subscribed to directory {}: {} relays, {} token credential(s)",
+                    threnody_core::directory::short_id(&d.issuer),
+                    d.relays,
+                    d.tokens
+                );
+            }
+            "remove" | "rm" => {
+                let id = words
+                    .next()
+                    .ok_or_else(|| anyhow!("usage: /dir remove <id>"))?;
+                let found = self.node.directories().into_iter().find(|d| {
+                    threnody_core::directory::short_id(&d.issuer).starts_with(&id.to_uppercase())
+                });
+                match found {
+                    Some(d) if self.node.unsubscribe_directory(&d.issuer) => {
+                        println!("* unsubscribed")
+                    }
+                    _ => bail!("no directory {id}"),
+                }
+            }
+            "refresh" => {
+                self.node.refresh_directories().await;
+                println!("* directories refreshed");
+            }
+            "relays" => {
+                for r in self.node.volunteer_relays() {
+                    println!("  {}  {}", r.identity.fingerprint(), r.addrs.join(", "));
+                }
+            }
+            _ => bail!("usage: /dir [list|add <link>|remove <id>|refresh|relays]"),
+        }
+        Ok(())
+    }
+
+    fn directory_command(&self, arg: Option<&str>) -> Result<()> {
+        if !self.node.serving_directory() {
+            bail!("not serving a directory (run with --serve-directory <host:port>)");
+        }
+        let mut words = arg.unwrap_or("").split_whitespace();
+        match words.next().unwrap_or("relays") {
+            "relays" => {
+                let relays = self.node.directory_relays();
+                if relays.is_empty() {
+                    println!("No relays have registered yet.");
+                }
+                for r in relays {
+                    println!(
+                        "  {} {}  {}  (descriptor expires {})",
+                        if r.listed { "listed " } else { "waiting" },
+                        r.identity.fingerprint(),
+                        r.addrs.join(", "),
+                        fmt_time(r.expires_ms)
+                    );
+                }
+            }
+            cmd @ ("list" | "unlist") => {
+                let q = words
+                    .next()
+                    .ok_or_else(|| anyhow!("usage: /directory {cmd} <relay fingerprint>"))?;
+                let relay = self
+                    .node
+                    .directory_relays()
+                    .into_iter()
+                    .find(|r| {
+                        threnody_core::identity::fingerprint_matches_prefix(
+                            &r.identity.fingerprint(),
+                            q,
+                        )
+                    })
+                    .ok_or_else(|| anyhow!("no registered relay {q}"))?;
+                self.node
+                    .set_relay_listed(&relay.identity.fingerprint(), cmd == "list");
+                println!(
+                    "* {} {}",
+                    relay.identity.fingerprint(),
+                    if cmd == "list" { "listed" } else { "unlisted" }
+                );
+            }
+            _ => bail!("usage: /directory [relays|list <relay>|unlist <relay>]"),
+        }
+        Ok(())
+    }
+
+    fn cred_command(&self, arg: Option<&str>) -> Result<()> {
+        let mut words = arg.unwrap_or("").split_whitespace();
+        let parse_id = |w: Option<&str>| -> Result<u64> {
+            let w = w.ok_or_else(|| anyhow!("missing id"))?;
+            u64::from_str_radix(w, 16).map_err(|_| anyhow!("{w:?} is not an id"))
+        };
+        match words.next().unwrap_or("list") {
+            "list" => {
+                let held = self.node.credentials();
+                if held.is_empty() {
+                    println!("No credentials. Someone you know can /cred offer you one.");
+                }
+                for (i, c) in held.iter().enumerate() {
+                    let attrs: Vec<String> = c
+                        .attributes
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    println!(
+                        "  {}. {} from {} (expires day {}): {}",
+                        i + 1,
+                        c.schema,
+                        c.issuer,
+                        c.expires_day,
+                        attrs.join(", ")
+                    );
+                }
+            }
+            "offer" => {
+                let peer = self.resolve_peer(words.next())?;
+                let schema = words.next().ok_or_else(|| {
+                    anyhow!("usage: /cred offer <peer> <schema> key=value… [days=N]")
+                })?;
+                let mut days = 365u32;
+                let mut attrs = Vec::new();
+                for w in words {
+                    let (k, v) = w
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("{w:?}: expected key=value"))?;
+                    if k == "days" {
+                        days = v.parse()?;
+                    } else {
+                        attrs.push((k.to_owned(), v.to_owned()));
+                    }
+                }
+                let expires = threnody_core::credential::day(threnody_core::now_ms()) + days;
+                let id = self.node.offer_credential(&peer, schema, attrs, expires)?;
+                println!(
+                    "* offered {} a credential ({schema}, {id:x})",
+                    self.name(&peer)
+                );
+            }
+            "offers" => {
+                for o in self.node.credential_offers() {
+                    let attrs: Vec<String> = o
+                        .attributes
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    println!(
+                        "  {:x}  {} from {}: {}",
+                        o.id,
+                        o.schema,
+                        self.name(&o.peer),
+                        attrs.join(", ")
+                    );
+                }
+            }
+            "accept" => {
+                self.node.accept_credential_offer(parse_id(words.next())?)?;
+                println!("* accepted; waiting for the issuer to sign");
+            }
+            "decline" => {
+                self.node.decline_credential(parse_id(words.next())?)?;
+                println!("* declined");
+            }
+            "ask" => {
+                let peer = self.resolve_peer(words.next())?;
+                let schema = words
+                    .next()
+                    .ok_or_else(|| anyhow!("usage: /cred ask <peer> <schema> <key,key,…>"))?;
+                let keys: Vec<String> = words
+                    .next()
+                    .map(|k| {
+                        k.split(',')
+                            .filter(|k| !k.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let id = self.node.ask_credential(&peer, schema, keys)?;
+                println!(
+                    "* asked {} for a credential ({schema}, {id:x})",
+                    self.name(&peer)
+                );
+            }
+            "asks" => {
+                for a in self.node.credential_asks() {
+                    println!(
+                        "  {:x}  {} asks for {} from {}",
+                        a.id,
+                        self.name(&a.peer),
+                        a.keys.join(", "),
+                        a.schema
+                    );
+                }
+            }
+            "present" => {
+                let id = parse_id(words.next())?;
+                let n: usize = words
+                    .next()
+                    .ok_or_else(|| anyhow!("usage: /cred present <id> <n> [key,key,…]"))?
+                    .parse()?;
+                let held = self.node.credentials();
+                let cred = held
+                    .get(n.wrapping_sub(1))
+                    .ok_or_else(|| anyhow!("no credential {n}"))?;
+                let ask = self
+                    .node
+                    .credential_asks()
+                    .into_iter()
+                    .find(|a| a.id == id)
+                    .ok_or_else(|| anyhow!("no request {id:x}"))?;
+                let keys: Vec<String> = match words.next() {
+                    Some(k) => k.split(',').map(str::to_owned).collect(),
+                    None => ask.keys.clone(),
+                };
+                self.node.present_credential(id, cred.id, &keys)?;
+                let shown: Vec<&String> = keys.iter().filter(|k| ask.keys.contains(k)).collect();
+                println!(
+                    "* proved to {}: {}",
+                    self.name(&ask.peer),
+                    if shown.is_empty() {
+                        "that you hold it".to_owned()
+                    } else {
+                        shown
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                );
+            }
+            "delete" => {
+                let n: usize = words
+                    .next()
+                    .ok_or_else(|| anyhow!("usage: /cred delete <n>"))?
+                    .parse()?;
+                let held = self.node.credentials();
+                let cred = held
+                    .get(n.wrapping_sub(1))
+                    .ok_or_else(|| anyhow!("no credential {n}"))?;
+                self.node.delete_credential(cred.id);
+                println!("* deleted");
+            }
+            _ => bail!("see /help for /cred commands"),
+        }
+        Ok(())
+    }
+
     fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Connected {
@@ -852,6 +1173,64 @@ impl Ui {
                 );
             }
             Event::ReachNote { note } => println!("  · {note}"),
+            Event::VolunteerNote { note } => println!("  · {note}"),
+            Event::CredentialOffered { offer } => {
+                let attrs: Vec<String> = offer
+                    .attributes
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                println!(
+                    "* {} offers you a credential ({}): {}. /cred accept {:x} or /cred decline {:x}",
+                    self.name(&offer.peer),
+                    offer.schema,
+                    attrs.join(", "),
+                    offer.id,
+                    offer.id
+                );
+            }
+            Event::CredentialReceived { peer, schema } => {
+                println!(
+                    "* got a credential ({schema}) from {}. /cred list",
+                    self.name(&peer)
+                );
+            }
+            Event::CredentialAsked { ask } => {
+                println!(
+                    "* {} asks you to prove {} from your {} credential. /cred present {:x} <n> or /cred decline {:x}",
+                    self.name(&ask.peer),
+                    if ask.keys.is_empty() {
+                        "that you hold one".to_owned()
+                    } else {
+                        ask.keys.join(", ")
+                    },
+                    ask.schema,
+                    ask.id,
+                    ask.id
+                );
+            }
+            Event::CredentialPresented { peer, verified, .. } => {
+                let attrs: Vec<String> = verified
+                    .attributes
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                println!(
+                    "* {} proved a credential ({}) issued by {}: {}",
+                    self.name(&peer),
+                    verified.schema,
+                    self.name(&verified.issuer),
+                    if attrs.is_empty() {
+                        "(nothing else shown)".to_owned()
+                    } else {
+                        attrs.join(", ")
+                    }
+                );
+                println!("  pseudonym for you: {}", hex8(&verified.pseudonym));
+            }
+            Event::CredentialFailed { peer, reason, .. } => {
+                println!("! credential exchange with {}: {reason}", self.name(&peer));
+            }
             Event::PunchFailed { peer } => {
                 println!("* no direct path to {} yet", self.name(&peer));
             }
@@ -1189,6 +1568,48 @@ impl Ui {
                 _ => bail!("usage: /wifi-direct [request|leave]"),
             },
             "status" => self.status(),
+            "dir" => self.dir_command(arg).await?,
+            "directory" => self.directory_command(arg)?,
+            "volunteer" => match arg {
+                None | Some("") => println!(
+                    "* {}",
+                    if self.node.volunteering() {
+                        "volunteering as a relay"
+                    } else {
+                        "not volunteering"
+                    }
+                ),
+                Some("off") => {
+                    self.node.set_volunteer(None)?;
+                    println!("* no longer volunteering");
+                }
+                Some(a) => {
+                    let addrs: Vec<String> = a.split_whitespace().map(str::to_owned).collect();
+                    self.node.set_volunteer(Some(addrs.clone()))?;
+                    println!("* volunteering as a relay at {}", addrs.join(", "));
+                }
+            },
+            "vonion" => {
+                let q =
+                    arg.ok_or_else(|| anyhow!("usage: /vonion <contact|fingerprint|invite>"))?;
+                let dest = self.parse_destination(q)?;
+                let addr = crate::target::invite_addr(q).or_else(|| {
+                    self.node
+                        .contacts()
+                        .iter()
+                        .find(|c| c.key.fingerprint() == dest)
+                        .and_then(|c| c.last_addr.clone())
+                });
+                let addr = addr.ok_or_else(|| anyhow!("no address known for {dest}"))?;
+                println!("* building a circuit to {dest} through volunteer relays");
+                let node = self.node.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node.connect_volunteer(dest, &addr).await {
+                        println!("! volunteer circuit to {dest}: {e:#}");
+                    }
+                });
+            }
+            "cred" => self.cred_command(arg)?,
             "devices" => self.devices(),
             #[cfg(all(feature = "ble", target_os = "linux"))]
             "ble" => self.ble(arg.unwrap_or("scan")),
@@ -1835,4 +2256,20 @@ async fn listen_quic(node: &Node, tcp: std::net::SocketAddr) -> Option<std::net:
     }
     println!("! QUIC unavailable on udp/{}", tcp.port());
     None
+}
+
+/// The first bytes of a value in hex, for display.
+fn hex8(b: &[u8]) -> String {
+    b.iter().take(8).map(|x| format!("{x:02x}")).collect()
+}
+
+/// A local time for display.
+fn fmt_time(ms: u64) -> String {
+    jiff::Timestamp::from_millisecond(i64::try_from(ms).unwrap_or(0))
+        .map(|t| {
+            t.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
 }

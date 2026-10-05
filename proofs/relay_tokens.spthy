@@ -1,0 +1,205 @@
+theory Threnody_Relay_Tokens
+begin
+
+/*
+ * Symbolic model of volunteer relay directories and relay tokens
+ * (docs/appendix-p-volunteer-relays.md).
+ *
+ * - A relay signs its descriptor; a directory lists a relay only after
+ *   checking it, and signs its document with both an Ed25519 and an
+ *   ML-DSA key. A client pins both (the directory link pins the issuer id).
+ * - A relay-access credential is a blind BBS signature on <'relay', D,
+ *   epoch> over the client's commitment to its link secret l and
+ *   pseudonym secret ns. A token is a proof tok(sig, l, ns, r, ctx, b, nym)
+ *   with ctx = <relay, epoch, slot>, b = h(e_pub) the circuit's hop key and
+ *   nym = nymf(ns, ctx). It has no destructor for the witnesses; it shows
+ *   only ctx, b and nym, and one that verifies needs every witness.
+ * - "BBS broken" leaks a directory's BBS key; the directory's signing keys
+ *   leak separately. Unlinkability of tokens is an equivalence property and
+ *   is not modelled.
+ */
+
+builtins: hashing, signing
+
+functions: bbspk/1, commit/3, bsign/3, nymf/2, pkK/1,
+           tok/7, tokcheck/2, tokctx/1, tokbind/1, toknym/1
+equations:
+  tokcheck(tok(bsign(m, commit(l, ns, r), sk), l, ns, r, ctx, b, nymf(ns, ctx)), bbspk(sk)) = true,
+  tokctx(tok(s, l, ns, r, ctx, b, n)) = ctx,
+  tokbind(tok(s, l, ns, r, ctx, b, n)) = b,
+  toknym(tok(s, l, ns, r, ctx, b, n)) = n
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+// A relay accepts each pseudonym once (per epoch: the epoch is in ctx).
+restriction Fresh_Pseudonym:
+  "All R n #i #j. UseNym(R, n) @ #i & UseNym(R, n) @ #j ==> #i = #j"
+
+// ----- Keys -----
+
+rule Relay_Key:
+  [ Fr(~k) ] --[ RelayKey($R) ]-> [ !RelayLtk($R, ~k), !RelayPk($R, pk(~k)), Out(pk(~k)) ]
+
+rule Directory_Keys:
+  [ Fr(~ed), Fr(~pq), Fr(~bbs) ]
+  --[ Directory($D) ]->
+  [ !DirEd($D, ~ed), !DirPq($D, ~pq), !DirBbs($D, ~bbs),
+    !DirPub($D, pk(~ed), pk(~pq), bbspk(~bbs)),
+    Out(<pk(~ed), pk(~pq), bbspk(~bbs)>) ]
+
+rule Reveal_Relay:
+  [ !RelayLtk(R, k) ] --[ RelayRevealed(R) ]-> [ Out(k) ]
+rule Reveal_Ed:
+  [ !DirEd(D, k) ] --[ EdRevealed(D) ]-> [ Out(k) ]
+rule Reveal_Pq:
+  [ !DirPq(D, k) ] --[ PqRevealed(D) ]-> [ Out(k) ]
+rule Break_Bbs:
+  [ !DirBbs(D, k) ] --[ BbsBroken(D) ]-> [ Out(k) ]
+
+// ----- Directories -----
+
+// A relay registers: a descriptor it signs.
+rule Relay_Register:
+  [ !RelayLtk($R, k) ]
+  --[ Registered($R) ]->
+  [ Out(<'desc', $R, sign(<'desc', $R>, k)>) ]
+
+// The directory lists a relay whose descriptor verifies, signing the
+// listing with both keys.
+rule Directory_List:
+  let m = <'doc', $D, R>
+  in
+  [ In(<'desc', R, sd>), !RelayPk(R, rpk), !DirEd($D, ed), !DirPq($D, pq) ]
+  --[ Eq(verify(sd, <'desc', R>, rpk), true), Listed($D, R) ]->
+  [ Out(<m, sign(m, ed), sign(m, pq)>) ]
+
+// A client uses a relay only when both signatures verify against the
+// directory's pinned keys.
+rule Client_Accept_Listing:
+  let m = <'doc', D, R>
+  in
+  [ !DirPub(D, edpk, pqpk, bpk), In(<m, s1, s2>) ]
+  --[ Eq(verify(s1, m, edpk), true), Eq(verify(s2, m, pqpk), true),
+      ClientUses($C, D, R) ]->
+  [ ]
+
+// ----- Tokens -----
+
+// Issuance (the request crosses an anonymous link; only the commitment
+// shows). The directory signs blindly.
+rule Client_Request:
+  [ Fr(~l), Fr(~ns), Fr(~r) ]
+  --[ TokenRequested($C, $D, commit(~l, ~ns, ~r)) ]->
+  [ Wallet($C, $D, ~l, ~ns, ~r), Out(commit(~l, ~ns, ~r)) ]
+
+rule Directory_Issue:
+  [ In(c), !DirBbs($D, k) ]
+  --[ TokenIssued($D, c) ]->
+  [ Out(<$ep, bsign(<'relay', $D, $ep>, c, k)>) ]
+
+rule Client_Store:
+  [ Wallet(C, D, l, ns, rr), !DirPub(D, edpk, pqpk, bpk), In(<ep, s>) ]
+  --[ Eq(tokcheck(tok(s, l, ns, rr, 'probe', 'probe', nymf(ns, 'probe')), bpk), true),
+      Stored(C, D, ep) ]->
+  [ !Cred(C, D, ep, s, l, ns, rr) ]
+
+// A device compromise leaks the client's credential secrets.
+rule Reveal_Client:
+  [ !Cred(C, D, ep, s, l, ns, rr) ] --[ ClientRevealed(C) ]-> [ Out(<s, l, ns, rr>) ]
+
+// For one hop: a fresh ephemeral key, a token bound to it and to this
+// relay, epoch and slot.
+rule Client_Mint:
+  let ctx = <$R, ep, $slot>
+      b = h(pkK(~e))
+  in
+  [ !Cred(C, D, ep, s, l, ns, rr), Fr(~e) ]
+  --[ Minted(C, $R, ep, $slot, pkK(~e)) ]->
+  [ Out(<pkK(~e), tok(s, l, ns, rr, ctx, b, nymf(ns, ctx))>) ]
+
+// A volunteer relay: the token verifies against a directory it trusts,
+// names this relay, is bound to the CREATE's key, and its pseudonym is new.
+rule Relay_Accept:
+  let ctx = tokctx(t)
+      ep = fst(snd(ctx))
+      slot = snd(snd(ctx))
+  in
+  [ !DirPub(D, edpk, pqpk, bpk), In(<epub, t>) ]
+  --[ Eq(tokcheck(t, bpk), true),
+      Eq(fst(ctx), $R),
+      Eq(tokbind(t), h(epub)),
+      UseNym($R, toknym(t)),
+      AcceptedNym($R, toknym(t), epub),
+      RelayAccepts($R, D, ep, slot, epub) ]->
+  [ ]
+
+
+// ----- Lemmas -----
+
+lemma executable:
+  exists-trace
+  "Ex R D ep slot e #i. RelayAccepts(R, D, ep, slot, e) @ #i
+    & not (Ex X #x. BbsBroken(X) @ #x)
+    & not (Ex X #x. ClientRevealed(X) @ #x)"
+
+// Hybrid directory signatures: a forged listing needs both of the
+// directory's keys.
+lemma listing_authentic:
+  "All C D R #i. ClientUses(C, D, R) @ #i ==>
+      (Ex #j. Listed(D, R) @ #j & #j < #i)
+    | ((Ex #a. EdRevealed(D) @ #a) & (Ex #b. PqRevealed(D) @ #b))"
+
+// A directory lists only relays that registered themselves.
+lemma listed_relays_registered:
+  "All D R #i. Listed(D, R) @ #i ==>
+      (Ex #j. Registered(R) @ #j & #j < #i) | (Ex #r. RelayRevealed(R) @ #r)"
+
+// Every token a relay accepts comes from a credential the directory
+// issued, unless its BBS key was broken. (Anyone may hold credentials:
+// directories limit them per network, not per identity.)
+lemma token_from_issued_credential:
+  "All R D ep slot e #i. RelayAccepts(R, D, ep, slot, e) @ #i ==>
+      (Ex c #j. TokenIssued(D, c) @ #j & #j < #i) | (Ex #x. BbsBroken(D) @ #x)"
+
+// An honest client's token is bound to the relay and the hop key it was
+// minted for: a relay or observer that sees it can't spend it elsewhere,
+// unless the client's device leaked.
+lemma honest_token_binding:
+  "All C D l ns rr R ep slot e #k #i.
+      TokenRequested(C, D, commit(l, ns, rr)) @ #k
+    & AcceptedNym(R, nymf(ns, <R, ep, slot>), e) @ #i
+    ==> (Ex #j. Minted(C, R, ep, slot, e) @ #j & #j < #i)
+      | (Ex #x. ClientRevealed(C) @ #x)"
+
+// An honest client's pseudonym secret stays secret.
+lemma pseudonym_secret_secrecy:
+  "All C D l ns rr #k #x. TokenRequested(C, D, commit(l, ns, rr)) @ #k & K(ns) @ #x ==>
+      (Ex #y. ClientRevealed(C) @ #y)"
+
+// Rate limit: one credential pays one circuit per relay, epoch and slot.
+// (Its pseudonym is fixed by its secret and the context.)
+lemma one_circuit_per_slot:
+  "All R ns ep slot #i #j.
+      UseNym(R, nymf(ns, <R, ep, slot>)) @ #i & UseNym(R, nymf(ns, <R, ep, slot>)) @ #j
+      ==> #i = #j"
+
+// The exceptions are real.
+lemma sanity_bbs_break_mints:
+  exists-trace
+  "Ex R D ep slot e #i #x. RelayAccepts(R, D, ep, slot, e) @ #i & BbsBroken(D) @ #x
+    & not (Ex c #j. TokenIssued(D, c) @ #j)"
+
+lemma sanity_stolen_token_secrets_spend:
+  exists-trace
+  "Ex C D l ns rr R ep slot e #k #i #x.
+      TokenRequested(C, D, commit(l, ns, rr)) @ #k
+    & AcceptedNym(R, nymf(ns, <R, ep, slot>), e) @ #i & ClientRevealed(C) @ #x
+    & not (Ex #j. Minted(C, R, ep, slot, e) @ #j)"
+
+lemma sanity_both_keys_forge_listing:
+  exists-trace
+  "Ex C D R #i #a #b. ClientUses(C, D, R) @ #i & EdRevealed(D) @ #a & PqRevealed(D) @ #b
+    & not (Ex #j. Listed(D, R) @ #j)"
+
+end

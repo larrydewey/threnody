@@ -45,7 +45,7 @@ digest    = BLAKE3-keyed(d, le64(n) || plaintext with digest zeroed)[0..4]
 
 | cmd | Name | Data |
 |---|---|---|
-| 1 | EXTEND | `to` fingerprint (20) ‖ `e_pub` (1216) |
+| 1 | EXTEND | `to` fingerprint (20) ‖ `e_pub` (1216), optionally followed by an address and a token (Appendix P) |
 | 2 | EXTENDED | `id` (32) ‖ `ct` (1120) ‖ `sig` (64) |
 | 3 | EXTEND_FAILED | — |
 | 4 | BEGIN | — (the last hop is the destination and attaches the stream) |
@@ -67,7 +67,7 @@ op: 1 create, 2 created, 3 cell, 4 destroy
 
 ## Relay rules
 
-- **Who may create.** A node answers `CREATE` only from a mutually approved neighbour, with at most 64 circuits per neighbour.
+- **Who may create.** A node answers `CREATE` from any neighbour, with at most 64 circuits per neighbour. Only a hop created by a mutually approved neighbour, or paid with a relay token (Appendix P), may `EXTEND`; any other hop may only end there (`BEGIN` or `DEPOSIT`).
 - **Who to extend to.** On `EXTEND`, a node checks for a live direct session with a mutually approved contact whose fingerprint is `to`. If there is one, it sends that contact `CREATE` on a new link circuit and returns its `CREATED` fields as `EXTENDED`. Otherwise it returns `EXTEND_FAILED`.
 - **Passing cells on.** Cells that aren't recognized are forwarded on the paired link circuit. Cells from the next hop get this hop's backward layer and are forwarded upstream.
 - **Teardown.** `DESTROY`, or losing either link, tears the circuit down in both directions.
@@ -89,4 +89,4 @@ If any extension fails, A destroys the circuit and tries the next path.
 
 - **Unauthenticated layers.** As in Tor's original design, the per-hop layers aren't individually authenticated. Tampering is detected end to end, because the inner session is AEAD. But colluding first and last hops could tag cells to confirm they are on the same circuit, and such hops can already link them by timing.
 - **No cover traffic inside circuits.** Link-level constant-rate mode (§9 layer 1) still applies to each hop.
-- **Contacts-only relays.** A can only use relays that are its own contacts; there are no volunteer relay directories yet.
+- **Contacts-only relays.** Without directories, A can only use relays that are its own contacts. Volunteer relays from subscribed directories (Appendix P) lift this.

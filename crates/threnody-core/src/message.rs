@@ -35,13 +35,16 @@ pub const FEATURE_REACT: u64 = 16;
 pub const FEATURE_OBSERVED: u64 = 32;
 /// The peer understands `AppMessage::Paths` and keeps the lease it implies.
 pub const FEATURE_PATHS: u64 = 64;
+/// The peer understands `AppMessage::Credential` (Appendix O).
+pub const FEATURE_CREDENTIALS: u64 = 128;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
     | FEATURE_IDENTITY
     | FEATURE_REACT
     | FEATURE_OBSERVED
-    | FEATURE_PATHS;
+    | FEATURE_PATHS
+    | FEATURE_CREDENTIALS;
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -141,6 +144,12 @@ pub enum AppMessage {
     /// session fast. Only to a mutually approved peer whose `Hello` has
     /// [`FEATURE_PATHS`].
     Paths(Vec<u8>),
+    /// Credential issuance or presentation (`credential::CredMsg`,
+    /// Appendix O). Only to a peer whose `Hello` has [`FEATURE_CREDENTIALS`].
+    Credential(Vec<u8>),
+    /// A relay directory request or answer (`directory::DirMsg`,
+    /// Appendix P), over an anonymous link.
+    Directory(Vec<u8>),
 }
 
 mod kind {
@@ -165,6 +174,8 @@ mod kind {
     pub const REACT: u64 = 18;
     pub const OBSERVED: u64 = 19;
     pub const PATHS: u64 = 20;
+    pub const CREDENTIAL: u64 = 21;
+    pub const DIRECTORY: u64 = 22;
 }
 
 impl AppMessage {
@@ -344,6 +355,14 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::PATHS)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Credential(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::CREDENTIAL)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
+                Self::Directory(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::DIRECTORY)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -381,6 +400,8 @@ impl AppMessage {
             | Self::Mailbox(p)
             | Self::Onion(p)
             | Self::Paths(p)
+            | Self::Credential(p)
+            | Self::Directory(p)
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
@@ -517,6 +538,8 @@ impl AppMessage {
             | kind::ACCOUNT
             | kind::DIRECT
             | kind::PATHS
+            | kind::CREDENTIAL
+            | kind::DIRECTORY
             | kind::IDENTITY => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
@@ -531,6 +554,8 @@ impl AppMessage {
                     Some(kind::DIRECT) => Self::Direct(p),
                     Some(kind::IDENTITY) => Self::Identity(p),
                     Some(kind::PATHS) => Self::Paths(p),
+                    Some(kind::CREDENTIAL) => Self::Credential(p),
+                    Some(kind::DIRECTORY) => Self::Directory(p),
                     _ => Self::Mailbox(p),
                 }
             }

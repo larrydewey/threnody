@@ -150,7 +150,22 @@ class ChatActivity : Activity() {
         Threnody.visible++
         Threnody.visibleChat = setOf(key, device) + (convo?.devices ?: emptyList())
         ThrenodyService.clearNotification(this, ThrenodyService.notificationKey(key, persona))
-        unsubscribe = Threnody.subscribe { e -> if (concerns(e)) worker.execute { refresh() } }
+        unsubscribe = Threnody.subscribe { e ->
+            if (!concerns(e)) return@subscribe
+            when (e) {
+                is NodeEvent.CredentialPresented -> runOnUiThread {
+                    CredentialUi.showProof(this, node, e.peer, e.issuer, e.schema, e.attributes, e.pseudonym)
+                }
+                is NodeEvent.CredentialReceived -> runOnUiThread {
+                    Toast.makeText(this, "Got a credential (${e.schema}). Menu → Credentials lists it.", Toast.LENGTH_LONG).show()
+                }
+                is NodeEvent.CredentialFailed -> runOnUiThread {
+                    Toast.makeText(this, "Credential: ${e.reason}", Toast.LENGTH_LONG).show()
+                }
+                else -> {}
+            }
+            worker.execute { refresh() }
+        }
         if (::node.isInitialized) worker.execute { refresh() }
     }
 
@@ -189,6 +204,11 @@ class ChatActivity : Activity() {
             is NodeEvent.ProfileChanged -> e.peer
             is NodeEvent.Reacted -> if (e.group == null) e.peer else return false
             is NodeEvent.IdentityRevealed -> e.peer
+            is NodeEvent.CredentialOffered -> e.offer.peer
+            is NodeEvent.CredentialAsked -> e.ask.peer
+            is NodeEvent.CredentialReceived -> e.peer
+            is NodeEvent.CredentialPresented -> e.peer
+            is NodeEvent.CredentialFailed -> e.peer
             is NodeEvent.AccountChanged -> return true
             else -> return false
         }
@@ -225,6 +245,10 @@ class ChatActivity : Activity() {
             pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList()), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
+        // Credential offers and requests from this contact, waiting for an answer.
+        val mine = c?.devices ?: listOf(device)
+        val offers = if (g == null) node.credentialOffers().filter { it.peer in mine } else emptyList()
+        val asks = if (g == null) node.credentialAsks().filter { it.peer in mine } else emptyList()
         runOnUiThread {
             convo = c
             info = gi
@@ -232,6 +256,15 @@ class ChatActivity : Activity() {
                 Threnody.visibleChat = setOf(key, device) + (c?.devices ?: emptyList())
             }
             if (g != null) groupHeader(gi) else header(c)
+            for (o in offers) banner(
+                "${c?.title ?: "They"} offers you a credential (${o.schema}).",
+                "Review" to { CredentialUi.answerOffer(this, node, worker, o) { worker.execute { refresh() } } },
+            )
+            for (q in asks) banner(
+                "${c?.title ?: "They"} asks you to prove " +
+                    (if (q.keys.isEmpty()) "you hold a credential (${q.schema})." else "${q.keys.joinToString(", ")} (${q.schema})."),
+                "Review" to { CredentialUi.answerAsk(this, node, worker, q) { worker.execute { refresh() } } },
+            )
             show(items, names)
         }
     }
@@ -850,6 +883,12 @@ class ChatActivity : Activity() {
                 menu.add("Approve").setOnMenuItemClickListener { setApproval(true); true }
             }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
+            menu.add("Offer a credential…").setOnMenuItemClickListener {
+                CredentialUi.offer(this@ChatActivity, node, worker, device, c?.title ?: "They"); true
+            }
+            menu.add("Ask for a credential…").setOnMenuItemClickListener {
+                CredentialUi.ask(this@ChatActivity, node, worker, device, c?.title ?: "They"); true
+            }
             menu.add("Share your profile…").setOnMenuItemClickListener {
                 ProfileUi.share(this@ChatActivity, node, device, c?.title ?: "They", worker,
                     if (persona != null) "This identity's profile" else "Your profile")
