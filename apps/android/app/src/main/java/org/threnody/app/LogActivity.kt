@@ -85,6 +85,11 @@ class LogActivity : Activity() {
 
     private fun dial(t: String) {
         val n = node ?: return
+        // Testing: "keepalive <seconds>" sets the gap on standby holes.
+        t.removePrefix("keepalive").trim().toUIntOrNull()?.takeIf { t.startsWith("keepalive") }?.let {
+            n.setStandbyKeepalive(it)
+            return say("* standby keepalive every $it s")
+        }
         val i = t.removePrefix("ble").trim().toIntOrNull()
         val found = i?.let { seen.getOrNull(it - 1) } ?: return say("! no such Bluetooth device; scan first")
         worker.execute { Bluetooth.dial(n, found.first, found.second, null) }

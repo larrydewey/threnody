@@ -202,3 +202,109 @@ async fn nothing_reaches_out_while_turned_off() {
     assert!(!r.online, "joined the DHT while off");
     assert!(r.candidates.is_empty());
 }
+
+/// Forwards UDP between a client and `server` until `cut` is set, then
+/// drops everything: a path that dies without a word, as Wi-Fi does.
+async fn udp_proxy(
+    server: std::net::SocketAddr,
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::net::SocketAddr {
+    use std::sync::atomic::Ordering;
+    let front = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let client = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (f, b, c, x) = (front.clone(), back.clone(), client.clone(), cut.clone());
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, src)) = f.recv_from(&mut buf).await {
+            *c.lock().unwrap() = Some(src);
+            if !x.load(Ordering::Relaxed) {
+                let _ = b.send_to(&buf[..n], server).await;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = back.recv_from(&mut buf).await {
+            let to = *client.lock().unwrap();
+            if let Some(to) = to
+                && !cut.load(Ordering::Relaxed)
+            {
+                let _ = front.send_to(&buf[..n], to).await;
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silently_dead_path_is_repaired_within_seconds() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    // Cover traffic every 200 ms: the lease is then about 2.5 s.
+    for n in [&alice, &bob] {
+        n.set_constant_rate(Some(Duration::from_millis(200)));
+    }
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    let b_quic = bob.listen_quic("127.0.0.1:0").await.unwrap();
+    for n in [&alice, &bob] {
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    // Wait until both know their own addresses, so `Paths` carry them.
+    timeout(Duration::from_secs(10), async {
+        while alice.reachability().candidates.is_empty() || bob.reachability().candidates.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let cut = std::sync::Arc::new(AtomicBool::new(false));
+    let proxy = udp_proxy(b_quic, cut.clone()).await;
+    let bob_id = alice.connect_quic(proxy, None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Let the `Paths` messages cross.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    cut.store(true, Ordering::Relaxed);
+    let cut_at = std::time::Instant::now();
+    next(&mut arx, 10, |e| matches!(e, Event::Disconnected { .. })).await;
+    let lost_after = cut_at.elapsed();
+    let Event::Connected { peer, addr, .. } =
+        next(&mut arx, 30, |e| matches!(e, Event::Connected { .. })).await
+    else {
+        unreachable!()
+    };
+    let back_after = cut_at.elapsed();
+    println!("lost after {lost_after:?}, back after {back_after:?}");
+    assert_eq!(peer, bob_id);
+    assert_ne!(addr, proxy, "reconnected around the dead path");
+    assert!(
+        lost_after < Duration::from_secs(5),
+        "lease took {lost_after:?}"
+    );
+    assert!(
+        back_after < Duration::from_secs(12),
+        "recovery took {back_after:?}"
+    );
+}

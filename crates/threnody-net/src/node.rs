@@ -10,7 +10,9 @@ use std::time::Duration;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
-use threnody_core::message::{FEATURE_ACKS, FEATURE_OBSERVED, FEATURES, MAX_ACK_IDS};
+use threnody_core::message::{
+    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURES, MAX_ACK_IDS,
+};
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
@@ -277,6 +279,9 @@ pub(crate) enum Route {
     Onion(PublicIdentity),
     /// A direct QUIC connection (Appendix N).
     Quic,
+    /// A QUIC connection from our standby endpoint (see `recover`): what
+    /// the peer sees there is the standby network's address, not ours.
+    QuicStandby,
     /// A direct link over another transport, e.g. Bluetooth LE.
     Link {
         transport: &'static str,
@@ -295,7 +300,7 @@ impl Route {
             Self::Relay(v) => (None, Some(v), "relay", addr.to_string()),
             Self::Onion(v) => (None, Some(v), "onion", addr.to_string()),
             // Punched paths are ephemeral: nothing to remember for redialing.
-            Self::Quic => (None, None, "quic", addr.to_string()),
+            Self::Quic | Self::QuicStandby => (None, None, "quic", addr.to_string()),
             Self::Link { transport, remote } => (None, None, transport, remote),
         }
     }
@@ -353,6 +358,8 @@ pub(crate) struct Shared {
     pub(crate) quic: Mutex<Option<Arc<crate::quic::Quic>>>,
     /// Reaching contacts across the internet (see `reach`).
     pub(crate) reach: crate::reach::ReachState,
+    /// Repairing lost sessions fast (see `recover`).
+    pub(crate) recover: crate::recover::RecoverState,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -523,6 +530,7 @@ impl Node {
             peer_features: Mutex::new(HashMap::new()),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
+            recover: crate::recover::RecoverState::new(),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -732,6 +740,10 @@ impl Node {
         lock(&self.shared.sessions).clear();
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.shared.shutdown.borrow()
+    }
+
     /// Resolves once [`Node::shutdown`] has been called.
     pub(crate) fn closed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let mut rx = self.shared.shutdown.subscribe();
@@ -904,6 +916,27 @@ impl Node {
         r
     }
 
+    /// Two direct sessions with `peer` that start within a few seconds of
+    /// each other came from both sides dialing at once. Newest-wins would
+    /// let each side keep a different one and lose the other, over and
+    /// over; so both keep the one dialed by the smaller identity key. True
+    /// if the new session (`outbound` from our side) is the one to drop.
+    fn loses_duplicate(&self, peer: &PublicIdentity, outbound: bool) -> bool {
+        let sessions = lock(&self.shared.sessions);
+        let Some(old) = sessions.get(peer) else {
+            return false;
+        };
+        if old.info.via.is_some()
+            || now_ms().saturating_sub(old.info.since_ms) > DUPLICATE_WINDOW_MS
+            || old.info.outbound == outbound
+        {
+            return false;
+        }
+        let me = self.identity();
+        let dialer = |out: bool| if out { me } else { *peer };
+        dialer(old.info.outbound).as_bytes() < dialer(outbound).as_bytes()
+    }
+
     pub(crate) fn spawn_session<S>(
         &self,
         stream: S,
@@ -915,9 +948,18 @@ impl Node {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // Over QUIC the peer's address is its outside address, worth telling it.
-        let observed = matches!(route, Route::Quic).then_some(addr);
+        let over = match route {
+            Route::Quic => Over::Quic(addr),
+            Route::QuicStandby => Over::Standby,
+            _ => Over::Other,
+        };
         let (dialed, via, transport, remote) = route.into_parts(addr);
         let peer = *chan.peer();
+        if via.is_none() && self.loses_duplicate(&peer, outbound) {
+            // Both sides dialed at once; the other session stays (dropping
+            // this stream closes it).
+            return;
+        }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let new_contact = {
@@ -959,7 +1001,10 @@ impl Node {
 
         let node = self.clone();
         tokio::spawn(async move {
-            let reason = match run_session(&node, stream, chan, addr, via, observed, rx).await {
+            let result = run_session(&node, stream, chan, addr, via, over, rx).await;
+            // Closed on purpose (either side) is not a loss to repair.
+            let failed = result.is_err();
+            let reason = match result {
                 Ok(()) => "closed".to_owned(),
                 Err(e) => e.to_string(),
             };
@@ -983,6 +1028,9 @@ impl Node {
             // is not a disconnection: the peer is still connected.
             if current {
                 node.shared.emit(Event::Disconnected { peer, reason });
+                if via.is_none() && failed {
+                    node.on_session_lost(peer);
+                }
             }
         });
     }
@@ -994,12 +1042,17 @@ async fn run_session<S>(
     mut chan: SecureChannel,
     addr: SocketAddr,
     via: Option<PublicIdentity>,
-    observed: Option<SocketAddr>,
+    over: Over,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let observed = match over {
+        Over::Quic(a) => Some(a),
+        _ => None,
+    };
+    let on_standby = matches!(over, Over::Standby);
     let shared: &Shared = &node.shared;
     let peer = *chan.peer();
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -1047,6 +1100,13 @@ where
     let mut ticker = make_ticker(*rate.borrow_and_update());
 
     let mut offered = false;
+    let mut paths_sent = false;
+    // Silence longer than this ends the session (see `recover`): known once
+    // the peer's `Paths` says how often it sends.
+    let mut lease: Option<Duration> = None;
+    let mut last_rx = tokio::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(node.beat());
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
     // Our account chain (and, for own devices, our contacts), then anything
@@ -1063,12 +1123,28 @@ where
             // Refresh the pairwise LAN discovery key once per session.
             if !discovery_keyed && shared.mutual(&peer) {
                 let key = *chan.export(DISCOVERY_CONTEXT);
-                let mut contacts = lock(&shared.contacts);
-                if let Some(c) = contacts.get_mut(&peer) {
-                    c.set_discovery_key(key);
+                {
+                    let mut contacts = lock(&shared.contacts);
+                    if let Some(c) = contacts.get_mut(&peer) {
+                        c.set_discovery_key(key);
+                    }
+                    shared.save_contacts(&contacts);
                 }
-                shared.save_contacts(&contacts);
+                if via.is_none() {
+                    let slot = *chan.export(threnody_core::rendezvous::RECOVERY_CONTEXT);
+                    node.session_up(peer, slot, observed);
+                }
                 discovery_keyed = true;
+            }
+            // Tell an approved peer how to find us if this session breaks.
+            if !paths_sent
+                && via.is_none()
+                && peer_acks.is_some()
+                && node.supports(&peer, FEATURE_PATHS)
+                && shared.mutual(&peer)
+            {
+                pending.extend(node.paths_message());
+                paths_sent = true;
             }
             // Hand a mutually approved peer fresh prekeys once per session.
             if !prekeys_sent && shared.mutual(&peer) {
@@ -1096,7 +1172,20 @@ where
                 pending = waiting;
             }
             tokio::select! {
+                () = lease_expired(lease, last_rx) => {
+                    return Err(NetError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "lease expired (peer silent)",
+                    )));
+                }
+                _ = heartbeat.tick(), if ticker.is_none() && paths_sent => {
+                    // No cover traffic: an empty frame keeps the peer's lease.
+                    if chan.can_send() && pending.is_empty() {
+                        write_frame(&mut wr, &chan.seal(&AppMessage::Cover)?).await?;
+                    }
+                }
                 frame = inbox.recv() => {
+                    last_rx = tokio::time::Instant::now();
                     let frame = match frame {
                         Some(Ok(f)) => f,
                         Some(Err(NetError::Closed)) | None => return Ok(()),
@@ -1189,8 +1278,13 @@ where
                                 });
                             }
                         }
-                        AppMessage::Observed { addr } => {
+                        AppMessage::Paths(payload) => {
                             if via.is_none() {
+                                lease = node.on_paths(peer, &payload).or(lease);
+                            }
+                        }
+                        AppMessage::Observed { addr } => {
+                            if via.is_none() && !on_standby {
                                 node.on_observed(peer, addr);
                             }
                         }
@@ -1270,6 +1364,29 @@ fn ready(
             Ok(*inner)
         }
         (m, _) => Ok(m),
+    }
+}
+
+/// Sessions with one peer starting this close together are duplicates.
+const DUPLICATE_WINDOW_MS: u64 = 5_000;
+
+/// What a session runs over, as far as addresses go.
+#[derive(Clone, Copy)]
+enum Over {
+    /// A main-endpoint QUIC connection: the peer's outside address is
+    /// worth telling it.
+    Quic(SocketAddr),
+    /// Our standby endpoint: what the peer reports seeing is the standby
+    /// network's address, not ours.
+    Standby,
+    Other,
+}
+
+/// Resolves when `lease` has passed since `last_rx`; never without a lease.
+async fn lease_expired(lease: Option<Duration>, last_rx: tokio::time::Instant) {
+    match lease {
+        Some(l) => tokio::time::sleep_until(last_rx + l).await,
+        None => std::future::pending().await,
     }
 }
 

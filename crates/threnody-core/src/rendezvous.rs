@@ -43,6 +43,9 @@ const NONCE_LEN: usize = 24;
 /// Length of every record value: under BEP 44's 1,000-byte limit.
 pub const RECORD_LEN: usize = NONCE_LEN + PADDED_LEN + 16;
 pub const PROBE_LEN: usize = 32;
+/// Exporter context for a session's recovery slot: the DHT record either
+/// side writes its new addresses to if the session is lost.
+pub const RECOVERY_CONTEXT: &[u8] = b"rendezvous recovery slot";
 /// Record flag: this node's NAT looks symmetric (a new outside port for
 /// every destination).
 pub const FLAG_SYMMETRIC: u64 = 1;
@@ -130,20 +133,110 @@ pub struct Candidates {
     pub seeking_until_ms: Option<u64>,
 }
 
+fn encode_list(
+    e: &mut const_cbor::Encoder<'_>,
+    list: &[Candidate],
+) -> core::result::Result<(), const_cbor::Error> {
+    let list = &list[..list.len().min(MAX_CANDIDATES)];
+    e.array_len(list.len())?;
+    for c in list {
+        e.array_len(3)?.u8(c.kind as u8)?;
+        match c.addr.ip() {
+            IpAddr::V4(a) => e.bytes(&a.octets())?,
+            IpAddr::V6(a) => e.bytes(&a.octets())?,
+        };
+        e.u16(c.addr.port())?;
+    }
+    Ok(())
+}
+
+fn decode_list(d: &mut Decoder<'_>) -> Result<Vec<Candidate>> {
+    let n = d.array_len()?;
+    if n > MAX_CANDIDATES {
+        return Err(Error::Malformed("too many candidates"));
+    }
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        if d.array_len()? != 3 {
+            return Err(Error::Malformed("candidate"));
+        }
+        let kind = d.u64()?;
+        let ip = match d.bytes()? {
+            b if b.len() == 4 => {
+                IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(b).unwrap_or_default()))
+            }
+            b if b.len() == 16 => {
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(b).unwrap_or_default()))
+            }
+            _ => return Err(Error::Malformed("candidate address")),
+        };
+        let port = d.u16()?;
+        // Unknown kinds (a later relay kind, say) are skipped.
+        if let Some(kind) = CandidateKind::from_wire(kind) {
+            v.push(Candidate {
+                kind,
+                addr: SocketAddr::new(ip, port),
+            });
+        }
+    }
+    Ok(v)
+}
+
+/// What one side of a live session tells the other about its paths, so
+/// that losing the session can be repaired at once (Appendix N, fast
+/// recovery):
+///
+/// ```text
+/// Paths = { 0: [* candidate], 1: [* candidate], 2: beat_ms uint }
+/// ```
+///
+/// `main` are our current addresses; `standby` the addresses of a second
+/// network we keep a path open on (mobile data while on Wi-Fi), empty when
+/// none is warm; `beat_ms` the longest gap between our frames, so the peer
+/// knows when silence means we are gone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Paths {
+    pub main: Vec<Candidate>,
+    pub standby: Vec<Candidate>,
+    pub beat_ms: u64,
+}
+
+impl Paths {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        cbor::to_vec(PADDED_LEN, |e| {
+            e.map_len(3)?;
+            e.u8(0)?;
+            encode_list(e, &self.main)?;
+            e.u8(1)?;
+            encode_list(e, &self.standby)?;
+            e.u8(2)?.uint(self.beat_ms)?;
+            Ok(())
+        })
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        let mut dec = Decoder::new(b);
+        let mut p = Paths::default();
+        read_map(&mut dec, |key, d| {
+            match key {
+                0 => p.main = decode_list(d)?,
+                1 => p.standby = decode_list(d)?,
+                2 => p.beat_ms = d.u64()?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        Ok(p)
+    }
+}
+
 impl Candidates {
     fn encode(&self) -> Result<Vec<u8>> {
-        let list = &self.list[..self.list.len().min(MAX_CANDIDATES)];
         cbor::to_vec(PADDED_LEN, |e| {
             e.map_len(3 + usize::from(self.seeking_until_ms.is_some()))?;
-            e.u8(0)?.array_len(list.len())?;
-            for c in list {
-                e.array_len(3)?.u8(c.kind as u8)?;
-                match c.addr.ip() {
-                    IpAddr::V4(a) => e.bytes(&a.octets())?,
-                    IpAddr::V6(a) => e.bytes(&a.octets())?,
-                };
-                e.u16(c.addr.port())?;
-            }
+            e.u8(0)?;
+            encode_list(e, &self.list)?;
             e.u8(1)?.uint(self.issued_ms)?;
             e.u8(2)?.uint(self.flags)?;
             if let Some(t) = self.seeking_until_ms {
@@ -158,37 +251,7 @@ impl Candidates {
         let (mut list, mut issued, mut flags, mut seeking) = (None, None, 0, None);
         read_map(&mut dec, |key, d| {
             match key {
-                0 => {
-                    let n = d.array_len()?;
-                    if n > MAX_CANDIDATES {
-                        return Err(Error::Malformed("too many candidates"));
-                    }
-                    let mut v = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        if d.array_len()? != 3 {
-                            return Err(Error::Malformed("candidate"));
-                        }
-                        let kind = d.u64()?;
-                        let ip = match d.bytes()? {
-                            b if b.len() == 4 => IpAddr::V4(Ipv4Addr::from(
-                                <[u8; 4]>::try_from(b).unwrap_or_default(),
-                            )),
-                            b if b.len() == 16 => IpAddr::V6(Ipv6Addr::from(
-                                <[u8; 16]>::try_from(b).unwrap_or_default(),
-                            )),
-                            _ => return Err(Error::Malformed("candidate address")),
-                        };
-                        let port = d.u16()?;
-                        // Unknown kinds (a later relay kind, say) are skipped.
-                        if let Some(kind) = CandidateKind::from_wire(kind) {
-                            v.push(Candidate {
-                                kind,
-                                addr: SocketAddr::new(ip, port),
-                            });
-                        }
-                    }
-                    list = Some(v);
-                }
+                0 => list = Some(decode_list(d)?),
                 1 => issued = Some(d.u64()?),
                 2 => flags = d.u64()?,
                 3 => seeking = Some(d.u64()?),
@@ -326,6 +389,20 @@ mod tests {
             ..c
         };
         assert_eq!(seal_record(&keys, &full).unwrap().len(), RECORD_LEN);
+    }
+
+    #[test]
+    fn paths_round_trip() {
+        let p = Paths {
+            main: sample().list,
+            standby: vec![sample().list[0]],
+            beat_ms: 10_000,
+        };
+        assert_eq!(Paths::decode(&p.encode().unwrap()).unwrap(), p);
+        assert_eq!(
+            Paths::decode(&Paths::default().encode().unwrap()).unwrap(),
+            Paths::default()
+        );
     }
 
     #[test]

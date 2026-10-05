@@ -33,12 +33,15 @@ pub const FEATURE_IDENTITY: u64 = 8;
 pub const FEATURE_REACT: u64 = 16;
 /// The peer understands `AppMessage::Observed`.
 pub const FEATURE_OBSERVED: u64 = 32;
+/// The peer understands `AppMessage::Paths` and keeps the lease it implies.
+pub const FEATURE_PATHS: u64 = 64;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
     | FEATURE_IDENTITY
     | FEATURE_REACT
-    | FEATURE_OBSERVED;
+    | FEATURE_OBSERVED
+    | FEATURE_PATHS;
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -134,6 +137,10 @@ pub enum AppMessage {
     /// outside address, for rendezvous. Only to a peer whose `Hello` has
     /// [`FEATURE_OBSERVED`].
     Observed { addr: std::net::SocketAddr },
+    /// Our paths and heartbeat (`rendezvous::Paths`), for repairing a lost
+    /// session fast. Only to a mutually approved peer whose `Hello` has
+    /// [`FEATURE_PATHS`].
+    Paths(Vec<u8>),
 }
 
 mod kind {
@@ -157,6 +164,7 @@ mod kind {
     pub const IDENTITY: u64 = 17;
     pub const REACT: u64 = 18;
     pub const OBSERVED: u64 = 19;
+    pub const PATHS: u64 = 20;
 }
 
 impl AppMessage {
@@ -332,6 +340,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::IDENTITY)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Paths(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::PATHS)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -368,6 +380,7 @@ impl AppMessage {
             | Self::Prekeys(p)
             | Self::Mailbox(p)
             | Self::Onion(p)
+            | Self::Paths(p)
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
@@ -503,6 +516,7 @@ impl AppMessage {
             | kind::ONION
             | kind::ACCOUNT
             | kind::DIRECT
+            | kind::PATHS
             | kind::IDENTITY => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
@@ -516,6 +530,7 @@ impl AppMessage {
                     Some(kind::ACCOUNT) => Self::Account(p),
                     Some(kind::DIRECT) => Self::Direct(p),
                     Some(kind::IDENTITY) => Self::Identity(p),
+                    Some(kind::PATHS) => Self::Paths(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -588,6 +603,7 @@ mod tests {
             AppMessage::Observed {
                 addr: "203.0.113.9:7450".parse().unwrap(),
             },
+            AppMessage::Paths(vec![1, 2, 3]),
             AppMessage::Observed {
                 addr: "[2001:db8::7]:61000".parse().unwrap(),
             },

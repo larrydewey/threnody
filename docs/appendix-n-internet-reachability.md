@@ -1,6 +1,6 @@
 # Appendix N: Reaching Contacts Across the Internet
 
-Status: **sections 1 to 4 are implemented** (QUIC, candidates, DHT rendezvous, hole punching) for 0.3.0. Router port mapping (section 0) is not built yet. Field test, 2026-10-05: a Pixel 8a on AT&T LTE (carrier-grade NAT, Wi-Fi and Bluetooth off) and a laptop behind a home router found each other through the public DHT and connected directly over QUIC through both NATs, about two minutes after the phone left Wi-Fi.
+Status: **sections 1 to 5 are implemented** (QUIC, candidates, DHT rendezvous, hole punching, fast recovery) for 0.3.0. Router port mapping (section 0) is not built yet. Field test, 2026-10-05: a Pixel 8a on AT&T LTE (carrier-grade NAT, Wi-Fi and Bluetooth off) and a laptop behind a home router found each other through the public DHT and connected directly over QUIC through both NATs, about two minutes after the phone left Wi-Fi.
 
 ## The problem
 
@@ -117,6 +117,36 @@ Once either side sees the other's fresh candidates:
 5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
 
 **Symmetric NAT.** With `flags & 1` set on exactly one side, the other side (which has a stable port) dials, and the symmetric side's probes open its own mapping toward that port. That usually works. When both sides are symmetric, the relay fallback applies.
+
+## 5. Fast recovery
+
+Sections 2 to 4 find a contact by polling the DHT; after a network change that took about 1m45s in the field. Fast recovery prepares everything during a live session, so a break is repaired in under a second. It is driven by the platform telling the node, the moment it happens, that the default network changed.
+
+- **Paths.** On each direct session with a mutually approved contact, both sides send `Paths` (feature bit 64): their current candidates, their *standby* candidates (below), and their heartbeat. Both sides also export a per-session *recovery slot* key from the session (`"rendezvous recovery slot"`), naming one DHT record each side can write to if the session breaks.
+- **Lease.** Every session sends a frame at least every heartbeat: the cover-traffic interval, or an empty frame every 10 s when cover traffic is off. Silence for three heartbeats plus a second ends the session, so both sides notice a loss within seconds of each other. Only sessions that *fail* (errors, lease) start recovery; a session closed on purpose doesn't.
+- **Standby path.** While on Wi-Fi, the app keeps a second UDP socket bound to the mobile network (Rust makes it and hands its descriptor to Kotlin, which calls `Network.bindSocket`), opens a QUIC endpoint on it, and learns its outside address with a DHT ping. The standby addresses go to contacts in `Paths`. Both sides then keep a hole open between the contact's main socket and our standby socket:
+  - our standby socket probes the contact's addresses every 45 s, adapting: shorter when a refresh finds the outside port changed (the mapping had expired), slowly longer while it holds, between 20 s and 5 minutes;
+  - the contact's main socket probes our standby addresses every 20 s (home routers forget UDP mappings within a minute).
+  The standby path is kept warm only while it matters, since the probes cost mobile radio time: the app is open, a message came or went in the last ten minutes, or the Wi-Fi signal is below -72 dBm.
+- **The moving side acts first.** When Android reports that mobile data became the default network, the node dials every approved contact through its standby hole at once. If Wi-Fi is back, or there is no warm hole, it gathers its new addresses (DHT pings to cached nodes, no DNS: about 0.3–0.5 s), probes and dials the contact's known addresses, and writes its new addresses to each recovery slot (it rejoins the DHT from the new network first, starting from the nodes it knew).
+- **The other side.** Its session fails (an error, or the lease). It probes the contact's standby and last known addresses, reads the contact's recovery slot every 1.5 s for a minute, and probes whatever appears there. It leaves dialing to the side that moved; it dials itself only after 15 s without hearing that side's probes. When neither side moved (a path between them died), the smaller key dials as soon as it hears the other.
+- **Duplicates.** If both sides dial at once, both keep the session dialed by the smaller key when two sessions start within 5 s of each other. Keeping the newest instead made each side keep a different one and lose the other, over and over.
+
+**Measured** (2026-10-05, Pixel 8a on AT&T, laptop behind two home NATs), from Android's network-change callback to a session back up:
+
+| Case | Time |
+|---|---|
+| Wi-Fi off, standby hole warm, defaults | 0.5–0.9 s |
+| Standby hole gone stale (no refresh for 60–120 s) | about 8–9 s, via the probes and recovery slot |
+| Before fast recovery | about 1m45s |
+
+Android itself reported the change about 2.5 s after Wi-Fi was turned off. AT&T kept idle UDP mappings for between 60 and 120 s; the home router forgot them in under 60 s. The home network turned out to be behind two NATs, so router port mapping (section 0) would need both routers to cooperate there.
+
+**Still to do:**
+- **Joining Wi-Fi.** When Wi-Fi becomes the default the session breaks and recovery takes the slower path (about 8–30 s). Android announces the new network a second or two before switching, while the old one still works: the node will send its new addresses over the old session then, so the contact probes before the switch.
+- **The other side on mobile data** can refresh its holes as rarely as the phone does, rather than every 20 s.
+- **On start**, publish and look for contacts at once rather than at the next poll.
+- **A persistent relay circuit** to a reachable, always-on approved contact would carry a "here are my new addresses" message immediately (about 1–2 s instead of the recovery slot's 5–8 s), and reach a phone in the background. It needs such a contact with a stable public address.
 
 ## Privacy
 

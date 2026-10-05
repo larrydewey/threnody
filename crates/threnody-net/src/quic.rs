@@ -249,7 +249,7 @@ fn configs() -> Result<(quinn::ServerConfig, quinn::ClientConfig)> {
     Ok((server, client))
 }
 
-fn bind(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+pub(crate) fn bind(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -287,7 +287,21 @@ impl Node {
             .next()
             .ok_or_else(|| NetError::Io(io::Error::other("no address to bind")))?;
         let std_sock = bind(addr)?;
-        let ipv6 = addr.is_ipv6();
+        let quic = self.open_endpoint(std_sock, addr.is_ipv6(), false)?;
+        let local = quic.local;
+        *lock(&self.shared.quic) = Some(quic);
+        Ok(local)
+    }
+
+    /// Runs a QUIC endpoint on `std_sock`: accepts sessions and hands
+    /// non-QUIC datagrams to rendezvous. `standby` marks the endpoint on a
+    /// second network (see `recover`).
+    pub(crate) fn open_endpoint(
+        &self,
+        std_sock: std::net::UdpSocket,
+        ipv6: bool,
+        standby: bool,
+    ) -> Result<Arc<Quic>> {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| NetError::Io(io::Error::other("no async runtime")))?;
         let socket = runtime.wrap_udp_socket(std_sock)?;
@@ -309,7 +323,6 @@ impl Node {
             ipv6,
             local,
         });
-        *lock(&self.shared.quic) = Some(quic);
 
         let node = self.clone();
         tokio::spawn(async move {
@@ -345,10 +358,10 @@ impl Node {
                     () = &mut closed => break,
                 };
                 let Some((src, data)) = got else { break };
-                node.on_foreign(src, &data);
+                node.on_foreign(src, &data, standby);
             }
         });
-        Ok(local)
+        Ok(quic)
     }
 
     async fn run_quic_inbound(&self, incoming: quinn::Incoming) -> Result<()> {
@@ -368,6 +381,15 @@ impl Node {
     /// Opens a QUIC connection to `addr`, without a session yet.
     pub(crate) async fn quic_dial(&self, addr: SocketAddr) -> Result<quinn::Connection> {
         let quic = self.quic().ok_or(NetError::Closed)?;
+        self.quic_dial_via(&quic, addr).await
+    }
+
+    /// Opens a QUIC connection to `addr` from the endpoint `quic`.
+    pub(crate) async fn quic_dial_via(
+        &self,
+        quic: &Quic,
+        addr: SocketAddr,
+    ) -> Result<quinn::Connection> {
         if !quic.can_reach(addr.ip()) {
             return Err(NetError::Io(io::ErrorKind::Unsupported.into()));
         }
@@ -387,6 +409,7 @@ impl Node {
         &self,
         conn: quinn::Connection,
         expect: Option<Fingerprint>,
+        standby: bool,
     ) -> Result<PublicIdentity> {
         let addr = canonical(conn.remote_address());
         let (send, recv) = conn.open_bi().await.map_err(quic_error)?;
@@ -401,7 +424,12 @@ impl Node {
                 got: peer.fingerprint().to_string(),
             });
         }
-        self.spawn_session(stream, chan, addr, true, Route::Quic);
+        let route = if standby {
+            Route::QuicStandby
+        } else {
+            Route::Quic
+        };
+        self.spawn_session(stream, chan, addr, true, route);
         Ok(peer)
     }
 
@@ -412,7 +440,7 @@ impl Node {
         expect: Option<Fingerprint>,
     ) -> Result<PublicIdentity> {
         let conn = self.quic_dial(addr).await?;
-        self.quic_session(conn, expect).await
+        self.quic_session(conn, expect, false).await
     }
 }
 

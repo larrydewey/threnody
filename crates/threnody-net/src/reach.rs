@@ -49,6 +49,9 @@ const PROBE_EVERY: Duration = Duration::from_secs(1);
 /// The dialer waits this long for a probe before dialing anyway.
 const DIAL_AFTER: Duration = Duration::from_secs(3);
 const REDIAL_EVERY: Duration = Duration::from_secs(5);
+/// After a session was lost, the side that didn't move waits this long for
+/// the other to dial before dialing itself.
+const LOST_DIAL_AFTER: Duration = Duration::from_secs(15);
 /// Contacts punched at once.
 const MAX_PUNCHES: usize = 4;
 /// Candidates probed per contact (so at most 32 probes in flight).
@@ -116,13 +119,19 @@ pub struct Reachability {
 
 /// Why we punch toward a contact.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Urge {
+pub(crate) enum Urge {
     /// Its record is new to us: we start, and ask it to join in.
     Start,
     /// Its record asks for us: join in, even while backing off.
     Answer,
     /// Its probe arrived: it is punching toward us.
     Probed,
+    /// Our network changed under a session with it: we know first, so we
+    /// dial at once (see `recover`).
+    Moved,
+    /// Its session ended without warning: probe where it may be now, and
+    /// dial only if it hasn't reached us in a few seconds (see `recover`).
+    Lost,
 }
 
 struct Punch {
@@ -131,6 +140,11 @@ struct Punch {
     /// A probe from the contact arrived.
     heard: Notify,
     we_dial: bool,
+    /// With `we_dial`: wait this long before the first dial.
+    dial_after: Duration,
+    /// The other side is expected to dial: a probe from it means it is
+    /// dialing, so don't dial too.
+    defer: bool,
 }
 
 struct Published {
@@ -139,8 +153,8 @@ struct Published {
 }
 
 #[derive(Default)]
-struct Inner {
-    candidates: Vec<Candidate>,
+pub(crate) struct Inner {
+    pub(crate) candidates: Vec<Candidate>,
     symmetric: bool,
     /// Our address as each session peer sees it.
     observed: HashMap<PublicIdentity, SocketAddr>,
@@ -158,6 +172,11 @@ struct Inner {
     backoff: HashMap<PublicIdentity, (usize, Instant)>,
     /// Publishing rounds in a row where every write failed.
     put_failures: u32,
+    /// DHT nodes to ping for our outside address, resolved and kept, so a
+    /// network change needs no DNS before the pings go out.
+    pub(crate) reflectors: Vec<SocketAddr>,
+    /// The last DHT routing table, to rejoin from quickly.
+    warm_nodes: Vec<String>,
 }
 
 pub(crate) struct ReachState {
@@ -165,10 +184,11 @@ pub(crate) struct ReachState {
     foreground: AtomicBool,
     started: AtomicBool,
     dht: Mutex<Option<AsyncDht>>,
-    inner: Mutex<Inner>,
+    pub(crate) inner: Mutex<Inner>,
     regather: Notify,
     republish: Notify,
     poll: Notify,
+    cfg: Mutex<Option<Arc<ReachConfig>>>,
 }
 
 impl ReachState {
@@ -182,6 +202,7 @@ impl ReachState {
             regather: Notify::new(),
             republish: Notify::new(),
             poll: Notify::new(),
+            cfg: Mutex::new(None),
         }
     }
 }
@@ -198,7 +219,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn krpc_ping(tid: [u8; 2]) -> Vec<u8> {
+pub(crate) fn krpc_ping(tid: [u8; 2]) -> Vec<u8> {
     let mut m = b"d1:ad2:id20:".to_vec();
     m.extend_from_slice(&random_bytes::<20>());
     m.extend_from_slice(b"e1:q4:ping1:t2:");
@@ -208,7 +229,7 @@ fn krpc_ping(tid: [u8; 2]) -> Vec<u8> {
 }
 
 /// The transaction id and our address (BEP 42 `ip`) from a ping reply.
-fn parse_krpc_reply(data: &[u8]) -> Option<([u8; 2], SocketAddr)> {
+pub(crate) fn parse_krpc_reply(data: &[u8]) -> Option<([u8; 2], SocketAddr)> {
     let t = find(data, b"1:t2:")? + 5;
     let tid = [*data.get(t)?, *data.get(t + 1)?];
     let addr = if let Some(i) = find(data, b"2:ip6:") {
@@ -233,11 +254,11 @@ fn route_source(bind: &str, probe: &str) -> Option<IpAddr> {
     Some(s.local_addr().ok()?.ip())
 }
 
-fn is_global_v6(ip: &IpAddr) -> bool {
+pub(crate) fn is_global_v6(ip: &IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xe000 == 0x2000)
 }
 
-fn is_public(ip: &IpAddr) -> bool {
+pub(crate) fn is_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             !(v4.is_private()
@@ -251,7 +272,7 @@ fn is_public(ip: &IpAddr) -> bool {
 }
 
 impl Node {
-    fn rdv(&self) -> &ReachState {
+    pub(crate) fn rdv(&self) -> &ReachState {
         &self.shared.reach
     }
 
@@ -304,11 +325,20 @@ impl Node {
 
     /// The network changed: gather candidates again, publish and poll.
     pub fn network_changed(&self) {
-        // DHT write tokens are bound to our address: rejoin from the new one.
-        self.leave_dht();
         lock(&self.rdv().inner).backoff.clear();
-        self.rdv().regather.notify_one();
-        self.rdv().poll.notify_one();
+        // DHT write tokens are bound to our address: rejoin from the new
+        // one, starting from the nodes we knew, so it takes a moment.
+        let old = lock(&self.rdv().dht).take();
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Some(old) = old {
+                let nodes = old.to_bootstrap().await;
+                lock(&node.rdv().inner).warm_nodes = nodes;
+            }
+            node.leave_dht();
+            node.rdv().regather.notify_one();
+            node.rdv().poll.notify_one();
+        });
     }
 
     pub fn reachability(&self) -> Reachability {
@@ -322,7 +352,7 @@ impl Node {
         }
     }
 
-    fn connected(&self, peer: &PublicIdentity) -> bool {
+    pub(crate) fn connected(&self, peer: &PublicIdentity) -> bool {
         self.sessions().iter().any(|s| s.peer == *peer)
     }
 
@@ -356,7 +386,11 @@ impl Node {
         inner.put_failures = 0;
     }
 
-    fn dht(&self) -> Option<AsyncDht> {
+    pub(crate) fn reach_config(&self) -> Option<Arc<ReachConfig>> {
+        lock(&self.rdv().cfg).clone()
+    }
+
+    pub(crate) fn dht(&self) -> Option<AsyncDht> {
         lock(&self.rdv().dht).clone()
     }
 
@@ -373,6 +407,9 @@ impl Node {
             return Ok(());
         }
         let cfg = Arc::new(cfg);
+        *lock(&self.rdv().cfg) = Some(cfg.clone());
+        let node = self.clone();
+        tokio::spawn(async move { node.keepalive_loop().await });
         let (node, c) = (self.clone(), cfg.clone());
         tokio::spawn(async move { node.gather_loop(&c).await });
         let (node, c) = (self.clone(), cfg.clone());
@@ -383,7 +420,7 @@ impl Node {
     }
 
     /// Waits for `d`, a notification, or shutdown (`false`).
-    async fn pause(&self, d: Duration, n: &Notify) -> bool {
+    pub(crate) async fn pause(&self, d: Duration, n: &Notify) -> bool {
         let closed = self.closed();
         tokio::select! {
             () = tokio::time::sleep(d) => true,
@@ -396,7 +433,8 @@ impl Node {
         loop {
             if self.reach_enabled() {
                 if self.dht().is_none() {
-                    match join_dht(cfg).await {
+                    let warm = lock(&self.rdv().inner).warm_nodes.clone();
+                    match join_dht(cfg, &warm).await {
                         Ok(dht) => *lock(&self.rdv().dht) = Some(dht),
                         Err(e) => eprintln!("threnody: joining the DHT failed: {e}"),
                     }
@@ -424,8 +462,48 @@ impl Node {
         }
     }
 
+    /// DHT nodes to ping for our outside address: the cached list, else
+    /// the configured reflectors and some of the routing table (resolved
+    /// now and cached for next time).
+    pub(crate) async fn reflectors(&self, cfg: &ReachConfig) -> Vec<SocketAddr> {
+        let cached = lock(&self.rdv().inner).reflectors.clone();
+        if cached.len() >= 2 {
+            // Refresh in the background for next time.
+            let (node, cfg) = (self.clone(), cfg.clone());
+            tokio::spawn(async move {
+                let fresh = node.resolve_reflectors(&cfg).await;
+                if !fresh.is_empty() {
+                    lock(&node.rdv().inner).reflectors = fresh;
+                }
+            });
+            return cached;
+        }
+        let fresh = self.resolve_reflectors(cfg).await;
+        lock(&self.rdv().inner).reflectors = fresh.clone();
+        fresh
+    }
+
+    async fn resolve_reflectors(&self, cfg: &ReachConfig) -> Vec<SocketAddr> {
+        let mut targets = Vec::new();
+        for r in &cfg.reflectors {
+            if let Ok(addrs) = tokio::net::lookup_host(r.as_str()).await {
+                targets.extend(addrs.filter(SocketAddr::is_ipv4).take(1));
+            }
+        }
+        if let Some(dht) = self.dht() {
+            let table = dht.to_bootstrap().await;
+            targets.extend(
+                table
+                    .iter()
+                    .filter_map(|s| s.parse::<SocketAddr>().ok())
+                    .take(TABLE_REFLECTORS),
+            );
+        }
+        targets
+    }
+
     /// Gathers our candidates; republishes when they changed.
-    async fn gather(&self, cfg: &ReachConfig) {
+    pub(crate) async fn gather(&self, cfg: &ReachConfig) {
         let Some(quic) = self.quic() else { return };
         let port = quic.local.port();
         let mut list = Vec::new();
@@ -455,21 +533,7 @@ impl Node {
         }
 
         // Our outside address, from DHT nodes pinged off the QUIC socket.
-        let mut targets = Vec::new();
-        for r in &cfg.reflectors {
-            if let Ok(addrs) = tokio::net::lookup_host(r.as_str()).await {
-                targets.extend(addrs.filter(|a| quic.can_reach(a.ip())).take(1));
-            }
-        }
-        if let Some(dht) = self.dht() {
-            let table = dht.to_bootstrap().await;
-            targets.extend(
-                table
-                    .iter()
-                    .filter_map(|s| s.parse::<SocketAddr>().ok())
-                    .take(TABLE_REFLECTORS),
-            );
-        }
+        let targets = self.reflectors(cfg).await;
         {
             let mut inner = lock(&self.rdv().inner);
             inner.pings.clear();
@@ -481,8 +545,13 @@ impl Node {
                 }
             }
         }
-        if !targets.is_empty() {
-            tokio::time::sleep(REFLECT_WAIT).await;
+        // Two answers are enough (one can't show a symmetric NAT).
+        let deadline = Instant::now() + REFLECT_WAIT;
+        while !targets.is_empty()
+            && Instant::now() < deadline
+            && lock(&self.rdv().inner).reflected.len() < 2
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let dht_guess = match self.dht() {
             Some(dht) => dht.info().await.public_address(),
@@ -553,6 +622,7 @@ impl Node {
                 candidates,
                 symmetric,
             });
+            self.broadcast_paths();
             self.rdv().republish.notify_one();
         }
     }
@@ -737,7 +807,7 @@ impl Node {
     /// Starts hole punching toward `peer` at `candidates`, unless it is
     /// connected, already being punched, backing off, or too many are
     /// (see [`Urge`] for the exceptions). True if it started.
-    fn punch(
+    pub(crate) fn punch(
         &self,
         peer: PublicIdentity,
         candidates: &[Candidate],
@@ -747,50 +817,76 @@ impl Node {
         let Some(quic) = self.quic() else {
             return false;
         };
-        if !self.reach_enabled() || self.connected(&peer) {
+        if !self.reach_enabled() || (self.connected(&peer) && urge != Urge::Moved) {
             return false;
         }
         let mut sorted = candidates.to_vec();
         sorted.sort_by_key(|c| c.kind.rank());
-        let targets: Vec<SocketAddr> = sorted
-            .iter()
-            .map(|c| c.addr)
-            .filter(|a| quic.can_reach(a.ip()))
-            .take(MAX_TARGETS)
-            .collect();
+        let mut targets: Vec<SocketAddr> = Vec::new();
+        for a in sorted.iter().map(|c| c.addr) {
+            if quic.can_reach(a.ip()) && !targets.contains(&a) && targets.len() < MAX_TARGETS {
+                targets.push(a);
+            }
+        }
         let punch = {
             let mut inner = lock(&self.rdv().inner);
             let backing_off = inner
                 .backoff
                 .get(&peer)
                 .is_some_and(|(_, until)| Instant::now() < *until);
+            let recovering = matches!(urge, Urge::Moved | Urge::Lost);
             if targets.is_empty()
                 || (backing_off && urge == Urge::Start)
-                || inner.punches.contains_key(&peer)
-                || inner.punches.len() >= MAX_PUNCHES
+                || (inner.punches.contains_key(&peer) && !recovering)
+                || (inner.punches.len() >= MAX_PUNCHES && !recovering)
             {
                 return false;
             }
-            let lasts = if urge == Urge::Start {
-                // Ask the contact to join in: our record says we seek it.
-                let until = now_ms() + SEEK_FOR.as_millis() as u64;
-                inner.seeking.insert(peer, until);
-                SEEK_FOR
-            } else {
-                ANSWER_FOR
+            if let Some(p) = inner.punches.get(&peer) {
+                // Already punching: aim it at the new places too.
+                let mut t = lock(&p.targets);
+                for a in targets.iter().rev() {
+                    if !t.contains(a) {
+                        t.insert(0, *a);
+                    }
+                }
+                t.truncate(MAX_TARGETS);
+                p.heard.notify_one();
+                return true;
+            }
+            let lasts = match urge {
+                Urge::Start => {
+                    // Ask the contact to join in: our record says we seek it.
+                    let until = now_ms() + SEEK_FOR.as_millis() as u64;
+                    inner.seeking.insert(peer, until);
+                    SEEK_FOR
+                }
+                Urge::Lost => crate::recover::RECOVER_FOR,
+                _ => ANSWER_FOR,
             };
             // Exactly one side dials: the one with a stable outside port if
             // only one has, else the one with the smaller key.
-            let we_dial = match (inner.symmetric, their_symmetric) {
-                (true, false) => false,
-                (false, true) => true,
-                _ => self.identity().as_bytes() < peer.as_bytes(),
+            let (we_dial, dial_after) = match urge {
+                Urge::Moved => (true, Duration::ZERO),
+                Urge::Lost => (true, LOST_DIAL_AFTER),
+                _ => (
+                    match (inner.symmetric, their_symmetric) {
+                        (true, false) => false,
+                        (false, true) => true,
+                        _ => self.identity().as_bytes() < peer.as_bytes(),
+                    },
+                    DIAL_AFTER,
+                ),
             };
             let p = Arc::new(Punch {
                 targets: Mutex::new(targets),
                 lasts,
                 heard: Notify::new(),
                 we_dial,
+                dial_after,
+                // On a loss neither side caused, the smaller key dials once
+                // it hears the other; the larger leaves it to that side.
+                defer: urge == Urge::Lost && self.identity().as_bytes() > peer.as_bytes(),
             });
             inner.punches.insert(peer, p.clone());
             p
@@ -832,7 +928,8 @@ impl Node {
         };
         let me = self.identity();
         let start = Instant::now();
-        let mut next_dial = start + DIAL_AFTER;
+        let mut next_dial = start + punch.dial_after;
+        let mut heard: Option<Instant> = None;
         let mut dialing: Option<tokio::task::JoinHandle<()>> = None;
         let mut tick = tokio::time::interval(PROBE_EVERY);
         let closed = self.closed();
@@ -847,7 +944,13 @@ impl Node {
             }
             tokio::select! {
                 _ = tick.tick() => {}
-                () = punch.heard.notified() => next_dial = Instant::now(),
+                () = punch.heard.notified() => {
+                    if punch.defer {
+                        heard = Some(Instant::now());
+                    } else {
+                        next_dial = Instant::now();
+                    }
+                }
                 () = &mut closed => break false,
             }
             let Some(d) = self.contacts().get(&peer).and_then(|c| c.discovery_key) else {
@@ -858,12 +961,16 @@ impl Node {
                 let _ = quic.send_raw(*t, &rendezvous::probe(&d, &me));
             }
             let idle = dialing.as_ref().is_none_or(|h| h.is_finished());
-            if punch.we_dial && idle && Instant::now() >= next_dial {
+            let quiet = heard.is_none_or(|h| h.elapsed() > Duration::from_secs(5));
+            if punch.we_dial && idle && quiet && Instant::now() >= next_dial {
                 next_dial = Instant::now() + REDIAL_EVERY;
                 let node = self.clone();
                 dialing = Some(tokio::spawn(async move {
                     let r = match node.race(&targets).await {
-                        Ok(conn) => node.quic_session(conn, Some(peer.fingerprint())).await,
+                        Ok(conn) => {
+                            node.quic_session(conn, Some(peer.fingerprint()), false)
+                                .await
+                        }
                         Err(e) => Err(e),
                     };
                     if let Err(e) = r {
@@ -902,7 +1009,11 @@ impl Node {
     }
 
     /// A non-QUIC datagram on the QUIC socket: a DHT reply or a probe.
-    pub(crate) fn on_foreign(&self, src: SocketAddr, data: &[u8]) {
+    pub(crate) fn on_foreign(&self, src: SocketAddr, data: &[u8], standby: bool) {
+        if standby && is_krpc_reply(data) {
+            self.on_standby_krpc(src, data);
+            return;
+        }
         if is_krpc_reply(data) {
             if let Some((tid, ours)) = parse_krpc_reply(data) {
                 let mut inner = lock(&self.rdv().inner);
@@ -968,10 +1079,13 @@ impl Node {
     }
 }
 
-async fn join_dht(cfg: &ReachConfig) -> std::io::Result<AsyncDht> {
+async fn join_dht(cfg: &ReachConfig, warm: &[String]) -> std::io::Result<AsyncDht> {
     let mut b = Dht::builder();
     if let Some(bs) = &cfg.bootstrap {
         b.bootstrap(bs);
+    }
+    if !warm.is_empty() {
+        b.extra_bootstrap(warm);
     }
     if cfg.loopback {
         b.bind_address(Ipv4Addr::LOCALHOST);

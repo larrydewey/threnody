@@ -43,12 +43,16 @@ object Threnody {
             val was = field > 0
             field = v
             // Contacts are looked for more often while the app is open.
-            if ((v > 0) != was) instance?.setForeground(v > 0)
+            if ((v > 0) != was) {
+                instance?.setForeground(v > 0)
+                updateStandby()
+            }
         }
 
     @Synchronized
     fun start(ctx: Context): ThrenodyNode = instance ?: open(ctx).also {
         debuggable = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+        if (debuggable) debugHooks(ctx.applicationContext, it)
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
         say("listening on $listenAddr")
@@ -57,6 +61,7 @@ object Threnody {
         openPersonas(ctx.applicationContext, it)
         applyPrivacy(ctx)
         redialOnNetwork(ctx.applicationContext, it)
+        keepStandby(ctx.applicationContext, it)
         nameThisDevice(it)
         sweepMedia(ctx.applicationContext, it)
     }
@@ -242,6 +247,75 @@ object Threnody {
         attempt(0)
     }
 
+    /** The default network is Wi-Fi (else mobile data, or none). */
+    @Volatile private var onWifi = false
+    /** The Wi-Fi signal is weak enough that losing it soon is likely. */
+    @Volatile private var wifiWeak = false
+    /** When a message last came or went, for the standby policy. */
+    @Volatile private var lastActivity = 0L
+    /** Below this Wi-Fi signal (dBm), the standby path is kept warm. */
+    private const val WEAK_WIFI_DBM = -72
+    /** A chat counts as active for this long after its last message. */
+    private const val ACTIVE_MS = 10 * 60_000L
+
+    /** A message came or went: keep the standby path warm for a while. */
+    fun touch() {
+        lastActivity = System.currentTimeMillis()
+        updateStandby()
+    }
+
+    /**
+     * Keeps holes open through mobile data while on Wi-Fi, so losing Wi-Fi
+     * costs a fraction of a second, but only while it matters (the radio
+     * time costs battery): the app is open, a chat was active in the last
+     * ten minutes, or the Wi-Fi signal is weakening.
+     */
+    fun updateStandby() {
+        val n = instance ?: return
+        val warm = forceWarm ?: (onWifi && (visible > 0 || wifiWeak ||
+            System.currentTimeMillis() - lastActivity < ACTIVE_MS))
+        n.setStandbyWarm(warm)
+    }
+
+    /**
+     * Keeps a socket bound to mobile data while Wi-Fi is the default
+     * network: the standby path that `network_changed` dials through when
+     * Wi-Fi goes.
+     */
+    private fun keepStandby(ctx: Context, node: ThrenodyNode) {
+        val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return
+        val req = android.net.NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                try {
+                    val fd = node.standbySocket()
+                    android.os.ParcelFileDescriptor.fromFd(fd).use { network.bindSocket(it.fileDescriptor) }
+                    val v6 = cm.getLinkProperties(network)?.linkAddresses.orEmpty()
+                        .map { it.address }
+                        .filterIsInstance<java.net.Inet6Address>()
+                        .filter { !it.isLinkLocalAddress && !it.isSiteLocalAddress && !it.isLoopbackAddress }
+                        .mapNotNull { it.hostAddress?.substringBefore('%') }
+                    node.standbyBound(v6)
+                    say("* standby path on mobile data ready")
+                    updateStandby()
+                } catch (e: Exception) {
+                    say("! standby path: ${e.message}")
+                }
+            }
+
+            override fun onLost(network: Network) {
+                node.standbyLost()
+                say("* standby path gone")
+            }
+        })
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "threnody-standby").apply { isDaemon = true }
+        }.scheduleWithFixedDelay({ updateStandby() }, 1, 1, TimeUnit.MINUTES)
+    }
+
     /**
      * Redials approved contacts whenever a network becomes available,
      * including right away if one already is.
@@ -250,14 +324,27 @@ object Threnody {
         val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                say("* network available; reconnecting to approved contacts")
-                node.networkChanged()
+                val caps = cm.getNetworkCapabilities(network)
+                val cellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+                onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                // First, before anything else: this side knows it moved.
+                node.networkChanged(cellular)
+                updateStandby()
+                say("* network available (${if (cellular) "mobile data" else if (onWifi) "Wi-Fi" else "other"}); reconnecting")
                 node.reconnect()
                 for (n in personaNodes.values) n.reconnect()
             }
 
             // Cover traffic stays on; on metered data it runs slower.
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    val weak = caps.signalStrength != NetworkCapabilities.SIGNAL_STRENGTH_UNSPECIFIED &&
+                        caps.signalStrength < WEAK_WIFI_DBM
+                    if (weak != wifiWeak) {
+                        wifiWeak = weak
+                        updateStandby()
+                    }
+                }
                 val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
                 if (metered != Privacy.metered) {
                     Privacy.metered = metered
@@ -288,6 +375,36 @@ object Threnody {
 
     /** Debug builds also copy the log to logcat, for testing over adb. */
     @Volatile private var debuggable = false
+
+    /** Forced standby warmth, for testing (null: the normal policy). */
+    @Volatile private var forceWarm: Boolean? = null
+
+    /**
+     * Debug builds only: test commands over adb, so tests don't need the
+     * screen. `adb shell am broadcast -a org.threnody.app.DEBUG --es cmd
+     * "keepalive 60"` (or "warm on", "warm off", "warm auto").
+     */
+    private fun debugHooks(ctx: Context, node: ThrenodyNode) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, i: android.content.Intent) {
+                val cmd = i.getStringExtra("cmd")?.trim() ?: return
+                val arg = cmd.substringAfter(' ', "")
+                when (cmd.substringBefore(' ')) {
+                    "keepalive" -> arg.toUIntOrNull()?.let { node.setStandbyKeepalive(it) }
+                    "warm" -> forceWarm = when (arg) { "on" -> true; "off" -> false; else -> null }
+                }
+                updateStandby()
+                say("* debug: $cmd")
+            }
+        }
+        val filter = android.content.IntentFilter("org.threnody.app.DEBUG")
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            ctx.registerReceiver(receiver, filter)
+        }
+    }
 
     fun say(line: String) {
         if (debuggable) android.util.Log.d("Threnody", line)
@@ -337,6 +454,7 @@ object Threnody {
                     if (node.contacts().any { it.fingerprint == e.peer && it.mutuallyApproved }) redialSoon(node)
                 }
                 is NodeEvent.Message -> {
+                    touch()
                     // The log is for transports, not content.
                     say("* message from ${short(e.peer)} (${e.text.length} chars)")
                     val contacts = node.contacts()

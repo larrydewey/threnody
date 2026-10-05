@@ -73,6 +73,7 @@ Type a line to send it to the current peer. Commands:
   /forget <peer>                        delete a contact and the conversation, on all your devices
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
+  /keepalive <secs>                     gap between keepalives on contacts' standby paths
   /devices   /device add [host:port]   /device rename <name> <new>   /device remove <name>
   /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
   /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
@@ -938,6 +939,14 @@ impl Ui {
             "help" | "h" | "?" => println!("{HELP}\n{}", crate::groups::HELP),
             "connect" | "c" => {
                 self.connect(arg.ok_or_else(|| anyhow!("usage: /connect <target>"))?)
+            }
+            "keepalive" => {
+                let secs: u64 = arg
+                    .and_then(|a| a.trim().parse().ok())
+                    .ok_or_else(|| anyhow!("usage: /keepalive <seconds>"))?;
+                self.node
+                    .set_standby_keepalive(std::time::Duration::from_secs(secs));
+                println!("* keepalives on standby holes every {secs} s");
             }
             "to" => {
                 let p =

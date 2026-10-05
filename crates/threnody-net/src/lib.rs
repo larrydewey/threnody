@@ -19,6 +19,7 @@ pub mod node;
 pub mod onion;
 mod quic;
 pub mod reach;
+mod recover;
 pub mod relay;
 pub mod sync;
 

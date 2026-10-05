@@ -748,10 +748,47 @@ impl ThrenodyNode {
         self.node.set_foreground(on);
     }
 
-    /// The network changed (another Wi-Fi, mobile data): learn our
-    /// addresses again and look for contacts.
-    pub fn network_changed(&self) {
-        self.node.network_changed();
+    /// The default network changed (another Wi-Fi, mobile data). Call it
+    /// the moment the platform says so: this side knows first, so it
+    /// redials through the standby path (`cellular`: the new default is
+    /// the network the standby socket is bound to), tells contacts where
+    /// it is now, and punches.
+    pub fn network_changed(&self, cellular: bool) {
+        let _guard = self.rt.enter();
+        self.node.network_switched(cellular);
+    }
+
+    /// Makes the standby socket and returns its file descriptor; bind it
+    /// to the mobile network (`Network.bindSocket`), then call
+    /// `standby_bound`.
+    pub fn standby_socket(&self) -> Result<i32> {
+        self.node.standby_socket().map_err(fail)
+    }
+
+    /// The standby socket is bound; `ipv6` are the mobile network's
+    /// global IPv6 addresses.
+    pub fn standby_bound(&self, ipv6: Vec<String>) -> Result<()> {
+        let _guard = self.rt.enter();
+        let ips = ipv6.iter().filter_map(|a| a.parse().ok()).collect();
+        self.node.standby_bound(ips).map_err(fail)
+    }
+
+    /// The mobile network went away.
+    pub fn standby_lost(&self) {
+        self.node.standby_lost();
+    }
+
+    /// Keep holes open through the standby path, so losing Wi-Fi costs a
+    /// fraction of a second. Costs mobile radio time: turn it on while the
+    /// app is open, a chat was active recently, or Wi-Fi is weakening.
+    pub fn set_standby_warm(&self, on: bool) {
+        self.node.set_standby_warm(on);
+    }
+
+    /// Gap between keepalives on standby holes, in seconds.
+    pub fn set_standby_keepalive(&self, secs: u32) {
+        self.node
+            .set_standby_keepalive(Duration::from_secs(u64::from(secs)));
     }
 
     /// We want to reach `peer` (its chat is open): look for it across the

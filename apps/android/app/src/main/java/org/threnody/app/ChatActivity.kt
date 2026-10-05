@@ -662,6 +662,7 @@ class ChatActivity : Activity() {
         val text = compose.text.toString().trim()
         if (text.isEmpty() || !::node.isInitialized) return
         compose.setText("")
+        Threnody.touch()
         synchronized(pending) { pending.add(text) }
         worker.execute { refresh() }
         worker.execute {
