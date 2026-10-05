@@ -38,14 +38,19 @@ object KeyVault {
      * plain identity first. A new identity is created sealed by `open`.
      */
     fun passphrase(ctx: Context, home: String): String {
-        val file = File(ctx.noBackupFilesDir, FILE)
-        val pw = if (file.exists()) read(file) else create(file)
+        val pw = secret(ctx)
         // A plain identity (from before this, or interrupted mid-way): seal it.
         if (!identityIsSealed(home) && File(home, "identity.cbor").exists()) {
             changePassphrase(home, null, pw)
             Threnody.say("* identity key sealed with the Android Keystore")
         }
         return pw
+    }
+
+    /** The Keystore-protected passphrase that seals identities on this device. */
+    fun secret(ctx: Context): String {
+        val file = File(ctx.noBackupFilesDir, FILE)
+        return if (file.exists()) read(file) else create(file)
     }
 
     /** Where the Keystore key lives, for the diagnostics screen. */

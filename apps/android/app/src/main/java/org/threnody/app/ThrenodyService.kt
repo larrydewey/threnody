@@ -49,12 +49,20 @@ class ThrenodyService : Service() {
         }
 
         /** Shows an incoming message while its chat isn't on screen. */
-        fun notifyMessage(ctx: Context, key: String, device: String, from: String, text: String) {
+        fun notifyMessage(ctx: Context, key: String, device: String, from: String, text: String, persona: String? = null) {
             val open = Intent(ctx, ChatActivity::class.java)
                 .putExtra(ChatActivity.KEY, key)
                 .putExtra(ChatActivity.DEVICE, device)
-            post(ctx, key, from, text, open)
+                .putExtra(ChatActivity.PERSONA, persona)
+            post(ctx, notificationKey(key, persona), titled(from, persona), text, open)
         }
+
+        /** Conversations of different identities never share a notification. */
+        fun notificationKey(key: String, persona: String?) = if (persona == null) key else "$persona:$key"
+
+        /** Which anonymous identity a notification is for, by its label. */
+        private fun titled(title: String, persona: String?): String =
+            if (persona == null) title else "🎭 ${Threnody.personaLabels[persona] ?: "Anonymous"} · $title"
 
         /** One notification per conversation [key], opening [open] above the list. */
         private fun post(ctx: Context, key: String, title: String, text: String, open: Intent) {
@@ -88,9 +96,11 @@ class ThrenodyService : Service() {
         }
 
         /** A group message or invitation; opens the group. */
-        fun notifyGroup(ctx: Context, group: String, title: String, text: String) {
-            val open = Intent(ctx, ChatActivity::class.java).putExtra(ChatActivity.GROUP, group)
-            post(ctx, group, title, text, open)
+        fun notifyGroup(ctx: Context, group: String, title: String, text: String, persona: String? = null) {
+            val open = Intent(ctx, ChatActivity::class.java)
+                .putExtra(ChatActivity.GROUP, group)
+                .putExtra(ChatActivity.PERSONA, persona)
+            post(ctx, notificationKey(group, persona), titled(title, persona), text, open)
         }
 
         fun clearNotification(ctx: Context, key: String) {

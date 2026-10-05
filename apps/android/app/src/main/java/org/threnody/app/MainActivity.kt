@@ -125,7 +125,22 @@ class MainActivity : Activity() {
         val invites = n.groupInvites().map { i ->
             Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null) { openGroup(i.group) }
         }
-        val rows = requests + invites + (contacts + groups).sortedByDescending { it.atMs }
+        // Anonymous identities' conversations, marked with the identity's label.
+        val anonymous = Threnody.personaIds().flatMap { id ->
+            val p = Threnody.personaNode(id) ?: return@flatMap emptyList()
+            val tag = "🎭 ${Threnody.personaLabels[id] ?: "anonymous"}"
+            Threnody.conversations(p, id).filter { !it.blocked }.map { c ->
+                val last = try { p.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
+                val what = when {
+                    !c.accepted -> "Message request · tap to review"
+                    last != null -> (if (last.outgoing) "You: " else "") + preview(last)
+                    else -> status(c)
+                }
+                Row(c.title, c.key, "$tag · $what", if (c.accepted) last?.atMs?.toLong() ?: 0 else Long.MAX_VALUE,
+                    c.connected) { openChat(c.key, c.device, id) }
+            }
+        }
+        val rows = requests + invites + (contacts + groups + anonymous).sortedByDescending { it.atMs }
         runOnUiThread { show(rows) }
     }
 
@@ -179,6 +194,7 @@ class MainActivity : Activity() {
             menu.add("Scan a QR code").setOnMenuItemClickListener { scan(); true }
             menu.add("Add a contact").setOnMenuItemClickListener { addContact(null); true }
             menu.add("New group").setOnMenuItemClickListener { newGroup(); true }
+            menu.add("Anonymous invite").setOnMenuItemClickListener { newPersona(); true }
             show()
         }
     }
@@ -262,6 +278,11 @@ class MainActivity : Activity() {
     private fun more(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add("Devices").setOnMenuItemClickListener { devices(); true }
+            menu.add("Your profile").setOnMenuItemClickListener {
+                node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile", worker) }
+                true
+            }
+            menu.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
             fun toggle(title: String, on: Boolean, set: (Boolean) -> Unit, says: (Boolean) -> String) =
                 menu.add(title).apply {
                     isCheckable = true
@@ -311,10 +332,152 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun openChat(key: String, device: String) {
+    private fun openChat(key: String, device: String, persona: String? = null) {
         startActivity(Intent(this, ChatActivity::class.java)
             .putExtra(ChatActivity.KEY, key)
-            .putExtra(ChatActivity.DEVICE, device))
+            .putExtra(ChatActivity.DEVICE, device)
+            .putExtra(ChatActivity.PERSONA, persona))
+    }
+
+    /** Burn-after choices for a new anonymous identity (null = keep it). */
+    private val burnChoices = listOf<Pair<String, Long?>>(
+        "Keep it until I burn it" to null,
+        "Burn after 1 day" to DateUtils.DAY_IN_MILLIS,
+        "Burn after 1 week" to DateUtils.WEEK_IN_MILLIS,
+        "Burn after 4 weeks" to 4 * DateUtils.WEEK_IN_MILLIS,
+    )
+
+    /** A new anonymous identity and its invite. */
+    private fun newPersona() {
+        val field = input("Your label for it (only you see this)", null).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        var burn = 2
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(field, matchWrap)
+            val group = android.widget.RadioGroup(this@MainActivity)
+            burnChoices.forEachIndexed { i, (name, _) ->
+                group.addView(android.widget.RadioButton(this@MainActivity).apply {
+                    id = i + 1
+                    text = name
+                    isChecked = i == burn
+                })
+            }
+            group.setOnCheckedChangeListener { _, id -> burn = id - 1 }
+            addView(group, matchWrap)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Anonymous invite")
+            .setMessage(
+                "A new identity with its own keys and conversations. Nothing links it to you unless you reveal it. " +
+                    "Anyone you reach directly can still see your network address.",
+            )
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Create") { _, _ ->
+                val label = field.text.toString().trim().ifEmpty { "Anonymous" }
+                val expires = burnChoices[burn].second?.let { System.currentTimeMillis() + it }
+                worker.execute {
+                    try {
+                        val rec = Threnody.createPersona(this, label, expires)
+                        runOnUiThread { personaInvite(rec.id) }
+                        refresh()
+                    } catch (e: Exception) {
+                        runOnUiThread { failed("Couldn't create it: ${e.message}") }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** An anonymous identity's invite, on its own port. */
+    private fun personaInvite(id: String) {
+        val p = Threnody.personaNode(id) ?: return
+        val ip = ourAddr()?.substringBeforeLast(':') ?: return failed("No network: connect to Wi-Fi to make an invite.")
+        val link = p.inviteLink("$ip:${Threnody.personaPort(this, id)}")
+        showCode(
+            "Anonymous invite · ${Threnody.personaLabels[id] ?: ""}",
+            "Whoever uses this reaches your anonymous identity, not you. It works while this phone is on this network.",
+            link,
+            "Anonymous identity ${p.deviceFingerprint()}",
+        )
+    }
+
+    /** The anonymous identities, each with its invite, profile, rename and burn. */
+    private fun personas() {
+        val n = node ?: return
+        worker.execute {
+            val list = try { n.personas() } catch (_: Exception) { emptyList() }
+            runOnUiThread {
+                if (list.isEmpty()) {
+                    AlertDialog.Builder(this)
+                        .setTitle("Anonymous identities")
+                        .setMessage("None yet. + → Anonymous invite makes one.")
+                        .setPositiveButton("Make one") { _, _ -> newPersona() }
+                        .setNegativeButton("Close", null)
+                        .show()
+                    return@runOnUiThread
+                }
+                val rows = list.map { p ->
+                    p.label + (p.expiresMs?.let { " · burns " + DateUtils.getRelativeTimeSpanString(it.toLong()).toString().replaceFirstChar(Char::lowercase) } ?: "")
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Anonymous identities")
+                    .setItems(rows.toTypedArray()) { _, i -> persona(list[i].id, list[i].label) }
+                    .setPositiveButton("New") { _, _ -> newPersona() }
+                    .setNegativeButton("Close", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun persona(id: String, label: String) {
+        val p = Threnody.personaNode(id) ?: return
+        val options = listOf("Show its invite", "Its profile", "Rename", "Burn it")
+        AlertDialog.Builder(this)
+            .setTitle(label)
+            .setItems(options.toTypedArray()) { _, i ->
+                when (i) {
+                    0 -> personaInvite(id)
+                    1 -> ProfileUi.edit(this, p, "$label's profile", worker)
+                    2 -> renamePersona(id, label)
+                    3 -> burnPersona(id, label)
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun renamePersona(id: String, label: String) {
+        val field = input("Label", label)
+        AlertDialog.Builder(this)
+            .setTitle("Rename")
+            .setView(padded(field))
+            .setPositiveButton("Save") { _, _ ->
+                val new = field.text.toString().trim()
+                if (new.isNotEmpty()) worker.execute {
+                    try { Threnody.renamePersona(this, id, new) } catch (e: Exception) { runOnUiThread { failed("${e.message}") } }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun burnPersona(id: String, label: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Burn $label?")
+            .setMessage("Its keys, contacts, messages and files are deleted for good. Nobody can reach it again.")
+            .setPositiveButton("Burn") { _, _ ->
+                worker.execute {
+                    try { Threnody.burnPersona(this, id) } catch (e: Exception) { runOnUiThread { failed("${e.message}") } }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /** The address others should dial: our Wi-Fi (or other) IPv4 address. */

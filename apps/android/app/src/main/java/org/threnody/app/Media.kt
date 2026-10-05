@@ -46,9 +46,13 @@ object Media {
         return name.substringBeforeLast('.') + ".jpg" to out.toByteArray()
     }
 
-    /** Keeps an image privately; returns its location for history. */
-    fun savePrivate(ctx: Context, name: String, data: ByteArray): String? = try {
-        val dir = File(ctx.filesDir, "media").apply { mkdirs() }
+    /** The private folder for an identity's files: the main one's, or a persona's. */
+    fun dir(ctx: Context, persona: String?): File =
+        File(ctx.filesDir, if (persona == null) "media" else "media-p-$persona")
+
+    /** Keeps a file privately; returns its location for history. */
+    fun savePrivate(ctx: Context, name: String, data: ByteArray, persona: String? = null): String? = try {
+        val dir = dir(ctx, persona).apply { mkdirs() }
         val safe = name.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_").takeLast(80)
         val f = File(dir, "${System.currentTimeMillis()}-${(1000..9999).random()}-$safe")
         f.writeBytes(data)
@@ -97,11 +101,11 @@ object Media {
      * ones, and ones whose messages disappeared. Recent files are left, as
      * their message may not be recorded yet.
      */
-    fun sweep(ctx: Context, node: uniffi.threnody_ffi.ThrenodyNode) {
-        val dir = File(ctx.filesDir, "media")
+    fun sweep(ctx: Context, node: uniffi.threnody_ffi.ThrenodyNode, persona: String? = null) {
+        val dir = dir(ctx, persona)
         val files = dir.listFiles() ?: return
         val used = try {
-            val chats = Threnody.conversations(node).flatMap { node.history(it.device, 10_000u) }
+            val chats = Threnody.conversations(node, persona).flatMap { node.history(it.device, 10_000u) }
             val groups = node.groups().flatMap { node.groupHistory(it.id, 10_000u) }
             (chats + groups).mapNotNull { it.file?.location }.toSet()
         } catch (_: Exception) {
@@ -117,6 +121,6 @@ object Media {
     fun forget(ctx: Context, location: String?) {
         val uri = location?.let(Uri::parse) ?: return
         val path = uri.path ?: return
-        if (uri.scheme == "file" && path.startsWith(File(ctx.filesDir, "media").path)) File(path).delete()
+        if (uri.scheme == "file" && path.startsWith(ctx.filesDir.path + "/media")) File(path).delete()
     }
 }

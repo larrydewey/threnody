@@ -53,6 +53,10 @@
         <activity android:name=".LogActivity" android:exported="false"
             android:parentActivityName=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+        <provider android:name=".FilesProvider"
+            android:authorities="org.threnody.app.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
         <service android:name=".ThrenodyService" android:exported="false"
             android:foregroundServiceType="remoteMessaging" />
     </application>

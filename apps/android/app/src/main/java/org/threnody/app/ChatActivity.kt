@@ -39,6 +39,10 @@ class ChatActivity : Activity() {
     private lateinit var node: ThrenodyNode
     /** The group id, for a group conversation. */
     private var group: String? = null
+    /** The anonymous identity this chat belongs to; null for the main one. */
+    private var persona: String? = null
+    /** They proved they are a contact of our main identity: its name. */
+    private var revealedKnown: String? = null
     private var info: GroupInfo? = null
     private var key = ""
     /** The device to address; any of the account's devices reaches them all. */
@@ -62,6 +66,7 @@ class ChatActivity : Activity() {
         super.onCreate(savedInstanceState)
         Privacy.apply(this)
         group = intent.getStringExtra(GROUP)
+        persona = intent.getStringExtra(PERSONA)
         key = group ?: intent.getStringExtra(KEY) ?: return finish()
         device = intent.getStringExtra(DEVICE) ?: key
 
@@ -95,7 +100,15 @@ class ChatActivity : Activity() {
         scroll.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, ob -> if (b < ob) toBottom() }
 
         worker.execute {
-            node = Threnody.start(this)
+            node = try {
+                Threnody.node(this, persona)
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+                    finish()
+                }
+                return@execute
+            }
             refresh()
         }
     }
@@ -134,7 +147,7 @@ class ChatActivity : Activity() {
         super.onStart()
         Threnody.visible++
         Threnody.visibleChat = setOf(key, device) + (convo?.devices ?: emptyList())
-        ThrenodyService.clearNotification(this, key)
+        ThrenodyService.clearNotification(this, ThrenodyService.notificationKey(key, persona))
         unsubscribe = Threnody.subscribe { e -> if (concerns(e)) worker.execute { refresh() } }
         if (::node.isInitialized) worker.execute { refresh() }
     }
@@ -170,6 +183,8 @@ class ChatActivity : Activity() {
             is NodeEvent.Disconnected -> e.peer
             is NodeEvent.ApprovalChanged -> e.peer
             is NodeEvent.Delivered -> e.peer
+            is NodeEvent.ProfileChanged -> e.peer
+            is NodeEvent.IdentityRevealed -> e.peer
             is NodeEvent.AccountChanged -> return true
             else -> return false
         }
@@ -189,12 +204,16 @@ class ChatActivity : Activity() {
             history = try { node.groupHistory(g, 200u) } catch (_: Exception) { emptyList() }
         } else {
             // The key moves from device to account once the account is known.
-            c = Threnody.conversations(node).firstOrNull { it.key == key || device in it.devices }
+            c = Threnody.conversations(node, persona).firstOrNull { it.key == key || device in it.devices }
             if (c != null) {
                 key = c.key
                 device = c.device
             }
             history = try { node.history(device, 200u) } catch (_: Exception) { emptyList() }
+        }
+        revealedKnown = c?.revealed?.let { fp ->
+            // Known to the main identity, which is who they revealed themselves to.
+            Threnody.start(this).contacts().firstOrNull { it.fingerprint == fp }?.let { it.name ?: Threnody.short(fp) }
         }
         val me = node.deviceFingerprint()
         myDevice = me
@@ -217,6 +236,7 @@ class ChatActivity : Activity() {
         bar.title.text = c?.title ?: Threnody.short(device)
         bar.subtitle.visibility = View.VISIBLE
         bar.subtitle.text = listOfNotNull(
+            persona?.let { "🎭 as ${Threnody.personaLabels[it] ?: "anonymous"}" },
             if (c?.connected == true) "connected" else "not connected",
             if (c?.verified == true) "verified" else "⚠ not verified",
             c?.devices?.size?.takeIf { it > 1 }?.let { "$it devices" },
@@ -236,7 +256,15 @@ class ChatActivity : Activity() {
             )
             return
         }
+        val revealed = c.revealed
         when {
+            // They reached us anonymously and then proved who they are.
+            revealed != null && revealedKnown == null -> banner(
+                "${c.title} proved they are ${Threnody.short(revealed)}. Add them to talk to them as themselves" +
+                    (if (persona != null) " (from your main identity)." else "."),
+                *(c.revealedInvite?.let { inv -> arrayOf<Pair<String, () -> Unit>>("Add them" to { addRevealed(inv) }) }
+                    ?: emptyArray()),
+            )
             // Someone we'd verified now has a device we haven't: a key we
             // don't know is in the conversation.
             !c.verified && c.anyVerified -> banner(
@@ -468,7 +496,7 @@ class ChatActivity : Activity() {
                 })
             }
             Formatter.formatShortFileSize(this, run.sumOf { it.entry.file?.size ?: 0uL }.toLong()) + " · " + time +
-                if (file.location != null && !outgoing) " · in Downloads" else ""
+                if (file.location?.startsWith("content:") == true && !outgoing) " · in Downloads" else ""
         }
         // One tick once sent, two once delivered: to a device of the
         // contact, or to every member of a group (with a count until then).
@@ -715,7 +743,7 @@ class ChatActivity : Activity() {
             for ((i, p) in picked.withIndex()) {
                 val options = FileOptions(sensitive, if (i == 0) caption else "", album)
                 // Keep our own copy of a photo privately, so the chat can show it.
-                val location = if (Media.isImage(p.name)) Media.savePrivate(this, p.name, p.data) else p.uri.toString()
+                val location = if (Media.isImage(p.name)) Media.savePrivate(this, p.name, p.data, persona) else p.uri.toString()
                 try {
                     if (g != null) node.sendGroupFile(g, p.name, p.data, location, options)
                     else node.sendFile(device, p.name, p.data, location, options)
@@ -731,7 +759,8 @@ class ChatActivity : Activity() {
         }
     }
 
-    private fun open(uri: Uri) {
+    private fun open(location: Uri) {
+        val uri = FilesProvider.shareable(this, location)
         try {
             startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
         } catch (_: Exception) {
@@ -751,10 +780,67 @@ class ChatActivity : Activity() {
                 menu.add("Approve").setOnMenuItemClickListener { setApproval(true); true }
             }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
+            menu.add("Share your profile…").setOnMenuItemClickListener {
+                ProfileUi.share(this@ChatActivity, node, device, c?.title ?: "They", worker,
+                    if (persona != null) "This identity's profile" else "Your profile")
+                true
+            }
+            if (persona != null && c != null) {
+                menu.add("Reveal who you are…").setOnMenuItemClickListener { reveal(c); true }
+            }
             if (c?.connected == true && c.approved) {
                 menu.add("Faster link (Wi-Fi Direct)").setOnMenuItemClickListener { wifiDirect(); true }
             }
             show()
+        }
+    }
+
+    /** Proves to them that this anonymous identity is us. Can't be undone. */
+    private fun reveal(c: Conversation) {
+        val p = persona ?: return
+        AlertDialog.Builder(this)
+            .setTitle("Reveal who you are?")
+            .setMessage(
+                "${c.title} will get proof, signed by your main identity, that this anonymous identity is you, " +
+                    "and an invite to reach you. They can show that proof to anyone. This can't be taken back.",
+            )
+            .setPositiveButton("Reveal") { _, _ ->
+                worker.execute {
+                    val main = Threnody.start(this)
+                    val error = try {
+                        val p2 = Threnody.personaNode(p) ?: throw IllegalStateException("anonymous identity is gone")
+                        main.revealThrough(p2, device, mainInvite(main))
+                        null
+                    } catch (e: Exception) {
+                        e.message
+                    }
+                    runOnUiThread {
+                        Toast.makeText(this, error?.let { "Couldn't reveal: $it" } ?: "${c.title} now knows who you are",
+                            Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Our main identity's invite, on this device's current address. */
+    private fun mainInvite(main: ThrenodyNode): String? {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return null
+        val props = cm.getLinkProperties(cm.activeNetwork) ?: return null
+        val ip = props.linkAddresses.map { it.address }.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: return null
+        return main.inviteLink("$ip:${Threnody.listenAddr.substringAfterLast(':')}")
+    }
+
+    /** Adds the identity they revealed, as a contact of our main identity. */
+    private fun addRevealed(invite: String) {
+        worker.execute {
+            val error = try { Threnody.start(this).connect(invite); null } catch (e: Exception) { e.message }
+            runOnUiThread {
+                Toast.makeText(this, error?.let { "Couldn't reach them: $it" } ?: "Added. They're in your conversations.",
+                    Toast.LENGTH_LONG).show()
+            }
+            refresh()
         }
     }
 
@@ -811,7 +897,7 @@ class ChatActivity : Activity() {
     private fun inviteToGroup() {
         val g = info ?: return
         worker.execute {
-            val candidates = Threnody.conversations(node).filter { c -> c.devices.none { it in g.members } }
+            val candidates = Threnody.conversations(node, persona).filter { c -> c.devices.none { it in g.members } }
             runOnUiThread {
                 if (candidates.isEmpty()) {
                     Toast.makeText(this, "All your contacts are already in this group", Toast.LENGTH_LONG).show()
@@ -926,7 +1012,7 @@ class ChatActivity : Activity() {
                         worker.execute {
                             run("verify") { node.markVerified(target) }
                             // More devices to check? Offer the next one.
-                            val more = Threnody.conversations(node).firstOrNull { it.key == key }?.unverified?.isNotEmpty() == true
+                            val more = Threnody.conversations(node, persona).firstOrNull { it.key == key }?.unverified?.isNotEmpty() == true
                             if (more) runOnUiThread { safety() }
                         }
                     }
@@ -1005,6 +1091,7 @@ class ChatActivity : Activity() {
         const val KEY = "key"
         const val DEVICE = "device"
         const val GROUP = "group"
+        const val PERSONA = "persona"
         private const val PICK_FILE = 1
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
