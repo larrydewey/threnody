@@ -135,8 +135,8 @@ enum Cmd {
         #[arg(long)]
         keep_metadata: bool,
         /// How long messages last in chats that haven't set their own timer
-        /// (`30s`, `10m`, `1h`, `1d`, `1w`), or `off`. A week by default.
-        #[arg(long, value_name = "TIME", default_value = "1w")]
+        /// (`30s`, `10m`, `1h`, `1d`, `1w`), or `off` (the default).
+        #[arg(long, value_name = "TIME", default_value = "off")]
         disappear_default: String,
         /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
@@ -601,10 +601,27 @@ fn main() -> Result<()> {
         }
         Cmd::Forget { peer } => {
             let mut contacts = home.load_contacts()?;
-            let key = find_contact(&contacts, &peer)?.key;
-            contacts.remove(&key);
+            let c = find_contact(&contacts, &peer)?;
+            let (key, account) = (c.key, c.account);
+            // Every device of their account, and the conversation.
+            let keys: Vec<_> = contacts
+                .iter()
+                .filter(|o| o.key == key || (account.is_some() && o.account == account))
+                .map(|o| o.key)
+                .collect();
+            let now = threnody_core::now_ms();
+            for k in &keys {
+                contacts.forget(k, now);
+            }
             home.save_contacts(&contacts)?;
-            println!("Forgot {}", key.fingerprint());
+            let conv = threnody_core::history::ConversationId::Peer(
+                account.map_or(*key.as_bytes(), |a| a.0),
+            );
+            home.delete_history(conv)?;
+            println!(
+                "Deleted {} and your conversation; your other devices follow when they sync.",
+                key.fingerprint()
+            );
         }
         Cmd::Run {
             listen,

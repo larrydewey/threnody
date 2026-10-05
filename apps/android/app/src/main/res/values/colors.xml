@@ -13,4 +13,8 @@
     <color name="on_bubble_out">#FFFFFFFF</color>
     <color name="online">#FF2E9E5B</color>
     <color name="warning">#FFB4561A</color>
+    <!-- A sensitive photo's cover: opaque, never bright. -->
+    <color name="cover">#FF2B2B33</color>
+    <color name="cover_edge">#FF2B2B33</color>
+    <color name="on_cover">#FFE6E6EC</color>
 </resources>

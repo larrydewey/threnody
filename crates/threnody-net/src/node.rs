@@ -469,7 +469,7 @@ impl Node {
             persona,
             profile: Mutex::new(profile),
             strip_metadata: std::sync::atomic::AtomicBool::new(true),
-            default_timer: std::sync::atomic::AtomicU32::new(crate::history::DEFAULT_TIMER_S),
+            default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel,
             tunnel_peers: Mutex::new(HashMap::new()),
             relay: Mutex::new(RelayState::default()),

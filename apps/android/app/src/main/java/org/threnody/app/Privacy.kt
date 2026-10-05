@@ -39,7 +39,7 @@ object Privacy {
 
     /** Timer for chats without their own: a week unless changed (0 = off). */
     fun defaultTimer(ctx: Context): UInt? =
-        prefs(ctx).getLong(TIMER, 604_800L).takeIf { it > 0 }?.toUInt()
+        prefs(ctx).getLong(TIMER, 0L).takeIf { it > 0 }?.toUInt()
 
     fun setDefaultTimer(ctx: Context, secs: UInt?) {
         prefs(ctx).edit().putLong(TIMER, secs?.toLong() ?: 0L).apply()

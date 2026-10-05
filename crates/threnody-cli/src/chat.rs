@@ -65,6 +65,8 @@ Type a line to send it to the current peer. Commands:
   /file [-s] <path>... [| caption]      send files (photos) to the current peer;
                                         -s marks them sensitive
   /drop [peer]                          close a session
+  /clear [peer]                         delete the messages, keep the contact (all your devices)
+  /forget <peer>                        delete a contact and the conversation, on all your devices
   /policy anyone|contacts|approved      who may connect to us
   /status                               transports and protection level
   /devices   /device add [host:port]   /device rename <name> <new>   /device remove <name>
@@ -1146,6 +1148,26 @@ impl Ui {
                     "* revealed to {} that you are {}. This can't be taken back.",
                     self.name(&peer),
                     main.public().fingerprint()
+                );
+            }
+            "clear" => {
+                let p = self.resolve_peer(arg)?;
+                self.node.clear_conversation(&p);
+                println!(
+                    "* cleared your messages with {}; they're still a contact",
+                    self.name(&p)
+                );
+            }
+            "forget" => {
+                let p =
+                    self.resolve_peer(Some(arg.ok_or_else(|| anyhow!("usage: /forget <peer>"))?))?;
+                let name = self.name(&p);
+                self.node.delete_conversation(&p);
+                if self.current == Some(p) {
+                    self.current = None;
+                }
+                println!(
+                    "* deleted {name} and your conversation; they can write again as a new request"
                 );
             }
             "disappear" => {

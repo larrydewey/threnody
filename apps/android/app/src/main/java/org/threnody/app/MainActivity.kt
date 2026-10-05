@@ -99,6 +99,8 @@ class MainActivity : Activity() {
         /** Null for groups, which have no single connection. */
         val connected: Boolean?,
         val open: () -> Unit,
+        /** Long-press: clear or delete it. */
+        val manage: (() -> Unit)? = null,
     )
 
     /** Reloads the list (on the worker thread). */
@@ -108,22 +110,22 @@ class MainActivity : Activity() {
         // Someone we haven't accepted, who wrote to us: a request.
         val requests = all.filter { !it.accepted }.mapNotNull { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null } ?: return@mapNotNull null
-            Row(c.title, c.key, "Message request · tap to review", Long.MAX_VALUE, null) { openChat(c.key, c.device) }
+            Row(c.title, c.key, "Message request · tap to review", Long.MAX_VALUE, null, open = { openChat(c.key, c.device) })
         }
         val contacts = all.filter { it.accepted }.map { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
             Row(c.title, c.key, last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
-                last?.atMs?.toLong() ?: 0, c.connected) { openChat(c.key, c.device) }
+                last?.atMs?.toLong() ?: 0, c.connected, { openChat(c.key, c.device) }) { manage(n, c.title, c.device, null) }
         }
         val groups = n.groups().map { g ->
             val last = try { n.groupHistory(g.id, 1u).lastOrNull() } catch (_: Exception) { null }
             val who = last?.let { if (it.outgoing) "You" else Threnody.nameOf(n, it.device) }
             Row(g.name, g.id, last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
-                last?.atMs?.toLong() ?: 0, null) { openGroup(g.id) }
+                last?.atMs?.toLong() ?: 0, null, { openGroup(g.id) }) { manage(n, g.name, null, g.id) }
         }
         // Invitations go first: they wait on the user.
         val invites = n.groupInvites().map { i ->
-            Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null) { openGroup(i.group) }
+            Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null, open = { openGroup(i.group) })
         }
         // Anonymous identities' conversations, marked with the identity's label.
         val anonymous = Threnody.personaIds().flatMap { id ->
@@ -137,7 +139,7 @@ class MainActivity : Activity() {
                     else -> status(c)
                 }
                 Row(c.title, c.key, "$tag · $what", if (c.accepted) last?.atMs?.toLong() ?: 0 else Long.MAX_VALUE,
-                    c.connected) { openChat(c.key, c.device, id) }
+                    c.connected, { openChat(c.key, c.device, id) }) { manage(p, c.title, c.device, null) }
             }
         }
         val rows = requests + invites + (contacts + groups + anonymous).sortedByDescending { it.atMs }
@@ -186,7 +188,23 @@ class MainActivity : Activity() {
             addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(14); marginEnd = dp(8) })
             addView(side)
             setOnClickListener { r.open() }
+            r.manage?.let { m -> setOnLongClickListener { m(); true } }
         }
+    }
+
+    /** Long-press on a conversation: clear it, or delete the contact. */
+    private fun manage(n: ThrenodyNode, title: String, device: String?, group: String?) {
+        val options = if (group != null) listOf("Clear chat") else listOf("Clear chat", "Delete contact")
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setItems(options.toTypedArray()) { _, i ->
+                when (options[i]) {
+                    "Clear chat" -> Chats.clear(this, n, worker, title, device, group) { worker.execute { refresh() } }
+                    else -> Chats.delete(this, n, worker, title, device!!) { worker.execute { refresh() } }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun add(anchor: View) {

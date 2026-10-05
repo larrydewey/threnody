@@ -429,3 +429,84 @@ async fn deleting_in_a_chat_between_our_own_devices() {
     assert_eq!(laptop.node.delete_messages(&pid, &[id], true), 1);
     wait_for(|| text(&phone.node, &lid).is_none()).await;
 }
+
+#[tokio::test]
+async fn deleting_a_chat_deletes_it_on_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    laptop.node.send_text(&bid, "before deleting").unwrap();
+    let conv = laptop.node.conversation_for(&bid);
+    wait_for(|| {
+        phone
+            .node
+            .history(phone.node.conversation_for(&bid))
+            .is_ok_and(|h| !h.entries().is_empty())
+    })
+    .await;
+
+    phone.node.delete_conversation(&bid);
+    assert!(phone.node.contacts().get(&bid).is_none());
+    // The laptop follows: contact and history gone, not resurrected.
+    wait_for(|| laptop.node.contacts().get(&bid).is_none()).await;
+    wait_for(|| {
+        laptop
+            .node
+            .history(conv)
+            .is_ok_and(|h| h.entries().is_empty())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(phone.node.contacts().get(&bid).is_none());
+    assert!(laptop.node.contacts().get(&bid).is_none());
+
+    // Bob writes again: a new message request, on both devices.
+    bob.node.connect(&phone.addr, None).await.unwrap();
+    let pid = phone.node.identity();
+    bob.node.send_text(&pid, "hello again").unwrap();
+    wait_for(|| phone.node.contacts().get(&bid).is_some_and(|c| !c.accepted)).await;
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn clearing_a_chat_keeps_the_contact_on_every_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    laptop.node.send_text(&bid, "old news").unwrap();
+    let entries = |n: &Node| {
+        n.history(n.conversation_for(&bid))
+            .map(|h| h.entries().len())
+            .unwrap_or(0)
+    };
+    wait_for(|| entries(&phone.node) == 1).await;
+
+    phone.node.clear_conversation(&bid);
+    assert_eq!(entries(&phone.node), 0);
+    wait_for(|| entries(&laptop.node) == 0).await;
+    // Still a contact, still approved, still reachable.
+    for n in [&phone.node, &laptop.node] {
+        assert!(n.contacts().get(&bid).is_some_and(|c| c.local_approved));
+    }
+    laptop.node.send_text(&bid, "new news").unwrap();
+    wait_for(|| entries(&phone.node) == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let h = laptop
+        .node
+        .history(laptop.node.conversation_for(&bid))
+        .unwrap();
+    assert_eq!(h.entries()[0].text, "new news", "old messages stay cleared");
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}

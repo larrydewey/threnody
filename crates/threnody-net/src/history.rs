@@ -11,9 +11,8 @@ use crate::delivery::Tag;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 
-/// Messages disappear after a week unless a conversation (or the user's
-/// default) says otherwise.
-pub const DEFAULT_TIMER_S: u32 = 7 * 24 * 3600;
+/// A week: the usual choice when the user turns disappearing messages on.
+pub const WEEK_S: u32 = 7 * 24 * 3600;
 
 /// A random non-zero id for an outgoing history entry.
 pub fn local_id() -> u64 {
@@ -308,6 +307,60 @@ impl Node {
         let _ = self.shared.home.delete_history(conv);
     }
 
+    /// Deletes the conversation with `peer`: every device of its account
+    /// leaves our contacts and the history goes, here and (through contact
+    /// sync) on our other devices. If they write again, it's a new request.
+    pub fn delete_conversation(&self, peer: &PublicIdentity) {
+        let conv = self.conversation_for(peer);
+        let devices = self.mark_contacts(peer, |_| {});
+        let now = now_ms();
+        self.update_contacts(|c| {
+            for d in &devices {
+                c.forget(d, now);
+            }
+        });
+        for d in &devices {
+            self.disconnect(d);
+        }
+        let _ = self.shared.home.delete_history(conv);
+        self.push_contact_sync();
+    }
+
+    /// Clears the conversation with `peer`: its messages go, here and on
+    /// our other devices, but the contact stays (approved, verified and
+    /// reachable as before), and so does the chat's timer.
+    pub fn clear_conversation(&self, peer: &PublicIdentity) {
+        let now = now_ms();
+        self.mark_contacts(peer, |c| c.cleared_ms = c.cleared_ms.max(now));
+        self.clear_before(self.conversation_for(peer), now);
+        self.push_contact_sync();
+    }
+
+    /// Clears a group's messages on this device (members keep theirs).
+    pub fn clear_group_conversation(&self, group: [u8; 16]) {
+        self.clear_before(ConversationId::Group(group), now_ms());
+    }
+
+    pub(crate) fn clear_before(&self, conv: ConversationId, t: u64) {
+        let _ = self
+            .shared
+            .home
+            .delete_entries(self.identity_ref(), conv, now_ms(), |e| e.at_ms <= t);
+    }
+
+    /// When the user last cleared the conversation `conv` (0 if never).
+    pub(crate) fn cleared_at(&self, conv: ConversationId) -> u64 {
+        let ConversationId::Peer(id) = conv else {
+            return 0;
+        };
+        lock(&self.shared.contacts)
+            .iter()
+            .filter(|c| *c.key.as_bytes() == id || c.account.is_some_and(|a| a.0 == id))
+            .map(|c| c.cleared_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Applies `f` to `peer` and the other devices of its account; returns them.
     fn mark_contacts(
         &self,
@@ -565,8 +618,9 @@ impl Node {
         }
     }
 
-    /// The disappearing timer for conversations that haven't set one: on by
-    /// default ([`DEFAULT_TIMER_S`]), like every protection.
+    /// The disappearing timer for conversations that haven't set one: off
+    /// unless the user chooses one (the user decided messages stay by
+    /// default; every timer remains available per chat and as a default).
     pub fn default_timer(&self) -> Option<u32> {
         match self
             .shared

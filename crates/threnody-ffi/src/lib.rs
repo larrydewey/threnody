@@ -854,6 +854,25 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Clears the messages with `peer`, here and on our other devices;
+    /// the contact stays.
+    pub fn clear_conversation(&self, peer: String) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node.clear_conversation(&p);
+        Ok(())
+    }
+
+    /// Deletes the conversation with `peer`: the contact (every device of
+    /// its account) and the history, here and on our other devices. They
+    /// can write again, as a new request.
+    pub fn delete_conversation(&self, peer: String) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node.delete_conversation(&p);
+        Ok(())
+    }
+
     pub fn set_approval(&self, peer: String, approved: bool) -> Result<()> {
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();

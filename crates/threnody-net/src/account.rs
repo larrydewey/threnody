@@ -296,6 +296,20 @@ impl Node {
             }
             AccountMsg::ContactSync(snap) => {
                 if self.is_own_device(&from) {
+                    // Conversations of contacts the sync deletes go too.
+                    // (The contacts lock must be released before
+                    // conversation_for, which takes it again.)
+                    let keys: Vec<(PublicIdentity, u64)> = lock(&self.shared.contacts)
+                        .iter()
+                        .map(|c| (c.key, c.cleared_ms))
+                        .collect();
+                    let cleared_before: std::collections::HashMap<PublicIdentity, u64> =
+                        keys.iter().copied().collect();
+                    let keys: Vec<PublicIdentity> = keys.into_iter().map(|(k, _)| k).collect();
+                    let before: Vec<(PublicIdentity, ConversationId)> = keys
+                        .into_iter()
+                        .map(|k| (k, self.conversation_for(&k)))
+                        .collect();
                     let changed = {
                         let mut c = lock(&self.shared.contacts);
                         let mut changed = c.merge_snapshot(&snap, now_ms()).unwrap_or(false);
@@ -306,6 +320,26 @@ impl Node {
                         }
                         changed
                     };
+                    let left: Vec<(PublicIdentity, ConversationId)> = {
+                        let c = lock(&self.shared.contacts);
+                        before
+                            .into_iter()
+                            .filter(|(k, _)| c.get(k).is_none() && c.forgotten_at(k).is_some())
+                            .collect()
+                    };
+                    for (k, conv) in left {
+                        self.disconnect(&k);
+                        let _ = self.shared.home.delete_history(conv);
+                    }
+                    // Chats cleared on our other device.
+                    let cleared: Vec<(PublicIdentity, u64)> = lock(&self.shared.contacts)
+                        .iter()
+                        .filter(|c| c.cleared_ms > cleared_before.get(&c.key).copied().unwrap_or(0))
+                        .map(|c| (c.key, c.cleared_ms))
+                        .collect();
+                    for (k, t) in cleared {
+                        self.clear_before(self.conversation_for(&k), t);
+                    }
                     if changed {
                         self.emit(Event::ContactsSynced { from });
                     }

@@ -414,11 +414,13 @@ class ChatActivity : Activity() {
                 .putExtra(ImageActivity.CAPTION, e.text))
         }
         if (f.sensitive || location == null) {
-            return label(if (location == null) "📷\nnot available" else "🔒\nSensitive photo\nTap to view", 14f, R.color.bubble_in).apply {
+            return label(if (location == null) "📷\nnot available" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
                 gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
-                // Opaque, in the text colour: unmistakably covered, in either theme.
-                background = rounded(color(R.color.text), dp(12).toFloat())
+                // Opaque and dark in either theme: covered, without glare.
+                background = rounded(color(R.color.cover), dp(12).toFloat()).apply {
+                    setStroke(dp(1), color(R.color.cover_edge))
+                }
                 height = if (limit == width) width else dp(180)
                 contentDescription = if (location == null) "Photo not available" else "Sensitive photo, tap to view"
                 setOnClickListener(open)
@@ -791,6 +793,16 @@ class ChatActivity : Activity() {
             if (c?.connected == true && c.approved) {
                 menu.add("Faster link (Wi-Fi Direct)").setOnMenuItemClickListener { wifiDirect(); true }
             }
+            if (c != null) {
+                menu.add("Clear chat…").setOnMenuItemClickListener {
+                    Chats.clear(this@ChatActivity, node, worker, c.title, c.device, null) { refresh() }
+                    true
+                }
+                menu.add("Delete contact…").setOnMenuItemClickListener {
+                    Chats.delete(this@ChatActivity, node, worker, c.title, c.device) { finish() }
+                    true
+                }
+            }
             show()
         }
     }
@@ -850,6 +862,10 @@ class ChatActivity : Activity() {
             menu.add("Members").setOnMenuItemClickListener { members(); true }
             if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
+            menu.add("Clear chat…").setOnMenuItemClickListener {
+                Chats.clear(this@ChatActivity, node, worker, g.name, null, g.id) { refresh() }
+                true
+            }
             menu.add(if (g.owned) "Delete group" else "Leave group").setOnMenuItemClickListener { leaveGroup(); true }
             show()
         }

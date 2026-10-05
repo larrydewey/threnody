@@ -156,7 +156,14 @@ impl Node {
         if !matches!(conv, ConversationId::Peer(_)) {
             return;
         }
-        let entries: Vec<Entry> = h.entries().to_vec();
+        // Nothing from before the user cleared this chat.
+        let cleared = self.cleared_at(conv);
+        let entries: Vec<Entry> = h
+            .entries()
+            .iter()
+            .filter(|e| e.at_ms > cleared)
+            .cloned()
+            .collect();
         if let Ok(added) =
             self.shared
                 .home

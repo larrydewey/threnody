@@ -290,6 +290,9 @@ pub struct Contact {
     /// The main identity this peer (a persona) proved it belongs to, with
     /// the invite it gave to reach it.
     pub revealed: Option<(PublicIdentity, Option<String>)>,
+    /// The user cleared the conversation up to this time: on every one of
+    /// our devices, older messages go and don't come back (0 = never).
+    pub cleared_ms: u64,
 }
 
 impl Contact {
@@ -312,6 +315,7 @@ impl Contact {
             profile: Vec::new(),
             shares: Vec::new(),
             revealed: None,
+            cleared_ms: 0,
         }
     }
 
@@ -372,7 +376,14 @@ impl Contact {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contacts {
     list: Vec<Contact>,
+    /// Contacts the user deleted, and when: own-device sync deletes them
+    /// on our other devices too, and doesn't bring them back.
+    forgotten: Vec<(PublicIdentity, u64)>,
 }
+
+/// How long deletions are remembered for sync, and how many.
+const FORGET_FOR_MS: u64 = 90 * 24 * 3600 * 1000;
+const MAX_FORGOTTEN: usize = 1024;
 
 /// Outcome of a contact lookup by user-supplied text.
 pub enum Lookup<'a> {
@@ -417,6 +428,44 @@ impl Contacts {
         before != self.list.len()
     }
 
+    /// Deletes a contact the user chose to delete, remembering that so our
+    /// other devices delete it too. If it reaches us again later, it comes
+    /// back as a new contact.
+    pub fn forget(&mut self, key: &PublicIdentity, now_ms: u64) -> bool {
+        self.note_forgotten(*key, now_ms);
+        self.prune_forgotten(now_ms);
+        self.remove(key)
+    }
+
+    /// When `key` was last deleted, if within the remembered window.
+    pub fn forgotten_at(&self, key: &PublicIdentity) -> Option<u64> {
+        self.forgotten
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, t)| *t)
+    }
+
+    fn note_forgotten(&mut self, key: PublicIdentity, at: u64) {
+        match self.forgotten.iter_mut().find(|(k, _)| *k == key) {
+            Some(f) => f.1 = f.1.max(at),
+            None => self.forgotten.push((key, at)),
+        }
+    }
+
+    fn prune_forgotten(&mut self, now_ms: u64) {
+        self.forgotten
+            .retain(|(_, t)| now_ms.saturating_sub(*t) < FORGET_FOR_MS);
+        if self.forgotten.len() > MAX_FORGOTTEN {
+            self.forgotten.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+            self.forgotten.truncate(MAX_FORGOTTEN);
+        }
+    }
+
+    /// Whether a contact first seen at `first_seen_ms` predates its deletion.
+    fn deleted(&self, key: &PublicIdentity, first_seen_ms: u64) -> bool {
+        self.forgotten_at(key).is_some_and(|t| first_seen_ms <= t)
+    }
+
     /// Finds a contact by exact petname, else by fingerprint prefix.
     pub fn find(&self, query: &str) -> Lookup<'_> {
         if let Some(c) = self
@@ -456,7 +505,26 @@ impl Contacts {
     pub fn merge_snapshot(&mut self, bytes: &[u8], now_ms: u64) -> Result<bool> {
         let other = Self::decode(bytes)?;
         let mut changed = false;
+        // Deletions first: on our other device, the user deleted these.
+        for (k, t) in other.forgotten {
+            if self.forgotten_at(&k).is_none_or(|ours| ours < t) {
+                self.note_forgotten(k, t);
+            }
+        }
+        self.prune_forgotten(now_ms);
+        let before = self.list.len();
+        let gone: Vec<PublicIdentity> = self
+            .list
+            .iter()
+            .filter(|c| self.deleted(&c.key, c.first_seen_ms))
+            .map(|c| c.key)
+            .collect();
+        self.list.retain(|c| !gone.contains(&c.key));
+        changed |= self.list.len() != before;
         for o in other.list {
+            if self.deleted(&o.key, o.first_seen_ms) {
+                continue;
+            }
             match self.get_mut(&o.key) {
                 None => {
                     let mut c = o;
@@ -494,6 +562,11 @@ impl Contacts {
                         c.blocked = true;
                         changed = true;
                     }
+                    // Clearing a chat on one device clears it on all.
+                    if o.cleared_ms > c.cleared_ms {
+                        c.cleared_ms = o.cleared_ms;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -501,79 +574,92 @@ impl Contacts {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        cbor::to_vec(64 + self.list.len() * 160, |e| {
-            e.map_len(2)?;
-            e.u8(0)?.uint(FILE_VERSION)?;
-            e.u8(1)?.array_len(self.list.len())?;
-            for c in &self.list {
-                let n = 6
-                    + usize::from(c.petname.is_some())
-                    + usize::from(c.last_addr.is_some())
-                    + usize::from(c.discovery_key.is_some())
-                    + usize::from(!c.discovery_older.is_empty())
-                    + usize::from(c.account.is_some())
-                    + usize::from(c.blocked)
-                    + usize::from(!c.profile.is_empty())
-                    + usize::from(!c.shares.is_empty())
-                    + usize::from(c.revealed.is_some())
-                    + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
-                    + 2;
-                e.map_len(n)?;
-                e.u8(0)?.bytes(c.key.as_bytes())?;
-                if let Some(p) = &c.petname {
-                    e.u8(1)?.str(p)?;
-                }
-                e.u8(2)?.bool(c.local_approved)?;
-                e.u8(3)?.bool(c.remote_approved)?;
-                e.u8(4)?.bool(c.verified)?;
-                if let Some(a) = &c.last_addr {
-                    e.u8(5)?.str(a)?;
-                }
-                e.u8(6)?.u64(c.first_seen_ms)?;
-                e.u8(7)?.u64(c.last_seen_ms)?;
-                if let Some(k) = &c.discovery_key {
-                    e.u8(8)?.bytes(k)?;
-                }
-                if let Some(a) = &c.account {
-                    e.u8(9)?.bytes(&a.0)?;
-                }
-                e.u8(10)?.u64(c.approval_changed_ms)?;
-                if !c.discovery_older.is_empty() {
-                    e.u8(11)?.array_len(c.discovery_older.len())?;
-                    for k in &c.discovery_older {
-                        e.bytes(k)?;
+        cbor::to_vec(
+            64 + self.list.len() * 160 + self.forgotten.len() * 48,
+            |e| {
+                e.map_len(2 + usize::from(!self.forgotten.is_empty()))?;
+                e.u8(0)?.uint(FILE_VERSION)?;
+                e.u8(1)?.array_len(self.list.len())?;
+                for c in &self.list {
+                    let n = 6
+                        + usize::from(c.petname.is_some())
+                        + usize::from(c.last_addr.is_some())
+                        + usize::from(c.discovery_key.is_some())
+                        + usize::from(!c.discovery_older.is_empty())
+                        + usize::from(c.account.is_some())
+                        + usize::from(c.blocked)
+                        + usize::from(!c.profile.is_empty())
+                        + usize::from(!c.shares.is_empty())
+                        + usize::from(c.revealed.is_some())
+                        + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
+                        + usize::from(c.cleared_ms != 0)
+                        + 2;
+                    e.map_len(n)?;
+                    e.u8(0)?.bytes(c.key.as_bytes())?;
+                    if let Some(p) = &c.petname {
+                        e.u8(1)?.str(p)?;
+                    }
+                    e.u8(2)?.bool(c.local_approved)?;
+                    e.u8(3)?.bool(c.remote_approved)?;
+                    e.u8(4)?.bool(c.verified)?;
+                    if let Some(a) = &c.last_addr {
+                        e.u8(5)?.str(a)?;
+                    }
+                    e.u8(6)?.u64(c.first_seen_ms)?;
+                    e.u8(7)?.u64(c.last_seen_ms)?;
+                    if let Some(k) = &c.discovery_key {
+                        e.u8(8)?.bytes(k)?;
+                    }
+                    if let Some(a) = &c.account {
+                        e.u8(9)?.bytes(&a.0)?;
+                    }
+                    e.u8(10)?.u64(c.approval_changed_ms)?;
+                    if !c.discovery_older.is_empty() {
+                        e.u8(11)?.array_len(c.discovery_older.len())?;
+                        for k in &c.discovery_older {
+                            e.bytes(k)?;
+                        }
+                    }
+                    e.u8(12)?.bool(c.accepted)?;
+                    if c.blocked {
+                        e.u8(13)?.bool(true)?;
+                    }
+                    if !c.profile.is_empty() {
+                        e.u8(14)?.array_len(c.profile.len())?;
+                        for (k, v) in &c.profile {
+                            e.array_len(2)?.str(k)?.str(v)?;
+                        }
+                    }
+                    if !c.shares.is_empty() {
+                        e.u8(15)?.array_len(c.shares.len())?;
+                        for k in &c.shares {
+                            e.str(k)?;
+                        }
+                    }
+                    if let Some((id, invite)) = &c.revealed {
+                        e.u8(16)?.bytes(id.as_bytes())?;
+                        if let Some(i) = invite {
+                            e.u8(17)?.str(i)?;
+                        }
+                    }
+                    if c.cleared_ms != 0 {
+                        e.u8(18)?.u64(c.cleared_ms)?;
                     }
                 }
-                e.u8(12)?.bool(c.accepted)?;
-                if c.blocked {
-                    e.u8(13)?.bool(true)?;
-                }
-                if !c.profile.is_empty() {
-                    e.u8(14)?.array_len(c.profile.len())?;
-                    for (k, v) in &c.profile {
-                        e.array_len(2)?.str(k)?.str(v)?;
+                if !self.forgotten.is_empty() {
+                    e.u8(2)?.array_len(self.forgotten.len())?;
+                    for (k, t) in &self.forgotten {
+                        e.array_len(2)?.bytes(k.as_bytes())?.u64(*t)?;
                     }
                 }
-                if !c.shares.is_empty() {
-                    e.u8(15)?.array_len(c.shares.len())?;
-                    for k in &c.shares {
-                        e.str(k)?;
-                    }
-                }
-                if let Some((id, invite)) = &c.revealed {
-                    e.u8(16)?.bytes(id.as_bytes())?;
-                    if let Some(i) = invite {
-                        e.u8(17)?.str(i)?;
-                    }
-                }
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut ver, mut list) = (None, Vec::new());
+        let (mut ver, mut list, mut forgotten) = (None, Vec::new(), Vec::new());
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -582,13 +668,25 @@ impl Contacts {
                         list.push(decode_contact(d)?);
                     }
                 }
+                2 => {
+                    for _ in 0..d.array_len()? {
+                        if d.array_len()? != 2 {
+                            return Err(Error::Malformed("forgotten contact"));
+                        }
+                        let k = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?)?;
+                        let t = d.u64()?;
+                        if forgotten.len() < MAX_FORGOTTEN {
+                            forgotten.push((k, t));
+                        }
+                    }
+                }
                 _ => return Ok(false),
             }
             Ok(true)
         })?;
         finish(&dec)?;
         check_version(ver)?;
-        Ok(Self { list })
+        Ok(Self { list, forgotten })
     }
 }
 
@@ -613,6 +711,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         profile: Vec::new(),
         shares: Vec::new(),
         revealed: None,
+        cleared_ms: 0,
     };
     let (mut revealed, mut invite) = (None, None);
     read_map(d, |k, d| {
@@ -651,6 +750,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             }
             16 => revealed = Some(fixed_bytes::<32>(d)?),
             17 => invite = Some(d.str()?.to_owned()),
+            18 => c.cleared_ms = d.u64()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -842,5 +942,48 @@ mod passphrase_tests {
         assert_eq!(back.list[0], c);
         c.clear_discovery_keys();
         assert_eq!(c.recognition_keys().count(), 0);
+    }
+
+    #[test]
+    fn deleted_contacts_stay_deleted_across_devices() {
+        let x = Identity::generate().public();
+        let y = Identity::generate().public();
+        let (mut phone, mut laptop) = (Contacts::default(), Contacts::default());
+        for c in [&mut phone, &mut laptop] {
+            c.observe(x, None, 100);
+            c.observe(y, None, 100);
+        }
+        // Deleted on the phone; the laptop follows, and keeps nothing.
+        assert!(phone.forget(&x, 200));
+        assert!(phone.get(&x).is_none() && phone.forgotten_at(&x) == Some(200));
+        assert!(
+            laptop
+                .merge_snapshot(&phone.sync_snapshot().unwrap(), 300)
+                .unwrap()
+        );
+        assert!(laptop.get(&x).is_none() && laptop.get(&y).is_some());
+        // An older snapshot from a device that still had it doesn't bring it back.
+        let mut stale = Contacts::default();
+        stale.observe(x, None, 100);
+        assert!(
+            !phone
+                .merge_snapshot(&stale.sync_snapshot().unwrap(), 300)
+                .unwrap()
+        );
+        assert!(phone.get(&x).is_none());
+        // They write again later: a new contact, which syncs normally.
+        assert!(phone.observe(x, None, 400));
+        assert!(
+            laptop
+                .merge_snapshot(&phone.sync_snapshot().unwrap(), 500)
+                .unwrap()
+        );
+        assert!(laptop.get(&x).is_some());
+        // Deletions survive encoding, and are forgotten after 90 days.
+        let mut c = Contacts::decode(&phone.encode().unwrap()).unwrap();
+        assert_eq!(c.forgotten_at(&x), Some(200));
+        c.forget(&y, 200 + FORGET_FOR_MS + 1);
+        assert_eq!(c.forgotten_at(&x), None);
+        assert!(c.forgotten_at(&y).is_some());
     }
 }

@@ -296,6 +296,13 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Clears a group's messages on this device; members keep theirs.
+    pub fn clear_group_conversation(&self, group: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.node.clear_group_conversation(g);
+        Ok(())
+    }
+
     /// A group's disappearing timer on this device (`None` = off).
     pub fn group_disappearing(&self, group: String) -> Result<Option<u32>> {
         let g = self.group_id(&group)?;

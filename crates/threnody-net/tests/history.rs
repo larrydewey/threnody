@@ -89,7 +89,7 @@ async fn history_records_both_sides_and_disappearing_messages_vanish() {
 }
 
 #[tokio::test]
-async fn messages_disappear_by_default_unless_turned_off() {
+async fn messages_stay_by_default_and_disappear_when_chosen() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _arx, _) = spawn(&dir, "alice").await;
     let (bob, mut brx, addr) = spawn(&dir, "bob").await;
@@ -97,8 +97,11 @@ async fn messages_disappear_by_default_unless_turned_off() {
     let a_id = alice.identity();
     next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
     bob.accept_contact(&a_id); // else alice's messages are requests
-    let week = threnody_net::history::DEFAULT_TIMER_S;
-    assert_eq!(alice.timer(&bob_id), Some(week), "on by default");
+    let week = threnody_net::history::WEEK_S;
+    assert_eq!(alice.timer(&bob_id), None, "messages stay by default");
+    // A default timer the user chooses applies to chats without their own.
+    alice.set_default_timer(Some(week));
+    assert_eq!(alice.timer(&bob_id), Some(week));
 
     alice.send_text(&bob_id, "goes in a week").unwrap();
     next(&mut brx, |e| matches!(e, Event::Message { .. })).await;

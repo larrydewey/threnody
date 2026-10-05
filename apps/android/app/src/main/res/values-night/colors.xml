@@ -13,4 +13,8 @@
     <color name="on_bubble_out">#FFFFFFFF</color>
     <color name="online">#FF5BCB86</color>
     <color name="warning">#FFE89A5E</color>
+    <!-- Darker than the bubble around it, with a faint edge: no glare. -->
+    <color name="cover">#FF0E0E12</color>
+    <color name="cover_edge">#FF34343E</color>
+    <color name="on_cover">#FF8D8D99</color>
 </resources>
