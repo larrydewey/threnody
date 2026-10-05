@@ -10,7 +10,9 @@ fi
 
 status=0
 for model in *.spthy; do
-    out=$(tamarin-prover --prove "$model" 2>&1)
+    # The derivation (well-formedness) check times out after 5 s by default,
+    # which slower machines (CI runners) can hit on sealed.spthy.
+    out=$(tamarin-prover --derivcheck-timeout="${DERIVCHECK_TIMEOUT:-120}" --prove "$model" 2>&1)
     results=$(grep -E '^\s+\S+ \((all-traces|exists-trace)\): ' <<<"$out" || true)
     if [[ -z "$results" ]]; then
         echo "$model: tamarin produced no results" >&2
@@ -25,7 +27,7 @@ for model in *.spthy; do
     fi
     if grep -q 'WARNING' <<<"$out"; then
         echo "$model: tamarin warned:" >&2
-        grep -A4 'WARNING' <<<"$out" >&2
+        grep -A12 'WARNING' <<<"$out" >&2
         status=1
     fi
 done
