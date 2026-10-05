@@ -22,7 +22,7 @@ class ThrenodyService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         channels(this)
         val n = Notification.Builder(this, CHANNEL_SERVICE)
-            .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Threnody is running")
             .setContentText("Connected peers can reach you.")
             .setContentIntent(openApp(this))
@@ -69,12 +69,12 @@ class ThrenodyService : Service() {
             channels(ctx)
             // On the lock screen: only that something arrived, not who or what.
             val public = Notification.Builder(ctx, CHANNEL_MESSAGES)
-                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("Threnody")
                 .setContentText("New message")
                 .build()
             val n = Notification.Builder(ctx, CHANNEL_MESSAGES)
-                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(title)
                 .setContentText(text)
                 .setVisibility(Notification.VISIBILITY_PRIVATE)

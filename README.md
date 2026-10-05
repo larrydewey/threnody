@@ -1,3 +1,5 @@
+<img src="docs/icon.svg" width="96" alt="Threnody icon: a speech bubble holding a waveform">
+
 # Threnody
 
 Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
