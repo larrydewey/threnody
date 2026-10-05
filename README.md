@@ -117,6 +117,24 @@ cargo +nightly fuzz run envelope   # see fuzz/README.md
 crates/threnody-ffi/bindings.sh    # generate bindings, run the Python binding test
 ```
 
+## CI and releases
+
+Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, an Android build and a dependency advisory check (`.github/workflows/ci.yml`). Pushes to master also build on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
+
+To release, bump `version` in the workspace `Cargo.toml`, then push a matching tag:
+
+```sh
+git tag -a v0.2.0 -m "Threnody 0.2.0" && git push origin v0.2.0
+```
+
+The release workflow runs CI, then publishes a GitHub Release with:
+- CLI binaries for Linux (x86_64, aarch64), macOS (Apple silicon, Intel) and Windows;
+- the Android APK;
+- FFI libraries with Python, Kotlin and Swift bindings, including the Android libraries;
+- a `SHA256SUMS` file.
+
+A tag with a suffix (`v0.2.0-rc.1`) makes a pre-release. The APK is signed when the `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` secrets are set; otherwise it is published unsigned.
+
 ## License
 
-Apache-2.0 OR MIT.
+Apache-2.0 OR MIT, at your option ([LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT)).
