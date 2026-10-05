@@ -229,6 +229,27 @@ pub async fn connect(
 pub struct Listening {
     pub psm: u16,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    adapter: bluer::Adapter,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl Listening {
+    /// Stops scanning and waits for BlueZ and the controller to finish,
+    /// so the next node to start here finds the controller idle. Exiting
+    /// mid-scan has left this laptop's controller scanning on its own,
+    /// refusing every later scan.
+    pub async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        let idle = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if !self.adapter.is_discovering().await.unwrap_or(false) {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(3), idle).await;
+    }
 }
 
 impl Drop for Listening {
@@ -310,14 +331,21 @@ pub async fn listen(node: &Node) -> Result<Listening> {
 
     // Scanning can fail to start (BlueZ may still be finishing a previous
     // scan, say after a restart) or stop; keep trying, backing off.
-    let n = node.clone();
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let (n, scan_adapter) = (node.clone(), adapter.clone());
     tasks.push(tokio::spawn(async move {
+        let adapter = scan_adapter;
         let mut wait = Duration::from_secs(2);
         let mut failing = false;
         let mut failures = 0u32;
+        let mut reset_at: Option<std::time::Instant> = None;
         loop {
             let started = std::time::Instant::now();
-            let r = auto_dial(&n, &adapter, uuid).await;
+            let r = tokio::select! {
+                r = auto_dial(&n, &adapter, uuid) => r,
+                // Dropping the scan stops discovery cleanly.
+                _ = stopped.wait_for(|s| *s) => return,
+            };
             if started.elapsed() > Duration::from_secs(60) {
                 // It ran for a while: report a new failure, retry soon.
                 wait = Duration::from_secs(2);
@@ -329,11 +357,24 @@ pub async fn listen(node: &Node) -> Result<Listening> {
                     failing = true;
                     failures = 1;
                 }
-                Err(_) => {
+                Err(e) => {
                     failures += 1;
-                    // Seen with a MediaTek controller: BlueZ answers
-                    // "InProgress" until the adapter is power-cycled. That
-                    // would drop the user's other devices, so only say how.
+                    // Seen with a MediaTek controller: it keeps scanning
+                    // while the kernel thinks it stopped, and BlueZ answers
+                    // "InProgress" until the adapter is power-cycled.
+                    let stuck = format!("{e:#}").contains("in progress");
+                    if stuck && failures == 3 {
+                        let recent = reset_at.is_some_and(|t| t.elapsed() < RESET_EVERY);
+                        if !recent && only_ours_connected(&adapter).await {
+                            eprintln!("! Bluetooth controller stuck scanning; resetting it");
+                            reset_at = Some(std::time::Instant::now());
+                            power_cycle(&adapter).await;
+                            wait = Duration::from_secs(2);
+                            continue;
+                        }
+                    }
+                    // A reset would drop the user's other devices, so only
+                    // say how.
                     if failures == 5 {
                         eprintln!(
                             "! Bluetooth still can't scan; contacts can still reach this laptop. \
@@ -347,7 +388,62 @@ pub async fn listen(node: &Node) -> Result<Listening> {
             wait = (wait * 2).min(Duration::from_secs(60));
         }
     }));
-    Ok(Listening { psm, tasks })
+    Ok(Listening {
+        psm,
+        tasks,
+        adapter,
+        stop,
+    })
+}
+
+/// Whether every mutually approved contact has a live session, so a
+/// rescan would find nobody new to dial.
+fn all_connected(node: &Node) -> bool {
+    let live: Vec<PublicIdentity> = node.sessions().into_iter().map(|s| s.peer).collect();
+    node.contacts()
+        .iter()
+        .filter(|c| c.mutually_approved())
+        .all(|c| live.contains(&c.key))
+}
+
+/// Least time between automatic adapter resets.
+const RESET_EVERY: Duration = Duration::from_secs(600);
+
+/// Whether resetting the adapter would disturb none of the user's other
+/// devices: every connected device is either one we hold Threnody links
+/// with or unpaired (headsets, keyboards and the like are paired; an
+/// unpaired link is a peer's dial or a scan, and is redialled).
+async fn only_ours_connected(adapter: &bluer::Adapter) -> bool {
+    let Ok(addrs) = adapter.device_addresses().await else {
+        return false;
+    };
+    let ours: Vec<Address> = ours()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .copied()
+        .collect();
+    for addr in addrs {
+        let Ok(dev) = adapter.device(addr) else {
+            return false;
+        };
+        if dev.is_connected().await.unwrap_or(true)
+            && dev.is_paired().await.unwrap_or(true)
+            && !ours.contains(&addr)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Powers the adapter off and on, which resets the controller. Our
+/// listener and adverts survive it; BlueZ re-registers the adverts.
+async fn power_cycle(adapter: &bluer::Adapter) {
+    let _ = adapter.set_powered(false).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let _ = adapter.set_powered(true).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 /// How long one discovery run lasts before we restart it to hear
@@ -376,8 +472,19 @@ async fn auto_dial(node: &Node, adapter: &bluer::Adapter, uuid: bluer::Uuid) -> 
     loop {
         let events = adapter.discover_devices_with_changes().await?;
         let mut events = Box::pin(events);
-        let until = tokio::time::Instant::now() + RESCAN;
-        while let Ok(Some(ev)) = tokio::time::timeout_at(until, events.next()).await {
+        let mut until = tokio::time::Instant::now() + RESCAN;
+        loop {
+            let ev = match tokio::time::timeout_at(until, events.next()).await {
+                Ok(Some(ev)) => ev,
+                Ok(None) => break,
+                // Restarting a scan risks wedging some controllers; only do
+                // it when there is someone left to hear.
+                Err(_) if all_connected(node) => {
+                    until = tokio::time::Instant::now() + RESCAN;
+                    continue;
+                }
+                Err(_) => break,
+            };
             let AdapterEvent::DeviceAdded(addr) = ev else {
                 continue;
             };

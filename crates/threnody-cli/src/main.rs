@@ -569,7 +569,7 @@ fn main() -> Result<()> {
         } => {
             let identity = load_identity(&home)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(chat::run(chat::Options {
+            let r = rt.block_on(chat::run(chat::Options {
                 home,
                 identity,
                 listen: (!no_listen).then_some(listen),
@@ -592,7 +592,10 @@ fn main() -> Result<()> {
                     iface: wg_iface,
                     apply: wg_apply,
                 }),
-            }))?;
+            }));
+            // Don't wait on a stdin read still pending after a signal.
+            rt.shutdown_timeout(std::time::Duration::from_secs(1));
+            r?;
         }
     }
     Ok(())

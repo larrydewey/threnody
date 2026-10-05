@@ -203,6 +203,8 @@ pub async fn run(opts: Options) -> Result<()> {
     println!("Type /help for commands.");
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let stopped = stop_signal();
+    tokio::pin!(stopped);
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -214,11 +216,36 @@ pub async fn run(opts: Options) -> Result<()> {
                 }
             }
             Some(ev) = events.recv() => ui.handle_event(ev),
-            _ = tokio::signal::ctrl_c() => break,
+            () = &mut stopped => break,
         }
     }
     ui.leave_wifi_direct().await;
+    #[cfg(all(feature = "ble", target_os = "linux"))]
+    if let Some(b) = _ble {
+        b.shutdown().await;
+    }
     Ok(())
+}
+
+/// Ctrl-C, or (on Unix) being stopped by a service manager, `kill` or a
+/// closed terminal: each shuts down as /quit does.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut term), Ok(mut hup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn name_of(node: &Node, p: &PublicIdentity) -> String {
