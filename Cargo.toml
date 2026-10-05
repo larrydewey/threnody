@@ -20,7 +20,7 @@ openmls_traits = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"
 openmls_basic_credential = "0.6"
 const-cbor = { version = "0.3", features = ["std"] }
 ml-kem = { version = "0.3.2", features = ["zeroize", "hazmat"] }
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 chacha20poly1305 = "0.10"
 chacha20 = "0.9"
