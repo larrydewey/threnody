@@ -9,9 +9,14 @@ android {
         applicationId = "org.threnody.app"
         minSdk = 29
         targetSdk = 36
-        // Release builds take these from CI (the tag and run number).
-        versionCode = System.getenv("THRENODY_VERSION_CODE")?.toInt() ?: 1
+        // CI sets these from the tag. Local builds use the same scheme
+        // (major * 1000000 + minor * 1000 + patch), so a build from the
+        // laptop installs over a release instead of being refused as a
+        // downgrade.
         versionName = System.getenv("THRENODY_VERSION") ?: "0.1.0"
+        versionCode = System.getenv("THRENODY_VERSION_CODE")?.toInt()
+            ?: versionName!!.substringBefore('-').split('.').map(String::toInt)
+                .let { (major, minor, patch) -> major * 1_000_000 + minor * 1_000 + patch }
     }
     // Release signing comes only from the environment (CI secrets); the
     // key never lives in the repository. Without it, release builds are
