@@ -78,6 +78,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix K: Bluetooth LE transport](docs/appendix-k-bluetooth.md)
 - [Appendix L: Wi-Fi Direct link upgrade](docs/appendix-l-wifi-direct.md)
 - [Appendix M: anonymous identities and selective disclosure](docs/appendix-m-anonymity.md)
+- [Appendix N: reaching contacts across the internet](docs/appendix-n-internet-reachability.md) (draft, planned for 0.3.0)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
@@ -106,6 +107,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 
 ## Roadmap
 
+0. **Next release, 0.3.0: reaching contacts across the internet.** Phones on mobile data and devices behind home routers will connect directly, with no server: sessions over QUIC (UDP), rendezvous through the public BitTorrent DHT under encrypted, hourly-rotating keys only the two contacts share, and NAT hole punching. See [Appendix N](docs/appendix-n-internet-reachability.md) (draft). Until then, contacts meet on the same network, over Bluetooth, or through a reachable mutual contact.
 1. **Hardening (remaining).** An iOS keystore, ratchet persistence across reconnects, and an external audit.
 2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
