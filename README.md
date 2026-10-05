@@ -86,8 +86,8 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix L: Wi-Fi Direct link upgrade](docs/appendix-l-wifi-direct.md)
 - [Appendix M: anonymous identities and selective disclosure](docs/appendix-m-anonymity.md)
 - [Appendix N: reaching contacts across the internet](docs/appendix-n-internet-reachability.md) (0.3.0)
-- [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md)
-- [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md)
+- [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md) (0.4.0)
+- [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md) (0.4.0)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
