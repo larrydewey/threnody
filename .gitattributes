@@ -1,0 +1,6 @@
+# LF everywhere: test vectors and other text are compared byte for byte.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.jar binary

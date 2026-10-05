@@ -93,9 +93,6 @@ jobs:
 
   portability:
     name: Build on ${{ matrix.os }}
-    # macOS and Windows minutes cost more on private repositories: check
-    # them on master and releases rather than on every pull request.
-    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
