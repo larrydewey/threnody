@@ -177,7 +177,10 @@ pub enum Event {
         peer: PublicIdentity,
         secs: Option<u32>,
     },
-    Typing { peer: PublicIdentity, active: bool },
+    Typing {
+        peer: PublicIdentity,
+        active: bool,
+    },
     /// A sealed message from `from`, delivered by mailbox `via` (Appendix H).
     OfflineMessage {
         from: PublicIdentity,
@@ -1065,7 +1068,11 @@ impl Node {
             note: match old {
                 Some(o) => format!(
                     "{note}, replacing one {} {} ms old",
-                    if o.info.outbound { "dialed" } else { "accepted" },
+                    if o.info.outbound {
+                        "dialed"
+                    } else {
+                        "accepted"
+                    },
                     now_ms().saturating_sub(o.info.since_ms)
                 ),
                 None => note,

@@ -878,7 +878,9 @@ impl Node {
                 // (its app in the background polled us late), and our
                 // record seeking it makes it join in at its next poll.
                 if urge == Urge::Answer && inner.seeking.get(&peer).is_none_or(|t| *t <= now) {
-                    inner.seeking.insert(peer, now + ANSWER_FOR.as_millis() as u64);
+                    inner
+                        .seeking
+                        .insert(peer, now + ANSWER_FOR.as_millis() as u64);
                     drop(inner);
                     self.rdv().republish.notify_one();
                 }

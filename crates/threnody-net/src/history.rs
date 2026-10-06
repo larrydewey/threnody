@@ -5,7 +5,9 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
-use threnody_core::message::{FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING};
+use threnody_core::message::{
+    FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
+};
 
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
@@ -913,7 +915,7 @@ impl Node {
             delivered_to: Vec::new(),
             remote_id,
             edited_ms: 0,
-                read_ms: 0,
+            read_ms: 0,
             reactions: Vec::new(),
         };
         let _ = self

@@ -335,7 +335,9 @@ impl ChatView {
         if self.sending_typing.get() == active && !again {
             return;
         }
-        let Some(app) = self.app.upgrade() else { return };
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
         if active && !app.core.settings().flag(settings::SEND_TYPING) {
             return;
         }
@@ -361,12 +363,13 @@ impl ChatView {
         }
         if active {
             let weak = self.weak_self.clone();
-            *self.peer_quiet.borrow_mut() = Some(glib::timeout_add_local_once(PEER_TYPING, move || {
-                if let Some(t) = weak.upgrade() {
-                    t.peer_quiet.borrow_mut().take();
-                    t.set_typing(false);
-                }
-            }));
+            *self.peer_quiet.borrow_mut() =
+                Some(glib::timeout_add_local_once(PEER_TYPING, move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.peer_quiet.borrow_mut().take();
+                        t.set_typing(false);
+                    }
+                }));
         }
         if self.peer_typing.replace(active) != active {
             self.typing_row.set_visible(active);
@@ -388,7 +391,9 @@ impl ChatView {
         if self.group().is_some() {
             return;
         }
-        let Some(app) = self.app.upgrade() else { return };
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
         if !app.core.settings().flag(settings::SEND_READ) || !app.window.is_active() {
             return;
         }
