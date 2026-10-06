@@ -1,7 +1,6 @@
 package org.threnody.app
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.text.InputType
 import android.widget.CheckBox
 import android.widget.EditText
@@ -32,9 +31,8 @@ object CredentialUi {
 
     private fun field(a: Activity, hint: String, multiLine: Boolean = false) = EditText(a).apply {
         this.hint = hint
-        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-            (if (multiLine) InputType.TYPE_TEXT_FLAG_MULTI_LINE else 0)
-        isSingleLine = !multiLine
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        wrapping(newlines = multiLine, max = if (multiLine) 10 else 4)
         if (multiLine) minLines = 3
     }
 
@@ -46,12 +44,12 @@ object CredentialUi {
             val held = node.credentials()
             val names = held.map { "${it.schema} · from ${Threnody.nameOf(node, it.issuer)}\n${attrs(it.attributes)}" }
             a.runOnUiThread {
-                val b = AlertDialog.Builder(a).setTitle("Credentials").setNegativeButton("Close", null)
+                val b = SecureBuilder(a).setTitle("Credentials").setNegativeButton("Close", null)
                 if (held.isEmpty()) {
                     b.setMessage("None yet. A contact can vouch for you from their chat's menu → Offer a credential.")
                 } else {
                     b.setItems(names.toTypedArray()) { _, i ->
-                        AlertDialog.Builder(a)
+                        SecureBuilder(a)
                             .setTitle("Delete this credential?")
                             .setMessage(names[i])
                             .setPositiveButton("Delete") { _, _ -> worker.execute { node.deleteCredential(held[i].id) } }
@@ -77,7 +75,7 @@ object CredentialUi {
         v.addView(schema, matchWrap)
         v.addView(body, matchWrap)
         v.addView(days, matchWrap)
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("Offer $title a credential")
             .setView(ScrollView(a).apply { addView(v) })
             .setPositiveButton("Offer") { _, _ ->
@@ -110,7 +108,7 @@ object CredentialUi {
         v.addView(a.label("$title chooses whether to answer, and with what. You learn only what they show.", 14f, R.color.muted), matchWrap)
         v.addView(schema, matchWrap)
         v.addView(keys, matchWrap)
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("Ask $title to prove something")
             .setView(v)
             .setPositiveButton("Ask") { _, _ ->
@@ -133,7 +131,7 @@ object CredentialUi {
     /** An offer made to us: accept (keep the credential) or decline. */
     fun answerOffer(a: Activity, node: ThrenodyNode, worker: Executor, offer: CredentialOfferRecord, done: () -> Unit) {
         val who = Threnody.nameOf(node, offer.peer)
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("$who offers you a credential")
             .setMessage("${offer.schema}\n\n${attrs(offer.attributes)}\n\nKeep it to prove these later, choosing what to show each time.")
             .setPositiveButton("Accept") { _, _ ->
@@ -159,7 +157,7 @@ object CredentialUi {
             val matching = node.credentials().filter { it.schema == ask.schema }
             a.runOnUiThread {
                 if (matching.isEmpty()) {
-                    AlertDialog.Builder(a)
+                    SecureBuilder(a)
                         .setTitle("$who asks for a credential (${ask.schema})")
                         .setMessage("You don't hold one.")
                         .setPositiveButton("Decline") { _, _ ->
@@ -186,7 +184,7 @@ object CredentialUi {
                 // Nothing is shown unless ticked.
                 val checks = ask.keys.map { k -> CheckBox(a).apply { text = k }.also { v.addView(it, matchWrap) } }
                 if (ask.keys.isEmpty()) v.addView(a.label("Only that you hold one.", 14f, R.color.muted), matchWrap)
-                AlertDialog.Builder(a)
+                SecureBuilder(a)
                     .setTitle("$who asks you to prove something")
                     .setView(ScrollView(a).apply { addView(v) })
                     .setPositiveButton("Prove") { _, _ ->
@@ -219,7 +217,7 @@ object CredentialUi {
         val who = Threnody.nameOf(node, peer)
         val body = (if (shown.isEmpty()) "Nothing else was shown." else attrs(shown)) +
             "\n\nIssued by ${Threnody.nameOf(node, issuer)}.\nTheir pseudonym for you: ${pseudonym.take(16)}"
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("$who proved a credential ($schema)")
             .setMessage(body)
             .setPositiveButton("OK", null)

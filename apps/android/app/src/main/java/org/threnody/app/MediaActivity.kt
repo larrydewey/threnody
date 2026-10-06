@@ -1,7 +1,6 @@
 package org.threnody.app
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -194,7 +193,7 @@ class MediaActivity : Activity() {
     /** Links leave the app (and show your address to that site), so ask first. */
     private fun openLink(url: String) {
         val uri = Uri.parse(if (url.contains("://")) url else "https://$url")
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Open this link?")
             .setMessage("${uri}\n\nIt opens in your browser, outside Threnody. The site sees your network address.")
             .setPositiveButton("Open") { _, _ ->
@@ -213,7 +212,7 @@ class MediaActivity : Activity() {
         content.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(10), dp(8), dp(10))
-            background = getDrawable(android.R.drawable.list_selector_background)
+            background = ripple()
             addView(label(title, 15f).apply { maxLines = 2 })
             addView(label(detail, 12f, R.color.muted).apply { maxLines = 2 })
             setOnClickListener { onClick() }

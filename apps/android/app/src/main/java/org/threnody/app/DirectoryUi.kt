@@ -1,7 +1,6 @@
 package org.threnody.app
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.Context
 import android.text.InputType
 import android.text.format.DateUtils
@@ -52,7 +51,7 @@ object DirectoryUi {
                     } ?: "no relay list yet"
                     "Directory ${d.id}\n${d.relays} relays · ${d.tokens} tokens · $until"
                 }
-                val b = AlertDialog.Builder(a)
+                val b = SecureBuilder(a)
                     .setTitle("Relay directories")
                     .setPositiveButton("Add") { _, _ -> add(a, worker, prefill) }
                     .setNegativeButton("Close", null)
@@ -65,7 +64,7 @@ object DirectoryUi {
                 } else {
                     b.setTitle("Relay directories · $usable relays usable")
                     b.setItems(rows.toTypedArray()) { _, i ->
-                        AlertDialog.Builder(a)
+                        SecureBuilder(a)
                             .setTitle("Unsubscribe from directory ${dirs[i].id}?")
                             .setPositiveButton("Unsubscribe") { _, _ ->
                                 worker.execute {
@@ -90,9 +89,9 @@ object DirectoryUi {
             hint = "$SCHEME…"
             setText(prefill ?: "")
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            isSingleLine = true
+            wrapping(newlines = false, max = 4)
         }
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("Subscribe to a directory")
             .setMessage("Paste or scan its link. A relay is used only if enough of your directories list it.")
             .setView(LinearLayout(a).apply {

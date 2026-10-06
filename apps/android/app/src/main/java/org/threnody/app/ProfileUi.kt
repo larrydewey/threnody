@@ -37,12 +37,12 @@ object ProfileUi {
                 fun row(text: String, color: Int, onClick: () -> Unit) = box.addView(a.label(text, 16f, color).apply {
                     minHeight = a.dp(48)
                     gravity = android.view.Gravity.CENTER_VERTICAL
-                    background = a.getDrawable(android.R.drawable.list_selector_background)
+                    background = a.ripple()
                     setOnClickListener { dialog.dismiss(); onClick() }
                 }, matchWrap)
                 for (attr in attrs) row("${attr.key}: ${attr.value}", R.color.text) { detail(a, node, title, worker, attr) }
                 row("+ Add a detail", R.color.accent) { detail(a, node, title, worker, null) }
-                dialog = AlertDialog.Builder(a)
+                dialog = SecureBuilder(a)
                     .setTitle(title)
                     .setView(android.widget.ScrollView(a).apply { addView(box) })
                     .setNegativeButton("Done", null)
@@ -79,7 +79,7 @@ object ProfileUi {
                 edit(a, node, title, worker)
             }
         }
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle(if (current == null) "Add a detail" else current.key)
             .setView(box)
             .setPositiveButton("Save") { _, _ -> save(false) }
@@ -95,7 +95,7 @@ object ProfileUi {
             val shared = try { node.sharedWith(peer).toSet() } catch (_: Exception) { emptySet() }
             a.runOnUiThread {
                 if (attrs.isEmpty()) {
-                    AlertDialog.Builder(a)
+                    SecureBuilder(a)
                         .setTitle("Your profile is empty")
                         .setMessage("Add details such as your name first; then choose which ones $name sees.")
                         .setPositiveButton("Add details") { _, _ -> edit(a, node, editTitle, worker) }
@@ -104,7 +104,7 @@ object ProfileUi {
                     return@runOnUiThread
                 }
                 val checked = BooleanArray(attrs.size) { attrs[it].key in shared }
-                AlertDialog.Builder(a)
+                SecureBuilder(a)
                     .setTitle("What $name sees")
                     .setMultiChoiceItems(attrs.map { "${it.key}: ${it.value}" }.toTypedArray(), checked) { _, i, on ->
                         checked[i] = on
@@ -133,6 +133,6 @@ object ProfileUi {
         this.hint = hint
         setText(value ?: "")
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        isSingleLine = true
+        wrapping(newlines = false, max = 4)
     }
 }

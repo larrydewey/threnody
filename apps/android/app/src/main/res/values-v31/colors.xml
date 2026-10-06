@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+: the system's colours (Material You, from the wallpaper). -->
+<resources>
+    <color name="background">@android:color/system_neutral1_10</color>
+    <color name="bar">@android:color/system_neutral1_10</color>
+    <color name="surface">@android:color/system_neutral1_50</color>
+    <color name="sheet">@android:color/system_neutral2_50</color>
+    <color name="field">@android:color/system_neutral2_100</color>
+    <color name="text">@android:color/system_neutral1_900</color>
+    <color name="muted">@android:color/system_neutral2_700</color>
+    <color name="divider">@android:color/system_accent2_100</color>
+    <color name="accent">@android:color/system_accent1_600</color>
+    <color name="on_accent">@android:color/system_accent1_0</color>
+    <color name="bubble_in">@android:color/system_neutral2_100</color>
+    <color name="bubble_out">@android:color/system_accent1_600</color>
+    <color name="on_bubble_out">@android:color/system_accent1_0</color>
+</resources>

@@ -15,6 +15,12 @@ use crate::window::App;
 
 /// How many messages a chat loads.
 const HISTORY: u32 = 1000;
+/// We're taken to have stopped typing after this long without a keystroke.
+const TYPING_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+/// While typing goes on, the contact is told again this often.
+const TYPING_AGAIN: std::time::Duration = std::time::Duration::from_secs(4);
+/// The contact's "…" goes after this long without word.
+const PEER_TYPING: std::time::Duration = std::time::Duration::from_secs(8);
 /// A banner or menu action on the open chat.
 type Action = fn(&Rc<ChatView>);
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
@@ -46,10 +52,14 @@ pub struct ChatView {
     peer_typing: Cell<bool>,
     /// Set of remote message ids we've already sent read receipts for.
     sent_read: RefCell<HashSet<u64>>,
-    /// Timer source id for typing timeout.
+    /// Fires when we've stopped typing for a while.
     typing_timeout: RefCell<Option<glib::SourceId>>,
-    /// Whether we've sent "typing: true" for the current non-empty compose.
+    /// Whether the peer was last told we are typing.
     sending_typing: Cell<bool>,
+    /// When it was last told so (it is told again while typing goes on).
+    typing_sent_at: Cell<Option<std::time::Instant>>,
+    /// Hides the peer's "…" if its "stopped" never comes.
+    peer_quiet: RefCell<Option<glib::SourceId>>,
     /// Weak reference to self for creating weak pointers in callbacks.
     weak_self: Weak<ChatView>,
 }
@@ -128,17 +138,7 @@ impl ChatView {
         send.add_css_class("suggested-action");
         send.add_css_class("circular");
         send.set_valign(gtk::Align::End);
-        let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        composer.add_css_class("composer");
-        composer.append(&attach);
-        composer.append(&input_scroll);
-        composer.append(&send);
-        let composer_clamp = adw::Clamp::builder()
-            .maximum_size(860)
-            .child(&composer)
-            .build();
-
-        // Build typing indicator row (shown when peer is typing in 1:1 chats).
+        // Typing indicator row (shown when peer is typing in 1:1 chats).
         let typing_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         typing_row.add_css_class("chat-typing");
         typing_row.add_css_class("bubble");
@@ -179,7 +179,7 @@ impl ChatView {
         root.set_content(Some(&body));
         root.add_bottom_bar(&composer_clamp);
 
-        let mut this = Rc::new(Self {
+        let this = Rc::new_cyclic(|weak_self| Self {
             app: Rc::downgrade(app),
             conv: RefCell::new(conv.clone()),
             root,
@@ -202,12 +202,12 @@ impl ChatView {
             sent_read: RefCell::new(HashSet::new()),
             typing_timeout: RefCell::new(None),
             sending_typing: Cell::new(false),
-            weak_self: Weak::new(),
+            weak_self: weak_self.clone(),
+            peer_quiet: RefCell::new(None),
+            typing_sent_at: Cell::new(None),
         });
 
         let weak = Rc::downgrade(&this);
-        // Initialize weak_self after creation
-        Rc::get_mut(&mut this).unwrap().weak_self = weak.clone();
         send.connect_clicked(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.send();
@@ -257,37 +257,24 @@ impl ChatView {
             let weak = Rc::downgrade(&this);
             this.input.buffer().connect_changed(move |buf| {
                 let Some(t) = weak.upgrade() else { return };
-                if t.group().is_some() {
-                    return; // No typing indicator for groups yet.
-                }
                 let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
-                let is_empty = text.trim().is_empty();
-                if is_empty {
-                    if t.sending_typing.replace(false) {
-                        t.notify_typing(false);
-                    }
-                    // Cancel any pending timeout.
-                    if let Some(id) = t.typing_timeout.borrow_mut().take() {
-                        id.remove();
-                    }
-                } else if !t.sending_typing.replace(true) {
-                    t.notify_typing(true);
-                }
-                // Reset the "stop typing" timeout.
+                placeholder.set_visible(text.is_empty());
                 if let Some(id) = t.typing_timeout.borrow_mut().take() {
                     id.remove();
                 }
+                if text.trim().is_empty() {
+                    t.notify_typing(false);
+                    return;
+                }
+                t.notify_typing(true);
                 let weak = Rc::downgrade(&t);
-                *t.typing_timeout.borrow_mut() = Some(glib::timeout_add_local_once(
-                    std::time::Duration::from_secs(3),
-                    move || {
+                *t.typing_timeout.borrow_mut() =
+                    Some(glib::timeout_add_local_once(TYPING_IDLE, move || {
                         if let Some(t) = weak.upgrade() {
-                            if t.sending_typing.replace(false) {
-                                t.notify_typing(false);
-                            }
+                            t.typing_timeout.borrow_mut().take();
+                            t.notify_typing(false);
                         }
-                    },
-                ));
+                    }));
             });
         }
 
@@ -334,26 +321,105 @@ impl ChatView {
         }
     }
 
-    /// Sends a typing notification to the peer.
+    /// Tells the contact (not a group) we started or stopped typing: on a
+    /// change, and again now and then while typing goes on.
     fn notify_typing(&self, active: bool) {
+        if self.group().is_some() {
+            return;
+        }
+        let again = active
+            && self
+                .typing_sent_at
+                .get()
+                .is_some_and(|t| t.elapsed() > TYPING_AGAIN);
+        if self.sending_typing.get() == active && !again {
+            return;
+        }
+        let Some(app) = self.app.upgrade() else { return };
+        if active && !app.core.settings().flag(settings::SEND_TYPING) {
+            return;
+        }
         let Some(node) = self.node() else { return };
+        self.sending_typing.set(active);
+        self.typing_sent_at.set(Some(std::time::Instant::now()));
         let device = self.device();
-        bg(move || { let _ = node.set_typing(device, active); }, |_| {});
+        bg(
+            move || {
+                let _ = node.set_typing(device, active);
+            },
+            |()| {},
+        );
     }
 
-    /// Shows or hides the typing indicator for this conversation.
+    /// Shows or hides "…" for the contact typing.
     pub fn set_typing(&self, active: bool) {
         if self.group().is_some() {
-            return; // No typing indicator for groups yet.
+            return;
+        }
+        if let Some(id) = self.peer_quiet.borrow_mut().take() {
+            id.remove();
+        }
+        if active {
+            let weak = self.weak_self.clone();
+            *self.peer_quiet.borrow_mut() = Some(glib::timeout_add_local_once(PEER_TYPING, move || {
+                if let Some(t) = weak.upgrade() {
+                    t.peer_quiet.borrow_mut().take();
+                    t.set_typing(false);
+                }
+            }));
         }
         if self.peer_typing.replace(active) != active {
             self.typing_row.set_visible(active);
             if active {
-                // Re-render to append the typing row at the end.
-                let entries = self.entries.borrow().clone();
-                self.display_entries(entries);
+                self.scroll_to_end();
             }
         }
+    }
+
+    /// The window came to the front: what's on screen is now read.
+    pub fn shown(&self) {
+        let entries = self.entries.borrow().clone();
+        self.report_read(&entries);
+    }
+
+    /// Tells the contact which of its messages are now on screen (1:1
+    /// chats, with read receipts on); ids it was told of aren't sent again.
+    fn report_read(&self, entries: &[HistoryEntry]) {
+        if self.group().is_some() {
+            return;
+        }
+        let Some(app) = self.app.upgrade() else { return };
+        if !app.core.settings().flag(settings::SEND_READ) || !app.window.is_active() {
+            return;
+        }
+        let ids: Vec<u64> = {
+            let sent = self.sent_read.borrow();
+            entries
+                .iter()
+                .filter(|e| !e.outgoing && e.id != 0 && !sent.contains(&e.id))
+                .map(|e| e.id)
+                .collect()
+        };
+        let Some(node) = self.node() else { return };
+        if ids.is_empty() {
+            return;
+        }
+        let device = self.device();
+        let weak = self.weak_self.clone();
+        bg(
+            {
+                let ids = ids.clone();
+                move || node.report_read(device, ids).is_ok()
+            },
+            // Without a session now, they're reported on a later render.
+            move |ok| {
+                if let Some(t) = weak.upgrade()
+                    && ok
+                {
+                    t.sent_read.borrow_mut().extend(ids);
+                }
+            },
+        );
     }
 
     // ----- Header, banner and menu -----
@@ -701,6 +767,8 @@ impl ChatView {
             self.messages.append(&self.bubble(e, sender));
             prev = Some(e);
         }
+        self.messages.append(&self.typing_row);
+        self.report_read(&entries);
         self.stack.set_visible_child_name(if entries.is_empty() {
             "empty"
         } else {
@@ -1173,13 +1241,7 @@ impl ChatView {
             return;
         }
         let Some(node) = self.node() else { return };
-        // Stop typing indicator when sending.
-        if self.sending_typing.replace(false) {
-            self.notify_typing(false);
-        }
-        if let Some(id) = self.typing_timeout.borrow_mut().take() {
-            id.remove();
-        }
+        // Clearing the composer also says we stopped typing.
         buf.set_text("");
         let (group, device) = (self.group(), self.device());
         let weak = self.weak_self.clone();

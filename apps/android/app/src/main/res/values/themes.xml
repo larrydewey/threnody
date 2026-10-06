@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Threnody" parent="android:Theme.Material.Light.NoActionBar">
+    <!-- DeviceDefault: the phone's own look for dialogs, menus and controls. -->
+    <style name="Theme.Threnody" parent="android:Theme.DeviceDefault.Light.NoActionBar">
         <item name="android:colorAccent">@color/accent</item>
         <item name="android:colorPrimary">@color/accent</item>
         <item name="android:windowBackground">@color/background</item>
@@ -8,5 +9,19 @@
         <item name="android:navigationBarColor">@color/background</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:editTextStyle">@style/Threnody.EditText</item>
+        <item name="android:alertDialogTheme">@style/Threnody.Dialog</item>
+    </style>
+
+    <style name="Threnody.Dialog" parent="android:Theme.DeviceDefault.Light.Dialog.Alert">
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorPrimary">@color/accent</item>
+        <item name="android:editTextStyle">@style/Threnody.EditText</item>
+    </style>
+
+    <style name="Threnody.EditText" parent="android:Widget.DeviceDefault.Light.EditText">
+        <item name="android:background">@drawable/field</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:textColorHint">@color/muted</item>
     </style>
 </resources>

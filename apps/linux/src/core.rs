@@ -394,13 +394,6 @@ impl Core {
         self.say("* network changed; reconnecting");
     }
 
-    pub fn set_foreground(&self, on: bool) {
-        self.main.set_foreground(on);
-        for p in lock(&self.personas).values() {
-            p.node.set_foreground(on);
-        }
-    }
-
     // ----- Conversations -----
 
     /// Every conversation of every identity, newest first, requests and

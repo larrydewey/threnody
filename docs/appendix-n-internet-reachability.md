@@ -99,10 +99,10 @@ Every record is padded to the same length, so its size doesn't reveal how many c
 
 - **Publishing.**
   - For each mutually approved contact, connected or not, a node publishes its record when its candidates change, and otherwise every 30 minutes. Records stay current even during a session: a session can die unnoticed, and an old record sends the contact to an old address.
-  - When it wants to reach a contact (a message is waiting, the user opened the chat, or it starts punching), it sets `seeking_until` to two minutes ahead and republishes at once.
+  - When it wants to reach a contact (a message is waiting, or the user opened the chat), it sets `seeking_until` to 20 minutes ahead and republishes at once; when it starts punching, to at least two minutes ahead. Twenty minutes outlasts the background poll, so a contact whose app is in the background still sees the request once.
   - DHT write tokens are bound to the writer's IP address. After a network change the node leaves the DHT and joins again from the new address; otherwise its writes are silently refused for several minutes. It also rejoins after two publishing rounds in which every write failed.
 - **Watching.** A node polls the records of contacts it has no session with.
-  - It polls every minute while the app is open, every 15 seconds while it is seeking a contact, and every 15 minutes in the background.
+  - It polls every 20 seconds while the app is open, and every 15 minutes in the background. Contacts it is seeking are polled every 15 seconds in between, and only they. The desktop app always polls at the open rate: it runs on mains power, and window focus says nothing about whether the user waits for a reply.
   - A record that is newer than the last one acted on starts hole punching (section 4). A record that can't be acted on yet (backing off, too many punches) stays "new".
 - **Cost.** One DHT read or write takes a few round trips and a few kilobytes. Polling ten contacts every 15 minutes is under 1 MB a day.
 
@@ -111,10 +111,10 @@ Every record is padded to the same length, so its size doesn't reveal how many c
 Once either side sees the other's fresh candidates:
 
 1. **Both sides probe.** Each side sends a small UDP probe to every candidate of the other (at most 8), once a second, from its QUIC socket. Probes are a 16-byte nonce and a 16-byte tag keyed with `D` (as LAN beacons are), so only the intended contact recognises them. Sending a probe opens this side's NAT mapping and firewall for replies from that address. A probe that arrives tells the receiver a path that works: its source address goes first in the receiver's list.
-2. **Overlapping in time.** Both sides must punch at once, but each only learns of the other through polling. So the side that starts (it found a new record) marks its own record as seeking the contact and keeps punching for two minutes; the contact, seeing a record that seeks it, joins in for 45 seconds, even while backing off. A probe from the contact also makes a node join in.
+2. **Overlapping in time.** Both sides must punch at once, but each only learns of the other through polling. So the side that starts (it found a new record, or it seeks the contact) marks its own record as seeking the contact and punches for two minutes. While it still seeks the contact after that, it keeps probing every 5 seconds without dialing, which keeps its NAT open toward the contact. The contact, seeing a record that seeks it, joins in for 60 seconds, even while backing off, and marks its own record as seeking in return, so a seeker that slowed down sees the answer at its next 15-second poll and punches at full rate again. A probe from the contact also makes a node join in.
 3. **One side dials.** When a probe arrives, or after 3 seconds, the device with the smaller identity key dials every candidate at once over QUIC, retrying every 5 seconds; the first connection wins. As LAN discovery does, it pins the expected fingerprint.
 4. **The handshake decides.** The Threnody handshake inside the QUIC stream authenticates both sides. A probe from anyone else can at most cause a connection attempt that then fails.
-5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
+5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. A message none of these can take is held (with the unacknowledged ones, so it survives a restart when small) and goes first in the next session with the contact, instead of failing. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
 
 **Symmetric NAT.** With `flags & 1` set on exactly one side, the other side (which has a stable port) dials, and the symmetric side's probes open its own mapping toward that port. That usually works. When both sides are symmetric, the relay fallback applies.
 

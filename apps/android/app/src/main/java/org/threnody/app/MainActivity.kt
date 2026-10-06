@@ -2,7 +2,6 @@ package org.threnody.app
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -183,7 +182,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(12))
             minimumHeight = dp(72)
-            background = getDrawable(android.R.drawable.list_selector_background)
+            background = ripple()
             addView(avatar)
             addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(14); marginEnd = dp(8) })
             addView(side)
@@ -195,7 +194,7 @@ class MainActivity : Activity() {
     /** Long-press on a conversation: clear it, or delete the contact. */
     private fun manage(n: ThrenodyNode, title: String, device: String?, group: String?) {
         val options = if (group != null) listOf("Clear chat") else listOf("Clear chat", "Delete contact")
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle(title)
             .setItems(options.toTypedArray()) { _, i ->
                 when (options[i]) {
@@ -218,10 +217,8 @@ class MainActivity : Activity() {
     }
 
     private fun newGroup() {
-        val field = input("Group name", null).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
-        }
-        AlertDialog.Builder(this)
+        val field = input("Group name", null, InputType.TYPE_TEXT_FLAG_CAP_WORDS)
+        SecureBuilder(this)
             .setTitle("New group")
             .setMessage("You'll own the group: only you can add and remove members. Everyone in it sees who else is.")
             .setView(padded(field))
@@ -288,7 +285,7 @@ class MainActivity : Activity() {
         this.text = text
         isAllCaps = false
         setTextColor(color(R.color.accent))
-        background = getDrawable(android.R.drawable.list_selector_background)
+        background = ripple()
         minHeight = dp(48)
         setOnClickListener { onClick() }
     }
@@ -347,6 +344,11 @@ class MainActivity : Activity() {
                 if (it) "When you open a chat, the sender learns you've displayed their messages"
                 else "The sender won't know when you've read their messages"
             }
+            toggle("Send typing indicators", Privacy.sendTyping(this@MainActivity),
+                { Privacy.setSendTyping(this@MainActivity, it) }) {
+                if (it) "Contacts see “…” while you write to them"
+                else "Contacts don't see when you're typing"
+            }
             menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {
                 isCheckable = true
@@ -388,9 +390,7 @@ class MainActivity : Activity() {
 
     /** A new anonymous identity and its invite. */
     private fun newPersona() {
-        val field = input("Your label for it (only you see this)", null).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-        }
+        val field = input("Your label for it (only you see this)", null, InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
         var burn = 2
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -407,7 +407,7 @@ class MainActivity : Activity() {
             group.setOnCheckedChangeListener { _, id -> burn = id - 1 }
             addView(group, matchWrap)
         }
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Anonymous invite")
             .setMessage(
                 "A new identity with its own keys and conversations. Nothing links it to you unless you reveal it. " +
@@ -451,7 +451,7 @@ class MainActivity : Activity() {
             val list = try { n.personas() } catch (_: Exception) { emptyList() }
             runOnUiThread {
                 if (list.isEmpty()) {
-                    AlertDialog.Builder(this)
+                    SecureBuilder(this)
                         .setTitle("Anonymous identities")
                         .setMessage("None yet. + → Anonymous invite makes one.")
                         .setPositiveButton("Make one") { _, _ -> newPersona() }
@@ -462,7 +462,7 @@ class MainActivity : Activity() {
                 val rows = list.map { p ->
                     p.label + (p.expiresMs?.let { " · burns " + DateUtils.getRelativeTimeSpanString(it.toLong()).toString().replaceFirstChar(Char::lowercase) } ?: "")
                 }
-                AlertDialog.Builder(this)
+                SecureBuilder(this)
                     .setTitle("Anonymous identities")
                     .setItems(rows.toTypedArray()) { _, i -> persona(list[i].id, list[i].label) }
                     .setPositiveButton("New") { _, _ -> newPersona() }
@@ -475,7 +475,7 @@ class MainActivity : Activity() {
     private fun persona(id: String, label: String) {
         val p = Threnody.personaNode(id) ?: return
         val options = listOf("Show its invite", "Its profile", "Rename", "Burn it")
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle(label)
             .setItems(options.toTypedArray()) { _, i ->
                 when (i) {
@@ -491,7 +491,7 @@ class MainActivity : Activity() {
 
     private fun renamePersona(id: String, label: String) {
         val field = input("Label", label)
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Rename")
             .setView(padded(field))
             .setPositiveButton("Save") { _, _ ->
@@ -506,7 +506,7 @@ class MainActivity : Activity() {
     }
 
     private fun burnPersona(id: String, label: String) {
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Burn $label?")
             .setMessage("Its keys, contacts, messages and files are deleted for good. Nobody can reach it again.")
             .setPositiveButton("Burn") { _, _ ->
@@ -544,7 +544,7 @@ class MainActivity : Activity() {
     private fun defaultTimer() {
         val choices = Privacy.TIMERS
         val checked = choices.indexOfFirst { it.second == Privacy.defaultTimer(this) }
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Default disappearing timer")
             .setSingleChoiceItems(choices.map { it.first }.toTypedArray(), checked) { d, i ->
                 d.dismiss()
@@ -564,7 +564,7 @@ class MainActivity : Activity() {
                 val labels = list.map { d ->
                     d.name + (if (d.thisDevice) " (this device)" else "") + "\n" + Threnody.short(d.fingerprint)
                 }
-                AlertDialog.Builder(this)
+                SecureBuilder(this)
                     .setTitle("Your devices")
                     .setItems(labels.toTypedArray()) { _, i -> renameDevice(list[i].fingerprint, list[i].name) }
                     .setPositiveButton("Link a new device") { _, _ -> linkDevice() }
@@ -575,10 +575,8 @@ class MainActivity : Activity() {
     }
 
     private fun renameDevice(fingerprint: String, current: String) {
-        val field = input("Name", current).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
-        }
-        AlertDialog.Builder(this)
+        val field = input("Name", current, InputType.TYPE_TEXT_FLAG_CAP_WORDS)
+        SecureBuilder(this)
             .setTitle("Rename device")
             .setMessage("Your other devices and your contacts see this name.")
             .setView(padded(field))
@@ -626,7 +624,7 @@ class MainActivity : Activity() {
         } catch (_: Exception) {}
         box.addView(label(code, 12f, R.color.muted).apply { setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }, matchWrap)
         box.addView(label(footer, 12f, R.color.muted).apply { setTextIsSelectable(true); setPadding(0, dp(8), 0, 0) }, matchWrap)
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle(title)
             .setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton("Share") { _, _ ->
@@ -641,11 +639,12 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun input(hint: String, value: String?) = EditText(this).apply {
+    /** A one-value field (a name, a link) that wraps when long. */
+    private fun input(hint: String, value: String?, flags: Int = InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) = EditText(this).apply {
         this.hint = hint
+        inputType = InputType.TYPE_CLASS_TEXT or flags
+        wrapping(newlines = false, max = 4)
         setText(value ?: "")
-        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        isSingleLine = true
     }
 
     private fun padded(v: View) = LinearLayout(this).apply {
@@ -656,7 +655,7 @@ class MainActivity : Activity() {
     private fun addContact(prefill: String?) {
         // A copied invite (say, from the camera app) fills itself in.
         val field = input("threnody://… or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Add a contact")
             .setMessage("Scan or paste their invite. You'll check their safety number together later.")
             .setView(padded(field))
@@ -708,7 +707,7 @@ class MainActivity : Activity() {
         if (link.contains(n.deviceFingerprint().replace("-", ""))) return
         offered = link
         if (link.startsWith(DirectoryUi.SCHEME)) {
-            AlertDialog.Builder(this)
+            SecureBuilder(this)
                 .setTitle("Subscribe to the copied directory?")
                 .setMessage(link)
                 .setPositiveButton("Subscribe") { _, _ -> DirectoryUi.subscribe(this, worker, link) }
@@ -717,7 +716,7 @@ class MainActivity : Activity() {
             return
         }
         val invite = link.startsWith("threnody://")
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle(if (invite) "Add the copied invite?" else "Join with the copied link code?")
             .setMessage(link)
             .setPositiveButton(if (invite) "Connect" else "Continue") { _, _ ->
@@ -746,7 +745,7 @@ class MainActivity : Activity() {
         val field = input("threnody-link://…", prefill)
         val prefilled = prefill ?: copiedLink()?.takeIf { it.startsWith("threnody-link://") }
         field.setText(prefilled ?: "")
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Join another device's account")
             .setMessage("This device becomes part of that account: your contacts see both as you. " +
                 "Get the code from “Link a new device” on the other device.")
@@ -781,7 +780,7 @@ class MainActivity : Activity() {
     }
 
     private fun failed(msg: String) {
-        AlertDialog.Builder(this).setMessage(msg).setPositiveButton("OK", null).show()
+        SecureBuilder(this).setMessage(msg).setPositiveButton("OK", null).show()
     }
 
     override fun onDestroy() {

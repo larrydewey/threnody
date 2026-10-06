@@ -3,6 +3,8 @@
     <color name="background">#FFF7F7F9</color>
     <color name="bar">#FFF7F7F9</color>
     <color name="surface">#FFFFFFFF</color>
+    <color name="sheet">#FFEEEEF3</color>
+    <color name="field">#FFE6E6EC</color>
     <color name="text">#FF1B1B1F</color>
     <color name="muted">#FF6B6B76</color>
     <color name="divider">#FFE3E3E8</color>

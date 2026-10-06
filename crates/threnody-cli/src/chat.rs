@@ -448,16 +448,16 @@ impl Ui {
     /// where connected, sealed for mailboxes otherwise; recorded in history.
     fn send_to_account(&self, peer: PublicIdentity, body: &str) -> Result<()> {
         let r = self.node.send_text(&peer, body)?;
-        if r.live + r.sealed + r.unreachable > 1 || r.sealed > 0 {
+        if r.live + r.sealed + r.queued > 1 || r.sealed + r.queued > 0 {
             println!(
                 "* to {} device(s): {} live, {} sealed for mailboxes{}",
-                r.live + r.sealed + r.unreachable,
+                r.live + r.sealed + r.queued,
                 r.live,
                 r.sealed,
-                if r.unreachable == 0 {
+                if r.queued == 0 {
                     String::new()
                 } else {
-                    format!(", {} unreachable", r.unreachable)
+                    format!(", {} waiting to connect", r.queued)
                 }
             );
         }
@@ -1020,7 +1020,12 @@ impl Ui {
                 .groups
                 .relayed(&self.node, &peer, &group, local_id, &origin),
             // Shown as ✓✓ in /history; too chatty to print live.
-            Event::Delivered { .. } => {}
+            Event::Delivered { .. } | Event::Read { .. } => {}
+            Event::Typing { peer, active } => {
+                if active {
+                    println!("* {} is typing", self.name(&peer));
+                }
+            }
             Event::Reacted { peer, .. } => {
                 println!("* {} reacted (see /history)", self.name(&peer));
             }

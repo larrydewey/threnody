@@ -13,6 +13,9 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
+import android.text.InputType
+import android.view.inputmethod.EditorInfo
+import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -21,6 +24,15 @@ import uniffi.threnody_ffi.QrMatrix
 fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
 fun Context.color(id: Int): Int = getColor(id)
+
+/** The system's touch ripple: bounded for rows, borderless for icons. */
+fun Context.ripple(borderless: Boolean = false): android.graphics.drawable.Drawable? {
+    val v = android.util.TypedValue()
+    theme.resolveAttribute(
+        if (borderless) android.R.attr.selectableItemBackgroundBorderless else android.R.attr.selectableItemBackground, v, true,
+    )
+    return getDrawable(v.resourceId)
+}
 
 fun rounded(color: Int, radius: Float) = GradientDrawable().apply {
     setColor(color)
@@ -94,7 +106,7 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
         imageTintList = android.content.res.ColorStateList.valueOf(context.color(R.color.text))
         contentDescription = label
         tooltipText = label
-        background = context.getDrawable(android.R.drawable.list_selector_background)
+        background = context.ripple(borderless = true)
         layoutParams = LayoutParams(context.dp(48), context.dp(48))
         setOnClickListener(onClick)
     }
@@ -155,6 +167,75 @@ fun Context.label(text: String, size: Float = 15f, colorId: Int = R.color.text) 
     this.text = text
     textSize = size
     setTextColor(color(colorId))
+}
+
+/** An AlertDialog.Builder whose dialogs follow screen security (see [Privacy.secure]). */
+class SecureBuilder(ctx: Context) : android.app.AlertDialog.Builder(ctx) {
+    override fun create(): android.app.AlertDialog = super.create().also { Privacy.secure(it) }
+}
+
+/**
+ * A tray that rises from the bottom edge, in the theme's colours, with a
+ * handle; a tap outside or Back closes it. Shown with `show()`.
+ */
+fun Activity.bottomSheet(content: View): android.app.Dialog = android.app.Dialog(this).apply {
+    requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+    val r = dp(28).toFloat()
+    val frame = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+        background = GradientDrawable().apply {
+            setColor(color(R.color.sheet))
+            cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        }
+        addView(View(context).apply {
+            background = rounded(color(R.color.muted), dp(2).toFloat())
+            alpha = 0.4f
+        }, LinearLayout.LayoutParams(dp(32), dp(4)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = dp(10)
+            bottomMargin = dp(8)
+        })
+        addView(content, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+    }
+    val bottom = frame.paddingBottom
+    frame.setOnApplyWindowInsetsListener { v, insets ->
+        // Clear of the navigation bar, and of the keyboard while typing.
+        val nav = if (Build.VERSION.SDK_INT >= 30) insets.getInsets(WindowInsets.Type.navigationBars() or WindowInsets.Type.ime()).bottom
+            else @Suppress("DEPRECATION") insets.systemWindowInsetBottom
+        v.setPadding(0, 0, 0, bottom + nav + dp(8))
+        insets
+    }
+    setContentView(frame)
+    setCanceledOnTouchOutside(true)
+    Privacy.secure(this)
+    window?.apply {
+        setLayout(MATCH_PARENT, WRAP_CONTENT)
+        setGravity(Gravity.BOTTOM)
+        setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+        setWindowAnimations(android.R.style.Animation_InputMethod)
+        if (Build.VERSION.SDK_INT >= 30) setDecorFitsSystemWindows(false)
+    }
+}
+
+/**
+ * Lets a field grow onto more lines (up to `max`) instead of scrolling
+ * sideways. With `newlines`, Enter starts a new line (messages and other
+ * prose); without, text only wraps and Enter means done (names, links).
+ * Call it after setting the input type.
+ */
+fun EditText.wrapping(newlines: Boolean = true, max: Int = 6): EditText {
+    val type = inputType or InputType.TYPE_CLASS_TEXT
+    isSingleLine = false
+    setHorizontallyScrolling(false)
+    maxLines = max
+    if (newlines) {
+        inputType = type or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+    } else {
+        // Shown on several lines, typed as one: the keyboard offers Done.
+        setRawInputType(type and InputType.TYPE_TEXT_FLAG_MULTI_LINE.inv())
+        imeOptions = EditorInfo.IME_ACTION_DONE
+    }
+    return this
 }
 
 val matchWrap get() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)

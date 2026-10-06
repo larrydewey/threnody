@@ -805,12 +805,14 @@ impl App {
         let weak = Rc::downgrade(self);
         self.window.connect_is_active_notify(move |w| {
             if let Some(this) = weak.upgrade() {
-                let core = this.core.clone();
+                // Contacts' records are polled at the foreground rate
+                // whether or not the window has focus: a desktop runs on
+                // mains power, and a contact's punch only lasts minutes.
                 let on = w.is_active();
-                ui::bg_quiet(move || core.set_foreground(on));
                 this.update_watching();
                 if on && let Some(c) = this.chat.borrow().as_ref() {
                     this.app.withdraw_notification(&notification_id(&c.chat()));
+                    c.shown();
                 }
             }
         });
@@ -1547,6 +1549,12 @@ impl App {
             settings::SEND_READ,
             "Send read receipts",
             "When you open a chat, the sender learns you've displayed their messages",
+        );
+        toggle(
+            &messages,
+            settings::SEND_TYPING,
+            "Send typing indicators",
+            "Contacts see “…” while you write to them",
         );
         toggle(
             &messages,

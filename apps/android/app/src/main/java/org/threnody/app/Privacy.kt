@@ -30,6 +30,7 @@ object Privacy {
     private const val REACH = "reach_internet"
     private const val VOLUNTEERS = "use_volunteers"
     private const val READ_RECEIPTS = "send_read_receipts"
+    private const val TYPING = "send_typing"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -64,6 +65,10 @@ object Privacy {
     fun useVolunteers(ctx: Context) = prefs(ctx).getBoolean(VOLUNTEERS, true)
 
     fun sendReadReceipts(ctx: Context) = prefs(ctx).getBoolean(READ_RECEIPTS, true)
+
+    fun sendTyping(ctx: Context) = prefs(ctx).getBoolean(TYPING, true)
+
+    fun setSendTyping(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(TYPING, on).apply()
 
     fun setSendReadReceipts(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(READ_RECEIPTS, on).apply()
@@ -111,6 +116,15 @@ object Privacy {
     }
 
     /** Call from every Activity's onCreate. */
+    /**
+     * A dialog's window is separate from its activity's, so it needs its
+     * own FLAG_SECURE: without it, screenshots and the recents screen
+     * show dialogs and trays while the screen behind them stays blank.
+     */
+    fun secure(dialog: android.app.Dialog) {
+        if (screenSecurity(dialog.context)) dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
     fun apply(activity: Activity) {
         if (screenSecurity(activity)) {
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)

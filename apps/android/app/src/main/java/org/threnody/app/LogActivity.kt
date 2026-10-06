@@ -34,7 +34,7 @@ class LogActivity : Activity() {
             setPadding(dp(16), 0, dp(16), 0)
         }
         val header = label("", 12f, R.color.muted).apply { setTextIsSelectable(true); typeface = Typeface.MONOSPACE }
-        val target = EditText(this).apply { hint = "ble <n> after a scan"; isSingleLine = true }
+        val target = EditText(this).apply { hint = "ble <n> after a scan"; wrapping(newlines = false, max = 3) }
         fun button(text: String, onClick: () -> Unit) = Button(this).apply {
             this.text = text
             isAllCaps = false

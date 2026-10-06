@@ -27,7 +27,8 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
 pub struct SendReport {
     pub live: usize,
     pub sealed: usize,
-    pub unreachable: usize,
+    /// Held until a session with the device comes up.
+    pub queued: usize,
 }
 
 /// A file to send, with what goes with it.
@@ -661,14 +662,9 @@ impl Node {
             if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
                 r.sealed += 1;
             } else {
-                r.unreachable += 1;
+                self.hold(d, msg.clone(), tag);
+                r.queued += 1;
             }
-        }
-        if r.live + r.sealed == 0 {
-            return Err(NetError::NoRoute(format!(
-                "{} (no session and no prekeys; try a relay)",
-                peer.fingerprint()
-            )));
         }
         let now = now_ms();
         self.append(
@@ -738,14 +734,18 @@ impl Node {
             caption: caption.clone(),
             album,
         };
-        self.send_tagged(
-            peer,
-            msg,
-            Tag {
-                local_id,
-                ..Tag::NONE
-            },
-        )?;
+        let tag = Tag {
+            local_id,
+            ..Tag::NONE
+        };
+        if let Err(e) = self.send_tagged(peer, msg.clone(), tag) {
+            if !matches!(e, NetError::Closed) {
+                return Err(e);
+            }
+            // No session yet: it goes once one comes up.
+            self.seek(peer);
+            self.hold(peer, msg, tag);
+        }
         self.append_file(
             peer,
             true,

@@ -946,8 +946,8 @@ impl ThrenodyNode {
 
     /// Sends text to every device of `peer`'s account: live where
     /// connected (reaching `peer` through relays if need be), sealed for
-    /// mailboxes otherwise; recorded in history.
-    /// Returns how many devices it reached.
+    /// mailboxes, or else held until a session comes up; recorded in
+    /// history. Returns how many devices it reached or will.
     pub fn send_text(&self, peer: String, text: String) -> Result<u32> {
         let p = self.resolve(&peer)?;
         // No session: try to reach it before falling back to sealed delivery.
@@ -955,7 +955,7 @@ impl ThrenodyNode {
         self.try_reach(&p);
         let _guard = self.rt.enter();
         let r = self.node.send_text(&p, &text).map_err(fail)?;
-        Ok(u32::try_from(r.live + r.sealed).unwrap_or(u32::MAX))
+        Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
     }
 
     /// Sends a file (at most `max_file_size` bytes) to `peer`, reaching
@@ -977,7 +977,7 @@ impl ThrenodyNode {
                 threnody_core::message::MAX_FILE
             )));
         }
-        // Files aren't sealed for mailboxes: they need a live session.
+        // Files aren't sealed for mailboxes: they wait for a live session.
         self.try_reach(&p);
         let _guard = self.rt.enter();
         self.node

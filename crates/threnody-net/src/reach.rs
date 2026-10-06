@@ -39,13 +39,27 @@ pub const DEFAULT_REFLECTORS: &[&str] = &[
     "router.bittorrent.com:6881",
     "router.utorrent.com:6881",
 ];
-/// How long a contact we want to reach is marked as sought.
+/// How long punching we start lasts: the contact only joins in once it
+/// has polled our record.
 const SEEK_FOR: Duration = Duration::from_secs(120);
+/// How long a contact we want to reach (a message waits for it, its chat
+/// is open) stays marked as sought in our record. Longer than the
+/// background poll, so a contact whose app is in the background still
+/// sees it once, and answers.
+const WANT_FOR: Duration = Duration::from_secs(20 * 60);
 /// How long we punch when answering a contact (its record seeks us, or
-/// its probe arrived). Punching we start lasts [`SEEK_FOR`], since the
-/// contact only joins in once it has polled our record.
-const ANSWER_FOR: Duration = Duration::from_secs(45);
+/// its probe arrived). Our record then seeks it too, and the contact
+/// polls every [`ReachConfig::poll_seeking`], so this covers a poll, a
+/// read and a write with room to spare.
+const ANSWER_FOR: Duration = Duration::from_secs(60);
 const PROBE_EVERY: Duration = Duration::from_secs(1);
+/// After [`SEEK_FOR`], a contact we still want is probed this often: it
+/// keeps our NAT open toward it, so its probes get through whenever it
+/// polls our record and answers (from the background, that is late).
+const SLOW_PROBE_EVERY: Duration = Duration::from_secs(5);
+/// Hearing the contact or new addresses brings back full-rate punching
+/// for this long.
+const LIVELY_FOR: Duration = Duration::from_secs(60);
 /// The dialer waits this long for a probe before dialing anyway.
 const DIAL_AFTER: Duration = Duration::from_secs(3);
 const REDIAL_EVERY: Duration = Duration::from_secs(5);
@@ -137,6 +151,9 @@ pub(crate) enum Urge {
 struct Punch {
     targets: Mutex<Vec<SocketAddr>>,
     lasts: Duration,
+    /// Full-rate punching for this long; slow probes after it (see
+    /// [`SLOW_PROBE_EVERY`]), dialing only once the contact is heard.
+    brisk: Duration,
     /// A probe from the contact arrived.
     heard: Notify,
     /// New addresses for the contact arrived: dial now.
@@ -320,7 +337,7 @@ impl Node {
         if !self.reach_enabled() || self.connected(peer) {
             return;
         }
-        let until = now_ms() + SEEK_FOR.as_millis() as u64;
+        let until = now_ms() + WANT_FOR.as_millis() as u64;
         {
             let mut inner = lock(&self.rdv().inner);
             inner.seeking.insert(*peer, until);
@@ -739,35 +756,63 @@ impl Node {
         }
     }
 
+    /// Contacts we seek and have no session with.
+    fn sought(&self) -> Vec<PublicIdentity> {
+        let now = now_ms();
+        let sought: Vec<PublicIdentity> = lock(&self.rdv().inner)
+            .seeking
+            .iter()
+            .filter(|(_, t)| **t > now)
+            .map(|(p, _)| *p)
+            .collect();
+        sought.into_iter().filter(|p| !self.connected(p)).collect()
+    }
+
+    /// Polls every contact's record at the foreground or background rate,
+    /// and the records of contacts we seek more often in between.
     async fn poll_loop(&self, cfg: &ReachConfig) {
+        let mut last_full: Option<Instant> = None;
+        let mut woken = true;
         loop {
-            if self.reach_enabled()
-                && let Some(dht) = self.dht()
-            {
-                self.poll_all(&dht, cfg).await;
-            }
-            let seeking = {
-                let now = now_ms();
-                lock(&self.rdv().inner).seeking.values().any(|t| *t > now)
-            };
-            let wait = if seeking {
-                cfg.poll_seeking
-            } else if self.rdv().foreground.load(Ordering::Relaxed) {
+            let every = if self.rdv().foreground.load(Ordering::Relaxed) {
                 cfg.poll_foreground
             } else {
                 cfg.poll_background
             };
-            if !self.pause(wait, &self.rdv().poll).await {
-                break;
+            let full = woken || last_full.is_none_or(|t| t.elapsed() >= every);
+            if self.reach_enabled()
+                && let Some(dht) = self.dht()
+            {
+                let only = (!full).then(|| self.sought());
+                self.poll_all(&dht, cfg, only.as_deref()).await;
+                if full {
+                    last_full = Some(Instant::now());
+                }
             }
+            let next_full = every.saturating_sub(last_full.map_or(Duration::ZERO, |t| t.elapsed()));
+            let wait = if self.sought().is_empty() {
+                next_full
+            } else {
+                cfg.poll_seeking.min(next_full)
+            };
+            let closed = self.closed();
+            woken = tokio::select! {
+                () = tokio::time::sleep(wait) => false,
+                () = self.rdv().poll.notified() => true,
+                () = closed => break,
+            };
         }
     }
 
-    /// Fetches the records of contacts we have no session with, and punches
-    /// those that are fresh and new to us, or seeking us.
-    async fn poll_all(&self, dht: &AsyncDht, cfg: &ReachConfig) {
+    /// Fetches the records of contacts we have no session with (only
+    /// those in `only`, if given), and punches those that are fresh and
+    /// new to us, or seeking us.
+    async fn poll_all(&self, dht: &AsyncDht, cfg: &ReachConfig, only: Option<&[PublicIdentity]>) {
         let mut gets = JoinSet::new();
         for (peer, keys) in self.unreached() {
+            if only.is_some_and(|o| !o.contains(&peer)) {
+                continue;
+            }
             let dht = dht.clone();
             gets.spawn(async move { (peer, fetch(&dht, &peer, &keys).await) });
         }
@@ -797,7 +842,18 @@ impl Node {
                 .seen
                 .get(&peer)
                 .is_none_or(|last| rec.issued_ms > *last);
-            if !newer {
+            // A contact we want (a message waits) is punched toward its
+            // last addresses even when they are not new: it answers late
+            // from the background, and our probes must be going out then.
+            let wanted = !newer && {
+                let inner = lock(&self.rdv().inner);
+                !inner.punches.contains_key(&peer)
+                    && inner
+                        .seeking
+                        .get(&peer)
+                        .is_some_and(|t| *t > now + SEEK_FOR.as_millis() as u64 / 2)
+            };
+            if !newer && !wanted {
                 continue;
             }
             let urge = if seeking { Urge::Answer } else { Urge::Start };
@@ -816,7 +872,16 @@ impl Node {
             }
             // A record we couldn't act on (backing off, too busy) stays new.
             if self.punch(peer, &rec.list, rec.flags & FLAG_SYMMETRIC != 0, urge) {
-                lock(&self.rdv().inner).seen.insert(peer, rec.issued_ms);
+                let mut inner = lock(&self.rdv().inner);
+                inner.seen.insert(peer, rec.issued_ms);
+                // Tell the contact we answer: it may have stopped punching
+                // (its app in the background polled us late), and our
+                // record seeking it makes it join in at its next poll.
+                if urge == Urge::Answer && inner.seeking.get(&peer).is_none_or(|t| *t <= now) {
+                    inner.seeking.insert(peer, now + ANSWER_FOR.as_millis() as u64);
+                    drop(inner);
+                    self.rdv().republish.notify_one();
+                }
             }
         }
     }
@@ -875,9 +940,11 @@ impl Node {
             let lasts = match urge {
                 Urge::Start => {
                     // Ask the contact to join in: our record says we seek it.
-                    let until = now_ms() + SEEK_FOR.as_millis() as u64;
-                    inner.seeking.insert(peer, until);
-                    SEEK_FOR
+                    let now = now_ms();
+                    let t = inner.seeking.entry(peer).or_default();
+                    *t = (*t).max(now + SEEK_FOR.as_millis() as u64);
+                    // Wanted longer (a message waits): keep the way open.
+                    SEEK_FOR.max(Duration::from_millis(*t - now))
                 }
                 Urge::Lost => crate::recover::RECOVER_FOR,
                 _ => ANSWER_FOR,
@@ -899,6 +966,7 @@ impl Node {
             let p = Arc::new(Punch {
                 targets: Mutex::new(targets),
                 lasts,
+                brisk: lasts.min(SEEK_FOR),
                 heard: Notify::new(),
                 retarget: Notify::new(),
                 we_dial,
@@ -950,6 +1018,9 @@ impl Node {
         let start = Instant::now();
         let mut next_dial = start + punch.dial_after;
         let mut heard: Option<Instant> = None;
+        // When we last heard the contact or got new addresses for it.
+        let mut lively = start;
+        let mut probed: Option<Instant> = None;
         let mut dialing: Option<tokio::task::JoinHandle<()>> = None;
         let mut tick = tokio::time::interval(PROBE_EVERY);
         let closed = self.closed();
@@ -971,8 +1042,10 @@ impl Node {
                     }
                     next_dial = Instant::now();
                     heard = None;
+                    lively = Instant::now();
                 }
                 () = punch.heard.notified() => {
+                    lively = Instant::now();
                     if punch.defer {
                         heard = Some(Instant::now());
                     } else {
@@ -984,13 +1057,18 @@ impl Node {
             let Some(d) = self.contacts().get(&peer).and_then(|c| c.discovery_key) else {
                 break false;
             };
+            let brisk = start.elapsed() < punch.brisk || lively.elapsed() < LIVELY_FOR;
+            if !brisk && probed.is_some_and(|t| t.elapsed() < SLOW_PROBE_EVERY) {
+                continue;
+            }
+            probed = Some(Instant::now());
             let targets = lock(&punch.targets).clone();
             for t in &targets {
                 let _ = quic.send_raw(*t, &rendezvous::probe(&d, &me));
             }
             let idle = dialing.as_ref().is_none_or(|h| h.is_finished());
             let quiet = heard.is_none_or(|h| h.elapsed() > Duration::from_secs(5));
-            if punch.we_dial && idle && quiet && Instant::now() >= next_dial {
+            if punch.we_dial && brisk && idle && quiet && Instant::now() >= next_dial {
                 next_dial = Instant::now() + REDIAL_EVERY;
                 let node = self.clone();
                 dialing = Some(tokio::spawn(async move {

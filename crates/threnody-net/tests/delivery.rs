@@ -411,3 +411,26 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
     assert!(last(&alice).delivered);
 }
+
+#[tokio::test]
+async fn text_sent_with_no_way_through_waits_for_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b = bob.identity();
+    bob.accept_contact(&alice.identity());
+
+    // No session, no relay, no mailbox: held rather than refused.
+    let r = alice.send_text(&b, "when you're back").unwrap();
+    assert_eq!((r.live, r.sealed, r.queued), (0, 0, 1));
+    assert_eq!(alice.unacked(&b), 1);
+
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    alice
+        .connect(&addr.to_string(), Some(b.fingerprint()))
+        .await
+        .unwrap();
+    next(&mut brx, |e| is_text(e, "when you're back")).await;
+    next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
+    wait_for(|| alice.unacked(&b) == 0).await;
+}

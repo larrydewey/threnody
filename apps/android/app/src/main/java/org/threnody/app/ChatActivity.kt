@@ -12,7 +12,10 @@ import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.SpannableString
 import android.text.Spanned
+import android.text.InputType
 import android.text.TextWatcher
+import android.text.format.DateFormat
+import android.text.format.Formatter
 import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.View
@@ -58,20 +61,21 @@ class ChatActivity : Activity() {
     private lateinit var scroll: ScrollView
     private lateinit var compose: EditText
     private lateinit var composeBar: LinearLayout
-    /** Typing indicator view, shown when peer is typing. */
+    /** "…" below the messages while the contact is typing. */
     private lateinit var typingBubble: View
-    /** Whether the peer is currently typing. */
-    private var peerTyping = false
-    /** Handler for typing timeout. */
     private val typingHandler = Handler(Looper.getMainLooper())
-    /** Runnable to stop typing indicator after inactivity. */
-    private val stopTyping = Runnable { setTyping(false) }
+    /** We stopped typing for a while: say so. */
+    private val stopTyping = Runnable { sendTyping(false) }
+    /** The contact's "typing" went quiet (its "stopped" may be lost). */
+    private val peerStopped = Runnable { showTyping(false) }
     /** Messages being sent, shown until history has them. */
     private val pending = mutableListOf<String>()
     private var unsubscribe: (() -> Unit)? = null
     private var myDevice = ""
-    /** Set of remote message ids we've already sent read receipts for. */
+    /** Incoming message ids already reported read. */
     private val sentRead = mutableSetOf<ULong>()
+    /** On screen (between onStart and onStop): only then are messages read. */
+    private var started = false
 
     /** A history entry, or a message still being sent. */
     private data class Item(val entry: HistoryEntry, val sending: Boolean = false)
@@ -104,7 +108,7 @@ class ChatActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.START
             setPadding(0, dp(3), dp(48), dp(3))
-            val bubble = LinearLayout(this).apply {
+            val bubble = LinearLayout(this@ChatActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 background = rounded(color(R.color.bubble_in), dp(16).toFloat())
                 setPadding(dp(12), dp(8), dp(12), dp(8))
@@ -148,12 +152,11 @@ class ChatActivity : Activity() {
     }
 
     private fun composeBar(): LinearLayout {
-        compose = EditText(this).apply {
+        compose = ComposeField(this, ::received).apply {
             hint = "Message"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            maxLines = 5
-            background = rounded(color(R.color.surface), dp(22).toFloat())
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            wrapping(max = 6)
+            background = rounded(color(R.color.field), dp(22).toFloat())
             setPadding(dp(16), dp(10), dp(16), dp(10))
             setTextColor(color(R.color.text))
             setHintTextColor(color(R.color.muted))
@@ -161,18 +164,10 @@ class ChatActivity : Activity() {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
                 override fun afterTextChanged(s: Editable?) {
-                    if (group != null) return
-                    val d = device
-                    if (d.isEmpty() || !::node.isInitialized) return
-                    val text = s.toString().trim()
-                    if (text.isEmpty()) {
-                        if (lastTypingSent) { setTyping(false); lastTypingSent = false }
-                    } else if (!lastTypingSent) {
-                        lastTypingSent = true
-                        worker.execute { try { node.setTyping(device, true) } catch (_: Exception) {} }
-                    }
                     typingHandler.removeCallbacks(stopTyping)
-                    typingHandler.postDelayed(stopTyping, 3000)
+                    if (s.toString().isBlank()) return sendTyping(false)
+                    sendTyping(true)
+                    typingHandler.postDelayed(stopTyping, TYPING_IDLE_MS)
                 }
             })
         }
@@ -181,7 +176,7 @@ class ChatActivity : Activity() {
             imageTintList = android.content.res.ColorStateList.valueOf(color(tint))
             contentDescription = label
             tooltipText = label
-            background = getDrawable(android.R.drawable.list_selector_background)
+            background = ripple(borderless = true)
             setOnClickListener { onClick(it) }
         }
         return LinearLayout(this).apply {
@@ -190,33 +185,60 @@ class ChatActivity : Activity() {
             setBackgroundColor(color(R.color.bar))
             setPadding(dp(4), dp(6), dp(4), dp(6))
             addView(button(R.drawable.ic_attach, "Send photos or files", R.color.muted) { attach(it) }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(button(R.drawable.ic_emoji, "Emoji", R.color.muted) {
+                EmojiPicker(this@ChatActivity, "Emoji", stay = true) { e ->
+                    val at = compose.selectionStart.coerceAtLeast(0)
+                    compose.text.replace(at, compose.selectionEnd.coerceAtLeast(at), e)
+                }.show()
+            }, LinearLayout.LayoutParams(dp(44), dp(48)))
             addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             addView(button(R.drawable.ic_send, "Send", R.color.accent) { send() }, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
     }
 
-    /** Tracks whether we've sent "typing: true" for the current non-empty compose. */
-    private var lastTypingSent = false
+    /** Whether the contact was last told we are typing, and when. */
+    private var typingSent = false
+    private var typingSentAt = 0L
 
-    /** Shows or hides the typing indicator for this conversation. */
-    private fun setTyping(active: Boolean) {
-        if (group != null) return // No typing indicator for groups yet.
-        peerTyping = active
+    /**
+     * Tells the contact (not a group) we started or stopped typing: on a
+     * change, and again now and then while typing goes on.
+     */
+    private fun sendTyping(active: Boolean) {
+        if (group != null || !::node.isInitialized) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (typingSent == active && !(active && now - typingSentAt > TYPING_AGAIN_MS)) return
+        if (active && !Privacy.sendTyping(this)) return
+        typingSent = active
+        typingSentAt = now
+        val d = device
+        worker.execute { try { node.setTyping(d, active) } catch (_: Exception) {} }
+    }
+
+    /** Shows or hides "…" for the contact typing. */
+    private fun showTyping(active: Boolean) {
+        if (group != null) return
+        typingHandler.removeCallbacks(peerStopped)
+        if (active) typingHandler.postDelayed(peerStopped, PEER_TYPING_MS)
+        val was = typingBubble.visibility == View.VISIBLE
         typingBubble.visibility = if (active) View.VISIBLE else View.GONE
-        if (active) toBottom()
+        if (active && !was && !scroll.canScrollVertically(1)) toBottom()
     }
 
     override fun onStart() {
         super.onStart()
+        started = true
         Threnody.visible++
         Threnody.visibleChat = setOf(key, device) + (convo?.devices ?: emptyList())
         ThrenodyService.clearNotification(this, ThrenodyService.notificationKey(key, persona))
         unsubscribe = Threnody.subscribe { e ->
             if (!concerns(e)) return@subscribe
             if (e is NodeEvent.Typing) {
-                runOnUiThread { setTyping(e.active) }
+                runOnUiThread { showTyping(e.active) }
                 return@subscribe
             }
+            // A message from them ends their typing.
+            if (e is NodeEvent.Message) runOnUiThread { showTyping(false) }
             when (e) {
                 is NodeEvent.CredentialPresented -> runOnUiThread {
                     CredentialUi.showProof(this, node, e.peer, e.issuer, e.schema, e.attributes, e.pseudonym)
@@ -235,6 +257,9 @@ class ChatActivity : Activity() {
     }
 
     override fun onStop() {
+        started = false
+        typingHandler.removeCallbacks(stopTyping)
+        sendTyping(false)
         Threnody.visible--
         Threnody.visibleChat = emptySet()
         unsubscribe?.invoke()
@@ -333,11 +358,17 @@ class ChatActivity : Activity() {
                 "Review" to { CredentialUi.answerAsk(this, node, worker, q) { worker.execute { refresh() } } },
             )
             show(items, names)
-            // Send read receipts for incoming messages we've now displayed (1:1 chats only).
-            if (g == null && Privacy.sendReadReceipts(this)) {
-                val ids = items.filter { !it.entry.outgoing && it.entry.id != 0uL }.map { it.entry.id }
-                if (ids.isNotEmpty()) {
-                    worker.execute { try { node.reportRead(device, ids) } catch (_: Exception) {} }
+            // Incoming messages now on screen are read (1:1 chats only).
+            if (g == null && started && Privacy.sendReadReceipts(this)) {
+                val ids = synchronized(sentRead) {
+                    items.filter { !it.entry.outgoing && it.entry.id != 0uL && it.entry.id !in sentRead }.map { it.entry.id }
+                }
+                if (ids.isNotEmpty()) worker.execute {
+                    // Without a session now, they're reported on a later refresh.
+                    try {
+                        node.reportRead(device, ids)
+                        synchronized(sentRead) { sentRead.addAll(ids) }
+                    } catch (_: Exception) {}
                 }
             }
         }
@@ -469,6 +500,7 @@ class ChatActivity : Activity() {
             lastSender = if (e.outgoing) null else e.device
             messages.addView(bubble(run, sender))
         }
+        messages.addView(typingBubble, matchWrap)
         if (atEnd || items.lastOrNull()?.sending == true) toBottom()
     }
 
@@ -519,10 +551,11 @@ class ChatActivity : Activity() {
         val location = f.location
         val open = View.OnClickListener {
             if (location == null) return@OnClickListener
-            startActivity(Intent(this, ImageActivity::class.java)
+            // For a result: a photo edited there comes back here to send.
+            startActivityForResult(Intent(this, ImageActivity::class.java)
                 .putExtra(ImageActivity.LOCATION, location)
                 .putExtra(ImageActivity.NAME, f.name)
-                .putExtra(ImageActivity.CAPTION, e.text))
+                .putExtra(ImageActivity.CAPTION, e.text), VIEW_PHOTO)
         }
         if (f.sensitive || location == null) {
             return label(if (location == null) "📷\nnot available" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
@@ -547,7 +580,17 @@ class ChatActivity : Activity() {
             contentDescription = e.text.ifBlank { "Photo" }
             setOnClickListener(open)
         }
-        Media.thumbnail(this, location, width) { b -> runOnUiThread { view.setImageBitmap(b); view.minimumHeight = 0 } }
+        val still = { Media.thumbnail(this, location, width) { b -> runOnUiThread { view.setImageBitmap(b); view.minimumHeight = 0 } } }
+        if (!Media.isGif(f.name)) still()
+        else Media.animated(this, location, width) { d ->
+            if (d == null) return@animated still()
+            runOnUiThread {
+                view.setImageDrawable(d)
+                view.minimumHeight = 0
+                (d as android.graphics.drawable.AnimatedImageDrawable).start()
+            }
+        }
+        if (Media.isGif(f.name)) view.contentDescription = e.text.ifBlank { "GIF" }
         return view
     }
 
@@ -713,7 +756,7 @@ class ChatActivity : Activity() {
             setTextIsSelectable(true)
             setPadding(dp(24), dp(16), dp(24), dp(8))
         }
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setView(android.widget.ScrollView(this).apply { addView(view) })
             .setPositiveButton("Done", null)
             .show()
@@ -756,10 +799,10 @@ class ChatActivity : Activity() {
         val field = EditText(this).apply {
             setText(e.text)
             setSelection(e.text.length)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            wrapping(max = 10)
         }
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Edit message")
             .setMessage("They see it marked as edited, if they're running a current version.")
             .setView(LinearLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(field, matchWrap) })
@@ -777,10 +820,8 @@ class ChatActivity : Activity() {
     private fun send() {
         val text = compose.text.toString().trim()
         if (text.isEmpty() || !::node.isInitialized) return
-        // Stop typing indicator when sending.
-        if (lastTypingSent) { lastTypingSent = false; setTyping(false) }
         typingHandler.removeCallbacks(stopTyping)
-        compose.setText("")
+        compose.setText("") // also says we stopped typing
         Threnody.touch()
         synchronized(pending) { pending.add(text) }
         worker.execute { refresh() }
@@ -826,12 +867,41 @@ class ChatActivity : Activity() {
         startActivityForResult(intent, PICK_FILE)
     }
 
+    /**
+     * A GIF or sticker from the keyboard: into the send sheet, like a
+     * picked photo.
+     */
+    private fun received(uri: Uri, mime: String, release: () -> Unit) {
+        worker.execute {
+            val picked = try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw IllegalArgumentException("unreadable")
+                val ext = mime.substringAfter('/')
+                val (n, d) = Media.prepare(this, "${if (ext == "gif") "gif" else "sticker"}-${System.currentTimeMillis()}.$ext", bytes)
+                if (d.size > node.maxFileSize().toLong()) throw IllegalArgumentException("too large to send")
+                Picked(n, d, uri)
+            } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this, "Couldn't add it: ${e.message}", Toast.LENGTH_LONG).show() }
+                null
+            } finally {
+                release()
+            }
+            if (picked != null) runOnUiThread { sendSheet(listOf(picked)) }
+        }
+    }
+
     /** A picked file, read and ready to send. */
     private class Picked(val name: String, val data: ByteArray, val uri: Uri)
 
     @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == ANNOTATE) return annotated(if (resultCode == RESULT_OK) data else null)
+        if (requestCode == VIEW_PHOTO) {
+            val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
+            if (resultCode == RESULT_OK && path != null) sendEdited(path, data.getStringExtra(ImageActivity.NAME) ?: "photo.jpg")
+            return
+        }
         if (requestCode != PICK_FILE || resultCode != RESULT_OK || data == null) return
         val clip = data.clipData
         val uris = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri } else listOfNotNull(data.data)
@@ -867,17 +937,43 @@ class ChatActivity : Activity() {
     private fun sendSheet(picked: List<Picked>) {
         val images = picked.count { Media.isImage(it.name) }
         val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for (p in picked) {
-            val cell = if (Media.isImage(p.name)) {
+        for ((i, p) in picked.withIndex()) {
+            val cell = if (Media.isGif(p.name)) {
                 ImageView(this).apply {
                     scaleType = ImageView.ScaleType.CENTER_CROP
                     background = rounded(color(R.color.surface), dp(8).toFloat())
                     clipToOutline = true
-                    contentDescription = p.name
-                    worker.execute {
-                        val b = Media.decode(android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)), dp(160))
-                        runOnUiThread { setImageBitmap(b) }
+                    contentDescription = "GIF"
+                    Media.animated({ android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)) }, dp(200)) { d ->
+                        runOnUiThread { setImageDrawable(d); (d as? android.graphics.drawable.AnimatedImageDrawable)?.start() }
                     }
+                }
+            } else if (Media.isImage(p.name)) {
+                // The photo, with an Edit button on it: drawing and text.
+                android.widget.FrameLayout(this).apply {
+                    contentDescription = "${p.name}. Edit: draw or add text"
+                    setOnClickListener { annotate(picked, i) }
+                    addView(ImageView(this@ChatActivity).apply {
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        background = rounded(color(R.color.surface), dp(8).toFloat())
+                        clipToOutline = true
+                        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                        worker.execute {
+                            val b = Media.decode(android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)), dp(200))
+                            runOnUiThread { setImageBitmap(b) }
+                        }
+                    }, MATCH_PARENT, MATCH_PARENT)
+                    addView(TextView(this@ChatActivity).apply {
+                        text = "✏️ Edit"
+                        textSize = 12f
+                        setTypeface(typeface, Typeface.BOLD)
+                        setTextColor(android.graphics.Color.WHITE)
+                        background = rounded(android.graphics.Color.argb(170, 0, 0, 0), dp(12).toFloat())
+                        setPadding(dp(8), dp(3), dp(8), dp(3))
+                        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                    }, android.widget.FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.END).apply {
+                        setMargins(dp(4), dp(4), dp(4), dp(4))
+                    })
                 }
             } else {
                 label("📎\n${p.name}", 12f, R.color.text).apply {
@@ -885,14 +981,13 @@ class ChatActivity : Activity() {
                     background = rounded(color(R.color.surface), dp(8).toFloat())
                 }
             }
-            strip.addView(cell, LinearLayout.LayoutParams(dp(80), dp(80)).apply { marginEnd = dp(6) })
+            strip.addView(cell, LinearLayout.LayoutParams(dp(104), dp(104)).apply { marginEnd = dp(6) })
         }
         val caption = EditText(this).apply {
             hint = "Add a message"
             setText(compose.text)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            maxLines = 4
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            wrapping(max = 6)
         }
         val sensitive = android.widget.CheckBox(this).apply {
             text = if (images > 0) "Sensitive: they see it covered until they tap it" else "Sensitive: shown covered until opened"
@@ -912,7 +1007,7 @@ class ChatActivity : Activity() {
             picked.size == 1 -> "1 file"
             else -> "${picked.size} files"
         }
-        AlertDialog.Builder(this)
+        sheet = Sheet(picked, caption, sensitive, SecureBuilder(this)
             .setTitle("Send $what")
             .setView(android.widget.ScrollView(this).apply { addView(body) })
             .setPositiveButton("Send") { _, _ ->
@@ -920,7 +1015,73 @@ class ChatActivity : Activity() {
                 sendFiles(picked, caption.text.toString().trim(), sensitive.isChecked)
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .setOnDismissListener { if (sheet?.annotating != true) sheet = null }
+            .show())
+    }
+
+    /** The open send sheet, kept while one of its photos is drawn on. */
+    private class Sheet(
+        val picked: List<Picked>,
+        val caption: EditText,
+        val sensitive: android.widget.CheckBox,
+        val dialog: AlertDialog,
+        var annotating: Boolean = false,
+    )
+    private var sheet: Sheet? = null
+
+    /** Opens picked photo `i` for editing; the sheet comes back with the result. */
+    private fun annotate(picked: List<Picked>, i: Int) {
+        val s = sheet ?: return
+        val p = picked[i]
+        worker.execute {
+            val f = java.io.File(java.io.File(cacheDir, AnnotateActivity.DIR).apply { mkdirs() }, "source-$i")
+            try { f.writeBytes(p.data) } catch (_: Exception) { return@execute }
+            runOnUiThread {
+                s.annotating = true
+                s.dialog.dismiss()
+                startActivityForResult(
+                    Intent(this, AnnotateActivity::class.java)
+                        .putExtra(AnnotateActivity.LOCATION, Uri.fromFile(f).toString())
+                        .putExtra(AnnotateActivity.NAME, p.name)
+                        .putExtra(AnnotateActivity.INDEX, i),
+                    ANNOTATE,
+                )
+            }
+        }
+    }
+
+    /** A photo edited from the viewer: ready to send, in the send sheet. */
+    private fun sendEdited(path: String, name: String) {
+        worker.execute {
+            val f = java.io.File(path)
+            val bytes = try { f.readBytes() } catch (_: Exception) { null }
+            java.io.File(cacheDir, AnnotateActivity.DIR).deleteRecursively()
+            if (bytes != null) runOnUiThread {
+                sendSheet(listOf(Picked(name.substringBeforeLast('.') + "-edited.jpg", bytes, Uri.fromFile(f))))
+            }
+        }
+    }
+
+    /** An edited photo came back: it replaces the picked one in the sheet. */
+    private fun annotated(data: Intent?) {
+        val s = sheet ?: return
+        val i = data?.getIntExtra(AnnotateActivity.INDEX, -1) ?: -1
+        val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
+        compose.setText(s.caption.text)
+        val sensitive = s.sensitive.isChecked
+        worker.execute {
+            val bytes = if (path == null || i !in s.picked.indices) null
+                else try { java.io.File(path).readBytes() } catch (_: Exception) { null }
+            java.io.File(cacheDir, AnnotateActivity.DIR).deleteRecursively()
+            runOnUiThread {
+                val picked = if (bytes == null) s.picked else s.picked.toMutableList().also {
+                    val old = it[i]
+                    it[i] = Picked(old.name.substringBeforeLast('.') + ".jpg", bytes, old.uri)
+                }
+                sendSheet(picked)
+                sheet?.sensitive?.isChecked = sensitive
+            }
+        }
     }
 
     private fun sendFiles(picked: List<Picked>, caption: String, sensitive: Boolean) {
@@ -1011,7 +1172,7 @@ class ChatActivity : Activity() {
     /** Proves to them that this anonymous identity is us. Can't be undone. */
     private fun reveal(c: Conversation) {
         val p = persona ?: return
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Reveal who you are?")
             .setMessage(
                 "${c.title} will get proof, signed by your main identity, that this anonymous identity is you, " +
@@ -1087,7 +1248,7 @@ class ChatActivity : Activity() {
                 Threnody.nameOf(node, fp) + if (fp == g.owner) " (owner)" else ""
             }
             runOnUiThread {
-                val d = AlertDialog.Builder(this)
+                val d = SecureBuilder(this)
                     .setTitle(members(g.members.size))
                     .setNegativeButton("Close", null)
                 if (g.owned) {
@@ -1104,7 +1265,7 @@ class ChatActivity : Activity() {
 
     private fun removeMember(fp: String, name: String) {
         val g = group ?: return
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Remove $name?")
             .setMessage("They stop receiving new messages in ${info?.name}. You can invite them again later.")
             .setPositiveButton("Remove") { _, _ -> worker.execute { run("remove") { node.removeFromGroup(g, fp) } } }
@@ -1122,7 +1283,7 @@ class ChatActivity : Activity() {
                     return@runOnUiThread
                 }
                 val chosen = BooleanArray(candidates.size)
-                AlertDialog.Builder(this)
+                SecureBuilder(this)
                     .setTitle("Invite to ${g.name}")
                     .setMultiChoiceItems(candidates.map { it.title }.toTypedArray(), chosen) { _, i, on -> chosen[i] = on }
                     .setPositiveButton("Invite") { _, _ ->
@@ -1143,7 +1304,7 @@ class ChatActivity : Activity() {
 
     private fun leaveGroup() {
         val g = info ?: return
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle(if (g.owned) "Delete ${g.name}?" else "Leave ${g.name}?")
             .setMessage(
                 if (g.owned) "Everyone is removed and the group ends. Its history stays on your devices."
@@ -1190,10 +1351,10 @@ class ChatActivity : Activity() {
         val field = EditText(this).apply {
             setText(convo?.name ?: "")
             hint = "Name"
-            isSingleLine = true
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+            wrapping(newlines = false, max = 3)
         }
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Name this contact")
             .setMessage("Only you see this name.")
             .setView(LinearLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(field, matchWrap) })
@@ -1219,7 +1380,7 @@ class ChatActivity : Activity() {
                     gravity = Gravity.CENTER
                     setPadding(dp(24), dp(16), dp(24), 0)
                 }
-                AlertDialog.Builder(this)
+                SecureBuilder(this)
                     .setTitle(if (many) "Safety number: device ${Threnody.short(target)}" else "Safety number")
                     .setMessage("Compare this with the number on ${convo?.title?.let { "$it's" } ?: "their"} " +
                         (if (many) "device ${Threnody.short(target)} " else "") +
@@ -1242,7 +1403,7 @@ class ChatActivity : Activity() {
     private fun setApproval(approved: Boolean) {
         val apply = { worker.execute { run(if (approved) "approve" else "revoke") { node.setApproval(device, approved) } } }
         if (approved) return apply()
-        AlertDialog.Builder(this)
+        SecureBuilder(this)
             .setTitle("Revoke approval?")
             .setMessage("${convo?.title ?: "They"} will no longer be able to find you nearby, relay for you or hold your messages.")
             .setPositiveButton("Revoke") { _, _ -> apply() }
@@ -1260,7 +1421,7 @@ class ChatActivity : Activity() {
             } catch (_: Exception) { null }
             val checked = choices.indexOfFirst { it.second == current }
             runOnUiThread {
-                AlertDialog.Builder(this)
+                SecureBuilder(this)
                     .setTitle("Disappearing messages")
                     .setSingleChoiceItems(choices.map { it.first }.toTypedArray(), checked) { d, i ->
                         d.dismiss()
@@ -1313,5 +1474,12 @@ class ChatActivity : Activity() {
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2
+        private const val ANNOTATE = 3
+        private const val VIEW_PHOTO = 4
+        /** We're taken to have stopped typing after this long without a keystroke. */
+        private const val TYPING_IDLE_MS = 5_000L
+        /** The contact's "…" goes after this long without word (refreshed while it types). */
+        private const val PEER_TYPING_MS = 8_000L
+        private const val TYPING_AGAIN_MS = 4_000L
     }
 }

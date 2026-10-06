@@ -84,6 +84,34 @@ object Media {
         else ImageDecoder.createSource(ctx.contentResolver, uri)
     }
 
+    fun isGif(name: String) = name.substringAfterLast('.', "").lowercase() == "gif"
+
+    /**
+     * An animated GIF at `location`, at most `maxSide` pixels on the longer
+     * side, decoded in the background; `done` gets null if it isn't one.
+     */
+    fun animated(ctx: Context, location: String, maxSide: Int, done: (android.graphics.drawable.Drawable?) -> Unit) {
+        val app = ctx.applicationContext
+        animated({ source(app, location) }, maxSide, done)
+    }
+
+    /** As above, from bytes or wherever `src` reads. */
+    fun animated(src: () -> ImageDecoder.Source, maxSide: Int, done: (android.graphics.drawable.Drawable?) -> Unit) {
+        decoder.execute {
+            val d = try {
+                ImageDecoder.decodeDrawable(src()) { dec, info, _ ->
+                    val (w, h) = info.size.width to info.size.height
+                    if (w <= 0 || h <= 0 || w.toLong() * h > MAX_PIXELS) throw IllegalArgumentException("too large")
+                    val scale = maxOf(1.0, maxOf(w, h).toDouble() / maxSide)
+                    dec.setTargetSize((w / scale).toInt().coerceAtLeast(1), (h / scale).toInt().coerceAtLeast(1))
+                }
+            } catch (_: Throwable) {
+                null
+            }
+            done(d as? android.graphics.drawable.AnimatedImageDrawable)
+        }
+    }
+
     /** A thumbnail for `location`, from the cache or decoded in the background. */
     fun thumbnail(ctx: Context, location: String, side: Int, done: (Bitmap?) -> Unit) {
         val key = "$location@$side"

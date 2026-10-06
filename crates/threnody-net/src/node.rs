@@ -909,6 +909,15 @@ impl Node {
         h.tx.send(msg).map_err(|_| NetError::Closed)
     }
 
+    /// Keeps `msg` for `peer` until a session with it comes up, when it
+    /// goes first (see `spawn_session`), as anything a lost session left
+    /// unacknowledged does.
+    pub(crate) fn hold(&self, peer: &PublicIdentity, msg: AppMessage, tag: Tag) {
+        self.shared.delivery(|d| {
+            d.track(peer, msg, tag);
+        });
+    }
+
     /// Whether `peer` said (in its latest session) it supports `feature`.
     pub fn supports(&self, peer: &PublicIdentity, feature: u64) -> bool {
         lock(&self.shared.peer_features)
@@ -1046,7 +1055,22 @@ impl Node {
         }
         // A newer session to the same peer replaces the old one; dropping
         // the old handle's sender ends its task.
-        lock(&self.shared.sessions).insert(peer, SessionHandle { id, tx, info });
+        let note = format!(
+            "session with {} {} over {transport} at {addr}",
+            peer.fingerprint(),
+            if outbound { "dialed" } else { "accepted" },
+        );
+        let old = lock(&self.shared.sessions).insert(peer, SessionHandle { id, tx, info });
+        self.shared.emit(Event::ReachNote {
+            note: match old {
+                Some(o) => format!(
+                    "{note}, replacing one {} {} ms old",
+                    if o.info.outbound { "dialed" } else { "accepted" },
+                    now_ms().saturating_sub(o.info.since_ms)
+                ),
+                None => note,
+            },
+        });
         self.shared.emit(Event::Connected {
             peer,
             addr,

@@ -5,13 +5,9 @@ import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.RectF
-import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -36,7 +32,6 @@ class ImageActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var image: ImageView
     private val matrix = Matrix()
-    private var bitmap: Bitmap? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,17 +46,18 @@ class ImageActivity : Activity() {
         }
         val bar = TopBar(this) { finish() }.apply {
             title.text = name
+            // An edited GIF would be a still photo: GIFs aren't edited.
+            if (!Media.isGif(name)) action(R.drawable.ic_edit, "Edit: draw or add text") {
+                startActivityForResult(
+                    Intent(this@ImageActivity, AnnotateActivity::class.java)
+                        .putExtra(AnnotateActivity.LOCATION, location)
+                        .putExtra(AnnotateActivity.NAME, name),
+                    EDIT,
+                )
+            }
             action(R.drawable.ic_more, "Photo options") { anchor ->
                 android.widget.PopupMenu(this@ImageActivity, anchor).apply {
                     menu.add("Save to Downloads").setOnMenuItemClickListener { save(location, name); true }
-                    menu.add("Annotate").setOnMenuItemClickListener {
-                        val intent = Intent(this@ImageActivity, AnnotateActivity::class.java).apply {
-                            putExtra(LOCATION, location)
-                            putExtra(NAME, name)
-                        }
-                        startActivity(intent)
-                        true
-                    }
                 }.show()
             }
         }
@@ -86,6 +82,21 @@ class ImageActivity : Activity() {
 
         // Big enough for zooming in, small enough for memory.
         val side = maxOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels) * 2
+        if (Media.isGif(name)) {
+            Media.animated(this, location, side) { d ->
+                if (d == null) return@animated still(location, side)
+                runOnUiThread {
+                    image.setImageDrawable(d)
+                    (d as android.graphics.drawable.AnimatedImageDrawable).start()
+                    image.post { fit() }
+                }
+            }
+        } else {
+            still(location, side)
+        }
+    }
+
+    private fun still(location: String, side: Int) {
         worker.execute {
             val b = Media.decode(Media.source(this, location), side)
             runOnUiThread {
@@ -94,7 +105,6 @@ class ImageActivity : Activity() {
                     finish()
                     return@runOnUiThread
                 }
-                bitmap = b
                 image.setImageBitmap(b)
                 image.post { fit() }
             }
@@ -103,9 +113,9 @@ class ImageActivity : Activity() {
 
     /** Fits the whole image in view. */
     private fun fit() {
-        val b = bitmap ?: return
+        val d = image.drawable ?: return
         matrix.setRectToRect(
-            RectF(0f, 0f, b.width.toFloat(), b.height.toFloat()),
+            RectF(0f, 0f, d.intrinsicWidth.toFloat(), d.intrinsicHeight.toFloat()),
             RectF(0f, 0f, image.width.toFloat(), image.height.toFloat()),
             Matrix.ScaleToFit.CENTER,
         )
@@ -147,7 +157,33 @@ class ImageActivity : Activity() {
         }
     }
 
-    private fun save(location: String, name: String) {
+    @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
+        if (requestCode != EDIT || resultCode != RESULT_OK || path == null) return
+        val name = intent.getStringExtra(NAME) ?: "photo"
+        val edited = name.substringAfterLast('/').substringBeforeLast('.') + "-edited.jpg"
+        val f = java.io.File(path)
+        val saveIt = { save(android.net.Uri.fromFile(f).toString(), edited, f) }
+        // Opened from a chat: the edited copy can go straight back there.
+        if (callingActivity == null) return saveIt()
+        SecureBuilder(this)
+            .setTitle("Edited photo")
+            .setItems(arrayOf("Send in this chat", "Save to Downloads")) { _, which ->
+                if (which == 0) {
+                    setResult(RESULT_OK, Intent().putExtra(AnnotateActivity.RESULT_PATH, path).putExtra(NAME, name))
+                    finish()
+                } else {
+                    saveIt()
+                }
+            }
+            .setNegativeButton("Discard") { _, _ -> f.delete() }
+            .show()
+    }
+
+    /** Copies the image at `location` to Downloads; deletes `then` afterwards. */
+    private fun save(location: String, name: String, then: java.io.File? = null) {
         worker.execute {
             val ok = try {
                 val uri = android.net.Uri.parse(location)
@@ -165,6 +201,7 @@ class ImageActivity : Activity() {
             } catch (_: Exception) {
                 false
             }
+            then?.delete()
             runOnUiThread {
                 Toast.makeText(this, if (ok) "Saved to Downloads/Threnody" else "Couldn't save", Toast.LENGTH_SHORT).show()
             }
@@ -180,5 +217,6 @@ class ImageActivity : Activity() {
         const val LOCATION = "location"
         const val NAME = "name"
         const val CAPTION = "caption"
+        private const val EDIT = 1
     }
 }

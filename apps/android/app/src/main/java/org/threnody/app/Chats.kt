@@ -1,7 +1,6 @@
 package org.threnody.app
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.widget.Toast
 import java.util.concurrent.Executor
 import uniffi.threnody_ffi.ThrenodyNode
@@ -13,7 +12,7 @@ object Chats {
      * devices for a contact, on this one for a group.
      */
     fun clear(a: Activity, node: ThrenodyNode, worker: Executor, title: String, device: String?, group: String?, done: () -> Unit) {
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("Clear chat with $title?")
             .setMessage(
                 if (group != null) "Its messages are deleted from this device. You stay in the group, and members keep their copies."
@@ -37,7 +36,7 @@ object Chats {
 
     /** Deletes the contact (every device of theirs) and the conversation, on all our devices. */
     fun delete(a: Activity, node: ThrenodyNode, worker: Executor, title: String, device: String, done: () -> Unit) {
-        AlertDialog.Builder(a)
+        SecureBuilder(a)
             .setTitle("Delete $title?")
             .setMessage(
                 "They leave your contacts and your messages with them are deleted, on all your devices. " +
