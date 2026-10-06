@@ -3,10 +3,15 @@ package org.threnody.app
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentValues
+import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
+import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -49,6 +54,14 @@ class ImageActivity : Activity() {
             action(R.drawable.ic_more, "Photo options") { anchor ->
                 android.widget.PopupMenu(this@ImageActivity, anchor).apply {
                     menu.add("Save to Downloads").setOnMenuItemClickListener { save(location, name); true }
+                    menu.add("Annotate").setOnMenuItemClickListener {
+                        val intent = Intent(this@ImageActivity, AnnotateActivity::class.java).apply {
+                            putExtra(LOCATION, location)
+                            putExtra(NAME, name)
+                        }
+                        startActivity(intent)
+                        true
+                    }
                 }.show()
             }
         }
