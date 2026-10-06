@@ -142,6 +142,11 @@ pub enum Event {
         peer: PublicIdentity,
         id: u64,
     },
+    /// `peer` says it displayed our outgoing messages, so their ticks can
+    /// show "seen".
+    Read {
+        peer: PublicIdentity,
+    },
     /// `peer` changed what it shares of its profile (see `Contact::profile`).
     ProfileChanged {
         peer: PublicIdentity,
@@ -172,6 +177,7 @@ pub enum Event {
         peer: PublicIdentity,
         secs: Option<u32>,
     },
+    Typing { peer: PublicIdentity, active: bool },
     /// A sealed message from `from`, delivered by mailbox `via` (Appendix H).
     OfflineMessage {
         from: PublicIdentity,
@@ -1321,6 +1327,7 @@ where
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
                         AppMessage::Identity(payload) => node.on_identity(peer, &payload),
                         AppMessage::React { conversation, id, emoji, add } => node.on_react(&peer, &conversation, id, &emoji, add),
+                        AppMessage::Read { conversation, ids } => node.on_read(&peer, &conversation, &ids),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }
@@ -1395,6 +1402,11 @@ where
                         AppMessage::Direct(payload) => {
                             if via.is_none() {
                                 node.on_direct(peer, &payload);
+                            }
+                        }
+                        AppMessage::Typing { active } => {
+                            if via.is_none() && !on_standby {
+                                shared.emit(Event::Typing { peer, active });
                             }
                         }
                         AppMessage::Relay(payload) => {

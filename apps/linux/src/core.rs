@@ -933,7 +933,7 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             title: name.unwrap_or_else(|| short(&best.fingerprint)),
             device: best.fingerprint.clone(),
             connected: devices.iter().any(|d| d.connected),
-            approved: devices.iter().any(|d| d.mutually_approved),
+            approved: devices.iter().any(|d| d.local_approved),
             verified: devices.iter().all(|d| d.verified),
             any_verified: devices.iter().any(|d| d.verified),
             unverified: devices

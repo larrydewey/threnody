@@ -39,7 +39,7 @@ class ThrenodyService : Service() {
     }
 
     companion object {
-        private const val CHANNEL_SERVICE = "service"
+        private const val CHANNEL_SERVICE = "service2" // showBadge=false requires a fresh channel
         private const val CHANNEL_MESSAGES = "messages"
         private const val ID_SERVICE = 1
         private const val ID_MESSAGE = 2
@@ -111,6 +111,7 @@ class ThrenodyService : Service() {
             val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_SERVICE, "Background connection", NotificationManager.IMPORTANCE_LOW)
+                    .apply { setShowBadge(false) }
             )
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_MESSAGES, "Messages", NotificationManager.IMPORTANCE_HIGH)

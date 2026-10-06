@@ -471,7 +471,7 @@ object Threnody {
                 device = best.fingerprint,
                 name = devices.firstNotNullOfOrNull { it.name },
                 connected = devices.any { it.connected },
-                approved = devices.any { it.mutuallyApproved },
+                approved = devices.any { it.localApproved },
                 verified = devices.all { it.verified },
                 unverified = devices.filter { !it.verified }.map { it.fingerprint },
                 accepted = devices.any { it.accepted },

@@ -81,3 +81,26 @@ windowtitle.warning .subtitle {
   font-size: 1.25em;
   letter-spacing: 1px;
 }
+
+.bubble-meta.read {
+  color: @accent_color;
+  opacity: 1;
+}
+
+.chat-typing {
+  padding: 6px 10px 4px 10px;
+  border-radius: 14px;
+  border-bottom-left-radius: 4px;
+  background-color: alpha(currentColor, 0.08);
+}
+
+.chat-typing .typing-dots {
+  font-size: 1.2em;
+  color: alpha(currentColor, 0.7);
+}
+
+.composer-placeholder {
+  color: alpha(currentColor, 0.4);
+  margin-left: 10px;
+  margin-right: 10px;
+}

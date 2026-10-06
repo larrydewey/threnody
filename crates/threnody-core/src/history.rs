@@ -84,6 +84,9 @@ pub struct Entry {
     /// An outgoing message the recipient acknowledged (Appendix C); for a
     /// group, every recipient.
     pub delivered: bool,
+    /// When the recipient displayed this message (0 = not yet). Only
+    /// meaningful on outgoing entries.
+    pub read_ms: u64,
     /// For outgoing group messages: how many members it went to, and the
     /// devices that acknowledged it so far.
     pub recipients: u32,
@@ -265,7 +268,8 @@ impl History {
                         + usize::from(!e.delivered_to.is_empty())
                         + usize::from(e.remote_id != 0)
                         + usize::from(e.edited_ms != 0)
-                        + usize::from(!e.reactions.is_empty()),
+                        + usize::from(!e.reactions.is_empty())
+                        + usize::from(e.read_ms != 0),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -311,6 +315,9 @@ impl History {
                 if e.edited_ms != 0 {
                     enc.u8(12)?.u64(e.edited_ms)?;
                 }
+                if e.read_ms != 0 {
+                    enc.u8(14)?.u64(e.read_ms)?;
+                }
                 if !e.reactions.is_empty() {
                     enc.u8(13)?.array_len(e.reactions.len())?;
                     for (who, emoji) in &e.reactions {
@@ -336,7 +343,7 @@ impl History {
                         let (mut local_id, mut delivered) = (0, false);
                         let (mut recipients, mut delivered_to) = (0, Vec::new());
                         let (mut remote_id, mut edited_ms) = (0, 0);
-                        let mut reactions = Vec::new();
+                        let (mut reactions, mut read_ms) = (Vec::new(), 0);
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -358,6 +365,7 @@ impl History {
                                 }
                                 11 => remote_id = d.u64()?,
                                 12 => edited_ms = d.u64()?,
+                                14 => read_ms = d.u64()?,
                                 13 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 2 {
@@ -388,6 +396,7 @@ impl History {
                             delivered_to,
                             remote_id,
                             edited_ms,
+                            read_ms,
                             reactions,
                         });
                     }
@@ -615,6 +624,27 @@ impl Home {
         Ok(n)
     }
 
+    /// Marks the entries `pick` chooses as read at `now_ms`; returns how
+    /// many changed. Only our outgoing entries are meant to get this.
+    pub fn mark_read_entries(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Result<usize> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let mut n = 0;
+        for e in h.entries.iter_mut().filter(|e| pick(e) && e.read_ms == 0) {
+            e.read_ms = now_ms;
+            n += 1;
+        }
+        if n > 0 {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(n)
+    }
+
     /// Deletes a conversation's history.
     pub fn delete_history(&self, c: ConversationId) -> Result<()> {
         self.remove_state(&c.state_name())
@@ -670,6 +700,7 @@ mod tests {
             delivered_to: Vec::new(),
             remote_id: 0,
             edited_ms: 0,
+            read_ms: 0,
             reactions: Vec::new(),
         }
     }

@@ -6,10 +6,14 @@ import android.content.Intent
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
-import android.text.InputType
-import android.text.format.DateFormat
-import android.text.format.Formatter
+import android.text.Editable
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.TextWatcher
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -54,10 +58,20 @@ class ChatActivity : Activity() {
     private lateinit var scroll: ScrollView
     private lateinit var compose: EditText
     private lateinit var composeBar: LinearLayout
+    /** Typing indicator view, shown when peer is typing. */
+    private lateinit var typingBubble: View
+    /** Whether the peer is currently typing. */
+    private var peerTyping = false
+    /** Handler for typing timeout. */
+    private val typingHandler = Handler(Looper.getMainLooper())
+    /** Runnable to stop typing indicator after inactivity. */
+    private val stopTyping = Runnable { setTyping(false) }
     /** Messages being sent, shown until history has them. */
     private val pending = mutableListOf<String>()
     private var unsubscribe: (() -> Unit)? = null
     private var myDevice = ""
+    /** Set of remote message ids we've already sent read receipts for. */
+    private val sentRead = mutableSetOf<ULong>()
 
     /** A history entry, or a message still being sent. */
     private data class Item(val entry: HistoryEntry, val sending: Boolean = false)
@@ -85,6 +99,24 @@ class ChatActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
         }
+        // Typing indicator bubble (shown when peer is typing).
+        typingBubble = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.START
+            setPadding(0, dp(3), dp(48), dp(3))
+            val bubble = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                background = rounded(color(R.color.bubble_in), dp(16).toFloat())
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                addView(TextView(this@ChatActivity).apply {
+                    text = "…"
+                    textSize = 16f
+                    setTextColor(color(R.color.muted))
+                })
+            }
+            addView(bubble, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        }
+        typingBubble.visibility = View.GONE
         scroll = ScrollView(this).apply {
             isFillViewport = true
             addView(messages, MATCH_PARENT, WRAP_CONTENT)
@@ -125,6 +157,24 @@ class ChatActivity : Activity() {
             setPadding(dp(16), dp(10), dp(16), dp(10))
             setTextColor(color(R.color.text))
             setHintTextColor(color(R.color.muted))
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    if (group != null) return
+                    val d = device
+                    if (d.isEmpty() || !::node.isInitialized) return
+                    val text = s.toString().trim()
+                    if (text.isEmpty()) {
+                        if (lastTypingSent) { setTyping(false); lastTypingSent = false }
+                    } else if (!lastTypingSent) {
+                        lastTypingSent = true
+                        worker.execute { try { node.setTyping(device, true) } catch (_: Exception) {} }
+                    }
+                    typingHandler.removeCallbacks(stopTyping)
+                    typingHandler.postDelayed(stopTyping, 3000)
+                }
+            })
         }
         fun button(res: Int, label: String, tint: Int, onClick: (View) -> Unit) = ImageButton(this).apply {
             setImageResource(res)
@@ -145,6 +195,17 @@ class ChatActivity : Activity() {
         }
     }
 
+    /** Tracks whether we've sent "typing: true" for the current non-empty compose. */
+    private var lastTypingSent = false
+
+    /** Shows or hides the typing indicator for this conversation. */
+    private fun setTyping(active: Boolean) {
+        if (group != null) return // No typing indicator for groups yet.
+        peerTyping = active
+        typingBubble.visibility = if (active) View.VISIBLE else View.GONE
+        if (active) toBottom()
+    }
+
     override fun onStart() {
         super.onStart()
         Threnody.visible++
@@ -152,6 +213,10 @@ class ChatActivity : Activity() {
         ThrenodyService.clearNotification(this, ThrenodyService.notificationKey(key, persona))
         unsubscribe = Threnody.subscribe { e ->
             if (!concerns(e)) return@subscribe
+            if (e is NodeEvent.Typing) {
+                runOnUiThread { setTyping(e.active) }
+                return@subscribe
+            }
             when (e) {
                 is NodeEvent.CredentialPresented -> runOnUiThread {
                     CredentialUi.showProof(this, node, e.peer, e.issuer, e.schema, e.attributes, e.pseudonym)
@@ -204,6 +269,8 @@ class ChatActivity : Activity() {
             is NodeEvent.ProfileChanged -> e.peer
             is NodeEvent.Reacted -> if (e.group == null) e.peer else return false
             is NodeEvent.IdentityRevealed -> e.peer
+            is NodeEvent.Typing -> e.peer
+            is NodeEvent.Read -> e.peer
             is NodeEvent.CredentialOffered -> e.offer.peer
             is NodeEvent.CredentialAsked -> e.ask.peer
             is NodeEvent.CredentialReceived -> e.peer
@@ -242,7 +309,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList()), sending = true) }
+            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList()), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         // Credential offers and requests from this contact, waiting for an answer.
@@ -266,6 +333,13 @@ class ChatActivity : Activity() {
                 "Review" to { CredentialUi.answerAsk(this, node, worker, q) { worker.execute { refresh() } } },
             )
             show(items, names)
+            // Send read receipts for incoming messages we've now displayed (1:1 chats only).
+            if (g == null && Privacy.sendReadReceipts(this)) {
+                val ids = items.filter { !it.entry.outgoing && it.entry.id != 0uL }.map { it.entry.id }
+                if (ids.isNotEmpty()) {
+                    worker.execute { try { node.reportRead(device, ids) } catch (_: Exception) {} }
+                }
+            }
         }
     }
 
@@ -547,12 +621,21 @@ class ChatActivity : Activity() {
         }
         reactionChips(e, fg)?.let { body.addView(it, matchWrap) }
         body.addView(TextView(this).apply {
-            text = meta + (if (e.edited) " · edited" else "") + (if (e.disappearing) " · ⏱" else "") + tick
-            contentDescription = text.toString().replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
+            val metaText = meta + (if (e.edited) " · edited" else "") + (if (e.disappearing) " · ⏱" else "") + tick
+            contentDescription = metaText.replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
             textSize = 11f
             setTextColor(fg)
             alpha = 0.7f
             gravity = Gravity.END
+            // Color the ticks blue when message is read (Signal-style).
+            if (e.read && e.outgoing && e.delivered) {
+                val spannable = SpannableString(metaText)
+                val idx = metaText.lastIndexOf("✓")
+                if (idx >= 0) {
+                    spannable.setSpan(ForegroundColorSpan(color(R.color.accent)), idx, metaText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
+                text = spannable
+            }
         }, matchWrap)
         if (!item.sending) {
             val longPress = View.OnLongClickListener { deleteMessage(run.map { it.entry }); true }
@@ -694,6 +777,9 @@ class ChatActivity : Activity() {
     private fun send() {
         val text = compose.text.toString().trim()
         if (text.isEmpty() || !::node.isInitialized) return
+        // Stop typing indicator when sending.
+        if (lastTypingSent) { lastTypingSent = false; setTyping(false) }
+        typingHandler.removeCallbacks(stopTyping)
         compose.setText("")
         Threnody.touch()
         synchronized(pending) { pending.add(text) }

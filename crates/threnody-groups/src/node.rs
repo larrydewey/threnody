@@ -324,6 +324,7 @@ impl GroupNode {
                 delivered_to: Vec::new(),
                 remote_id: 0,
                 edited_ms: 0,
+                read_ms: 0,
                 reactions: Vec::new(),
             },
         );
@@ -361,6 +362,7 @@ impl GroupNode {
                 delivered_to: Vec::new(),
                 remote_id,
                 edited_ms: 0,
+                read_ms: 0,
                 reactions: Vec::new(),
             },
         );

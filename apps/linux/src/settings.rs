@@ -13,6 +13,7 @@ pub const PRIVATE_NOTIFICATIONS: &str = "private_notifications";
 pub const BACKGROUND: &str = "run_in_background";
 pub const TIMER: &str = "default_timer";
 pub const VOLUNTEERS: &str = "use_volunteers";
+pub const SEND_READ: &str = "send_read_receipts";
 
 /// Cover interval on unmetered networks, and on metered ones.
 pub const COVER_UNMETERED_MS: u32 = 2_000;

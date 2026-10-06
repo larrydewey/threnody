@@ -617,6 +617,24 @@ impl App {
             NodeEvent::Delivered { peer, group } | NodeEvent::Reacted { peer, group } => {
                 (Some(group.clone().unwrap_or_else(|| peer.clone())), None)
             }
+            NodeEvent::Typing { peer, active } => {
+                if let Some(chat) = self.chat.borrow().as_ref() {
+                    let conv = self.conversation_of(persona.as_deref(), peer);
+                    if conv.as_ref().is_some_and(|c| c.chat == chat.chat()) {
+                        chat.set_typing(*active);
+                    }
+                }
+                (None, None)
+            }
+            NodeEvent::Read { peer } => {
+                if let Some(chat) = self.chat.borrow().as_ref() {
+                    let conv = self.conversation_of(persona.as_deref(), peer);
+                    if conv.as_ref().is_some_and(|c| c.chat == chat.chat()) {
+                        chat.reload();
+                    }
+                }
+                (Some(peer.clone()), None)
+            }
             NodeEvent::GroupJoined { group, .. }
             | NodeEvent::GroupMembersChanged { group, .. }
             | NodeEvent::GroupLeft { group } => (Some(group.clone()), None),
@@ -1523,6 +1541,12 @@ impl App {
             settings::PRIVATE_NOTIFICATIONS,
             "Private notifications",
             "Notifications say only “New message”, without sender or text",
+        );
+        toggle(
+            &messages,
+            settings::SEND_READ,
+            "Send read receipts",
+            "When you open a chat, the sender learns you've displayed their messages",
         );
         toggle(
             &messages,

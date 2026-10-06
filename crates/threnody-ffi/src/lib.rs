@@ -66,6 +66,8 @@ pub struct ContactInfo {
     /// and the invite it gave to reach that identity.
     pub revealed: Option<String>,
     pub revealed_invite: Option<String>,
+    /// We approved them (regardless of whether they approved us back).
+    pub local_approved: bool,
 }
 
 /// A device of our account.
@@ -104,6 +106,8 @@ pub struct HistoryEntry {
     /// An outgoing message a device of the recipient acknowledged (for a
     /// group, every recipient did).
     pub delivered: bool,
+    /// An outgoing message that the recipient displayed: "seen".
+    pub read: bool,
     /// The id to delete it by (`delete_messages`); 0 = none, use
     /// `delete_entry` with `at_ms` and `device`.
     pub id: u64,
@@ -340,6 +344,11 @@ pub enum NodeEvent {
         caption: String,
         album: u64,
     },
+    /// `peer` says it displayed our outgoing messages `ids` (their
+    /// sender-ids, as recorded on our side): ticks update on reload.
+    Read {
+        peer: String,
+    },
     /// `peer` changed reactions in our chat, or in `group`; reload it.
     Reacted {
         peer: String,
@@ -348,6 +357,12 @@ pub enum NodeEvent {
     /// `peer` changed what it shares of its profile; reload contacts.
     ProfileChanged {
         peer: String,
+    },
+    /// `peer` is (or isn't) typing in its conversation with us: show (or
+    /// hide) the typing indicator bubble.
+    Typing {
+        peer: String,
+        active: bool,
     },
     /// `peer` (a persona, to us) proved it is `identity`; `invite` reaches
     /// that identity. Also kept as `ContactInfo::revealed`.
@@ -490,6 +505,7 @@ fn history_entries(entries: &[threnody_core::history::Entry], me: [u8; 32]) -> V
                 album: f.album,
             }),
             delivered: e.delivered,
+            read: e.read_ms != 0,
             id: e.message_id(),
             edited: e.edited_ms != 0,
             recipients: e.recipients,
@@ -580,7 +596,12 @@ fn convert(e: Event) -> NodeEvent {
                 _ => None,
             },
         },
+        Event::Read { peer, .. } => NodeEvent::Read { peer: fp(&peer) },
         Event::ProfileChanged { peer } => NodeEvent::ProfileChanged { peer: fp(&peer) },
+        Event::Typing { peer, active } => NodeEvent::Typing {
+            peer: fp(&peer),
+            active,
+        },
         Event::Reacted { peer, .. } => NodeEvent::Reacted {
             peer: fp(&peer),
             group: None,
@@ -1127,6 +1148,24 @@ impl ThrenodyNode {
         self.node.set_approval(&p, approved).map_err(fail)
     }
 
+    /// Tells `peer` whether we are typing in its conversation with us.
+    /// Rides the same session — direct, relayed or over the internet — so
+    /// it reaches them even on an LTE/5G-only connection.
+    pub fn set_typing(&self, peer: String, active: bool) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node.set_typing(&p, active).map_err(fail)
+    }
+
+    /// Marks the incoming messages of `peer` we've now displayed —
+    /// `ids` are their sender-ids — and tells `peer`'s devices, so our
+    /// own ticks can show "seen". No-op without a live session.
+    pub fn report_read(&self, peer: String, ids: Vec<u64>) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node.report_read(&p, &ids).map_err(fail)
+    }
+
     pub fn set_name(&self, peer: String, name: String) -> Result<()> {
         let p = self.resolve(&peer)?;
         self.node.update_contacts(|c| {
@@ -1159,6 +1198,7 @@ impl ThrenodyNode {
                 connected: live.contains(&c.key),
                 accepted: self.node.is_accepted(&c.key),
                 blocked: c.blocked,
+                local_approved: c.local_approved,
             })
             .collect()
     }

@@ -29,6 +29,7 @@ object Privacy {
     private const val STRIP = "strip_metadata"
     private const val REACH = "reach_internet"
     private const val VOLUNTEERS = "use_volunteers"
+    private const val READ_RECEIPTS = "send_read_receipts"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -61,6 +62,13 @@ object Privacy {
     fun reachInternet(ctx: Context) = prefs(ctx).getBoolean(REACH, true)
     /** Route through volunteer relays from subscribed directories (Appendix P). */
     fun useVolunteers(ctx: Context) = prefs(ctx).getBoolean(VOLUNTEERS, true)
+
+    fun sendReadReceipts(ctx: Context) = prefs(ctx).getBoolean(READ_RECEIPTS, true)
+
+    fun setSendReadReceipts(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(READ_RECEIPTS, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
 
     fun setUseVolunteers(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(VOLUNTEERS, on).apply()

@@ -1,6 +1,7 @@
 //! One open conversation: header, trust banner, messages and composer.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
@@ -39,6 +40,18 @@ pub struct ChatView {
     revealed_known: Cell<bool>,
     /// Sensitive photos the user uncovered, by time and sender.
     shown: RefCell<Vec<(u64, String)>>,
+    /// Typing indicator row (shown when peer is typing in 1:1 chats).
+    typing_row: gtk::Box,
+    /// Whether the peer is currently typing.
+    peer_typing: Cell<bool>,
+    /// Set of remote message ids we've already sent read receipts for.
+    sent_read: RefCell<HashSet<u64>>,
+    /// Timer source id for typing timeout.
+    typing_timeout: RefCell<Option<glib::SourceId>>,
+    /// Whether we've sent "typing: true" for the current non-empty compose.
+    sending_typing: Cell<bool>,
+    /// Weak reference to self for creating weak pointers in callbacks.
+    weak_self: Weak<ChatView>,
 }
 
 impl ChatView {
@@ -125,6 +138,39 @@ impl ChatView {
             .child(&composer)
             .build();
 
+        // Build typing indicator row (shown when peer is typing in 1:1 chats).
+        let typing_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        typing_row.add_css_class("chat-typing");
+        typing_row.add_css_class("bubble");
+        typing_row.add_css_class("incoming");
+        typing_row.set_halign(gtk::Align::Start);
+        typing_row.set_margin_top(8);
+        let dots = gtk::Label::new(Some("…"));
+        dots.add_css_class("typing-dots");
+        typing_row.append(&dots);
+        typing_row.set_visible(false);
+
+        // Composer with "(Message)" placeholder overlay.
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&input_scroll));
+        let placeholder = gtk::Label::new(Some("(Message)"));
+        placeholder.add_css_class("composer-placeholder");
+        placeholder.set_halign(gtk::Align::Start);
+        placeholder.set_valign(gtk::Align::Center);
+        placeholder.set_margin_start(12);
+        placeholder.set_can_target(false);
+        overlay.add_overlay(&placeholder);
+
+        let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        composer.add_css_class("composer");
+        composer.append(&attach);
+        composer.append(&overlay);
+        composer.append(&send);
+        let composer_clamp = adw::Clamp::builder()
+            .maximum_size(860)
+            .child(&composer)
+            .build();
+
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&banner);
         body.append(&stack);
@@ -133,7 +179,7 @@ impl ChatView {
         root.set_content(Some(&body));
         root.add_bottom_bar(&composer_clamp);
 
-        let this = Rc::new(Self {
+        let mut this = Rc::new(Self {
             app: Rc::downgrade(app),
             conv: RefCell::new(conv.clone()),
             root,
@@ -151,9 +197,17 @@ impl ChatView {
             loaded: Cell::new(false),
             revealed_known: Cell::new(true),
             shown: RefCell::new(Vec::new()),
+            typing_row,
+            peer_typing: Cell::new(false),
+            sent_read: RefCell::new(HashSet::new()),
+            typing_timeout: RefCell::new(None),
+            sending_typing: Cell::new(false),
+            weak_self: Weak::new(),
         });
 
         let weak = Rc::downgrade(&this);
+        // Initialize weak_self after creation
+        Rc::get_mut(&mut this).unwrap().weak_self = weak.clone();
         send.connect_clicked(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.send();
@@ -198,6 +252,45 @@ impl ChatView {
         });
         this.root.add_controller(drop);
 
+        // Connect text buffer changed signal for typing notifications.
+        {
+            let weak = Rc::downgrade(&this);
+            this.input.buffer().connect_changed(move |buf| {
+                let Some(t) = weak.upgrade() else { return };
+                if t.group().is_some() {
+                    return; // No typing indicator for groups yet.
+                }
+                let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
+                let is_empty = text.trim().is_empty();
+                if is_empty {
+                    if t.sending_typing.replace(false) {
+                        t.notify_typing(false);
+                    }
+                    // Cancel any pending timeout.
+                    if let Some(id) = t.typing_timeout.borrow_mut().take() {
+                        id.remove();
+                    }
+                } else if !t.sending_typing.replace(true) {
+                    t.notify_typing(true);
+                }
+                // Reset the "stop typing" timeout.
+                if let Some(id) = t.typing_timeout.borrow_mut().take() {
+                    id.remove();
+                }
+                let weak = Rc::downgrade(&t);
+                *t.typing_timeout.borrow_mut() = Some(glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(3),
+                    move || {
+                        if let Some(t) = weak.upgrade() {
+                            if t.sending_typing.replace(false) {
+                                t.notify_typing(false);
+                            }
+                        }
+                    },
+                ));
+            });
+        }
+
         this.update(conv);
         this.reload();
         this.input.grab_focus();
@@ -241,6 +334,28 @@ impl ChatView {
         }
     }
 
+    /// Sends a typing notification to the peer.
+    fn notify_typing(&self, active: bool) {
+        let Some(node) = self.node() else { return };
+        let device = self.device();
+        bg(move || { let _ = node.set_typing(device, active); }, |_| {});
+    }
+
+    /// Shows or hides the typing indicator for this conversation.
+    pub fn set_typing(&self, active: bool) {
+        if self.group().is_some() {
+            return; // No typing indicator for groups yet.
+        }
+        if self.peer_typing.replace(active) != active {
+            self.typing_row.set_visible(active);
+            if active {
+                // Re-render to append the typing row at the end.
+                let entries = self.entries.borrow().clone();
+                self.display_entries(entries);
+            }
+        }
+    }
+
     // ----- Header, banner and menu -----
 
     /// Shows a newer state of the conversation (connected, approved, …).
@@ -249,7 +364,7 @@ impl ChatView {
         if let (Some(rev), Some(app)) = (&conv.revealed, self.app.upgrade()) {
             let core = app.core.clone();
             let rev = rev.clone();
-            let weak = Rc::downgrade(self);
+            let weak = self.weak_self.clone();
             bg(
                 move || core.main.contacts().iter().any(|c| c.fingerprint == rev),
                 move |known| {
@@ -432,7 +547,7 @@ impl ChatView {
                 if i == 0 {
                     b.add_css_class("suggested-action");
                 }
-                let (weak, f) = (Rc::downgrade(self), *f);
+                let (weak, f) = (self.weak_self.clone(), *f);
                 b.connect_clicked(move |_| {
                     if let Some(t) = weak.upgrade() {
                         f(&t);
@@ -454,7 +569,7 @@ impl ChatView {
         let menu = gio::Menu::new();
         let add = |label: &str, name: &str, f: Action| {
             let a = gio::SimpleAction::new(name, None);
-            let weak = Rc::downgrade(self);
+            let weak = self.weak_self.clone();
             a.connect_activate(move |_, _| {
                 if let Some(t) = weak.upgrade() {
                     f(&t);
@@ -525,7 +640,7 @@ impl ChatView {
             return;
         };
         let (group, device) = (self.group(), self.device());
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         bg(
             move || match group {
                 Some(g) => node.group_history(g, HISTORY).unwrap_or_default(),
@@ -535,7 +650,7 @@ impl ChatView {
                 let Some(t) = weak.upgrade() else { return };
                 t.loading.set(false);
                 if !t.loaded.replace(true) || *t.entries.borrow() != entries {
-                    t.render(entries);
+                    t.display_entries(entries);
                 }
                 if t.again.replace(false) {
                     t.reload();
@@ -544,7 +659,7 @@ impl ChatView {
         );
     }
 
-    fn render(self: &Rc<Self>, entries: Vec<HistoryEntry>) {
+    fn display_entries(&self, entries: Vec<HistoryEntry>) {
         let adj = self.scroll.vadjustment();
         let at_bottom =
             adj.value() + adj.page_size() >= adj.upper() - 40.0 || self.entries.borrow().is_empty();
@@ -611,7 +726,7 @@ impl ChatView {
         });
     }
 
-    fn bubble(self: &Rc<Self>, e: &HistoryEntry, sender: Option<String>) -> gtk::Box {
+    fn bubble(&self, e: &HistoryEntry, sender: Option<String>) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
         row.set_halign(if e.outgoing {
             gtk::Align::End
@@ -688,6 +803,9 @@ impl ChatView {
         let m = gtk::Label::new(Some(&bits.join(" ")));
         m.add_css_class("caption");
         m.add_css_class("bubble-meta");
+        if e.outgoing && e.delivered && e.read {
+            m.add_css_class("read");
+        }
         meta.append(&m);
         bubble.append(&meta);
         row.append(&bubble);
@@ -709,7 +827,7 @@ impl ChatView {
                     "Add yours"
                 }));
                 let (weak, entry, emoji, mine) =
-                    (Rc::downgrade(self), e.clone(), r.emoji.clone(), r.mine);
+                    (self.weak_self.clone(), e.clone(), r.emoji.clone(), r.mine);
                 b.connect_clicked(move |_| {
                     if let Some(t) = weak.upgrade() {
                         t.react(&entry, emoji.clone(), !mine);
@@ -724,7 +842,7 @@ impl ChatView {
         let click = gtk::GestureClick::new();
         click.set_button(gdk::BUTTON_SECONDARY);
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let (weak, entry, anchor) = (Rc::downgrade(self), e.clone(), bubble.clone());
+        let (weak, entry, anchor) = (self.weak_self.clone(), e.clone(), bubble.clone());
         click.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk::EventSequenceState::Claimed);
             if let Some(t) = weak.upgrade() {
@@ -734,7 +852,7 @@ impl ChatView {
         bubble.add_controller(click);
         let press = gtk::GestureLongPress::new();
         press.set_touch_only(true);
-        let (weak, entry, anchor) = (Rc::downgrade(self), e.clone(), bubble.clone());
+        let (weak, entry, anchor) = (self.weak_self.clone(), e.clone(), bubble.clone());
         press.connect_pressed(move |_, x, y| {
             if let Some(t) = weak.upgrade() {
                 t.message_menu(&anchor, &entry, x, y);
@@ -744,7 +862,7 @@ impl ChatView {
         row
     }
 
-    fn file_view(self: &Rc<Self>, e: &HistoryEntry, f: &threnody_ffi::FileInfo) -> gtk::Widget {
+    fn file_view(&self, e: &HistoryEntry, f: &threnody_ffi::FileInfo) -> gtk::Widget {
         let path = f
             .location
             .as_ref()
@@ -759,12 +877,12 @@ impl ChatView {
                 let b = gtk::Button::with_label("Sensitive photo · click to show");
                 b.add_css_class("sensitive-cover");
                 b.set_size_request(240, 160);
-                let weak = Rc::downgrade(self);
+                let weak = self.weak_self.clone();
                 b.connect_clicked(move |_| {
                     if let Some(t) = weak.upgrade() {
                         t.shown.borrow_mut().push(key.clone());
                         let entries = t.entries.borrow().clone();
-                        t.render(entries);
+                        t.display_entries(entries);
                     }
                 });
                 return b.upcast();
@@ -782,7 +900,7 @@ impl ChatView {
             pic.set_tooltip_text(Some(&f.name));
             let click = gtk::GestureClick::new();
             click.set_button(gdk::BUTTON_PRIMARY);
-            let (weak, p) = (Rc::downgrade(self), p.clone());
+            let (weak, p) = (self.weak_self.clone(), p.clone());
             click.connect_released(move |_, _, _, _| {
                 if let Some(t) = weak.upgrade() {
                     t.open_file(&p);
@@ -830,7 +948,7 @@ impl ChatView {
             row.set_tooltip_text(Some("Open"));
             let open = gtk::GestureClick::new();
             open.set_button(gdk::BUTTON_PRIMARY);
-            let (weak, p2) = (Rc::downgrade(self), p.clone());
+            let (weak, p2) = (self.weak_self.clone(), p.clone());
             open.connect_released(move |_, _, _, _| {
                 if let Some(t) = weak.upgrade() {
                     t.open_file(&p2);
@@ -841,7 +959,7 @@ impl ChatView {
             folder.set_tooltip_text(Some("Show in folder"));
             folder.add_css_class("flat");
             folder.set_valign(gtk::Align::Center);
-            let weak = Rc::downgrade(self);
+            let weak = self.weak_self.clone();
             folder.connect_clicked(move |_| {
                 let Some(t) = weak.upgrade() else { return };
                 let Some(app) = t.app.upgrade() else { return };
@@ -891,7 +1009,7 @@ impl ChatView {
                 btn.add_css_class("reaction-pick");
                 let on = mine_on(em);
                 btn.set_active(on);
-                let (weak, entry, p) = (Rc::downgrade(self), e.clone(), pop.clone());
+                let (weak, entry, p) = (self.weak_self.clone(), e.clone(), pop.clone());
                 btn.connect_clicked(move |_| {
                     if let Some(t) = weak.upgrade() {
                         t.react(&entry, em.to_owned(), !on);
@@ -906,7 +1024,7 @@ impl ChatView {
             more.add_css_class("flat");
             more.set_tooltip_text(Some("More emoji"));
             let chooser = gtk::EmojiChooser::new();
-            let (weak, entry, p) = (Rc::downgrade(self), e.clone(), pop.clone());
+            let (weak, entry, p) = (self.weak_self.clone(), e.clone(), pop.clone());
             chooser.connect_emoji_picked(move |_, em| {
                 if let Some(t) = weak.upgrade() {
                     let on = entry.reactions.iter().any(|r| r.emoji == em && r.mine);
@@ -938,7 +1056,7 @@ impl ChatView {
         }
         let group = self.group().is_some();
         if e.outgoing && e.file.is_none() && e.id != 0 && !group {
-            let (weak, entry) = (Rc::downgrade(self), e.clone());
+            let (weak, entry) = (self.weak_self.clone(), e.clone());
             item(
                 "Edit",
                 Box::new(move || {
@@ -948,7 +1066,7 @@ impl ChatView {
                 }),
             );
         }
-        let (weak, entry) = (Rc::downgrade(self), e.clone());
+        let (weak, entry) = (self.weak_self.clone(), e.clone());
         item(
             "Delete for me",
             Box::new(move || {
@@ -958,7 +1076,7 @@ impl ChatView {
             }),
         );
         if e.outgoing && e.id != 0 && !group {
-            let (weak, entry) = (Rc::downgrade(self), e.clone());
+            let (weak, entry) = (self.weak_self.clone(), e.clone());
             item(
                 "Delete for everyone",
                 Box::new(move || {
@@ -995,7 +1113,7 @@ impl ChatView {
         let Some(app) = self.app.upgrade() else {
             return;
         };
-        let (weak, id) = (Rc::downgrade(self), e.id);
+        let (weak, id) = (self.weak_self.clone(), e.id);
         ui::ask_text(
             &app.window,
             "Edit message",
@@ -1055,9 +1173,16 @@ impl ChatView {
             return;
         }
         let Some(node) = self.node() else { return };
+        // Stop typing indicator when sending.
+        if self.sending_typing.replace(false) {
+            self.notify_typing(false);
+        }
+        if let Some(id) = self.typing_timeout.borrow_mut().take() {
+            id.remove();
+        }
         buf.set_text("");
         let (group, device) = (self.group(), self.device());
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         let sent = text.clone();
         bg(
             move || match group {
@@ -1105,7 +1230,7 @@ impl ChatView {
             .title("Send photos or files")
             .modal(true)
             .build();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         dialog.open_multiple(Some(&app.window), gio::Cancellable::NONE, move |r| {
             let (Some(t), Ok(files)) = (weak.upgrade(), r) else {
                 return;
@@ -1169,7 +1294,7 @@ impl ChatView {
             ));
         }
         d.set_extra_child(Some(&b));
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         d.connect_response(Some("send"), move |_, _| {
             if let Some(t) = weak.upgrade() {
                 t.send_files(
@@ -1195,7 +1320,7 @@ impl ChatView {
         } else {
             "Sending files…"
         });
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         bg(
             move || {
                 let album = if paths.len() > 1 {
@@ -1283,7 +1408,7 @@ impl ChatView {
             return;
         };
         let title = self.conv.borrow().title.clone();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         ui::confirm(
             &app.window,
             &format!("Block {title}?"),
@@ -1319,7 +1444,7 @@ impl ChatView {
             return;
         };
         let title = self.conv.borrow().title.clone();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         ui::confirm(
             &app.window,
             "Revoke approval?",
@@ -1342,7 +1467,7 @@ impl ChatView {
             return;
         };
         let title = self.conv.borrow().title.clone();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         ui::ask_text(
             &app.window,
             "Name this contact",
@@ -1370,7 +1495,7 @@ impl ChatView {
             .cloned()
             .unwrap_or_else(|| c.device.clone());
         let many = c.devices.len() > 1;
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         let t2 = target.clone();
         bg(
             move || node.safety_number(t2).map_err(|e| e.to_string()),
@@ -1444,7 +1569,7 @@ impl ChatView {
     fn disappearing(self: &Rc<Self>) {
         let Some(node) = self.node() else { return };
         let (group, device) = (self.group(), self.device());
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         bg(
             {
                 let (group, device) = (group.clone(), device.clone());
@@ -1494,7 +1619,7 @@ impl ChatView {
         let device = self.device();
         let title = self.conv.borrow().title.clone();
         let persona = self.persona();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         bg(
             {
                 let device = device.clone();
@@ -1594,7 +1719,7 @@ impl ChatView {
         row.append(&days);
         b.append(&row);
         d.set_extra_child(Some(&b));
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         d.connect_response(Some("offer"), move |_, _| {
             let Some(t) = weak.upgrade() else { return };
             let buf = attrs.buffer();
@@ -1650,7 +1775,7 @@ impl ChatView {
         b.append(&schema);
         b.append(&keys);
         d.set_extra_child(Some(&b));
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         d.connect_response(Some("ask"), move |_, _| {
             let Some(t) = weak.upgrade() else { return };
             let schema = schema.text().trim().to_owned();
@@ -1682,7 +1807,7 @@ impl ChatView {
             return;
         };
         let title = self.conv.borrow().title.clone();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         ui::confirm(
             &app.window,
             "Reveal who you are?",
@@ -1788,7 +1913,7 @@ impl ChatView {
         } else {
             "Only the owner can add and remove members."
         };
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         let members = info.members.clone();
         let (heading, shown) = (info.name.clone(), names.clone());
         ui::choose(&app.window, &heading, body, &shown, None, move |i| {
@@ -1845,7 +1970,7 @@ impl ChatView {
             return self.toast("All your contacts are already in this group");
         }
         let names: Vec<String> = candidates.iter().map(|c| c.title.clone()).collect();
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         ui::choose(
             &app.window,
             &format!("Invite to {}", info.name),
@@ -1870,7 +1995,7 @@ impl ChatView {
         let Some(info) = self.conv.borrow().group.clone() else {
             return;
         };
-        let weak = Rc::downgrade(self);
+        let weak = self.weak_self.clone();
         ui::confirm(
             &app.window,
             &if info.owned {
@@ -1939,7 +2064,7 @@ impl ChatView {
                     };
                     w.set_size_request(96, 96);
                     if let Ok(b) = w.clone().downcast::<gtk::Button>() {
-                        let weak = Rc::downgrade(self);
+                        let weak = self.weak_self.clone();
                         b.add_css_class("flat");
                         b.connect_clicked(move |_| {
                             if let Some(t) = weak.upgrade() {
@@ -1956,7 +2081,7 @@ impl ChatView {
                     &format!("{} · {}", ui::human_size(f.size), ui::time_label(e.at_ms)),
                 );
                 if let Some(p) = path {
-                    let weak = Rc::downgrade(self);
+                    let weak = self.weak_self.clone();
                     row.connect_activated(move |_| {
                         if let Some(t) = weak.upgrade() {
                             t.open_file(&p);

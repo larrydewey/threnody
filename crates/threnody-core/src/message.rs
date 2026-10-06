@@ -37,6 +37,10 @@ pub const FEATURE_OBSERVED: u64 = 32;
 pub const FEATURE_PATHS: u64 = 64;
 /// The peer understands `AppMessage::Credential` (Appendix O).
 pub const FEATURE_CREDENTIALS: u64 = 128;
+/// The peer understands `AppMessage::Typing` (typing indicators).
+pub const FEATURE_TYPING: u64 = 256;
+/// The peer understands `AppMessage::Read` (read receipts).
+pub const FEATURE_READ: u64 = 512;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -44,7 +48,9 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_REACT
     | FEATURE_OBSERVED
     | FEATURE_PATHS
-    | FEATURE_CREDENTIALS;
+    | FEATURE_CREDENTIALS
+    | FEATURE_TYPING
+    | FEATURE_READ;
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -110,6 +116,13 @@ pub enum AppMessage {
     Tracked { id: u64, inner: Box<AppMessage> },
     /// Acknowledges `Tracked` messages by id.
     Ack(Vec<u64>),
+    /// Tells the peer that the messages with these sender-ids were
+    /// displayed: "seen". Only sent to peers whose `Hello` has
+    /// [`FEATURE_READ`]. Like `Ack`, bounded to [`MAX_ACK_IDS`].
+    Read {
+        conversation: Vec<u8>,
+        ids: Vec<u64>,
+    },
     /// Delete these messages (by the sender's `id`s). From a peer: its own
     /// messages, "delete for everyone". From one of our devices: any
     /// messages in `conversation`, which it deleted. Only sent to peers
@@ -150,6 +163,10 @@ pub enum AppMessage {
     /// A relay directory request or answer (`directory::DirMsg`,
     /// Appendix P), over an anonymous link.
     Directory(Vec<u8>),
+    /// "I am (or am not) typing right now": a transient hint, never
+    /// tracked, sealed or stored. Only sent to a peer whose `Hello` has
+    /// [`FEATURE_TYPING`].
+    Typing { active: bool },
 }
 
 mod kind {
@@ -176,6 +193,8 @@ mod kind {
     pub const PATHS: u64 = 20;
     pub const CREDENTIAL: u64 = 21;
     pub const DIRECTORY: u64 = 22;
+    pub const TYPING: u64 = 23;
+    pub const READ: u64 = 24;
 }
 
 impl AppMessage {
@@ -197,6 +216,15 @@ impl AppMessage {
                 return cbor::to_vec(packed.len() + 16, |e| {
                     e.map_len(2)?.u8(0)?.uint(kind::ACK)?;
                     e.u8(2)?.bytes(&packed)?;
+                    Ok(())
+                });
+            }
+            Self::Read { conversation, ids } => {
+                let packed: Vec<u8> = ids.iter().flat_map(|i| i.to_be_bytes()).collect();
+                return cbor::to_vec(packed.len() + conversation.len() + 24, |e| {
+                    e.map_len(3)?.u8(0)?.uint(kind::READ)?;
+                    e.u8(2)?.bytes(&packed)?;
+                    e.u8(3)?.bytes(conversation)?;
                     Ok(())
                 });
             }
@@ -257,7 +285,8 @@ impl AppMessage {
                 | Self::Ack(_)
                 | Self::Delete { .. }
                 | Self::Edit { .. }
-                | Self::React { .. } => {
+                | Self::React { .. }
+                | Self::Read { .. } => {
                     unreachable!("encoded above")
                 }
                 Self::Cover => {
@@ -367,6 +396,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
                 }
+                Self::Typing { active } => {
+                    e.map_len(2)?.u8(0)?.uint(kind::TYPING)?;
+                    e.u8(2)?.bool(*active)?;
+                }
                 Self::Observed { addr } => {
                     e.map_len(3)?.u8(0)?.uint(kind::OBSERVED)?;
                     match addr.ip() {
@@ -405,6 +438,7 @@ impl AppMessage {
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
+            Self::Read { conversation, ids } => conversation.len() + ids.len() * 8 + 16,
             _ => 16,
         }
     }
@@ -508,6 +542,21 @@ impl AppMessage {
                         .collect(),
                 )
             }
+            kind::READ => {
+                let packed = required(bytes, "read ids")?;
+                if packed.len() % 8 != 0 || packed.len() / 8 > MAX_ACK_IDS {
+                    return Err(Error::Malformed("read"));
+                }
+                Self::Read {
+                    conversation: required(conv, "conversation")?,
+                    ids: packed
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| u64::from_be_bytes(*c))
+                        .collect(),
+                }
+            }
             kind::COVER => Self::Cover,
             kind::TEXT => Self::Text {
                 sent_ms: ts.unwrap_or(0),
@@ -567,6 +616,9 @@ impl AppMessage {
             },
             kind::APPROVAL => Self::Approval {
                 approved: required(flag, "approval flag")?,
+            },
+            kind::TYPING => Self::Typing {
+                active: required(flag, "typing flag")?,
             },
             kind::OBSERVED => {
                 let b = required(bytes, "observed address")?;
@@ -706,6 +758,8 @@ mod tests {
                 add: false,
             },
             AppMessage::Approval { approved: true },
+            AppMessage::Typing { active: true },
+            AppMessage::Typing { active: false },
             AppMessage::TunnelOffer {
                 wg_public: [7; 32],
                 port: 51820,

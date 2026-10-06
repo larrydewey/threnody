@@ -342,6 +342,11 @@ class MainActivity : Activity() {
                 if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
                 else "Only your own contacts relay for you"
             }
+            toggle("Send read receipts", Privacy.sendReadReceipts(this@MainActivity),
+                { Privacy.setSendReadReceipts(this@MainActivity, it) }) {
+                if (it) "When you open a chat, the sender learns you've displayed their messages"
+                else "The sender won't know when you've read their messages"
+            }
             menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {
                 isCheckable = true

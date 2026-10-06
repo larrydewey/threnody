@@ -5,7 +5,7 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
-use threnody_core::message::{FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT};
+use threnody_core::message::{FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING};
 
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
@@ -297,6 +297,36 @@ impl Node {
         true
     }
 
+    /// Tells the devices of `peer`'s account we are (or aren't) typing in
+    /// their conversation with us. Transient: not tracked, not sealed for
+    /// mailboxes, and ignored by peers without [`FEATURE_TYPING`].
+    pub fn set_typing(&self, peer: &PublicIdentity, active: bool) -> Result<()> {
+        let msg = AppMessage::Typing { active };
+        let devices: Vec<PublicIdentity> = match self.account_of(peer) {
+            Some(a) if !self.is_own_device(peer) => {
+                a.state().devices.iter().map(|(d, _)| *d).collect()
+            }
+            _ => vec![*peer],
+        };
+        let mut reached = false;
+        for d in &devices {
+            if !self.supports(d, FEATURE_TYPING) {
+                continue;
+            }
+            if self.send(d, msg.clone()).is_ok() {
+                reached = true;
+            }
+        }
+        if reached {
+            Ok(())
+        } else {
+            Err(NetError::NoRoute(format!(
+                "{} (no session with a typing-capable peer)",
+                peer.fingerprint()
+            )))
+        }
+    }
+
     /// Adds or takes away `who`'s `emoji` on message `id` in `conv` (used
     /// for groups, whose reactions travel inside MLS). Returns true if it
     /// changed anything.
@@ -350,6 +380,70 @@ impl Node {
             .unwrap_or(0);
         if n > 0 {
             self.emit(Event::Reacted { peer: *from, id });
+        }
+    }
+
+    /// Tells `peer`'s account devices we've displayed the messages it
+    /// sent us with the sender-ids `ids` (their `remote_id`s in our
+    /// conversation). Live-only: never sealed or tracked.
+    pub fn report_read(&self, peer: &PublicIdentity, ids: &[u64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conv = self.conversation_for(peer);
+        let msg = AppMessage::Read {
+            conversation: conv.to_bytes(),
+            ids: ids.to_vec(),
+        };
+        let devices: Vec<PublicIdentity> = match self.account_of(peer) {
+            Some(a) if !self.is_own_device(peer) => {
+                a.state().devices.iter().map(|(d, _)| *d).collect()
+            }
+            _ => vec![*peer],
+        };
+        let mut reached = false;
+        for d in &devices {
+            if !self.supports(d, FEATURE_READ) {
+                continue;
+            }
+            if self.send(d, msg.clone()).is_ok() {
+                reached = true;
+            }
+        }
+        if reached {
+            Ok(())
+        } else {
+            Err(NetError::NoRoute(format!(
+                "{} (no session with a read-receipt-capable peer)",
+                peer.fingerprint()
+            )))
+        }
+    }
+
+    /// Handles a `Read` from `from`: it displayed our outgoing messages
+    /// `ids` in our conversation with it; their "seen" ticks update.
+    pub(crate) fn on_read(&self, from: &PublicIdentity, conversation: &[u8], ids: &[u64]) {
+        if self.is_own_device(from) {
+            return;
+        }
+        let expected = self.conversation_for(from);
+        let ok = match ConversationId::from_bytes(conversation) {
+            Some(c) => c == expected,
+            None => false,
+        };
+        if !ok {
+            return;
+        }
+        let now = now_ms();
+        let n = self
+            .shared
+            .home
+            .mark_read_entries(self.identity_ref(), expected, now, |e| {
+                e.outgoing && e.local_id != 0 && ids.contains(&e.local_id)
+            })
+            .unwrap_or(0);
+        if n > 0 {
+            self.emit(Event::Read { peer: *from });
         }
     }
 
@@ -593,6 +687,7 @@ impl Node {
                 delivered_to: Vec::new(),
                 remote_id: 0,
                 edited_ms: 0,
+                read_ms: 0,
                 reactions: Vec::new(),
             },
         );
@@ -818,6 +913,7 @@ impl Node {
             delivered_to: Vec::new(),
             remote_id,
             edited_ms: 0,
+                read_ms: 0,
             reactions: Vec::new(),
         };
         let _ = self
@@ -880,6 +976,7 @@ impl Node {
                 delivered_to: Vec::new(),
                 remote_id,
                 edited_ms: 0,
+                read_ms: 0,
                 reactions: Vec::new(),
             },
         );
