@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bluer",
@@ -4499,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4522,7 +4522,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-desktop"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-channel",
  "gtk4",
@@ -4535,7 +4535,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-ffi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "qrcode",
  "rqrr",
@@ -4550,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-groups"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "const-cbor",
  "openmls",
@@ -4564,7 +4564,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-net"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
