@@ -46,6 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(boot) = arg(&args, "--extra") {
             b.extra_bootstrap(&[boot]);
         }
+        if let Some(pip) = arg(&args, "--public-ip") {
+            b.public_ip(pip.parse()?);
+        }
         let _dht = b.build()?;
         println!("dht on :{port}");
         loop {

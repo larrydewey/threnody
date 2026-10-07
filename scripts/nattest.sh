@@ -86,9 +86,9 @@ iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.5
 iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
 
 # Private DHT testnet (two nodes, second seeded from the first).
-ip netns exec I timeout 300 "$BIN" --serve-dht 7460 > "$TMP/dht0.log" 2>&1 &
+ip netns exec I timeout 300 "$BIN" --serve-dht 7460 --public-ip 198.51.100.1 > "$TMP/dht0.log" 2>&1 &
 sleep 1
-ip netns exec I timeout 300 "$BIN" --serve-dht 7461 --extra 198.51.100.1:7460 > "$TMP/dht1.log" 2>&1 &
+ip netns exec I timeout 300 "$BIN" --serve-dht 7461 --public-ip 198.51.100.1 --extra 198.51.100.1:7460 > "$TMP/dht1.log" 2>&1 &
 sleep 1
 BOOT="198.51.100.1:7460,198.51.100.1:7461"
 ip netns exec I timeout 300 "$BIN" --serve-reflector 198.51.100.1:7462 > "$TMP/refl.log" 2>&1 &
