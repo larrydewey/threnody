@@ -25,7 +25,7 @@ zkryptium.workspace = true
 ml-dsa.workspace = true
 
 [dev-dependencies]
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 tempfile.workspace = true
 
 [lints]

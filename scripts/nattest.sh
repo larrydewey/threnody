@@ -238,6 +238,13 @@ echo "bootstrap: $BOOT"
 ip netns exec I timeout 300 "$BIN" --serve-reflector 198.51.100.1:7462 > "$TMP/refl.log" 2>&1 &
 sleep 1
 
+# An always-on relay in the internet netns. When a punch cannot succeed,
+# the app must still find its peer through a circuit over this node, so the
+# "no direct path" combos exercise the fallback instead of just failing.
+ip netns exec I timeout 300 "$BIN" --home "$TMP/r" --serve 7455 > "$TMP/r.log" 2>&1 &
+sleep 1
+RELAY=198.51.100.1:7455
+
 # Bootstrap an approved contact over the direct host link.
 ip netns exec A "$BIN" --home "$TMP/a" --accept 7451 > "$TMP/a-accept.log" 2>&1 &
 sleep 1
@@ -247,9 +254,9 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --relay "$RELAY" --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --relay "$RELAY" --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
 
@@ -308,11 +315,16 @@ else
 fi
 
 # Only when *both* NATs are symmetric can the peers fail to reach each
-# other. A dialer behind a symmetric NAT can still reach a cone NAT's
-# mapped port: the acceptor has the inbound path, and the reply rides the
-# conntrack flow the dialer opened by sending first.
+# other directly. A dialer behind a symmetric NAT can still reach a cone
+# NAT's mapped port: the acceptor has the inbound path, and the reply rides
+# the conntrack flow the dialer opened by sending first.
+#
+# With a relay in the topology, two symmetric NATs must still end up
+# connected -- over a circuit. "No direct path" is not an acceptable outcome
+# any more, so the symmetric combo now expects the fallback rather than
+# tolerating its absence.
 if [ "$A_MODE" = random ] && [ "$B_MODE" = random ]; then
-    want="none"
+    want="relay"
 elif [ "$a_relay" -gt 0 ] || [ "$b_relay" -gt 0 ]; then
     want="relay"
 else
@@ -325,12 +337,11 @@ if [ "$want" = direct ] && [ "$a_dir" -gt 0 ] && [ "$b_dir" -gt 0 ]; then
 elif [ "$want" = relay ] && { [ "$a_relay" -gt 0 ] || [ "$b_relay" -gt 0 ]; }; then
     echo "RESULT: PASS ($A_MODE/$B_MODE) fell back to a relay circuit"
     exit 0
-elif [ "$want" = none ] && [ "$a_dir" -eq 0 ] && [ "$b_dir" -eq 0 ]; then
-    echo "RESULT: PASS ($A_MODE/$B_MODE) no direct path, as expected (no relay in this topology)"
-    exit 0
 fi
 
 echo "RESULT: FAIL ($A_MODE/$B_MODE) wanted $want; got direct=$a_dir/$b_dir relay=$a_relay/$b_relay${dial_lan:+ lan=$dial_lan}"
+echo "--- relay log (sessions it held):"; cat "$TMP/r.log" 2>/dev/null | head -10 || true
+echo "--- sides reported:"; grep -h '^connected to\|^relay ' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | tail -6 || true
 echo "--- refl.log (NATed sources seen by the reflector):"; tail -4 "$TMP/refl.log" 2>/dev/null || true
 dump_nat
 echo "--- last dial attempts:"; grep -h 'dialing\|dialed over' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | tail -6 || true

@@ -22,7 +22,7 @@ keyring = "4.2"
 qrcode.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true
-jiff = "0.2.37"
+jiff = "0.2.38"
 
 [features]
 default = ["ble"]

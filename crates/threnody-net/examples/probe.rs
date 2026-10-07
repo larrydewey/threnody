@@ -12,8 +12,8 @@
 
 use std::time::Duration;
 
-use threnody_core::store::{Contacts, Home, Lookup};
 use threnody_core::PublicIdentity;
+use threnody_core::store::{Contacts, Home, Lookup};
 use threnody_net::reach::ReachConfig;
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 
@@ -91,10 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (n, src) = sock.recv_from(&mut buf).await?;
             let data = &buf[..n];
             eprintln!("reflector: {n} bytes from {src}");
-            if data
-                .windows(b"q4:ping".len())
-                .any(|w| w == b"q4:ping")
-            {
+            if data.windows(b"q4:ping".len()).any(|w| w == b"q4:ping") {
                 let Some(i) = data.windows(b"1:t2:".len()).position(|w| w == b"1:t2:") else {
                     continue;
                 };
@@ -138,7 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("listening tcp {bound}");
         loop {
             match rx.recv().await {
-                Some(Event::ApprovalChanged { mutual: true, peer, .. }) => {
+                Some(Event::ApprovalChanged {
+                    mutual: true, peer, ..
+                }) => {
                     println!("mutual {}", peer.fingerprint());
                     return Ok(());
                 }
@@ -159,7 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::ApprovalChanged { peer, .. } => {
                     node.set_approval(&peer, true)?;
                 }
-                Event::Connected { peer, via, addr, .. } => {
+                Event::Connected {
+                    peer, via, addr, ..
+                } => {
                     let how = if via.is_none() { "direct" } else { "relay" };
                     println!("session with {} via {} {addr}", peer.fingerprint(), how);
                 }
@@ -218,6 +219,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ReachConfig::default()
     };
     node.start_reach(cfg)?;
+
+    // Hold a session to the always-on relay before seeking, so a peer we
+    // cannot reach directly can still be found through a circuit. The
+    // session must be direct (not relayed) and mutually approved: that is
+    // exactly what the relay extends a circuit over.
+    if let Some(addr) = arg(&args, "--relay") {
+        let peer = node.connect(&addr, None).await?;
+        node.set_approval(&peer, true)?;
+        // Wait for the relay to approve us back before seeking, otherwise an
+        // early circuit open would be refused for lack of mutual approval.
+        let mut ok = false;
+        while let Some(ev) = rx.recv().await {
+            if let Event::ApprovalChanged {
+                mutual: true, peer, ..
+            } = ev
+            {
+                println!("relay {}", peer.fingerprint());
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            return Err("relay never approved".into());
+        }
+    }
+
     if let Some(q) = arg(&args, "--seek") {
         let contacts = node.contacts();
         match find_contact(&contacts, &q) {
@@ -233,13 +260,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         loop {
             let r = watcher.reachability();
-            println!("reach: online {} candidates {:?} symmetric {}", r.online, r.candidates, r.symmetric);
+            println!(
+                "reach: online {} candidates {:?} symmetric {}",
+                r.online, r.candidates, r.symmetric
+            );
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
     loop {
         match rx.recv().await {
-            Some(Event::Connected { peer, addr, via, .. }) => {
+            Some(Event::Connected {
+                peer, addr, via, ..
+            }) => {
                 let how = match via {
                     None => "direct",
                     Some(_) => "relay",
@@ -250,7 +282,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Some(Event::ReachNote { note }) => println!("note: {note}"),
-            Some(Event::Addresses { candidates, symmetric }) => {
+            Some(Event::Addresses {
+                candidates,
+                symmetric,
+            }) => {
                 println!("addresses: {candidates:?} symmetric {symmetric}");
             }
             _ => {}

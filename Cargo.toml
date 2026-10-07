@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.5.2"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/larrydewey/threnody"
 
@@ -20,15 +20,15 @@ openmls_traits = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"
 openmls_basic_credential = "0.6"
 const-cbor = { version = "0.3", features = ["std"] }
 ml-kem = { version = "0.3.2", features = ["zeroize", "hazmat"] }
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
-chacha20poly1305 = "0.10"
-chacha20 = "0.9"
-aes-gcm = "0.10"
-sha3 = "0.10"
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"] }
+chacha20poly1305 = "0.11"
+chacha20 = "0.10"
+aes-gcm = "0.11"
+sha3 = "0.12"
 blake3 = "1.8"
-rand_core = { version = "0.6", features = ["getrandom"] }
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
+rand_core = { version = "0", features = ["getrandom"] }
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "fs", "macros", "sync", "time", "signal"] }
 clap = { version = "4.6", features = ["derive"] }
@@ -36,7 +36,7 @@ anyhow = "1"
 qrcode = { version = "0.14", default-features = false }
 tempfile = "3"
 socket2 = { version = "0.6", features = ["all"] }
-argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 rpassword = "7"
 # BBS signatures with blind issuance and per-verifier pseudonyms (IETF CFRG drafts).
 zkryptium = { version = "0.7.1", default-features = false, features = ["bbsplus_nym"] }
@@ -51,3 +51,7 @@ all = { level = "deny", priority = -1 }
 # Crypto dependencies are unusably slow unoptimised; keep our crates debuggable.
 [profile.dev.package."*"]
 opt-level = 3
+
+[patch.crates-io]
+libcrux-hmac-drbg = { git = "https://github.com/celabshq/libcrux", tag = "libcrux-v0.0.5" }
+libcrux-kem = { git = "https://github.com/celabshq/libcrux", tag = "libcrux-v0.0.5" }

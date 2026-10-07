@@ -20,9 +20,21 @@ sudo ./scripts/nattest.sh random random  # both CGNAT-like: expect symmetric fal
 ```
 
 The script puts both probes in netns, SNATs A's traffic to 198.51.100.2 and
-B's to 203.0.113.2 (`--random` = random external port per flow, like CGNAT),
-runs a private DHT (mainline testnet), and expects both sides to detect the
-session route: `via direct` / `via relay` / none.
+B's to 203.0.113.2 (`random` = random external port per flow, like CGNAT),
+runs a private DHT (mainline testnet), and serves an always-on relay in the
+internet netns so the symmetric combinations can be checked for *fallback*
+rather than merely for failure.
+
+Every combo must end with a session:
+
+| combo | expected route |
+|---|---|
+| `plain plain` | direct |
+| `plain random` | direct |
+| `random random` | relay circuit |
+
+`random random` is the one that proves graceful degradation: neither side
+has an inbound path, so the session can only exist through the relay.
 
 ## On-device matrix (two phones)
 
