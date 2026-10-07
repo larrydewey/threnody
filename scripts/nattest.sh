@@ -102,21 +102,25 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-# A stable relay in the internet netns; A and B approve it, so each can
-# fall back to a relay circuit when the NAT combos block direct dial.
-ip netns exec I timeout 600 "$BIN" --home "$TMP/r" --serve 7455 > "$TMP/r.log" 2>&1 &
-sleep 1
-ip netns exec A "$BIN" --home "$TMP/a" --dial 198.51.100.1:7455 > "$TMP/a-dial-r.log" 2>&1 &
-RA=$!
-ip netns exec B "$BIN" --home "$TMP/b" --dial 203.0.113.1:7455 > "$TMP/b-dial-r.log" 2>&1 &
-RB=$!
-wait $RA $RB || true
-
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
+
+# What the NAT actually did: which flows existed, and whether either
+# direction of A<->B traffic was seen at all.
+dump_nat() {
+    echo "--- conntrack (udp, both NAT subnets):"
+    conntrack -L -p udp 2>/dev/null | grep -E '10\.0\.1\.2|10\.0\.2\.2' | tail -20 || echo "(conntrack unavailable)"
+    echo "--- vethC counters:"
+    ip -s link show vethC 2>/dev/null | tail -4
+    echo "--- A/B socket state:"
+    for ns in A B; do
+        echo -n "  $ns: "
+        ip netns exec "$ns" ss -un 2>/dev/null | grep -c ':7450' || echo 0
+    done
+}
 
 echo "--- A:"; grep -h '^connected\|^addresses\|^note:' "$TMP/a-run.log" || tail -5 "$TMP/a-run.log"
 echo "--- B:"; grep -h '^connected\|^addresses\|^note:' "$TMP/b-run.log" || tail -5 "$TMP/b-run.log"
@@ -133,6 +137,7 @@ else
     echo "--- dht.log:"; head -3 "$TMP/dht1.log" 2>/dev/null || true
     echo "--- a-run.log tail:"; tail -3 "$TMP/a-run.log" 2>/dev/null || true
     echo "--- b-run.log tail:"; tail -3 "$TMP/b-run.log" 2>/dev/null || true
+    dump_nat
     rm -rf /tmp/nattest-last; cp -r "$TMP" /tmp/nattest-last
     exit 1
 fi
