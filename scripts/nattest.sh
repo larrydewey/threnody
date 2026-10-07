@@ -29,8 +29,8 @@ cleanup() {
     ip link del vethA 2>/dev/null
     ip link del vethB 2>/dev/null
     ip link del vethC 2>/dev/null
-    ip route del blackhole 198.51.100.0/24 2>/dev/null
-    ip route del blackhole 203.0.113.0/24 2>/dev/null
+    ip route del 198.51.100.0/24 2>/dev/null
+    ip route del 203.0.113.0/24 2>/dev/null
     iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
     iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
     iptables -D FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null
@@ -78,8 +78,8 @@ iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/
 iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT
 iptables -C FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -j ACCEPT
 # Anything to the NAT aliases that conntrack does not rewrite is not for us.
-ip route add blackhole 198.51.100.0/24 2>/dev/null || true
-ip route add blackhole 203.0.113.0/24 2>/dev/null || true
+ip route add 198.51.100.0/24 via 172.16.0.2 2>/dev/null || true
+ip route add 203.0.113.0/24 via 172.16.0.2 2>/dev/null || true
 echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 
 iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
