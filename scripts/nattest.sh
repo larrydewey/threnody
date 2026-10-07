@@ -102,9 +102,19 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
+# A stable relay in the internet netns; A and B approve it, so each can
+# fall back to a relay circuit when the NAT combos block direct dial.
+ip netns exec I timeout 600 "$BIN" --home "$TMP/r" --serve 7455 > "$TMP/r.log" 2>&1 &
+sleep 1
+ip netns exec A "$BIN" --home "$TMP/a" --dial 198.51.100.1:7455 > "$TMP/a-dial-r.log" 2>&1 &
+RA=$!
+ip netns exec B "$BIN" --home "$TMP/b" --dial 203.0.113.1:7455 > "$TMP/b-dial-r.log" 2>&1 &
+RB=$!
+wait $RA $RB || true
+
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
 

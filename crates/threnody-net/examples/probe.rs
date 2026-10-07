@@ -150,6 +150,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Relay node: approve everyone, keep sessions alive, print each one.
+    if let Some(port) = arg(&args, "--serve") {
+        let bound = node.listen(&format!("0.0.0.0:{port}")).await?;
+        println!("serving tcp {bound}");
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                Event::ApprovalChanged { peer, .. } => {
+                    node.set_approval(&peer, true)?;
+                }
+                Event::Connected { peer, via, addr, .. } => {
+                    let how = if via.is_none() { "direct" } else { "relay" };
+                    println!("session with {} via {} {addr}", peer.fingerprint(), how);
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
     // Dial mode: connect and approve, then wait for mutual approval.
     if let Some(addr) = arg(&args, "--dial") {
         let peer = node.connect(&addr, None).await?;
@@ -164,6 +183,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     node.set_reach(true);
+    if has(&args, "--clear-addrs") {
+        node.update_contacts(|c| {
+            let keys: Vec<_> = c.iter().map(|k| k.key).collect();
+            for key in keys {
+                if let Some(contact) = c.get_mut(&key) {
+                    contact.last_addr = None;
+                }
+            }
+        });
+    }
     let q = match arg(&args, "--listen-port") {
         Some(p) => node.listen_quic(&format!("0.0.0.0:{p}")).await?,
         None => node.listen_quic("0.0.0.0:0").await?,
