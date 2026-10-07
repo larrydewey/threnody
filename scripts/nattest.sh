@@ -26,6 +26,9 @@ cleanup() {
     ip addr del 203.0.113.1/24 dev lo
     iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o lo -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random)
     iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o lo -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random)
+    iptables -D FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -53,6 +56,10 @@ ip netns exec B ip link set vethzB up
 ip netns exec B ip link set lo up
 ip netns exec B ip route add default via 10.0.2.1
 echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT
+iptables -C FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -j ACCEPT
+echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 # "Internet": loopback aliases; DHT testnet inside host netns.
 ip addr add 198.51.100.1/24 dev lo
 ip addr add 203.0.113.1/24 dev lo
