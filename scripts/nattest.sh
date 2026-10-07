@@ -53,10 +53,10 @@ cleanup() {
     ip link del vethC 2>/dev/null
     ip route del 198.51.100.0/24 2>/dev/null
     ip route del 203.0.113.0/24 2>/dev/null
-    iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
-    iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
-    iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethB -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
-    iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethA -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
+    snat_del 10.0.1.0/24 vethC 198.51.100.2 "$A_MODE"
+    snat_del 10.0.2.0/24 vethC 203.0.113.2 "$B_MODE"
+    snat_del 10.0.1.0/24 vethB 198.51.100.2 "$A_MODE"
+    snat_del 10.0.2.0/24 vethA 203.0.113.2 "$B_MODE"
     # Port mappings: the cone NAT's inbound path. Without these nothing owns
     # the NAT aliases, so packets addressed to them loop host->INT->host.
     for p in udp tcp; do
@@ -71,7 +71,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkmode() { [ "$1" = random ] && echo "--random" || echo ""; }
+# A symmetric NAT assigns a fresh external port per flow.
+#
+# Not `SNAT --random`: iptables-translate renders it as `snat to <ip> random`,
+# and the reflector still saw the port preserved at 7450, so the random NAT
+# was not randomising and the combo silently tested cone/cone again. An
+# explicit port range is the form that translates to a real nft range, so the
+# kernel picks a different port per flow.
+#
+# One rule per protocol: iptables accepts a single -p.
+mkmode() { [ "$1" = random ] && echo ":1024-65535" || echo ""; }
+
+# snat_rule <src-subnet> <out-if> <public-ip> <mode>
+snat_rule() {
+    local src="$1" oif="$2" pub="$3" mode="$4"
+    iptables -t nat -A POSTROUTING -p udp -s "$src" -o "$oif" -j SNAT --to-source "$pub$(mkmode "$mode")"
+    iptables -t nat -A POSTROUTING -p tcp -s "$src" -o "$oif" -j SNAT --to-source "$pub$(mkmode "$mode")"
+}
+
+# snat_del <src-subnet> <out-if> <public-ip> <mode>
+snat_del() {
+    local src="$1" oif="$2" pub="$3" mode="$4"
+    iptables -t nat -D POSTROUTING -p udp -s "$src" -o "$oif" -j SNAT --to-source "$pub$(mkmode "$mode")" 2>/dev/null
+    iptables -t nat -D POSTROUTING -p tcp -s "$src" -o "$oif" -j SNAT --to-source "$pub$(mkmode "$mode")" 2>/dev/null
+}
 
 mknet() {
     local ns="$1" n="$2"
@@ -135,8 +158,8 @@ ip route add 198.51.100.0/24 via 172.16.0.2 2>/dev/null || true
 ip route add 203.0.113.0/24 via 172.16.0.2 2>/dev/null || true
 echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 
-iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
-iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
+snat_rule 10.0.1.0/24 vethC 198.51.100.2 "$A_MODE"
+snat_rule 10.0.2.0/24 vethC 203.0.113.2 "$B_MODE"
 
 # A cone NAT's inbound DNAT redirects to the peer's *private* address, so
 # the packet then leaves via that LAN's veth, not vethC. Without these the
@@ -144,8 +167,8 @@ iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0
 # LAN-to-LAN with no translation at all: the alias resolves, and then the
 # two nodes are talking directly behind the NAT's back. Translate the
 # reply direction too, so a punched session really does cross the NAT.
-iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethB -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
-iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethA -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
+snat_rule 10.0.1.0/24 vethB 198.51.100.2 "$A_MODE"
+snat_rule 10.0.2.0/24 vethA 203.0.113.2 "$B_MODE"
 
 # A cone NAT keeps one mapping per internal port, so anything arriving for
 # that port is delivered. That is the inbound path hole punching relies on,
@@ -230,14 +253,16 @@ else
     a_dir=0; b_dir=0
 fi
 
-# A punch only works when both NATs are cone: a symmetric side has no
-# inbound path, so neither can reach the other directly.
-if [ "$A_MODE" = plain ] && [ "$B_MODE" = plain ]; then
-    want="direct"
+# Only when *both* NATs are symmetric can the peers fail to reach each
+# other. A dialer behind a symmetric NAT can still reach a cone NAT's
+# mapped port: the acceptor has the inbound path, and the reply rides the
+# conntrack flow the dialer opened by sending first.
+if [ "$A_MODE" = random ] && [ "$B_MODE" = random ]; then
+    want="none"
 elif [ "$a_relay" -gt 0 ] || [ "$b_relay" -gt 0 ]; then
     want="relay"
 else
-    want="none"
+    want="direct"
 fi
 
 if [ "$want" = direct ] && [ "$a_dir" -gt 0 ] && [ "$b_dir" -gt 0 ]; then
