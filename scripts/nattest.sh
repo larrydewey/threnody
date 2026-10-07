@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Two-phone NAT test topology (Appendix N, "Two phones" item).
 #
-# Two probe nodes, each in its own netns, behind the host's NAT:
-# A-subnet traffic is SNAT'd to 198.51.100.2, B-subnet to 203.0.113.2.
-#   plain   = port-preserving masquerade (home-router-like)
-#   random  = random per-flow external port (carrier-NAT-like)
-# A private DHT testnet runs on 198.51.100.1:7460/7461 in the host ns.
+# A and B each in their own netns, behind the host's NAT:
+#   A's traffic SNAT'd to 198.51.100.2, B's to 203.0.113.2
+# (plain = port-preserving, random = per-flow port like CGNAT).
+# A third "internet" netns holds the private DHT + reflector.
 #
 #   sudo ./scripts/nattest.sh plain plain   # expect direct QUIC
-#   sudo ./scripts/nattest.sh random random # expect symmetric NAT, no direct
+#   sudo ./scripts/nattest.sh random random # expect no direct path
 set -euo pipefail
 
 BIN="$(dirname "$0")/../target/debug/examples/probe"
@@ -21,11 +20,19 @@ TMP="$(mktemp -d)"
 cleanup() {
     set +e
     kill $(jobs -p) 2>/dev/null
-    ip netns del A; ip netns del B
-    ip addr del 198.51.100.1/24 dev lo
-    ip addr del 203.0.113.1/24 dev lo
-    iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o lo -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random)
-    iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o lo -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random)
+    ip netns del A
+    ip netns del B
+    ip netns del I
+    ip addr del 10.0.1.1/24 dev vethA 2>/dev/null
+    ip addr del 10.0.2.1/24 dev vethB 2>/dev/null
+    ip addr del 172.16.0.1/24 dev vethC 2>/dev/null
+    ip link del vethA 2>/dev/null
+    ip link del vethB 2>/dev/null
+    ip link del vethC 2>/dev/null
+    ip route del blackhole 198.51.100.0/24 2>/dev/null
+    ip route del blackhole 203.0.113.0/24 2>/dev/null
+    iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
+    iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
     iptables -D FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null
     iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null
     iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
@@ -35,48 +42,59 @@ trap cleanup EXIT INT TERM
 
 mkmode() { [ "$1" = random ] && echo "--random" || echo ""; }
 
-ip netns add A
-ip netns add B
-ip link add vethA type veth peer name vethzA
-ip link add vethB type veth peer name vethzB
-ip link set vethzA netns A
-ip link set vethzB netns B
-# A side
-ip addr add 10.0.1.1/24 dev vethA
-ip link set vethA up
-ip netns exec A ip addr add 10.0.1.2/24 dev vethzA
-ip netns exec A ip link set vethzA up
-ip netns exec A ip link set lo up
-ip netns exec A ip route add default via 10.0.1.1
-# B side
-ip addr add 10.0.2.1/24 dev vethB
-ip link set vethB up
-ip netns exec B ip addr add 10.0.2.2/24 dev vethzB
-ip netns exec B ip link set vethzB up
-ip netns exec B ip link set lo up
-ip netns exec B ip route add default via 10.0.2.1
+mknet() {
+    local ns="$1" n="$2"
+    ip netns add "$ns"
+    ip link add "veth$ns" type veth peer name "vethz$ns"
+    ip link set "vethz$ns" netns "$ns"
+    ip addr add "10.0.$n.1/24" dev "veth$ns"
+    ip link set "veth$ns" up
+    ip netns exec "$ns" ip addr add "10.0.$n.2/24" dev "vethz$ns"
+    ip netns exec "$ns" ip link set "vethz$ns" up
+    ip netns exec "$ns" ip link set lo up
+    ip netns exec "$ns" ip route add default via "10.0.$n.1"
+}
+
+mknet A 1
+mknet B 2
+
+# "Internet" namespace.
+ip netns add I
+ip link add vethC type veth peer name vethzC
+ip link set vethzC netns I
+ip addr add 172.16.0.1/24 dev vethC
+ip link set vethC up
+ip netns exec I ip addr add 172.16.0.2/24 dev vethzC
+ip netns exec I ip link set vethzC up
+ip netns exec I ip link set lo up
+ip netns exec I ip route add default via 172.16.0.1
+# Alias IPs belonging to the private internet; /32 so unmatched reply-src
+# connections do not pull ARP onto this interface.
+ip netns exec I ip addr add 198.51.100.1/32 dev vethzC
+ip netns exec I ip addr add 203.0.113.1/32 dev vethzC
+
 echo 1 > /proc/sys/net/ipv4/ip_forward
 iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT
 iptables -C FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -j ACCEPT
+# Anything to the NAT aliases that conntrack does not rewrite is not for us.
+ip route add blackhole 198.51.100.0/24 2>/dev/null || true
+ip route add blackhole 203.0.113.0/24 2>/dev/null || true
 echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
-# "Internet": loopback aliases; DHT testnet inside host netns.
-ip addr add 198.51.100.1/24 dev lo
-ip addr add 203.0.113.1/24 dev lo
 
-iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o lo -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
-iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o lo -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
+iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
+iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
 
 # Private DHT testnet (two nodes, second seeded from the first).
-timeout 300 "$BIN" --serve-dht 7460 > "$TMP/dht0.log" 2>&1 &
+ip netns exec I timeout 300 "$BIN" --serve-dht 7460 > "$TMP/dht0.log" 2>&1 &
 sleep 1
-timeout 300 "$BIN" --serve-dht 7461 --extra 127.0.0.1:7460 > "$TMP/dht1.log" 2>&1 &
+ip netns exec I timeout 300 "$BIN" --serve-dht 7461 --extra 198.51.100.1:7460 > "$TMP/dht1.log" 2>&1 &
 sleep 1
 BOOT="198.51.100.1:7460,198.51.100.1:7461"
-timeout 300 "$BIN" --serve-reflector 7462 > "$TMP/refl.log" 2>&1 &
+ip netns exec I timeout 300 "$BIN" --serve-reflector 7462 > "$TMP/refl.log" 2>&1 &
 sleep 1
 
-# Bootstrap an approved contact over the direct veth link.
+# Bootstrap an approved contact over the direct host link.
 ip netns exec A "$BIN" --home "$TMP/a" --accept 7451 > "$TMP/a-accept.log" 2>&1 &
 sleep 1
 ip netns exec B "$BIN" --home "$TMP/b" --dial 10.0.1.2:7451 > "$TMP/dial.log" 2>&1 &
