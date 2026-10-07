@@ -38,6 +38,22 @@ fn find_contact<'a>(contacts: &'a Contacts, q: &str) -> Option<&'a threnody_core
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    // Serve canned mainline testnet: probe --serve-testnet COUNT.
+    // Prints "TESTNET <addr>" lines for each seed node (source addresses
+    // rewritten to 198.51.100.1, the alias on the test's ethernetns).
+    if has(&args, "--serve-testnet") {
+        let count: usize = arg(&args, "--serve-testnet").unwrap().parse()?;
+        let t = mainline::Testnet::new(count)?;
+        for b in &t.bootstrap {
+            let port = b.rsplit(':').next().unwrap();
+            println!("TESTNET 198.51.100.1:{port}");
+        }
+        std::mem::forget(t);
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
     // Serve a tiny DHT for the netns test: `probe --serve-dht PORT [BOOT]`.
     if has(&args, "--serve-dht") {
         let port: u16 = arg(&args, "--serve-dht").unwrap().parse()?;

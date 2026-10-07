@@ -85,12 +85,11 @@ echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
 iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
 
-# Private DHT testnet (two nodes, second seeded from the first).
-ip netns exec I timeout 300 "$BIN" --serve-dht 7460 --public-ip 198.51.100.1 > "$TMP/dht0.log" 2>&1 &
-sleep 1
-ip netns exec I timeout 300 "$BIN" --serve-dht 7461 --public-ip 198.51.100.1 --extra 198.51.100.1:7460 > "$TMP/dht1.log" 2>&1 &
-sleep 1
-BOOT="198.51.100.1:7460,198.51.100.1:7461"
+# Private DHT: a canned mainline testnet inside the internet netns.
+ip netns exec I timeout 300 "$BIN" --serve-testnet 8 > "$TMP/dht.log" 2>&1 &
+sleep 3
+BOOT=$(grep '^TESTNET ' "$TMP/dht.log" | cut -d' ' -f2 | paste -sd,)
+echo "bootstrap: $BOOT"
 ip netns exec I timeout 300 "$BIN" --serve-reflector 198.51.100.1:7462 > "$TMP/refl.log" 2>&1 &
 sleep 1
 
@@ -120,8 +119,8 @@ elif grep -q '^connected to .* via relay' "$TMP/a-run.log"; then
 else
     echo "RESULT: NO DIRECT PATH"
     echo "--- refl.log:"; cat "$TMP/refl.log" 2>/dev/null || true
-    echo "--- dht0.log:"; head -3 "$TMP/dht0.log" 2>/dev/null || true
-    echo "--- dht1.log:"; head -3 "$TMP/dht1.log" 2>/dev/null || true
+    echo "--- dht.log:"; head -3 "$TMP/dht0.log" 2>/dev/null || true
+    echo "--- dht.log:"; head -3 "$TMP/dht1.log" 2>/dev/null || true
     echo "--- a-run.log tail:"; tail -3 "$TMP/a-run.log" 2>/dev/null || true
     echo "--- b-run.log tail:"; tail -3 "$TMP/b-run.log" 2>/dev/null || true
     rm -rf /tmp/nattest-last; cp -r "$TMP" /tmp/nattest-last
