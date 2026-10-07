@@ -20,6 +20,9 @@ import android.view.WindowManager
  * across the internet (Appendix N). Its cost is that strangers in the
  * public DHT see this device's IP address, though not who it talks to.
  * Anonymous identities never use it.
+ *
+ * GIF search is off until the user agrees to it, as GIPHY sees what is
+ * searched for and this device's IP address ([Giphy]).
  */
 object Privacy {
     private const val PREFS = "privacy"
@@ -31,6 +34,7 @@ object Privacy {
     private const val VOLUNTEERS = "use_volunteers"
     private const val READ_RECEIPTS = "send_read_receipts"
     private const val TYPING = "send_typing"
+    private const val GIPHY = "giphy_search"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -67,6 +71,11 @@ object Privacy {
     fun sendReadReceipts(ctx: Context) = prefs(ctx).getBoolean(READ_RECEIPTS, true)
 
     fun sendTyping(ctx: Context) = prefs(ctx).getBoolean(TYPING, true)
+
+    /** Whether GIF search may contact GIPHY: only once the user agrees. */
+    fun giphy(ctx: Context) = prefs(ctx).getBoolean(GIPHY, false)
+
+    fun setGiphy(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(GIPHY, on).apply()
 
     fun setSendTyping(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(TYPING, on).apply()
 

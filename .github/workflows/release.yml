@@ -8,6 +8,8 @@
 #   ANDROID_KEYSTORE_PASSWORD
 #   ANDROID_KEY_ALIAS
 #   ANDROID_KEY_PASSWORD
+# GIF search uses GIPHY_API_KEY when set; without it, the app asks the user
+# for a key the first time GIF search is used.
 name: Release
 
 on:
@@ -185,6 +187,7 @@ jobs:
           THRENODY_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           THRENODY_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           THRENODY_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
         run: |
           apps/android/build.sh --emulator --release
           v="${{ needs.version.outputs.version }}"

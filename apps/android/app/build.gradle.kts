@@ -17,6 +17,13 @@ android {
         versionCode = System.getenv("THRENODY_VERSION_CODE")?.toInt()
             ?: versionName!!.substringBefore('-').split('.').map(String::toInt)
                 .let { (major, minor, patch) -> major * 1_000_000 + minor * 1_000 + patch }
+        // GIF search's GIPHY key: from CI's GIPHY_API_KEY secret, or a
+        // `giphyApiKey` Gradle property. Without one, the app asks for it.
+        val giphy = System.getenv("GIPHY_API_KEY") ?: (project.findProperty("giphyApiKey") as String?) ?: ""
+        buildConfigField("String", "GIPHY_API_KEY", "\"${giphy.replace("\"", "")}\"")
+    }
+    buildFeatures {
+        buildConfig = true
     }
     // Release signing comes only from the environment (CI secrets); the
     // key never lives in the repository. Without it, release builds are

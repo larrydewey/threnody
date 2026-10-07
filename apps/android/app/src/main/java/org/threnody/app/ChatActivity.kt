@@ -191,7 +191,7 @@ class ChatActivity : Activity() {
                     compose.text.replace(at, compose.selectionEnd.coerceAtLeast(at), e)
                 }.show()
             }, LinearLayout.LayoutParams(dp(44), dp(48)))
-            addView(button(R.drawable.ic_gif, "GIF from this phone", R.color.muted) { pick(photos = true, gifs = true) }, LinearLayout.LayoutParams(dp(44), dp(48)))
+            addView(button(R.drawable.ic_gif, "GIF", R.color.muted) { gifs() }, LinearLayout.LayoutParams(dp(44), dp(48)))
             addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             addView(button(R.drawable.ic_send, "Send", R.color.accent) { send() }, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
@@ -894,6 +894,62 @@ class ChatActivity : Activity() {
                 release()
             }
             if (picked != null) runOnUiThread { sendSheet(listOf(picked)) }
+        }
+    }
+
+    /**
+     * GIPHY's GIFs once the user has agreed to GIPHY seeing their searches;
+     * until then, or without an API key, the GIFs on this phone.
+     */
+    private fun gifs() {
+        val phone = { pick(photos = true, gifs = true) }
+        if (!Privacy.giphy(this)) {
+            SecureBuilder(this)
+                .setTitle("Search GIFs with GIPHY?")
+                .setMessage("GIPHY will see what you search for and this phone's IP address. " +
+                    "It won't see who you send GIFs to, and your contacts' phones never contact it. " +
+                    "You can turn this off in Settings.")
+                .setPositiveButton("Use GIPHY") { _, _ -> Privacy.setGiphy(this, true); gifs() }
+                .setNegativeButton("GIFs on this phone") { _, _ -> phone() }
+                .show()
+            return
+        }
+        if (Giphy.key(this).isBlank()) return giphyKey { gifs() }
+        GifPicker(this, phone) { g -> giphy(g) }.show()
+    }
+
+    /** Asks for a GIPHY API key (from developers.giphy.com), as this build has none. */
+    private fun giphyKey(then: () -> Unit) {
+        val field = EditText(this).apply {
+            hint = "API key"
+            wrapping(newlines = false, max = 1)
+        }
+        SecureBuilder(this)
+            .setTitle("GIPHY API key")
+            .setMessage("This copy of Threnody was built without one. Get a free key at developers.giphy.com.")
+            .setView(android.widget.FrameLayout(this).apply {
+                setPadding(dp(20), 0, dp(20), 0)
+                addView(field)
+            })
+            .setPositiveButton("Save") { _, _ ->
+                if (field.text.isNotBlank()) { Giphy.setKey(this, field.text.toString()); then() }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Downloads a GIF from GIPHY into the send sheet, like a picked photo. */
+    private fun giphy(g: Giphy.Gif) {
+        Toast.makeText(this, "Getting the GIF…", Toast.LENGTH_SHORT).show()
+        Giphy.net.execute {
+            try {
+                val max = node.maxFileSize().toLong()
+                val bytes = Giphy.get(g.full, max)
+                val picked = Picked("gif-${g.id.ifBlank { System.currentTimeMillis().toString() }}.gif", bytes, Uri.EMPTY)
+                runOnUiThread { sendSheet(listOf(picked)) }
+            } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this, "Couldn't get the GIF: ${e.message}", Toast.LENGTH_LONG).show() }
+            }
         }
     }
 

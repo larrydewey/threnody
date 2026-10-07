@@ -349,6 +349,11 @@ class MainActivity : Activity() {
                 if (it) "Contacts see “…” while you write to them"
                 else "Contacts don't see when you're typing"
             }
+            toggle("GIF search with GIPHY", Privacy.giphy(this@MainActivity),
+                { Privacy.setGiphy(this@MainActivity, it) }) {
+                if (it) "GIF search on: GIPHY sees your searches and this phone's IP address"
+                else "GIF search off: the GIF button offers only GIFs on this phone"
+            }
             menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
             menu.add("Screen security").apply {
                 isCheckable = true
