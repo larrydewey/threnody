@@ -28,7 +28,7 @@ cleanup() {
     iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o lo -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random)
     rm -rf "$TMP"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 mkmode() { [ "$1" = random ] && echo "--random" || echo ""; }
 
@@ -61,9 +61,9 @@ iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o lo -j SNAT --to-source 198.51.1
 iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o lo -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
 
 # Private DHT testnet (two nodes, second seeded from the first).
-"$BIN" --serve-dht 7460 > "$TMP/dht0.log" 2>&1 &
+timeout 300 "$BIN" --serve-dht 7460 > "$TMP/dht0.log" 2>&1 &
 sleep 1
-"$BIN" --serve-dht 7461 --extra 127.0.0.1:7460 > "$TMP/dht1.log" 2>&1 &
+timeout 300 "$BIN" --serve-dht 7461 --extra 127.0.0.1:7460 > "$TMP/dht1.log" 2>&1 &
 sleep 1
 BOOT="198.51.100.1:7460,198.51.100.1:7461"
 
@@ -77,8 +77,10 @@ FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
 ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --seek "$FPB" > "$TMP/a-run.log" 2>&1 &
+PA=$!
 ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --seek "$FPA" > "$TMP/b-run.log" 2>&1 &
-wait
+PB=$!
+wait $PA $PB || true
 
 echo "--- A:"; grep -h '^connected\|^addresses\|^note:' "$TMP/a-run.log" || tail -5 "$TMP/a-run.log"
 echo "--- B:"; grep -h '^connected\|^addresses\|^note:' "$TMP/b-run.log" || tail -5 "$TMP/b-run.log"
