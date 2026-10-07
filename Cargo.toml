@@ -43,6 +43,8 @@ rpassword = "7"
 # BBS signatures with blind issuance and per-verifier pseudonyms (IETF CFRG drafts).
 zkryptium = { version = "0.7.1", default-features = false, features = ["bbsplus_nym"] }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
+# Userspace WireGuard (boringtun) for Android/iOS/unprivileged
+boringtun = { version = "0.7.1", features = ["device"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

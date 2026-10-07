@@ -11,8 +11,11 @@ repository.workspace = true
 name = "threnody-desktop"
 path = "src/main.rs"
 
+[features]
+boringtun = ["threnody-ffi/boringtun"]
+
 [dependencies]
-threnody-ffi = { path = "../../crates/threnody-ffi" }
+threnody-ffi = { path = "../../crates/threnody-ffi", features = ["boringtun"] }
 threnody-core.workspace = true
 # GTK 4.14 and libadwaita 1.5 are what Ubuntu 24.04 and Debian 13 ship.
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }

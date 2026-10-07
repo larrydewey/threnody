@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+boringtun = ["boringtun/device"]
+
 [dependencies]
 threnody-core.workspace = true
 tokio.workspace = true
@@ -15,6 +18,7 @@ zeroize.workspace = true
 socket2.workspace = true
 const-cbor.workspace = true
 anyhow.workspace = true
+boringtun = { workspace = true, optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "log"] }
 rcgen = "0.14"

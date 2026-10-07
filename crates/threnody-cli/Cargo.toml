@@ -28,6 +28,8 @@ jiff = "0.2.38"
 default = ["ble"]
 # Bluetooth LE transport via BlueZ (Linux only).
 ble = ["dep:bluer", "dep:futures-util"]
+# Userspace WireGuard via boringtun (Android, iOS, unprivileged).
+boringtun = ["threnody-net/boringtun"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
