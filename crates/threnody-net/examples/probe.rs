@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bind: std::net::SocketAddr = if spec.contains(':') {
             spec.parse()?
         } else {
-            ("0.0.0.0", spec.parse().unwrap()).into()
+            format!("0.0.0.0:{spec}").parse()?
         };
         let sock = tokio::net::UdpSocket::bind(bind).await?;
         println!("reflector on {bind}");
