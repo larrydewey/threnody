@@ -191,6 +191,7 @@ class ChatActivity : Activity() {
                     compose.text.replace(at, compose.selectionEnd.coerceAtLeast(at), e)
                 }.show()
             }, LinearLayout.LayoutParams(dp(44), dp(48)))
+            addView(button(R.drawable.ic_gif, "GIF from this phone", R.color.muted) { pick(photos = true, gifs = true) }, LinearLayout.LayoutParams(dp(44), dp(48)))
             addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             addView(button(R.drawable.ic_send, "Send", R.color.accent) { send() }, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
@@ -854,14 +855,20 @@ class ChatActivity : Activity() {
         }.show()
     }
 
-    private fun pick(photos: Boolean) {
+    /**
+     * Photos, files, or (`gifs`) only the GIFs already on this phone: no
+     * GIF service is asked. The keyboard's GIF search works too; see
+     * [ComposeField].
+     */
+    private fun pick(photos: Boolean, gifs: Boolean = false) {
         val intent = if (photos && android.os.Build.VERSION.SDK_INT >= 33) {
             // The system photo picker: no storage permission needed.
             Intent(android.provider.MediaStore.ACTION_PICK_IMAGES)
                 .putExtra(android.provider.MediaStore.EXTRA_PICK_IMAGES_MAX, MAX_PICK)
+                .apply { if (gifs) type = "image/gif" }
         } else {
             Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                .setType(if (photos) "image/*" else "*/*")
+                .setType(if (gifs) "image/gif" else if (photos) "image/*" else "*/*")
                 .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
         startActivityForResult(intent, PICK_FILE)
@@ -912,11 +919,14 @@ class ChatActivity : Activity() {
                 val picked = uris.take(MAX_PICK).map { uri ->
                     // Keep access so a sent file can be opened from the chat later.
                     try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
-                    val (name, size) = contentResolver.query(uri, null, null, null, null)?.use { c ->
+                    val (shown, size) = contentResolver.query(uri, null, null, null, null)?.use { c ->
                         c.moveToFirst()
                         c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) to
                             c.getLong(c.getColumnIndexOrThrow(OpenableColumns.SIZE))
                     } ?: ("file" to -1L)
+                    // A GIF must be named one to be shown animated.
+                    val gif = contentResolver.getType(uri) == "image/gif" && !Media.isGif(shown)
+                    val name = if (gif) shown.substringBeforeLast('.') + ".gif" else shown
                     if (size > max * 2) throw IllegalArgumentException("$name is too large")
                     val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                         ?: throw IllegalArgumentException("couldn't read $name")
@@ -1002,7 +1012,9 @@ class ChatActivity : Activity() {
                 addView(label("Location and camera details are removed before sending.", 12f, R.color.muted), matchWrap)
             }
         }
+        val gifs = picked.count { Media.isGif(it.name) }
         val what = when {
+            gifs == picked.size -> if (gifs == 1) "1 GIF" else "$gifs GIFs"
             images == picked.size -> if (images == 1) "1 photo" else "$images photos"
             picked.size == 1 -> "1 file"
             else -> "${picked.size} files"
