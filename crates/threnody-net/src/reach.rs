@@ -101,6 +101,10 @@ pub struct ReachConfig {
     pub regather: Duration,
     /// Also offer loopback addresses and keep the DHT on loopback (tests).
     pub loopback: bool,
+    /// Offer our LAN address as a candidate (same-NAT dial shortcut).
+    /// Off in the netns NAT test, where two subnets can't share one
+    /// public address anyway.
+    pub local_candidates: bool,
     /// An always-on, mutually approved contact we keep a session with
     /// (direct or through a relay circuit). It carries our address
     /// updates immediately, and its circuit's death means we moved.
@@ -118,6 +122,7 @@ impl Default for ReachConfig {
             republish: Duration::from_secs(1800),
             regather: Duration::from_secs(600),
             loopback: false,
+            local_candidates: true,
             anchor: None,
         }
     }
@@ -579,7 +584,8 @@ impl Node {
                 addr: a,
             });
         }
-        if let Some(ip) = route_source("0.0.0.0:0", "8.8.8.8:53")
+        if cfg.local_candidates
+            && let Some(ip) = route_source("0.0.0.0:0", "8.8.8.8:53")
             && !ip.is_loopback()
             && !ip.is_unspecified()
         {

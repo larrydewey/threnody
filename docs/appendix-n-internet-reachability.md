@@ -151,7 +151,7 @@ Android itself reported the change about 2.5 s after Wi-Fi was turned off. AT&T 
 An app starting after a long time away is found at the contact's next read of its record: within about 20 s while the contact's app is open, 15 minutes in the background.
 
 **Still to do:**
-- **Two phones.** Everything above was measured between a phone and a laptop.
+- **Two phones.** Everything above was measured between a phone and a laptop; the lab equivalent is `scripts/nattest.sh` (sudo) and the remaining step is repeating it on-device.
 
 ## Privacy
 
