@@ -73,14 +73,20 @@ trap cleanup EXIT INT TERM
 
 # A symmetric NAT assigns a fresh external port per flow.
 #
-# Not `SNAT --random`: iptables-translate renders it as `snat to <ip> random`,
-# and the reflector still saw the port preserved at 7450, so the random NAT
-# was not randomising and the combo silently tested cone/cone again. An
-# explicit port range is the form that translates to a real nft range, so the
-# kernel picks a different port per flow.
+# Two things bite here, both found by reading the reflector log rather than
+# the rule list:
+#  - 'SNAT --random' translates to 'snat to <ip> random', which does not
+#    randomise the port on this backend;
+#  - an explicit range that *contains* the listening port does not help
+#    either, because nf_nat preserves the original port when it falls inside
+#    the range. With :1024-65535 the reflector still saw 7450.
+#
+# So the range must exclude the port the node listens on, forcing the kernel
+# to pick another: :20000-65535.
 #
 # One rule per protocol: iptables accepts a single -p.
-mkmode() { [ "$1" = random ] && echo ":1024-65535" || echo ""; }
+NAT_PORT=20000-65535
+mkmode() { [ "$1" = random ] && echo ":$NAT_PORT" || echo ""; }
 
 # snat_rule <src-subnet> <out-if> <public-ip> <mode>
 snat_rule() {
@@ -243,6 +249,7 @@ dial_alias=$(echo "$nat_dials" | grep -c '198\.51\.100\.2\|203\.0\.113\.2' || tr
 dial_lan=$(echo "$nat_dials" | grep -c ' 10\.0\.' || true)
 
 echo "note: dialled aliases=$dial_alias lan=$dial_lan"
+echo "note: reflector saw: $(grep -ho 'from [^ ]*' "$TMP/refl.log" 2>/dev/null | sort -u | paste -sd' ')"
 if [ "$dial_lan" -gt 0 ]; then
     echo "note: a dial targeted a lab LAN address; the shortcut was used"
 fi
