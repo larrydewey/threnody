@@ -57,9 +57,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // back (like libtorrent DHT nodes), so `gather` learns our NATed
     // address even against a mainline testnet that omits ping replies.
     if has(&args, "--serve-reflector") {
-        let port: u16 = arg(&args, "--serve-reflector").unwrap().parse()?;
-        let sock = tokio::net::UdpSocket::bind(("0.0.0.0", port)).await?;
-        println!("reflector on :{port}");
+        let spec = arg(&args, "--serve-reflector").unwrap();
+        // Bind the exact address: replies then leave from that address.
+        let bind: std::net::SocketAddr = if spec.contains(':') {
+            spec.parse()?
+        } else {
+            ("0.0.0.0", spec.parse().unwrap()).into()
+        };
+        let sock = tokio::net::UdpSocket::bind(bind).await?;
+        println!("reflector on {bind}");
         loop {
             let mut buf = [0u8; 2048];
             let (n, src) = sock.recv_from(&mut buf).await?;

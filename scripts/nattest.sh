@@ -91,7 +91,7 @@ sleep 1
 ip netns exec I timeout 300 "$BIN" --serve-dht 7461 --extra 198.51.100.1:7460 > "$TMP/dht1.log" 2>&1 &
 sleep 1
 BOOT="198.51.100.1:7460,198.51.100.1:7461"
-ip netns exec I timeout 300 "$BIN" --serve-reflector 7462 > "$TMP/refl.log" 2>&1 &
+ip netns exec I timeout 300 "$BIN" --serve-reflector 198.51.100.1:7462 > "$TMP/refl.log" 2>&1 &
 sleep 1
 
 # Bootstrap an approved contact over the direct host link.
