@@ -107,7 +107,7 @@ object Threnody {
     @Synchronized
     private fun openPersona(ctx: Context, rec: PersonaRecord): ThrenodyNode {
         personaNodes[rec.id]?.let { return it }
-        val n = ThrenodyNode.open(rec.home, KeyVault.passphrase(ctx, rec.home))
+        val n = ThrenodyNode.open(rec.home, KeyVault.passphrase(ctx, rec.home), null)
         val port = prefs(ctx).getInt("port_${rec.id}", 0)
         val addr = try { n.listen("0.0.0.0:$port") } catch (_: Exception) { n.listen("0.0.0.0:0") }
         prefs(ctx).edit().putInt("port_${rec.id}", addr.substringAfterLast(':').toInt()).apply()
@@ -398,7 +398,7 @@ object Threnody {
     /** Opens the node, its identity sealed under the Android Keystore. */
     private fun open(ctx: Context): ThrenodyNode {
         val home = ctx.filesDir.resolve("threnody").path
-        return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home))
+        return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home), null)
     }
 
     /** Subscribes to node events (called on the event thread); returns an unsubscriber. */

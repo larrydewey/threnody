@@ -17,6 +17,7 @@ use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, SecureChannel, now_ms};
+use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -63,6 +64,15 @@ impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secret(<redacted>)")
     }
+}
+
+/// A peer's WireGuard tunnel info.
+#[derive(Clone)]
+pub struct TunnelPeer {
+    pub wg_public: [u8; 32],
+    pub endpoint: SocketAddr,
+    pub overlay: Ipv6Addr,
+    pub psk: Secret,
 }
 
 /// Something the user interface should know about.
@@ -370,9 +380,9 @@ pub(crate) struct Shared {
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
     pub(crate) default_timer: std::sync::atomic::AtomicU32,
-    tunnel: Option<(u16, [u8; 32])>,
-    /// WireGuard keys peers offered us, for clean removal on revocation.
-    tunnel_peers: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
+    tunnel: Mutex<Option<(u16, [u8; 32])>>,
+    /// WireGuard peers offered us, for config and live apply.
+    tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
     pub(crate) relay: Mutex<RelayState>,
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
@@ -423,11 +433,11 @@ impl Shared {
     }
 
     fn tunnel_down(&self, peer: &PublicIdentity) {
-        if self.tunnel.is_some() {
-            let wg_public = lock(&self.tunnel_peers).remove(peer);
+        if lock(&self.tunnel).is_some() {
+            let removed = lock(&self.tunnel_peers).remove(peer);
             self.emit(Event::TunnelDown {
                 peer: *peer,
-                wg_public,
+                wg_public: removed.map(|tp| tp.wg_public),
             });
         }
     }
@@ -555,7 +565,7 @@ impl Node {
             profile: Mutex::new(profile),
             strip_metadata: std::sync::atomic::AtomicBool::new(true),
             default_timer: std::sync::atomic::AtomicU32::new(0),
-            tunnel,
+            tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
             relay: Mutex::new(RelayState::default()),
             prekeys: Mutex::new(prekeys),
@@ -638,12 +648,94 @@ impl Node {
 
     /// WireGuard listen port, when tunnels are enabled.
     pub fn tunnel_port(&self) -> Option<u16> {
-        self.shared.tunnel.map(|(p, _)| p)
+        lock(&self.shared.tunnel).map(|(p, _)| p)
     }
 
     /// Peers that currently have a tunnel configured.
     pub fn tunnel_peers(&self) -> Vec<PublicIdentity> {
         lock(&self.shared.tunnel_peers).keys().copied().collect()
+    }
+
+    /// Returns full tunnel peer info for config generation.
+    pub fn tunnel_peers_full(&self) -> Vec<TunnelPeer> {
+        lock(&self.shared.tunnel_peers).values().cloned().collect()
+    }
+
+    /// Sets the WireGuard tunnel port. Changing this restarts tunnel state.
+    pub fn set_tunnel_port(&self, port: Option<u16>) -> Result<()> {
+        let new_tunnel = port.map(|p| (p, *WgKeys::derive(&self.shared.identity).public()));
+        *lock(&self.shared.tunnel) = new_tunnel;
+        // Clear existing tunnel peers since port changed
+        lock(&self.shared.tunnel_peers).clear();
+        Ok(())
+    }
+
+    /// Applies current tunnel peers to a WireGuard interface via `wg set`.
+    /// Requires CAP_NET_ADMIN or root.
+    pub fn apply_wireguard(&self, iface: &str) -> Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let keys = WgKeys::derive(&self.shared.identity);
+        let port = self.tunnel_port().unwrap_or(51820);
+
+        // First, set the interface's private key and listen port
+        let mut child = Command::new("wg")
+            .args(["set", iface, "listen-port", &port.to_string(), "private-key", "/dev/stdin"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running wg (is wireguard-tools installed?)")?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(keys.secret_base64().as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "wg set listen-port/private-key: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ).into());
+        }
+
+        // Then add/update each peer
+        for peer in self.tunnel_peers_full() {
+            let psk = zeroize::Zeroizing::new(threnody_core::tunnel::base64(&peer.psk.0[..]));
+            let mut child = Command::new("wg")
+                .args([
+                    "set",
+                    iface,
+                    "peer",
+                    &threnody_core::tunnel::base64(&peer.wg_public),
+                    "preshared-key",
+                    "/dev/stdin",
+                    "endpoint",
+                    &peer.endpoint.to_string(),
+                    "allowed-ips",
+                    &format!("{}/128", peer.overlay),
+                    "persistent-keepalive",
+                    "25",
+                ])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("running wg")?;
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(psk.as_bytes())?;
+            let status = child.wait_with_output()?;
+            if !status.status.success() {
+                return Err(anyhow::anyhow!(
+                    "wg set peer: {}",
+                    String::from_utf8_lossy(&status.stderr).trim()
+                ).into());
+            }
+        }
+
+        Ok(())
     }
 
     /// Binds a TCP listener and accepts sessions in the background.
@@ -811,7 +903,7 @@ impl Node {
         }
     }
 
-    pub(crate) fn identity_ref(&self) -> &Identity {
+    pub fn identity_ref(&self) -> &Identity {
         &self.shared.identity
     }
 
@@ -1267,7 +1359,7 @@ where
             }
             // Offer a tunnel once per session, as soon as approval is mutual.
             // Tunnels need a direct UDP path, so never over relayed sessions.
-            if let Some((port, wg_public)) = shared.tunnel
+            if let Some((port, wg_public)) = *lock(&shared.tunnel)
                 && via.is_none()
                 && !offered
                 && shared.mutual(&peer)
@@ -1396,14 +1488,20 @@ where
                         }
                         AppMessage::TunnelOffer { wg_public, port } => {
                             // Spec §8: tunnels only between mutually approved devices.
-                            if shared.tunnel.is_some() && shared.mutual(&peer) {
-                                lock(&shared.tunnel_peers).insert(peer, wg_public);
-                                shared.emit(Event::TunnelUp {
-                                    peer,
+                            if lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
+                                let tp = TunnelPeer {
                                     wg_public,
                                     endpoint: SocketAddr::new(addr.ip(), port),
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
+                                };
+                                lock(&shared.tunnel_peers).insert(peer, tp.clone());
+                                shared.emit(Event::TunnelUp {
+                                    peer,
+                                    wg_public: tp.wg_public,
+                                    endpoint: tp.endpoint,
+                                    overlay: tp.overlay,
+                                    psk: tp.psk,
                                 });
                             }
                         }

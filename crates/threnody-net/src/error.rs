@@ -23,6 +23,8 @@ pub enum NetError {
     NoRoute(String),
     #[error("node has shut down")]
     Shutdown,
+    #[error("external: {0}")]
+    External(#[from] anyhow::Error),
 }
 
 pub type Result<T> = core::result::Result<T, NetError>;

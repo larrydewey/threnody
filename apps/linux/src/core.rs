@@ -74,21 +74,21 @@ pub fn open_main(
             Protect::Passphrase(p) => Some(p),
             Protect::Nothing => None,
         };
-        return ThrenodyNode::open(dir, pw).map_err(failed);
+        return ThrenodyNode::open(dir, pw, None).map_err(failed);
     }
     if !threnody_ffi::identity_is_sealed(dir.clone()).map_err(failed)? {
         // Seal a plain identity, as `threnody keyring on` would.
         if let Ok(pw) = keyring::create(home) {
             if threnody_ffi::change_passphrase(dir.clone(), None, Some(pw.0.clone())).is_err() {
                 keyring::delete(home);
-                return ThrenodyNode::open(dir, None).map_err(failed);
+                return ThrenodyNode::open(dir, None, None).map_err(failed);
             }
-            return ThrenodyNode::open(dir, Some(pw.0.clone())).map_err(failed);
+            return ThrenodyNode::open(dir, Some(pw.0.clone()), None).map_err(failed);
         }
-        return ThrenodyNode::open(dir, None).map_err(failed);
+        return ThrenodyNode::open(dir, None, None).map_err(failed);
     }
     if let Some(pw) = passphrase {
-        return ThrenodyNode::open(dir, Some(pw)).map_err(|e| {
+        return ThrenodyNode::open(dir, Some(pw), None).map_err(|e| {
             OpenError::Failed(if e.to_string().to_lowercase().contains("decrypt") {
                 "Wrong passphrase".into()
             } else {
@@ -98,7 +98,7 @@ pub fn open_main(
     }
     match keyring::get(home) {
         Some(pw) => {
-            ThrenodyNode::open(dir, Some(pw.0.clone())).map_err(|_| OpenError::NeedPassphrase)
+            ThrenodyNode::open(dir, Some(pw.0.clone()), None).map_err(|_| OpenError::NeedPassphrase)
         }
         None => Err(OpenError::NeedPassphrase),
     }
@@ -495,7 +495,7 @@ impl Core {
         } else {
             None
         };
-        let node = ThrenodyNode::open(rec.home.clone(), pw).map_err(|e| e.to_string())?;
+        let node = ThrenodyNode::open(rec.home.clone(), pw, None).map_err(|e| e.to_string())?;
         let key = format!("port_{}", rec.id);
         let want = self.settings().number(&key).unwrap_or(0);
         let addr = node
