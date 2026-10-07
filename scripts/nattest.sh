@@ -102,9 +102,9 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" > "$TMP/a-run.log" 2>&1 &
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
 
