@@ -59,6 +59,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Answer BEP42-style KRPC pings: report the querier's source address
+    // back (like libtorrent DHT nodes), so `gather` learns our NATed
+    // address even against a mainline testnet that omits ping replies.
+    if has(&args, "--serve-reflector") {
+        let port: u16 = arg(&args, "--serve-reflector").unwrap().parse()?;
+        let sock = tokio::net::UdpSocket::bind(("0.0.0.0", port)).await?;
+        println!("reflector on :{port}");
+        loop {
+            let mut buf = [0u8; 2048];
+            let (n, src) = sock.recv_from(&mut buf).await?;
+            let data = &buf[..n];
+            if data
+                .windows(b"q4:ping".len())
+                .any(|w| w == b"q4:ping")
+            {
+                let Some(i) = data.windows(b"1:t2:".len()).position(|w| w == b"1:t2:") else {
+                    continue;
+                };
+                let tid = &data[i + 5..i + 7];
+                let std::net::IpAddr::V4(a) = src.ip() else {
+                    continue;
+                };
+                let mut r = b"d2:ip6:".to_vec();
+                r.extend_from_slice(&a.octets());
+                r.extend_from_slice(&src.port().to_be_bytes());
+                r.extend_from_slice(b"1:rd2:id20:");
+                r.extend_from_slice(&threnody_core::crypto::random_bytes::<20>());
+                r.extend_from_slice(b"1:t2:");
+                r.extend_from_slice(tid);
+                r.extend_from_slice(b"1:y1:re");
+                sock.send_to(&r, src).await?;
+            }
+        }
+    }
+
     let fp = identity.public().fingerprint();
     let (node, mut rx) = Node::new(NodeConfig {
         home,
@@ -111,9 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(b) = arg(&args, "--bootstrap") {
         bs.extend(b.split(',').map(|s| s.to_owned()));
     }
+    let mut refls = Vec::new();
+    if let Some(r) = arg(&args, "--reflect") {
+        refls.extend(r.split(',').map(|s| s.to_owned()));
+    }
     let cfg = ReachConfig {
         bootstrap: (!bs.is_empty()).then_some(bs),
-        reflectors: vec![],
+        reflectors: refls,
         loopback: has(&args, "--loopback"),
         local_candidates: !has(&args, "--no-local"),
         poll_foreground: Duration::from_secs(1),
@@ -134,6 +173,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => return Err(format!("unknown contact {q:?}").into()),
         }
     }
+    let watcher = node.clone();
+    tokio::spawn(async move {
+        loop {
+            let r = watcher.reachability();
+            println!("reach: online {} candidates {:?} symmetric {}", r.online, r.candidates, r.symmetric);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
     loop {
         match rx.recv().await {
             Some(Event::Connected { peer, addr, via, .. }) => {

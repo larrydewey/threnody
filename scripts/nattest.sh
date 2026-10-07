@@ -73,6 +73,8 @@ sleep 1
 timeout 300 "$BIN" --serve-dht 7461 --extra 127.0.0.1:7460 > "$TMP/dht1.log" 2>&1 &
 sleep 1
 BOOT="198.51.100.1:7460,198.51.100.1:7461"
+timeout 300 "$BIN" --serve-reflector 7462 > "$TMP/refl.log" 2>&1 &
+sleep 1
 
 # Bootstrap an approved contact over the direct veth link.
 ip netns exec A "$BIN" --home "$TMP/a" --accept 7451 > "$TMP/a-accept.log" 2>&1 &
@@ -83,9 +85,9 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --seek "$FPB" > "$TMP/a-run.log" 2>&1 &
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --seek "$FPA" > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
 
