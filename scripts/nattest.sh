@@ -67,6 +67,11 @@ cleanup() {
     iptables -D FORWARD -m mark --mark 0x1 -j DROP 2>/dev/null
     iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     iptables -t mangle -D PREROUTING -s 10.0.0.0/16 -d 10.0.0.0/16 -m conntrack --ctstate NEW -j MARK --set-mark 0x1 2>/dev/null
+    # An interrupted run can leave a namespace or rules behind; make the
+    # next run start clean rather than inheriting stale state.
+    iptables -t nat -S POSTROUTING | grep -vE '^(-P|--) ' | grep -vE '10\.0\.[12]\.0/24' | while read -r r; do
+        iptables -t nat $(echo "${r#-A}" | sed 's/^-A/-D/') 2>/dev/null || true
+    done
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -164,6 +169,19 @@ ip route add 198.51.100.0/24 via 172.16.0.2 2>/dev/null || true
 ip route add 203.0.113.0/24 via 172.16.0.2 2>/dev/null || true
 echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 
+# Leftovers from an earlier, interrupted run would sit ahead of ours in
+# POSTROUTING and win the match, silently preserving the port no matter what
+# rules we add. An early version of this script had no cleanup trap, so a
+# ^C could leave exactly that behind. Show the whole chain before we touch
+# it, and refuse to run if anything unexpected is already there.
+leftovers=$(iptables -t nat -S POSTROUTING | grep -vE '^(-P|--) ' | grep -vE '10\.0\.[12]\.0/24' || true)
+if [ -n "$leftovers" ]; then
+    echo "refusing to run: unexpected rules already in nat/POSTROUTING:" >&2
+    echo "$leftovers" >&2
+    echo "  review them, then: sudo iptables -t nat -F POSTROUTING" >&2
+    exit 1
+fi
+
 snat_rule 10.0.1.0/24 vethC 198.51.100.2 "$A_MODE"
 snat_rule 10.0.2.0/24 vethC 203.0.113.2 "$B_MODE"
 
@@ -250,6 +268,13 @@ dial_lan=$(echo "$nat_dials" | grep -c ' 10\.0\.' || true)
 
 echo "note: dialled aliases=$dial_alias lan=$dial_lan"
 echo "note: reflector saw: $(grep -ho 'from [^ ]*' "$TMP/refl.log" 2>/dev/null | sort -u | paste -sd' ')"
+# A cone NAT preserves the listening port (7450). A symmetric one must not:
+# if the reflector still sees 7450 from a random NAT, the port range is not
+# taking effect and the combo is not testing what it claims.
+refl_ports=$(grep -ho 'from [^ ]*:7450' "$TMP/refl.log" 2>/dev/null | sort -u | wc -l)
+if [ "$A_MODE" = random ] && [ "$B_MODE" = random ] && [ "$refl_ports" -gt 0 ]; then
+    echo "note: a random NAT still shows port 7450; the symmetric case is not being modelled"
+fi
 if [ "$dial_lan" -gt 0 ]; then
     echo "note: a dial targeted a lab LAN address; the shortcut was used"
 fi
