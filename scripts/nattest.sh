@@ -201,18 +201,30 @@ b_dir=$(grep -c '^connected to .* via direct' "$TMP/b-run.log" || true)
 a_relay=$(grep -c '^connected to .* via relay' "$TMP/a-run.log" || true)
 b_relay=$(grep -c '^connected to .* via relay' "$TMP/b-run.log" || true)
 
-# A "direct" session is only evidence if it crossed the NAT. A peer's LAN
-# address (10.0.x.x) means the two nodes found each other behind the NAT's
-# back, which is exactly the back door the isolation rules exist to close.
-# Treat that as no path at all, so a shortcut can never read as a pass.
-if grep -h '^connected to .* via direct 10\.' "$TMP/a-run.log" "$TMP/b-run.log" | grep -q .; then
-    echo "note: a session used a lab LAN address; the NAT was bypassed (see below)"
-    echo "      (this is a lab defect, not a result)"
-    bypass=1
-else
-    bypass=0
+# The app logs the address it actually dialled ("session with ... dialed
+# over quic at <addr>"), from its own knowledge of the candidate list. That
+# is the only signal worth grading: an alias means the punch crossed the
+# NAT, a 10.0.x.x LAN address means the two nodes dialled each other
+# directly, which is the back door the isolation rules exist to close.
+#
+# Deliberately not judging from the "connected ... via direct" line: for an
+# accepted inbound session the peer is reported as it arrived at the socket,
+# i.e. post-DNAT, so a LAN address there is legitimate. Nor from conntrack:
+# it records the expected reply tuple even when no reply ever arrives.
+nat_dials=$(grep -ho 'dialed over quic at [^ ]*' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | sort -u || true)
+dial_alias=$(echo "$nat_dials" | grep -c '198\.51\.100\.2\|203\.0\.113\.2' || true)
+dial_lan=$(echo "$nat_dials" | grep -c ' 10\.0\.' || true)
+
+echo "note: dialled aliases=$dial_alias lan=$dial_lan"
+if [ "$dial_lan" -gt 0 ]; then
+    echo "note: a dial targeted a lab LAN address; the shortcut was used"
 fi
-[ "$bypass" -eq 1 ] && { a_dir=0; b_dir=0; }
+
+if [ "$dial_alias" -gt 0 ]; then
+    a_dir=1; b_dir=1
+else
+    a_dir=0; b_dir=0
+fi
 
 # A punch only works when both NATs are cone: a symmetric side has no
 # inbound path, so neither can reach the other directly.
@@ -235,7 +247,7 @@ elif [ "$want" = none ] && [ "$a_dir" -eq 0 ] && [ "$b_dir" -eq 0 ]; then
     exit 0
 fi
 
-echo "RESULT: FAIL ($A_MODE/$B_MODE) wanted $want; got direct=$a_dir/$b_dir relay=$a_relay/$b_relay${bypass:+ bypassed=1}"
+echo "RESULT: FAIL ($A_MODE/$B_MODE) wanted $want; got direct=$a_dir/$b_dir relay=$a_relay/$b_relay${dial_lan:+ lan=$dial_lan}"
 echo "--- refl.log (NATed sources seen by the reflector):"; tail -4 "$TMP/refl.log" 2>/dev/null || true
 dump_nat
 echo "--- last dial attempts:"; grep -h 'dialing\|dialed over' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | tail -6 || true
