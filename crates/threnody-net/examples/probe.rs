@@ -38,12 +38,6 @@ fn find_contact<'a>(contacts: &'a Contacts, q: &str) -> Option<&'a threnody_core
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let home_dir = arg(&args, "--home").unwrap_or_else(|| "probe-home".into());
-    let home = Home::new(home_dir);
-    let identity = match home.load_identity(None) {
-        Ok(i) => i,
-        Err(_) => home.create_identity(None).unwrap(),
-    };
     // Serve a tiny DHT for the netns test: `probe --serve-dht PORT [BOOT]`.
     if has(&args, "--serve-dht") {
         let port: u16 = arg(&args, "--serve-dht").unwrap().parse()?;
@@ -94,6 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let home_dir = arg(&args, "--home").unwrap_or_else(|| "probe-home".into());
+    let home = Home::new(home_dir);
+    let identity = match home.load_identity(None) {
+        Ok(i) => i,
+        Err(_) => home.create_identity(None).unwrap(),
+    };
     let fp = identity.public().fingerprint();
     let (node, mut rx) = Node::new(NodeConfig {
         home,
