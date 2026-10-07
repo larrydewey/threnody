@@ -51,6 +51,8 @@ cleanup() {
     ip route del 203.0.113.0/24 2>/dev/null
     iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
     iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
+    iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethB -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
+    iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethA -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
     # Port mappings: the cone NAT's inbound path. Without these nothing owns
     # the NAT aliases, so packets addressed to them loop host->INT->host.
     for p in udp tcp; do
@@ -132,6 +134,15 @@ echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
 iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
 
+# A cone NAT's inbound DNAT redirects to the peer's *private* address, so
+# the packet then leaves via that LAN's veth, not vethC. Without these the
+# `-o vethC` rules above never fire for it and the flow completes
+# LAN-to-LAN with no translation at all: the alias resolves, and then the
+# two nodes are talking directly behind the NAT's back. Translate the
+# reply direction too, so a punched session really does cross the NAT.
+iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethB -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
+iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethA -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
+
 # A cone NAT keeps one mapping per internal port, so anything arriving for
 # that port is delivered. That is the inbound path hole punching relies on,
 # and the same one a router port mapping (UPnP IGD / PCP / NAT-PMP) grants.
@@ -190,6 +201,19 @@ b_dir=$(grep -c '^connected to .* via direct' "$TMP/b-run.log" || true)
 a_relay=$(grep -c '^connected to .* via relay' "$TMP/a-run.log" || true)
 b_relay=$(grep -c '^connected to .* via relay' "$TMP/b-run.log" || true)
 
+# A "direct" session is only evidence if it crossed the NAT. A peer's LAN
+# address (10.0.x.x) means the two nodes found each other behind the NAT's
+# back, which is exactly the back door the isolation rules exist to close.
+# Treat that as no path at all, so a shortcut can never read as a pass.
+if grep -h '^connected to .* via direct 10\.' "$TMP/a-run.log" "$TMP/b-run.log" | grep -q .; then
+    echo "note: a session used a lab LAN address; the NAT was bypassed (see below)"
+    echo "      (this is a lab defect, not a result)"
+    bypass=1
+else
+    bypass=0
+fi
+[ "$bypass" -eq 1 ] && { a_dir=0; b_dir=0; }
+
 # A punch only works when both NATs are cone: a symmetric side has no
 # inbound path, so neither can reach the other directly.
 if [ "$A_MODE" = plain ] && [ "$B_MODE" = plain ]; then
@@ -211,7 +235,7 @@ elif [ "$want" = none ] && [ "$a_dir" -eq 0 ] && [ "$b_dir" -eq 0 ]; then
     exit 0
 fi
 
-echo "RESULT: FAIL ($A_MODE/$B_MODE) wanted $want; got direct=$a_dir/$b_dir relay=$a_relay/$b_relay"
+echo "RESULT: FAIL ($A_MODE/$B_MODE) wanted $want; got direct=$a_dir/$b_dir relay=$a_relay/$b_relay${bypass:+ bypassed=1}"
 echo "--- refl.log (NATed sources seen by the reflector):"; tail -4 "$TMP/refl.log" 2>/dev/null || true
 dump_nat
 echo "--- last dial attempts:"; grep -h 'dialing\|dialed over' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | tail -6 || true
