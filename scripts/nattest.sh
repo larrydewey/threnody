@@ -67,11 +67,9 @@ cleanup() {
     iptables -D FORWARD -m mark --mark 0x1 -j DROP 2>/dev/null
     iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     iptables -t mangle -D PREROUTING -s 10.0.0.0/16 -d 10.0.0.0/16 -m conntrack --ctstate NEW -j MARK --set-mark 0x1 2>/dev/null
-    # An interrupted run can leave a namespace or rules behind; make the
-    # next run start clean rather than inheriting stale state.
-    iptables -t nat -S POSTROUTING | grep -vE '^(-P|--) ' | grep -vE '10\.0\.[12]\.0/24' | while read -r r; do
-        iptables -t nat $(echo "${r#-A}" | sed 's/^-A/-D/') 2>/dev/null || true
-    done
+    # An interrupted run can leave a namespace behind; make the next run
+    # start clean rather than inheriting stale state. Only ever remove our
+    # own rules -- a table flush would take out the host's containers.
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -169,16 +167,23 @@ ip route add 198.51.100.0/24 via 172.16.0.2 2>/dev/null || true
 ip route add 203.0.113.0/24 via 172.16.0.2 2>/dev/null || true
 echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 
-# Leftovers from an earlier, interrupted run would sit ahead of ours in
-# POSTROUTING and win the match, silently preserving the port no matter what
-# rules we add. An early version of this script had no cleanup trap, so a
-# ^C could leave exactly that behind. Show the whole chain before we touch
-# it, and refuse to run if anything unexpected is already there.
-leftovers=$(iptables -t nat -S POSTROUTING | grep -vE '^(-P|--) ' | grep -vE '10\.0\.[12]\.0/24' || true)
-if [ -n "$leftovers" ]; then
-    echo "refusing to run: unexpected rules already in nat/POSTROUTING:" >&2
-    echo "$leftovers" >&2
-    echo "  review them, then: sudo iptables -t nat -F POSTROUTING" >&2
+# Guard against rules that could actually steal our flows, not just any
+# pre-existing rule. Docker installs MASQUERADE rules for 172.17/172.18 on a
+# normal machine; those never match 10.0.1.0/24 or 10.0.2.0/24 and are
+# harmless, so their presence must not stop the run. Never suggest flushing
+# POSTROUTING: that would take out the host's containers.
+#
+# Only a NAT rule that matches our lab subnets but is not one of ours can
+# preserve the port we are trying to randomise.
+foreign=$(iptables -t nat -S POSTROUTING \
+    | grep -E '10\.0\.[12]\.0/24' \
+    | grep -vE -- '-o veth[ABC] .*SNAT .*(198\.51\.100\.2|203\.0\.113\.2)' \
+    || true)
+if [ -n "$foreign" ]; then
+    echo "refusing to run: another rule already matches the lab subnets," >&2
+    echo "and would win the match before ours:" >&2
+    echo "$foreign" >&2
+    echo "  remove just that rule (not a table flush), then re-run." >&2
     exit 1
 fi
 
