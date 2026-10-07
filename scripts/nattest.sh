@@ -6,8 +6,13 @@
 # (plain = port-preserving, random = per-flow port like CGNAT).
 # A third "internet" netns holds the private DHT + reflector.
 #
-#   sudo ./scripts/nattest.sh plain plain   # expect direct QUIC
-#   sudo ./scripts/nattest.sh random random # expect no direct path
+#   sudo ./scripts/nattest.sh plain plain   # cone NATs: direct QUIC expected
+#   sudo ./scripts/nattest.sh random random # symmetric NATs: no direct path
+#
+# `plain` models a cone NAT: the source port is preserved and inbound
+# traffic for the mapped port is delivered, so hole punching works. `random`
+# models carrier-grade NAT: a fresh external port per flow and no inbound
+# path at all, so punching cannot succeed and the node must fall back.
 set -euo pipefail
 
 BIN="$(dirname "$0")/../target/debug/examples/probe"
@@ -33,6 +38,12 @@ cleanup() {
     ip route del 203.0.113.0/24 2>/dev/null
     iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $([ "$A_MODE" = random ] && echo --random) 2>/dev/null
     iptables -t nat -D POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $([ "$B_MODE" = random ] && echo --random) 2>/dev/null
+    # Port mappings: the cone NAT's inbound path. Without these nothing owns
+    # the NAT aliases, so packets addressed to them loop host->INT->host.
+    for p in udp tcp; do
+        iptables -t nat -D PREROUTING -p "$p" -d 198.51.100.2 --dport 7450 -j DNAT --to-destination 10.0.1.2:7450 2>/dev/null
+        iptables -t nat -D PREROUTING -p "$p" -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450 2>/dev/null
+    done
     iptables -D FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null
     iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null
     iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
@@ -85,6 +96,19 @@ echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
 iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o vethC -j SNAT --to-source 198.51.100.2 $(mkmode "$A_MODE")
 iptables -t nat -A POSTROUTING -s 10.0.2.0/24 -o vethC -j SNAT --to-source 203.0.113.2 $(mkmode "$B_MODE")
 
+# A cone NAT keeps one mapping per internal port, so anything arriving for
+# that port is delivered. That is the inbound path hole punching relies on,
+# and the same one a router port mapping (UPnP IGD / PCP / NAT-PMP) grants.
+# Only the plain side gets it: a symmetric NAT like `random` must not.
+nat_dnat() {
+    iptables -t nat -A PREROUTING -p udp -d 198.51.100.2 --dport 7450 -j DNAT --to-destination 10.0.1.2:7450
+    iptables -t nat -A PREROUTING -p tcp -d 198.51.100.2 --dport 7450 -j DNAT --to-destination 10.0.1.2:7450
+    iptables -t nat -A PREROUTING -p udp -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450
+    iptables -t nat -A PREROUTING -p tcp -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450
+}
+[ "$A_MODE" = plain ] && nat_dnat
+[ "$B_MODE" = plain ] && nat_dnat
+
 # Private DHT: a canned mainline testnet inside the internet netns.
 ip netns exec I timeout 300 "$BIN" --serve-testnet 8 > "$TMP/dht.log" 2>&1 &
 sleep 3
@@ -111,15 +135,14 @@ wait $PA $PB || true
 # What the NAT actually did: which flows existed, and whether either
 # direction of A<->B traffic was seen at all.
 dump_nat() {
-    echo "--- conntrack (udp, both NAT subnets):"
-    conntrack -L -p udp 2>/dev/null | grep -E '10\.0\.1\.2|10\.0\.2\.2' | tail -20 || echo "(conntrack unavailable)"
-    echo "--- vethC counters:"
-    ip -s link show vethC 2>/dev/null | tail -4
-    echo "--- A/B socket state:"
-    for ns in A B; do
-        echo -n "  $ns: "
-        ip netns exec "$ns" ss -un 2>/dev/null | grep -c ':7450' || echo 0
-    done
+    echo "--- NAT rules in effect:"
+    iptables -t nat -S | grep -E '198\.51\.100\.2|203\.0\.113\.2'
+    echo "--- conntrack flows touching the NAT subnets:"
+    conntrack -L -p udp 2>/dev/null | grep -E '10\.0\.1\.2|10\.0\.2\.2' | tail -20
+    echo "--- which side dialed:"
+    grep -ho 'dialed over quic at [^ ]*\|dialing .* failed' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | tail -5
+    echo "--- ICMP rejected in INT (packets nothing owned):"
+    ip netns exec I nft list chain inet filter input 2>/dev/null | tail -5 || echo "(nft unavailable)"
 }
 
 echo "--- A:"; grep -h '^connected\|^addresses\|^note:' "$TMP/a-run.log" || tail -5 "$TMP/a-run.log"
