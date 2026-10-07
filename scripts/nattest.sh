@@ -33,6 +33,10 @@ if [ $# -eq 0 ]; then
 fi
 A_MODE="$1"
 B_MODE="$2"
+
+# Identify this run, so pasted output can never be confused with an older
+# run's: which script, which commit, and a fresh identity pair each time.
+echo "nattest: $A_MODE/$B_MODE  script=$0  sha=$(sha256sum "$0" | cut -c1-12)  HEAD=$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
 TMP="$(mktemp -d)"
 
 cleanup() {
