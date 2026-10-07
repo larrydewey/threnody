@@ -8,6 +8,15 @@ Threnody is an encrypted, metadata-resistant messaging protocol with post-quantu
 
 > ⚠️ Not audited. Do not rely on it for real-world safety yet.
 
+## Why Threnody?
+
+Threnody exists because content encryption alone is not enough.
+
+Most messengers—including Signal, WhatsApp, Threema, and SimpleX Chat—still rely on central servers or relay infrastructure that can observe connection patterns, and none combine local-first mesh networking, aggressive default metadata protection, post-quantum hybrid cryptography, and true multi-device operation without a central identity provider.
+
+For a clear, concise explanation of the design goals, threat model, and how Threnody differs from existing options, see **[Why Threnody](WhyThrenody.md)**.
+
+
 ## Quick start
 
 For a graphical messenger on Linux, run `apps/linux/install.sh` and start Threnody from your app menu ([details](apps/linux/README.md)). It shares its identity with the CLI. The rest of this section uses the CLI.
