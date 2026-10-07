@@ -43,10 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rewritten to 198.51.100.1, the alias on the test's ethernetns).
     if has(&args, "--serve-testnet") {
         let count: usize = arg(&args, "--serve-testnet").unwrap().parse()?;
-        let t = mainline::Testnet::new(count)?;
+        let t = mainline::Testnet::builder(count)
+            .bind_address("198.51.100.1".parse()?)
+            .build()?;
         for b in &t.bootstrap {
-            let port = b.rsplit(':').next().unwrap();
-            println!("TESTNET 198.51.100.1:{port}");
+            println!("TESTNET {b}");
         }
         std::mem::forget(t);
         loop {
