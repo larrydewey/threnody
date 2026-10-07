@@ -12,7 +12,7 @@
 set -euo pipefail
 
 BIN="$(dirname "$0")/../target/debug/examples/probe"
-[ -x "$BIN" ] || cargo build -p threnody-net --example probe
+cargo build -p threnody-net --example probe >/dev/null 2>&1
 
 A_MODE="${1:-plain}"
 B_MODE="${2:-plain}"

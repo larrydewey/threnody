@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut buf = [0u8; 2048];
             let (n, src) = sock.recv_from(&mut buf).await?;
             let data = &buf[..n];
+            eprintln!("reflector: {n} bytes from {src}");
             if data
                 .windows(b"q4:ping".len())
                 .any(|w| w == b"q4:ping")
