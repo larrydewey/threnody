@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
 # Two-phone NAT test topology (Appendix N, "Two phones" item).
 #
-# A and B each in their own netns, behind the host's NAT:
-#   A's traffic SNAT'd to 198.51.100.2, B's to 203.0.113.2
-# (plain = port-preserving, random = per-flow port like CGNAT).
-# A third "internet" netns holds the private DHT + reflector.
-#
-#   sudo ./scripts/nattest.sh plain plain   # cone NATs: direct QUIC expected
-#   sudo ./scripts/nattest.sh random random # symmetric NATs: no direct path
+# A and B each in their own netns, behind the host's NAT: A's traffic is
+# SNAT'd to 198.51.100.2, B's to 203.0.113.2. A third "internet" netns
+# holds the private DHT and the reflector, so all traffic crosses the NAT.
 #
 # `plain` models a cone NAT: the source port is preserved and inbound
-# traffic for the mapped port is delivered, so hole punching works. `random`
-# models carrier-grade NAT: a fresh external port per flow and no inbound
-# path at all, so punching cannot succeed and the node must fall back.
+# traffic for the mapped port is delivered, so hole punching works. This
+# is the same inbound path a router port mapping (UPnP IGD / PCP / NAT-PMP)
+# grants. `random` models carrier-grade NAT: a fresh external port per flow
+# and no inbound path at all, so punching cannot succeed.
+#
+# With no arguments, every combination runs and each gets a pass/fail
+# line. Exits non-zero if any combination fails.
+#
+#   sudo ./scripts/nattest.sh            # the whole matrix
+#   sudo ./scripts/nattest.sh plain      # one side cone, one symmetric
+#   sudo ./scripts/nattest.sh plain plain
 set -euo pipefail
 
 BIN="$(dirname "$0")/../target/debug/examples/probe"
 cargo build -p threnody-net --example probe >/dev/null 2>&1
 
-A_MODE="${1:-plain}"
-B_MODE="${2:-plain}"
+# No arguments: run the whole matrix. Otherwise run the given pair.
+if [ $# -eq 0 ]; then
+    set --
+    for combo in "plain plain" "plain random" "random random"; do
+        # shellcheck disable=SC2086
+        "$0" $combo || true
+    done
+    exit 0
+fi
+A_MODE="$1"
+B_MODE="$2"
 TMP="$(mktemp -d)"
 
 cleanup() {
@@ -88,7 +101,9 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT
 iptables -C FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -j ACCEPT
-# Anything to the NAT aliases that conntrack does not rewrite is not for us.
+# Route the NAT aliases out to the internet ns. Inbound packets the NAT
+# rewrites (a cone NAT's DNAT, or a conntrack reply) reach the LAN behind
+# PREROUTING instead, so these routes only carry outward-bound traffic.
 ip route add 198.51.100.0/24 via 172.16.0.2 2>/dev/null || true
 ip route add 203.0.113.0/24 via 172.16.0.2 2>/dev/null || true
 echo "FORWARD policy/rules: $(iptables -L FORWARD -n | head -1)"
@@ -106,8 +121,9 @@ nat_dnat() {
     iptables -t nat -A PREROUTING -p udp -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450
     iptables -t nat -A PREROUTING -p tcp -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450
 }
-[ "$A_MODE" = plain ] && nat_dnat
-[ "$B_MODE" = plain ] && nat_dnat
+if [ "$A_MODE" = plain ] || [ "$B_MODE" = plain ]; then
+    nat_dnat
+fi
 
 # Private DHT: a canned mainline testnet inside the internet netns.
 ip netns exec I timeout 300 "$BIN" --serve-testnet 8 > "$TMP/dht.log" 2>&1 &
@@ -126,9 +142,9 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" > "$TMP/a-run.log" 2>&1 &
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
 
@@ -145,22 +161,38 @@ dump_nat() {
     ip netns exec I nft list chain inet filter input 2>/dev/null | tail -5 || echo "(nft unavailable)"
 }
 
-echo "--- A:"; grep -h '^connected\|^addresses\|^note:' "$TMP/a-run.log" || tail -5 "$TMP/a-run.log"
-echo "--- B:"; grep -h '^connected\|^addresses\|^note:' "$TMP/b-run.log" || tail -5 "$TMP/b-run.log"
-if grep -q '^connected to .* via direct' "$TMP/a-run.log" && grep -q '^connected to .* via direct' "$TMP/b-run.log"; then
-    echo "RESULT: DIRECT (both sides)"
-    exit 0
-elif grep -q '^connected to .* via relay' "$TMP/a-run.log"; then
-    echo "RESULT: VIA RELAY"
-    exit 0
+echo "--- A:"; grep -h '^connected to\|^addresses' "$TMP/a-run.log" || tail -3 "$TMP/a-run.log"
+echo "--- B:"; grep -h '^connected to\|^addresses' "$TMP/b-run.log" || tail -3 "$TMP/b-run.log"
+
+a_dir=$(grep -c '^connected to .* via direct' "$TMP/a-run.log" || true)
+b_dir=$(grep -c '^connected to .* via direct' "$TMP/b-run.log" || true)
+a_relay=$(grep -c '^connected to .* via relay' "$TMP/a-run.log" || true)
+b_relay=$(grep -c '^connected to .* via relay' "$TMP/b-run.log" || true)
+
+# A punch only works when both NATs are cone: a symmetric side has no
+# inbound path, so neither can reach the other directly.
+if [ "$A_MODE" = plain ] && [ "$B_MODE" = plain ]; then
+    want="direct"
+elif [ "$a_relay" -gt 0 ] || [ "$b_relay" -gt 0 ]; then
+    want="relay"
 else
-    echo "RESULT: NO DIRECT PATH"
-    echo "--- refl.log:"; cat "$TMP/refl.log" 2>/dev/null || true
-    echo "--- dht.log:"; head -3 "$TMP/dht0.log" 2>/dev/null || true
-    echo "--- dht.log:"; head -3 "$TMP/dht1.log" 2>/dev/null || true
-    echo "--- a-run.log tail:"; tail -3 "$TMP/a-run.log" 2>/dev/null || true
-    echo "--- b-run.log tail:"; tail -3 "$TMP/b-run.log" 2>/dev/null || true
-    dump_nat
-    rm -rf /tmp/nattest-last; cp -r "$TMP" /tmp/nattest-last
-    exit 1
+    want="none"
 fi
+
+if [ "$want" = direct ] && [ "$a_dir" -gt 0 ] && [ "$b_dir" -gt 0 ]; then
+    echo "RESULT: PASS ($A_MODE/$B_MODE) direct from both sides"
+    exit 0
+elif [ "$want" = relay ] && { [ "$a_relay" -gt 0 ] || [ "$b_relay" -gt 0 ]; }; then
+    echo "RESULT: PASS ($A_MODE/$B_MODE) fell back to a relay circuit"
+    exit 0
+elif [ "$want" = none ] && [ "$a_dir" -eq 0 ] && [ "$b_dir" -eq 0 ]; then
+    echo "RESULT: PASS ($A_MODE/$B_MODE) no direct path, as expected (no relay in this topology)"
+    exit 0
+fi
+
+echo "RESULT: FAIL ($A_MODE/$B_MODE) wanted $want; got direct=$a_dir/$b_dir relay=$a_relay/$b_relay"
+echo "--- refl.log (NATed sources seen by the reflector):"; tail -4 "$TMP/refl.log" 2>/dev/null || true
+dump_nat
+echo "--- last dial attempts:"; grep -h 'dialing\|dialed over' "$TMP/a-run.log" "$TMP/b-run.log" 2>/dev/null | tail -6 || true
+rm -rf /tmp/nattest-last; cp -r "$TMP" /tmp/nattest-last
+exit 1
