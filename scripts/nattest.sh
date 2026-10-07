@@ -101,5 +101,11 @@ elif grep -q '^connected to .* via relay' "$TMP/a-run.log"; then
     exit 0
 else
     echo "RESULT: NO DIRECT PATH"
+    echo "--- refl.log:"; cat "$TMP/refl.log" 2>/dev/null || true
+    echo "--- dht0.log:"; head -3 "$TMP/dht0.log" 2>/dev/null || true
+    echo "--- dht1.log:"; head -3 "$TMP/dht1.log" 2>/dev/null || true
+    echo "--- a-run.log tail:"; tail -3 "$TMP/a-run.log" 2>/dev/null || true
+    echo "--- b-run.log tail:"; tail -3 "$TMP/b-run.log" 2>/dev/null || true
+    rm -rf /tmp/nattest-last; cp -r "$TMP" /tmp/nattest-last
     exit 1
 fi
