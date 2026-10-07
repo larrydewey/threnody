@@ -57,8 +57,8 @@ cleanup() {
         iptables -t nat -D PREROUTING -p "$p" -d 198.51.100.2 --dport 7450 -j DNAT --to-destination 10.0.1.2:7450 2>/dev/null
         iptables -t nat -D PREROUTING -p "$p" -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450 2>/dev/null
     done
-    iptables -D FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -p tcp --dport 7451 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j DROP 2>/dev/null
     iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     rm -rf "$TMP"
 }
@@ -98,9 +98,15 @@ ip netns exec I ip addr add 198.51.100.1/32 dev vethzC
 ip netns exec I ip addr add 203.0.113.1/32 dev vethzC
 
 echo 1 > /proc/sys/net/ipv4/ip_forward
-iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j ACCEPT
-iptables -C FORWARD -s 10.0.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.0.0.0/16 -j ACCEPT
+# Order matters: replies to the bootstrap dial are ESTABLISHED *and*
+# inter-subnet, so the ESTABLISHED accept must be matched before the drop.
+# Inserting at the front in reverse gives: ESTABLISHED, bootstrap, drop.
+iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j DROP 2>/dev/null || \
+    iptables -I FORWARD 1 -s 10.0.0.0/16 -d 10.0.0.0/16 -j DROP
+iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -p tcp --dport 7451 -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD 1 -s 10.0.0.0/16 -d 10.0.0.0/16 -p tcp --dport 7451 -j ACCEPT
+iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 # Route the NAT aliases out to the internet ns. Inbound packets the NAT
 # rewrites (a cone NAT's DNAT, or a conntrack reply) reach the LAN behind
 # PREROUTING instead, so these routes only carry outward-bound traffic.
@@ -142,9 +148,9 @@ FPA=$(grep '^fingerprint ' "$TMP/a-accept.log" | cut -d' ' -f2)
 FPB=$(grep '^fingerprint ' "$TMP/dial.log" | cut -d' ' -f2)
 echo "A=$FPA B=$FPB"
 
-ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
+ip netns exec A timeout 120 "$BIN" --home "$TMP/a" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPB" --one > "$TMP/a-run.log" 2>&1 &
 PA=$!
-ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
+ip netns exec B timeout 120 "$BIN" --home "$TMP/b" --listen-port 7450 --no-local --clear-addrs --bootstrap "$BOOT" --reflect 198.51.100.1:7462 --seek "$FPA" --one > "$TMP/b-run.log" 2>&1 &
 PB=$!
 wait $PA $PB || true
 
