@@ -293,6 +293,9 @@ pub fn open_record(keys: &RecordKeys, value: &[u8]) -> Result<Candidates> {
         return Err(Error::Malformed("record length"));
     }
     let (nonce, ct) = value.split_at(NONCE_LEN);
+    let nonce: &[u8; NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| Error::Malformed("record nonce"))?;
     let pt = XChaCha20Poly1305::new((&keys.enc_key).into())
         .decrypt(nonce.into(), Payload { msg: ct, aad: AAD })
         .map_err(|_| Error::Malformed("record authentication"))?;

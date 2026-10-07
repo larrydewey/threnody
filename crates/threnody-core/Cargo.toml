@@ -23,6 +23,8 @@ thiserror.workspace = true
 argon2.workspace = true
 zkryptium.workspace = true
 ml-dsa.workspace = true
+getrandom = "0.4"
+shake = "0.1"
 
 [dev-dependencies]
 rand_chacha = "0.10"

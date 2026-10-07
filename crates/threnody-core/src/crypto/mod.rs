@@ -11,8 +11,9 @@ pub mod rng;
 
 /// Returns `N` bytes from the OS CSPRNG.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
-    use rand_core::{OsRng, RngCore};
+    use getrandom::SysRng;
+    use rand_core::{Rng as RandRng, UnwrapErr};
     let mut b = [0u8; N];
-    OsRng.fill_bytes(&mut b);
+    UnwrapErr(SysRng).fill_bytes(&mut b);
     b
 }

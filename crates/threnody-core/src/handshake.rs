@@ -18,7 +18,7 @@ use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::crypto::aead::Suite;
 use crate::crypto::hybrid::{HybridPublic, HybridSecret};
 use crate::crypto::kdf::{self, label};
-use crate::crypto::rng::Rng;
+use crate::crypto::rng::Rng as RngSource;
 use crate::error::{Error, Result};
 use crate::identity::{Identity, PublicIdentity};
 use crate::ratchet::Ratchet;
@@ -68,17 +68,17 @@ pub struct Initiator<'a> {
     identity: &'a Identity,
     eph: HybridSecret,
     transcript: Transcript,
-    rng: Rng,
+    rng: RngSource,
 }
 
 impl<'a> Initiator<'a> {
     /// Starts a handshake. Returns the state and the HS1 frame.
     pub fn start(identity: &'a Identity) -> Result<(Self, Vec<u8>)> {
-        Self::start_with(identity, Rng::Os)
+        Self::start_with(identity, RngSource::Os)
     }
 
     /// [`Initiator::start`] with an explicit randomness source.
-    pub fn start_with(identity: &'a Identity, mut rng: Rng) -> Result<(Self, Vec<u8>)> {
+    pub fn start_with(identity: &'a Identity, mut rng: RngSource) -> Result<(Self, Vec<u8>)> {
         let eph = HybridSecret::generate_with(&mut rng);
         let body = cbor::to_vec(1300, |e| {
             e.map_len(2)?;
@@ -189,20 +189,20 @@ pub struct Responder {
     transcript: Transcript,
     initiator_key: [u8; 32],
     ratchet_secret: HybridSecret,
-    rng: Rng,
+    rng: RngSource,
 }
 
 impl Responder {
     /// Consumes HS1 and returns the state plus the HS2 frame.
     pub fn respond(identity: &Identity, frame: &[u8]) -> Result<(Self, Vec<u8>)> {
-        Self::respond_with(identity, frame, Rng::Os)
+        Self::respond_with(identity, frame, RngSource::Os)
     }
 
     /// [`Responder::respond`] with an explicit randomness source.
     pub fn respond_with(
         identity: &Identity,
         frame: &[u8],
-        mut rng: Rng,
+        mut rng: RngSource,
     ) -> Result<(Self, Vec<u8>)> {
         let body = wire::expect(frame, MsgType::HandshakeInit)?;
         let mut dec = Decoder::new(body);

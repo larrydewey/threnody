@@ -16,7 +16,8 @@
 //! own beacons; dialing pins the fingerprint, so a replayed beacon can at
 //! worst trigger a failed connection.
 
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::{Rng as RandRng, UnwrapErr};
 
 use crate::identity::PublicIdentity;
 
@@ -71,7 +72,7 @@ pub fn beacon_with(
     max_tags: usize,
 ) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce);
     let max_tags = max_tags.clamp(1, MAX_TAGS);
     let mut keys: Vec<&[u8; 32]> = keys.iter().collect();
     if keys.len() > max_tags {
@@ -89,7 +90,7 @@ pub fn beacon_with(
         .collect();
     while tags.len() < slots {
         let mut r = [0u8; TAG_LEN];
-        OsRng.fill_bytes(&mut r);
+        UnwrapErr(SysRng).fill_bytes(&mut r);
         tags.push(r);
     }
     // Shuffle so slot position does not reveal contact-book order.
@@ -102,7 +103,7 @@ pub fn beacon_with(
 
 fn shuffle<T>(v: &mut [T]) {
     for i in (1..v.len()).rev() {
-        let j = (OsRng.next_u32() as usize) % (i + 1);
+        let j = (UnwrapErr(SysRng).next_u32() as usize) % (i + 1);
         v.swap(i, j);
     }
 }

@@ -4,7 +4,8 @@
 //! ChaCha20 generator so complete handshakes and ratchet runs are
 //! reproducible, which is what the published test vectors are made from.
 
-use rand_core::{CryptoRng, OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::{TryCryptoRng, TryRng, UnwrapErr};
 
 #[derive(Clone, Default)]
 pub enum Rng {
@@ -23,38 +24,41 @@ impl Rng {
     }
 }
 
-impl RngCore for Rng {
-    fn next_u32(&mut self) -> u32 {
+impl TryRng for Rng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        use rand_core::Rng;
         match self {
-            Self::Os => OsRng.next_u32(),
+            Self::Os => Ok(UnwrapErr(SysRng).next_u32()),
             #[cfg(test)]
-            Self::Seeded(r) => r.next_u32(),
+            Self::Seeded(r) => Ok(r.next_u32()),
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        use rand_core::Rng;
         match self {
-            Self::Os => OsRng.next_u64(),
+            Self::Os => Ok(UnwrapErr(SysRng).next_u64()),
             #[cfg(test)]
-            Self::Seeded(r) => r.next_u64(),
+            Self::Seeded(r) => Ok(r.next_u64()),
         }
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        use rand_core::Rng;
         match self {
-            Self::Os => OsRng.fill_bytes(dest),
+            Self::Os => {
+                UnwrapErr(SysRng).fill_bytes(dest);
+                Ok(())
+            }
             #[cfg(test)]
-            Self::Seeded(r) => r.fill_bytes(dest),
-        }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        match self {
-            Self::Os => OsRng.try_fill_bytes(dest),
-            #[cfg(test)]
-            Self::Seeded(r) => r.try_fill_bytes(dest),
+            Self::Seeded(r) => {
+                r.fill_bytes(dest);
+                Ok(())
+            }
         }
     }
 }
 
-impl CryptoRng for Rng {}
+impl TryCryptoRng for Rng {}

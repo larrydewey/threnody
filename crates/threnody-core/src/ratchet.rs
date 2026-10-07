@@ -16,14 +16,14 @@
 use std::collections::{HashMap, VecDeque};
 
 use const_cbor::Decoder;
-use rand_core::RngCore;
+use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::crypto::aead::Suite;
 use crate::crypto::hybrid::{HybridPublic, HybridSecret};
 use crate::crypto::kdf::{self, label};
-use crate::crypto::rng::Rng;
+use crate::crypto::rng::Rng as RngSource;
 use crate::error::{Error, Result};
 use crate::wire::{self, MsgType};
 
@@ -75,7 +75,7 @@ pub struct Ratchet {
     next_recv_hk: Key,
     skipped: HashMap<([u8; 32], u32), Key>,
     skipped_order: VecDeque<([u8; 32], u32)>,
-    rng: Rng,
+    rng: RngSource,
 }
 
 struct Header {
@@ -103,7 +103,7 @@ impl Ratchet {
         session_id: [u8; 32],
         root: &[u8; 32],
         peer: HybridPublic,
-        mut rng: Rng,
+        mut rng: RngSource,
     ) -> Result<Self> {
         let (hk_i, hk_r) = initial_header_keys(root);
         let own = HybridSecret::generate_with(&mut rng);
@@ -132,7 +132,7 @@ impl Ratchet {
         session_id: [u8; 32],
         root: &[u8; 32],
         own: HybridSecret,
-        rng: Rng,
+        rng: RngSource,
     ) -> Self {
         let (hk_i, hk_r) = initial_header_keys(root);
         Self {
@@ -385,9 +385,10 @@ mod tests {
         let sid = [3u8; 32];
         let b_secret = HybridSecret::generate();
         let b_pub = b_secret.public().clone();
-        let a =
-            Ratchet::new_initiator(Suite::ChaCha20Poly1305, sid, &root, b_pub, Rng::Os).unwrap();
-        let b = Ratchet::new_responder(Suite::ChaCha20Poly1305, sid, &root, b_secret, Rng::Os);
+        let a = Ratchet::new_initiator(Suite::ChaCha20Poly1305, sid, &root, b_pub, RngSource::Os)
+            .unwrap();
+        let b =
+            Ratchet::new_responder(Suite::ChaCha20Poly1305, sid, &root, b_secret, RngSource::Os);
         (a, b)
     }
 

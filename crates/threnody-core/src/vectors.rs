@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use crate::channel::SecureChannel;
 use crate::crypto::hybrid::{HybridPublic, HybridSecret};
 use crate::crypto::kdf::{self, label};
-use crate::crypto::rng::Rng;
+use crate::crypto::rng::Rng as RngSource;
 use crate::handshake::{Initiator, Responder};
 use crate::identity::{Identity, safety_number};
 use crate::message::AppMessage;
@@ -93,7 +93,7 @@ fn generate() -> String {
     );
 
     // Hybrid KEM
-    let mut rng = Rng::seeded(seed(0x10));
+    let mut rng = RngSource::seeded(seed(0x10));
     let sk = HybridSecret::generate_with(&mut rng);
     let pk = HybridPublic::from_bytes(sk.public().as_bytes()).unwrap();
     let (ct, ss) = pk.encapsulate_with(&mut rng).unwrap();
@@ -108,8 +108,8 @@ fn generate() -> String {
     put("kem.shared_secret", hex(&ss[..]));
 
     // Handshake + ratchet
-    let (ini, hs1) = Initiator::start_with(&a, Rng::seeded(seed(0x20))).unwrap();
-    let (resp, hs2) = Responder::respond_with(&b, &hs1, Rng::seeded(seed(0x30))).unwrap();
+    let (ini, hs1) = Initiator::start_with(&a, RngSource::seeded(seed(0x20))).unwrap();
+    let (resp, hs2) = Responder::respond_with(&b, &hs1, RngSource::seeded(seed(0x30))).unwrap();
     let (hs3, ea) = ini.finish(&hs2).unwrap();
     let eb = resp.finish(&hs3).unwrap();
     assert_eq!(ea.session_id, eb.session_id);

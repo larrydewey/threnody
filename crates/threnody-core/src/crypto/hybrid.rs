@@ -11,10 +11,13 @@
 //! The 32-byte seed is the whole private key, which keeps persisted
 //! ratchet state small.
 
+use getrandom::SysRng;
 use ml_kem::{B32, Ciphertext, Decapsulate, Key, KeyExport, MlKem768, Seed};
-use rand_core::{CryptoRngCore, OsRng};
+use rand_core::UnwrapErr;
+use rand_core::{CryptoRng, Rng};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
-use sha3::{Digest, Sha3_256, Shake256};
+use sha3::{Digest, Sha3_256};
+use shake::Shake256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -60,11 +63,11 @@ impl core::fmt::Debug for HybridPublic {
 
 impl HybridSecret {
     pub fn generate() -> Self {
-        Self::generate_with(&mut OsRng)
+        Self::generate_with(&mut UnwrapErr(SysRng))
     }
 
     /// Draws a 32-byte seed from `rng` (X-Wing `GenerateKeyPair`).
-    pub fn generate_with(rng: &mut impl CryptoRngCore) -> Self {
+    pub fn generate_with<R: Rng + CryptoRng>(rng: &mut R) -> Self {
         let mut seed = Zeroizing::new([0u8; SEED_LEN]);
         rng.fill_bytes(&mut seed[..]);
         Self::from_seed(&seed)
@@ -148,13 +151,13 @@ impl HybridPublic {
 
     /// Returns `(ciphertext, shared_secret)`.
     pub fn encapsulate(&self) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
-        self.encapsulate_with(&mut OsRng)
+        self.encapsulate_with(&mut UnwrapErr(SysRng))
     }
 
     /// Draws a 64-byte `eseed` from `rng` (X-Wing `Encapsulate`).
-    pub fn encapsulate_with(
+    pub fn encapsulate_with<R: Rng + CryptoRng>(
         &self,
-        rng: &mut impl CryptoRngCore,
+        rng: &mut R,
     ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
         let mut eseed = Zeroizing::new([0u8; 64]);
         rng.fill_bytes(&mut eseed[..]);

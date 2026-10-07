@@ -4,7 +4,7 @@ use core::fmt;
 use core::str::FromStr;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand_core::OsRng;
+use getrandom::SysRng;
 use zeroize::Zeroizing;
 
 use crate::crypto::kdf::{derive, label};
@@ -17,8 +17,9 @@ pub struct Identity {
 
 impl Identity {
     pub fn generate() -> Self {
+        use rand_core::UnwrapErr;
         Self {
-            key: SigningKey::generate(&mut OsRng),
+            key: SigningKey::generate(&mut UnwrapErr(SysRng)),
         }
     }
 

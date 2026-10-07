@@ -5,7 +5,7 @@
 //! with a seeded RNG; every decoder must return `Err` or `Ok`, never panic,
 //! and a mutated frame must never be accepted as authentic.
 
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{Rng, SeedableRng};
 
 use crate::channel::SecureChannel;
 use crate::handshake::{Initiator, Responder};
@@ -16,7 +16,7 @@ use crate::wire;
 
 const ITERATIONS: usize = 3000;
 
-fn mutate(rng: &mut impl RngCore, input: &[u8]) -> Vec<u8> {
+fn mutate(rng: &mut impl Rng, input: &[u8]) -> Vec<u8> {
     let mut v = input.to_vec();
     let edits = 1 + rng.next_u32() % 4;
     for _ in 0..edits {
