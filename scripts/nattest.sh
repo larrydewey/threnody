@@ -189,7 +189,6 @@ fi
 
 snat_rule 10.0.1.0/24 vethC 198.51.100.2 "$A_MODE"
 snat_rule 10.0.2.0/24 vethC 203.0.113.2 "$B_MODE"
-
 # A cone NAT's inbound DNAT redirects to the peer's *private* address, so
 # the packet then leaves via that LAN's veth, not vethC. Without these the
 # `-o vethC` rules above never fire for it and the flow completes
@@ -198,6 +197,19 @@ snat_rule 10.0.2.0/24 vethC 203.0.113.2 "$B_MODE"
 # reply direction too, so a punched session really does cross the NAT.
 snat_rule 10.0.1.0/24 vethB 198.51.100.2 "$A_MODE"
 snat_rule 10.0.2.0/24 vethA 203.0.113.2 "$B_MODE"
+
+# Every combo reuses the same lab addresses and ports, so conntrack entries
+# from the previous combo are still alive when this one starts -- with the
+# previous combo's NAT mappings attached. nf_nat reuses a known mapping
+# instead of allocating a new one, so a cone NAT's preserved port would be
+# inherited by a symmetric NAT and the combo would silently test the wrong
+# thing. Drop the lab's flows before starting.
+#
+# Scoped to the lab addresses only: a blanket flush would disturb the host's
+# own traffic and its containers.
+for sel in "-s 10.0.1.0/24" "-s 10.0.2.0/24" "-d 198.51.100.2/32" "-d 203.0.113.2/32"; do
+    conntrack -D $sel 2>/dev/null || true
+done
 
 # A cone NAT keeps one mapping per internal port, so anything arriving for
 # that port is delivered. That is the inbound path hole punching relies on,
