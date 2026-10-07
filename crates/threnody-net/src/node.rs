@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use anyhow::Context;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
@@ -17,7 +18,6 @@ use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
 use threnody_core::tunnel::{PSK_CONTEXT, WgKeys, overlay_addr};
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, SecureChannel, now_ms};
-use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -681,7 +681,14 @@ impl Node {
 
         // First, set the interface's private key and listen port
         let mut child = Command::new("wg")
-            .args(["set", iface, "listen-port", &port.to_string(), "private-key", "/dev/stdin"])
+            .args([
+                "set",
+                iface,
+                "listen-port",
+                &port.to_string(),
+                "private-key",
+                "/dev/stdin",
+            ])
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -696,7 +703,8 @@ impl Node {
             return Err(anyhow::anyhow!(
                 "wg set listen-port/private-key: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
-            ).into());
+            )
+            .into());
         }
 
         // Then add/update each peer
@@ -731,7 +739,8 @@ impl Node {
                 return Err(anyhow::anyhow!(
                     "wg set peer: {}",
                     String::from_utf8_lossy(&status.stderr).trim()
-                ).into());
+                )
+                .into());
             }
         }
 

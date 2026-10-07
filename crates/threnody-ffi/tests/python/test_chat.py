@@ -16,8 +16,8 @@ def wait(node, kind, timeout_s=20):
 # shutdown() doesn't wait for the nodes' tasks, which may still be saving
 # state as the directory is removed.
 with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
-    alice = ThrenodyNode.open(f"{d}/alice", None)
-    bob = ThrenodyNode.open(f"{d}/bob", "correct horse")
+    alice = ThrenodyNode.open(f"{d}/alice", None, None)
+    bob = ThrenodyNode.open(f"{d}/bob", "correct horse", None)
     addr = bob.listen("127.0.0.1:0")
     bob_fp = alice.connect(bob.invite_link(addr))
     assert bob_fp == bob.device_fingerprint()

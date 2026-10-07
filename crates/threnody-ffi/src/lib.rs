@@ -694,9 +694,7 @@ fn convert(e: Event) -> NodeEvent {
             overlay: overlay.to_string(),
             psk: psk.0.to_vec(),
         },
-        Event::TunnelDown { peer, .. } => NodeEvent::TunnelDown {
-            peer: fp(&peer),
-        },
+        Event::TunnelDown { peer, .. } => NodeEvent::TunnelDown { peer: fp(&peer) },
         other => NodeEvent::Other {
             description: format!("{other:?}"),
         },
@@ -1652,8 +1650,10 @@ mod tests {
     #[test]
     fn personas_share_profiles_and_reveal_through_apps() {
         let dir = tempfile::tempdir().unwrap();
-        let me = ThrenodyNode::open(dir.path().join("me").display().to_string(), None, None).unwrap();
-        let bob = ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let me =
+            ThrenodyNode::open(dir.path().join("me").display().to_string(), None, None).unwrap();
+        let bob =
+            ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
         let addr = bob.listen("127.0.0.1:0".into()).unwrap();
         let rec = me
             .create_persona("market".into(), None, Some("pw".into()))
@@ -1721,7 +1721,8 @@ mod tests {
     #[test]
     fn two_embedded_nodes_chat() {
         let dir = tempfile::tempdir().unwrap();
-        let alice = ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
         let bob = ThrenodyNode::open(
             dir.path().join("b").display().to_string(),
             Some("pw".into()),
@@ -2020,7 +2021,8 @@ mod tests {
         // Group handshakes take many round trips: opt out of cover traffic
         // (on by default) so this test about group logic runs quickly.
         let open = |n: &str| {
-            let node = ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
             node.set_cover_traffic(None);
             node
         };
@@ -2265,8 +2267,10 @@ mod tests {
             fn disconnect(&self) {}
         }
         let dir = tempfile::tempdir().unwrap();
-        let alice = ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
-        let bob = ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let bob =
+            ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
         let (a_tx, a_rx) = sync_channel::<Vec<u8>>(16);
         let (b_tx, b_rx) = sync_channel::<Vec<u8>>(16);
         let ha = alice
