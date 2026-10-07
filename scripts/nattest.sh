@@ -58,8 +58,9 @@ cleanup() {
         iptables -t nat -D PREROUTING -p "$p" -d 203.0.113.2 --dport 7450 -j DNAT --to-destination 10.0.2.2:7450 2>/dev/null
     done
     iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -p tcp --dport 7451 -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j DROP 2>/dev/null
+    iptables -D FORWARD -m mark --mark 0x1 -j DROP 2>/dev/null
     iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    iptables -t mangle -D PREROUTING -s 10.0.0.0/16 -d 10.0.0.0/16 -m conntrack --ctstate NEW -j MARK --set-mark 0x1 2>/dev/null
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -98,11 +99,25 @@ ip netns exec I ip addr add 198.51.100.1/32 dev vethzC
 ip netns exec I ip addr add 203.0.113.1/32 dev vethzC
 
 echo 1 > /proc/sys/net/ipv4/ip_forward
-# Order matters: replies to the bootstrap dial are ESTABLISHED *and*
-# inter-subnet, so the ESTABLISHED accept must be matched before the drop.
-# Inserting at the front in reverse gives: ESTABLISHED, bootstrap, drop.
-iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -j DROP 2>/dev/null || \
-    iptables -I FORWARD 1 -s 10.0.0.0/16 -d 10.0.0.0/16 -j DROP
+# Block the LAN shortcut: A reaching B's private address directly.
+#
+# Matching on the *current* destination is wrong here. A cone NAT's DNAT
+# rewrites 203.0.113.2:7450 to 10.0.2.2:7450, so by FORWARD time the
+# legitimate path looks exactly like the shortcut and gets dropped too --
+# which is exactly how the first plain/plain run failed with no packet ever
+# reaching the peer's alias.
+#
+# So mark it in mangle PREROUTING, which runs *before* nat PREROUTING and
+# therefore still sees the pre-DNAT destination: the shortcut was addressed
+# to a lab subnet, the NAT path was addressed to an alias. Replies are
+# un-SNAT'd in nat PREROUTING (after mangle), so they are never marked and
+# are matched earlier by ESTABLISHED anyway.
+SHORTCUT=0x1
+iptables -t mangle -C PREROUTING -s 10.0.0.0/16 -d 10.0.0.0/16 -m conntrack --ctstate NEW -j MARK --set-mark "$SHORTCUT" 2>/dev/null || \
+    iptables -t mangle -I PREROUTING 1 -s 10.0.0.0/16 -d 10.0.0.0/16 -m conntrack --ctstate NEW -j MARK --set-mark "$SHORTCUT"
+# Inserted at the front in reverse: ESTABLISHED, bootstrap, marked-drop.
+iptables -C FORWARD -m mark --mark "$SHORTCUT" -j DROP 2>/dev/null || \
+    iptables -I FORWARD 1 -m mark --mark "$SHORTCUT" -j DROP
 iptables -C FORWARD -s 10.0.0.0/16 -d 10.0.0.0/16 -p tcp --dport 7451 -j ACCEPT 2>/dev/null || \
     iptables -I FORWARD 1 -s 10.0.0.0/16 -d 10.0.0.0/16 -p tcp --dport 7451 -j ACCEPT
 iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
