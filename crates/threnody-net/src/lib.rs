@@ -19,6 +19,7 @@ pub mod identity;
 pub mod mailbox;
 pub mod node;
 pub mod onion;
+pub(crate) mod portmap;
 mod quic;
 pub mod reach;
 mod recover;

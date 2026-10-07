@@ -19,6 +19,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.14"
 mainline = "8"
 futures-lite = "2"
+port-control-client = "0.2"
 blake3.workspace = true
 chacha20poly1305.workspace = true
 rand_core.workspace = true

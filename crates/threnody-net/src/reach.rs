@@ -201,6 +201,8 @@ pub(crate) struct Inner {
     pub(crate) reflectors: Vec<SocketAddr>,
     /// The last DHT routing table, to rejoin from quickly.
     warm_nodes: Vec<String>,
+    /// External addresses the router forwarded to us.
+    pub(crate) mapped: Vec<SocketAddr>,
 }
 
 pub(crate) struct ReachState {
@@ -209,7 +211,7 @@ pub(crate) struct ReachState {
     started: AtomicBool,
     dht: Mutex<Option<AsyncDht>>,
     pub(crate) inner: Mutex<Inner>,
-    regather: Notify,
+    pub(crate) regather: Notify,
     republish: Notify,
     poll: Notify,
     cfg: Mutex<Option<Arc<ReachConfig>>>,
@@ -432,6 +434,10 @@ impl Node {
         }
         let cfg = Arc::new(cfg);
         *lock(&self.rdv().cfg) = Some(cfg.clone());
+        if let Some(port) = std::num::NonZeroU16::new(self.quic_addr().map_or(0, |a| a.port())) {
+            let node = self.clone();
+            tokio::spawn(async move { crate::portmap::run(node, port).await });
+        }
         let node = self.clone();
         tokio::spawn(async move { node.keepalive_loop().await });
         let (node, c) = (self.clone(), cfg.clone());
@@ -535,6 +541,13 @@ impl Node {
             list.push(Candidate {
                 kind: CandidateKind::Local,
                 addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+            });
+        }
+        // Addresses the router forwards to us: dialable without a punch.
+        for a in lock(&self.rdv().inner).mapped.clone() {
+            list.push(Candidate {
+                kind: CandidateKind::Reflexive,
+                addr: a,
             });
         }
         if let Some(ip) = route_source("0.0.0.0:0", "8.8.8.8:53")

@@ -2168,6 +2168,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3440,6 +3446,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "port-control-client"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05fbee8da8d09f415159e1be2ad5c909854cd3ffc9f5ac25589747d0685ab0c7"
+dependencies = [
+ "getrandom 0.4.3",
+ "httparse",
+ "libc",
+ "roxmltree",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3815,6 +3835,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -4571,6 +4600,7 @@ dependencies = [
  "const-cbor",
  "futures-lite",
  "mainline",
+ "port-control-client",
  "quinn",
  "rand_core 0.6.4",
  "rcgen",
