@@ -207,9 +207,14 @@ snat_rule 10.0.2.0/24 vethA 203.0.113.2 "$B_MODE"
 #
 # Scoped to the lab addresses only: a blanket flush would disturb the host's
 # own traffic and its containers.
+dropped=0
 for sel in "-s 10.0.1.0/24" "-s 10.0.2.0/24" "-d 198.51.100.2/32" "-d 203.0.113.2/32"; do
-    conntrack -D $sel 2>/dev/null || true
+    # conntrack -D prints each deleted entry to stdout, which would bury the
+    # results; count them instead, and only report when there were any.
+    n=$(conntrack -D $sel 2>/dev/null | grep -c . || true)
+    dropped=$((dropped + n))
 done
+[ "$dropped" -gt 0 ] && echo "nattest: dropped $dropped stale lab conntrack entries" || true
 
 # A cone NAT keeps one mapping per internal port, so anything arriving for
 # that port is delivered. That is the inbound path hole punching relies on,
