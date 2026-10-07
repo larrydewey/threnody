@@ -38,6 +38,9 @@ pub struct Options {
     pub discover: Option<u16>,
     /// Reach contacts across the internet (DHT rendezvous, hole punching).
     pub rendezvous: bool,
+    /// Always-on approved contact: keep a session to it so address
+    /// updates reach it immediately, in the background too.
+    pub anchor: Option<String>,
     /// Advertise and accept sessions over Bluetooth LE.
     pub ble: bool,
     /// Join Wi-Fi Direct groups that approved contacts offer.
@@ -217,7 +220,20 @@ pub async fn run(opts: Options) -> Result<()> {
     if let Some(q) = quic_addr {
         // On loopback there is nobody to reach.
         if node.reach_enabled() && !q.ip().is_loopback() {
-            match node.start_reach(ReachConfig::default()) {
+            let anchor = opts
+                .anchor
+                .as_deref()
+                .and_then(|name| match node.contacts().find(name) {
+                    threnody_core::store::Lookup::Found(c) if c.mutually_approved() => Some(c.key),
+                    _ => {
+                        eprintln!("! --anchor: {name:?} is not a mutually approved contact");
+                        None
+                    }
+                });
+            match node.start_reach(ReachConfig {
+                anchor,
+                ..ReachConfig::default()
+            }) {
                 Ok(()) => println!(
                     "QUIC on udp/{}; reaching approved contacts across the internet \
                      (public DHT rendezvous; --no-rendezvous turns it off)",

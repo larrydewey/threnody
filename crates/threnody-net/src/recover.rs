@@ -258,10 +258,7 @@ impl Node {
             return;
         };
         for s in self.sessions() {
-            if s.via.is_none()
-                && self.supports(&s.peer, FEATURE_PATHS)
-                && self.shared.mutual(&s.peer)
-            {
+            if self.supports(&s.peer, FEATURE_PATHS) && self.shared.mutual(&s.peer) {
                 let _ = self.send(&s.peer, msg.clone());
             }
         }

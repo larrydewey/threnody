@@ -1,6 +1,6 @@
 # Appendix N: Reaching Contacts Across the Internet
 
-Status: **sections 1 to 5 are implemented** (QUIC, candidates, DHT rendezvous, hole punching, fast recovery) for 0.3.0. Router port mapping (section 0) is not built yet. Field test, 2026-10-05: a Pixel 8a on AT&T LTE (carrier-grade NAT, Wi-Fi and Bluetooth off) and a laptop behind a home router found each other through the public DHT and connected directly over QUIC through both NATs, about two minutes after the phone left Wi-Fi.
+Status: **sections 1 to 5 are implemented** (QUIC, candidates, DHT rendezvous, hole punching, fast recovery) for 0.3.0. Router port mapping (section 0) is built (UPnP IGD, PCP, NAT-PMP). Field test, 2026-10-05: a Pixel 8a on AT&T LTE (carrier-grade NAT, Wi-Fi and Bluetooth off) and a laptop behind a home router found each other through the public DHT and connected directly over QUIC through both NATs, about two minutes after the phone left Wi-Fi.
 
 ## The problem
 
@@ -152,7 +152,6 @@ An app starting after a long time away is found at the contact's next read of it
 
 **Still to do:**
 - **Two phones.** Everything above was measured between a phone and a laptop.
-- **A persistent relay circuit** to a reachable, always-on approved contact would carry a "here are my new addresses" message immediately (about 1–2 s instead of the recovery slot's 5–8 s), and reach a phone in the background. It needs such a contact with a stable public address.
 
 ## Privacy
 

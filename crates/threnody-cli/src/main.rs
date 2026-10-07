@@ -153,6 +153,10 @@ enum Cmd {
         /// over QUIC still work on addresses you dial.
         #[arg(long)]
         no_rendezvous: bool,
+        /// Always-on approved contact (name or fingerprint) to keep a
+        /// session with for instant address updates (Appendix N).
+        #[arg(long)]
+        anchor: Option<String>,
         /// UDP port for LAN discovery beacons (multicast 239.255.84.86).
         #[arg(long, default_value_t = threnody_net::discovery::DEFAULT_PORT)]
         discover_port: u16,
@@ -665,6 +669,7 @@ fn main() -> Result<()> {
             wg_apply,
             no_discover,
             no_rendezvous,
+            anchor,
             discover_port,
             ble,
             wifi_direct,
@@ -714,6 +719,7 @@ fn main() -> Result<()> {
                 },
                 discover: (!no_discover && !persona).then_some(discover_port),
                 rendezvous: !no_rendezvous && !persona,
+                anchor,
                 ble: ble && !persona,
                 wifi_direct: wifi_direct && !persona,
                 tunnel: tunnel.filter(|_| !persona).map(|port| chat::TunnelOptions {

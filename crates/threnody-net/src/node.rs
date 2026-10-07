@@ -1238,8 +1238,10 @@ where
                 lease = node.on_paths(peer, &payload).or(lease);
             }
             // Tell an approved peer how to find us if this session breaks.
+            // Over relay and onion circuits too: the endpoints are mutual
+            // contacts, and a persistent circuit to an always-on contact
+            // (Appendix N) exists precisely to carry these updates fast.
             if !paths_sent
-                && via.is_none()
                 && peer_acks.is_some()
                 && node.supports(&peer, FEATURE_PATHS)
                 && shared.mutual(&peer)
@@ -1406,12 +1408,10 @@ where
                             }
                         }
                         AppMessage::Paths(payload) => {
-                            if via.is_none() {
-                                if shared.mutual(&peer) {
-                                    lease = node.on_paths(peer, &payload).or(lease);
-                                } else {
-                                    early_paths = Some(payload);
-                                }
+                            if shared.mutual(&peer) {
+                                lease = node.on_paths(peer, &payload).or(lease);
+                            } else {
+                                early_paths = Some(payload);
                             }
                         }
                         AppMessage::Observed { addr } => {

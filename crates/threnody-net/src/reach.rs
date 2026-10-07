@@ -101,6 +101,10 @@ pub struct ReachConfig {
     pub regather: Duration,
     /// Also offer loopback addresses and keep the DHT on loopback (tests).
     pub loopback: bool,
+    /// An always-on, mutually approved contact we keep a session with
+    /// (direct or through a relay circuit). It carries our address
+    /// updates immediately, and its circuit's death means we moved.
+    pub anchor: Option<PublicIdentity>,
 }
 
 impl Default for ReachConfig {
@@ -114,6 +118,7 @@ impl Default for ReachConfig {
             republish: Duration::from_secs(1800),
             regather: Duration::from_secs(600),
             loopback: false,
+            anchor: None,
         }
     }
 }
@@ -440,6 +445,8 @@ impl Node {
         }
         let node = self.clone();
         tokio::spawn(async move { node.keepalive_loop().await });
+        let node = self.clone();
+        tokio::spawn(async move { node.anchor_loop().await });
         let (node, c) = (self.clone(), cfg.clone());
         tokio::spawn(async move { node.gather_loop(&c).await });
         let (node, c) = (self.clone(), cfg.clone());
@@ -487,6 +494,28 @@ impl Node {
                 cfg.regather.min(UNKNOWN_REGATHER)
             };
             if !self.pause(wait, &self.rdv().regather).await {
+                break;
+            }
+        }
+    }
+
+    /// Keeps a session with the configured always-on anchor contact so
+    /// our address updates reach it immediately, in the background too.
+    async fn anchor_loop(&self) {
+        loop {
+            let anchor = self
+                .reach_config()
+                .and_then(|c| c.anchor)
+                .filter(|_| self.reach_enabled());
+            if let Some(anchor) = anchor
+                && !self.sessions().iter().any(|s| s.peer == anchor)
+            {
+                let _ = self.reach_peer(&anchor).await;
+            }
+            if !self
+                .pause(Duration::from_secs(5), &self.rdv().regather)
+                .await
+            {
                 break;
             }
         }
