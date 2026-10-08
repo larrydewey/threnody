@@ -757,6 +757,19 @@ impl Node {
         Ok(())
     }
 
+    /// Exports all node state as an encrypted backup (identity, contacts,
+    /// history, groups, prekeys, etc.). The backup is encrypted with a key
+    /// derived from the identity seed.
+    pub fn export_backup(&self) -> Result<Vec<u8>> {
+        self.shared.home.export_backup(&self.shared.identity).map_err(|e| NetError::External(anyhow::anyhow!(e)))
+    }
+
+    /// Imports a backup, replacing all node state. The backup must have been
+    /// created by the same identity.
+    pub fn import_backup(&self, backup_data: &[u8]) -> Result<()> {
+        self.shared.home.import_backup(&self.shared.identity, backup_data).map_err(|e| NetError::External(anyhow::anyhow!(e)))
+    }
+
     /// Starts the userspace WireGuard implementation (boringtun).
     /// Returns the local UDP port being listened on.
     #[cfg(feature = "boringtun")]

@@ -95,6 +95,23 @@ pub struct WireguardInfo {
     pub overlay: String,
 }
 
+/// A URL preview with Open Graph meta tags.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct UrlPreview {
+    /// The original URL.
+    pub url: String,
+    /// The page title (from og:title or <title>).
+    pub title: Option<String>,
+    /// The page description (from og:description or meta description).
+    pub description: Option<String>,
+    /// The preview image URL (from og:image).
+    pub image_url: Option<String>,
+    /// The site name (from og:site_name).
+    pub site_name: Option<String>,
+    /// The content type (from og:type).
+    pub content_type: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceInfo {
     pub fingerprint: String,
@@ -1014,6 +1031,35 @@ PersistentKeepalive = 25\n",
     pub fn wireguard_stop_userspace(&self) {
         let _guard = self.rt.enter();
         self.node.stop_wg_userspace();
+    }
+
+    /// Exports all node state as an encrypted backup (identity, contacts,
+    /// history, groups, prekeys, etc.). The backup is encrypted with a key
+    /// derived from the identity seed.
+    pub fn export_backup(&self) -> Result<Vec<u8>> {
+        let _guard = self.rt.enter();
+        self.node.export_backup().map_err(fail)
+    }
+
+    /// Imports a backup, replacing all node state. The backup must have been
+    /// created by the same identity.
+    pub fn import_backup(&self, backup_data: Vec<u8>) -> Result<()> {
+        let _guard = self.rt.enter();
+        self.node.import_backup(&backup_data).map_err(fail)
+    }
+
+    /// Fetches a URL preview (Open Graph meta tags: title, description,
+    /// image, site name, type) from the given URL. Returns `None` if the
+    /// URL cannot be fetched or has no preview data.
+    pub fn fetch_preview(&self, url: String) -> Option<UrlPreview> {
+        threnody_core::fetch_preview(&url).map(|p| UrlPreview {
+            url: p.url,
+            title: p.title,
+            description: p.description,
+            image_url: p.image_url,
+            site_name: p.site_name,
+            content_type: p.content_type,
+        })
     }
 
     /// Sends a packet through the userspace WireGuard tunnel to a peer.
