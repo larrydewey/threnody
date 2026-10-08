@@ -92,7 +92,7 @@ pub struct RatchetState {
     pub suite: Suite,
     pub session_id: [u8; 32],
     pub root: [u8; 32],
-    pub own: Vec<u8>,  // HybridSecret serialized
+    pub own: Vec<u8>, // HybridSecret serialized
     pub send: Option<SendChainState>,
     pub next_send_hk: [u8; 32],
     pub prev_send_n: u32,
@@ -252,7 +252,11 @@ impl RatchetState {
                         ratchet_pub.copy_from_slice(d.bytes()?);
                         n = d.u32()?;
                         key.copy_from_slice(d.bytes()?);
-                        skipped.push(SkippedEntry { ratchet_pub, n, key });
+                        skipped.push(SkippedEntry {
+                            ratchet_pub,
+                            n,
+                            key,
+                        });
                     }
                 }
                 _ => return Ok(false),
@@ -318,7 +322,7 @@ impl Ratchet {
     pub fn from_state(state: RatchetState, rng: RngSource) -> Result<Self> {
         let own = HybridSecret::from_bytes(&state.own)
             .map_err(|_| Error::Malformed("invalid own secret in ratchet state"))?;
-        
+
         let send = state.send.map(|s| SendChain {
             chain: Chain {
                 key: Zeroizing::new(s.chain.key),
@@ -328,7 +332,7 @@ impl Ratchet {
             pub_bytes: s.pub_bytes,
             ct: s.ct,
         });
-        
+
         let recv = state.recv.map(|r| Chain {
             key: Zeroizing::new(r.key),
             n: r.n,
@@ -355,7 +359,7 @@ impl Ratchet {
             skipped,
             skipped_order,
             rng,
-})
+        })
     }
 }
 

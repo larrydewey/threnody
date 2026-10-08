@@ -27,14 +27,14 @@ use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 #[cfg(feature = "boringtun")]
-use threnody_core::tunnel::{WgKeys, overlay_addr, DEFAULT_PORT};
+use threnody_core::tunnel::{DEFAULT_PORT, WgKeys, overlay_addr};
 #[cfg(feature = "boringtun")]
 use threnody_core::{Identity, PublicIdentity};
 
 #[cfg(feature = "boringtun")]
-use crate::node::Secret;
-#[cfg(feature = "boringtun")]
 use crate::error::{NetError, Result};
+#[cfg(feature = "boringtun")]
+use crate::node::Secret;
 #[cfg(feature = "boringtun")]
 use anyhow;
 
@@ -97,18 +97,18 @@ impl WgUserspace {
 
     pub fn add_peer(&mut self, config: WgPeerConfig) -> Result<()> {
         let peer_id = config.peer_identity;
-        
+
         // Create boringtun tunnel
         let static_private = StaticSecret::from(*self.local_keys.public());
         let peer_static_public = PublicKey::from(config.peer_wg_public);
-        
+
         let mut tunn = Tunn::new(
             static_private,
             peer_static_public,
             Some(config.psk.0[..].try_into().unwrap()),
             Some(25), // persistent keepalive
-            0, // index
-            None, // rate limiter
+            0,        // index
+            None,     // rate limiter
         );
 
         // Initiate handshake
@@ -139,13 +139,11 @@ impl WgUserspace {
         // Create UDP socket
         let socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port))
             .map_err(|e| NetError::Io(e))?;
-        socket.set_nonblocking(true)
-            .map_err(|e| NetError::Io(e))?;
-        let udp_socket = Arc::new(UdpSocket::from_std(socket)
-            .map_err(|e| NetError::Io(e))?);
-        
+        socket.set_nonblocking(true).map_err(|e| NetError::Io(e))?;
+        let udp_socket = Arc::new(UdpSocket::from_std(socket).map_err(|e| NetError::Io(e))?);
+
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        
+
         // We need to move tunnels and peers into the tasks
         // Since Tunn doesn't implement Clone, we'll use a different approach
         // For now, just store the socket and let the Node handle packet processing
@@ -168,21 +166,37 @@ impl WgUserspace {
         self.udp_socket = None;
     }
 
-    pub fn encapsulate(&mut self, peer: &PublicIdentity, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    pub fn encapsulate(
+        &mut self,
+        peer: &PublicIdentity,
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> Result<usize> {
         if let Some(tunn) = self.tunnels.get_mut(peer) {
             let result = tunn.encapsulate(src, dst);
             match result {
                 TunnResult::WriteToNetwork(out) => Ok(out.len()),
                 TunnResult::Done => Ok(0),
-                TunnResult::Err(e) => Err(NetError::External(anyhow::anyhow!("encapsulate error: {:?}", e))),
-                _ => Err(NetError::External(anyhow::anyhow!("unexpected encapsulate result"))),
+                TunnResult::Err(e) => Err(NetError::External(anyhow::anyhow!(
+                    "encapsulate error: {:?}",
+                    e
+                ))),
+                _ => Err(NetError::External(anyhow::anyhow!(
+                    "unexpected encapsulate result"
+                ))),
             }
         } else {
             Err(NetError::External(anyhow::anyhow!("no tunnel for peer")))
         }
     }
 
-    pub fn decapsulate(&mut self, peer: &PublicIdentity, src_addr: SocketAddr, packet: &[u8], out_buf: &mut [u8]) -> Result<Option<Vec<u8>>> {
+    pub fn decapsulate(
+        &mut self,
+        peer: &PublicIdentity,
+        src_addr: SocketAddr,
+        packet: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<Option<Vec<u8>>> {
         if let Some(tunn) = self.tunnels.get_mut(peer) {
             let result = tunn.decapsulate(Some(src_addr.ip().into()), packet, out_buf);
             match result {
@@ -190,20 +204,29 @@ impl WgUserspace {
                 TunnResult::WriteToTunnelV6(out, dst) => Ok(Some(out.to_vec())),
                 TunnResult::WriteToTunnelV4(out, dst) => Ok(Some(out.to_vec())),
                 TunnResult::Done => Ok(None),
-                TunnResult::Err(e) => Err(NetError::External(anyhow::anyhow!("decapsulate error: {:?}", e))),
+                TunnResult::Err(e) => Err(NetError::External(anyhow::anyhow!(
+                    "decapsulate error: {:?}",
+                    e
+                ))),
             }
         } else {
             Err(NetError::External(anyhow::anyhow!("no tunnel for peer")))
         }
     }
 
-    pub fn update_timers(&mut self, peer: &PublicIdentity, out_buf: &mut [u8]) -> Result<Option<Vec<u8>>> {
+    pub fn update_timers(
+        &mut self,
+        peer: &PublicIdentity,
+        out_buf: &mut [u8],
+    ) -> Result<Option<Vec<u8>>> {
         if let Some(tunn) = self.tunnels.get_mut(peer) {
             let result = tunn.update_timers(out_buf);
             match result {
                 TunnResult::WriteToNetwork(out) => Ok(Some(out.to_vec())),
                 TunnResult::Done => Ok(None),
-                TunnResult::Err(e) => Err(NetError::External(anyhow::anyhow!("timer error: {:?}", e))),
+                TunnResult::Err(e) => {
+                    Err(NetError::External(anyhow::anyhow!("timer error: {:?}", e)))
+                }
                 _ => Ok(None),
             }
         } else {
@@ -238,6 +261,8 @@ pub struct WgUserspace;
 #[cfg(not(feature = "boringtun"))]
 impl WgUserspace {
     pub fn new(_identity: &Identity, _listen_port: u16) -> Result<Self> {
-        Err(NetError::External(anyhow::anyhow!("boringtun feature not enabled")))
+        Err(NetError::External(anyhow::anyhow!(
+            "boringtun feature not enabled"
+        )))
     }
 }

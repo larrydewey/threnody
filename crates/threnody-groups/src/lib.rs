@@ -202,11 +202,19 @@ impl Group {
     fn new(mls: MlsGroup, name: String, owner: PublicIdentity) -> Self {
         let mut roles = HashMap::new();
         roles.insert(owner, MemberRole::Owner);
-        Self { mls, name, owner, roles }
+        Self {
+            mls,
+            name,
+            owner,
+            roles,
+        }
     }
 
     fn role(&self, member: &PublicIdentity) -> MemberRole {
-        self.roles.get(member).copied().unwrap_or(MemberRole::Member)
+        self.roles
+            .get(member)
+            .copied()
+            .unwrap_or(MemberRole::Member)
     }
 
     fn set_role(&mut self, member: PublicIdentity, role: MemberRole) {
@@ -306,7 +314,12 @@ impl Groups {
         use threnody_core::cbor::{fixed_bytes, read_map};
         let mut me = Self::new(identity);
         let mut dec = const_cbor::Decoder::new(bytes);
-        let mut meta: Vec<(GroupId, String, [u8; 32], HashMap<PublicIdentity, MemberRole>)> = Vec::new();
+        let mut meta: Vec<(
+            GroupId,
+            String,
+            [u8; 32],
+            HashMap<PublicIdentity, MemberRole>,
+        )> = Vec::new();
         let mut version = None;
         {
             let mut values = me
@@ -338,7 +351,10 @@ impl Groups {
                             let owner = fixed_bytes::<32>(d)?;
                             let role_count = d.map_len()?;
                             for _ in 0..role_count {
-                                let member = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?).map_err(|_| threnody_core::Error::Malformed("member identity"))?;
+                                let member = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?)
+                                    .map_err(|_| {
+                                        threnody_core::Error::Malformed("member identity")
+                                    })?;
                                 let role = MemberRole::from_wire(d.u8()?);
                                 roles.insert(member, role);
                             }
@@ -378,7 +394,15 @@ impl Groups {
     }
 
     /// `(id, name, owner, members, roles)` for every group we are in.
-    pub fn list_with_roles(&self) -> Vec<(GroupId, String, PublicIdentity, Vec<PublicIdentity>, Vec<MemberRole>)> {
+    pub fn list_with_roles(
+        &self,
+    ) -> Vec<(
+        GroupId,
+        String,
+        PublicIdentity,
+        Vec<PublicIdentity>,
+        Vec<MemberRole>,
+    )> {
         self.groups
             .iter()
             .map(|(id, g)| {
@@ -417,10 +441,8 @@ impl Groups {
             credential_for(&self.me),
         )
         .map_err(mls)?;
-        self.groups.insert(
-            id,
-            Group::new(mls, truncate(name), self.me),
-        );
+        self.groups
+            .insert(id, Group::new(mls, truncate(name), self.me));
         Ok(id)
     }
 
@@ -520,9 +542,9 @@ impl Groups {
                 member: *member,
             }],
         })
-}
+    }
 
-/// Owner/Admin: promotes `member` to Admin.
+    /// Owner/Admin: promotes `member` to Admin.
     pub fn promote(&mut self, group: &GroupId, member: PublicIdentity) -> Result<Output> {
         let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
         if g.owner != self.me {
@@ -538,7 +560,11 @@ impl Groups {
         g.set_role(member, MemberRole::Admin);
         Ok(Output {
             send: vec![],
-            events: vec![GroupEvent::RoleChanged { group: *group, member, role: MemberRole::Admin }],
+            events: vec![GroupEvent::RoleChanged {
+                group: *group,
+                member,
+                role: MemberRole::Admin,
+            }],
         })
     }
 
@@ -555,7 +581,11 @@ impl Groups {
         g.set_role(member, MemberRole::Member);
         Ok(Output {
             send: vec![],
-            events: vec![GroupEvent::RoleChanged { group: *group, member, role: MemberRole::Member }],
+            events: vec![GroupEvent::RoleChanged {
+                group: *group,
+                member,
+                role: MemberRole::Member,
+            }],
         })
     }
 
@@ -847,17 +877,17 @@ impl Groups {
         }
         let name = truncate(name);
         let mut roles = HashMap::new();
-            roles.insert(from, MemberRole::Owner);
-            roles.insert(self.me, MemberRole::Member);
-            self.groups.insert(
-                group,
-                Group {
-                    mls,
-                    name: name.clone(),
-                    owner: from,
-                    roles,
-                },
-            );
+        roles.insert(from, MemberRole::Owner);
+        roles.insert(self.me, MemberRole::Member);
+        self.groups.insert(
+            group,
+            Group {
+                mls,
+                name: name.clone(),
+                owner: from,
+                roles,
+            },
+        );
         Ok(Output {
             send: vec![],
             events: vec![GroupEvent::Joined {

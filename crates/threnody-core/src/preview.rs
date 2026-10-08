@@ -74,7 +74,10 @@ pub fn fetch_preview(url: &str) -> Option<UrlPreview> {
     let document = Html::parse_document(&body);
 
     // Extract Open Graph meta tags
-    let meta_selector = Selector::parse("meta[property^='og:'], meta[name='description'], meta[name='twitter:card'], title").ok()?;
+    let meta_selector = Selector::parse(
+        "meta[property^='og:'], meta[name='description'], meta[name='twitter:card'], title",
+    )
+    .ok()?;
 
     let mut title = None;
     let mut description = None;
@@ -97,7 +100,9 @@ pub fn fetch_preview(url: &str) -> Option<UrlPreview> {
             let content = element.value().attr("content").unwrap_or("");
             match name {
                 "description" if description.is_none() => description = Some(content.to_string()),
-                "twitter:card" if content_type.is_none() => content_type = Some(content.to_string()),
+                "twitter:card" if content_type.is_none() => {
+                    content_type = Some(content.to_string())
+                }
                 _ => {}
             }
         } else if element.value().name() == "title" && title.is_none() {
@@ -106,7 +111,12 @@ pub fn fetch_preview(url: &str) -> Option<UrlPreview> {
     }
 
     // Only return if we found at least some data
-    if title.is_none() && description.is_none() && image_url.is_none() && site_name.is_none() && content_type.is_none() {
+    if title.is_none()
+        && description.is_none()
+        && image_url.is_none()
+        && site_name.is_none()
+        && content_type.is_none()
+    {
         return None;
     }
 

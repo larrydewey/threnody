@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
@@ -668,7 +668,10 @@ impl Node {
 
     /// Returns tunnel peer entries with their identities for userspace WireGuard.
     pub fn tunnel_peer_entries(&self) -> Vec<(PublicIdentity, TunnelPeer)> {
-        lock(&self.shared.tunnel_peers).iter().map(|(k, v)| (*k, v.clone())).collect()
+        lock(&self.shared.tunnel_peers)
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
     }
 
     /// Sets the WireGuard tunnel port. Changing this restarts tunnel state.
@@ -761,13 +764,19 @@ impl Node {
     /// history, groups, prekeys, etc.). The backup is encrypted with a key
     /// derived from the identity seed.
     pub fn export_backup(&self) -> Result<Vec<u8>> {
-        self.shared.home.export_backup(&self.shared.identity).map_err(|e| NetError::External(anyhow::anyhow!(e)))
+        self.shared
+            .home
+            .export_backup(&self.shared.identity)
+            .map_err(|e| NetError::External(anyhow::anyhow!(e)))
     }
 
     /// Imports a backup, replacing all node state. The backup must have been
     /// created by the same identity.
     pub fn import_backup(&self, backup_data: &[u8]) -> Result<()> {
-        self.shared.home.import_backup(&self.shared.identity, backup_data).map_err(|e| NetError::External(anyhow::anyhow!(e)))
+        self.shared
+            .home
+            .import_backup(&self.shared.identity, backup_data)
+            .map_err(|e| NetError::External(anyhow::anyhow!(e)))
     }
 
     /// Starts the userspace WireGuard implementation (boringtun).
@@ -780,7 +789,9 @@ impl Node {
         }
 
         let identity = Identity::from_seed(&*self.shared.identity.seed());
-        let port = self.tunnel_port().unwrap_or(threnody_core::tunnel::DEFAULT_PORT);
+        let port = self
+            .tunnel_port()
+            .unwrap_or(threnody_core::tunnel::DEFAULT_PORT);
         let mut wg_userspace = crate::wg_userspace::WgUserspace::new(&identity, port)?;
 
         // Add existing tunnel peers
@@ -831,7 +842,9 @@ impl Node {
             }
             Ok(())
         } else {
-            Err(crate::error::NetError::External(anyhow!("userspace WireGuard not started")))
+            Err(crate::error::NetError::External(anyhow!(
+                "userspace WireGuard not started"
+            )))
         }
     }
 

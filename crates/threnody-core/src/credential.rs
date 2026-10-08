@@ -794,7 +794,12 @@ impl Presentation {
             to_sign.extend_from_slice(&self.proof);
             to_sign.extend_from_slice(&self.pseudonym);
             to_sign.extend_from_slice(binding);
-            crate::crypto::pqsig::verify(&key.pq_public, &to_sign, b"threnody presentation pq sig", sig)?;
+            crate::crypto::pqsig::verify(
+                &key.pq_public,
+                &to_sign,
+                b"threnody presentation pq sig",
+                sig,
+            )?;
         }
 
         Ok(Verified {
@@ -828,7 +833,8 @@ impl Presentation {
 
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut is, mut h, mut t, mut dis, mut p, mut n, mut pq) = (None, None, None, None, None, None, None);
+        let (mut is, mut h, mut t, mut dis, mut p, mut n, mut pq) =
+            (None, None, None, None, None, None, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => is = Some(fixed_bytes::<32>(d)?),
@@ -864,7 +870,8 @@ impl Presentation {
                 5 => n = Some(fixed_bytes::<PSEUDONYM_LEN>(d)?),
                 6 => {
                     let b = d.bytes()?;
-                    if b.len() > 3309 { // ML-DSA-65 sig max size
+                    if b.len() > 3309 {
+                        // ML-DSA-65 sig max size
                         return Err(Error::Malformed("pq_signature too long"));
                     }
                     pq = Some(b.to_vec());

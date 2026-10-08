@@ -107,7 +107,11 @@ impl GroupUi {
                 Update::MemberRemoved { group, member } => {
                     println!("* {} left {}", name(&member), self.label(&group));
                 }
-                Update::RoleChanged { group: _, member, role } => {
+                Update::RoleChanged {
+                    group: _,
+                    member,
+                    role,
+                } => {
                     let role_str = match role {
                         threnody_groups::MemberRole::Owner => "owner",
                         threnody_groups::MemberRole::Admin => "admin",

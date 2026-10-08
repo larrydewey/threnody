@@ -136,7 +136,15 @@ impl GroupNode {
     }
 
     /// `(id, name, owner, members, roles)` for every group we are in.
-    pub fn list_with_roles(&self) -> Vec<(GroupId, String, PublicIdentity, Vec<PublicIdentity>, Vec<MemberRole>)> {
+    pub fn list_with_roles(
+        &self,
+    ) -> Vec<(
+        GroupId,
+        String,
+        PublicIdentity,
+        Vec<PublicIdentity>,
+        Vec<MemberRole>,
+    )> {
         self.groups.list_with_roles()
     }
 
@@ -648,7 +656,15 @@ impl GroupNode {
             GroupEvent::MemberAdded { group, member } => Update::MemberAdded { group, member },
             GroupEvent::MemberRemoved { group, member } => Update::MemberRemoved { group, member },
             GroupEvent::Left { group } => Update::Left { group },
-            GroupEvent::RoleChanged { group, member, role } => Update::RoleChanged { group, member, role },
+            GroupEvent::RoleChanged {
+                group,
+                member,
+                role,
+            } => Update::RoleChanged {
+                group,
+                member,
+                role,
+            },
             GroupEvent::Text {
                 group,
                 from,

@@ -37,4 +37,4 @@ pub use error::{NetError, Result};
 pub use node::{AcceptPolicy, Event, Node, NodeConfig, SessionInfo};
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};
 #[cfg(feature = "boringtun")]
-pub use wg_userspace::{WgUserspace, WgPeerConfig};
+pub use wg_userspace::{WgPeerConfig, WgUserspace};

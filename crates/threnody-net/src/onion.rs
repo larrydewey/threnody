@@ -345,9 +345,9 @@ impl Node {
     }
 
     /// Cover traffic interval for onion circuits (default 2s, same as link layer).
-const ONION_COVER_INTERVAL: Duration = Duration::from_secs(2);
+    const ONION_COVER_INTERVAL: Duration = Duration::from_secs(2);
 
-fn onion_create(
+    fn onion_create(
         &self,
         from: PublicIdentity,
         circ: u64,
@@ -1207,11 +1207,13 @@ impl Node {
     /// Sends a single dummy cover cell through a specific circuit.
     fn send_onion_cover_cell_for_link(&self, link: Link) {
         // Generate a dummy payload (Cmd::Data with random bytes)
-        let dummy_payload = Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
+        let dummy_payload =
+            Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
         // Build a cell that the first hop will forward
         let mut st = lock(&self.shared.onion);
         if let Some(hop) = st.hops.get_mut(&link) {
-let dummy_payload = Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
+            let dummy_payload =
+                Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
             if let Ok(cell) = hop.keys.relay_originate(&dummy_payload) {
                 drop(st);
                 self.onion_send(

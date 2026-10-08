@@ -253,16 +253,16 @@ pub fn secure_delete(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    
+
     // Get file size
     let metadata = fs::metadata(path)?;
     let size = metadata.len() as usize;
-    
+
     if size == 0 {
         fs::remove_file(path)?;
         return Ok(());
     }
-    
+
     // Overwrite with random data (3 passes)
     for _ in 0..3 {
         let random_bytes: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
@@ -277,7 +277,7 @@ pub fn secure_delete(path: &Path) -> Result<()> {
         f.write_all(&random_bytes)?;
         f.sync_all()?;
     }
-    
+
     // Final pass with zeros
     let zeros = vec![0u8; size];
     {
@@ -292,7 +292,7 @@ pub fn secure_delete(path: &Path) -> Result<()> {
         f.write_all(&zeros)?;
         f.sync_all()?;
     }
-    
+
     fs::remove_file(path)?;
     Ok(())
 }
@@ -314,9 +314,9 @@ impl Home {
     /// The backup is encrypted with a key derived from the identity seed.
     pub fn export_backup(&self, identity: &Identity) -> Result<Vec<u8>> {
         use crate::cbor::to_vec;
-        
+
         let mut files = Vec::new();
-        
+
         // Collect all state files
         let state_dir = self.dir.join("state");
         if state_dir.exists() {
@@ -334,29 +334,29 @@ impl Home {
                 }
             }
         }
-        
+
         // Also include identity file
         if let Ok(content) = fs::read(self.identity_path()) {
             files.push(("identity.cbor".to_string(), content));
         }
-        
+
         // Include contacts
         if let Ok(content) = fs::read(self.contacts_path()) {
             files.push(("contacts.cbor".to_string(), content));
         }
-        
+
         // Include personas list
         let personas_path = self.dir.join("personas.list.cbor");
         if let Ok(content) = fs::read(&personas_path) {
             files.push(("personas.list.cbor".to_string(), content));
         }
-        
+
         let backup = Backup {
             version: 1,
             created_ms: crate::now_ms(),
             files,
         };
-        
+
         // Encrypt the backup
         let key = backup_key(identity);
         let nonce: [u8; 12] = crate::crypto::random_bytes();
@@ -370,29 +370,31 @@ impl Home {
             }
             Ok(())
         })?;
-        
+
         let mut out = nonce.to_vec();
         out.extend(Suite::ChaCha20Poly1305.seal(&key, &nonce, b"backup", &plaintext));
         Ok(out)
     }
-    
+
     /// Imports a backup, replacing all node state.
     /// The backup must have been created by the same identity.
     pub fn import_backup(&self, identity: &Identity, backup_data: &[u8]) -> Result<()> {
         if backup_data.len() < 12 {
             return Err(Error::Malformed("backup file"));
         }
-        
+
         let key = backup_key(identity);
         let (nonce, ct) = backup_data.split_at(12);
-        let nonce: [u8; 12] = nonce.try_into().map_err(|_| Error::Malformed("backup file"))?;
+        let nonce: [u8; 12] = nonce
+            .try_into()
+            .map_err(|_| Error::Malformed("backup file"))?;
         let plaintext = Suite::ChaCha20Poly1305.open(&key, &nonce, b"backup", ct)?;
-        
+
         let mut dec = const_cbor::Decoder::new(&plaintext);
         let mut version = None;
         let mut created_ms = None;
         let mut files = Vec::new();
-        
+
         crate::cbor::read_map(&mut dec, |k, d| {
             match k {
                 0 => version = Some(d.u64()?),
@@ -411,11 +413,11 @@ impl Home {
             Ok(true)
         })?;
         crate::cbor::finish(&dec)?;
-        
+
         if version != Some(1) {
             return Err(Error::UnsupportedVersion(version.unwrap_or(0)));
         }
-        
+
         // Write all files
         for (name, content) in files {
             if name == "identity.cbor" {
@@ -431,14 +433,17 @@ impl Home {
                 write_private(&self.dir, &path, &content)?;
             }
         }
-        
+
         Ok(())
     }
 }
 
 fn backup_key(identity: &Identity) -> Zeroizing<[u8; 32]> {
     let seed = identity.seed();
-    Zeroizing::new(crate::crypto::kdf::derive(crate::crypto::kdf::label::STATE_KEY, &[&seed[..], b"backup"]))
+    Zeroizing::new(crate::crypto::kdf::derive(
+        crate::crypto::kdf::label::STATE_KEY,
+        &[&seed[..], b"backup"],
+    ))
 }
 
 /// A known peer. Identity is the key; everything else is local metadata.

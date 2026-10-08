@@ -82,7 +82,11 @@ fn event(u: Update) -> NodeEvent {
             removed: vec![fp(&member)],
         },
         Update::Left { group } => NodeEvent::GroupLeft { group: hex(&group) },
-        Update::RoleChanged { group, member, role } => NodeEvent::GroupRoleChanged {
+        Update::RoleChanged {
+            group,
+            member,
+            role,
+        } => NodeEvent::GroupRoleChanged {
             group: hex(&group),
             member: fp(&member),
             role: role as u8,
