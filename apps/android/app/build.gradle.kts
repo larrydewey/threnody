@@ -61,6 +61,9 @@ dependencies {
     // AndroidX Core for AppCompatDelegate
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.core:core-ktx:1.13.1")
+    // WebRTC's Java half for calls (audio devices), from LiveKit's prebuilt
+    // WebRTC; build.sh copies it here.
+    implementation(files("libs/libwebrtc.jar"))
 }
 
 /** The `[workspace.package]` version in the repository's Cargo.toml. */

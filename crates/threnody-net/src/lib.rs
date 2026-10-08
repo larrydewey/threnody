@@ -7,6 +7,7 @@
 
 pub mod account;
 mod anon;
+pub mod call;
 pub mod cred;
 pub mod delivery;
 pub mod direct;
@@ -29,6 +30,7 @@ pub mod volunteer;
 #[cfg(feature = "boringtun")]
 pub mod wg_userspace;
 
+pub use call::{CallInfo, Phase as CallPhase};
 pub use cred::{CredentialAsk, CredentialInfo, CredentialOffer};
 pub use delivery::Tag;
 pub use direct::DirectOffer;

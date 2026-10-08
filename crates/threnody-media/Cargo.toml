@@ -1,0 +1,26 @@
+[package]
+name = "threnody-media"
+description = "Voice and video call media for Threnody: WebRTC, carried over a Threnody call."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+threnody-core.workspace = true
+threnody-net.workspace = true
+tokio.workspace = true
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+anyhow.workspace = true
+# WebRTC (Apache-2.0), with prebuilt native libraries for Linux and Android.
+libwebrtc = "0.3"
+futures-lite = "2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

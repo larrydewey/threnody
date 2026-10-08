@@ -182,6 +182,45 @@ pub enum Event {
     WifiDirectRequested {
         peer: PublicIdentity,
     },
+    /// `peer` is calling us (see `call`): answer with
+    /// [`Node::answer_call`], or decline with [`Node::hangup_call`].
+    CallIncoming {
+        peer: PublicIdentity,
+        call: u64,
+        video: bool,
+    },
+    /// Our call to `peer` is ringing there.
+    CallRinging {
+        peer: PublicIdentity,
+        call: u64,
+    },
+    /// The call was answered: media flows ([`Node::call_media`]).
+    CallStarted {
+        peer: PublicIdentity,
+        call: u64,
+        peer_video: bool,
+    },
+    /// Signalling for the media layer from `peer` (see
+    /// [`Node::send_call_signal`]).
+    CallSignal {
+        peer: PublicIdentity,
+        call: u64,
+        data: Vec<u8>,
+    },
+    /// `peer` turned its video on or off.
+    CallVideo {
+        peer: PublicIdentity,
+        call: u64,
+        video: bool,
+    },
+    /// The call is over; `by_us` when this side ended it (including
+    /// timeouts here).
+    CallEnded {
+        peer: PublicIdentity,
+        call: u64,
+        reason: threnody_core::call::HangupReason,
+        by_us: bool,
+    },
     /// A peer changed the conversation's disappearing-message timer.
     TimerChanged {
         peer: PublicIdentity,
@@ -326,10 +365,10 @@ pub(crate) enum Route {
     /// An onion circuit (Appendix I) whose first hop is this neighbour.
     Onion(PublicIdentity),
     /// A direct QUIC connection (Appendix N).
-    Quic,
+    Quic(quinn::Connection),
     /// A QUIC connection from our standby endpoint (see `recover`): what
     /// the peer sees there is the standby network's address, not ours.
-    QuicStandby,
+    QuicStandby(quinn::Connection),
     /// A direct link over another transport, e.g. Bluetooth LE.
     Link {
         transport: &'static str,
@@ -348,7 +387,7 @@ impl Route {
             Self::Relay(v) => (None, Some(v), "relay", addr.to_string()),
             Self::Onion(v) => (None, Some(v), "onion", addr.to_string()),
             // Punched paths are ephemeral: nothing to remember for redialing.
-            Self::Quic | Self::QuicStandby => (None, None, "quic", addr.to_string()),
+            Self::Quic(_) | Self::QuicStandby(_) => (None, None, "quic", addr.to_string()),
             Self::Link { transport, remote } => (None, None, transport, remote),
         }
     }
@@ -358,6 +397,8 @@ struct SessionHandle {
     id: u64,
     tx: mpsc::UnboundedSender<AppMessage>,
     info: SessionInfo,
+    /// The QUIC connection under a QUIC session, for call media datagrams.
+    datagrams: Option<quinn::Connection>,
 }
 
 pub(crate) struct Shared {
@@ -417,6 +458,8 @@ pub(crate) struct Shared {
     pub(crate) volunteer: crate::volunteer::VolunteerState,
     /// Credentials held and exchanges in progress (see `cred`).
     pub(crate) creds: Mutex<crate::cred::CredState>,
+    /// The current voice or video call (see `call`).
+    pub(crate) calls: Mutex<crate::call::CallState>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -593,6 +636,7 @@ impl Node {
             anon: Mutex::default(),
             volunteer: crate::volunteer::VolunteerState::new(),
             creds: Mutex::default(),
+            calls: Mutex::default(),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -1123,6 +1167,24 @@ impl Node {
         });
     }
 
+    /// The QUIC connection under the session with `peer`, if it has one.
+    pub(crate) fn datagrams_to(&self, peer: &PublicIdentity) -> Option<quinn::Connection> {
+        lock(&self.shared.sessions)
+            .get(peer)
+            .and_then(|h| h.datagrams.clone())
+    }
+
+    /// Hands `peer`'s datagrams on `conn` to the call layer until the
+    /// connection closes.
+    fn read_datagrams(&self, peer: PublicIdentity, conn: quinn::Connection) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            while let Ok(d) = conn.read_datagram().await {
+                node.on_media(peer, &d);
+            }
+        });
+    }
+
     /// Whether `peer` said (in its latest session) it supports `feature`.
     pub fn supports(&self, peer: &PublicIdentity, feature: u64) -> bool {
         lock(&self.shared.peer_features)
@@ -1218,10 +1280,10 @@ impl Node {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // Over QUIC the peer's address is its outside address, worth telling it.
-        let over = match route {
-            Route::Quic => Over::Quic(addr),
-            Route::QuicStandby => Over::Standby,
-            _ => Over::Other,
+        let (over, datagrams) = match &route {
+            Route::Quic(c) => (Over::Quic(addr), Some(c.clone())),
+            Route::QuicStandby(c) => (Over::Standby, Some(c.clone())),
+            _ => (Over::Other, None),
         };
         let (dialed, via, transport, remote) = route.into_parts(addr);
         let peer = *chan.peer();
@@ -1265,7 +1327,18 @@ impl Node {
             peer.fingerprint(),
             if outbound { "dialed" } else { "accepted" },
         );
-        let old = lock(&self.shared.sessions).insert(peer, SessionHandle { id, tx, info });
+        if let Some(conn) = &datagrams {
+            self.read_datagrams(peer, conn.clone());
+        }
+        let old = lock(&self.shared.sessions).insert(
+            peer,
+            SessionHandle {
+                id,
+                tx,
+                info,
+                datagrams,
+            },
+        );
         self.shared.emit(Event::ReachNote {
             note: match old {
                 Some(o) => format!(
@@ -1643,6 +1716,8 @@ where
                                 node.on_direct(peer, &payload);
                             }
                         }
+                        AppMessage::Call(payload) => node.on_call(peer, &payload),
+                        AppMessage::Media(packet) => node.on_media(peer, &packet),
                         AppMessage::Typing { active } => {
                             if via.is_none() && !on_standby {
                                 shared.emit(Event::Typing { peer, active });
@@ -1665,6 +1740,14 @@ where
                     }
                 }
                 out = outbox.recv() => match out {
+                    // Calls can't hide behind cover traffic (their media
+                    // shows anyway), and a call can't wait for ticks.
+                    Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
+                        match ready(shared, &peer, m, peer_acks) {
+                            Ok(m) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                            Err(m) => pending.push_back(m),
+                        }
+                    }
                     Some(m) => pending.push_back(m),
                     None => return Ok(()), // replaced or disconnected locally
                 },
@@ -1694,6 +1777,16 @@ where
     .await;
     reader.abort();
     result
+}
+
+/// Call signalling and media: sent at once even under constant-rate
+/// cover traffic.
+fn urgent(m: &AppMessage) -> bool {
+    match m {
+        AppMessage::Call(_) | AppMessage::Media(_) => true,
+        AppMessage::Tracked { inner, .. } => urgent(inner),
+        _ => false,
+    }
 }
 
 /// What to send for `m` now: tracked messages wait until we know whether

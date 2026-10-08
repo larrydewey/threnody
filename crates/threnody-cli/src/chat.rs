@@ -1111,6 +1111,15 @@ impl Ui {
                 .relayed(&self.node, &peer, &group, local_id, &origin),
             // Shown as ✓✓ in /history; too chatty to print live.
             Event::Delivered { .. } | Event::Read { .. } => {}
+            // Calls are for the apps; the terminal only says one rang.
+            Event::CallIncoming { peer, .. } => {
+                println!("* {} is calling (answer in the app)", self.name(&peer));
+            }
+            Event::CallRinging { .. }
+            | Event::CallStarted { .. }
+            | Event::CallSignal { .. }
+            | Event::CallVideo { .. }
+            | Event::CallEnded { .. } => {}
             Event::Typing { peer, active } => {
                 if active {
                     println!("* {} is typing", self.name(&peer));

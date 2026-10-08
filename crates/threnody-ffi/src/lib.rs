@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 uniffi::setup_scaffolding!();
 
+mod calls;
 mod groups;
 mod persona;
 mod volunteer;
@@ -27,6 +28,7 @@ pub use volunteer::{
     CredentialAskRecord, CredentialOfferRecord, CredentialRecord, DirectoryRecord,
 };
 
+pub use calls::CallRecord;
 pub use groups::{GroupInfo, GroupInvite};
 use threnody_groups::node::GroupNode;
 
@@ -263,6 +265,43 @@ pub struct BleDial {
 /// Things the app should react to.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum NodeEvent {
+    /// `peer` is calling: `answer_call` or `hangup_call` (to decline).
+    CallIncoming {
+        peer: String,
+        call: u64,
+        video: bool,
+    },
+    /// Our call to `peer` is ringing there.
+    CallRinging {
+        peer: String,
+        call: u64,
+    },
+    /// The call was answered; audio follows (`CallMedia`).
+    CallStarted {
+        peer: String,
+        call: u64,
+        peer_video: bool,
+    },
+    /// The call's audio: "connected", "interrupted" (recovering) or
+    /// "failed" (the call ends).
+    CallMedia {
+        call: u64,
+        state: String,
+    },
+    /// `peer` turned its video on or off.
+    CallVideo {
+        peer: String,
+        call: u64,
+        video: bool,
+    },
+    /// The call is over: "ended", "declined", "busy", "unanswered",
+    /// "failed", …; `by_us` when this side ended it.
+    CallEnded {
+        peer: String,
+        call: u64,
+        reason: String,
+        by_us: bool,
+    },
     Connected {
         peer: String,
         via: Option<String>,
@@ -518,8 +557,12 @@ pub struct ThrenodyNode {
     node: Node,
     events: Mutex<UnboundedReceiver<Event>>,
     groups: Mutex<GroupNode>,
-    /// Events produced while handling another (group traffic), not yet returned.
-    queued: Mutex<VecDeque<NodeEvent>>,
+    /// Events produced while handling another (group traffic, call
+    /// media), not yet returned.
+    queued: Arc<Mutex<VecDeque<NodeEvent>>>,
+    /// Call audio (see `calls`).
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    media: calls::Media,
 }
 
 /// Groups an entry's reactions by emoji; `me` is our reactor id.
@@ -728,6 +771,40 @@ fn convert(e: Event) -> NodeEvent {
             psk: psk.0.to_vec(),
         },
         Event::TunnelDown { peer, .. } => NodeEvent::TunnelDown { peer: fp(&peer) },
+        Event::CallIncoming { peer, call, video } => NodeEvent::CallIncoming {
+            peer: fp(&peer),
+            call,
+            video,
+        },
+        Event::CallRinging { peer, call } => NodeEvent::CallRinging {
+            peer: fp(&peer),
+            call,
+        },
+        Event::CallStarted {
+            peer,
+            call,
+            peer_video,
+        } => NodeEvent::CallStarted {
+            peer: fp(&peer),
+            call,
+            peer_video,
+        },
+        Event::CallVideo { peer, call, video } => NodeEvent::CallVideo {
+            peer: fp(&peer),
+            call,
+            video,
+        },
+        Event::CallEnded {
+            peer,
+            call,
+            reason,
+            by_us,
+        } => NodeEvent::CallEnded {
+            peer: fp(&peer),
+            call,
+            reason: calls::reason(reason),
+            by_us,
+        },
         other => NodeEvent::Other {
             description: format!("{other:?}"),
         },
@@ -822,12 +899,18 @@ impl ThrenodyNode {
             })
             .map_err(fail)?
         };
+        let queued = Arc::new(Mutex::new(VecDeque::new()));
+        let media = {
+            let _guard = rt.enter();
+            calls::media(&node, queued.clone())
+        };
         Ok(Arc::new(Self {
             rt,
             node,
             events: Mutex::new(events),
             groups: Mutex::new(groups),
-            queued: Mutex::new(VecDeque::new()),
+            queued,
+            media,
         }))
     }
 
@@ -1684,10 +1767,14 @@ PersistentKeepalive = 25\n",
                     self.group_node()
                         .relayed(&self.node, &peer, &group, local_id, &origin);
                 }
+                // Media-layer signalling (SDP, ICE) is for the call's
+                // media only, and never reaches the app or its logs.
+                ref e @ Event::CallSignal { .. } => self.call_event(e),
                 other => {
                     if let Event::Connected { peer, .. } = &other {
                         self.group_connected(peer);
                     }
+                    self.call_event(&other);
                     return Some(convert(other));
                 }
             }
@@ -1871,6 +1958,65 @@ mod tests {
         assert!(!std::path::Path::new(&rec.home).exists());
     }
 
+    /// A call with the real microphone and speaker: run by hand with
+    /// `cargo test -p threnody-ffi --features calls -- --ignored call_audio`.
+    #[cfg(feature = "calls")]
+    #[test]
+    #[ignore = "needs a microphone and speaker"]
+    fn call_audio_connects_on_real_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap()
+        };
+        let (alice, bob) = (open("a"), open("b"));
+        let addr = bob.listen("127.0.0.1:0".into()).unwrap();
+        let bob_fp = alice.connect(bob.invite_link(addr)).unwrap();
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(alice.device_fingerprint()).unwrap();
+        // Apps drain events all the time; the call's media relies on it.
+        let pump = |n: Arc<ThrenodyNode>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                loop {
+                    if let Some(e) = n.next_event(100)
+                        && tx.send(e).is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            rx
+        };
+        let until = |rx: &std::sync::mpsc::Receiver<NodeEvent>,
+                     pred: &dyn Fn(&NodeEvent) -> bool| {
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            while let Ok(e) = rx.recv_timeout(end - std::time::Instant::now()) {
+                if pred(&e) {
+                    return e;
+                }
+            }
+            panic!("event did not arrive");
+        };
+        let (arx, brx) = (pump(alice.clone()), pump(bob.clone()));
+        std::thread::sleep(Duration::from_millis(500));
+        // Twice: the audio device must survive the first call's end.
+        for round in 0..2 {
+            let t0 = std::time::Instant::now();
+            let id = alice.start_call(bob_fp.clone(), false).unwrap();
+            until(&brx, &|e| matches!(e, NodeEvent::CallIncoming { .. }));
+            bob.answer_call(id, false).unwrap();
+            let connected = |e: &NodeEvent| matches!(e, NodeEvent::CallMedia { state, .. } if state == "connected");
+            until(&arx, &connected);
+            until(&brx, &connected);
+            eprintln!("call {round}: audio connected after {:?}", t0.elapsed());
+            bob.set_call_muted(true);
+            std::thread::sleep(Duration::from_secs(2));
+            alice.hangup_call(id);
+            until(&brx, &|e| matches!(e, NodeEvent::CallEnded { .. }));
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     #[test]
     fn two_embedded_nodes_chat() {
         let dir = tempfile::tempdir().unwrap();
@@ -1985,6 +2131,28 @@ mod tests {
                 .iter()
                 .any(|c| c.fingerprint == bob_fp && c.mutually_approved && c.connected)
         );
+
+        // A call: ringing, answered, hung up; the app never sees the media
+        // layer's signalling.
+        bob.accept_contact(alice.device_fingerprint()).unwrap();
+        let id = alice.start_call(bob_fp.clone(), false).unwrap();
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::CallIncoming { call, .. } if *call == id),
+        );
+        wait(&alice, |e| matches!(e, NodeEvent::CallRinging { .. }));
+        assert_eq!(bob.current_call().unwrap().phase, "incoming");
+        bob.answer_call(id, false).unwrap();
+        wait(&alice, |e| matches!(e, NodeEvent::CallStarted { .. }));
+        assert_eq!(alice.current_call().unwrap().phase, "active");
+        bob.hangup_call(id);
+        let NodeEvent::CallEnded { reason, by_us, .. } =
+            wait(&alice, |e| matches!(e, NodeEvent::CallEnded { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(reason == "ended" && !by_us);
+        assert!(alice.current_call().is_none() && bob.current_call().is_none());
         let h = alice.history(bob_fp.clone(), 10).unwrap();
         assert_eq!(h.len(), 3, "the request, the same text again, the file");
         assert!(h[0].outgoing && h[0].text == "hello from an app");

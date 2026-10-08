@@ -216,6 +216,10 @@ fn transport() -> Arc<quinn::TransportConfig> {
     // One stream per connection, from the dialer.
     t.max_concurrent_uni_streams(0u8.into());
     t.max_concurrent_bidi_streams(1u8.into());
+    // Call media datagrams (see `call`): a small send buffer, so that
+    // under congestion old media is dropped rather than queued.
+    t.datagram_receive_buffer_size(Some(256 * 1024));
+    t.datagram_send_buffer_size(64 * 1024);
     Arc::new(t)
 }
 
@@ -374,7 +378,7 @@ impl Node {
         let mut stream = tokio::io::join(recv, send);
         let chan = handshake::accept(&mut stream, self.identity_ref()).await?;
         self.check_policy(chan.peer())?;
-        self.spawn_session(stream, chan, addr, false, Route::Quic);
+        self.spawn_session(stream, chan, addr, false, Route::Quic(conn));
         Ok(())
     }
 
@@ -425,9 +429,9 @@ impl Node {
             });
         }
         let route = if standby {
-            Route::QuicStandby
+            Route::QuicStandby(conn)
         } else {
-            Route::Quic
+            Route::Quic(conn)
         };
         self.spawn_session(stream, chan, addr, true, route);
         Ok(peer)

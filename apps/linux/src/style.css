@@ -117,3 +117,10 @@ windowtitle.warning .subtitle {
   margin: 8px 6px 2px 6px;
   font-size: 0.85em;
 }
+
+/* The current call, across the top of the window. */
+.call-bar {
+    padding: 6px 12px;
+    background-color: alpha(@accent_bg_color, 0.15);
+    border-bottom: 1px solid alpha(@borders, 0.5);
+}

@@ -10,7 +10,9 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 sdk="${ANDROID_HOME:-$HOME/Android/Sdk}"
-ndk="${ANDROID_NDK_HOME:-$(ls -d "$sdk"/ndk/* | sort -V | tail -1)}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+# WebRTC's build (calls) finds the NDK through ANDROID_NDK_HOME.
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$sdk"/ndk/* | sort -V | tail -1)}"
+ndk="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 install=0
 release=0
 abis=(arm64-v8a)
@@ -33,11 +35,17 @@ for abi in "${abis[@]}"; do
     var="${triple//-/_}"
     export "CARGO_TARGET_${var^^}_LINKER=$ndk/${triple}35-clang"
     export "CC_${var}=$ndk/${triple}35-clang"
+    export "CXX_${var}=$ndk/${triple}35-clang++"
     export "AR_${var}=$ndk/llvm-ar"
-    cargo build -q --release -p threnody-ffi --target "$triple" --features boringtun
+    cargo build -q --release -p threnody-ffi --target "$triple" --features boringtun,calls
     mkdir -p "$here/app/src/main/jniLibs/$abi"
     cp "target/$triple/release/libthrenody_ffi.so" "$here/app/src/main/jniLibs/$abi/"
 done
+# WebRTC's Java half (audio devices), from the prebuilt the build fetched.
+jar="$(find target -path '*-release/libwebrtc.jar' -print -quit)"
+[[ -n "$jar" ]] || { echo "libwebrtc.jar not found under target/" >&2; exit 1; }
+mkdir -p "$here/app/libs"
+cp "$jar" "$here/app/libs/libwebrtc.jar"
 cargo build -q -p threnody-ffi --features boringtun
 cargo run -q -p threnody-ffi --features bindgen --bin uniffi-bindgen -- generate \
     --library target/debug/libthrenody_ffi.so --language kotlin --no-format \

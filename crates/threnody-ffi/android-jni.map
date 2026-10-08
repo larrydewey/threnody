@@ -1,0 +1,9 @@
+/* Android with the `calls` feature: WebRTC's own JNI_OnLoad (it keeps the
+   JavaVM, which WebRTC's audio needs) and the Java native methods of
+   LiveKit's libwebrtc.jar must stay visible, alongside the exports Rust
+   makes. See build.rs. */
+{
+  global:
+    JNI_OnLoad;
+    Java_livekit_org_webrtc_*;
+};

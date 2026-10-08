@@ -2,6 +2,7 @@ package org.threnody.app
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -394,6 +395,7 @@ object Threnody {
 
     /** Opens the node, its identity sealed under the Android Keystore. */
     private fun open(ctx: Context): ThrenodyNode {
+        Calls.prepare(ctx)
         val home = ctx.filesDir.resolve("threnody").path
         return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home), null)
     }
@@ -591,6 +593,15 @@ object Threnody {
                             ThrenodyService.notifyMessage(ctx, c.key, c.device, "Safety alert: ${c.title}",
                                 "${c.title} added a device you haven't verified. Compare safety numbers.")
                         }
+                    }
+                }
+                is NodeEvent.CallIncoming, is NodeEvent.CallRinging, is NodeEvent.CallStarted,
+                is NodeEvent.CallMedia, is NodeEvent.CallVideo, is NodeEvent.CallEnded -> {
+                    // The log is for transports: that a call happened, not with whom.
+                    if (e is NodeEvent.CallIncoming || e is NodeEvent.CallEnded) say("* call: ${e::class.simpleName}")
+                    Calls.onEvent(ctx, node, persona, e)
+                    if (e is NodeEvent.CallIncoming && visible > 0) {
+                        ctx.startActivity(Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }
                 }
                 else -> say("· $e")

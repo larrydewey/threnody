@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/threnody-core", "crates/threnody-net", "crates/threnody-groups", "crates/threnody-cli", "crates/threnody-ffi", "apps/linux"]
+members = ["crates/threnody-core", "crates/threnody-net", "crates/threnody-groups", "crates/threnody-media", "crates/threnody-cli", "crates/threnody-ffi", "apps/linux"]
 exclude = ["fuzz"]
 
 [workspace.package]

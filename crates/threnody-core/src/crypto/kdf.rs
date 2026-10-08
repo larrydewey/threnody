@@ -42,6 +42,8 @@ pub mod label {
     pub const RELAY_TOKEN: &str = "threnody v1 2026-10-05 relay token binding";
     pub const SIG_RELAY_DESCRIPTOR: &str = "threnody v1 2026-10-05 relay descriptor";
     pub const SIG_DIRECTORY: &str = "threnody v1 2026-10-05 directory document";
+    pub const CALL_MEDIA: &str = "threnody v1 2026-10-08 call media secret";
+    pub const CALL_DIRECTION: &str = "threnody v1 2026-10-08 call media direction key";
 }
 
 /// Fills `out` from the KDF.

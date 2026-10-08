@@ -11,6 +11,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use threnody_ffi::{NodeEvent, ProfileAttr};
 
+use crate::call::CallBar;
 use crate::chat::{ChatView, Key};
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target, UiEvent};
 use crate::settings;
@@ -49,6 +50,8 @@ pub struct App {
     /// Ignore selection changes while the list is rebuilt.
     rebuilding: Cell<bool>,
     log: RefCell<Option<gtk::TextBuffer>>,
+    /// The current call, across the top of the window.
+    call: Rc<CallBar>,
 }
 
 impl App {
@@ -191,8 +194,13 @@ impl App {
         split.set_min_sidebar_width(280.0);
         split.set_max_sidebar_width(380.0);
 
+        let call = CallBar::new(core.clone());
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&call.widget);
+        column.append(&split);
+        split.set_vexpand(true);
         let toasts = adw::ToastOverlay::new();
-        toasts.set_child(Some(&split));
+        toasts.set_child(Some(&column));
         window.set_content(Some(&toasts));
 
         // Narrow windows show one pane at a time.
@@ -224,6 +232,7 @@ impl App {
             refresh_pending: Cell::new(false),
             rebuilding: Cell::new(false),
             log: RefCell::new(None),
+            call,
         });
         this.actions();
         this.watch(events);
@@ -978,6 +987,39 @@ impl App {
                 ));
                 (None, None)
             }
+            NodeEvent::CallIncoming { peer, call, .. } => {
+                let title = self.title_of(persona.as_deref(), peer);
+                self.call
+                    .incoming(persona.clone(), *call, &title, &self.window);
+                if !self.window.is_active() {
+                    self.notify_call(&title);
+                }
+                (None, None)
+            }
+            NodeEvent::CallRinging { call, .. } => {
+                self.call.ringing(*call);
+                (None, None)
+            }
+            NodeEvent::CallStarted { call, .. } => {
+                self.call.started(*call);
+                (None, None)
+            }
+            NodeEvent::CallMedia { call, state } => {
+                self.call.media(*call, state);
+                (None, None)
+            }
+            NodeEvent::CallEnded {
+                call,
+                reason,
+                by_us,
+                ..
+            } => {
+                self.app.withdraw_notification("call");
+                if let Some(what) = self.call.ended(*call, reason, *by_us) {
+                    self.toast(&what);
+                }
+                (None, None)
+            }
             NodeEvent::ThisDeviceRemoved => {
                 self.toast("This device was removed from your account.");
                 (None, None)
@@ -1054,6 +1096,45 @@ impl App {
 
     /// Shows a notification; unless the user turned private notifications
     /// off, it says only "New message".
+    /// Calls `conv` (a contact).
+    pub fn start_call(self: &Rc<Self>, conv: &Conversation) {
+        if self.call.busy() {
+            return self.toast("You're already in a call.");
+        }
+        let persona = conv.chat.persona.clone();
+        let Ok(node) = self.core.node(persona.as_deref()) else {
+            return;
+        };
+        let (device, title) = (conv.device.clone(), conv.title.clone());
+        let weak = Rc::downgrade(self);
+        bg(
+            move || node.start_call(device, false),
+            move |r| {
+                let Some(this) = weak.upgrade() else { return };
+                match r {
+                    Ok(id) => this.call.outgoing(persona, id, &title),
+                    Err(e) => this.toast(&format!("Couldn't call {title}: {e}")),
+                }
+            },
+        );
+    }
+
+    /// Tells the desktop someone is calling (not who, with private
+    /// notifications on).
+    fn notify_call(&self, title: &str) {
+        let n = if self.core.settings().flag(settings::PRIVATE_NOTIFICATIONS) {
+            let n = gio::Notification::new("Threnody");
+            n.set_body(Some("Incoming call"));
+            n
+        } else {
+            let n = gio::Notification::new(&format!("{title} is calling"));
+            n.set_body(Some("Open Threnody to answer."));
+            n
+        };
+        n.set_priority(gio::NotificationPriority::Urgent);
+        self.app.send_notification(Some("call"), &n);
+    }
+
     fn notify(&self, chat: &ChatRef, title: &str, body: &str) {
         let private = self.core.settings().flag(settings::PRIVATE_NOTIFICATIONS);
         let n = if private {

@@ -3,6 +3,7 @@
 //! directory and keyring entry, so an identity made with `threnody init`
 //! opens here as it is.
 
+mod call;
 mod chat;
 mod core;
 mod keyring;

@@ -97,6 +97,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix N: reaching contacts across the internet](docs/appendix-n-internet-reachability.md) (0.3.0)
 - [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md) (0.4.0)
 - [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md) (0.4.0)
+- [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (in progress: audio between apps)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 

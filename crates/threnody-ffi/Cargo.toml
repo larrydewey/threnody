@@ -11,6 +11,10 @@ repository.workspace = true
 crate-type = ["lib", "cdylib", "staticlib"]
 name = "threnody_ffi"
 
+[[example]]
+name = "call_bot"
+required-features = ["calls"]
+
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
@@ -19,6 +23,8 @@ required-features = ["bindgen"]
 [features]
 bindgen = ["uniffi/cli"]
 boringtun = ["threnody-net/boringtun"]
+# Call audio through WebRTC (prebuilt native libraries per platform).
+calls = ["dep:threnody-media"]
 
 [dependencies]
 threnody-core.workspace = true
@@ -29,6 +35,7 @@ qrcode.workspace = true
 threnody-groups = { workspace = true, features = ["node"] }
 uniffi = "0.32"
 rqrr = { version = "0.11.0", default-features = false }
+threnody-media = { path = "../threnody-media", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

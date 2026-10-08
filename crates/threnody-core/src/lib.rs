@@ -5,6 +5,7 @@
 //! wire format and local persistence. Transports live in `threnody-net`.
 
 pub mod account;
+pub mod call;
 pub mod cbor;
 pub mod channel;
 pub mod credential;

@@ -114,6 +114,7 @@ class ChatActivity : Activity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         bar = TopBar(this) { finish() }.apply {
             title.text = if (group != null) "Group" else Threnody.short(device)
+            if (group == null) action(R.drawable.ic_call, "Call") { call() }
             action(R.drawable.ic_search, "Search this chat") { search.open() }
             action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
         }
@@ -1716,6 +1717,12 @@ class ChatActivity : Activity() {
         }
     }
 
+    /** Calls this contact (voice). */
+    private fun call() {
+        if (!::node.isInitialized) return
+        Calls.start(this, node, persona, device, convo?.title ?: Threnody.short(device))
+    }
+
     private fun wifiDirect() {
         if (!WifiDirect.permitted(this)) return requestPermissions(arrayOf(WifiDirect.permission), WIFI_DIRECT)
         WifiDirect.host(applicationContext, node, device)
@@ -1724,6 +1731,7 @@ class ChatActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
+        Calls.permissionResult(code, results)
         if (code == WIFI_DIRECT && results.isNotEmpty() && results.all { it == 0 }) wifiDirect()
     }
 

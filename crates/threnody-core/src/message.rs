@@ -41,6 +41,9 @@ pub const FEATURE_CREDENTIALS: u64 = 128;
 pub const FEATURE_TYPING: u64 = 256;
 /// The peer understands `AppMessage::Read` (read receipts).
 pub const FEATURE_READ: u64 = 512;
+/// The peer understands `AppMessage::Call` and `AppMessage::Media`
+/// (voice and video calls, see `crate::call`).
+pub const FEATURE_CALLS: u64 = 1024;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -50,7 +53,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_PATHS
     | FEATURE_CREDENTIALS
     | FEATURE_TYPING
-    | FEATURE_READ;
+    | FEATURE_READ
+    | FEATURE_CALLS;
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -108,6 +112,12 @@ pub enum AppMessage {
     Account(Vec<u8>),
     /// An opaque Wi-Fi Direct link message (see `threnody-net::direct`).
     Direct(Vec<u8>),
+    /// Call signalling ([`crate::call::CallMsg`]). Only sent to peers whose
+    /// `Hello` has [`FEATURE_CALLS`].
+    Call(Vec<u8>),
+    /// One sealed call media packet ([`crate::call::MediaKeys`]), on links
+    /// that have no datagrams.
+    Media(Vec<u8>),
     /// A profile or a revealed identity ([`crate::persona::IdentityMsg`]).
     Identity(Vec<u8>),
     /// `inner`, which the receiver acknowledges by `id` and delivers once
@@ -195,6 +205,8 @@ mod kind {
     pub const DIRECTORY: u64 = 22;
     pub const TYPING: u64 = 23;
     pub const READ: u64 = 24;
+    pub const CALL: u64 = 25;
+    pub const MEDIA: u64 = 26;
 }
 
 impl AppMessage {
@@ -376,6 +388,14 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::DIRECT)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Call(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::CALL)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
+                Self::Media(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::MEDIA)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Identity(payload) => {
                     e.map_len(2)?.u8(0)?.uint(kind::IDENTITY)?;
                     e.u8(2)?.bytes(payload)?;
@@ -435,6 +455,8 @@ impl AppMessage {
             | Self::Paths(p)
             | Self::Credential(p)
             | Self::Directory(p)
+            | Self::Call(p)
+            | Self::Media(p)
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
@@ -586,6 +608,8 @@ impl AppMessage {
             | kind::ONION
             | kind::ACCOUNT
             | kind::DIRECT
+            | kind::CALL
+            | kind::MEDIA
             | kind::PATHS
             | kind::CREDENTIAL
             | kind::DIRECTORY
@@ -605,6 +629,8 @@ impl AppMessage {
                     Some(kind::PATHS) => Self::Paths(p),
                     Some(kind::CREDENTIAL) => Self::Credential(p),
                     Some(kind::DIRECTORY) => Self::Directory(p),
+                    Some(kind::CALL) => Self::Call(p),
+                    Some(kind::MEDIA) => Self::Media(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -771,6 +797,8 @@ mod tests {
             AppMessage::Onion(vec![8]),
             AppMessage::Account(vec![9]),
             AppMessage::Direct(vec![10]),
+            AppMessage::Call(vec![11]),
+            AppMessage::Media(vec![12]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }
