@@ -626,6 +626,7 @@ impl Credential {
                 .collect(),
             proof: proof.to_bytes(),
             pseudonym,
+            pq_signature: None,
         })
     }
 
@@ -692,6 +693,9 @@ pub struct Presentation {
     pub disclosed: Vec<(u16, String, String)>,
     pub proof: Vec<u8>,
     pub pseudonym: [u8; PSEUDONYM_LEN],
+    /// Optional ML-DSA signature on the presentation (for post-quantum security).
+    /// Covers: issuer || header || total || disclosed || proof || pseudonym || binding.
+    pub pq_signature: Option<Vec<u8>>,
 }
 
 /// What a valid presentation shows.
@@ -774,6 +778,25 @@ impl Presentation {
                 Some(&[]),
             )
         })?;
+
+        // Verify ML-DSA signature if present (post-quantum defense in depth)
+        if let Some(sig) = &self.pq_signature {
+            // The signature covers: issuer || header || total || disclosed || proof || pseudonym || binding
+            let mut to_sign = Vec::new();
+            to_sign.extend_from_slice(&self.issuer);
+            to_sign.extend_from_slice(&self.header);
+            to_sign.extend_from_slice(&self.total.to_le_bytes());
+            for (i, k, v) in &self.disclosed {
+                to_sign.extend_from_slice(&i.to_le_bytes());
+                to_sign.extend_from_slice(k.as_bytes());
+                to_sign.extend_from_slice(v.as_bytes());
+            }
+            to_sign.extend_from_slice(&self.proof);
+            to_sign.extend_from_slice(&self.pseudonym);
+            to_sign.extend_from_slice(binding);
+            crate::crypto::pqsig::verify(&key.pq_public, &to_sign, b"threnody presentation pq sig", sig)?;
+        }
+
         Ok(Verified {
             issuer: key.identity,
             schema: header.schema,
@@ -785,7 +808,8 @@ impl Presentation {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         cbor::to_vec(1024 + self.proof.len(), |e| {
-            e.map_len(6)?;
+            let map_len = 6 + usize::from(self.pq_signature.is_some());
+            e.map_len(map_len)?;
             e.u8(0)?.bytes(&self.issuer)?;
             e.u8(1)?.bytes(&self.header)?;
             e.u8(2)?.u16(self.total)?;
@@ -795,13 +819,16 @@ impl Presentation {
             }
             e.u8(4)?.bytes(&self.proof)?;
             e.u8(5)?.bytes(&self.pseudonym)?;
+            if let Some(sig) = &self.pq_signature {
+                e.u8(6)?.bytes(sig)?;
+            }
             Ok(())
         })
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut is, mut h, mut t, mut dis, mut p, mut n) = (None, None, None, None, None, None);
+        let (mut is, mut h, mut t, mut dis, mut p, mut n, mut pq) = (None, None, None, None, None, None, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => is = Some(fixed_bytes::<32>(d)?),
@@ -835,6 +862,13 @@ impl Presentation {
                     p = Some(b.to_vec());
                 }
                 5 => n = Some(fixed_bytes::<PSEUDONYM_LEN>(d)?),
+                6 => {
+                    let b = d.bytes()?;
+                    if b.len() > 3309 { // ML-DSA-65 sig max size
+                        return Err(Error::Malformed("pq_signature too long"));
+                    }
+                    pq = Some(b.to_vec());
+                }
                 _ => return Ok(false),
             }
             Ok(true)
@@ -847,6 +881,7 @@ impl Presentation {
             disclosed: required(dis, "disclosed attributes")?,
             proof: required(p, "proof")?,
             pseudonym: required(n, "pseudonym")?,
+            pq_signature: pq,
         })
     }
 }

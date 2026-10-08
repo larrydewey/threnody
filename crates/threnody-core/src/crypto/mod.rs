@@ -17,3 +17,12 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     UnwrapErr(SysRng).fill_bytes(&mut b);
     b
 }
+
+/// Returns `n` bytes from the OS CSPRNG as a Vec.
+pub fn random_bytes_vec(n: usize) -> Vec<u8> {
+    use getrandom::SysRng;
+    use rand_core::{Rng as RandRng, UnwrapErr};
+    let mut b = vec![0u8; n];
+    UnwrapErr(SysRng).fill_bytes(&mut b);
+    b
+}

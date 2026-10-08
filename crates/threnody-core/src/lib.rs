@@ -37,6 +37,7 @@ pub use error::{Error, Result};
 pub use identity::{Fingerprint, Identity, PublicIdentity, safety_number};
 pub use message::AppMessage;
 pub use preview::{fetch_preview, UrlPreview};
+pub use crypto::random_bytes_vec;
 
 /// Milliseconds since the Unix epoch, saturating at zero for clocks set
 /// before 1970.

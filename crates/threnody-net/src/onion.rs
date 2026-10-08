@@ -228,6 +228,8 @@ pub(crate) struct OnionState {
     extending: HashMap<Link, Link>,
     /// Our own circuits: first-hop link circuit -> backward cells.
     origins: HashMap<Link, mpsc::UnboundedSender<Cell>>,
+    /// Cover traffic state for our own circuits.
+    cover_traffic: HashMap<Link, CoverTrafficState>,
     /// Our first-hop CREATEs awaiting CREATED.
     creating: HashMap<Link, oneshot::Sender<CreatedFields>>,
     /// Per neighbour: start of the current minute and deposits in it.
@@ -236,6 +238,48 @@ pub(crate) struct OnionState {
     anon: HashSet<Link>,
     /// Per neighbour: start of the current minute and tokens checked in it.
     token_rate: HashMap<PublicIdentity, (Instant, u32)>,
+}
+
+/// State for cover traffic on a circuit we initiated.
+struct CoverTrafficState {
+    /// Interval for cover cells (None = disabled).
+    interval: Option<Duration>,
+    /// Timer handle for periodic dummy cell sending.
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CoverTrafficState {
+    fn new(interval: Duration, link: Link, node: Node) -> Self {
+        let mut state = Self {
+            interval: Some(interval),
+            timer: None,
+        };
+        state.start(node);
+        state
+    }
+
+    fn start(&mut self, node: Node) {
+        if self.interval.is_none() || self.timer.is_some() {
+            return;
+        }
+        let interval = self.interval.unwrap();
+        let timer = tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            interval_timer.tick().await; // skip immediate tick
+            loop {
+                interval_timer.tick().await;
+                node.send_onion_cover_cell();
+            }
+        });
+        self.timer = Some(timer);
+    }
+
+    fn stop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+        self.interval = None;
+    }
 }
 
 /// Relay tokens checked per neighbour per minute: each costs pairings.
@@ -300,7 +344,10 @@ impl Node {
         }
     }
 
-    fn onion_create(
+    /// Cover traffic interval for onion circuits (default 2s, same as link layer).
+const ONION_COVER_INTERVAL: Duration = Duration::from_secs(2);
+
+fn onion_create(
         &self,
         from: PublicIdentity,
         circ: u64,
@@ -359,6 +406,13 @@ impl Node {
         let mut st = lock(&self.shared.onion);
         if let Some(tx) = st.creating.remove(&(from, circ)) {
             let _ = tx.send((id, ct, sig));
+            // Circuit is fully established; start cover traffic if enabled.
+            let interval = *self.shared.constant_rate.borrow();
+            if let Some(interval) = interval {
+                let link = (from, circ);
+                let cover_state = CoverTrafficState::new(interval, link, self.clone());
+                st.cover_traffic.insert(link, cover_state);
+            }
             return;
         }
         let Some(up) = st.extending.remove(&(from, circ)) else {
@@ -656,6 +710,10 @@ impl Node {
         let mut notify = Vec::new();
         {
             let mut st = lock(&self.shared.onion);
+            // Stop cover traffic for this circuit if we initiated it
+            if let Some(mut ct) = st.cover_traffic.remove(&link) {
+                ct.stop();
+            }
             st.origins.remove(&link);
             st.creating.remove(&link);
             st.extending.remove(&link);
@@ -1130,6 +1188,41 @@ impl Node {
         Err(NetError::NoRoute(format!(
             "{dest} (no volunteer relays with tokens; subscribe to a directory)"
         )))
+    }
+
+    /// Sends a dummy cover cell through all circuits we initiated.
+    /// This is called periodically to maintain constant-rate cover traffic
+    /// through onion circuits, so observers cannot distinguish real traffic
+    /// from padding.
+    fn send_onion_cover_cell(&self) {
+        let links: Vec<Link> = {
+            let st = lock(&self.shared.onion);
+            st.cover_traffic.keys().copied().collect()
+        };
+        for link in links {
+            self.send_onion_cover_cell_for_link(link);
+        }
+    }
+
+    /// Sends a single dummy cover cell through a specific circuit.
+    fn send_onion_cover_cell_for_link(&self, link: Link) {
+        // Generate a dummy payload (Cmd::Data with random bytes)
+        let dummy_payload = Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
+        // Build a cell that the first hop will forward
+        let mut st = lock(&self.shared.onion);
+        if let Some(hop) = st.hops.get_mut(&link) {
+let dummy_payload = Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
+            if let Ok(cell) = hop.keys.relay_originate(&dummy_payload) {
+                drop(st);
+                self.onion_send(
+                    &link.0,
+                    &OnionMsg::Cell {
+                        circ: link.1,
+                        cell: cell.to_vec(),
+                    },
+                );
+            }
+        }
     }
 }
 
