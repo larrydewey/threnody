@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Pre-push hook: runs every check in .github/workflows/ci.yml locally.
+# Install once with:  ln -sf ../../scripts/pre-push .git/hooks/pre-push
+# Skip the slow Android build with THRENODY_SKIP_ANDROID=1 (CI still runs it).
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+# rustup's cargo; /usr/bin/cargo has no Android targets.
+export PATH="$HOME/.cargo/bin:$PATH"
+export RUSTFLAGS="-D warnings"
+export CARGO_TERM_COLOR=always
+export CARGO_INCREMENTAL=0
+
+step() { printf '\n==> %s\n' "$*"; }
+
+# lint job
+step "Format"
+cargo fmt --all --check
+step "Clippy (all features)"
+cargo clippy --workspace --all-targets --all-features --locked
+
+# --all-features hides code that only breaks with a feature off, so also lint
+# the shipped crates with their default features, as the portability job and
+# the release builds compile them.
+step "Clippy (default features: threnody-cli, threnody-ffi)"
+cargo clippy -p threnody-cli -p threnody-ffi --all-targets --locked
+
+# test job
+step "Tests"
+cargo test --workspace --all-features --locked --no-fail-fast
+
+# bindings job
+step "FFI bindings (Python test)"
+crates/threnody-ffi/bindings.sh
+
+# portability job (macOS/Windows). Built per package: a workspace build
+# unifies features and would mask the failure.
+step "Portability build (threnody-cli, threnody-ffi)"
+cargo build -p threnody-cli -p threnody-ffi --locked
+
+# android job
+if [[ "${THRENODY_SKIP_ANDROID:-0}" == 1 ]]; then
+    step "Android build SKIPPED (THRENODY_SKIP_ANDROID=1)"
+else
+    step "Android build (phone and emulator ABIs)"
+    for t in aarch64-linux-android x86_64-linux-android; do
+        rustup target list --installed | grep -qx "$t" || rustup target add "$t"
+    done
+    apps/android/build.sh --emulator
+fi
+
+# audit job
+step "Dependency advisories"
+cargo audit
+
+printf '\nAll CI checks passed.\n'
