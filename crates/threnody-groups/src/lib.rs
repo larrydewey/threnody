@@ -225,6 +225,7 @@ impl Group {
         self.roles.insert(member, role);
     }
 
+    #[allow(dead_code)]
     fn committer_role(&self) -> MemberRole {
         self.role(&self.owner)
     }

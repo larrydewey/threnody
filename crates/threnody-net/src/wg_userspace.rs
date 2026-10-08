@@ -4,30 +4,23 @@
 //! or CAP_NET_ADMIN, suitable for Android, iOS, and unprivileged environments.
 
 #[cfg(feature = "boringtun")]
-use std::collections::HashMap;
-#[cfg(feature = "boringtun")]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(feature = "boringtun")]
-use std::sync::Arc;
-#[cfg(feature = "boringtun")]
-use std::time::Duration;
-
-#[cfg(feature = "boringtun")]
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 #[cfg(feature = "boringtun")]
-use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
+#[cfg(feature = "boringtun")]
+use std::net::{Ipv6Addr, SocketAddr};
+#[cfg(feature = "boringtun")]
+use std::sync::Arc;
 #[cfg(feature = "boringtun")]
 use tokio::net::UdpSocket;
 #[cfg(feature = "boringtun")]
 use tokio::sync::mpsc;
 #[cfg(feature = "boringtun")]
 use tokio::task::JoinHandle;
-#[cfg(feature = "boringtun")]
-use zeroize::Zeroizing;
 
 #[cfg(feature = "boringtun")]
-use threnody_core::tunnel::{DEFAULT_PORT, WgKeys, overlay_addr};
+use threnody_core::tunnel::{WgKeys, overlay_addr};
 #[cfg(feature = "boringtun")]
 use threnody_core::{Identity, PublicIdentity};
 
@@ -142,7 +135,7 @@ impl WgUserspace {
         socket.set_nonblocking(true).map_err(NetError::Io)?;
         let udp_socket = Arc::new(UdpSocket::from_std(socket).map_err(NetError::Io)?);
 
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
 
         // We need to move tunnels and peers into the tasks
         // Since Tunn doesn't implement Clone, we'll use a different approach
@@ -201,8 +194,8 @@ impl WgUserspace {
             let result = tunn.decapsulate(Some(src_addr.ip()), packet, out_buf);
             match result {
                 TunnResult::WriteToNetwork(out) => Ok(Some(out.to_vec())),
-                TunnResult::WriteToTunnelV6(out, dst) => Ok(Some(out.to_vec())),
-                TunnResult::WriteToTunnelV4(out, dst) => Ok(Some(out.to_vec())),
+                TunnResult::WriteToTunnelV6(out, _dst) => Ok(Some(out.to_vec())),
+                TunnResult::WriteToTunnelV4(out, _dst) => Ok(Some(out.to_vec())),
                 TunnResult::Done => Ok(None),
                 TunnResult::Err(e) => Err(NetError::External(anyhow::anyhow!(
                     "decapsulate error: {:?}",
