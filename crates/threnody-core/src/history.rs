@@ -438,6 +438,86 @@ fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
     })
 }
 
+/// A message search: whitespace-separated terms (or `"quoted phrases"`),
+/// all of which must appear, ignoring case, in a message's text or file
+/// name. Search runs over the decrypted history in memory; no index of
+/// message contents is ever written to disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Query {
+    terms: Vec<String>,
+}
+
+/// Lowercases `s` for matching, so "Ä" finds "ä" and "STRASSE" finds
+/// "strasse".
+fn fold(s: &str) -> String {
+    s.to_lowercase()
+}
+
+impl Query {
+    pub fn new(q: &str) -> Self {
+        let mut terms = Vec::new();
+        let mut rest = q;
+        while let Some(start) = rest.find(|c: char| !c.is_whitespace()) {
+            rest = &rest[start..];
+            let (term, next) = match rest.strip_prefix('"') {
+                Some(inner) => match inner.find('"') {
+                    Some(end) => (&inner[..end], &inner[end + 1..]),
+                    None => (inner, ""),
+                },
+                None => {
+                    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    (&rest[..end], &rest[end..])
+                }
+            };
+            let term = fold(term.trim());
+            if !term.is_empty() && !terms.contains(&term) {
+                terms.push(term);
+            }
+            rest = next;
+        }
+        Self { terms }
+    }
+
+    /// No terms: matches nothing (an empty search shows no results).
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    pub fn terms(&self) -> &[String] {
+        &self.terms
+    }
+
+    pub fn matches(&self, e: &Entry) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let text = fold(&e.text);
+        let name = e.file.as_ref().map(|f| fold(&f.name)).unwrap_or_default();
+        self.terms
+            .iter()
+            .all(|t| text.contains(t.as_str()) || name.contains(t.as_str()))
+    }
+}
+
+/// One search result: the conversation and the matching entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hit {
+    pub conversation: ConversationId,
+    pub entry: Entry,
+}
+
+impl History {
+    /// The entries matching `q`, newest first, at most `limit`.
+    pub fn search(&self, q: &Query, limit: usize) -> Vec<&Entry> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| q.matches(e))
+            .take(limit)
+            .collect()
+    }
+}
+
 impl Home {
     /// Loads a conversation, pruning expired messages (and persisting the
     /// pruned form so they are gone from disk too).
@@ -661,6 +741,46 @@ impl Home {
                 ConversationId::parse_state_name(name.strip_suffix(".state")?)
             })
             .collect()
+    }
+
+    /// Searches `scope` (one conversation, or every one when `None`) for
+    /// `q`; returns at most `limit` hits, newest first. Expired messages
+    /// never match, and nothing is written back.
+    pub fn search_history(
+        &self,
+        identity: &Identity,
+        scope: Option<ConversationId>,
+        q: &Query,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        if q.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let convs = match scope {
+            Some(c) => vec![c],
+            None => self.conversations(),
+        };
+        let mut hits = Vec::new();
+        for c in convs {
+            let Some(b) = self.load_state(identity, &c.state_name())? else {
+                continue;
+            };
+            // One unreadable conversation shouldn't hide the others.
+            let mut h = match History::decode(&b) {
+                Ok(h) => h,
+                Err(e) if scope.is_some() => return Err(e),
+                Err(_) => continue,
+            };
+            h.prune(now_ms);
+            hits.extend(h.search(q, limit).into_iter().map(|e| Hit {
+                conversation: c,
+                entry: e.clone(),
+            }));
+        }
+        hits.sort_by_key(|h| std::cmp::Reverse(h.entry.at_ms));
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// Prunes expired messages in every conversation; returns how many
@@ -892,6 +1012,87 @@ mod tests {
         );
         let again = History::decode(&h.encode().unwrap()).unwrap();
         assert_eq!(again, h);
+    }
+
+    #[test]
+    fn query_terms_and_phrases() {
+        assert_eq!(Query::new("  Hello   WORLD ").terms(), ["hello", "world"]);
+        assert_eq!(
+            Query::new(r#"meet "at the cafe" meet"#).terms(),
+            ["meet", "at the cafe"]
+        );
+        assert_eq!(
+            Query::new(r#""unclosed phrase"#).terms(),
+            ["unclosed phrase"]
+        );
+        assert!(Query::new("   ").is_empty() && Query::new(r#""""#).is_empty());
+
+        let e = entry(1, "Meet me at the Café later", None);
+        assert!(Query::new("café MEET").matches(&e));
+        assert!(Query::new(r#""at the café""#).matches(&e));
+        assert!(!Query::new(r#""the at café""#).matches(&e));
+        assert!(!Query::new("meet tomorrow").matches(&e), "every term");
+        assert!(!Query::new("").matches(&e), "empty matches nothing");
+        assert!(Query::new("ÄRGER").matches(&entry(1, "kein ärger", None)));
+
+        let photo = Entry {
+            file: Some(FileNote {
+                name: "Holiday.JPG".into(),
+                size: 1,
+                location: None,
+                sensitive: false,
+                album: 0,
+            }),
+            ..entry(2, "beach day", None)
+        };
+        assert!(
+            Query::new("holiday beach").matches(&photo),
+            "name and caption"
+        );
+    }
+
+    #[test]
+    fn search_spans_conversations_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let (a, b, g) = (
+            ConversationId::Peer([1; 32]),
+            ConversationId::Peer([2; 32]),
+            ConversationId::Group([3; 16]),
+        );
+        home.append_history(&id, a, entry(10, "lunch at noon?", None), 10)
+            .unwrap();
+        home.append_history(&id, a, entry(11, "unrelated", None), 11)
+            .unwrap();
+        home.append_history(&id, b, entry(30, "Lunch was great", None), 30)
+            .unwrap();
+        home.append_history(&id, g, entry(20, "group lunch", Some(1000)), 20)
+            .unwrap();
+        let q = Query::new("lunch");
+        let all = home.search_history(&id, None, &q, 40, 10).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|h| (h.conversation, h.entry.at_ms))
+                .collect::<Vec<_>>(),
+            [(b, 30), (g, 20), (a, 10)]
+        );
+        assert_eq!(home.search_history(&id, None, &q, 40, 2).unwrap().len(), 2);
+        let one = home.search_history(&id, Some(a), &q, 40, 10).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].entry.text, "lunch at noon?");
+        // Expired messages don't match.
+        assert_eq!(home.search_history(&id, Some(g), &q, 2000, 10).unwrap(), []);
+        assert_eq!(
+            home.search_history(&id, None, &Query::new(""), 40, 10)
+                .unwrap(),
+            []
+        );
+        assert_eq!(
+            home.search_history(&id, Some(ConversationId::Peer([9; 32])), &q, 40, 10)
+                .unwrap(),
+            []
+        );
     }
 
     #[test]

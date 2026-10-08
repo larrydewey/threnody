@@ -77,6 +77,28 @@ class ChatActivity : Activity() {
     private val sentRead = mutableSetOf<ULong>()
     /** On screen (between onStart and onStop): only then are messages read. */
     private var started = false
+    /** Search in this chat: the box, its matches (newest first) and the one shown. */
+    private lateinit var search: SearchBox
+    private var hits: List<HistoryEntry> = emptyList()
+    private var hit = -1
+    private var terms: List<String> = emptyList()
+    /** Bumped per search, so a slow one's results don't replace a newer one's. */
+    private var searches = 0
+    /** Each message's bubble and texts on screen, by [mark], to scroll to and highlight. */
+    private val bubbles = mutableMapOf<String, View>()
+    private val texts = mutableMapOf<String, MutableList<Pair<TextView, String>>>()
+    /** A message to bring into view once loaded: its [mark] and time. */
+    private var jump: Pair<String, ULong>? = null
+    /**
+     * The search result the chat was opened at: the first search selects
+     * it. Kept apart from `jump`, which loading may finish with first.
+     */
+    private var openedAt: String? = null
+    /** How many messages are loaded; grows to reach an older match. */
+    @Volatile private var historyLimit = HISTORY_PAGE
+    /** The oldest loaded message's time, and whether that is the whole history. */
+    private var oldestLoaded = 0uL
+    private var allLoaded = true
 
     /** A history entry, or a message still being sent. */
     private data class Item(val entry: HistoryEntry, val sending: Boolean = false)
@@ -92,8 +114,10 @@ class ChatActivity : Activity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         bar = TopBar(this) { finish() }.apply {
             title.text = if (group != null) "Group" else Threnody.short(device)
+            action(R.drawable.ic_search, "Search this chat") { search.open() }
             action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
         }
+        search = SearchBox(this, bar, "Search this chat", stepper = true, query = ::find, step = ::step) { endSearch() }
         banner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(color(R.color.surface))
@@ -133,8 +157,20 @@ class ChatActivity : Activity() {
         root.addView(composeBar, matchWrap)
         setContentView(root)
         fitSystemBars(root, bar, composeBar)
-        // Keep the newest message in view when the keyboard opens.
-        scroll.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, ob -> if (b < ob) toBottom() }
+        // Keep the newest message in view when the keyboard opens (unless
+        // a search match is).
+        scroll.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, ob -> if (b < ob && hit < 0) toBottom() }
+
+        // Opened from a search result: that message, with the search open on it.
+        val jumpAt = intent.getLongExtra(JUMP_AT_MS, 0L)
+        if (jumpAt > 0) {
+            jump = mark(jumpAt.toULong(), intent.getStringExtra(JUMP_DEVICE) ?: "") to jumpAt.toULong()
+            openedAt = jump?.first
+            intent.getStringExtra(JUMP_QUERY)?.takeIf { it.isNotBlank() }?.let { q ->
+                search.open(typing = false)
+                search.field.setText(q)
+            }
+        }
 
         Threading.background {
             node = try {
@@ -256,9 +292,9 @@ class ChatActivity : Activity() {
                 }
                 else -> {}
             }
-            Threading.background { refresh() }
+            refreshSoon()
         }
-        if (::node.isInitialized) Threading.background { refresh() }
+        if (::node.isInitialized) refreshSoon()
     }
 
     override fun onStop() {
@@ -315,14 +351,33 @@ class ChatActivity : Activity() {
     }
 
     /** Reloads the conversation's state and messages (on the worker thread). */
+    /** A refresh is queued and hasn't started yet. */
+    private val refreshQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    /** Counts refreshes, so only the newest one is drawn. */
+    private val refreshGen = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Reloads on the worker thread, once for however many asks arrive
+     * meanwhile: a burst of events (a backlog of messages arriving) would
+     * otherwise redraw everything once per message.
+     */
+    private fun refreshSoon() {
+        if (refreshQueued.compareAndSet(false, true)) Threading.background {
+            refreshQueued.set(false)
+            refresh()
+        }
+    }
+
     private fun refresh() {
+        val gen = refreshGen.incrementAndGet()
         val g = group
         val history: List<HistoryEntry>
         var c: Conversation? = null
         var gi: GroupInfo? = null
+        val limit = historyLimit
         if (g != null) {
             gi = node.groups().firstOrNull { it.id == g }
-            history = try { node.groupHistory(g, 200u) } catch (_: Exception) { emptyList() }
+            history = try { node.groupHistory(g, limit) } catch (_: Exception) { emptyList() }
         } else {
             // The key moves from device to account once the account is known.
             c = Threnody.conversations(node, persona).firstOrNull { it.key == key || device in it.devices }
@@ -330,7 +385,7 @@ class ChatActivity : Activity() {
                 key = c.key
                 device = c.device
             }
-            history = try { node.history(device, 200u) } catch (_: Exception) { emptyList() }
+            history = try { node.history(device, limit) } catch (_: Exception) { emptyList() }
         }
         revealedKnown = c?.revealed?.let { fp ->
             // Known to the main identity, which is who they revealed themselves to.
@@ -347,6 +402,8 @@ class ChatActivity : Activity() {
         val offers = if (g == null) node.credentialOffers().filter { it.peer in mine } else emptyList()
         val asks = if (g == null) node.credentialAsks().filter { it.peer in mine } else emptyList()
         runOnUiThread {
+            // A newer refresh will draw instead.
+            if (gen != refreshGen.get()) return@runOnUiThread
             convo = c
             info = gi
             if (Threnody.visibleChat.isNotEmpty()) {
@@ -355,14 +412,24 @@ class ChatActivity : Activity() {
             if (g != null) groupHeader(gi) else header(c)
             for (o in offers) banner(
                 "${c?.title ?: "They"} offers you a credential (${o.schema}).",
-                "Review" to { CredentialUi.answerOffer(this, node, o) { Threading.background { refresh() } } },
+                "Review" to { CredentialUi.answerOffer(this, node, o) { refreshSoon() } },
             )
             for (q in asks) banner(
                 "${c?.title ?: "They"} asks you to prove " +
                     (if (q.keys.isEmpty()) "you hold a credential (${q.schema})." else "${q.keys.joinToString(", ")} (${q.schema})."),
-                "Review" to { CredentialUi.answerAsk(this, node, q) { Threading.background { refresh() } } },
+                "Review" to { CredentialUi.answerAsk(this, node, q) { refreshSoon() } },
             )
+            oldestLoaded = history.firstOrNull()?.atMs ?: 0uL
+            allLoaded = history.size.toUInt() < limit
             show(items, names)
+            jump?.let { (k, at) ->
+                when {
+                    k in bubbles -> { jump = null; reveal(k) }
+                    // Older than what's loaded: load back to it, then look again.
+                    !allLoaded && oldestLoaded > at && historyLimit < MAX_HISTORY -> loadUntil(at)
+                    else -> jump = null
+                }
+            }
             // Incoming messages now on screen are read (1:1 chats only).
             if (g == null && started && Privacy.sendReadReceipts(this)) {
                 val ids = synchronized(sentRead) {
@@ -494,6 +561,8 @@ class ChatActivity : Activity() {
     private fun show(items: List<Item>, names: Map<String, String>) {
         val atEnd = !scroll.canScrollVertically(1)
         messages.removeAllViews()
+        bubbles.clear()
+        texts.clear()
         if (items.isEmpty()) {
             val text = if (group != null) "No messages yet. Group messages are end-to-end encrypted with MLS."
             else "No messages yet. Messages are end-to-end encrypted and stored encrypted on this device."
@@ -505,10 +574,138 @@ class ChatActivity : Activity() {
             // In groups, name the sender above the first of their run of messages.
             val sender = if (group != null && !e.outgoing && e.device != lastSender) names[e.device] else null
             lastSender = if (e.outgoing) null else e.device
-            messages.addView(bubble(run, sender))
+            val view = bubble(run, sender)
+            messages.addView(view)
+            for (item in run) bubbles[mark(item.entry)] = view
         }
         messages.addView(typingBubble, matchWrap)
-        if (atEnd || items.lastOrNull()?.sending == true) toBottom()
+        if (atEnd && hit < 0 && jump == null || items.lastOrNull()?.sending == true) toBottom()
+    }
+
+    /** Identifies a message across reloads and search results. */
+    private fun mark(e: HistoryEntry) = mark(e.atMs, e.device)
+    private fun mark(atMs: ULong, device: String) = "$atMs/$device"
+
+    /** Searches this chat (on the worker thread); shows the newest match. */
+    private fun find(q: String) {
+        val t = Search.terms(q)
+        val n = ++searches
+        if (t.isEmpty()) return found(n, t, emptyList())
+        val g = group
+        val d = device
+        Threading.background {
+            if (!::node.isInitialized) return@background
+            val list = try {
+                if (g != null) node.searchGroupMessages(g, q, SEARCH_LIMIT) else node.searchMessages(d, q, SEARCH_LIMIT)
+            } catch (e: Exception) {
+                Threnody.say("! search: ${e.message}")
+                emptyList()
+            }
+            runOnUiThread { found(n, t, list) }
+        }
+    }
+
+    private fun found(n: Int, t: List<String>, list: List<HistoryEntry>) {
+        if (n != searches || !search.isOpen) return
+        terms = t
+        hits = list
+        // Opened from a search result: start at that one.
+        val wanted = openedAt ?: jump?.first
+        openedAt = null
+        hit = list.indexOfFirst { mark(it) == wanted }.takeIf { it >= 0 } ?: if (list.isEmpty()) -1 else 0
+        search.setCount(hit, list.size)
+        paint()
+        if (hit >= 0) goTo(list[hit])
+    }
+
+    /** To an older (+1) or newer (-1) match. */
+    private fun step(by: Int) {
+        val i = hit + by
+        if (i !in hits.indices) return
+        hit = i
+        search.setCount(hit, hits.size)
+        paint()
+        goTo(hits[i])
+    }
+
+    private fun endSearch() {
+        searches++
+        hits = emptyList()
+        hit = -1
+        terms = emptyList()
+        jump = null
+        paint()
+    }
+
+    /** Scrolls to a match, loading older history first if it isn't loaded. */
+    private fun goTo(e: HistoryEntry) {
+        val k = mark(e)
+        if (k in bubbles) {
+            jump = null
+            return reveal(k)
+        }
+        jump = k to e.atMs
+        if (!allLoaded && oldestLoaded > e.atMs) loadUntil(e.atMs)
+    }
+
+    /** Loads more history, a page at a time, until it reaches `at` (then refreshes). */
+    private fun loadUntil(at: ULong) {
+        val g = group
+        val d = device
+        Threading.background {
+            var limit = historyLimit
+            while (limit < MAX_HISTORY) {
+                limit = minOf(limit * 2u, MAX_HISTORY)
+                val h = try { if (g != null) node.groupHistory(g, limit) else node.history(d, limit) } catch (_: Exception) { break }
+                if (h.size.toUInt() < limit || (h.firstOrNull()?.atMs ?: 0uL) <= at) break
+            }
+            historyLimit = limit
+            refresh()
+        }
+    }
+
+    /** Marks the search terms in every bubble's text; the current match stands out. */
+    private fun paint() {
+        for ((k, views) in texts) for ((v, raw) in views) v.text = marked(k, raw)
+    }
+
+    private fun marked(k: String, raw: String): CharSequence =
+        if (terms.isEmpty()) raw else Search.highlight(raw, terms, k == hits.getOrNull(hit)?.let(::mark))
+
+    /** A bubble's text, kept so search can mark matches in it. */
+    private fun TextView.searchable(e: HistoryEntry, raw: String): TextView {
+        val k = mark(e)
+        texts.getOrPut(k) { mutableListOf() }.add(this to raw)
+        text = marked(k, raw)
+        return this
+    }
+
+    /** Scrolls a message into view (a third of the way down) and flashes it. */
+    private fun reveal(k: String) {
+        val row = bubbles[k] ?: return
+        val go = {
+            scroll.smoothScrollTo(0, maxOf(0, row.top - scroll.height / 3))
+            flash(row)
+        }
+        if (row.isLaidOut && !row.isLayoutRequested) row.post(go)
+        else row.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(v: View, l: Int, t: Int, r: Int, b: Int, ol: Int, ot: Int, oldR: Int, ob: Int) {
+                v.removeOnLayoutChangeListener(this)
+                v.post(go)
+            }
+        })
+    }
+
+    /** A brief tint behind a message, to show which one a search landed on. */
+    private fun flash(v: View) {
+        val tint = android.graphics.drawable.ColorDrawable(color(R.color.accent)).apply { alpha = 0 }
+        v.background = tint
+        android.animation.ValueAnimator.ofInt(0, 70, 0).apply {
+            duration = 1_200L
+            startDelay = Design.durationNormal.toLong()
+            addUpdateListener { tint.alpha = it.animatedValue as Int }
+            start()
+        }
     }
 
     // Not fullScroll(): that moves focus to the last bubble, away from the compose field.
@@ -627,7 +824,7 @@ class ChatActivity : Activity() {
             body.addView(photos(run))
             if (e.text.isNotBlank()) {
                 body.addView(TextView(this).apply {
-                    text = e.text
+                    searchable(e, e.text)
                     textSize = 16f
                     setTextColor(fg)
                     setPadding(dp(10), dp(4), dp(10), 0)
@@ -636,7 +833,7 @@ class ChatActivity : Activity() {
             time
         } else if (file == null) {
             body.addView(TextView(this).apply {
-                text = e.text
+                searchable(e, e.text)
                 textSize = 16f
                 setTextColor(fg)
             })
@@ -645,7 +842,7 @@ class ChatActivity : Activity() {
             for (r in run) {
                 val f = r.entry.file ?: continue
                 body.addView(TextView(this).apply {
-                    text = (if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name
+                    searchable(r.entry, (if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name)
                     textSize = 16f
                     setTextColor(fg)
                     setTypeface(typeface, Typeface.BOLD)
@@ -655,7 +852,7 @@ class ChatActivity : Activity() {
             }
             if (e.text.isNotBlank()) {
                 body.addView(TextView(this).apply {
-                    text = e.text
+                    searchable(e, e.text)
                     textSize = 16f
                     setTextColor(fg)
                 })
@@ -836,7 +1033,7 @@ class ChatActivity : Activity() {
         compose.setText("") // also says we stopped typing
         Threnody.touch()
         synchronized(pending) { pending.add(text) }
-        Threading.background { refresh() }
+        refreshSoon()
         Threading.background {
             val g = group
             val error = try {
@@ -1538,6 +1735,12 @@ class ChatActivity : Activity() {
         refresh()
     }
 
+    // Android 10–12; from 13 the search box takes Back itself.
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onBackPressed() {
+        if (search.isOpen) search.close() else super.onBackPressed()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
     }
@@ -1547,6 +1750,15 @@ class ChatActivity : Activity() {
         const val DEVICE = "device"
         const val GROUP = "group"
         const val PERSONA = "persona"
+        /** Opened from a search result: the message to show (its time and sender device), and the query. */
+        const val JUMP_AT_MS = "jump_at_ms"
+        const val JUMP_DEVICE = "jump_device"
+        const val JUMP_QUERY = "jump_query"
+        /** Messages loaded at first, and the most loaded to reach an old match. */
+        private const val HISTORY_PAGE = 200u
+        private const val MAX_HISTORY = 25_600u
+        /** Most matches a chat search lists. */
+        private const val SEARCH_LIMIT = 1_000u
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2

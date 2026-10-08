@@ -290,3 +290,104 @@ pub fn link_button_row(title: &str, subtitle: &str) -> adw::ActionRow {
         .activatable(true)
         .build()
 }
+
+/// The terms of a message search, parsed as the node parses them: words
+/// and `"quoted phrases"`, lowercased.
+pub fn search_terms(query: &str) -> Vec<String> {
+    threnody_core::history::Query::new(query).terms().to_vec()
+}
+
+/// Lowercases one character at a time, so positions in the result are
+/// positions in the original.
+fn fold(s: &str) -> Vec<char> {
+    s.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// Pango markup for one line of `text` starting a little before its first
+/// match of `terms`, about `width` characters long, every match in bold.
+/// None when nothing in `text` matches.
+pub fn snippet_markup(text: &str, terms: &[String], width: usize) -> Option<String> {
+    /// How much comes before the first match.
+    const LEAD: usize = 24;
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = line.chars().collect();
+    let folded = fold(&line);
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for t in terms.iter().map(|t| fold(t)) {
+        if t.is_empty() {
+            continue;
+        }
+        let mut i = 0;
+        while i + t.len() <= folded.len() {
+            if folded[i..i + t.len()] == t[..] {
+                found.push((i, i + t.len()));
+                i += t.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    found.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in found {
+        match spans.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => spans.push((s, e)),
+        }
+    }
+    let (first, first_end) = *spans.first()?;
+    // Start at a word, if one starts shortly before the match.
+    let mut start = first.saturating_sub(LEAD);
+    if start > 0
+        && let Some(sp) = chars[start..first].iter().position(|c| *c == ' ')
+    {
+        start += sp + 1;
+    }
+    // Always the whole first match, however long.
+    let end = (start + width).max(first_end).min(chars.len());
+    let piece = |a: usize, b: usize| {
+        glib::markup_escape_text(&chars[a..b].iter().collect::<String>()).to_string()
+    };
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    let mut at = start;
+    for (s, e) in spans {
+        let (s, e) = (s.max(start), e.min(end));
+        if s >= e {
+            continue;
+        }
+        out.push_str(&piece(at, s));
+        out.push_str("<b>");
+        out.push_str(&piece(s, e));
+        out.push_str("</b>");
+        at = e;
+    }
+    out.push_str(&piece(at, end));
+    if end < chars.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippet_bolds_matches_around_the_first() {
+        let terms = search_terms(r#"LUNCH "at noon""#);
+        let s = snippet_markup("Shall we have lunch at noon? <ok> lunch", &terms, 100);
+        assert_eq!(
+            s.as_deref(),
+            Some("Shall we have <b>lunch</b> <b>at noon</b>? &lt;ok&gt; <b>lunch</b>")
+        );
+        assert_eq!(snippet_markup("nothing here", &terms, 100), None);
+        let long = format!("{} needle and more", "word ".repeat(20));
+        let s = snippet_markup(&long, &search_terms("needle"), 20).unwrap_or_default();
+        assert!(s.starts_with('…') && s.contains("<b>needle</b>") && s.ends_with('…'));
+    }
+}

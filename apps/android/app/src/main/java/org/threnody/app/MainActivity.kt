@@ -39,6 +39,10 @@ class MainActivity : Activity() {
     private lateinit var scroll: ScrollView
     private lateinit var emptyStateContainer: LinearLayout
     private var unsubscribe: (() -> Unit)? = null
+    /** Search across every conversation: while it has a query, the list shows what it found. */
+    private lateinit var search: SearchBox
+    /** Bumped per search, so a slow one's results don't replace a newer one's. */
+    private var searches = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,9 +54,13 @@ class MainActivity : Activity() {
         val bar = TopBar(this, null).apply {
             title.text = "Threnody"
             title.setTextAppearance(Design.styleTitleLarge)
+            action(R.drawable.ic_search, "Search messages") { search.open() }
             action(R.drawable.ic_qr, "My invite") { showInvite() }
             action(R.drawable.ic_add, "New conversation") { add(it) }
             action(R.drawable.ic_more, "More") { more(it) }
+        }
+        search = SearchBox(this, bar, "Search messages", stepper = false, query = ::find) {
+            refreshSoon()
         }
 
         // Empty state container (shown when no conversations)
@@ -111,8 +119,8 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         Threnody.visible++
-        unsubscribe = Threnody.subscribe { Threading.background { refresh() } }
-        Threading.background { refresh() }
+        unsubscribe = Threnody.subscribe { refreshSoon() }
+        refreshSoon()
     }
 
     override fun onStop() {
@@ -125,7 +133,7 @@ class MainActivity : Activity() {
     private data class Row(
         val title: String,
         val avatarKey: String,
-        val preview: String,
+        val preview: CharSequence,
         val atMs: Long,
         val connected: Boolean?,
         val open: () -> Unit,
@@ -137,8 +145,26 @@ class MainActivity : Activity() {
         enum class Section { Requests, Invites, Contacts, Groups, Anonymous }
     }
 
+    /** A refresh is queued and hasn't started yet. */
+    private val refreshQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    /** Counts refreshes, so only the newest one is drawn. */
+    private val refreshGen = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Reloads on the worker thread, once for however many asks arrive
+     * meanwhile: a burst of events (a backlog of messages arriving) would
+     * otherwise rebuild the list once per message.
+     */
+    private fun refreshSoon() {
+        if (refreshQueued.compareAndSet(false, true)) Threading.background {
+            refreshQueued.set(false)
+            refresh()
+        }
+    }
+
     /** Reloads the list (on the worker thread). */
     private fun refresh() {
+        val gen = refreshGen.incrementAndGet()
         val n = node ?: return
         val all = Threnody.conversations(n).filter { !it.blocked }
 
@@ -225,7 +251,106 @@ class MainActivity : Activity() {
             listOf(header) + items
         }
 
-        runOnUiThread { show(sortedRows) }
+        // Search results stay until the search is cleared.
+        runOnUiThread {
+            // A newer refresh will draw instead; search results stay put.
+            if (gen == refreshGen.get() && (!search.isOpen || search.text.isEmpty())) show(sortedRows)
+        }
+    }
+
+    /** Searches every conversation, ours and the anonymous identities'. */
+    private fun find(q: String) {
+        val terms = Search.terms(q)
+        val n = ++searches
+        if (terms.isEmpty()) return refreshSoon()
+        val main = node ?: return
+        Threading.background {
+            val rows = found(main, q, terms)
+            runOnUiThread { if (n == searches && search.isOpen) showFound(rows) }
+        }
+    }
+
+    /**
+     * What a search found (on the worker thread): conversations named for
+     * it, then messages, newest first, each tagged with its conversation.
+     */
+    private fun found(main: ThrenodyNode, q: String, terms: List<String>): Pair<List<Row>, List<Row>> {
+        val nodes = listOf<Pair<String?, ThrenodyNode>>(null to main) +
+            Threnody.personaIds().mapNotNull { id -> Threnody.personaNode(id)?.let { id to it } }
+        val named = mutableListOf<Row>()
+        val messages = mutableListOf<Row>()
+        val tint = color(R.color.accent)
+        for ((persona, n) in nodes) {
+            val tag = persona?.let { "🎭 ${Threnody.personaLabels[it] ?: "anonymous"}" }
+            val section = if (persona != null) Row.Section.Anonymous else Row.Section.Contacts
+            val convos = Threnody.conversations(n, persona)
+            val groups = try { n.groups() } catch (_: Exception) { emptyList() }
+            for (c in convos) if (!c.blocked && Search.all(c.title, terms)) {
+                named.add(Row(c.title, c.key, listOfNotNull(tag, status(c)).joinToString(" · "), 0, c.connected,
+                    open = { openChat(c.key, c.device, persona) }, section = section))
+            }
+            for (g in groups) if (Search.all(g.name, terms)) {
+                named.add(Row(g.name, g.id, listOfNotNull(tag, members(g.members.size)).joinToString(" · "), 0, null,
+                    open = { openGroup(g.id, persona) }, section = section))
+            }
+            val hits = try { n.searchAll(q, MAX_RESULTS.toUInt()) } catch (e: Exception) {
+                Threnody.say("! search: ${e.message}")
+                emptyList()
+            }
+            val names = mutableMapOf<String, String>()
+            for (h in hits) {
+                val e = h.entry
+                val gid = h.group
+                val peer = h.peer
+                val title: String
+                val key: String
+                val open: () -> Unit
+                if (gid != null) {
+                    title = groups.firstOrNull { it.id == gid }?.name ?: "Group"
+                    key = gid
+                    open = { openGroup(gid, persona, e, q) }
+                } else if (peer != null) {
+                    val c = convos.firstOrNull { peer in it.devices }
+                    if (c?.blocked == true) continue
+                    title = c?.title ?: Threnody.short(peer)
+                    key = c?.key ?: peer
+                    open = { openChat(key, c?.device ?: peer, persona, e, q) }
+                } else continue
+                val who = if (e.outgoing) "You" else names.getOrPut(e.device) { Threnody.nameOf(n, e.device) }
+                // The text, or the file's name when that's what matched.
+                val name = e.file?.name
+                val what = if (name != null && Search.ranges(e.text, terms).isEmpty()) "📎 $name" else e.text
+                val preview = android.text.SpannableStringBuilder()
+                    .append(listOfNotNull(tag, "$who: ").joinToString(" · "))
+                    .append(Search.snippet(what, terms, tint))
+                messages.add(Row(title, key, preview, e.atMs.toLong(), null, open = open, section = section))
+            }
+        }
+        return named to messages.sortedByDescending { it.atMs }.take(MAX_RESULTS)
+    }
+
+    private fun showFound(found: Pair<List<Row>, List<Row>>) {
+        val (named, messages) = found
+        list.removeAllViews()
+        list.layoutAnimation = null
+        emptyStateContainer.visibility = View.GONE
+        list.visibility = View.VISIBLE
+        if (named.isNotEmpty()) {
+            addSectionHeader("Conversations")
+            named.forEach { list.addView(row(it)) }
+        }
+        if (messages.isNotEmpty()) {
+            if (named.isNotEmpty()) addSectionDivider()
+            addSectionHeader("Messages")
+            messages.forEach { list.addView(row(it)) }
+        }
+        if (named.isEmpty() && messages.isEmpty()) {
+            list.addView(label("No messages match", Design.typeBody, R.color.muted).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, dp(Design.xxl), 0, 0)
+            }, matchWrap)
+        }
+        scroll.scrollTo(0, 0)
     }
 
     private fun preview(e: HistoryEntry) = e.file?.let { Threnody.fileLabel(it.name, it.sensitive, e.text) } ?: e.text
@@ -301,7 +426,8 @@ class MainActivity : Activity() {
         }
 
         val previewColor = if (r.atMs == Long.MAX_VALUE) R.color.accent else R.color.muted
-        val preview = label(r.preview, Design.typeBodySmall, previewColor, Design.weightRegular).apply {
+        val preview = label("", Design.typeBodySmall, previewColor, Design.weightRegular).apply {
+            text = r.preview
             isSingleLine = true
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -385,8 +511,8 @@ class MainActivity : Activity() {
             .setTitle(title)
             .setItems(options.toTypedArray()) { _, i ->
                 when (options[i]) {
-                    "Clear chat" -> Chats.clear(this, n, title, device, group) { Threading.background { refresh() } }
-                    else -> Chats.delete(this, n, title, device!!) { Threading.background { refresh() } }
+                    "Clear chat" -> Chats.clear(this, n, title, device, group) { refreshSoon() }
+                    else -> Chats.delete(this, n, title, device!!) { refreshSoon() }
                 }
             }
             .setNegativeButton("Cancel", null)
@@ -426,8 +552,19 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun openGroup(id: String) {
-        startActivity(Intent(this, ChatActivity::class.java).putExtra(ChatActivity.GROUP, id))
+    private fun openGroup(id: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null) {
+        startActivity(Intent(this, ChatActivity::class.java)
+            .putExtra(ChatActivity.GROUP, id)
+            .putExtra(ChatActivity.PERSONA, persona)
+            .jumpTo(jump, query))
+    }
+
+    /** Opens the chat at a search result, with the search still open on it. */
+    private fun Intent.jumpTo(e: HistoryEntry?, query: String?): Intent {
+        if (e == null) return this
+        return putExtra(ChatActivity.JUMP_AT_MS, e.atMs.toLong())
+            .putExtra(ChatActivity.JUMP_DEVICE, e.device)
+            .putExtra(ChatActivity.JUMP_QUERY, query)
     }
 
     private fun more(anchor: View) {
@@ -524,11 +661,12 @@ class MainActivity : Activity() {
         popup.show()
     }
 
-    private fun openChat(key: String, device: String, persona: String? = null) {
+    private fun openChat(key: String, device: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null) {
         startActivity(Intent(this, ChatActivity::class.java)
             .putExtra(ChatActivity.KEY, key)
             .putExtra(ChatActivity.DEVICE, device)
-            .putExtra(ChatActivity.PERSONA, persona))
+            .putExtra(ChatActivity.PERSONA, persona)
+            .jumpTo(jump, query))
     }
 
     /** Burn-after choices for a new anonymous identity (null = keep it). */
@@ -945,10 +1083,18 @@ class MainActivity : Activity() {
         SecureBuilder(this).setMessage(msg).setPositiveButton("OK", null).show()
     }
 
+    // Android 10–12; from 13 the search box takes Back itself.
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onBackPressed() {
+        if (search.isOpen) search.close() else super.onBackPressed()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
     }
 
     companion object {
+        /** Most messages a search lists. */
+        private const val MAX_RESULTS = 200
     }
 }

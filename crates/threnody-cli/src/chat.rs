@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use threnody_core::history::FileNote;
+use threnody_core::history::{ConversationId, FileNote, Query};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, safety_number};
 use threnody_net::history::OutgoingFile;
@@ -88,6 +88,8 @@ Type a line to send it to the current peer. Commands:
   /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
   /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
   /history [peer] [n]                   recent messages (stored encrypted)
+  /search [@peer|@group] <words>        find messages everywhere, or in one chat;
+                                        \"quoted words\" match as a phrase
   /disappear <30s|10m|1h|1d|off>        disappearing messages with the current peer
   /profile [set <key> <value> | unset <key>]   your profile (shared with no one by default)
   /share [peer] [key,key,…|none]        which profile details a contact sees
@@ -115,7 +117,8 @@ struct Ui {
     tunnels: Option<Tunnels>,
     discovery: Option<std::net::SocketAddr>,
     groups: GroupUi,
-    /// What the last /history showed, numbered from 1: /del refers to it.
+    /// What the last /history (or one-chat /search) showed, numbered from
+    /// 1: /del refers to it.
     shown: std::cell::RefCell<(Option<PublicIdentity>, Vec<threnody_core::history::Entry>)>,
     #[cfg(all(feature = "ble", target_os = "linux"))]
     ble_seen: std::sync::Arc<std::sync::Mutex<Vec<crate::ble::Found>>>,
@@ -476,6 +479,77 @@ impl Ui {
                     format!(", {} waiting to connect", r.queued)
                 }
             );
+        }
+        Ok(())
+    }
+
+    /// `/search [@peer|@group] <words>`: every conversation, or one. The
+    /// results of a search in one chat with a contact are numbered for
+    /// /del, /edit and /react, like /history's.
+    fn search(&self, arg: &str) -> Result<()> {
+        const LIMIT: usize = 50;
+        let usage = || anyhow!("usage: /search [@peer|@group] <words>");
+        let (scope, query) = match arg.trim().strip_prefix('@') {
+            Some(rest) => {
+                let (who, q) = rest.split_once(char::is_whitespace).ok_or_else(usage)?;
+                let conv = match find_contact(&self.node.contacts(), who) {
+                    Ok(c) => (Some(c.key), self.node.conversation_for(&c.key)),
+                    Err(e) => match self.groups.find(who) {
+                        Ok(g) => (None, ConversationId::Group(g)),
+                        Err(_) => bail!("{e} (and no group matches either)"),
+                    },
+                };
+                (Some(conv), q)
+            }
+            None => (None, arg),
+        };
+        if Query::new(query).is_empty() {
+            return Err(usage());
+        }
+        let hits = self.node.search(scope.map(|(_, c)| c), query, LIMIT)?;
+        if hits.is_empty() {
+            println!("  no messages match");
+            return Ok(());
+        }
+        // Oldest first, like /history, so the newest is nearest the prompt.
+        let hits: Vec<_> = hits.into_iter().rev().collect();
+        if let Some((Some(peer), _)) = scope {
+            *self.shown.borrow_mut() = (Some(peer), hits.iter().map(|h| h.entry.clone()).collect());
+        }
+        let contacts = self.node.contacts();
+        for (i, h) in hits.iter().enumerate() {
+            let e = &h.entry;
+            let place = match (scope, h.conversation) {
+                (Some(_), _) => String::new(),
+                (None, ConversationId::Group(g)) => format!("{} ", self.groups.label(&g)),
+                (None, ConversationId::Peer(k)) => {
+                    let device = contacts
+                        .iter()
+                        .find(|c| c.account.is_some_and(|a| a.0 == k) || *c.key.as_bytes() == k)
+                        .map(|c| c.key)
+                        .or_else(|| PublicIdentity::from_bytes(&k).ok());
+                    format!("{} ", device.map_or_else(|| "?".into(), |d| self.name(&d)))
+                }
+            };
+            let who = if e.outgoing {
+                "me".to_owned()
+            } else {
+                PublicIdentity::from_bytes(&e.device).map_or_else(|_| "?".into(), |d| self.name(&d))
+            };
+            let body = match &e.file {
+                Some(f) if e.text.is_empty() => format!("file {}", f.name),
+                Some(f) => format!("file {}: {}", f.name, e.text),
+                None => e.text.clone(),
+            };
+            if scope.is_some_and(|(p, _)| p.is_some()) {
+                print!("{:>3}", i + 1);
+            } else {
+                print!("   ");
+            }
+            println!("  [{}] {place}<{who}> {body}", clock(e.at_ms));
+        }
+        if hits.len() == LIMIT {
+            println!("  (the {LIMIT} newest matches; add words to narrow it)");
         }
         Ok(())
     }
@@ -1646,6 +1720,7 @@ impl Ui {
                 let p = self.resolve_peer(who)?;
                 self.show_history(p, n)?;
             }
+            "search" | "find" => self.search(arg.unwrap_or(""))?,
             "profile" => self.profile_command(arg)?,
             "share" => {
                 // `/share`, `/share <peer>`, `/share <peer> <keys|none>`, or

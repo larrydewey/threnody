@@ -45,7 +45,7 @@ impl GroupUi {
         self.groups.list().len()
     }
 
-    fn label(&self, id: &GroupId) -> String {
+    pub fn label(&self, id: &GroupId) -> String {
         let name = self
             .groups
             .list()
@@ -64,7 +64,7 @@ impl GroupUi {
     }
 
     /// Finds a group by exact name, `name#hex`, or hex id prefix.
-    fn find(&self, q: &str) -> Result<GroupId> {
+    pub fn find(&self, q: &str) -> Result<GroupId> {
         let q = q.trim();
         let hits: Vec<GroupId> = self
             .groups

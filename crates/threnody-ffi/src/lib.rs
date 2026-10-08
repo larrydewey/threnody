@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use threnody_core::history::FileNote;
+use threnody_core::history::{ConversationId, FileNote};
 use threnody_core::store::{Home, Lookup};
 use threnody_core::{AppMessage, Fingerprint, PublicIdentity, safety_number};
 use threnody_net::history::OutgoingFile;
@@ -146,6 +146,16 @@ pub struct HistoryEntry {
     pub delivered_to: u32,
     /// Reactions, one per emoji in the order first added.
     pub reactions: Vec<ReactionInfo>,
+}
+
+/// A message found by `search_all`: where it is, and the message. For a
+/// chat with a contact `peer` is a device of theirs (preferring a
+/// connected one) to open the chat by; for a group, `group` is its id.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SearchHit {
+    pub peer: Option<String>,
+    pub group: Option<String>,
+    pub entry: HistoryEntry,
 }
 
 /// One emoji on a message: how many reacted with it, and whether we did.
@@ -1239,6 +1249,69 @@ PersistentKeepalive = 25\n",
         Ok(history_entries(h.recent(limit as usize), me))
     }
 
+    /// Messages with `peer` matching `query`, newest first, at most
+    /// `limit`. Terms are matched ignoring case against text and file
+    /// names, and every one must appear; `"quoted words"` match as a
+    /// phrase. An empty query finds nothing.
+    pub fn search_messages(
+        &self,
+        peer: String,
+        query: String,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>> {
+        let p = self.resolve(&peer)?;
+        let hits = self
+            .node
+            .search(Some(self.node.conversation_for(&p)), &query, limit as usize)
+            .map_err(fail)?;
+        let me = self.node.reactor_of(&self.node.identity());
+        let entries: Vec<_> = hits.into_iter().map(|h| h.entry).collect();
+        Ok(history_entries(&entries, me))
+    }
+
+    /// Messages in every conversation (contacts and groups) matching
+    /// `query` as in `search_messages`, newest first, at most `limit`.
+    pub fn search_all(&self, query: String, limit: u32) -> Result<Vec<SearchHit>> {
+        let hits = self
+            .node
+            .search(None, &query, limit as usize)
+            .map_err(fail)?;
+        let me = self.node.reactor_of(&self.node.identity());
+        let contacts = self.node.contacts();
+        let live: Vec<PublicIdentity> = self.node.sessions().iter().map(|s| s.peer).collect();
+        Ok(hits
+            .into_iter()
+            .map(|h| {
+                let (peer, group) = match h.conversation {
+                    ConversationId::Peer(k) => {
+                        // A device of that account (or that device itself).
+                        let mut devices: Vec<PublicIdentity> = contacts
+                            .iter()
+                            .filter(|c| {
+                                c.account.is_some_and(|a| a.0 == k) || *c.key.as_bytes() == k
+                            })
+                            .map(|c| c.key)
+                            .collect();
+                        devices.sort_by_key(|d| !live.contains(d));
+                        let device = devices
+                            .first()
+                            .copied()
+                            .or_else(|| PublicIdentity::from_bytes(&k).ok());
+                        (device.map(|d| fp(&d)), None)
+                    }
+                    ConversationId::Group(g) => (None, Some(groups::hex(&g))),
+                };
+                SearchHit {
+                    peer,
+                    group,
+                    entry: history_entries(std::slice::from_ref(&h.entry), me)
+                        .pop()
+                        .expect("one entry"),
+                }
+            })
+            .collect())
+    }
+
     /// The disappearing timer messages with `peer` get now (`None` = off):
     /// its own setting, else the default.
     pub fn disappearing(&self, peer: String) -> Result<Option<u32>> {
@@ -1917,6 +1990,24 @@ mod tests {
         assert!(h[0].outgoing && h[0].text == "hello from an app");
         let f = h[2].file.as_ref().unwrap();
         assert!(h[2].outgoing && f.name == "notes.txt" && f.size == 10);
+        // Search: within the chat, and across every conversation.
+        let found = alice
+            .search_messages(bob_fp.clone(), "FROM an".into(), 10)
+            .unwrap();
+        assert_eq!(found.len(), 2, "both copies of the text, newest first");
+        assert!(found[0].at_ms >= found[1].at_ms);
+        assert_eq!(
+            alice
+                .search_messages(bob_fp.clone(), "notes.txt".into(), 10)
+                .unwrap()
+                .len(),
+            1,
+            "file names match"
+        );
+        let all = alice.search_all("hello app".into(), 1).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].peer.as_deref() == Some(bob_fp.as_str()) && all[0].group.is_none());
+        assert!(alice.search_all("  ".into(), 10).unwrap().is_empty());
         // Bob acknowledged both (the Delivered events went by above).
         for _ in 0..100 {
             if alice
@@ -2176,6 +2267,14 @@ mod tests {
             );
         }
         assert_eq!(bob.group_history(g.clone(), 10).unwrap()[0].text, "hi all");
+        assert_eq!(
+            bob.search_group_messages(g.clone(), "HI".into(), 10)
+                .unwrap()[0]
+                .text,
+            "hi all"
+        );
+        let hit = bob.search_all("hi all".into(), 10).unwrap();
+        assert!(hit.iter().any(|h| h.group.as_deref() == Some(g.as_str())));
         assert!(carol.group_history(g.clone(), 10).unwrap()[0].outgoing);
         // Alice acknowledges her own copy, and forwards Bob's: when Bob
         // acknowledges it, Alice sends Carol a receipt. Both count.

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use threnody_core::history::{ConversationId, Entry, FileNote, History};
+use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Query};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
@@ -872,6 +872,26 @@ impl Node {
         self.shared
             .home
             .load_history(self.identity_ref(), conv, now_ms())
+            .map_err(NetError::from)
+    }
+
+    /// Searches one conversation, or all of them (`None`), for `query`;
+    /// at most `limit` hits, newest first.
+    pub fn search(
+        &self,
+        scope: Option<ConversationId>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        self.shared
+            .home
+            .search_history(
+                self.identity_ref(),
+                scope,
+                &Query::new(query),
+                now_ms(),
+                limit,
+            )
             .map_err(NetError::from)
     }
 

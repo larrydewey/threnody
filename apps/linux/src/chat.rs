@@ -13,8 +13,10 @@ use crate::settings;
 use crate::ui::{self, bg};
 use crate::window::App;
 
-/// How many messages a chat loads.
+/// How many messages a chat loads (more to reach an older search match).
 const HISTORY: u32 = 1000;
+/// The most matches a search in a chat finds.
+const SEARCH_LIMIT: u32 = 500;
 /// We're taken to have stopped typing after this long without a keystroke.
 const TYPING_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// While typing goes on, the contact is told again this often.
@@ -24,6 +26,8 @@ const PEER_TYPING: std::time::Duration = std::time::Duration::from_secs(8);
 /// A banner or menu action on the open chat.
 type Action = fn(&Rc<ChatView>);
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+/// A message by its time and sending device, as search finds it.
+pub type Key = (u64, String);
 
 pub struct ChatView {
     app: Weak<App>,
@@ -38,6 +42,27 @@ pub struct ChatView {
     input: gtk::TextView,
     menu: gtk::MenuButton,
     entries: RefCell<Vec<HistoryEntry>>,
+    /// How many messages are loaded; grows to take in an older message
+    /// to jump to.
+    limit: Cell<u32>,
+    /// The bubbles on screen, for search to mark and scroll to.
+    bubbles: RefCell<Vec<(Key, gtk::Box)>>,
+    search_bar: gtk::SearchBar,
+    search_entry: gtk::SearchEntry,
+    search_count: gtk::Label,
+    search_nav: gtk::Box,
+    /// The messages matching the search, newest first.
+    hits: RefCell<Vec<Key>>,
+    /// Which of them is selected.
+    hit_at: Cell<usize>,
+    /// The highlighted message: the selected match, or one jumped to.
+    current: RefCell<Option<Key>>,
+    /// A message to scroll to once it is loaded.
+    jump: RefCell<Option<Key>>,
+    /// The match to select when the search under way finishes.
+    want: RefCell<Option<Key>>,
+    /// Counts searches, so a slow one doesn't overwrite a newer one.
+    search_gen: Cell<u32>,
     loading: Cell<bool>,
     again: Cell<bool>,
     /// The history was shown at least once.
@@ -74,6 +99,47 @@ impl ChatView {
             .tooltip_text("Conversation options")
             .build();
         header.pack_end(&menu);
+
+        // Search in this conversation (Ctrl+F).
+        let search_entry = gtk::SearchEntry::builder()
+            .placeholder_text("Search this conversation")
+            .hexpand(true)
+            .build();
+        let search_count = gtk::Label::new(None);
+        search_count.add_css_class("dim-label");
+        search_count.add_css_class("numeric");
+        let older = gtk::Button::from_icon_name("go-up-symbolic");
+        older.set_tooltip_text(Some("Older match (Enter)"));
+        older.add_css_class("flat");
+        let newer = gtk::Button::from_icon_name("go-down-symbolic");
+        newer.set_tooltip_text(Some("Newer match (Shift+Enter)"));
+        newer.add_css_class("flat");
+        let search_nav = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        search_nav.append(&older);
+        search_nav.append(&newer);
+        search_nav.set_sensitive(false);
+        let search_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        search_box.append(&search_entry);
+        search_box.append(&search_count);
+        search_box.append(&search_nav);
+        let search_bar = gtk::SearchBar::builder()
+            .child(
+                &adw::Clamp::builder()
+                    .maximum_size(600)
+                    .child(&search_box)
+                    .build(),
+            )
+            .build();
+        search_bar.connect_entry(&search_entry);
+        let find = gtk::ToggleButton::builder()
+            .icon_name("system-search-symbolic")
+            .tooltip_text("Search (Ctrl+F)")
+            .build();
+        find.bind_property("active", &search_bar, "search-mode-enabled")
+            .bidirectional()
+            .sync_create()
+            .build();
+        header.pack_end(&find);
 
         let banner = gtk::Box::new(gtk::Orientation::Vertical, 6);
         banner.add_css_class("chat-banner");
@@ -176,6 +242,7 @@ impl ChatView {
         body.append(&stack);
         let root = adw::ToolbarView::new();
         root.add_top_bar(&header);
+        root.add_top_bar(&search_bar);
         root.set_content(Some(&body));
         root.add_bottom_bar(&composer_clamp);
 
@@ -192,6 +259,18 @@ impl ChatView {
             input,
             menu,
             entries: RefCell::new(Vec::new()),
+            limit: Cell::new(HISTORY),
+            bubbles: RefCell::new(Vec::new()),
+            search_bar,
+            search_entry,
+            search_count,
+            search_nav,
+            hits: RefCell::new(Vec::new()),
+            hit_at: Cell::new(0),
+            current: RefCell::new(None),
+            jump: RefCell::new(None),
+            want: RefCell::new(None),
+            search_gen: Cell::new(0),
             loading: Cell::new(false),
             again: Cell::new(false),
             loaded: Cell::new(false),
@@ -277,6 +356,61 @@ impl ChatView {
                     }));
             });
         }
+
+        // Searching: as you type; Enter and Up go to older matches,
+        // Shift+Enter and Down to newer ones; Escape closes.
+        let weak = Rc::downgrade(&this);
+        this.search_entry.connect_search_changed(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.search();
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&this);
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let older = match key {
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    !mods.contains(gdk::ModifierType::SHIFT_MASK)
+                }
+                gdk::Key::Up => true,
+                gdk::Key::Down => false,
+                _ => return glib::Propagation::Proceed,
+            };
+            if let Some(t) = weak.upgrade() {
+                t.step(older);
+            }
+            glib::Propagation::Stop
+        });
+        this.search_entry.add_controller(keys);
+        for (button, older) in [(&older, true), (&newer, false)] {
+            let weak = Rc::downgrade(&this);
+            button.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.step(older);
+                }
+            });
+        }
+        let weak = Rc::downgrade(&this);
+        this.search_entry.connect_next_match(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.step(true);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.search_entry.connect_previous_match(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.step(false);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.search_bar
+            .connect_search_mode_enabled_notify(move |bar| {
+                let Some(t) = weak.upgrade() else { return };
+                if !bar.is_search_mode() {
+                    t.close_search();
+                }
+            });
 
         this.update(conv);
         this.reload();
@@ -711,18 +845,31 @@ impl ChatView {
             return;
         };
         let (group, device) = (self.group(), self.device());
+        let (limit, until) = (self.limit.get(), self.jump.borrow().as_ref().map(|k| k.0));
         let weak = self.weak_self.clone();
         bg(
-            move || match group {
-                Some(g) => node.group_history(g, HISTORY).unwrap_or_default(),
-                None => node.history(device, HISTORY).unwrap_or_default(),
+            move || {
+                let fetch = |n| match &group {
+                    Some(g) => node.group_history(g.clone(), n).unwrap_or_default(),
+                    None => node.history(device.clone(), n).unwrap_or_default(),
+                };
+                let mut n = limit;
+                let mut entries = fetch(n);
+                // Further back, until the message to jump to is in.
+                while until.is_some_and(|at| older_than_loaded(&entries, n, at)) && n < u32::MAX {
+                    n = n.saturating_mul(4);
+                    entries = fetch(n);
+                }
+                (n, entries)
             },
-            move |entries| {
+            move |(n, entries)| {
                 let Some(t) = weak.upgrade() else { return };
                 t.loading.set(false);
+                t.limit.set(n);
                 if !t.loaded.replace(true) || *t.entries.borrow() != entries {
                     t.display_entries(entries);
                 }
+                t.finish_jump();
                 if t.again.replace(false) {
                     t.reload();
                 }
@@ -737,6 +884,7 @@ impl ChatView {
         while let Some(child) = self.messages.first_child() {
             self.messages.remove(&child);
         }
+        self.bubbles.borrow_mut().clear();
         let node = self.node();
         let group = self.group().is_some();
         let mut last_day = String::new();
@@ -780,7 +928,9 @@ impl ChatView {
             "messages"
         });
         *self.entries.borrow_mut() = entries;
-        if at_bottom {
+        self.mark_matches();
+        // A message to jump to decides where to scroll instead.
+        if at_bottom && self.jump.borrow().is_none() {
             self.scroll_to_end();
         }
     }
@@ -882,6 +1032,9 @@ impl ChatView {
         meta.append(&m);
         bubble.append(&meta);
         row.append(&bubble);
+        self.bubbles
+            .borrow_mut()
+            .push(((e.at_ms, e.device.clone()), bubble.clone()));
 
         if !e.reactions.is_empty() {
             let reactions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1232,6 +1385,187 @@ impl ChatView {
             },
             ok,
         );
+    }
+
+    // ----- Search -----
+
+    /// Opens the search (Ctrl+F), or selects its text if open.
+    pub fn open_search(&self) {
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+    }
+
+    /// Searches for `query` with `key`, one of its matches, selected: how
+    /// the app-wide search opens a message.
+    pub fn find(self: &Rc<Self>, query: &str, key: Key) {
+        *self.want.borrow_mut() = Some(key.clone());
+        self.search_bar.set_search_mode(true);
+        if self.search_entry.text() == query {
+            self.search();
+        } else {
+            // Searches once the entry's short delay is over.
+            self.search_entry.set_text(query);
+        }
+        self.jump_to(key);
+    }
+
+    fn search(self: &Rc<Self>) {
+        let query = self.search_entry.text().trim().to_owned();
+        let generation = self.search_gen.get().wrapping_add(1);
+        self.search_gen.set(generation);
+        if query.is_empty() {
+            self.want.take();
+            self.hits.borrow_mut().clear();
+            self.select_hit(0);
+            return;
+        }
+        let Some(node) = self.node() else { return };
+        let (group, device) = (self.group(), self.device());
+        let weak = self.weak_self.clone();
+        bg(
+            move || {
+                match group {
+                    Some(g) => node.search_group_messages(g, query, SEARCH_LIMIT),
+                    None => node.search_messages(device, query, SEARCH_LIMIT),
+                }
+                .unwrap_or_default()
+            },
+            move |found| {
+                let Some(t) = weak.upgrade() else { return };
+                if t.search_gen.get() != generation {
+                    return;
+                }
+                let hits: Vec<Key> = found.into_iter().map(|e| (e.at_ms, e.device)).collect();
+                let at = t
+                    .want
+                    .take()
+                    .and_then(|k| hits.iter().position(|h| *h == k))
+                    .unwrap_or(0);
+                *t.hits.borrow_mut() = hits;
+                t.select_hit(at);
+            },
+        );
+    }
+
+    /// Goes to the next match back in time (`older`) or forward, wrapping.
+    fn step(self: &Rc<Self>, older: bool) {
+        let n = self.hits.borrow().len();
+        if n == 0 {
+            return;
+        }
+        let at = self.hit_at.get() % n;
+        self.select_hit(if older {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        });
+    }
+
+    /// Selects match `i` (newest first) and shows it, or with no matches
+    /// just says so.
+    fn select_hit(self: &Rc<Self>, i: usize) {
+        self.hit_at.set(i);
+        let (key, n) = {
+            let hits = self.hits.borrow();
+            (hits.get(i).cloned(), hits.len())
+        };
+        let searching = !self.search_entry.text().trim().is_empty();
+        self.search_count.set_text(&match n {
+            _ if !searching => String::new(),
+            0 => "No matches".into(),
+            // The search stops at SEARCH_LIMIT; there may be more.
+            _ if n >= SEARCH_LIMIT as usize => format!("{} of {n}+", i + 1),
+            _ => format!("{} of {n}", i + 1),
+        });
+        self.search_nav.set_sensitive(n > 0);
+        match key {
+            Some(k) => self.jump_to(k),
+            None => {
+                self.current.borrow_mut().take();
+                self.mark_matches();
+            }
+        }
+    }
+
+    /// The search bar closed: no more marks.
+    fn close_search(&self) {
+        self.search_gen.set(self.search_gen.get().wrapping_add(1));
+        self.search_entry.set_text("");
+        self.search_count.set_text("");
+        self.search_nav.set_sensitive(false);
+        self.hits.borrow_mut().clear();
+        self.want.take();
+        self.current.borrow_mut().take();
+        self.mark_matches();
+        self.input.grab_focus();
+    }
+
+    /// Scrolls to a message and highlights it, loading older history
+    /// first when it isn't loaded.
+    pub fn jump_to(self: &Rc<Self>, key: Key) {
+        *self.current.borrow_mut() = Some(key.clone());
+        self.mark_matches();
+        if self.bubbles.borrow().iter().any(|(k, _)| *k == key) {
+            self.jump.borrow_mut().take();
+            self.scroll_to(&key);
+            return;
+        }
+        *self.jump.borrow_mut() = Some(key);
+        // Before the first load, it finishes the jump itself.
+        if self.loaded.get() {
+            self.reload();
+        }
+    }
+
+    /// After a load: scrolls to the message to jump to if it's in now,
+    /// loads further back if it may be older, else gives up on it.
+    fn finish_jump(self: &Rc<Self>) {
+        let Some(key) = self.jump.borrow().clone() else {
+            return;
+        };
+        if self.bubbles.borrow().iter().any(|(k, _)| *k == key) {
+            self.jump.borrow_mut().take();
+            self.scroll_to(&key);
+        } else if older_than_loaded(&self.entries.borrow(), self.limit.get(), key.0) {
+            self.reload();
+        } else {
+            // Deleted, or disappeared, since it was found.
+            self.jump.borrow_mut().take();
+            self.scroll_to_end();
+        }
+    }
+
+    /// Marks the bubbles of matches, and the highlighted message.
+    fn mark_matches(&self) {
+        let all = self.hits.borrow();
+        let hits: HashSet<&Key> = all.iter().collect();
+        let current = self.current.borrow();
+        for (k, b) in self.bubbles.borrow().iter() {
+            set_class(b, "search-match", hits.contains(k));
+            set_class(b, "search-current", current.as_ref() == Some(k));
+        }
+    }
+
+    /// Scrolls so the message is in the middle of the view.
+    fn scroll_to(&self, key: &Key) {
+        let Some(bubble) = self
+            .bubbles
+            .borrow()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, b)| b.clone())
+        else {
+            return;
+        };
+        let scroll = self.scroll.clone();
+        // After layout, as in `scroll_to_end`.
+        glib::idle_add_local_once(move || {
+            center(&scroll, &bubble);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+                center(&scroll, &bubble);
+            });
+        });
     }
 
     // ----- Sending -----
@@ -2206,6 +2540,31 @@ impl ChatView {
         d.set_child(Some(&view));
         d.present(Some(&app.window));
     }
+}
+
+/// Whether a message at `at_ms` may be older than all of `entries`, the
+/// last `limit` of the conversation: there are more and they start later.
+fn older_than_loaded(entries: &[HistoryEntry], limit: u32, at_ms: u64) -> bool {
+    entries.len() >= limit as usize && entries.first().is_some_and(|e| e.at_ms > at_ms)
+}
+
+fn set_class(w: &impl IsA<gtk::Widget>, class: &str, on: bool) {
+    if on {
+        w.add_css_class(class);
+    } else {
+        w.remove_css_class(class);
+    }
+}
+
+/// Scrolls `scroll` so `w`, inside it, is in the middle of the view.
+fn center(scroll: &gtk::ScrolledWindow, w: &impl IsA<gtk::Widget>) {
+    let Some(view) = scroll.child() else { return };
+    let Some(p) = w.compute_point(&view, &gtk::graphene::Point::new(0.0, 0.0)) else {
+        return;
+    };
+    let adj = scroll.vadjustment();
+    let h = f64::from(w.height());
+    adj.set_value(adj.value() + f64::from(p.y()) - (adj.page_size() - h) / 2.0);
 }
 
 /// The http(s) links in `text`.

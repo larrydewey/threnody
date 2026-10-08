@@ -44,7 +44,7 @@ pub struct GroupInvite {
     pub from: String,
 }
 
-fn hex(g: &GroupId) -> String {
+pub(crate) fn hex(g: &GroupId) -> String {
     g.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -377,6 +377,24 @@ impl ThrenodyNode {
     pub fn delete_group_entry(&self, group: String, at_ms: u64, device: String) -> Result<u32> {
         let g = self.group_id(&group)?;
         Ok(self.delete_any(ConversationId::Group(g), at_ms, &device))
+    }
+
+    /// Messages in `group` matching `query` (as `search_messages`),
+    /// newest first, at most `limit`.
+    pub fn search_group_messages(
+        &self,
+        group: String,
+        query: String,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>> {
+        let g = self.group_id(&group)?;
+        let hits = self
+            .node
+            .search(Some(ConversationId::Group(g)), &query, limit as usize)
+            .map_err(fail)?;
+        let me = self.node.reactor_of(&self.node.identity());
+        let entries: Vec<_> = hits.into_iter().map(|h| h.entry).collect();
+        Ok(history_entries(&entries, me))
     }
 
     /// The last `limit` messages in a group (oldest first).

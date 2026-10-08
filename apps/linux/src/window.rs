@@ -11,10 +11,20 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use threnody_ffi::{NodeEvent, ProfileAttr};
 
-use crate::chat::ChatView;
+use crate::chat::{ChatView, Key};
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target, UiEvent};
 use crate::settings;
 use crate::ui::{self, bg};
+
+/// The most messages the app-wide search shows.
+const SEARCH_ALL: u32 = 200;
+
+/// What a row of the app-wide search's results opens.
+#[derive(Clone)]
+enum Pick {
+    Chat(ChatRef),
+    Message { chat: ChatRef, key: Key },
+}
 
 pub struct App {
     pub app: adw::Application,
@@ -24,6 +34,13 @@ pub struct App {
     toasts: adw::ToastOverlay,
     list: gtk::ListBox,
     list_stack: gtk::Stack,
+    search_bar: gtk::SearchBar,
+    search_entry: gtk::SearchEntry,
+    results: gtk::ListBox,
+    /// What each row of `results` opens (None: a heading).
+    picks: RefCell<Vec<Option<Pick>>>,
+    /// Counts searches, so a slow one doesn't overwrite a newer one.
+    search_gen: Cell<u32>,
     content: adw::NavigationPage,
     convs: RefCell<Vec<Conversation>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
@@ -71,15 +88,49 @@ impl App {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
+        // While searching every conversation, its results replace the list.
+        let results = gtk::ListBox::new();
+        results.add_css_class("navigation-sidebar");
+        results.set_selection_mode(gtk::SelectionMode::None);
+        let results_scroller = gtk::ScrolledWindow::builder()
+            .child(&results)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        let no_results = adw::StatusPage::builder()
+            .icon_name("system-search-symbolic")
+            .title("No results")
+            .description("Words are matched in messages and file names; \"quote\" a phrase.")
+            .build();
+        no_results.add_css_class("compact");
         let list_stack = gtk::Stack::new();
         list_stack.add_named(&scroller, Some("list"));
         list_stack.add_named(&empty, Some("empty"));
+        list_stack.add_named(&results_scroller, Some("search"));
+        list_stack.add_named(&no_results, Some("no-results"));
+
+        let search_entry = gtk::SearchEntry::builder()
+            .placeholder_text("Search all messages")
+            .hexpand(true)
+            .build();
+        let search_bar = gtk::SearchBar::builder().child(&search_entry).build();
+        search_bar.connect_entry(&search_entry);
 
         let header = adw::HeaderBar::new();
         let invite = gtk::Button::from_icon_name("threnody-qr-symbolic");
         invite.set_tooltip_text(Some("My invite"));
         invite.set_action_name(Some("win.invite"));
         header.pack_start(&invite);
+        let search = gtk::ToggleButton::builder()
+            .icon_name("system-search-symbolic")
+            .tooltip_text("Search all messages (Ctrl+Shift+F)")
+            .build();
+        search
+            .bind_property("active", &search_bar, "search-mode-enabled")
+            .bidirectional()
+            .sync_create()
+            .build();
+        header.pack_start(&search);
 
         let add_menu = gio::Menu::new();
         add_menu.append(Some("Add a contact"), Some("win.add-contact"));
@@ -122,6 +173,7 @@ impl App {
 
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&header);
+        sidebar_view.add_top_bar(&search_bar);
         sidebar_view.set_content(Some(&list_stack));
         let sidebar = adw::NavigationPage::builder()
             .title("Threnody")
@@ -160,6 +212,11 @@ impl App {
             toasts,
             list,
             list_stack,
+            search_bar,
+            search_entry,
+            results,
+            picks: RefCell::new(Vec::new()),
+            search_gen: Cell::new(0),
             content,
             convs: RefCell::new(Vec::new()),
             unread: RefCell::new(HashMap::new()),
@@ -187,6 +244,30 @@ impl App {
                 this.open_chat(c);
             }
         });
+        let weak = Rc::downgrade(&this);
+        this.results.connect_row_activated(move |_, row| {
+            let Some(this) = weak.upgrade() else { return };
+            let i = usize::try_from(row.index()).unwrap_or(0);
+            let pick = this.picks.borrow().get(i).cloned().flatten();
+            if let Some(p) = pick {
+                this.open_pick(p);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.search_entry.connect_search_changed(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.search();
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.search_bar
+            .connect_search_mode_enabled_notify(move |bar| {
+                let Some(this) = weak.upgrade() else { return };
+                if !bar.is_search_mode() {
+                    this.search_entry.set_text("");
+                    this.search();
+                }
+            });
         this.refresh();
         this
     }
@@ -252,21 +333,37 @@ impl App {
                 }
             }
         }
-        self.list_stack
-            .set_visible_child_name(if convs.is_empty() { "empty" } else { "list" });
         *self.convs.borrow_mut() = convs;
+        if !self.searching() {
+            self.show_list();
+        }
         self.rebuilding.set(false);
     }
 
-    fn row(&self, c: &Conversation, unread: u32) -> gtk::ListBoxRow {
-        let title = match &c.chat.persona {
+    fn show_list(&self) {
+        self.list_stack
+            .set_visible_child_name(if self.convs.borrow().is_empty() {
+                "empty"
+            } else {
+                "list"
+            });
+    }
+
+    /// A conversation's name in the list, with the anonymous identity it
+    /// belongs to.
+    fn list_title(&self, c: &Conversation) -> String {
+        match &c.chat.persona {
             Some(p) => format!(
                 "🎭 {} · {}",
                 c.title,
                 self.core.persona_label(p).unwrap_or_default()
             ),
             None => c.title.clone(),
-        };
+        }
+    }
+
+    fn row(&self, c: &Conversation, unread: u32) -> gtk::ListBoxRow {
+        let title = self.list_title(c);
         let subtitle = if let Some(i) = &c.invite {
             format!("Group invitation from {}", core::short(&i.from))
         } else if c.is_request() {
@@ -397,6 +494,189 @@ impl App {
         });
         row.add_controller(click);
         row
+    }
+
+    // ----- Searching every conversation -----
+
+    fn searching(&self) -> bool {
+        self.search_bar.is_search_mode() && !self.search_entry.text().trim().is_empty()
+    }
+
+    /// Opens the search of every conversation (Ctrl+Shift+F, Ctrl+K).
+    fn open_search_all(self: &Rc<Self>) {
+        self.split.set_show_content(false);
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+    }
+
+    /// Ctrl+F: searches the open chat, else every conversation.
+    fn find(self: &Rc<Self>) {
+        let chat = self.chat.borrow().clone();
+        match chat {
+            Some(c) if !self.split.is_collapsed() || self.split.shows_content() => {
+                c.open_search();
+            }
+            _ => self.open_search_all(),
+        }
+    }
+
+    fn search(self: &Rc<Self>) {
+        let query = self.search_entry.text().trim().to_owned();
+        let generation = self.search_gen.get().wrapping_add(1);
+        self.search_gen.set(generation);
+        if !self.searching() {
+            self.show_list();
+            return;
+        }
+        let core = self.core.clone();
+        let weak = Rc::downgrade(self);
+        let q = query.clone();
+        bg(
+            move || core.search(&q, SEARCH_ALL),
+            move |found| {
+                let Some(this) = weak.upgrade() else { return };
+                if this.search_gen.get() == generation {
+                    this.show_results(&query, found);
+                }
+            },
+        );
+    }
+
+    /// Conversations whose names match, then the messages that do.
+    fn show_results(self: &Rc<Self>, query: &str, found: Vec<core::Found>) {
+        while let Some(row) = self.results.row_at_index(0) {
+            self.results.remove(&row);
+        }
+        let terms = ui::search_terms(query);
+        let mut picks = Vec::new();
+        let chats: Vec<Conversation> = self
+            .convs
+            .borrow()
+            .iter()
+            .filter(|c| {
+                let title = c.title.to_lowercase();
+                !terms.is_empty() && terms.iter().all(|t| title.contains(t.as_str()))
+            })
+            .cloned()
+            .collect();
+        if !chats.is_empty() {
+            self.results.append(&heading_row("Conversations"));
+            picks.push(None);
+            let unread = self.unread.borrow();
+            for c in chats {
+                let n = unread.get(&c.chat).copied().unwrap_or(0);
+                self.results.append(&self.row(&c, n));
+                picks.push(Some(Pick::Chat(c.chat)));
+            }
+        }
+        // Only messages of conversations in the list (not blocked ones).
+        let messages: Vec<(Conversation, core::Found)> = found
+            .into_iter()
+            .filter_map(|f| {
+                let at = f.hit.group.as_deref().or(f.hit.peer.as_deref())?;
+                Some((self.conversation_of(f.persona.as_deref(), at)?, f))
+            })
+            .collect();
+        if !messages.is_empty() {
+            self.results.append(&heading_row("Messages"));
+            picks.push(None);
+            for (c, f) in messages {
+                self.results.append(&self.found_row(&c, &f, &terms));
+                let e = f.hit.entry;
+                picks.push(Some(Pick::Message {
+                    chat: c.chat,
+                    key: (e.at_ms, e.device),
+                }));
+            }
+        }
+        self.list_stack.set_visible_child_name(if picks.is_empty() {
+            "no-results"
+        } else {
+            "search"
+        });
+        *self.picks.borrow_mut() = picks;
+    }
+
+    /// A found message: where, who, when, and the words around the match.
+    fn found_row(&self, c: &Conversation, f: &core::Found, terms: &[String]) -> gtk::ListBoxRow {
+        let e = &f.hit.entry;
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        b.set_margin_top(6);
+        b.set_margin_bottom(6);
+        let avatar = adw::Avatar::new(36, Some(&c.title), true);
+        if c.group.is_some() {
+            avatar.set_icon_name(Some("system-users-symbolic"));
+            avatar.set_show_initials(false);
+        }
+        avatar.set_valign(gtk::Align::Center);
+        b.append(&avatar);
+
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let t = gtk::Label::builder()
+            .label(self.list_title(c))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .hexpand(true)
+            .build();
+        top.append(&t);
+        let time = gtk::Label::new(Some(&ui::list_time(e.at_ms)));
+        time.add_css_class("dim-label");
+        time.add_css_class("caption");
+        top.append(&time);
+        text.append(&top);
+        let snippet = match &e.file {
+            // As the list shows them: not even the name.
+            Some(file) if file.sensitive => None,
+            Some(file) => ui::snippet_markup(&e.text, terms, 100).or_else(|| {
+                let icon = if core::is_image(&file.name) {
+                    "📷"
+                } else {
+                    "📎"
+                };
+                ui::snippet_markup(&file.name, terms, 100).map(|s| format!("{icon} {s}"))
+            }),
+            None => ui::snippet_markup(&e.text, terms, 100),
+        }
+        .unwrap_or_else(|| glib::markup_escape_text(&core::preview(e)).to_string());
+        let s = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .hexpand(true)
+            .single_line_mode(true)
+            .build();
+        s.set_markup(&format!(
+            "<span alpha=\"70%\">{}:</span> {snippet}",
+            glib::markup_escape_text(&f.sender)
+        ));
+        s.add_css_class("caption");
+        s.add_css_class("search-snippet");
+        text.append(&s);
+        b.append(&text);
+
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&b));
+        row.set_tooltip_text(Some(&ui::time_label(e.at_ms)));
+        row
+    }
+
+    /// Opens a search result; a message is scrolled to and highlighted,
+    /// with the search carried over to the chat.
+    fn open_pick(self: &Rc<Self>, pick: Pick) {
+        let (chat, key) = match pick {
+            Pick::Chat(chat) => (chat, None),
+            Pick::Message { chat, key } => (chat, Some(key)),
+        };
+        let Some(c) = self.conversation(&chat) else {
+            return;
+        };
+        self.open_chat(c);
+        let view = self.chat.borrow().clone();
+        if let (Some(view), Some(key)) = (view, key) {
+            view.find(self.search_entry.text().trim(), key);
+        }
     }
 
     fn conversation(&self, chat: &ChatRef) -> Option<Conversation> {
@@ -889,6 +1169,11 @@ impl App {
         add("diagnostics", Self::diagnostics);
         add("credentials", Self::credentials);
         add("about", Self::about);
+        add("find", Self::find);
+        add("search-all", Self::open_search_all);
+        self.app.set_accels_for_action("win.find", &["<Ctrl>f"]);
+        self.app
+            .set_accels_for_action("win.search-all", &["<Ctrl><Shift>f", "<Ctrl>k"]);
 
         let with_chat = |name: &str, f: fn(&Rc<Self>, Conversation)| {
             let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
@@ -2031,6 +2316,20 @@ impl App {
             },
         );
     }
+}
+
+/// A heading between groups of search results.
+fn heading_row(text: &str) -> gtk::ListBoxRow {
+    let l = gtk::Label::new(Some(text));
+    l.set_xalign(0.0);
+    l.add_css_class("heading");
+    l.add_css_class("dim-label");
+    l.add_css_class("search-heading");
+    gtk::ListBoxRow::builder()
+        .child(&l)
+        .activatable(false)
+        .selectable(false)
+        .build()
 }
 
 fn placeholder() -> adw::StatusPage {

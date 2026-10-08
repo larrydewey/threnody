@@ -127,6 +127,27 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
     fun action(res: Int, label: String, onClick: (View) -> Unit) {
         addView(icon(res, label, onClick))
     }
+
+    /** The bar's own views, hidden while [row] (a search box) stands in for them. */
+    private var hidden: List<View> = emptyList()
+    private var row: View? = null
+
+    /** Swaps the title and actions for `row`, keeping the bar's insets. */
+    fun replaceWith(row: View) {
+        if (this.row != null) return
+        hidden = (0 until childCount).map { getChildAt(it) }.filter { it.visibility == VISIBLE }
+        hidden.forEach { it.visibility = GONE }
+        this.row = row
+        addView(row, LayoutParams(0, WRAP_CONTENT, 1f))
+    }
+
+    /** Puts the title and actions back. */
+    fun restore() {
+        removeView(row ?: return)
+        row = null
+        hidden.forEach { it.visibility = VISIBLE }
+        hidden = emptyList()
+    }
 }
 
 /** A circle with a contact's initial, tinted from its fingerprint. */

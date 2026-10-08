@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use threnody_ffi::{
     ContactInfo, FileOptions, GroupInfo, GroupInvite, HistoryEntry, NodeEvent, PersonaRecord,
-    ThrenodyNode,
+    SearchHit, ThrenodyNode,
 };
 
 use crate::keyring;
@@ -153,6 +153,14 @@ impl Conversation {
         };
         (pinned, self.last.as_ref().map_or(0, |e| e.at_ms))
     }
+}
+
+/// A message found by searching every identity.
+pub struct Found {
+    pub persona: Option<String>,
+    pub hit: SearchHit,
+    /// Who sent it: "You", else the contact's name.
+    pub sender: String,
 }
 
 pub struct Persona {
@@ -421,6 +429,47 @@ impl Core {
             .find(|c| c.fingerprint == fp)
             .and_then(|c| c.name)
             .unwrap_or_else(|| short(fp))
+    }
+
+    /// Messages matching `query` in every conversation of every identity,
+    /// newest first, at most `limit`.
+    pub fn search(&self, query: &str, limit: u32) -> Vec<Found> {
+        let mut nodes = vec![(None, self.main.clone())];
+        nodes.extend(
+            lock(&self.personas)
+                .iter()
+                .map(|(id, p)| (Some(id.clone()), p.node.clone())),
+        );
+        let mut out = Vec::new();
+        for (persona, node) in nodes {
+            let hits = node.search_all(query.to_owned(), limit).unwrap_or_default();
+            if hits.is_empty() {
+                continue;
+            }
+            // Names once per identity, not once per message.
+            let me = node.device_fingerprint();
+            let names: HashMap<String, String> = node
+                .contacts()
+                .into_iter()
+                .filter_map(|c| Some((c.fingerprint, c.name?)))
+                .collect();
+            for hit in hits {
+                let d = &hit.entry.device;
+                let sender = if hit.entry.outgoing || *d == me {
+                    "You".into()
+                } else {
+                    names.get(d).cloned().unwrap_or_else(|| short(d))
+                };
+                out.push(Found {
+                    persona: persona.clone(),
+                    hit,
+                    sender,
+                });
+            }
+        }
+        out.sort_by_key(|f| std::cmp::Reverse(f.hit.entry.at_ms));
+        out.truncate(limit as usize);
+        out
     }
 
     // ----- Relay directories (Appendix P) -----
