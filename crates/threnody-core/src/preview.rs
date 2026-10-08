@@ -5,8 +5,6 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 
-
-
 /// Maximum time to wait for a preview response.
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum response size to process.
