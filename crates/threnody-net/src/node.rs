@@ -788,7 +788,8 @@ impl Node {
             return Ok(wg.as_ref().unwrap().listen_port());
         }
 
-        let identity = Identity::from_seed(&*self.shared.identity.seed());
+        let identity =
+            Identity::from_seed(self.shared.identity.seed().as_ref().try_into().unwrap());
         let port = self
             .tunnel_port()
             .unwrap_or(threnody_core::tunnel::DEFAULT_PORT);
@@ -828,17 +829,16 @@ impl Node {
         if let Some(wg_userspace) = wg.as_mut() {
             let mut out_buf = [0u8; 65536];
             let len = wg_userspace.encapsulate(peer, data, &mut out_buf)?;
-            if len > 0 {
-                if let Some(socket) = wg_userspace.udp_socket() {
-                    if let Some(config) = wg_userspace.peer_config(peer) {
-                        let socket = socket.clone();
-                        let data = out_buf[..len].to_vec();
-                        let endpoint = config.endpoint;
-                        tokio::spawn(async move {
-                            let _ = socket.send_to(&data, endpoint).await;
-                        });
-                    }
-                }
+            if len > 0
+                && let (Some(socket), Some(config)) =
+                    (wg_userspace.udp_socket(), wg_userspace.peer_config(peer))
+            {
+                let socket = socket.clone();
+                let data = out_buf[..len].to_vec();
+                let endpoint = config.endpoint;
+                tokio::spawn(async move {
+                    let _ = socket.send_to(&data, endpoint).await;
+                });
             }
             Ok(())
         } else {

@@ -138,9 +138,9 @@ impl WgUserspace {
     pub fn start(&mut self) -> Result<()> {
         // Create UDP socket
         let socket = std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.listen_port))
-            .map_err(|e| NetError::Io(e))?;
-        socket.set_nonblocking(true).map_err(|e| NetError::Io(e))?;
-        let udp_socket = Arc::new(UdpSocket::from_std(socket).map_err(|e| NetError::Io(e))?);
+            .map_err(NetError::Io)?;
+        socket.set_nonblocking(true).map_err(NetError::Io)?;
+        let udp_socket = Arc::new(UdpSocket::from_std(socket).map_err(NetError::Io)?);
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -198,7 +198,7 @@ impl WgUserspace {
         out_buf: &mut [u8],
     ) -> Result<Option<Vec<u8>>> {
         if let Some(tunn) = self.tunnels.get_mut(peer) {
-            let result = tunn.decapsulate(Some(src_addr.ip().into()), packet, out_buf);
+            let result = tunn.decapsulate(Some(src_addr.ip()), packet, out_buf);
             match result {
                 TunnResult::WriteToNetwork(out) => Ok(Some(out.to_vec())),
                 TunnResult::WriteToTunnelV6(out, dst) => Ok(Some(out.to_vec())),

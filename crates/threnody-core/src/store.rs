@@ -327,10 +327,10 @@ impl Home {
                     continue; // Skip temp files
                 }
                 let path = entry.path();
-                if let Ok(content) = fs::read(&path) {
-                    if !content.is_empty() {
-                        files.push((name, content));
-                    }
+                if let Ok(content) = fs::read(&path)
+                    && !content.is_empty()
+                {
+                    files.push((name, content));
                 }
             }
         }

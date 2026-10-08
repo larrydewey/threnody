@@ -314,6 +314,7 @@ impl Groups {
         use threnody_core::cbor::{fixed_bytes, read_map};
         let mut me = Self::new(identity);
         let mut dec = const_cbor::Decoder::new(bytes);
+        #[allow(clippy::type_complexity)]
         let mut meta: Vec<(
             GroupId,
             String,
@@ -394,6 +395,7 @@ impl Groups {
     }
 
     /// `(id, name, owner, members, roles)` for every group we are in.
+    #[allow(clippy::type_complexity)]
     pub fn list_with_roles(
         &self,
     ) -> Vec<(

@@ -136,6 +136,7 @@ impl GroupNode {
     }
 
     /// `(id, name, owner, members, roles)` for every group we are in.
+    #[allow(clippy::type_complexity)]
     pub fn list_with_roles(
         &self,
     ) -> Vec<(
