@@ -332,6 +332,12 @@ pub enum NodeEvent {
     GroupLeft {
         group: String,
     },
+    /// A member's role was changed.
+    GroupRoleChanged {
+        group: String,
+        member: String,
+        role: u8, // 0=Owner, 1=Admin, 2=Member
+    },
     /// `ours`: sent by another device of our own account.
     GroupMessage {
         group: String,

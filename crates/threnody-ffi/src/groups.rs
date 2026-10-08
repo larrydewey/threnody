@@ -22,8 +22,18 @@ pub struct GroupInfo {
     pub owner: String,
     /// Member device fingerprints, including ours.
     pub members: Vec<String>,
+    /// Member roles corresponding to `members`: 0=Owner, 1=Admin, 2=Member
+    pub member_roles: Vec<u8>,
     /// Whether we own it (only the owner adds and removes members).
     pub owned: bool,
+}
+
+/// Member role in a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MemberRole {
+    Owner = 0,
+    Admin = 1,
+    Member = 2,
 }
 
 /// An invitation waiting for the user's consent.
@@ -72,6 +82,11 @@ fn event(u: Update) -> NodeEvent {
             removed: vec![fp(&member)],
         },
         Update::Left { group } => NodeEvent::GroupLeft { group: hex(&group) },
+        Update::RoleChanged { group, member, role } => NodeEvent::GroupRoleChanged {
+            group: hex(&group),
+            member: fp(&member),
+            role: role as u8,
+        },
         Update::Reacted { group, from } => NodeEvent::Reacted {
             peer: fp(&from),
             group: Some(hex(&group)),
@@ -169,13 +184,14 @@ impl ThrenodyNode {
     pub fn groups(&self) -> Vec<GroupInfo> {
         let me = self.node.identity();
         self.group_node()
-            .list()
+            .list_with_roles()
             .into_iter()
-            .map(|(g, name, owner, members)| GroupInfo {
+            .map(|(g, name, owner, members, roles)| GroupInfo {
                 id: hex(&g),
                 name,
                 owner: fp(&owner),
                 members: members.iter().map(fp).collect(),
+                member_roles: roles.iter().map(|r| *r as u8).collect(),
                 owned: owner == me,
             })
             .collect()
@@ -216,6 +232,24 @@ impl ThrenodyNode {
         let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
         let _guard = self.rt.enter();
         let updates = self.group_node().remove(&self.node, &g, &p).map_err(fail)?;
+        self.queue_updates(updates);
+        Ok(())
+    }
+
+    /// Promotes `peer` to Admin (only the group owner can do this).
+    pub fn promote_in_group(&self, group: String, peer: String) -> Result<()> {
+        let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
+        let _guard = self.rt.enter();
+        let updates = self.group_node().promote(&self.node, &g, p).map_err(fail)?;
+        self.queue_updates(updates);
+        Ok(())
+    }
+
+    /// Demotes `peer` from Admin to Member (only the group owner can do this).
+    pub fn demote_in_group(&self, group: String, peer: String) -> Result<()> {
+        let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
+        let _guard = self.rt.enter();
+        let updates = self.group_node().demote(&self.node, &g, p).map_err(fail)?;
         self.queue_updates(updates);
         Ok(())
     }

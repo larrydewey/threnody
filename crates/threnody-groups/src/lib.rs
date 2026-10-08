@@ -110,6 +110,12 @@ pub enum GroupEvent {
         group: GroupId,
         member: PublicIdentity,
     },
+    /// A member's role was changed.
+    RoleChanged {
+        group: GroupId,
+        member: PublicIdentity,
+        role: MemberRole,
+    },
     /// We were removed, or the group was otherwise closed for us.
     Left { group: GroupId },
     /// `id` is the sender's id for the message (0 from older members).
@@ -146,10 +152,74 @@ pub struct Output {
     pub events: Vec<GroupEvent>,
 }
 
+/// Internal group state.
 struct Group {
     mls: MlsGroup,
     name: String,
     owner: PublicIdentity,
+    /// Member roles: maps PublicIdentity -> MemberRole
+    roles: HashMap<PublicIdentity, MemberRole>,
+}
+
+/// Member role in a group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+impl MemberRole {
+    /// Returns true if this role can add/remove members.
+    pub fn can_commit(self) -> bool {
+        matches!(self, MemberRole::Owner | MemberRole::Admin)
+    }
+
+    /// Returns true if this role can promote/demote other members.
+    pub fn can_manage_roles(self) -> bool {
+        matches!(self, MemberRole::Owner)
+    }
+
+    /// Wire format: 0=Owner, 1=Admin, 2=Member
+    pub fn to_wire(self) -> u8 {
+        match self {
+            MemberRole::Owner => 0,
+            MemberRole::Admin => 1,
+            MemberRole::Member => 2,
+        }
+    }
+
+    pub fn from_wire(v: u8) -> Self {
+        match v {
+            0 => MemberRole::Owner,
+            1 => MemberRole::Admin,
+            _ => MemberRole::Member,
+        }
+    }
+}
+
+impl Group {
+    fn new(mls: MlsGroup, name: String, owner: PublicIdentity) -> Self {
+        let mut roles = HashMap::new();
+        roles.insert(owner, MemberRole::Owner);
+        Self { mls, name, owner, roles }
+    }
+
+    fn role(&self, member: &PublicIdentity) -> MemberRole {
+        self.roles.get(member).copied().unwrap_or(MemberRole::Member)
+    }
+
+    fn set_role(&mut self, member: PublicIdentity, role: MemberRole) {
+        if role == MemberRole::Owner {
+            // Only one owner allowed
+            self.roles.retain(|_, r| *r != MemberRole::Owner);
+        }
+        self.roles.insert(member, role);
+    }
+
+    fn committer_role(&self) -> MemberRole {
+        self.role(&self.owner)
+    }
 }
 
 pub struct Groups {
@@ -218,10 +288,14 @@ impl Groups {
             }
             e.u8(2)?.array_len(self.groups.len())?;
             for (id, g) in &self.groups {
-                e.array_len(3)?
+                e.array_len(4)?
                     .bytes(id)?
                     .str(&g.name)?
-                    .bytes(g.owner.as_bytes())?;
+                    .bytes(g.owner.as_bytes())?
+                    .map_len(g.roles.len())?;
+                for (member, role) in &g.roles {
+                    e.bytes(member.as_bytes())?.u8(*role as u8)?;
+                }
             }
             Ok(())
         })?)
@@ -232,7 +306,7 @@ impl Groups {
         use threnody_core::cbor::{fixed_bytes, read_map};
         let mut me = Self::new(identity);
         let mut dec = const_cbor::Decoder::new(bytes);
-        let mut meta: Vec<(GroupId, String, [u8; 32])> = Vec::new();
+        let mut meta: Vec<(GroupId, String, [u8; 32], HashMap<PublicIdentity, MemberRole>)> = Vec::new();
         let mut version = None;
         {
             let mut values = me
@@ -255,12 +329,20 @@ impl Groups {
                     }
                     2 => {
                         for _ in 0..d.array_len()? {
-                            if d.array_len()? != 3 {
+                            let mut roles = HashMap::new();
+                            if d.array_len()? != 4 {
                                 return Err(threnody_core::Error::Malformed("group entry"));
                             }
                             let id = fixed_bytes::<16>(d)?;
                             let name = d.str()?.to_owned();
-                            meta.push((id, name, fixed_bytes::<32>(d)?));
+                            let owner = fixed_bytes::<32>(d)?;
+                            let role_count = d.map_len()?;
+                            for _ in 0..role_count {
+                                let member = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?).map_err(|_| threnody_core::Error::Malformed("member identity"))?;
+                                let role = MemberRole::from_wire(d.u8()?);
+                                roles.insert(member, role);
+                            }
+                            meta.push((id, name, owner, roles));
                         }
                     }
                     _ => return Ok(false),
@@ -272,7 +354,7 @@ impl Groups {
         if version != Some(STATE_VERSION) {
             return Err(GroupError::Unexpected("group state version"));
         }
-        for (id, name, owner) in meta {
+        for (id, name, owner, roles) in meta {
             let mls = MlsGroup::load(
                 me.provider.storage(),
                 &openmls::group::GroupId::from_slice(&id),
@@ -280,7 +362,9 @@ impl Groups {
             .map_err(mls)?
             .ok_or(GroupError::Unexpected("group missing from storage"))?;
             let owner = PublicIdentity::from_bytes(&owner)?;
-            me.groups.insert(id, Group { mls, name, owner });
+            let mut group = Group::new(mls, name, owner);
+            group.roles = roles;
+            me.groups.insert(id, group);
         }
         Ok(me)
     }
@@ -290,6 +374,18 @@ impl Groups {
         self.groups
             .iter()
             .map(|(id, g)| (*id, g.name.clone(), g.owner, self.members_of(g)))
+            .collect()
+    }
+
+    /// `(id, name, owner, members, roles)` for every group we are in.
+    pub fn list_with_roles(&self) -> Vec<(GroupId, String, PublicIdentity, Vec<PublicIdentity>, Vec<MemberRole>)> {
+        self.groups
+            .iter()
+            .map(|(id, g)| {
+                let members = self.members_of(g);
+                let roles = members.iter().map(|m| g.role(m)).collect();
+                (*id, g.name.clone(), g.owner, members, roles)
+            })
             .collect()
     }
 
@@ -323,20 +419,16 @@ impl Groups {
         .map_err(mls)?;
         self.groups.insert(
             id,
-            Group {
-                mls,
-                name: truncate(name),
-                owner: self.me,
-            },
+            Group::new(mls, truncate(name), self.me),
         );
         Ok(id)
     }
 
-    /// Owner: asks `peer` for a key package; the add completes when it
+    /// Owner/Admin: asks `peer` for a key package; the add completes when it
     /// arrives.
     pub fn invite(&mut self, group: &GroupId, peer: PublicIdentity) -> Result<Output> {
         let g = self.group(group)?;
-        if g.owner != self.me {
+        if !self.can_commit(group)? {
             return Err(GroupError::NotOwner);
         }
         if self.members_of(g).contains(&peer) {
@@ -383,13 +475,19 @@ impl Groups {
         })
     }
 
-    /// Owner: removes `member` and distributes the commit.
+    /// Checks if the current user can commit (owner or admin).
+    fn can_commit(&self, group: &GroupId) -> Result<bool> {
+        let g = self.group(group)?;
+        Ok(g.role(&self.me).can_commit())
+    }
+
+    /// Owner/Admin: removes `member` and distributes the commit.
     pub fn remove(&mut self, group: &GroupId, member: &PublicIdentity) -> Result<Output> {
         let me = self.me;
-        let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
-        if g.owner != me {
+        if !self.can_commit(group)? {
             return Err(GroupError::NotOwner);
         }
+        let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
         let index = g
             .mls
             .members()
@@ -421,6 +519,43 @@ impl Groups {
                 group: *group,
                 member: *member,
             }],
+        })
+}
+
+/// Owner/Admin: promotes `member` to Admin.
+    pub fn promote(&mut self, group: &GroupId, member: PublicIdentity) -> Result<Output> {
+        let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+        if g.owner != self.me {
+            return Err(GroupError::NotOwner);
+        }
+        let role = g.role(&member);
+        if role == MemberRole::Owner {
+            return Err(GroupError::Unexpected("cannot promote owner"));
+        }
+        if role == MemberRole::Admin {
+            return Err(GroupError::Unexpected("already an admin"));
+        }
+        g.set_role(member, MemberRole::Admin);
+        Ok(Output {
+            send: vec![],
+            events: vec![GroupEvent::RoleChanged { group: *group, member, role: MemberRole::Admin }],
+        })
+    }
+
+    /// Owner: demotes `member` from Admin to Member.
+    pub fn demote(&mut self, group: &GroupId, member: PublicIdentity) -> Result<Output> {
+        let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+        if g.owner != self.me {
+            return Err(GroupError::NotOwner);
+        }
+        let role = g.role(&member);
+        if role != MemberRole::Admin {
+            return Err(GroupError::Unexpected("only admins can be demoted"));
+        }
+        g.set_role(member, MemberRole::Member);
+        Ok(Output {
+            send: vec![],
+            events: vec![GroupEvent::RoleChanged { group: *group, member, role: MemberRole::Member }],
         })
     }
 
@@ -711,14 +846,18 @@ impl Groups {
             return Err(GroupError::Unexpected("welcome from non-member"));
         }
         let name = truncate(name);
-        self.groups.insert(
-            group,
-            Group {
-                mls,
-                name: name.clone(),
-                owner: from,
-            },
-        );
+        let mut roles = HashMap::new();
+            roles.insert(from, MemberRole::Owner);
+            roles.insert(self.me, MemberRole::Member);
+            self.groups.insert(
+                group,
+                Group {
+                    mls,
+                    name: name.clone(),
+                    owner: from,
+                    roles,
+                },
+            );
         Ok(Output {
             send: vec![],
             events: vec![GroupEvent::Joined {

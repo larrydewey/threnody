@@ -20,7 +20,7 @@ use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::OutgoingFile;
 use threnody_net::{Node, Tag};
 
-use crate::{Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, Output};
+use crate::{Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, MemberRole, Output};
 
 type Result<T> = std::result::Result<T, GroupError>;
 
@@ -60,6 +60,12 @@ pub enum Update {
     MemberRemoved {
         group: GroupId,
         member: PublicIdentity,
+    },
+    /// A member's role was changed.
+    RoleChanged {
+        group: GroupId,
+        member: PublicIdentity,
+        role: MemberRole,
     },
     /// The owner removed us.
     Left { group: GroupId },
@@ -127,6 +133,11 @@ impl GroupNode {
     /// `(id, name, owner, members)` for every group we are in.
     pub fn list(&self) -> Vec<(GroupId, String, PublicIdentity, Vec<PublicIdentity>)> {
         self.groups.list()
+    }
+
+    /// `(id, name, owner, members, roles)` for every group we are in.
+    pub fn list_with_roles(&self) -> Vec<(GroupId, String, PublicIdentity, Vec<PublicIdentity>, Vec<MemberRole>)> {
+        self.groups.list_with_roles()
     }
 
     pub fn invites(&self) -> &[Invite] {
@@ -205,6 +216,36 @@ impl GroupNode {
             updates.extend(self.apply(node, out, true));
         }
         Ok(updates)
+    }
+
+    /// Promotes `peer` to Admin (only the group owner can do this).
+    pub fn promote(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        peer: PublicIdentity,
+    ) -> Result<Vec<Update>> {
+        let members = self.members(group)?;
+        if !members.contains(&peer) {
+            return Err(GroupError::NotMember(peer.fingerprint().to_string()));
+        }
+        let out = self.groups.promote(group, peer)?;
+        Ok(self.apply(node, out, true))
+    }
+
+    /// Demotes `peer` from Admin to Member (only the group owner can do this).
+    pub fn demote(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        peer: PublicIdentity,
+    ) -> Result<Vec<Update>> {
+        let members = self.members(group)?;
+        if !members.contains(&peer) {
+            return Err(GroupError::NotMember(peer.fingerprint().to_string()));
+        }
+        let out = self.groups.demote(group, peer)?;
+        Ok(self.apply(node, out, true))
     }
 
     /// Leaves a group: a member asks the owner to remove it, the owner
@@ -607,6 +648,7 @@ impl GroupNode {
             GroupEvent::MemberAdded { group, member } => Update::MemberAdded { group, member },
             GroupEvent::MemberRemoved { group, member } => Update::MemberRemoved { group, member },
             GroupEvent::Left { group } => Update::Left { group },
+            GroupEvent::RoleChanged { group, member, role } => Update::RoleChanged { group, member, role },
             GroupEvent::Text {
                 group,
                 from,

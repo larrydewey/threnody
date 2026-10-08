@@ -20,6 +20,7 @@ pub mod message;
 pub mod onion;
 pub mod persona;
 pub mod prekey;
+pub mod preview;
 pub mod ratchet;
 pub mod rendezvous;
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub use channel::SecureChannel;
 pub use error::{Error, Result};
 pub use identity::{Fingerprint, Identity, PublicIdentity, safety_number};
 pub use message::AppMessage;
+pub use preview::{fetch_preview, UrlPreview};
 
 /// Milliseconds since the Unix epoch, saturating at zero for clocks set
 /// before 1970.
