@@ -102,21 +102,21 @@ pub struct RatchetState {
 }
 
 #[derive(Clone)]
-struct ChainState {
+pub struct ChainState {
     key: [u8; 32],
     n: u32,
     hk: [u8; 32],
 }
 
 #[derive(Clone)]
-struct SendChainState {
+pub struct SendChainState {
     chain: ChainState,
     pub_bytes: Vec<u8>,
     ct: Vec<u8>,
 }
 
 #[derive(Clone)]
-struct SkippedEntry {
+pub struct SkippedEntry {
     ratchet_pub: [u8; 32],
     n: u32,
     key: [u8; 32],
@@ -245,13 +245,17 @@ impl RatchetState {
                 8 => next_recv_hk.copy_from_slice(&fixed_bytes::<32>(d)?),
                 9 => {
                     for _ in 0..d.array_len()? {
-                        let mut ratchet_pub = [0u8; 32];
-                        let mut n = 0;
-                        let mut key = [0u8; 32];
-                        d.array_len()?;
-                        ratchet_pub.copy_from_slice(d.bytes()?);
-                        n = d.u32()?;
-                        key.copy_from_slice(d.bytes()?);
+                        let ratchet_pub = {
+                            let mut r = [0u8; 32];
+                            r.copy_from_slice(d.bytes()?);
+                            r
+                        };
+                        let n = d.u32()?;
+                        let key = {
+                            let mut k = [0u8; 32];
+                            k.copy_from_slice(d.bytes()?);
+                            k
+                        };
                         skipped.push(SkippedEntry {
                             ratchet_pub,
                             n,
