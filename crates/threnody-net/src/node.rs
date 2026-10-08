@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
@@ -383,6 +383,9 @@ pub(crate) struct Shared {
     tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
     tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    /// Userspace WireGuard (boringtun) state.
+    #[cfg(feature = "boringtun")]
+    wg_userspace: Mutex<Option<crate::wg_userspace::WgUserspace>>,
     pub(crate) relay: Mutex<RelayState>,
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
@@ -567,6 +570,8 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
+            #[cfg(feature = "boringtun")]
+            wg_userspace: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
@@ -661,6 +666,11 @@ impl Node {
         lock(&self.shared.tunnel_peers).values().cloned().collect()
     }
 
+    /// Returns tunnel peer entries with their identities for userspace WireGuard.
+    pub fn tunnel_peer_entries(&self) -> Vec<(PublicIdentity, TunnelPeer)> {
+        lock(&self.shared.tunnel_peers).iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
     /// Sets the WireGuard tunnel port. Changing this restarts tunnel state.
     pub fn set_tunnel_port(&self, port: Option<u16>) -> Result<()> {
         let new_tunnel = port.map(|p| (p, *WgKeys::derive(&self.shared.identity).public()));
@@ -745,6 +755,71 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    /// Starts the userspace WireGuard implementation (boringtun).
+    /// Returns the local UDP port being listened on.
+    #[cfg(feature = "boringtun")]
+    pub fn start_wg_userspace(&self) -> Result<u16> {
+        let mut wg = self.shared.wg_userspace.lock().unwrap();
+        if wg.is_some() {
+            return Ok(wg.as_ref().unwrap().listen_port());
+        }
+
+        let identity = Identity::from_seed(&*self.shared.identity.seed());
+        let port = self.tunnel_port().unwrap_or(threnody_core::tunnel::DEFAULT_PORT);
+        let mut wg_userspace = crate::wg_userspace::WgUserspace::new(&identity, port)?;
+
+        // Add existing tunnel peers
+        for (peer_id, peer) in self.tunnel_peer_entries() {
+            let config = crate::wg_userspace::WgPeerConfig {
+                peer_identity: peer_id,
+                peer_wg_public: peer.wg_public,
+                endpoint: peer.endpoint,
+                overlay: peer.overlay,
+                psk: peer.psk,
+            };
+            wg_userspace.add_peer(config)?;
+        }
+
+        wg_userspace.start()?;
+        let listen_port = wg_userspace.listen_port();
+        *wg = Some(wg_userspace);
+        Ok(listen_port)
+    }
+
+    /// Stops the userspace WireGuard implementation.
+    #[cfg(feature = "boringtun")]
+    pub fn stop_wg_userspace(&self) {
+        let mut wg = self.shared.wg_userspace.lock().unwrap();
+        if let Some(mut wg_userspace) = wg.take() {
+            wg_userspace.stop();
+        }
+    }
+
+    /// Sends a packet through the userspace WireGuard tunnel to a peer.
+    #[cfg(feature = "boringtun")]
+    pub fn wg_userspace_send(&self, peer: &PublicIdentity, data: &[u8]) -> Result<()> {
+        let mut wg = self.shared.wg_userspace.lock().unwrap();
+        if let Some(wg_userspace) = wg.as_mut() {
+            let mut out_buf = [0u8; 65536];
+            let len = wg_userspace.encapsulate(peer, data, &mut out_buf)?;
+            if len > 0 {
+                if let Some(socket) = wg_userspace.udp_socket() {
+                    if let Some(config) = wg_userspace.peer_config(peer) {
+                        let socket = socket.clone();
+                        let data = out_buf[..len].to_vec();
+                        let endpoint = config.endpoint;
+                        tokio::spawn(async move {
+                            let _ = socket.send_to(&data, endpoint).await;
+                        });
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(crate::error::NetError::External(anyhow!("userspace WireGuard not started")))
+        }
     }
 
     /// Binds a TCP listener and accepts sessions in the background.

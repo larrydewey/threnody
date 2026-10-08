@@ -26,6 +26,8 @@ mod recover;
 pub mod relay;
 pub mod sync;
 pub mod volunteer;
+#[cfg(feature = "boringtun")]
+pub mod wg_userspace;
 
 pub use cred::{CredentialAsk, CredentialInfo, CredentialOffer};
 pub use delivery::Tag;
@@ -34,3 +36,5 @@ pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};
 pub use node::{AcceptPolicy, Event, Node, NodeConfig, SessionInfo};
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};
+#[cfg(feature = "boringtun")]
+pub use wg_userspace::{WgUserspace, WgPeerConfig};

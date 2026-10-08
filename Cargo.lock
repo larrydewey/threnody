@@ -4893,6 +4893,7 @@ dependencies = [
  "getrandom 0.4.3",
  "ml-dsa",
  "ml-kem",
+ "rand 0.8.8",
  "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "sha3 0.12.0",

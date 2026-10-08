@@ -85,7 +85,280 @@ struct Header {
     n: u32,
 }
 
-/// `(initiator's first header key, responder's first header key)`.
+/// Serializable ratchet state for persistence across reconnects.
+/// Excludes the RNG which is reseeded on restore.
+#[derive(Clone)]
+pub struct RatchetState {
+    pub suite: Suite,
+    pub session_id: [u8; 32],
+    pub root: [u8; 32],
+    pub own: Vec<u8>,  // HybridSecret serialized
+    pub send: Option<SendChainState>,
+    pub next_send_hk: [u8; 32],
+    pub prev_send_n: u32,
+    pub recv: Option<ChainState>,
+    pub next_recv_hk: [u8; 32],
+    pub skipped: Vec<SkippedEntry>,
+}
+
+#[derive(Clone)]
+struct ChainState {
+    key: [u8; 32],
+    n: u32,
+    hk: [u8; 32],
+}
+
+#[derive(Clone)]
+struct SendChainState {
+    chain: ChainState,
+    pub_bytes: Vec<u8>,
+    ct: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct SkippedEntry {
+    ratchet_pub: [u8; 32],
+    n: u32,
+    key: [u8; 32],
+}
+
+impl RatchetState {
+    /// Encodes the ratchet state to CBOR bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        cbor::to_vec(self.encoded_len(), |e| self.write_to(e)).expect("ratchet state encoding")
+    }
+
+    fn encoded_len(&self) -> usize {
+        // Rough estimate
+        512 + self.skipped.len() * 100
+    }
+
+    fn write_to(&self, e: &mut const_cbor::Encoder) -> core::result::Result<(), const_cbor::Error> {
+        let map_len = 8 + usize::from(self.send.is_some()) + usize::from(self.recv.is_some());
+        e.map_len(map_len)?;
+        e.u8(0)?.u8(self.suite as u8)?;
+        e.u8(1)?.bytes(&self.session_id)?;
+        e.u8(2)?.bytes(&self.root)?;
+        e.u8(3)?.bytes(&self.own)?;
+        if let Some(s) = &self.send {
+            e.u8(4)?;
+            e.map_len(3)?;
+            e.u8(0)?;
+            e.map_len(3)?;
+            e.u8(0)?.bytes(&s.chain.key)?;
+            e.u8(1)?.u32(s.chain.n)?;
+            e.u8(2)?.bytes(&s.chain.hk)?;
+            e.u8(1)?.bytes(&s.pub_bytes)?;
+            e.u8(2)?.bytes(&s.ct)?;
+        }
+        e.u8(5)?.bytes(&self.next_send_hk)?;
+        e.u8(6)?.u32(self.prev_send_n)?;
+        if let Some(r) = &self.recv {
+            e.u8(7)?;
+            e.map_len(3)?;
+            e.u8(0)?.bytes(&r.key)?;
+            e.u8(1)?.u32(r.n)?;
+            e.u8(2)?.bytes(&r.hk)?;
+        }
+        e.u8(8)?.bytes(&self.next_recv_hk)?;
+        e.u8(9)?;
+        e.array_len(self.skipped.len())?;
+        for s in &self.skipped {
+            e.array_len(3)?;
+            e.bytes(&s.ratchet_pub)?;
+            e.u32(s.n)?;
+            e.bytes(&s.key)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes the ratchet state from CBOR bytes.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let mut dec = Decoder::new(data);
+        let mut suite = Suite::ChaCha20Poly1305;
+        let mut session_id = [0u8; 32];
+        let mut root = [0u8; 32];
+        let mut own = Vec::new();
+        let mut send = None;
+        let mut next_send_hk = [0u8; 32];
+        let mut prev_send_n = 0;
+        let mut recv = None;
+        let mut next_recv_hk = [0u8; 32];
+        let mut skipped = Vec::new();
+
+        read_map(&mut dec, |k, d| {
+            match k {
+                0 => suite = Suite::from_wire(d.u8()?).ok_or(Error::Malformed("bad suite"))?,
+                1 => session_id.copy_from_slice(&fixed_bytes::<32>(d)?),
+                2 => root.copy_from_slice(&fixed_bytes::<32>(d)?),
+                3 => own = d.bytes()?.to_vec(),
+                4 => {
+                    if d.is_null().map(|v| !v).unwrap_or(false) {
+                        read_map(d, |k2, d2| {
+                            match k2 {
+                                0 => {
+                                    read_map(d2, |k3, d3| {
+                                        let mut key = [0u8; 32];
+                                        let mut n = 0;
+                                        let mut hk = [0u8; 32];
+                                        match k3 {
+                                            0 => key.copy_from_slice(&fixed_bytes::<32>(d3)?),
+                                            1 => n = d3.u32()?,
+                                            2 => hk.copy_from_slice(&fixed_bytes::<32>(d3)?),
+                                            _ => return Ok(false),
+                                        }
+                                        send = Some(SendChainState {
+                                            chain: ChainState { key, n, hk },
+                                            pub_bytes: Vec::new(),
+                                            ct: Vec::new(),
+                                        });
+                                        Ok(true)
+                                    })?;
+                                }
+                                1 => send.as_mut().unwrap().pub_bytes = d2.bytes()?.to_vec(),
+                                2 => send.as_mut().unwrap().ct = d2.bytes()?.to_vec(),
+                                _ => return Ok(false),
+                            }
+                            Ok(true)
+                        })?;
+                    }
+                }
+                5 => next_send_hk.copy_from_slice(&fixed_bytes::<32>(d)?),
+                6 => prev_send_n = d.u32()?,
+                7 => {
+                    if d.is_null().map(|v| !v).unwrap_or(false) {
+                        read_map(d, |k2, d2| {
+                            let mut key = [0u8; 32];
+                            let mut n = 0;
+                            let mut hk = [0u8; 32];
+                            match k2 {
+                                0 => key.copy_from_slice(&fixed_bytes::<32>(d2)?),
+                                1 => n = d2.u32()?,
+                                2 => hk.copy_from_slice(&fixed_bytes::<32>(d2)?),
+                                _ => return Ok(false),
+                            }
+                            recv = Some(ChainState { key, n, hk });
+                            Ok(true)
+                        })?;
+                    }
+                }
+                8 => next_recv_hk.copy_from_slice(&fixed_bytes::<32>(d)?),
+                9 => {
+                    for _ in 0..d.array_len()? {
+                        let mut ratchet_pub = [0u8; 32];
+                        let mut n = 0;
+                        let mut key = [0u8; 32];
+                        d.array_len()?;
+                        ratchet_pub.copy_from_slice(d.bytes()?);
+                        n = d.u32()?;
+                        key.copy_from_slice(d.bytes()?);
+                        skipped.push(SkippedEntry { ratchet_pub, n, key });
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+
+        Ok(Self {
+            suite,
+            session_id,
+            root,
+            own,
+            send,
+            next_send_hk,
+            prev_send_n,
+            recv,
+            next_recv_hk,
+            skipped,
+        })
+    }
+}
+
+impl Ratchet {
+    /// Converts the ratchet to a persistable state.
+    pub fn to_state(&self) -> RatchetState {
+        let mut skipped = Vec::new();
+        for ((ratchet_pub, n), key) in &self.skipped {
+            skipped.push(SkippedEntry {
+                ratchet_pub: *ratchet_pub,
+                n: *n,
+                key: **key,
+            });
+        }
+
+        RatchetState {
+            suite: self.suite,
+            session_id: self.session_id,
+            root: *self.root,
+            own: self.own.to_bytes().to_vec(),
+            send: self.send.as_ref().map(|s| SendChainState {
+                chain: ChainState {
+                    key: *s.chain.key,
+                    n: s.chain.n,
+                    hk: *s.chain.hk,
+                },
+                pub_bytes: s.pub_bytes.clone(),
+                ct: s.ct.clone(),
+            }),
+            next_send_hk: *self.next_send_hk,
+            prev_send_n: self.prev_send_n,
+            recv: self.recv.as_ref().map(|r| ChainState {
+                key: *r.key,
+                n: r.n,
+                hk: *r.hk,
+            }),
+            next_recv_hk: *self.next_recv_hk,
+            skipped,
+        }
+    }
+
+    /// Restores the ratchet from a persisted state.
+    pub fn from_state(state: RatchetState, rng: RngSource) -> Result<Self> {
+        let own = HybridSecret::from_bytes(&state.own)
+            .map_err(|_| Error::Malformed("invalid own secret in ratchet state"))?;
+        
+        let send = state.send.map(|s| SendChain {
+            chain: Chain {
+                key: Zeroizing::new(s.chain.key),
+                n: s.chain.n,
+                hk: Zeroizing::new(s.chain.hk),
+            },
+            pub_bytes: s.pub_bytes,
+            ct: s.ct,
+        });
+        
+        let recv = state.recv.map(|r| Chain {
+            key: Zeroizing::new(r.key),
+            n: r.n,
+            hk: Zeroizing::new(r.hk),
+        });
+
+        let mut skipped = HashMap::new();
+        let mut skipped_order = VecDeque::new();
+        for s in state.skipped {
+            skipped.insert((s.ratchet_pub, s.n), Zeroizing::new(s.key));
+            skipped_order.push_back((s.ratchet_pub, s.n));
+        }
+
+        Ok(Self {
+            suite: state.suite,
+            session_id: state.session_id,
+            root: Zeroizing::new(state.root),
+            own,
+            send,
+            next_send_hk: Zeroizing::new(state.next_send_hk),
+            prev_send_n: state.prev_send_n,
+            recv,
+            next_recv_hk: Zeroizing::new(state.next_recv_hk),
+            skipped,
+            skipped_order,
+            rng,
+})
+    }
+}
+
 fn initial_header_keys(root: &[u8; 32]) -> (Key, Key) {
     let okm: Zeroizing<[u8; 64]> = Zeroizing::new(kdf::derive(label::HEADER_KEYS, &[root]));
     let mut a = Zeroizing::new([0u8; 32]);

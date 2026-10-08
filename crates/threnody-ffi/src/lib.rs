@@ -994,6 +994,30 @@ PersistentKeepalive = 25\n",
         self.node.apply_wireguard(&iface).map_err(fail)
     }
 
+    /// Starts the userspace WireGuard implementation (boringtun) for
+    /// platforms without kernel WireGuard support (Android, iOS, unprivileged).
+    /// Returns the local UDP port being listened on.
+    #[cfg(feature = "boringtun")]
+    pub fn wireguard_start_userspace(&self) -> Result<u16> {
+        let _guard = self.rt.enter();
+        self.node.start_wg_userspace().map_err(fail)
+    }
+
+    /// Stops the userspace WireGuard implementation.
+    #[cfg(feature = "boringtun")]
+    pub fn wireguard_stop_userspace(&self) {
+        let _guard = self.rt.enter();
+        self.node.stop_wg_userspace();
+    }
+
+    /// Sends a packet through the userspace WireGuard tunnel to a peer.
+    #[cfg(feature = "boringtun")]
+    pub fn wireguard_userspace_send(&self, peer: String, data: Vec<u8>) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node.wg_userspace_send(&p, &data).map_err(fail)
+    }
+
     /// We want to reach `peer` (its chat is open): look for it across the
     /// internet now.
     pub fn seek(&self, peer: String) -> Result<()> {

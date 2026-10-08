@@ -100,6 +100,21 @@ impl HybridSecret {
         &self.seed
     }
 
+    /// Returns the 32-byte seed for persistence.
+    pub fn to_bytes(&self) -> [u8; SEED_LEN] {
+        *self.seed
+    }
+
+    /// Reconstructs a HybridSecret from a 32-byte seed.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != SEED_LEN {
+            return Err(Error::Malformed("hybrid secret length"));
+        }
+        let mut seed = [0u8; SEED_LEN];
+        seed.copy_from_slice(bytes);
+        Ok(Self::from_seed(&seed))
+    }
+
     pub fn public(&self) -> &HybridPublic {
         &self.public
     }

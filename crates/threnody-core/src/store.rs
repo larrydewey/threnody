@@ -246,6 +246,57 @@ fn write_private(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Securely deletes a file by overwriting it with random data before removal.
+/// This is a best-effort implementation for spec §16 secure deletion.
+/// Note: On SSDs with wear leveling, this may not guarantee physical erasure.
+pub fn secure_delete(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    
+    // Get file size
+    let metadata = fs::metadata(path)?;
+    let size = metadata.len() as usize;
+    
+    if size == 0 {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+    
+    // Overwrite with random data (3 passes)
+    for _ in 0..3 {
+        let random_bytes: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(path)?;
+        f.write_all(&random_bytes)?;
+        f.sync_all()?;
+    }
+    
+    // Final pass with zeros
+    let zeros = vec![0u8; size];
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(path)?;
+        f.write_all(&zeros)?;
+        f.sync_all()?;
+    }
+    
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 /// A known peer. Identity is the key; everything else is local metadata.
 /// Previous discovery keys kept per contact (see [`Contact::discovery_older`]).
 pub const MAX_OLD_DISCOVERY_KEYS: usize = 2;
