@@ -34,11 +34,11 @@ for abi in "${abis[@]}"; do
     export "CARGO_TARGET_${var^^}_LINKER=$ndk/${triple}35-clang"
     export "CC_${var}=$ndk/${triple}35-clang"
     export "AR_${var}=$ndk/llvm-ar"
-    cargo build -q --release -p threnody-ffi --target "$triple"
+    cargo build -q --release -p threnody-ffi --target "$triple" --features boringtun
     mkdir -p "$here/app/src/main/jniLibs/$abi"
     cp "target/$triple/release/libthrenody_ffi.so" "$here/app/src/main/jniLibs/$abi/"
 done
-cargo build -q -p threnody-ffi
+cargo build -q -p threnody-ffi --features boringtun
 cargo run -q -p threnody-ffi --features bindgen --bin uniffi-bindgen -- generate \
     --library target/debug/libthrenody_ffi.so --language kotlin --no-format \
     --out-dir "$here/app/src/main/java"

@@ -26,7 +26,7 @@ zkryptium.workspace = true
 ml-dsa.workspace = true
 getrandom = "0.4"
 shake = "0.1"
-reqwest = { version = "0.12", features = ["rustls-tls", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 scraper = "0.20"
 
 [dev-dependencies]
