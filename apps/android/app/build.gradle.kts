@@ -9,11 +9,12 @@ android {
         applicationId = "org.threnody.app"
         minSdk = 29
         targetSdk = 36
-        // CI sets these from the tag. Local builds use the same scheme
-        // (major * 1000000 + minor * 1000 + patch), so a build from the
-        // laptop installs over a release instead of being refused as a
+        // CI sets these from the tag. Local builds take the workspace
+        // version from Cargo.toml (so the two never drift) and use the same
+        // scheme (major * 1000000 + minor * 1000 + patch), so a build from
+        // the laptop installs over a release instead of being refused as a
         // downgrade.
-        versionName = System.getenv("THRENODY_VERSION") ?: "0.5.2"
+        versionName = System.getenv("THRENODY_VERSION") ?: workspaceVersion()
         versionCode = System.getenv("THRENODY_VERSION_CODE")?.toInt()
             ?: versionName!!.substringBefore('-').split('.').map(String::toInt)
                 .let { (major, minor, patch) -> major * 1_000_000 + minor * 1_000 + patch }
@@ -60,4 +61,12 @@ dependencies {
     // AndroidX Core for AppCompatDelegate
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.core:core-ktx:1.13.1")
+}
+
+/** The `[workspace.package]` version in the repository's Cargo.toml. */
+fun workspaceVersion(): String {
+    val toml = rootDir.resolve("../../Cargo.toml").readText()
+    val section = toml.substringAfter("[workspace.package]").substringBefore("\n[")
+    return Regex("""(?m)^version = "([^"]+)"""").find(section)?.groupValues?.get(1)
+        ?: error("no workspace version in Cargo.toml")
 }
