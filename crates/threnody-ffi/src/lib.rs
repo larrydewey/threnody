@@ -1017,22 +1017,6 @@ PersistentKeepalive = 25\n",
         self.node.apply_wireguard(&iface).map_err(fail)
     }
 
-    /// Starts the userspace WireGuard implementation (boringtun) for
-    /// platforms without kernel WireGuard support (Android, iOS, unprivileged).
-    /// Returns the local UDP port being listened on.
-    #[cfg(feature = "boringtun")]
-    pub fn wireguard_start_userspace(&self) -> Result<u16> {
-        let _guard = self.rt.enter();
-        self.node.start_wg_userspace().map_err(fail)
-    }
-
-    /// Stops the userspace WireGuard implementation.
-    #[cfg(feature = "boringtun")]
-    pub fn wireguard_stop_userspace(&self) {
-        let _guard = self.rt.enter();
-        self.node.stop_wg_userspace();
-    }
-
     /// Exports all node state as an encrypted backup (identity, contacts,
     /// history, groups, prekeys, etc.). The backup is encrypted with a key
     /// derived from the identity seed.
@@ -1060,14 +1044,6 @@ PersistentKeepalive = 25\n",
             site_name: p.site_name,
             content_type: p.content_type,
         })
-    }
-
-    /// Sends a packet through the userspace WireGuard tunnel to a peer.
-    #[cfg(feature = "boringtun")]
-    pub fn wireguard_userspace_send(&self, peer: String, data: Vec<u8>) -> Result<()> {
-        let p = self.resolve(&peer)?;
-        let _guard = self.rt.enter();
-        self.node.wg_userspace_send(&p, &data).map_err(fail)
     }
 
     /// We want to reach `peer` (its chat is open): look for it across the
@@ -1648,6 +1624,34 @@ PersistentKeepalive = 25\n",
     /// Stops listening and closes every session.
     pub fn shutdown(&self) {
         self.node.shutdown();
+    }
+}
+
+/// Userspace WireGuard (boringtun), for platforms without kernel WireGuard
+/// support. Kept in its own block: `#[uniffi::export]` ignores `#[cfg]` on
+/// individual methods.
+#[cfg(feature = "boringtun")]
+#[uniffi::export]
+impl ThrenodyNode {
+    /// Starts the userspace WireGuard implementation (boringtun) for
+    /// platforms without kernel WireGuard support (Android, iOS, unprivileged).
+    /// Returns the local UDP port being listened on.
+    pub fn wireguard_start_userspace(&self) -> Result<u16> {
+        let _guard = self.rt.enter();
+        self.node.start_wg_userspace().map_err(fail)
+    }
+
+    /// Stops the userspace WireGuard implementation.
+    pub fn wireguard_stop_userspace(&self) {
+        let _guard = self.rt.enter();
+        self.node.stop_wg_userspace();
+    }
+
+    /// Sends a packet through the userspace WireGuard tunnel to a peer.
+    pub fn wireguard_userspace_send(&self, peer: String, data: Vec<u8>) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node.wg_userspace_send(&p, &data).map_err(fail)
     }
 }
 

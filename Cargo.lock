@@ -251,7 +251,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
 ]
 
@@ -646,8 +646,6 @@ dependencies = [
  "portable-atomic",
  "rand_core 0.6.4",
  "ring",
- "socket2 0.4.10",
- "thiserror 1.0.69",
  "tracing",
  "untrusted",
  "x25519-dalek 2.0.1",
@@ -724,7 +722,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1307,7 +1305,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -2505,7 +2503,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2",
  "tokio",
  "tower-service",
  "tracing",
@@ -3332,7 +3330,7 @@ dependencies = [
  "serde_bencode",
  "serde_bytes",
  "sha1_smol",
- "thiserror 2.0.21",
+ "thiserror",
  "tracing",
 ]
 
@@ -3600,7 +3598,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_bytes",
- "thiserror 2.0.21",
+ "thiserror",
  "tls_codec",
  "zeroize",
 ]
@@ -3655,7 +3653,7 @@ dependencies = [
  "openmls_traits",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -3681,7 +3679,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rand_core 0.6.4",
  "sha2 0.11.0",
- "thiserror 2.0.21",
+ "thiserror",
  "tls_codec",
 ]
 
@@ -3694,7 +3692,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -4232,8 +4230,8 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
- "thiserror 2.0.21",
+ "socket2",
+ "thiserror",
  "tokio",
  "tracing",
  "web-time",
@@ -4255,7 +4253,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.21",
+ "thiserror",
  "tinyvec",
  "tracing",
  "web-time",
@@ -4270,7 +4268,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4434,7 +4432,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "siphasher 1.0.4",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
  "toml",
  "url",
@@ -5071,16 +5069,6 @@ checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
 
 [[package]]
 name = "socket2"
-version = "0.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7916fc008ca5542385b89a3d3ce689953c143e9304a9bf8beec1de48994c0d"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -5322,31 +5310,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.21",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -5402,7 +5370,7 @@ dependencies = [
  "sha3 0.12.0",
  "shake",
  "tempfile",
- "thiserror 2.0.21",
+ "thiserror",
  "x25519-dalek 3.0.0",
  "zeroize",
  "zkryptium",
@@ -5428,7 +5396,7 @@ dependencies = [
  "qrcode",
  "rqrr",
  "tempfile",
- "thiserror 2.0.21",
+ "thiserror",
  "threnody-core",
  "threnody-groups",
  "threnody-net",
@@ -5444,7 +5412,7 @@ dependencies = [
  "openmls",
  "openmls_rust_crypto",
  "openmls_traits",
- "thiserror 2.0.21",
+ "thiserror",
  "threnody-core",
  "threnody-net",
  "tokio",
@@ -5466,9 +5434,9 @@ dependencies = [
  "rand_core 0.10.1",
  "rcgen",
  "rustls",
- "socket2 0.6.5",
+ "socket2",
  "tempfile",
- "thiserror 2.0.21",
+ "thiserror",
  "threnody-core",
  "tokio",
  "zeroize",
@@ -5554,7 +5522,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.5",
+ "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -6089,22 +6057,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6112,12 +6064,6 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-link"
@@ -6300,7 +6246,7 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
 ]
 
@@ -6529,7 +6475,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]

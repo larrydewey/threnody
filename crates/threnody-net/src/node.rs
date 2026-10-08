@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
@@ -842,7 +842,7 @@ impl Node {
             }
             Ok(())
         } else {
-            Err(crate::error::NetError::External(anyhow!(
+            Err(crate::error::NetError::External(anyhow::anyhow!(
                 "userspace WireGuard not started"
             )))
         }
