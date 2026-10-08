@@ -6,7 +6,6 @@ import android.text.InputType
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
-import java.util.concurrent.Executor
 import uniffi.threnody_ffi.ProfileAttr
 import uniffi.threnody_ffi.ThrenodyNode
 
@@ -19,8 +18,8 @@ object ProfileUi {
     private val SUGGESTED = listOf("name", "email", "phone", "about")
 
     /** Lists the profile's details; tap one to change or remove it, or add one. */
-    fun edit(a: Activity, node: ThrenodyNode, title: String, worker: Executor) {
-        worker.execute {
+    fun edit(a: Activity, node: ThrenodyNode, title: String) {
+        Threading.background {
             val attrs = node.profile()
             a.runOnUiThread {
                 // A message and a list can't share an AlertDialog: build both.
@@ -40,8 +39,8 @@ object ProfileUi {
                     background = a.ripple()
                     setOnClickListener { dialog.dismiss(); onClick() }
                 }, matchWrap)
-                for (attr in attrs) row("${attr.key}: ${attr.value}", R.color.text) { detail(a, node, title, worker, attr) }
-                row("+ Add a detail", R.color.accent) { detail(a, node, title, worker, null) }
+                for (attr in attrs) row("${attr.key}: ${attr.value}", R.color.text) { detail(a, node, title, attr) }
+                row("+ Add a detail", R.color.accent) { detail(a, node, title, null) }
                 dialog = SecureBuilder(a)
                     .setTitle(title)
                     .setView(android.widget.ScrollView(a).apply { addView(box) })
@@ -52,7 +51,7 @@ object ProfileUi {
     }
 
     /** Adds a detail ([current] null) or changes or removes one. */
-    private fun detail(a: Activity, node: ThrenodyNode, title: String, worker: Executor, current: ProfileAttr?) {
+    private fun detail(a: Activity, node: ThrenodyNode, title: String, current: ProfileAttr?) {
         val key = field(a, "What (name, email, …)", current?.key).apply { isEnabled = current == null }
         val value = field(a, "Value", current?.value)
         val box = LinearLayout(a).apply {
@@ -64,7 +63,7 @@ object ProfileUi {
             addView(key, matchWrap)
             addView(value, matchWrap)
         }
-        fun save(remove: Boolean) = worker.execute {
+        fun save(remove: Boolean) = Threading.background {
             val k = key.text.toString().trim().lowercase()
             val v = value.text.toString().trim()
             val attrs = node.profile().toMutableList()
@@ -76,7 +75,7 @@ object ProfileUi {
             val error = try { node.setProfile(attrs); null } catch (e: Exception) { e.message }
             a.runOnUiThread {
                 if (error != null) Toast.makeText(a, "Couldn't save: $error", Toast.LENGTH_LONG).show()
-                edit(a, node, title, worker)
+                edit(a, node, title)
             }
         }
         SecureBuilder(a)
@@ -89,8 +88,8 @@ object ProfileUi {
     }
 
     /** Chooses which profile details [peer] sees. */
-    fun share(a: Activity, node: ThrenodyNode, peer: String, name: String, worker: Executor, editTitle: String) {
-        worker.execute {
+    fun share(a: Activity, node: ThrenodyNode, peer: String, name: String, editTitle: String) {
+        Threading.background {
             val attrs = node.profile()
             val shared = try { node.sharedWith(peer).toSet() } catch (_: Exception) { emptySet() }
             a.runOnUiThread {
@@ -98,7 +97,7 @@ object ProfileUi {
                     SecureBuilder(a)
                         .setTitle("Your profile is empty")
                         .setMessage("Add details such as your name first; then choose which ones $name sees.")
-                        .setPositiveButton("Add details") { _, _ -> edit(a, node, editTitle, worker) }
+                        .setPositiveButton("Add details") { _, _ -> edit(a, node, editTitle) }
                         .setNegativeButton("Cancel", null)
                         .show()
                     return@runOnUiThread
@@ -111,7 +110,7 @@ object ProfileUi {
                     }
                     .setPositiveButton("Save") { _, _ ->
                         val keys = attrs.filterIndexed { i, _ -> checked[i] }.map { it.key }
-                        worker.execute {
+                        Threading.background {
                             val error = try { node.setSharedWith(peer, keys); null } catch (e: Exception) { e.message }
                             a.runOnUiThread {
                                 Toast.makeText(

@@ -1,22 +1,86 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="background">#FF121216</color>
-    <color name="bar">#FF121216</color>
-    <color name="surface">#FF1C1C22</color>
-    <color name="sheet">#FF1C1C22</color>
-    <color name="field">#FF2A2A32</color>
-    <color name="text">#FFE6E6EC</color>
-    <color name="muted">#FF9A9AA6</color>
-    <color name="divider">#FF2A2A32</color>
-    <color name="accent">#FF9EA2FF</color>
-    <color name="on_accent">#FF16163A</color>
-    <color name="bubble_in">#FF26262E</color>
-    <color name="bubble_out">#FF3A3E9E</color>
-    <color name="on_bubble_out">#FFFFFFFF</color>
+    <!-- Material 3 Color Roles - Dark Theme -->
+    <!-- Primary -->
+    <color name="md_sys_color_primary">#FFCFCFFF</color>
+    <color name="md_sys_color_on_primary">#FF00005E</color>
+    <color name="md_sys_color_primary_container">#FF333681</color>
+    <color name="md_sys_color_on_primary_container">#FFE8E8FF</color>
+
+    <!-- Secondary -->
+    <color name="md_sys_color_secondary">#FFCCCCE8</color>
+    <color name="md_sys_color_on_secondary">#FF2D2F4D</color>
+    <color name="md_sys_color_secondary_container">#FF434666</color>
+    <color name="md_sys_color_on_secondary_container">#FFE0E0FF</color>
+
+    <!-- Tertiary -->
+    <color name="md_sys_color_tertiary">#FFECCCEE</color>
+    <color name="md_sys_color_on_tertiary">#FF48264B</color>
+    <color name="md_sys_color_tertiary_container">#FF5F3D63</color>
+    <color name="md_sys_color_on_tertiary_container">#FFFFD9F9</color>
+
+    <!-- Error -->
+    <color name="md_sys_color_error">#FFFFB4AB</color>
+    <color name="md_sys_color_on_error">#FF690005</color>
+    <color name="md_sys_color_error_container">#FF93000A</color>
+    <color name="md_sys_color_on_error_container">#FFFFDAD6</color>
+
+    <!-- Surface -->
+    <color name="md_sys_color_surface">#FF1B1B1F</color>
+    <color name="md_sys_color_on_surface">#FFE4E2E6</color>
+    <color name="md_sys_color_surface_dim">#FF1B1B1F</color>
+    <color name="md_sys_color_surface_bright">#FF424147</color>
+    <color name="md_sys_color_surface_container_low">#FF25252B</color>
+    <color name="md_sys_color_surface_container">#FF2D2D33</color>
+    <color name="md_sys_color_surface_container_high">#FF38383E</color>
+    <color name="md_sys_color_surface_container_highest">#FF434349</color>
+
+    <!-- Outline -->
+    <color name="md_sys_color_outline">#FF8F8F9A</color>
+    <color name="md_sys_color_outline_variant">#FF44444F</color>
+
+    <!-- Inverse -->
+    <color name="md_sys_color_inverse_surface">#FFE4E2E6</color>
+    <color name="md_sys_color_inverse_on_surface">#FF303036</color>
+    <color name="md_sys_color_inverse_primary">#FF4A4FC4</color>
+
+    <!-- Shadow / Scrim -->
+    <color name="md_sys_color_shadow">#FF000000</color>
+    <color name="md_sys_color_scrim">#FF000000</color>
+
+    <!-- Custom Threnody colors mapped to M3 roles -->
+    <color name="background">@color/md_sys_color_surface</color>
+    <color name="surface">@color/md_sys_color_surface</color>
+    <color name="surface_variant">@color/md_sys_color_surface_container_high</color>
+    <color name="surface_container">@color/md_sys_color_surface_container</color>
+    <color name="surface_container_low">@color/md_sys_color_surface_container_low</color>
+    <color name="bar">@color/md_sys_color_surface</color>
+    <color name="sheet">@color/md_sys_color_surface_container_low</color>
+    <color name="field">@color/md_sys_color_surface_container_highest</color>
+    <color name="text">@color/md_sys_color_on_surface</color>
+    <color name="text_secondary">@color/md_sys_color_outline</color>
+    <color name="muted">@color/md_sys_color_outline</color>
+    <color name="divider">@color/md_sys_color_outline_variant</color>
+    <color name="accent">@color/md_sys_color_primary</color>
+    <color name="on_accent">@color/md_sys_color_on_primary</color>
+
+    <!-- Chat bubbles -->
+    <color name="bubble_in">@color/md_sys_color_surface_container_high</color>
+    <color name="bubble_out">@color/md_sys_color_primary</color>
+    <color name="on_bubble_out">@color/md_sys_color_on_primary</color>
+
+    <!-- Status -->
     <color name="online">#FF5BCB86</color>
-    <color name="warning">#FFE89A5E</color>
-    <!-- Darker than the bubble around it, with a faint edge: no glare. -->
+    <color name="warning">@color/md_sys_color_error</color>
+
+    <!-- Sensitive photo cover -->
     <color name="cover">#FF0E0E12</color>
     <color name="cover_edge">#FF34343E</color>
-    <color name="on_cover">#FF8D8D99</color>
+    <color name="on_cover">@color/md_sys_color_on_surface</color>
+
+    <!-- Legacy compat -->
+    <color name="primary">@color/md_sys_color_primary</color>
+    <color name="on_primary">@color/md_sys_color_on_primary</color>
+    <color name="primary_container">@color/md_sys_color_primary_container</color>
+    <color name="on_primary_container">@color/md_sys_color_on_primary_container</color>
 </resources>

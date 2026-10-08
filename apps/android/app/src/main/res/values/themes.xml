@@ -1,27 +1,220 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- DeviceDefault: the phone's own look for dialogs, menus and controls. -->
-    <style name="Theme.Threnody" parent="android:Theme.DeviceDefault.Light.NoActionBar">
-        <item name="android:colorAccent">@color/accent</item>
-        <item name="android:colorPrimary">@color/accent</item>
-        <item name="android:windowBackground">@color/background</item>
-        <item name="android:statusBarColor">@color/bar</item>
-        <item name="android:navigationBarColor">@color/background</item>
+    <!-- Material 3 Theme - Light (using MaterialComponents as base for API 29+) -->
+    <style name="Theme.Threnody" parent="Theme.MaterialComponents.Light.NoActionBar">
+        <!-- Material 3 Color Roles -->
+        <item name="colorPrimary">@color/md_sys_color_primary</item>
+        <item name="colorOnPrimary">@color/md_sys_color_on_primary</item>
+        <item name="colorPrimaryContainer">@color/md_sys_color_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/md_sys_color_on_primary_container</item>
+
+        <item name="colorSecondary">@color/md_sys_color_secondary</item>
+        <item name="colorOnSecondary">@color/md_sys_color_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/md_sys_color_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/md_sys_color_on_secondary_container</item>
+
+        <item name="colorTertiary">@color/md_sys_color_tertiary</item>
+        <item name="colorOnTertiary">@color/md_sys_color_on_tertiary</item>
+        <item name="colorTertiaryContainer">@color/md_sys_color_tertiary_container</item>
+        <item name="colorOnTertiaryContainer">@color/md_sys_color_on_tertiary_container</item>
+
+        <item name="colorError">@color/md_sys_color_error</item>
+        <item name="colorOnError">@color/md_sys_color_on_error</item>
+        <item name="colorErrorContainer">@color/md_sys_color_error_container</item>
+        <item name="colorOnErrorContainer">@color/md_sys_color_on_error_container</item>
+
+        <item name="colorSurface">@color/md_sys_color_surface</item>
+        <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
+        <item name="colorSurfaceVariant">@color/md_sys_color_surface_container_high</item>
+        <item name="colorOnSurfaceVariant">@color/md_sys_color_outline</item>
+
+        <item name="colorOutline">@color/md_sys_color_outline</item>
+        <item name="colorOutlineVariant">@color/md_sys_color_outline_variant</item>
+
+        <item name="android:windowBackground">@color/md_sys_color_surface</item>
+
+        <!-- Status & Navigation bars - transparent for edge-to-edge -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
+
+        <!-- Edge-to-edge -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+
+        <!-- Component styles -->
         <item name="android:editTextStyle">@style/Threnody.EditText</item>
-        <item name="android:alertDialogTheme">@style/Threnody.Dialog</item>
+        <item name="materialButtonStyle">@style/Threnody.Button</item>
+        <item name="textInputStyle">@style/Threnody.TextInputLayout</item>
+        <item name="chipStyle">@style/Threnody.Chip</item>
+        <item name="bottomSheetDialogTheme">@style/Threnody.BottomSheetDialog</item>
+
+        <!-- Shape appearances -->
+        <item name="shapeAppearanceSmallComponent">@style/Threnody.ShapeAppearance.SmallComponent</item>
+        <item name="shapeAppearanceMediumComponent">@style/Threnody.ShapeAppearance.MediumComponent</item>
+        <item name="shapeAppearanceLargeComponent">@style/Threnody.ShapeAppearance.LargeComponent</item>
+
+        <!-- Ripple -->
+        <item name="colorControlHighlight">@color/md_sys_color_primary_container</item>
+
+        <!-- Motion -->
+        <item name="android:windowActivityTransitions">true</item>
     </style>
 
-    <style name="Threnody.Dialog" parent="android:Theme.DeviceDefault.Light.Dialog.Alert">
-        <item name="android:colorAccent">@color/accent</item>
-        <item name="android:colorPrimary">@color/accent</item>
+    <!-- Dialog theme -->
+    <style name="Threnody.Dialog" parent="Theme.MaterialComponents.Light.Dialog.Alert">
+        <item name="colorPrimary">@color/md_sys_color_primary</item>
+        <item name="colorOnPrimary">@color/md_sys_color_on_primary</item>
+        <item name="colorSurface">@color/md_sys_color_surface</item>
+        <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
         <item name="android:editTextStyle">@style/Threnody.EditText</item>
     </style>
 
-    <style name="Threnody.EditText" parent="android:Widget.DeviceDefault.Light.EditText">
+    <!-- Bottom sheet dialog theme -->
+    <style name="Threnody.BottomSheetDialog" parent="Theme.MaterialComponents.Light.BottomSheetDialog">
+        <item name="colorPrimary">@color/md_sys_color_primary</item>
+        <item name="colorSurface">@color/md_sys_color_surface</item>
+        <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+
+    <!-- Button -->
+    <style name="Threnody.Button" parent="Widget.MaterialComponents.Button">
+        <item name="cornerRadius">24dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+        <item name="android:paddingHorizontal">24dp</item>
+    </style>
+
+    <!-- TextInputLayout -->
+    <style name="Threnody.TextInputLayout" parent="Widget.MaterialComponents.TextInputLayout.FilledBox">
+        <item name="boxBackgroundColor">@color/md_sys_color_surface_container_highest</item>
+        <item name="boxStrokeColor">@color/md_sys_color_outline_variant</item>
+        <item name="boxStrokeWidth">1dp</item>
+        <item name="boxStrokeWidthFocused">2dp</item>
+        <item name="hintTextColor">@color/md_sys_color_outline</item>
+        <item name="android:textColorHint">@color/md_sys_color_outline</item>
+    </style>
+
+    <!-- Chip -->
+    <style name="Threnody.Chip" parent="Widget.MaterialComponents.Chip.Action">
+        <item name="chipBackgroundColor">@color/md_sys_color_surface_container_high</item>
+        <item name="android:textColor">@color/md_sys_color_on_surface</item>
+        <item name="chipMinHeight">36dp</item>
+        <item name="shapeAppearance">@style/Threnody.ShapeAppearance.SmallComponent</item>
+    </style>
+
+    <!-- EditText -->
+    <style name="Threnody.EditText" parent="Widget.MaterialComponents.TextInputEditText.FilledBox">
         <item name="android:background">@drawable/field</item>
-        <item name="android:textColor">@color/text</item>
-        <item name="android:textColorHint">@color/muted</item>
+        <item name="android:textColor">@color/md_sys_color_on_surface</item>
+        <item name="android:textColorHint">@color/md_sys_color_outline</item>
+        <item name="android:textAppearance">@style/Threnody.TextAppearance.BodyLarge</item>
+        <item name="android:minHeight">48dp</item>
+    </style>
+
+    <!-- Text Appearances - Material 3 Type Scale -->
+    <style name="Threnody.TextAppearance.HeadlineLarge" parent="TextAppearance.MaterialComponents.Headline5">
+        <item name="android:textSize">32sp</item>
+        <item name="android:fontWeight">700</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="android:lineHeight">40sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.HeadlineMedium" parent="TextAppearance.MaterialComponents.Headline6">
+        <item name="android:textSize">28sp</item>
+        <item name="android:fontWeight">600</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="android:lineHeight">36sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.HeadlineSmall" parent="TextAppearance.MaterialComponents.Subtitle1">
+        <item name="android:textSize">24sp</item>
+        <item name="android:fontWeight">600</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="android:lineHeight">32sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.TitleLarge" parent="TextAppearance.MaterialComponents.Subtitle1">
+        <item name="android:textSize">22sp</item>
+        <item name="android:fontWeight">600</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="android:lineHeight">28sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.TitleMedium" parent="TextAppearance.MaterialComponents.Subtitle1">
+        <item name="android:textSize">16sp</item>
+        <item name="android:fontWeight">500</item>
+        <item name="android:letterSpacing">0.015</item>
+        <item name="android:lineHeight">24sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.TitleSmall" parent="TextAppearance.MaterialComponents.Body1">
+        <item name="android:textSize">14sp</item>
+        <item name="android:fontWeight">500</item>
+        <item name="android:letterSpacing">0.01</item>
+        <item name="android:lineHeight">20sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.BodyLarge" parent="TextAppearance.MaterialComponents.Body1">
+        <item name="android:textSize">16sp</item>
+        <item name="android:fontWeight">400</item>
+        <item name="android:letterSpacing">0.01</item>
+        <item name="android:lineHeight">24sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.BodyMedium" parent="TextAppearance.MaterialComponents.Body2">
+        <item name="android:textSize">14sp</item>
+        <item name="android:fontWeight">400</item>
+        <item name="android:letterSpacing">0.01</item>
+        <item name="android:lineHeight">20sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.BodySmall" parent="TextAppearance.MaterialComponents.Caption">
+        <item name="android:textSize">12sp</item>
+        <item name="android:fontWeight">400</item>
+        <item name="android:letterSpacing">0.02</item>
+        <item name="android:lineHeight">16sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.LabelLarge" parent="TextAppearance.MaterialComponents.Button">
+        <item name="android:textSize">14sp</item>
+        <item name="android:fontWeight">500</item>
+        <item name="android:letterSpacing">0.01</item>
+        <item name="android:lineHeight">20sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.LabelMedium" parent="TextAppearance.MaterialComponents.Caption">
+        <item name="android:textSize">12sp</item>
+        <item name="android:fontWeight">500</item>
+        <item name="android:letterSpacing">0.05</item>
+        <item name="android:lineHeight">16sp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.LabelSmall" parent="TextAppearance.MaterialComponents.Caption">
+        <item name="android:textSize">11sp</item>
+        <item name="android:fontWeight">500</item>
+        <item name="android:letterSpacing">0.05</item>
+        <item name="android:lineHeight">16sp</item>
+    </style>
+
+    <!-- Shape Appearances -->
+    <style name="Threnody.ShapeAppearance.SmallComponent" parent="ShapeAppearance.MaterialComponents.SmallComponent">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">12dp</item>
+    </style>
+
+    <style name="Threnody.ShapeAppearance.MediumComponent" parent="ShapeAppearance.MaterialComponents.MediumComponent">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">16dp</item>
+    </style>
+
+    <style name="Threnody.ShapeAppearance.LargeComponent" parent="ShapeAppearance.MaterialComponents.LargeComponent">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">28dp</item>
     </style>
 </resources>

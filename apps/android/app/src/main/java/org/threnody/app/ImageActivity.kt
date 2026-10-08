@@ -21,7 +21,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import java.util.concurrent.Executors
+import java.io.File
 
 /**
  * Shows one photo full screen, inside the app (so a sensitive one isn't
@@ -29,9 +29,10 @@ import java.util.concurrent.Executors
  * to Downloads is an explicit choice.
  */
 class ImageActivity : Activity() {
-    private val worker = Executors.newSingleThreadExecutor()
     private lateinit var image: ImageView
     private val matrix = Matrix()
+
+    private val editLauncher = ActivityResultRegistry.get(this)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,12 +49,32 @@ class ImageActivity : Activity() {
             title.text = name
             // An edited GIF would be a still photo: GIFs aren't edited.
             if (!Media.isGif(name)) action(R.drawable.ic_edit, "Edit: draw or add text") {
-                startActivityForResult(
+                editLauncher.launch(
                     Intent(this@ImageActivity, AnnotateActivity::class.java)
                         .putExtra(AnnotateActivity.LOCATION, location)
-                        .putExtra(AnnotateActivity.NAME, name),
-                    EDIT,
-                )
+                        .putExtra(AnnotateActivity.NAME, name)
+                ) { resultCode, data ->
+                    val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
+                    if (resultCode != RESULT_OK || path == null) return@launch
+                    val name = intent.getStringExtra(NAME) ?: "photo"
+                    val edited = name.substringAfterLast('/').substringBeforeLast('.') + "-edited.jpg"
+                    val f = java.io.File(path)
+                    val saveIt = { save(android.net.Uri.fromFile(f).toString(), edited, f) }
+                    // Opened from a chat: the edited copy can go straight back there.
+                    if (callingActivity == null) return@launch saveIt()
+                    SecureBuilder(this@ImageActivity)
+                        .setTitle("Edited photo")
+                        .setItems(arrayOf("Send in this chat", "Save to Downloads")) { _, which ->
+                            if (which == 0) {
+                                setResult(RESULT_OK, Intent().putExtra(AnnotateActivity.RESULT_PATH, path).putExtra(NAME, name))
+                                finish()
+                            } else {
+                                saveIt()
+                            }
+                        }
+                        .setNegativeButton("Discard") { _, _ -> f.delete() }
+                        .show()
+                }
             }
             action(R.drawable.ic_more, "Photo options") { anchor ->
                 android.widget.PopupMenu(this@ImageActivity, anchor).apply {
@@ -97,7 +118,7 @@ class ImageActivity : Activity() {
     }
 
     private fun still(location: String, side: Int) {
-        worker.execute {
+        Threading.background {
             val b = Media.decode(Media.source(this, location), side)
             runOnUiThread {
                 if (b == null) {
@@ -157,34 +178,15 @@ class ImageActivity : Activity() {
         }
     }
 
-    @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
-        if (requestCode != EDIT || resultCode != RESULT_OK || path == null) return
-        val name = intent.getStringExtra(NAME) ?: "photo"
-        val edited = name.substringAfterLast('/').substringBeforeLast('.') + "-edited.jpg"
-        val f = java.io.File(path)
-        val saveIt = { save(android.net.Uri.fromFile(f).toString(), edited, f) }
-        // Opened from a chat: the edited copy can go straight back there.
-        if (callingActivity == null) return saveIt()
-        SecureBuilder(this)
-            .setTitle("Edited photo")
-            .setItems(arrayOf("Send in this chat", "Save to Downloads")) { _, which ->
-                if (which == 0) {
-                    setResult(RESULT_OK, Intent().putExtra(AnnotateActivity.RESULT_PATH, path).putExtra(NAME, name))
-                    finish()
-                } else {
-                    saveIt()
-                }
-            }
-            .setNegativeButton("Discard") { _, _ -> f.delete() }
-            .show()
+        if (!ActivityResultRegistry.dispatch(this, requestCode, resultCode, data)) {
+            super.onActivityResult(requestCode, resultCode, data)
+        }
     }
 
     /** Copies the image at `location` to Downloads; deletes `then` afterwards. */
     private fun save(location: String, name: String, then: java.io.File? = null) {
-        worker.execute {
+        Threading.background {
             val ok = try {
                 val uri = android.net.Uri.parse(location)
                 val bytes = (if (uri.scheme == "file") java.io.File(uri.path ?: "").readBytes()
@@ -209,7 +211,6 @@ class ImageActivity : Activity() {
     }
 
     override fun onDestroy() {
-        worker.shutdownNow()
         super.onDestroy()
     }
 
@@ -217,6 +218,5 @@ class ImageActivity : Activity() {
         const val LOCATION = "location"
         const val NAME = "name"
         const val CAPTION = "caption"
-        private const val EDIT = 1
     }
 }

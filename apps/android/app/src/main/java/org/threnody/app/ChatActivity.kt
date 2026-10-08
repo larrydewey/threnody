@@ -30,7 +30,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Date
-import java.util.concurrent.Executors
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupInfo
 import uniffi.threnody_ffi.HistoryEntry
@@ -42,7 +41,6 @@ import uniffi.threnody_ffi.ThrenodyNode
  * ([GROUP]): its messages, a compose bar, and the conversation's settings.
  */
 class ChatActivity : Activity() {
-    private val worker = Executors.newSingleThreadExecutor()
     private lateinit var node: ThrenodyNode
     /** The group id, for a group conversation. */
     private var group: String? = null
@@ -72,6 +70,9 @@ class ChatActivity : Activity() {
     private val pending = mutableListOf<String>()
     private var unsubscribe: (() -> Unit)? = null
     private var myDevice = ""
+    private val pickFileLauncher = ActivityResultRegistry.get(this)
+    private val viewPhotoLauncher = ActivityResultRegistry.get(this)
+    private val annotateLauncher = ActivityResultRegistry.get(this)
     /** Incoming message ids already reported read. */
     private val sentRead = mutableSetOf<ULong>()
     /** On screen (between onStart and onStop): only then are messages read. */
@@ -135,7 +136,7 @@ class ChatActivity : Activity() {
         // Keep the newest message in view when the keyboard opens.
         scroll.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, ob -> if (b < ob) toBottom() }
 
-        worker.execute {
+        Threading.background {
             node = try {
                 Threnody.node(this, persona)
             } catch (e: Exception) {
@@ -143,11 +144,13 @@ class ChatActivity : Activity() {
                     Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
                     finish()
                 }
-                return@execute
+                return@background
             }
             refresh()
             // Not connected: look for them across the internet now.
-            if (group == null) try { node.seek(device) } catch (_: Exception) {}
+            if (group == null) try { node.seek(device) } catch (e: Exception) {
+                Threnody.say("! seek: ${e.message}")
+            }
         }
     }
 
@@ -177,7 +180,8 @@ class ChatActivity : Activity() {
             contentDescription = label
             tooltipText = label
             background = ripple(borderless = true)
-            setOnClickListener { onClick(it) }
+            layoutParams = LinearLayout.LayoutParams(dp(Design.touchTargetMin), dp(Design.touchTargetMin))
+            setOnClickListener { v -> Design.mediumHaptic(v); onClick(v) }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -213,7 +217,7 @@ class ChatActivity : Activity() {
         typingSent = active
         typingSentAt = now
         val d = device
-        worker.execute { try { node.setTyping(d, active) } catch (_: Exception) {} }
+        Threading.background { try { node.setTyping(d, active) } catch (e: Exception) { Threnody.say("! setTyping: ${e.message}") } }
     }
 
     /** Shows or hides "…" for the contact typing. */
@@ -252,9 +256,9 @@ class ChatActivity : Activity() {
                 }
                 else -> {}
             }
-            worker.execute { refresh() }
+            Threading.background { refresh() }
         }
-        if (::node.isInitialized) worker.execute { refresh() }
+        if (::node.isInitialized) Threading.background { refresh() }
     }
 
     override fun onStop() {
@@ -351,12 +355,12 @@ class ChatActivity : Activity() {
             if (g != null) groupHeader(gi) else header(c)
             for (o in offers) banner(
                 "${c?.title ?: "They"} offers you a credential (${o.schema}).",
-                "Review" to { CredentialUi.answerOffer(this, node, worker, o) { worker.execute { refresh() } } },
+                "Review" to { CredentialUi.answerOffer(this, node, o) { Threading.background { refresh() } } },
             )
             for (q in asks) banner(
                 "${c?.title ?: "They"} asks you to prove " +
                     (if (q.keys.isEmpty()) "you hold a credential (${q.schema})." else "${q.keys.joinToString(", ")} (${q.schema})."),
-                "Review" to { CredentialUi.answerAsk(this, node, worker, q) { worker.execute { refresh() } } },
+                "Review" to { CredentialUi.answerAsk(this, node, q) { Threading.background { refresh() } } },
             )
             show(items, names)
             // Incoming messages now on screen are read (1:1 chats only).
@@ -364,12 +368,14 @@ class ChatActivity : Activity() {
                 val ids = synchronized(sentRead) {
                     items.filter { !it.entry.outgoing && it.entry.id != 0uL && it.entry.id !in sentRead }.map { it.entry.id }
                 }
-                if (ids.isNotEmpty()) worker.execute {
+                if (ids.isNotEmpty()) Threading.background {
                     // Without a session now, they're reported on a later refresh.
                     try {
                         node.reportRead(device, ids)
                         synchronized(sentRead) { sentRead.addAll(ids) }
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        Threnody.say("! reportRead: ${e.message}")
+                    }
                 }
             }
         }
@@ -553,10 +559,15 @@ class ChatActivity : Activity() {
         val open = View.OnClickListener {
             if (location == null) return@OnClickListener
             // For a result: a photo edited there comes back here to send.
-            startActivityForResult(Intent(this, ImageActivity::class.java)
-                .putExtra(ImageActivity.LOCATION, location)
-                .putExtra(ImageActivity.NAME, f.name)
-                .putExtra(ImageActivity.CAPTION, e.text), VIEW_PHOTO)
+            viewPhotoLauncher.launch(
+                Intent(this, ImageActivity::class.java)
+                    .putExtra(ImageActivity.LOCATION, location)
+                    .putExtra(ImageActivity.NAME, f.name)
+                    .putExtra(ImageActivity.CAPTION, e.text)
+            ) { resultCode, data ->
+                val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
+                if (resultCode == RESULT_OK && path != null) sendEdited(path, data.getStringExtra(ImageActivity.NAME) ?: "photo.jpg")
+            }
         }
         if (f.sensitive || location == null) {
             return label(if (location == null) "📷\nnot available" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
@@ -724,7 +735,7 @@ class ChatActivity : Activity() {
             }
             if (option == "Select text") return selectText(e.text)
             val everyone = option == "Delete for everyone"
-            worker.execute {
+            Threading.background {
                 run("delete") {
                     when {
                         g != null -> entries.forEach { node.deleteGroupEntry(g, it.atMs, it.device) }
@@ -766,7 +777,7 @@ class ChatActivity : Activity() {
     /** Adds or takes away our reaction (several per message are fine). */
     private fun react(e: HistoryEntry, emoji: String, add: Boolean) {
         val g = group
-        worker.execute {
+        Threading.background {
             run("react") {
                 val ok = if (g != null) node.reactInGroup(g, e.id, emoji, add) else node.react(device, e.id, emoji, add)
                 if (!ok) throw IllegalStateException("that message is gone")
@@ -810,7 +821,7 @@ class ChatActivity : Activity() {
             .setPositiveButton("Save") { _, _ ->
                 val body = field.text.toString().trim()
                 if (body.isEmpty() || body == e.text) return@setPositiveButton
-                worker.execute { run("edit") { node.editMessage(device, e.id, body) } }
+                Threading.background { run("edit") { node.editMessage(device, e.id, body) } }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -825,8 +836,8 @@ class ChatActivity : Activity() {
         compose.setText("") // also says we stopped typing
         Threnody.touch()
         synchronized(pending) { pending.add(text) }
-        worker.execute { refresh() }
-        worker.execute {
+        Threading.background { refresh() }
+        Threading.background {
             val g = group
             val error = try {
                 if (g != null) {
@@ -871,7 +882,42 @@ class ChatActivity : Activity() {
                 .setType(if (gifs) "image/gif" else if (photos) "image/*" else "*/*")
                 .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
-        startActivityForResult(intent, PICK_FILE)
+        pickFileLauncher.launch(intent) { resultCode, data ->
+            if (resultCode != RESULT_OK || data == null) return@launch
+            val clip = data.clipData
+            val uris = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri } else listOfNotNull(data.data)
+            if (uris.isEmpty()) return@launch
+            Threading.background {
+                try {
+                    val max = node.maxFileSize().toLong()
+                    val picked = uris.take(MAX_PICK).map { uri ->
+                        // Keep access so a sent file can be opened from the chat later.
+                        try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {
+                            Threnody.say("! persist uri permission: ${e.message}")
+                        }
+                        val (shown, size) = contentResolver.query(uri, null, null, null, null)?.use { c ->
+                            c.moveToFirst()
+                            c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) to
+                                c.getLong(c.getColumnIndexOrThrow(OpenableColumns.SIZE))
+                        } ?: ("file" to -1L)
+                        // A GIF must be named one to be shown animated.
+                        val gif = contentResolver.getType(uri) == "image/gif" && !Media.isGif(shown)
+                        val name = if (gif) shown.substringBeforeLast('.') + ".gif" else shown
+                        if (size > max * 2) throw IllegalArgumentException("$name is too large")
+                        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                            ?: throw IllegalArgumentException("couldn't read $name")
+                        val (n, d) = Media.prepare(this, name, bytes)
+                        if (d.size > max) {
+                            throw IllegalArgumentException("$n is larger than " + Formatter.formatShortFileSize(this, max))
+                        }
+                        Picked(n, d, uri)
+                    }
+                    runOnUiThread { sendSheet(picked) }
+                } catch (e: Exception) {
+                    runOnUiThread { Toast.makeText(this@ChatActivity, "Couldn't send: ${e.message}", Toast.LENGTH_LONG).show() }
+                }
+            }
+        }
     }
 
     /**
@@ -879,7 +925,7 @@ class ChatActivity : Activity() {
      * picked photo.
      */
     private fun received(uri: Uri, mime: String, release: () -> Unit) {
-        worker.execute {
+        Threading.background {
             val picked = try {
                 val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     ?: throw IllegalArgumentException("unreadable")
@@ -956,46 +1002,9 @@ class ChatActivity : Activity() {
     /** A picked file, read and ready to send. */
     private class Picked(val name: String, val data: ByteArray, val uri: Uri)
 
-    @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == ANNOTATE) return annotated(if (resultCode == RESULT_OK) data else null)
-        if (requestCode == VIEW_PHOTO) {
-            val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
-            if (resultCode == RESULT_OK && path != null) sendEdited(path, data.getStringExtra(ImageActivity.NAME) ?: "photo.jpg")
-            return
-        }
-        if (requestCode != PICK_FILE || resultCode != RESULT_OK || data == null) return
-        val clip = data.clipData
-        val uris = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri } else listOfNotNull(data.data)
-        if (uris.isEmpty()) return
-        worker.execute {
-            try {
-                val max = node.maxFileSize().toLong()
-                val picked = uris.take(MAX_PICK).map { uri ->
-                    // Keep access so a sent file can be opened from the chat later.
-                    try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
-                    val (shown, size) = contentResolver.query(uri, null, null, null, null)?.use { c ->
-                        c.moveToFirst()
-                        c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) to
-                            c.getLong(c.getColumnIndexOrThrow(OpenableColumns.SIZE))
-                    } ?: ("file" to -1L)
-                    // A GIF must be named one to be shown animated.
-                    val gif = contentResolver.getType(uri) == "image/gif" && !Media.isGif(shown)
-                    val name = if (gif) shown.substringBeforeLast('.') + ".gif" else shown
-                    if (size > max * 2) throw IllegalArgumentException("$name is too large")
-                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: throw IllegalArgumentException("couldn't read $name")
-                    val (n, d) = Media.prepare(this, name, bytes)
-                    if (d.size > max) {
-                        throw IllegalArgumentException("$n is larger than " + Formatter.formatShortFileSize(this, max))
-                    }
-                    Picked(n, d, uri)
-                }
-                runOnUiThread { sendSheet(picked) }
-            } catch (e: Exception) {
-                runOnUiThread { Toast.makeText(this, "Couldn't send: ${e.message}", Toast.LENGTH_LONG).show() }
-            }
+        if (!ActivityResultRegistry.dispatch(this, requestCode, resultCode, data)) {
+            super.onActivityResult(requestCode, resultCode, data)
         }
     }
 
@@ -1024,7 +1033,7 @@ class ChatActivity : Activity() {
                         background = rounded(color(R.color.surface), dp(8).toFloat())
                         clipToOutline = true
                         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                        worker.execute {
+                        Threading.background {
                             val b = Media.decode(android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)), dp(200))
                             runOnUiThread { setImageBitmap(b) }
                         }
@@ -1101,26 +1110,27 @@ class ChatActivity : Activity() {
     private fun annotate(picked: List<Picked>, i: Int) {
         val s = sheet ?: return
         val p = picked[i]
-        worker.execute {
+        Threading.background {
             val f = java.io.File(java.io.File(cacheDir, AnnotateActivity.DIR).apply { mkdirs() }, "source-$i")
-            try { f.writeBytes(p.data) } catch (_: Exception) { return@execute }
+            try { f.writeBytes(p.data) } catch (_: Exception) { return@background }
             runOnUiThread {
                 s.annotating = true
                 s.dialog.dismiss()
-                startActivityForResult(
+                annotateLauncher.launch(
                     Intent(this, AnnotateActivity::class.java)
                         .putExtra(AnnotateActivity.LOCATION, Uri.fromFile(f).toString())
                         .putExtra(AnnotateActivity.NAME, p.name)
-                        .putExtra(AnnotateActivity.INDEX, i),
-                    ANNOTATE,
-                )
+                        .putExtra(AnnotateActivity.INDEX, i)
+                ) { resultCode, data ->
+                    annotated(if (resultCode == RESULT_OK) data else null)
+                }
             }
         }
     }
 
     /** A photo edited from the viewer: ready to send, in the send sheet. */
     private fun sendEdited(path: String, name: String) {
-        worker.execute {
+        Threading.background {
             val f = java.io.File(path)
             val bytes = try { f.readBytes() } catch (_: Exception) { null }
             java.io.File(cacheDir, AnnotateActivity.DIR).deleteRecursively()
@@ -1137,7 +1147,7 @@ class ChatActivity : Activity() {
         val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
         compose.setText(s.caption.text)
         val sensitive = s.sensitive.isChecked
-        worker.execute {
+        Threading.background {
             val bytes = if (path == null || i !in s.picked.indices) null
                 else try { java.io.File(path).readBytes() } catch (_: Exception) { null }
             java.io.File(cacheDir, AnnotateActivity.DIR).deleteRecursively()
@@ -1154,7 +1164,7 @@ class ChatActivity : Activity() {
 
     private fun sendFiles(picked: List<Picked>, caption: String, sensitive: Boolean) {
         val album = if (picked.size > 1) uniffi.threnody_ffi.albumId() else 0uL
-        worker.execute {
+        Threading.background {
             val g = group
             var failed: String? = null
             for ((i, p) in picked.withIndex()) {
@@ -1199,13 +1209,13 @@ class ChatActivity : Activity() {
             }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
             menu.add("Offer a credential…").setOnMenuItemClickListener {
-                CredentialUi.offer(this@ChatActivity, node, worker, device, c?.title ?: "They"); true
+                CredentialUi.offer(this@ChatActivity, node, device, c?.title ?: "They"); true
             }
             menu.add("Ask for a credential…").setOnMenuItemClickListener {
-                CredentialUi.ask(this@ChatActivity, node, worker, device, c?.title ?: "They"); true
+                CredentialUi.ask(this@ChatActivity, node, device, c?.title ?: "They"); true
             }
             menu.add("Share your profile…").setOnMenuItemClickListener {
-                ProfileUi.share(this@ChatActivity, node, device, c?.title ?: "They", worker,
+                ProfileUi.share(this@ChatActivity, node, device, c?.title ?: "They",
                     if (persona != null) "This identity's profile" else "Your profile")
                 true
             }
@@ -1217,11 +1227,11 @@ class ChatActivity : Activity() {
             }
             if (c != null) {
                 menu.add("Clear chat…").setOnMenuItemClickListener {
-                    Chats.clear(this@ChatActivity, node, worker, c.title, c.device, null) { refresh() }
+                    Chats.clear(this@ChatActivity, node, c.title, c.device, null) { refresh() }
                     true
                 }
                 menu.add("Delete contact…").setOnMenuItemClickListener {
-                    Chats.delete(this@ChatActivity, node, worker, c.title, c.device) { finish() }
+                    Chats.delete(this@ChatActivity, node, c.title, c.device) { finish() }
                     true
                 }
             }
@@ -1247,7 +1257,7 @@ class ChatActivity : Activity() {
                     "and an invite to reach you. They can show that proof to anyone. This can't be taken back.",
             )
             .setPositiveButton("Reveal") { _, _ ->
-                worker.execute {
+                Threading.background {
                     val main = Threnody.start(this)
                     val error = try {
                         val p2 = Threnody.personaNode(p) ?: throw IllegalStateException("anonymous identity is gone")
@@ -1276,7 +1286,7 @@ class ChatActivity : Activity() {
 
     /** Adds the identity they revealed, as a contact of our main identity. */
     private fun addRevealed(invite: String) {
-        worker.execute {
+        Threading.background {
             val error = try { Threnody.start(this).connect(invite); null } catch (e: Exception) { e.message }
             runOnUiThread {
                 Toast.makeText(this, error?.let { "Couldn't reach them: $it" } ?: "Added. They're in your conversations.",
@@ -1294,7 +1304,7 @@ class ChatActivity : Activity() {
             if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
             menu.add("Clear chat…").setOnMenuItemClickListener {
-                Chats.clear(this@ChatActivity, node, worker, g.name, null, g.id) { refresh() }
+                Chats.clear(this@ChatActivity, node, g.name, null, g.id) { refresh() }
                 true
             }
             menu.add(if (g.owned) "Delete group" else "Leave group").setOnMenuItemClickListener { leaveGroup(); true }
@@ -1305,7 +1315,7 @@ class ChatActivity : Activity() {
     /** The members, by name; the owner can remove them. */
     private fun members() {
         val g = info ?: return
-        worker.execute {
+        Threading.background {
             // One row per account: a contact's devices are invited and removed together.
             val contacts = node.contacts()
             val me = node.deviceFingerprint()
@@ -1336,14 +1346,14 @@ class ChatActivity : Activity() {
         SecureBuilder(this)
             .setTitle("Remove $name?")
             .setMessage("They stop receiving new messages in ${info?.name}. You can invite them again later.")
-            .setPositiveButton("Remove") { _, _ -> worker.execute { run("remove") { node.removeFromGroup(g, fp) } } }
+            .setPositiveButton("Remove") { _, _ -> Threading.background { run("remove") { node.removeFromGroup(g, fp) } } }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
     private fun inviteToGroup() {
         val g = info ?: return
-        worker.execute {
+        Threading.background {
             val candidates = Threnody.conversations(node, persona).filter { c -> c.devices.none { it in g.members } }
             runOnUiThread {
                 if (candidates.isEmpty()) {
@@ -1356,7 +1366,7 @@ class ChatActivity : Activity() {
                     .setMultiChoiceItems(candidates.map { it.title }.toTypedArray(), chosen) { _, i, on -> chosen[i] = on }
                     .setPositiveButton("Invite") { _, _ ->
                         val picked = candidates.filterIndexed { i, _ -> chosen[i] }
-                        worker.execute {
+                        Threading.background {
                             for (c in picked) run("invite ${c.title}") { node.inviteToGroup(g.id, c.device) }
                             if (picked.any { !it.approved }) runOnUiThread {
                                 Toast.makeText(this, "Contacts who haven't approved you are asked before they join.",
@@ -1379,7 +1389,7 @@ class ChatActivity : Activity() {
                 else "You stop receiving its messages. Its history stays on your devices; the owner can invite you again.",
             )
             .setPositiveButton(if (g.owned) "Delete" else "Leave") { _, _ ->
-                worker.execute {
+                Threading.background {
                     run(if (g.owned) "delete the group" else "leave") { node.leaveGroup(g.id) }
                     runOnUiThread { finish() }
                 }
@@ -1390,7 +1400,7 @@ class ChatActivity : Activity() {
 
     /** Answers a message request: accept, block or delete. */
     private fun request(what: String) {
-        worker.execute {
+        Threading.background {
             run(what) {
                 when (what) {
                     "accept" -> node.acceptContact(device)
@@ -1404,7 +1414,7 @@ class ChatActivity : Activity() {
 
     private fun declineGroup() {
         val g = group ?: return
-        worker.execute {
+        Threading.background {
             run("decline") { node.declineGroupInvite(g) }
             runOnUiThread { finish() }
         }
@@ -1412,7 +1422,7 @@ class ChatActivity : Activity() {
 
     private fun joinGroup() {
         val g = group ?: return
-        worker.execute { run("join") { node.acceptGroupInvite(g) } }
+        Threading.background { run("join") { node.acceptGroupInvite(g) } }
     }
 
     private fun rename() {
@@ -1428,7 +1438,7 @@ class ChatActivity : Activity() {
             .setView(LinearLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(field, matchWrap) })
             .setPositiveButton("Save") { _, _ ->
                 val name = field.text.toString().trim()
-                if (name.isNotEmpty()) worker.execute { run("rename") { node.setName(device, name) } }
+                if (name.isNotEmpty()) Threading.background { run("rename") { node.setName(device, name) } }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -1438,8 +1448,8 @@ class ChatActivity : Activity() {
     private fun safety() {
         val target = convo?.unverified?.firstOrNull() ?: device
         val many = (convo?.devices?.size ?: 1) > 1
-        worker.execute {
-            val number = try { node.safetyNumber(target) } catch (e: Exception) { return@execute }
+        Threading.background {
+            val number = try { node.safetyNumber(target) } catch (e: Exception) { return@background }
             // Twelve groups of five digits, three per line.
             val pretty = number.filter { it.isDigit() }.chunked(5).chunked(3).joinToString("\n") { it.joinToString("  ") }
             runOnUiThread {
@@ -1455,7 +1465,7 @@ class ChatActivity : Activity() {
                         "screen, in person or on a call. If they match, no one is intercepting your messages.")
                     .setView(view)
                     .setPositiveButton("They match") { _, _ ->
-                        worker.execute {
+                        Threading.background {
                             run("verify") { node.markVerified(target) }
                             // More devices to check? Offer the next one.
                             val more = Threnody.conversations(node, persona).firstOrNull { it.key == key }?.unverified?.isNotEmpty() == true
@@ -1469,7 +1479,7 @@ class ChatActivity : Activity() {
     }
 
     private fun setApproval(approved: Boolean) {
-        val apply = { worker.execute { run(if (approved) "approve" else "revoke") { node.setApproval(device, approved) } } }
+        val apply = { Threading.background { run(if (approved) "approve" else "revoke") { node.setApproval(device, approved) } } }
         if (approved) return apply()
         SecureBuilder(this)
             .setTitle("Revoke approval?")
@@ -1482,7 +1492,7 @@ class ChatActivity : Activity() {
     /** Sets this conversation's disappearing timer (any of the choices, or off). */
     private fun disappearing() {
         val choices = Privacy.TIMERS
-        worker.execute {
+        Threading.background {
             val g = group
             val current = try {
                 if (g != null) node.groupDisappearing(g) else node.disappearing(device)
@@ -1493,7 +1503,7 @@ class ChatActivity : Activity() {
                     .setTitle("Disappearing messages")
                     .setSingleChoiceItems(choices.map { it.first }.toTypedArray(), checked) { d, i ->
                         d.dismiss()
-                        worker.execute {
+                        Threading.background {
                             run("timer") {
                                 if (g != null) node.setGroupDisappearing(g, choices[i].second)
                                 else node.setDisappearing(device, choices[i].second)
@@ -1529,7 +1539,6 @@ class ChatActivity : Activity() {
     }
 
     override fun onDestroy() {
-        worker.shutdown()
         super.onDestroy()
     }
 
@@ -1538,12 +1547,9 @@ class ChatActivity : Activity() {
         const val DEVICE = "device"
         const val GROUP = "group"
         const val PERSONA = "persona"
-        private const val PICK_FILE = 1
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2
-        private const val ANNOTATE = 3
-        private const val VIEW_PHOTO = 4
         /** We're taken to have stopped typing after this long without a keystroke. */
         private const val TYPING_IDLE_MS = 5_000L
         /** The contact's "…" goes after this long without word (refreshed while it types). */

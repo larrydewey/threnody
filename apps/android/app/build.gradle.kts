@@ -55,4 +55,9 @@ android {
 dependencies {
     // UniFFI's Kotlin bindings call into libthrenody_ffi.so through JNA.
     implementation("net.java.dev.jna:jna:5.19.1@aar")
+    // Material 3 Components for dynamic color support
+    implementation("com.google.android.material:material:1.12.0")
+    // AndroidX Core for AppCompatDelegate
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.core:core-ktx:1.13.1")
 }

@@ -14,43 +14,75 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.animation.AnimationUtils
+import android.view.animation.LayoutAnimationController
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.graphics.drawable.ColorDrawable
 import java.net.Inet4Address
-import java.util.concurrent.Executors
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.ThrenodyNode
+import uniffi.threnody_ffi.qrMatrix
 import uniffi.threnody_ffi.qrMatrix
 
 /** The conversation list, plus invites, adding contacts and device linking. */
 class MainActivity : Activity() {
-    private val worker = Executors.newSingleThreadExecutor()
+
     private var node: ThrenodyNode? = null
     private lateinit var list: LinearLayout
     private lateinit var scroll: ScrollView
+    private lateinit var emptyStateContainer: LinearLayout
     private var unsubscribe: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Privacy.apply(this)
+
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // Top bar with dynamic color support
         val bar = TopBar(this, null).apply {
             title.text = "Threnody"
+            title.setTextAppearance(Design.styleTitleLarge)
             action(R.drawable.ic_qr, "My invite") { showInvite() }
             action(R.drawable.ic_add, "New conversation") { add(it) }
             action(R.drawable.ic_more, "More") { more(it) }
         }
-        list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // Empty state container (shown when no conversations)
+        emptyStateContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            setPadding(dp(Design.xl), dp(Design.xxl), dp(Design.xl), dp(Design.xxl))
+        }
+
+        // Conversation list
+        list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            clipToPadding = false
+            setPadding(dp(Design.screenPadding), dp(Design.md), dp(Design.screenPadding), dp(Design.xl))
+        }
+
+        // Scroll content container holds both list and empty state
+        val scrollContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(list, MATCH_PARENT, WRAP_CONTENT)
+            addView(emptyStateContainer, MATCH_PARENT, WRAP_CONTENT)
+        }
+
         scroll = ScrollView(this).apply {
             isFillViewport = true
             clipToPadding = false
-            addView(list, MATCH_PARENT, WRAP_CONTENT)
+            addView(scrollContent, MATCH_PARENT, WRAP_CONTENT)
         }
+
         root.addView(bar, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
@@ -60,7 +92,7 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 3)
         }
-        worker.execute {
+        Threading.background {
             try {
                 node = Threnody.start(this)
                 refresh()
@@ -79,8 +111,8 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         Threnody.visible++
-        unsubscribe = Threnody.subscribe { worker.execute { refresh() } }
-        worker.execute { refresh() }
+        unsubscribe = Threnody.subscribe { Threading.background { refresh() } }
+        Threading.background { refresh() }
     }
 
     override fun onStop() {
@@ -89,44 +121,80 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
-    /** One line in the list: a contact, a group, or an invitation to one. */
+    /** Conversation row data with section info. */
     private data class Row(
         val title: String,
         val avatarKey: String,
         val preview: String,
         val atMs: Long,
-        /** Null for groups, which have no single connection. */
         val connected: Boolean?,
         val open: () -> Unit,
-        /** Long-press: clear or delete it. */
         val manage: (() -> Unit)? = null,
-    )
+        val section: Section = Section.Contacts,
+        val isSectionHeader: Boolean = false,
+        val sectionTitle: String? = null,
+    ) {
+        enum class Section { Requests, Invites, Contacts, Groups, Anonymous }
+    }
 
     /** Reloads the list (on the worker thread). */
     private fun refresh() {
         val n = node ?: return
         val all = Threnody.conversations(n).filter { !it.blocked }
-        // Someone we haven't accepted, who wrote to us: a request.
+
+        val rows = mutableListOf<Row>()
+
+        // Section: Message Requests
         val requests = all.filter { !it.accepted }.mapNotNull { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null } ?: return@mapNotNull null
-            Row(c.title, c.key, "Message request · tap to review", Long.MAX_VALUE, null, open = { openChat(c.key, c.device) })
+            Row(c.title, c.key, "Message request · tap to review", Long.MAX_VALUE, null,
+                open = { openChat(c.key, c.device) }, section = Row.Section.Requests)
         }
+        if (requests.isNotEmpty()) {
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Message Requests", section = Row.Section.Requests))
+            rows.addAll(requests)
+        }
+
+        // Section: Group Invitations
+        val invites = n.groupInvites().map { i ->
+            Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null,
+                open = { openGroup(i.group) }, section = Row.Section.Invites)
+        }
+        if (invites.isNotEmpty()) {
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Invitations", section = Row.Section.Invites))
+            rows.addAll(invites)
+        }
+
+        // Section: Contacts
         val contacts = all.filter { it.accepted }.map { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
             Row(c.title, c.key, last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
-                last?.atMs?.toLong() ?: 0, c.connected, { openChat(c.key, c.device) }) { manage(n, c.title, c.device, null) }
+                last?.atMs?.toLong() ?: 0, c.connected,
+                open = { openChat(c.key, c.device) },
+                manage = { manage(n, c.title, c.device, null) },
+                section = Row.Section.Contacts)
         }
+        if (contacts.isNotEmpty()) {
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Conversations", section = Row.Section.Contacts))
+            rows.addAll(contacts)
+        }
+
+        // Section: Groups
         val groups = n.groups().map { g ->
             val last = try { n.groupHistory(g.id, 1u).lastOrNull() } catch (_: Exception) { null }
             val who = last?.let { if (it.outgoing) "You" else Threnody.nameOf(n, it.device) }
             Row(g.name, g.id, last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
-                last?.atMs?.toLong() ?: 0, null, { openGroup(g.id) }) { manage(n, g.name, null, g.id) }
+                last?.atMs?.toLong() ?: 0, null,
+                open = { openGroup(g.id) },
+                manage = { manage(n, g.name, null, g.id) },
+                section = Row.Section.Groups)
         }
-        // Invitations go first: they wait on the user.
-        val invites = n.groupInvites().map { i ->
-            Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null, open = { openGroup(i.group) })
+        if (groups.isNotEmpty()) {
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Groups", section = Row.Section.Groups))
+            rows.addAll(groups)
         }
-        // Anonymous identities' conversations, marked with the identity's label.
+
+        // Section: Anonymous Identities
         val anonymous = Threnody.personaIds().flatMap { id ->
             val p = Threnody.personaNode(id) ?: return@flatMap emptyList()
             val tag = "🎭 ${Threnody.personaLabels[id] ?: "anonymous"}"
@@ -137,58 +205,177 @@ class MainActivity : Activity() {
                     last != null -> (if (last.outgoing) "You: " else "") + preview(last)
                     else -> status(c)
                 }
-                Row(c.title, c.key, "$tag · $what", if (c.accepted) last?.atMs?.toLong() ?: 0 else Long.MAX_VALUE,
-                    c.connected, { openChat(c.key, c.device, id) }) { manage(p, c.title, c.device, null) }
+                Row(c.title, c.key, "$tag · $what",
+                    if (c.accepted) last?.atMs?.toLong() ?: 0 else Long.MAX_VALUE,
+                    c.connected,
+                    open = { openChat(c.key, c.device, id) },
+                    manage = { manage(p, c.title, c.device, null) },
+                    section = Row.Section.Anonymous)
             }
         }
-        val rows = requests + invites + (contacts + groups + anonymous).sortedByDescending { it.atMs }
-        runOnUiThread { show(rows) }
+        if (anonymous.isNotEmpty()) {
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Anonymous Identities", section = Row.Section.Anonymous))
+            rows.addAll(anonymous)
+        }
+
+        // Sort within sections by time (section headers stay at top of their section)
+        val sortedRows = rows.groupBy { it.section }.flatMap { (section, sectionRows) ->
+            val header = sectionRows.first { it.isSectionHeader }
+            val items = sectionRows.filter { !it.isSectionHeader }.sortedByDescending { it.atMs }
+            listOf(header) + items
+        }
+
+        runOnUiThread { show(sortedRows) }
     }
 
     private fun preview(e: HistoryEntry) = e.file?.let { Threnody.fileLabel(it.name, it.sensitive, e.text) } ?: e.text
 
+    private fun status(c: Conversation) = when {
+        c.approved && c.verified -> "Approved · verified"
+        c.approved -> "Approved"
+        else -> "Not approved yet"
+    }
+
     private fun show(rows: List<Row>) {
         list.removeAllViews()
-        if (rows.isEmpty()) return empty()
-        for (r in rows) list.addView(row(r))
+
+        val hasContent = rows.any { !it.isSectionHeader }
+        emptyStateContainer.visibility = if (hasContent) View.GONE else View.VISIBLE
+        list.visibility = if (hasContent) View.VISIBLE else View.GONE
+
+        if (!hasContent) return
+
+        // Apply staggered entrance animation
+        val animation = AnimationUtils.loadAnimation(this, android.R.anim.fade_in)
+        animation.duration = Design.durationFast.toLong()
+        val controller = LayoutAnimationController(animation)
+        controller.delay = 0.1f
+        controller.order = LayoutAnimationController.ORDER_NORMAL
+        list.layoutAnimation = controller
+
+        var lastSection: Row.Section? = null
+        for (r in rows) {
+            // Add divider between sections
+            if (r.isSectionHeader) {
+                if (lastSection != null) {
+                    addSectionDivider()
+                }
+                addSectionHeader(r.sectionTitle!!)
+                lastSection = r.section
+            } else {
+                list.addView(row(r))
+            }
+        }
+
+        list.startLayoutAnimation()
+    }
+
+    private fun addSectionHeader(title: String) {
+        list.addView(TextView(this).apply {
+            text = title.uppercase()
+            setTextAppearance(Design.styleLabelMedium)
+            setTextColor(color(R.color.muted))
+            setTypeface(typeface, Design.weightMedium)
+            letterSpacing = 0.05f
+            setPadding(dp(Design.listItemPaddingH), dp(Design.lg), dp(Design.listItemPaddingH), dp(Design.sm))
+        }, matchWrap)
+    }
+
+    private fun addSectionDivider() {
+        list.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(1)).apply {
+                topMargin = dp(Design.md)
+                bottomMargin = dp(Design.md)
+            }
+            background = color(R.color.divider).let { ColorDrawable(it) }
+        }, matchWrap)
     }
 
     private fun row(r: Row): View {
-        val avatar = Avatar(this, 44).apply { show(r.title, r.avatarKey) }
-        val title = label(r.title, 16f).apply { isSingleLine = true }
-        val preview = label(r.preview, 14f, if (r.atMs == Long.MAX_VALUE) R.color.accent else R.color.muted)
-            .apply { isSingleLine = true }
+        val avatar = Avatar(this, 48).apply { show(r.title, r.avatarKey) }
+
+        val title = label(r.title, Design.typeTitle, R.color.text, Design.weightMedium).apply {
+            isSingleLine = true
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+
+        val previewColor = if (r.atMs == Long.MAX_VALUE) R.color.accent else R.color.muted
+        val preview = label(r.preview, Design.typeBodySmall, previewColor, Design.weightRegular).apply {
+            isSingleLine = true
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(title)
-            addView(preview)
+            addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(Design.xs) })
         }
-        val time = label(if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else "", 12f, R.color.muted)
-            .apply { isSingleLine = true }
+
+        val timeText = if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else ""
+        val time = label(timeText, Design.typeCaption, R.color.muted, Design.weightRegular).apply {
+            isSingleLine = true
+        }
+
         val side = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
             addView(time, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             if (r.connected != null) {
                 val dot = View(this@MainActivity).apply {
-                    background = rounded(color(if (r.connected) R.color.online else R.color.divider), dp(5).toFloat())
-                    contentDescription = if (r.connected) "connected" else "not connected"
+                    background = roundedRes(if (r.connected!!) R.color.online else R.color.muted, dp(5).toFloat())
+                    contentDescription = if (r.connected!!) "connected" else "not connected"
+                    setMinimumWidth(dp(8))
+                    setMinimumHeight(dp(8))
                 }
-                addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply { topMargin = dp(8); gravity = Gravity.END })
+                addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply { topMargin = dp(Design.xs); gravity = Gravity.END })
             }
         }
-        return LinearLayout(this).apply {
+
+        val rowView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(12))
-            minimumHeight = dp(72)
+            setPadding(dp(Design.listItemPaddingH), dp(Design.listItemPaddingV), dp(Design.listItemPaddingH), dp(Design.listItemPaddingV))
+            minimumHeight = dp(76)
             background = ripple()
             addView(avatar)
-            addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(14); marginEnd = dp(8) })
+            addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.md); marginEnd = dp(Design.sm) })
             addView(side)
-            setOnClickListener { r.open() }
-            r.manage?.let { m -> setOnLongClickListener { m(); true } }
+            setOnClickListener { v -> Design.lightHaptic(v); r.open() }
+            r.manage?.let { m -> setOnLongClickListener { v -> Design.mediumHaptic(v); m(); true } }
         }
+
+        // Add section color accent for anonymous identities
+        if (r.section == Row.Section.Anonymous) {
+            val accent = View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(3), MATCH_PARENT)
+                background = color(R.color.accent).let { ColorDrawable(it) }
+            }
+            (rowView as LinearLayout).addView(accent, 0)
+        }
+
+        return rowView
+    }
+
+    private fun ago(ms: Long): String = when {
+        System.currentTimeMillis() - ms < DateUtils.MINUTE_IN_MILLIS -> "now"
+        DateUtils.isToday(ms) -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_TIME)
+        else -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_ABBREV_MONTH)
+    }
+
+    private fun empty() {
+        emptyStateContainer.removeAllViews()
+        emptyStateContainer.addView(emptyState(
+            title = "No conversations yet",
+            message = "Show your invite to someone nearby, or paste theirs. " +
+                "Scanning a Threnody QR code with your camera opens it here.",
+            actionText = "Show my invite",
+            action = { showInvite() },
+            iconRes = R.drawable.ic_qr,
+        ))
+        emptyStateContainer.addView(secondaryButton("Add a contact") { addContact(null) },
+            matchWrap.apply { topMargin = dp(Design.md) })
     }
 
     /** Long-press on a conversation: clear it, or delete the contact. */
@@ -198,8 +385,8 @@ class MainActivity : Activity() {
             .setTitle(title)
             .setItems(options.toTypedArray()) { _, i ->
                 when (options[i]) {
-                    "Clear chat" -> Chats.clear(this, n, worker, title, device, group) { worker.execute { refresh() } }
-                    else -> Chats.delete(this, n, worker, title, device!!) { worker.execute { refresh() } }
+                    "Clear chat" -> Chats.clear(this, n, title, device, group) { Threading.background { refresh() } }
+                    else -> Chats.delete(this, n, title, device!!) { Threading.background { refresh() } }
                 }
             }
             .setNegativeButton("Cancel", null)
@@ -226,7 +413,7 @@ class MainActivity : Activity() {
                 val name = field.text.toString().trim()
                 val n = node ?: return@setPositiveButton
                 if (name.isEmpty()) return@setPositiveButton
-                worker.execute {
+                Threading.background {
                     try {
                         val id = n.createGroup(name)
                         runOnUiThread { openGroup(id) }
@@ -243,139 +430,98 @@ class MainActivity : Activity() {
         startActivity(Intent(this, ChatActivity::class.java).putExtra(ChatActivity.GROUP, id))
     }
 
-    private fun status(c: Conversation) = when {
-        c.approved && c.verified -> "Approved · verified"
-        c.approved -> "Approved"
-        else -> "Not approved yet"
-    }
-
-    private fun ago(ms: Long): String = when {
-        System.currentTimeMillis() - ms < DateUtils.MINUTE_IN_MILLIS -> "now"
-        DateUtils.isToday(ms) -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_TIME)
-        else -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_ABBREV_MONTH)
-    }
-
-    private fun empty() {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(32), dp(48), dp(32), dp(48))
-        }
-        box.addView(label("No contacts yet", 20f).apply { gravity = Gravity.CENTER }, matchWrap)
-        box.addView(label(
-            "Show your invite to someone nearby, or paste theirs. " +
-                "Scanning a Threnody QR code with your camera opens it here.",
-            15f, R.color.muted,
-        ).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, dp(24)) }, matchWrap)
-        box.addView(primary("Show my invite") { showInvite() }, matchWrap)
-        box.addView(secondary("Add a contact") { addContact(null) }, matchWrap.apply { topMargin = dp(8) })
-        list.addView(box, LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
-    }
-
-    private fun primary(text: String, onClick: () -> Unit) = Button(this).apply {
-        this.text = text
-        isAllCaps = false
-        setTextColor(color(R.color.on_accent))
-        background = rounded(color(R.color.accent), dp(24).toFloat())
-        minHeight = dp(48)
-        setOnClickListener { onClick() }
-    }
-
-    private fun secondary(text: String, onClick: () -> Unit) = Button(this).apply {
-        this.text = text
-        isAllCaps = false
-        setTextColor(color(R.color.accent))
-        background = ripple()
-        minHeight = dp(48)
-        setOnClickListener { onClick() }
-    }
-
     private fun more(anchor: View) {
-        PopupMenu(this, anchor).apply {
-            menu.add("Devices").setOnMenuItemClickListener { devices(); true }
-            menu.add("Your profile").setOnMenuItemClickListener {
-                node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile", worker) }
-                true
-            }
-            menu.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
-            menu.add("Credentials").setOnMenuItemClickListener {
-                node?.let { CredentialUi.list(this@MainActivity, it, worker) }
-                true
-            }
-            menu.add("Relay directories").setOnMenuItemClickListener { DirectoryUi.show(this@MainActivity, worker); true }
-            fun toggle(title: String, on: Boolean, set: (Boolean) -> Unit, says: (Boolean) -> String) =
-                menu.add(title).apply {
-                    isCheckable = true
-                    isChecked = on
-                    setOnMenuItemClickListener {
-                        set(!on)
-                        Toast.makeText(this@MainActivity, says(!on), Toast.LENGTH_LONG).show()
-                        true
-                    }
-                }
-            toggle("Cover traffic", Privacy.coverTraffic(this@MainActivity),
-                { Privacy.setCoverTraffic(this@MainActivity, it) }) {
-                if (it) "Cover traffic on: traffic no longer shows when you send"
-                else "Cover traffic off: an observer can see when messages are sent"
-            }
-            toggle("Onion routing first", Privacy.onionFirst(this@MainActivity),
-                { Privacy.setOnionFirst(this@MainActivity, it) }) {
-                if (it) "Contacts are reached through onion circuits when possible"
-                else "Contacts are dialed directly: the network sees who you talk to"
-            }
-            toggle("Remove photo metadata", Privacy.stripMetadata(this@MainActivity),
-                { Privacy.setStripMetadata(this@MainActivity, it) }) {
-                if (it) "Photos are sent without location, camera or time details"
-                else "Photos are sent with their metadata, which can include where they were taken"
-            }
-            toggle("Reach contacts over the internet", Privacy.reachInternet(this@MainActivity),
-                { Privacy.setReachInternet(this@MainActivity, it) }) {
-                if (it) "Contacts can be reached on mobile data and other networks. " +
-                    "Strangers in the public DHT see this phone's IP address, not who you talk to"
-                else "Contacts are reached only nearby, through relays, or at addresses you dial"
-            }
-            toggle("Route through volunteer relays", Privacy.useVolunteers(this@MainActivity),
-                { Privacy.setUseVolunteers(this@MainActivity, it) }) {
-                if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
-                else "Only your own contacts relay for you"
-            }
-            toggle("Send read receipts", Privacy.sendReadReceipts(this@MainActivity),
-                { Privacy.setSendReadReceipts(this@MainActivity, it) }) {
-                if (it) "When you open a chat, the sender learns you've displayed their messages"
-                else "The sender won't know when you've read their messages"
-            }
-            toggle("Send typing indicators", Privacy.sendTyping(this@MainActivity),
-                { Privacy.setSendTyping(this@MainActivity, it) }) {
-                if (it) "Contacts see “…” while you write to them"
-                else "Contacts don't see when you're typing"
-            }
-            toggle("GIF search with GIPHY", Privacy.giphy(this@MainActivity),
-                { Privacy.setGiphy(this@MainActivity, it) }) {
-                if (it) "GIF search on: GIPHY sees your searches and this phone's IP address"
-                else "GIF search off: the GIF button offers only GIFs on this phone"
-            }
-            menu.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
-            menu.add("Screen security").apply {
+        val popup = PopupMenu(this, anchor)
+        val menu = popup.menu
+
+        // Account & Identity
+        val accountSection = menu.addSubMenu("Account & Identity")
+        accountSection.add("Devices").setOnMenuItemClickListener { devices(); true }
+        accountSection.add("Your profile").setOnMenuItemClickListener {
+            node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile") }
+            true
+        }
+        accountSection.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
+        accountSection.add("Credentials").setOnMenuItemClickListener {
+            node?.let { CredentialUi.list(this@MainActivity, it) }
+            true
+        }
+        accountSection.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
+        accountSection.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
+
+        // Privacy & Security
+        val privacySection = menu.addSubMenu("Privacy & Security")
+        fun toggle(title: String, on: Boolean, set: (Boolean) -> Unit, says: (Boolean) -> String) =
+            privacySection.add(title).apply {
                 isCheckable = true
-                isChecked = Privacy.screenSecurity(this@MainActivity)
+                isChecked = on
                 setOnMenuItemClickListener {
-                    val on = !Privacy.screenSecurity(this@MainActivity)
-                    Privacy.setScreenSecurity(this@MainActivity, on)
-                    Toast.makeText(
-                        this@MainActivity,
-                        if (on) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed",
-                        Toast.LENGTH_SHORT,
-                    ).show()
+                    set(!on)
+                    Toast.makeText(this@MainActivity, says(!on), Toast.LENGTH_LONG).show()
                     true
                 }
             }
-            menu.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
-            menu.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
-            menu.add("Diagnostics").setOnMenuItemClickListener {
-                startActivity(Intent(this@MainActivity, LogActivity::class.java)); true
-            }
-            show()
+        toggle("Cover traffic", Privacy.coverTraffic(this@MainActivity),
+            { Privacy.setCoverTraffic(this@MainActivity, it) }) {
+            if (it) "Cover traffic on: traffic no longer shows when you send"
+            else "Cover traffic off: an observer can see when messages are sent"
         }
+        toggle("Onion routing first", Privacy.onionFirst(this@MainActivity),
+            { Privacy.setOnionFirst(this@MainActivity, it) }) {
+            if (it) "Contacts are reached through onion circuits when possible"
+            else "Contacts are dialed directly: the network sees who you talk to"
+        }
+        toggle("Remove photo metadata", Privacy.stripMetadata(this@MainActivity),
+            { Privacy.setStripMetadata(this@MainActivity, it) }) {
+            if (it) "Photos are sent without location, camera or time details"
+            else "Photos are sent with their metadata, which can include where they were taken"
+        }
+        toggle("Screen security", Privacy.screenSecurity(this@MainActivity),
+            { Privacy.setScreenSecurity(this@MainActivity, it) }) {
+            if (it) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed"
+        }
+
+        // Network & Connectivity
+        val networkSection = menu.addSubMenu("Network & Connectivity")
+        toggle("Reach contacts over the internet", Privacy.reachInternet(this@MainActivity),
+            { Privacy.setReachInternet(this@MainActivity, it) }) {
+            if (it) "Contacts can be reached on mobile data and other networks. " +
+                "Strangers in the public DHT see this phone's IP address, not who you talk to"
+            else "Contacts are reached only nearby, through relays, or at addresses you dial"
+        }
+        toggle("Route through volunteer relays", Privacy.useVolunteers(this@MainActivity),
+            { Privacy.setUseVolunteers(this@MainActivity, it) }) {
+            if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
+            else "Only your own contacts relay for you"
+        }
+        networkSection.add("Relay directories").setOnMenuItemClickListener { DirectoryUi.show(this@MainActivity); true }
+
+        // Messaging
+        val messagingSection = menu.addSubMenu("Messaging")
+        toggle("Send read receipts", Privacy.sendReadReceipts(this@MainActivity),
+            { Privacy.setSendReadReceipts(this@MainActivity, it) }) {
+            if (it) "When you open a chat, the sender learns you've displayed their messages"
+            else "The sender won't know when you've read their messages"
+        }
+        toggle("Send typing indicators", Privacy.sendTyping(this@MainActivity),
+            { Privacy.setSendTyping(this@MainActivity, it) }) {
+            if (it) "Contacts see “…” while you write to them"
+            else "Contacts don't see when you're typing"
+        }
+        toggle("GIF search with GIPHY", Privacy.giphy(this@MainActivity),
+            { Privacy.setGiphy(this@MainActivity, it) }) {
+            if (it) "GIF search on: GIPHY sees your searches and this phone's IP address"
+            else "GIF search off: the GIF button offers only GIFs on this phone"
+        }
+        messagingSection.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
+
+        // Advanced
+        val advancedSection = menu.addSubMenu("Advanced")
+        advancedSection.add("Diagnostics").setOnMenuItemClickListener {
+            startActivity(Intent(this@MainActivity, LogActivity::class.java)); true
+        }
+
+        popup.show()
     }
 
     private fun openChat(key: String, device: String, persona: String? = null) {
@@ -422,7 +568,7 @@ class MainActivity : Activity() {
             .setPositiveButton("Create") { _, _ ->
                 val label = field.text.toString().trim().ifEmpty { "Anonymous" }
                 val expires = burnChoices[burn].second?.let { System.currentTimeMillis() + it }
-                worker.execute {
+                Threading.background {
                     try {
                         val rec = Threnody.createPersona(this, label, expires)
                         runOnUiThread { personaInvite(rec.id) }
@@ -452,7 +598,7 @@ class MainActivity : Activity() {
     /** The anonymous identities, each with its invite, profile, rename and burn. */
     private fun personas() {
         val n = node ?: return
-        worker.execute {
+        Threading.background {
             val list = try { n.personas() } catch (_: Exception) { emptyList() }
             runOnUiThread {
                 if (list.isEmpty()) {
@@ -485,7 +631,7 @@ class MainActivity : Activity() {
             .setItems(options.toTypedArray()) { _, i ->
                 when (i) {
                     0 -> personaInvite(id)
-                    1 -> ProfileUi.edit(this, p, "$label's profile", worker)
+                    1 -> ProfileUi.edit(this, p, "$label's profile")
                     2 -> renamePersona(id, label)
                     3 -> burnPersona(id, label)
                 }
@@ -501,7 +647,7 @@ class MainActivity : Activity() {
             .setView(padded(field))
             .setPositiveButton("Save") { _, _ ->
                 val new = field.text.toString().trim()
-                if (new.isNotEmpty()) worker.execute {
+                if (new.isNotEmpty()) Threading.background {
                     try { Threnody.renamePersona(this, id, new) } catch (e: Exception) { runOnUiThread { failed("${e.message}") } }
                     refresh()
                 }
@@ -515,7 +661,7 @@ class MainActivity : Activity() {
             .setTitle("Burn $label?")
             .setMessage("Its keys, contacts, messages and files are deleted for good. Nobody can reach it again.")
             .setPositiveButton("Burn") { _, _ ->
-                worker.execute {
+                Threading.background {
                     try { Threnody.burnPersona(this, id) } catch (e: Exception) { runOnUiThread { failed("${e.message}") } }
                     refresh()
                 }
@@ -563,7 +709,7 @@ class MainActivity : Activity() {
     /** This account's devices; tap one to rename it. */
     private fun devices() {
         val n = node ?: return
-        worker.execute {
+        Threading.background {
             val list = n.devices()
             runOnUiThread {
                 val labels = list.map { d ->
@@ -589,7 +735,7 @@ class MainActivity : Activity() {
                 val name = field.text.toString().trim()
                 val n = node ?: return@setPositiveButton
                 if (name.isEmpty()) return@setPositiveButton
-                worker.execute {
+                Threading.background {
                     try {
                         n.renameDevice(fingerprint, name)
                         runOnUiThread { Toast.makeText(this, "Renamed to $name", Toast.LENGTH_SHORT).show() }
@@ -619,19 +765,27 @@ class MainActivity : Activity() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(24), dp(8), dp(24), 0)
+            setPadding(dp(Design.xl), dp(Design.md), dp(Design.xl), dp(Design.md))
         }
-        box.addView(label(help, 14f, R.color.muted), matchWrap)
+        box.addView(label(help, Design.typeBody, R.color.text_secondary, maxLines = 0, weight = Design.weightMedium).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+        }, matchWrap)
         try {
-            box.addView(QrView(this, qrMatrix(code)), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
-                topMargin = dp(16); bottomMargin = dp(16)
+            box.addView(QrView(this, qrMatrix(code)), LinearLayout.LayoutParams(dp(240), dp(240)).apply {
+                topMargin = dp(Design.lg); bottomMargin = dp(Design.lg)
+                gravity = Gravity.CENTER_HORIZONTAL
             })
-        } catch (_: Exception) {}
-        box.addView(label(code, 12f, R.color.muted).apply { setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }, matchWrap)
-        box.addView(label(footer, 12f, R.color.muted).apply { setTextIsSelectable(true); setPadding(0, dp(8), 0, 0) }, matchWrap)
+        } catch (e: Exception) {
+            Threnody.say("! QR generation failed: ${e.message}")
+        }
+        box.addView(label(code, Design.typeBody, R.color.md_sys_color_on_surface, weight = Design.weightBold, maxLines = 0), matchWrap)
+        box.addView(label(footer, Design.typeCaption, R.color.text_secondary, maxLines = 0).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(Design.md), 0, 0)
+        }, matchWrap)
         SecureBuilder(this)
             .setTitle(title)
-            .setView(ScrollView(this).apply { addView(box) })
+            .setView(android.widget.ScrollView(this).apply { addView(box) })
             .setPositiveButton("Share") { _, _ ->
                 startActivity(Intent.createChooser(
                     Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, code), title))
@@ -670,21 +824,24 @@ class MainActivity : Activity() {
             .show()
     }
 
+    private val scanLauncher = ActivityResultRegistry.get(this)
+
     private fun scan() {
-        @Suppress("DEPRECATION") // the result API needs AndroidX
-        startActivityForResult(Intent(this, ScanActivity::class.java), SCAN)
+        scanLauncher.launch(Intent(this, ScanActivity::class.java)) { resultCode, data ->
+            if (resultCode != RESULT_OK) return@launch
+            val text = data?.getStringExtra(ScanActivity.RESULT)?.trim() ?: return@launch
+            when {
+                text.startsWith("threnody://") -> addContact(text)
+                text.startsWith("threnody-link://") -> joinAccount(text)
+                text.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, text)
+                else -> failed("That QR code isn't a Threnody invite, link code or directory link.")
+            }
+        }
     }
 
-    @Deprecated("Activity result API needs AndroidX; this app uses the platform only.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != SCAN || resultCode != RESULT_OK) return
-        val text = data?.getStringExtra(ScanActivity.RESULT)?.trim() ?: return
-        when {
-            text.startsWith("threnody://") -> addContact(text)
-            text.startsWith("threnody-link://") -> joinAccount(text)
-            text.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, worker, text)
-            else -> failed("That QR code isn't a Threnody invite, link code or directory link.")
+        if (!ActivityResultRegistry.dispatch(this, requestCode, resultCode, data)) {
+            super.onActivityResult(requestCode, resultCode, data)
         }
     }
 
@@ -715,7 +872,7 @@ class MainActivity : Activity() {
             SecureBuilder(this)
                 .setTitle("Subscribe to the copied directory?")
                 .setMessage(link)
-                .setPositiveButton("Subscribe") { _, _ -> DirectoryUi.subscribe(this, worker, link) }
+                .setPositiveButton("Subscribe") { _, _ -> DirectoryUi.subscribe(this, link) }
                 .setNegativeButton("Not now", null)
                 .show()
             return
@@ -735,7 +892,7 @@ class MainActivity : Activity() {
         if (target.isEmpty()) return
         val n = node ?: return
         Toast.makeText(this, "Connecting…", Toast.LENGTH_SHORT).show()
-        worker.execute {
+        Threading.background {
             try {
                 val peer = n.connect(target)
                 val key = Threnody.key(n.contacts(), peer)
@@ -758,7 +915,7 @@ class MainActivity : Activity() {
             .setPositiveButton("Join") { _, _ ->
                 val code = field.text.toString().trim()
                 val n = node ?: return@setPositiveButton
-                worker.execute {
+                Threading.background {
                     try {
                         val account = n.linkWith(code)
                         runOnUiThread { Toast.makeText(this, "Joined account ${Threnody.short(account)}", Toast.LENGTH_LONG).show() }
@@ -780,7 +937,7 @@ class MainActivity : Activity() {
         when {
             uri.startsWith("threnody://") -> addContact(uri)
             uri.startsWith("threnody-link://") -> joinAccount(uri)
-            uri.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, worker, uri)
+            uri.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, uri)
         }
     }
 
@@ -789,11 +946,9 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        worker.shutdown()
         super.onDestroy()
     }
 
     companion object {
-        private const val SCAN = 1
     }
 }

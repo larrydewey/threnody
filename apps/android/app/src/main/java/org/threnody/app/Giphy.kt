@@ -19,7 +19,6 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.util.concurrent.Executors
 
 /**
  * GIF search through GIPHY's API. GIPHY sees what is searched for and this
@@ -41,7 +40,7 @@ object Giphy {
     /** Previews are small; anything bigger than this isn't one. */
     private const val MAX_PREVIEW = 2L * 1024 * 1024
 
-    val net = Executors.newFixedThreadPool(4)
+    val net: java.util.concurrent.ExecutorService = Threading.io
     private val previews = object : LruCache<String, ByteArray>(16 * 1024 * 1024) {
         override fun sizeOf(key: String, value: ByteArray) = value.size
     }

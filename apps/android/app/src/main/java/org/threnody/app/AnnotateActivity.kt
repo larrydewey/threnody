@@ -31,7 +31,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
-import java.util.concurrent.Executors
 import kotlin.math.abs
 
 /**
@@ -40,7 +39,6 @@ import kotlin.math.abs
  * ([RESULT_PATH]); the caller sends or saves it.
  */
 class AnnotateActivity : Activity() {
-    private val worker = Executors.newSingleThreadExecutor()
     private lateinit var canvasView: EditorView
     private lateinit var undoButton: View
     private lateinit var hint: TextView
@@ -152,7 +150,7 @@ class AnnotateActivity : Activity() {
         refreshUndo()
 
         // Full quality for sending, bounded for memory.
-        worker.execute {
+        Threading.background {
             val b = Media.decode(Media.source(this, location), 4096)
             runOnUiThread {
                 if (b == null) {
@@ -243,7 +241,7 @@ class AnnotateActivity : Activity() {
     private fun done() {
         val out = canvasView.render() ?: return
         val base = name.substringAfterLast('/').substringBeforeLast('.').ifBlank { "photo" }
-        worker.execute {
+        Threading.background {
             val path = try {
                 // Private; the caller deletes it once used.
                 val dir = File(cacheDir, DIR).apply { mkdirs() }
@@ -265,7 +263,6 @@ class AnnotateActivity : Activity() {
     }
 
     override fun onDestroy() {
-        worker.shutdownNow()
         super.onDestroy()
     }
 

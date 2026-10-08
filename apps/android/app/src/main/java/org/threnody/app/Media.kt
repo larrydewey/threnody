@@ -7,7 +7,6 @@ import android.net.Uri
 import android.util.LruCache
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.util.concurrent.Executors
 
 /**
  * Pictures: which files are images, where received ones are kept, and
@@ -24,7 +23,7 @@ object Media {
     /** Larger images are refused rather than decoded (decompression bombs). */
     private const val MAX_PIXELS = 100_000_000L
 
-    private val decoder = Executors.newFixedThreadPool(2)
+    private val decoder: java.util.concurrent.ExecutorService = Threading.io
     private val thumbs = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount
     }

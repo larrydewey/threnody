@@ -7,7 +7,6 @@ import android.text.format.DateUtils
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
-import java.util.concurrent.Executor
 
 /**
  * Relay directories (Appendix P): lists of volunteer relays and the
@@ -19,13 +18,15 @@ object DirectoryUi {
     const val SCHEME = "threnody-dir://"
 
     /** Subscribes the main identity and every anonymous one. */
-    fun subscribe(a: Activity, worker: Executor, link: String, done: () -> Unit = {}) {
+    fun subscribe(a: Activity, link: String, done: () -> Unit = {}) {
         Toast.makeText(a, "Subscribing…", Toast.LENGTH_SHORT).show()
-        worker.execute {
+        Threading.background {
             val msg = try {
                 val d = Threnody.start(a).subscribeDirectory(link)
                 for (id in Threnody.personaIds()) {
-                    try { Threnody.personaNode(id)?.subscribeDirectory(link) } catch (_: Exception) {}
+                    try { Threnody.personaNode(id)?.subscribeDirectory(link) } catch (e: Exception) {
+                        Threnody.say("! persona subscribe: ${e.message}")
+                    }
                 }
                 "Subscribed: ${d.relays} relays, ${d.tokens} tokens"
             } catch (e: Exception) {
@@ -39,8 +40,8 @@ object DirectoryUi {
     }
 
     /** Lists subscriptions; tap one to unsubscribe, or add one. */
-    fun show(a: Activity, worker: Executor, prefill: String? = null) {
-        worker.execute {
+    fun show(a: Activity, prefill: String? = null) {
+        Threading.background {
             val node = Threnody.start(a)
             val dirs = node.directories()
             val usable = node.volunteerRelayCount()
@@ -53,7 +54,7 @@ object DirectoryUi {
                 }
                 val b = SecureBuilder(a)
                     .setTitle("Relay directories")
-                    .setPositiveButton("Add") { _, _ -> add(a, worker, prefill) }
+                    .setPositiveButton("Add") { _, _ -> add(a, prefill) }
                     .setNegativeButton("Close", null)
                 if (dirs.isEmpty()) {
                     b.setMessage(
@@ -67,7 +68,7 @@ object DirectoryUi {
                         SecureBuilder(a)
                             .setTitle("Unsubscribe from directory ${dirs[i].id}?")
                             .setPositiveButton("Unsubscribe") { _, _ ->
-                                worker.execute {
+                                Threading.background {
                                     node.unsubscribeDirectory(dirs[i].idHex)
                                     for (id in Threnody.personaIds()) {
                                         Threnody.personaNode(id)?.unsubscribeDirectory(dirs[i].idHex)
@@ -79,12 +80,12 @@ object DirectoryUi {
                     }
                 }
                 b.show()
-                if (prefill != null && dirs.none { it.link == prefill }) add(a, worker, prefill)
+                if (prefill != null && dirs.none { it.link == prefill }) add(a, prefill)
             }
         }
     }
 
-    fun add(a: Activity, worker: Executor, prefill: String?) {
+    fun add(a: Activity, prefill: String?) {
         val field = EditText(a).apply {
             hint = "$SCHEME…"
             setText(prefill ?: "")
@@ -100,7 +101,7 @@ object DirectoryUi {
             })
             .setPositiveButton("Subscribe") { _, _ ->
                 val link = field.text.toString().trim()
-                if (link.startsWith(SCHEME)) subscribe(a, worker, link)
+                if (link.startsWith(SCHEME)) subscribe(a, link)
                 else Toast.makeText(a, "That isn't a $SCHEME link", Toast.LENGTH_LONG).show()
             }
             .setNegativeButton("Cancel", null)
@@ -112,7 +113,9 @@ object DirectoryUi {
         val main = Threnody.start(ctx)
         val have = persona.directories().map { it.link }.toSet()
         for (d in main.directories()) {
-            if (d.link !in have) try { persona.subscribeDirectory(d.link) } catch (_: Exception) {}
+            if (d.link !in have) try { persona.subscribeDirectory(d.link) } catch (e: Exception) {
+                Threnody.say("! followMain subscribe: ${e.message}")
+            }
         }
     }
 }

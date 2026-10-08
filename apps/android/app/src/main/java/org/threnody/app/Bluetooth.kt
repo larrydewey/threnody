@@ -20,7 +20,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import java.util.UUID
-import java.util.concurrent.Executors
 import uniffi.threnody_ffi.ByteLink
 import uniffi.threnody_ffi.ThrenodyNode
 
@@ -43,7 +42,6 @@ object Bluetooth {
     private const val MAX_SDU = 4096
 
     private val main = Handler(Looper.getMainLooper())
-    private val dialer = Executors.newSingleThreadExecutor()
     @Volatile private var server: BluetoothServerSocket? = null
     private var advertising: AdvertisingSet? = null
 
@@ -133,7 +131,7 @@ object Bluetooth {
                 val data = r.scanRecord?.getServiceData(uuid) ?: return
                 val dial = node.bleHeard(data) ?: return
                 Threnody.say("* heard ${Threnody.short(dial.peer)} over Bluetooth; connecting")
-                dialer.execute { dial(node, r.device, dial.psm.toInt(), dial.peer) }
+                Threading.io { dial(node, r.device, dial.psm.toInt(), dial.peer) }
             }
             override fun onScanFailed(code: Int) = Threnody.say("! Bluetooth scan failed ($code)")
         })

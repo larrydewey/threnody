@@ -9,7 +9,6 @@ import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Toast
-import java.util.concurrent.Executor
 import uniffi.threnody_ffi.CredentialAskRecord
 import uniffi.threnody_ffi.CredentialOfferRecord
 import uniffi.threnody_ffi.ProfileAttr
@@ -39,8 +38,8 @@ object CredentialUi {
     private fun toast(a: Activity, msg: String) = a.runOnUiThread { Toast.makeText(a, msg, Toast.LENGTH_LONG).show() }
 
     /** The credentials this identity holds; tap one to delete it. */
-    fun list(a: Activity, node: ThrenodyNode, worker: Executor) {
-        worker.execute {
+    fun list(a: Activity, node: ThrenodyNode) {
+Threading.background {
             val held = node.credentials()
             val names = held.map { "${it.schema} · from ${Threnody.nameOf(node, it.issuer)}\n${attrs(it.attributes)}" }
             a.runOnUiThread {
@@ -52,7 +51,7 @@ object CredentialUi {
                         SecureBuilder(a)
                             .setTitle("Delete this credential?")
                             .setMessage(names[i])
-                            .setPositiveButton("Delete") { _, _ -> worker.execute { node.deleteCredential(held[i].id) } }
+                            .setPositiveButton("Delete") { _, _ -> Threading.background { node.deleteCredential(held[i].id) } }
                             .setNegativeButton("Cancel", null)
                             .show()
                     }
@@ -63,7 +62,7 @@ object CredentialUi {
     }
 
     /** Vouches for attributes of [peer] with a credential they keep. */
-    fun offer(a: Activity, node: ThrenodyNode, worker: Executor, peer: String, title: String) {
+    fun offer(a: Activity, node: ThrenodyNode, peer: String, title: String) {
         val v = box(a)
         val schema = field(a, "Kind, e.g. hackspace/member")
         val body = field(a, "One per line: key=value", multiLine = true).apply { setText("name=\nmember=yes") }
@@ -87,7 +86,7 @@ object CredentialUi {
                 val kind = schema.text.toString().trim()
                 if (kind.isEmpty() || list.isEmpty()) return@setPositiveButton toast(a, "A kind and at least one attribute are needed")
                 val n = days.text.toString().toUIntOrNull() ?: 365u
-                worker.execute {
+                Threading.background {
                     try {
                         node.offerCredential(peer, kind, list, n)
                         toast(a, "Offered. $title decides whether to accept.")
@@ -101,7 +100,7 @@ object CredentialUi {
     }
 
     /** Asks [peer] to prove attributes of a credential. */
-    fun ask(a: Activity, node: ThrenodyNode, worker: Executor, peer: String, title: String) {
+    fun ask(a: Activity, node: ThrenodyNode, peer: String, title: String) {
         val v = box(a)
         val schema = field(a, "Kind, e.g. hackspace/member")
         val keys = field(a, "Attributes, comma-separated (optional)")
@@ -115,7 +114,7 @@ object CredentialUi {
                 val kind = schema.text.toString().trim()
                 if (kind.isEmpty()) return@setPositiveButton
                 val wanted = keys.text.split(',').map { it.trim() }.filter { it.isNotEmpty() }
-                worker.execute {
+                Threading.background {
                     try {
                         node.askCredential(peer, kind, wanted)
                         toast(a, "Asked")
@@ -129,20 +128,22 @@ object CredentialUi {
     }
 
     /** An offer made to us: accept (keep the credential) or decline. */
-    fun answerOffer(a: Activity, node: ThrenodyNode, worker: Executor, offer: CredentialOfferRecord, done: () -> Unit) {
+    fun answerOffer(a: Activity, node: ThrenodyNode, offer: CredentialOfferRecord, done: () -> Unit) {
         val who = Threnody.nameOf(node, offer.peer)
         SecureBuilder(a)
             .setTitle("$who offers you a credential")
             .setMessage("${offer.schema}\n\n${attrs(offer.attributes)}\n\nKeep it to prove these later, choosing what to show each time.")
             .setPositiveButton("Accept") { _, _ ->
-                worker.execute {
+                Threading.background {
                     try { node.acceptCredentialOffer(offer.id) } catch (e: Exception) { toast(a, "Couldn't accept: ${e.message}") }
                     done()
                 }
             }
             .setNegativeButton("Decline") { _, _ ->
-                worker.execute {
-                    try { node.declineCredential(offer.id) } catch (_: Exception) {}
+                Threading.background {
+                    try { node.declineCredential(offer.id) } catch (e: Exception) {
+                        Threnody.say("! decline offer: ${e.message}")
+                    }
                     done()
                 }
             }
@@ -150,9 +151,9 @@ object CredentialUi {
             .show()
     }
 
-    /** A request for a proof: pick a credential and what to show, or decline. */
-    fun answerAsk(a: Activity, node: ThrenodyNode, worker: Executor, ask: CredentialAskRecord, done: () -> Unit) {
-        worker.execute {
+/** A request for a proof: pick a credential and what to show, or decline. */
+    fun answerAsk(a: Activity, node: ThrenodyNode, ask: CredentialAskRecord, done: () -> Unit) {
+        Threading.background {
             val who = Threnody.nameOf(node, ask.peer)
             val matching = node.credentials().filter { it.schema == ask.schema }
             a.runOnUiThread {
@@ -161,8 +162,10 @@ object CredentialUi {
                         .setTitle("$who asks for a credential (${ask.schema})")
                         .setMessage("You don't hold one.")
                         .setPositiveButton("Decline") { _, _ ->
-                            worker.execute {
-                                try { node.declineCredential(ask.id) } catch (_: Exception) {}
+                            Threading.background {
+                                try { node.declineCredential(ask.id) } catch (e: Exception) {
+                                    Threnody.say("! decline ask: ${e.message}")
+                                }
                                 done()
                             }
                         }
@@ -190,7 +193,7 @@ object CredentialUi {
                     .setPositiveButton("Prove") { _, _ ->
                         val cred = matching[(group.checkedRadioButtonId - 1).coerceIn(0, matching.size - 1)]
                         val keys = ask.keys.filterIndexed { i, _ -> checks[i].isChecked }
-                        worker.execute {
+                        Threading.background {
                             try {
                                 node.presentCredential(ask.id, cred.id, keys)
                                 toast(a, "Proof sent")
@@ -201,8 +204,10 @@ object CredentialUi {
                         }
                     }
                     .setNegativeButton("Decline") { _, _ ->
-                        worker.execute {
-                            try { node.declineCredential(ask.id) } catch (_: Exception) {}
+                        Threading.background {
+                            try { node.declineCredential(ask.id) } catch (e: Exception) {
+                                Threnody.say("! decline ask (prove): ${e.message}")
+                            }
                             done()
                         }
                     }

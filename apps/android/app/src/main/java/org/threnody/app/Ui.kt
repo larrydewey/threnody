@@ -10,6 +10,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.view.Gravity
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
@@ -21,6 +22,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import uniffi.threnody_ffi.QrMatrix
 
+fun Context.dp(v: Float): Int = (v * resources.displayMetrics.density).toInt()
 fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
 fun Context.color(id: Int): Int = getColor(id)
@@ -34,9 +36,17 @@ fun Context.ripple(borderless: Boolean = false): android.graphics.drawable.Drawa
     return getDrawable(v.resourceId)
 }
 
-fun rounded(color: Int, radius: Float) = GradientDrawable().apply {
+fun rounded(color: Int, radius: Float = Design.radiusMd) = GradientDrawable().apply {
     setColor(color)
     cornerRadius = radius
+}
+
+fun Context.roundedRes(colorId: Int, radius: Float = Design.radiusMd): GradientDrawable {
+    val ctx = this
+    return GradientDrawable().apply {
+        setColor(ctx.color(colorId))
+        cornerRadius = radius
+    }
 }
 
 /**
@@ -72,13 +82,13 @@ fun Activity.fitSystemBars(root: View, top: View, bottom: View) {
 /** A screen's top bar: optional back arrow, title (and subtitle), actions. */
 class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
     val title = TextView(ctx).apply {
-        textSize = 20f
-        setTypeface(typeface, Typeface.BOLD)
+        textSize = Design.typeTitle
+        setTypeface(typeface, Design.weightBold)
         setTextColor(ctx.color(R.color.text))
         isSingleLine = true
     }
     val subtitle = TextView(ctx).apply {
-        textSize = 13f
+        textSize = Design.typeBodySmall
         setTextColor(ctx.color(R.color.muted))
         isSingleLine = true
         visibility = GONE
@@ -88,7 +98,7 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
         orientation = HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         setBackgroundColor(ctx.color(R.color.bar))
-        setPadding(ctx.dp(if (back == null) 16 else 4), ctx.dp(8), ctx.dp(4), ctx.dp(8))
+        setPadding(ctx.dp(if (back == null) Design.lg else Design.sm), ctx.dp(Design.sm), ctx.dp(Design.sm), ctx.dp(Design.sm))
         minimumHeight = ctx.dp(56)
         if (back != null) {
             addView(icon(R.drawable.ic_back, "Back") { back() })
@@ -98,7 +108,7 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
             addView(title)
             addView(subtitle)
         }
-        addView(titles, LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = ctx.dp(if (back == null) 0 else 4) })
+        addView(titles, LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = ctx.dp(if (back == null) 0 else Design.sm) })
     }
 
     fun icon(res: Int, label: String, onClick: (View) -> Unit) = ImageButton(context).apply {
@@ -107,8 +117,11 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
         contentDescription = label
         tooltipText = label
         background = context.ripple(borderless = true)
-        layoutParams = LayoutParams(context.dp(48), context.dp(48))
-        setOnClickListener(onClick)
+        layoutParams = LayoutParams(context.dp(Design.touchTargetMin), context.dp(Design.touchTargetMin))
+        setOnClickListener { v ->
+            Design.mediumHaptic(v)
+            onClick(v)
+        }
     }
 
     fun action(res: Int, label: String, onClick: (View) -> Unit) {
@@ -117,12 +130,12 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
 }
 
 /** A circle with a contact's initial, tinted from its fingerprint. */
-class Avatar(ctx: Context, size: Int) : TextView(ctx) {
+class Avatar(ctx: Context, size: Int = 44) : TextView(ctx) {
     init {
         gravity = Gravity.CENTER
         textSize = size / 2.6f
         setTextColor(Color.WHITE)
-        setTypeface(typeface, Typeface.BOLD)
+        setTypeface(typeface, Design.weightBold)
         layoutParams = LinearLayout.LayoutParams(ctx.dp(size), ctx.dp(size))
     }
 
@@ -163,15 +176,48 @@ class QrView(ctx: Context, private val qr: QrMatrix) : View(ctx) {
     }
 }
 
-fun Context.label(text: String, size: Float = 15f, colorId: Int = R.color.text) = TextView(this).apply {
+fun Context.label(
+    text: String,
+    size: Float = Design.typeBody,
+    colorId: Int = R.color.text,
+    weight: Int = Design.weightRegular,
+    maxLines: Int = 1,
+) = TextView(this).apply {
     this.text = text
     textSize = size
     setTextColor(color(colorId))
+    setTypeface(typeface, weight)
+    if (maxLines > 0) this.maxLines = maxLines
 }
 
 /** An AlertDialog.Builder whose dialogs follow screen security (see [Privacy.secure]). */
 class SecureBuilder(ctx: Context) : android.app.AlertDialog.Builder(ctx) {
     override fun create(): android.app.AlertDialog = super.create().also { Privacy.secure(it) }
+
+    /** Sets positive button with consistent styling and haptic feedback. */
+    @Suppress("UNUSED_PARAMETER")
+    fun setPositiveButton(text: String, onClick: (android.content.DialogInterface, Int) -> Unit = { _, _ -> }): SecureBuilder {
+        return super.setPositiveButton(text) { dialog, which ->
+            (dialog as? android.app.AlertDialog)?.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.let { Design.mediumHaptic(it) }
+            onClick(dialog, which)
+        } as SecureBuilder
+    }
+
+    /** Sets negative button with consistent styling. */
+    @Suppress("UNUSED_PARAMETER")
+    fun setNegativeButton(text: String, onClick: (android.content.DialogInterface, Int) -> Unit = { _, _ -> }): SecureBuilder {
+        return super.setNegativeButton(text) { dialog, which ->
+            onClick(dialog, which)
+        } as SecureBuilder
+    }
+
+    /** Sets neutral button with consistent styling. */
+    @Suppress("UNUSED_PARAMETER")
+    fun setNeutralButton(text: String, onClick: (android.content.DialogInterface, Int) -> Unit = { _, _ -> }): SecureBuilder {
+        return super.setNeutralButton(text) { dialog, which ->
+            onClick(dialog, which)
+        } as SecureBuilder
+    }
 }
 
 /**
@@ -180,29 +226,30 @@ class SecureBuilder(ctx: Context) : android.app.AlertDialog.Builder(ctx) {
  */
 fun Activity.bottomSheet(content: View): android.app.Dialog = android.app.Dialog(this).apply {
     requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
-    val r = dp(28).toFloat()
-    val frame = LinearLayout(context).apply {
+    val activity = this@bottomSheet
+    val r = activity.dp(Design.radiusXl).toFloat()
+    val frame = LinearLayout(activity).apply {
         orientation = LinearLayout.VERTICAL
         background = GradientDrawable().apply {
-            setColor(color(R.color.sheet))
+            setColor(activity.color(R.color.sheet))
             cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
         }
-        addView(View(context).apply {
-            background = rounded(color(R.color.muted), dp(2).toFloat())
+        setPadding(activity.dp(Design.screenPadding), activity.dp(Design.md), activity.dp(Design.screenPadding), activity.dp(Design.md))
+        addView(View(activity).apply {
+            background = roundedRes(R.color.muted, Design.radiusSm)
             alpha = 0.4f
-        }, LinearLayout.LayoutParams(dp(32), dp(4)).apply {
+        }, LinearLayout.LayoutParams(activity.dp(32), activity.dp(4)).apply {
             gravity = Gravity.CENTER_HORIZONTAL
-            topMargin = dp(10)
-            bottomMargin = dp(8)
+            topMargin = activity.dp(Design.xs)
+            bottomMargin = activity.dp(Design.sm)
         })
         addView(content, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
     }
     val bottom = frame.paddingBottom
     frame.setOnApplyWindowInsetsListener { v, insets ->
-        // Clear of the navigation bar, and of the keyboard while typing.
         val nav = if (Build.VERSION.SDK_INT >= 30) insets.getInsets(WindowInsets.Type.navigationBars() or WindowInsets.Type.ime()).bottom
             else @Suppress("DEPRECATION") insets.systemWindowInsetBottom
-        v.setPadding(0, 0, 0, bottom + nav + dp(8))
+        v.setPadding(activity.dp(Design.screenPadding), activity.dp(Design.md), activity.dp(Design.screenPadding), bottom + nav + activity.dp(Design.md))
         insets
     }
     setContentView(frame)
@@ -239,5 +286,72 @@ fun EditText.wrapping(newlines: Boolean = true, max: Int = 6): EditText {
 }
 
 val matchWrap get() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+
+/** Primary action button: filled, accent color. */
+fun Context.primaryButton(text: String, onClick: (View) -> Unit) = android.widget.Button(this).apply {
+    this.text = text
+    isAllCaps = false
+    setTextColor(color(R.color.on_accent))
+    background = roundedRes(R.color.accent, Design.radiusXl)
+    minHeight = dp(Design.touchTargetMin)
+    setPadding(dp(Design.lg), dp(Design.buttonPaddingV), dp(Design.lg), dp(Design.buttonPaddingV))
+    setOnClickListener { v -> Design.mediumHaptic(v); onClick(v) }
+}
+
+/** Secondary action button: outlined/tinted, subtle. */
+fun Context.secondaryButton(text: String, onClick: (View) -> Unit) = android.widget.Button(this).apply {
+    this.text = text
+    isAllCaps = false
+    setTextColor(color(R.color.accent))
+    background = ripple()
+    minHeight = dp(Design.touchTargetMin)
+    setPadding(dp(Design.lg), dp(Design.buttonPaddingV), dp(Design.lg), dp(Design.buttonPaddingV))
+    setOnClickListener { v -> Design.mediumHaptic(v); onClick(v) }
+}
+
+/** Tertiary/ghost button: text only. */
+fun Context.tertiaryButton(text: String, onClick: (View) -> Unit) = android.widget.TextView(this).apply {
+    this.text = text
+    textSize = Design.typeButton
+    setTextColor(color(R.color.accent))
+    setTypeface(typeface, Design.weightBold)
+    gravity = Gravity.CENTER
+    minHeight = dp(Design.touchTargetMin)
+    setPadding(dp(Design.md), dp(Design.sm), dp(Design.md), dp(Design.sm))
+    background = ripple(borderless = true)
+    setOnClickListener { v -> Design.lightHaptic(v); onClick(v) }
+}
+
+/** Empty state view with illustration, message, and action. */
+fun Activity.emptyState(
+    title: String,
+    message: String,
+    actionText: String? = null,
+    action: (() -> Unit)? = null,
+    iconRes: Int = 0,
+): LinearLayout = LinearLayout(this).apply {
+    orientation = LinearLayout.VERTICAL
+    gravity = Gravity.CENTER
+    setPadding(dp(Design.xl), dp(Design.xxl), dp(Design.xl), dp(Design.xxl))
+    val activity = this@emptyState
+    if (iconRes != 0) {
+        addView(android.widget.ImageView(activity).apply {
+            setImageResource(iconRes)
+            setColorFilter(activity.color(R.color.muted))
+            layoutParams = LinearLayout.LayoutParams(dp(80), dp(80)).apply { bottomMargin = dp(Design.lg) }
+        })
+    }
+    addView(label(title, Design.typeTitle, R.color.text, Design.weightBold).apply {
+        gravity = Gravity.CENTER
+        setPadding(0, 0, 0, dp(Design.sm))
+    }, matchWrap)
+    addView(label(message, Design.typeBody, R.color.muted).apply {
+        gravity = Gravity.CENTER
+        setPadding(0, 0, 0, dp(Design.lg))
+    }, matchWrap)
+    actionText?.let { text ->
+        addView(activity.primaryButton(text) { action?.invoke() }, matchWrap.apply { topMargin = dp(Design.md) })
+    }
+}
 
 fun members(n: Int) = if (n == 1) "1 member" else "$n members"

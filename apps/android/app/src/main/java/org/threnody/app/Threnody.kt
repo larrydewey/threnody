@@ -9,7 +9,6 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import uniffi.threnody_ffi.ContactInfo
 import uniffi.threnody_ffi.FileOptions
@@ -107,7 +106,7 @@ object Threnody {
     @Synchronized
     private fun openPersona(ctx: Context, rec: PersonaRecord): ThrenodyNode {
         personaNodes[rec.id]?.let { return it }
-        val n = ThrenodyNode.open(rec.home, KeyVault.passphrase(ctx, rec.home), null)
+        val n = ThrenodyNode.open(rec.home, KeyVault.passphrase(ctx, rec.home))
         val port = prefs(ctx).getInt("port_${rec.id}", 0)
         val addr = try { n.listen("0.0.0.0:$port") } catch (_: Exception) { n.listen("0.0.0.0:0") }
         prefs(ctx).edit().putInt("port_${rec.id}", addr.substringAfterLast(':').toInt()).apply()
@@ -116,7 +115,9 @@ object Threnody {
         pump(ctx, n, rec.id)
         say("anonymous identity ${rec.id.take(6)} listening on port ${addr.substringAfterLast(':')}")
         // The same directories as the main identity, through links of its own.
-        Thread { try { DirectoryUi.followMain(ctx, n) } catch (_: Exception) {} }.apply { isDaemon = true }.start()
+        Thread {
+            try { DirectoryUi.followMain(ctx, n) } catch (e: Exception) { say("! followMain: ${e.message}") }
+        }.apply { isDaemon = true }.start()
         return n
     }
 
@@ -156,17 +157,17 @@ object Threnody {
 
     /** Removes kept photos whose messages were deleted or disappeared. */
     private fun sweepMedia(ctx: Context, node: ThrenodyNode) {
-        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
-            Thread(r, "threnody-media-sweep").apply { isDaemon = true }
-        }.scheduleWithFixedDelay({
+        Threading.schedulePeriodic(1, 5, TimeUnit.MINUTES) {
             Media.sweep(ctx, node)
             for ((id, n) in personaNodes) Media.sweep(ctx, n, id)
             // Expired personas burn while the app runs, too.
             try {
                 val due = node.personas().filter { p -> p.expiresMs?.let { it.toLong() <= System.currentTimeMillis() } == true }
                 for (p in due) burnPersona(ctx, p.id)
-            } catch (_: Exception) {}
-        }, 1, 5, java.util.concurrent.TimeUnit.MINUTES)
+            } catch (e: Exception) {
+                say("! persona expiry check: ${e.message}")
+            }
+        }
     }
 
     /** Applies the privacy settings (all on unless turned off) to the node. */
@@ -218,9 +219,7 @@ object Threnody {
         }
     }
 
-    private val redialer = Executors.newSingleThreadScheduledExecutor { r ->
-        Thread(r, "threnody-redial").apply { isDaemon = true }
-    }
+    private val redialer: java.util.concurrent.ScheduledExecutorService = Threading.scheduled
     /** Seconds between redial attempts; the last repeats. */
     private val redialDelays = longArrayOf(3, 10, 30, 60, 120, 300)
     @Volatile private var redialing = false
@@ -319,9 +318,7 @@ object Threnody {
                 }
             })
         }
-        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
-            Thread(r, "threnody-standby").apply { isDaemon = true }
-        }.scheduleWithFixedDelay({ updateStandby() }, 1, 1, TimeUnit.MINUTES)
+        Threading.schedulePeriodic(1, 1, TimeUnit.MINUTES) { updateStandby() }
     }
 
     /** Binds the standby socket to a network that is up and not the default. */
@@ -398,7 +395,7 @@ object Threnody {
     /** Opens the node, its identity sealed under the Android Keystore. */
     private fun open(ctx: Context): ThrenodyNode {
         val home = ctx.filesDir.resolve("threnody").path
-        return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home), null)
+        return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home))
     }
 
     /** Subscribes to node events (called on the event thread); returns an unsubscriber. */

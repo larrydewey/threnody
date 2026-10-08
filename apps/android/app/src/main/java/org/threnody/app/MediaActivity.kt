@@ -17,7 +17,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Toast
 import java.util.Date
-import java.util.concurrent.Executors
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.ThrenodyNode
 
@@ -27,7 +26,6 @@ import uniffi.threnody_ffi.ThrenodyNode
  * history, so it holds whatever hasn't disappeared.
  */
 class MediaActivity : Activity() {
-    private val worker = Executors.newSingleThreadExecutor()
     private lateinit var node: ThrenodyNode
     private lateinit var content: LinearLayout
     private lateinit var tabs: LinearLayout
@@ -62,8 +60,11 @@ class MediaActivity : Activity() {
         fitSystemBars(root, bar, scroll)
         tab = savedInstanceState?.getInt("tab") ?: 0
 
-        worker.execute {
-            node = try { Threnody.node(this, persona) } catch (_: Exception) { return@execute runOnUiThread { finish() } }
+        Threading.background {
+            node = try { Threnody.node(this, persona) } catch (e: Exception) {
+                runOnUiThread { finish() }
+                return@background
+            }
             entries = try {
                 when {
                     group != null -> node.groupHistory(group, 10_000u)
@@ -227,7 +228,6 @@ class MediaActivity : Activity() {
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
-        worker.shutdownNow()
         super.onDestroy()
     }
 

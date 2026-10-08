@@ -11,7 +11,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
-import java.util.concurrent.Executors
 import uniffi.threnody_ffi.ThrenodyNode
 
 /**
@@ -19,7 +18,6 @@ import uniffi.threnody_ffi.ThrenodyNode
  * Wi-Fi Direct controls for testing transports.
  */
 class LogActivity : Activity() {
-    private val worker = Executors.newSingleThreadExecutor()
     private var node: ThrenodyNode? = null
     private lateinit var log: TextView
     private var seen: List<Pair<BluetoothDevice, Int>> = emptyList()
@@ -66,7 +64,7 @@ class LogActivity : Activity() {
         setContentView(root)
         fitSystemBars(root, bar, body)
 
-        worker.execute {
+        Threading.background {
             val n = Threnody.start(this)
             node = n
             val r = n.reachability()
@@ -92,7 +90,7 @@ class LogActivity : Activity() {
         }
         val i = t.removePrefix("ble").trim().toIntOrNull()
         val found = i?.let { seen.getOrNull(it - 1) } ?: return say("! no such Bluetooth device; scan first")
-        worker.execute { Bluetooth.dial(n, found.first, found.second, null) }
+        Threading.background { Bluetooth.dial(n, found.first, found.second, null) }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
@@ -105,7 +103,7 @@ class LogActivity : Activity() {
     private fun startBluetooth() {
         val n = node ?: return
         if (Bluetooth.running) return say("* Bluetooth already on")
-        worker.execute { Bluetooth.start(applicationContext, n) }
+        Threading.background { Bluetooth.start(applicationContext, n) }
     }
 
     private fun scanBluetooth() {
@@ -133,7 +131,6 @@ class LogActivity : Activity() {
     }
 
     override fun onDestroy() {
-        worker.shutdown()
         super.onDestroy()
     }
 }
