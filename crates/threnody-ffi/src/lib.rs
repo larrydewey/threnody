@@ -2110,6 +2110,10 @@ mod tests {
             None,
         )
         .unwrap();
+        // No microphone or speaker: CI runners have none, and a call whose
+        // audio device can't open ends as failed, racing the hang-up below.
+        alice.set_call_devices(false);
+        bob.set_call_devices(false);
         let addr = bob.listen("127.0.0.1:0".into()).unwrap();
         let bob_fp = alice.connect(bob.invite_link(addr)).unwrap();
         assert_eq!(bob_fp, bob.device_fingerprint());
