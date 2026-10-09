@@ -4,7 +4,8 @@
 //! hangs up after a while. With `BOT_CALL=1` it calls whoever connects
 //! instead, to test ringing on the other side. With `BOT_VIDEO=1` it sends
 //! moving colour bars as its video and logs the frames it receives (their
-//! size and brightness, nothing more).
+//! size and brightness, nothing more). It sends silence and plays
+//! nothing unless `BOT_MIC=1`: a bot's speaker echoes into its microphone.
 //!
 //! ```sh
 //! cargo run -p threnody-ffi --features calls --example call_bot -- <home> [port] [seconds]
@@ -24,6 +25,7 @@ fn main() {
 
     let node = ThrenodyNode::open(home, None, None).expect("open");
     node.set_cover_traffic(None);
+    node.set_call_devices(std::env::var_os("BOT_MIC").is_some());
     let addr = node.listen(format!("0.0.0.0:{port}")).expect("listen");
     let lan = std::env::var("BOT_ADDR").unwrap_or(addr);
     println!("invite: {}", node.invite_link(lan));
@@ -73,6 +75,9 @@ fn main() {
                 answered = Some((call, Instant::now()));
             }
             NodeEvent::CallMedia { call, state } => println!("call {call:x} audio: {state}"),
+            NodeEvent::CallVideo { call, video, .. } => {
+                println!("call {call:x} peer video: {video}")
+            }
             NodeEvent::CallEnded {
                 call,
                 reason,
@@ -137,6 +142,9 @@ fn watch(node: std::sync::Arc<ThrenodyNode>) {
             if at.elapsed() >= Duration::from_secs(2) {
                 if let Some((w, h, r, l)) = last {
                     println!("video in: {n} frames in 2s, {w}x{h} rot {r}, brightness {l}");
+                }
+                if let Some(s) = node.call_stats() {
+                    println!("media: {s:?}");
                 }
                 (n, at) = (0, Instant::now());
             }

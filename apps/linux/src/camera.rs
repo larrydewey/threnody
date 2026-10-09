@@ -22,13 +22,64 @@ pub struct Camera {
 /// `(width, height, bytes)` of one frame.
 type OnFrame = Box<dyn Fn(u32, u32, &[u8]) + Send + Sync>;
 
+/// The cameras GStreamer can see (front and back, built-in and USB…).
+fn cameras() -> Vec<gst::Device> {
+    if gst::init().is_err() {
+        return Vec::new();
+    }
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Video/Source"), None);
+    if monitor.start().is_err() {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let found = monitor
+        .devices()
+        .into_iter()
+        // Infrared sensors (face unlock) offer only greyscale: not a camera
+        // to call with. And one device can show up twice.
+        .filter(|d| d.caps().is_some_and(|c| c.iter().any(|st| !greyscale(st))))
+        .filter(|d| {
+            let path = d.properties().and_then(|p| {
+                p.get::<String>("api.v4l2.path")
+                    .or_else(|_| p.get::<String>("device.path"))
+                    .ok()
+            });
+            match path {
+                Some(p) if paths.contains(&p) => false,
+                Some(p) => {
+                    paths.push(p);
+                    true
+                }
+                None => true,
+            }
+        })
+        .collect();
+    monitor.stop();
+    found
+}
+
+fn greyscale(st: &gst::StructureRef) -> bool {
+    st.get::<&str>("format")
+        .is_ok_and(|f| f.starts_with("GRAY"))
+        || st
+            .get::<&str>("drm-format")
+            .is_ok_and(|f| f.trim_start().starts_with("R8") || f.trim_start().starts_with("R16"))
+}
+
+/// How many cameras there are to switch between.
+pub fn count() -> usize {
+    cameras().len()
+}
+
 impl Camera {
-    /// Starts the default camera. `send` gets I420 frames for the call,
+    /// Starts camera number `which` (of [`count`]; the default camera
+    /// when there's no such one). `send` gets I420 frames for the call,
     /// `preview` RGBA ones (mirrored, as people expect to see themselves).
-    pub fn start(send: OnFrame, preview: OnFrame) -> Result<Self, String> {
+    pub fn start(which: usize, send: OnFrame, preview: OnFrame) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
         let desc = format!(
-            "v4l2src ! videoconvert ! videoscale ! videorate \
+            "videoconvert name=head ! videoscale ! videorate \
              ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=30/1 ! tee name=t \
              t. ! queue leaky=downstream max-size-buffers=1 ! videoconvert \
                ! video/x-raw,format=I420 ! appsink name=send sync=false max-buffers=1 drop=true \
@@ -41,6 +92,15 @@ impl Camera {
             .map_err(|e| e.to_string())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| "not a pipeline".to_owned())?;
+        let source = match cameras().get(which) {
+            Some(d) => d.create_element(None).map_err(|e| e.to_string())?,
+            None => gst::ElementFactory::make("v4l2src")
+                .build()
+                .map_err(|e| e.to_string())?,
+        };
+        let head = pipeline.by_name("head").ok_or("no head")?;
+        pipeline.add(&source).map_err(|e| e.to_string())?;
+        source.link(&head).map_err(|e| e.to_string())?;
         for (name, deliver) in [("send", send), ("preview", preview)] {
             let sink = pipeline
                 .by_name(name)
@@ -91,7 +151,9 @@ mod tests {
     fn camera_delivers_both_streams() {
         let (sent, shown) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (s, p) = (sent.clone(), shown.clone());
+        eprintln!("{} camera(s)", count());
         let cam = Camera::start(
+            0,
             Box::new(move |w, h, i420| {
                 assert_eq!((w, h), (WIDTH, HEIGHT));
                 assert!(i420.len() >= (w * h * 3 / 2) as usize);

@@ -30,7 +30,7 @@ pub mod volunteer;
 #[cfg(feature = "boringtun")]
 pub mod wg_userspace;
 
-pub use call::{CallInfo, Phase as CallPhase};
+pub use call::{CallInfo, CallStats, Phase as CallPhase};
 pub use cred::{CredentialAsk, CredentialInfo, CredentialOffer};
 pub use delivery::Tag;
 pub use direct::DirectOffer;

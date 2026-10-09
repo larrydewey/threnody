@@ -46,6 +46,8 @@ object Calls {
         val video: Boolean = false,
         /** They say they send video. */
         val peerVideo: Boolean = false,
+        /** Which camera we send: the front one, or the back one. */
+        val frontCamera: Boolean = true,
     )
 
     @Volatile var current: Call? = null
@@ -77,6 +79,9 @@ object Calls {
             Threnody.say("! calls unavailable: ${e.message}")
         }
     }
+
+    fun hasMicrophone(ctx: Context) =
+        ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
     /** The permissions a call needs: the microphone, and the camera for video. */
     private fun missing(ctx: Context, video: Boolean) =
@@ -172,6 +177,25 @@ object Calls {
         changed()
     }
 
+    /**
+     * The call screen left (or came back): the camera stops with it, so the
+     * peer is told our video paused, rather than seeing a frozen picture.
+     * Whether we want video ([Call.video]) doesn't change.
+     */
+    fun pauseVideo(paused: Boolean) {
+        val c = current?.takeIf { it.video && it.state != "incoming" } ?: return
+        Threading.background {
+            try { c.node.setCallVideo(!paused) } catch (_: Exception) {}
+        }
+    }
+
+    /** Switches between the front and back cameras (the call screen restarts the camera). */
+    fun switchCamera() {
+        val c = current ?: return
+        current = c.copy(frontCamera = !c.frontCamera)
+        changed()
+    }
+
     fun setSpeaker(ctx: Context, on: Boolean) {
         val c = current ?: return
         current = c.copy(speaker = on)
@@ -202,6 +226,7 @@ object Calls {
                 val c = current?.takeIf { it.id == e.call } ?: return
                 current = null
                 cancelRinging(ctx)
+                ongoing(ctx)
                 inCall(ctx, false)
                 ended = when {
                     e.reason == "declined" && !e.byUs -> "Declined"
@@ -215,15 +240,56 @@ object Calls {
             }
             else -> return
         }
+        current?.takeIf { it.state == "connected" && e is NodeEvent.CallMedia }?.let {
+            ongoing(ctx)
+            logMedia(it)
+        }
         changed()
+    }
+
+    /** The call whose media is being logged. */
+    @Volatile private var logging: ULong = 0u
+
+    /** For the diagnostics log, every 5 s while the call lasts: how its media moves (counts only). */
+    private fun logMedia(c: Call) {
+        if (logging == c.id) return
+        logging = c.id
+        Thread {
+            while (current?.id == c.id) {
+                Thread.sleep(5000)
+                val s = try { c.node.callStats() } catch (_: Exception) { null } ?: break
+                Threnody.say("* call media: sent ${s.sentDatagrams} datagrams, ${s.sentStream} in stream, " +
+                    "${s.sendFailed} failed; got ${s.received}, ${s.rejected} rejected, ${s.dropped} dropped")
+            }
+        }.apply { isDaemon = true; name = "call-stats" }.start()
     }
 
     private fun update(id: ULong, f: (Call) -> Call) {
         current?.takeIf { it.id == id }?.let { current = f(it) }
     }
 
-    /** Voice-call audio mode while a call runs (echo cancellation, earpiece). */
+    /** Keeps Wi-Fi out of power saving while a call runs (honoured while the app is in front). */
+    @Volatile private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
+    /** Voice-call audio mode while a call runs (echo cancellation, earpiece), and the microphone kept. */
     private fun inCall(ctx: Context, on: Boolean) {
+        try {
+            if (on && wifiLock == null) {
+                val wm = ctx.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+                wifiLock = wm?.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "threnody-call")
+                    ?.apply { setReferenceCounted(false); acquire() }
+            } else if (!on) {
+                wifiLock?.release()
+                wifiLock = null
+            }
+        } catch (e: Exception) {
+            Threnody.say("! wifi lock: ${e.javaClass.simpleName}")
+        }
+        try {
+            ThrenodyService.inCall(ctx, on)
+        } catch (e: Exception) {
+            Threnody.say("! call service: ${e.javaClass.simpleName}")
+        }
         val am = ctx.getSystemService(AudioManager::class.java) ?: return
         am.mode = if (on) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL
         if (!on) route(ctx, false)
@@ -247,6 +313,7 @@ object Calls {
     /** Rings with the phone's ringtone, as a ringtone (silent mode and Do Not Disturb apply). */
     private const val CHANNEL_RING = "calls_ring"
     private const val CHANNEL_MISSED = "calls_missed"
+    private const val CHANNEL_ONGOING = "calls_in_progress"
     private const val ID_RINGING = 30
     private const val ID_MISSED = 31
 
@@ -270,6 +337,15 @@ object Calls {
         )
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_MISSED, "Missed calls", NotificationManager.IMPORTANCE_DEFAULT),
+        )
+        // Shown (not tucked away with the silent ones), but quiet.
+        nm.deleteNotificationChannel("calls_ongoing")
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_ONGOING, "Call in progress", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "While a call runs: back to it, or hang up"
+                setSound(null, null)
+                enableVibration(false)
+            },
         )
         return nm
     }
@@ -311,6 +387,51 @@ object Calls {
         // Rings (and vibrates) over and over until answered or declined.
         n.flags = n.flags or Notification.FLAG_INSISTENT
         post(ctx, ID_RINGING, n)
+    }
+
+    /**
+     * While a call runs, the background service's notification is the
+     * call's: the way back to the call screen, and Hang up (see
+     * [callNotification]). This refreshes it, the timer once audio connects.
+     */
+    private fun ongoing(ctx: Context) = ThrenodyService.inCall(ctx, current != null)
+
+    /**
+     * The call's notification for the background service to show (null
+     * when there's no call): ranked with calls (Android 12+), Hang up on it.
+     */
+    fun callNotification(ctx: Context): Notification? {
+        val c = current?.takeIf { it.state != "incoming" } ?: return null
+        channels(ctx)
+        val open = PendingIntent.getActivity(
+            ctx, 3, Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val hangUp = PendingIntent.getBroadcast(
+            ctx, 4, Intent(ctx, Decline::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return Notification.Builder(ctx, CHANNEL_ONGOING)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Call with ${c.title}")
+            .setContentText("Tap to return to the call")
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(public(ctx, "Call in progress"))
+            .setCategory(Notification.CATEGORY_CALL)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .apply {
+                if (c.since != 0L) {
+                    setUsesChronometer(true)
+                    setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - c.since))
+                }
+                if (Build.VERSION.SDK_INT >= 31) {
+                    setStyle(Notification.CallStyle.forOngoingCall(Person.Builder().setName(c.title).build(), hangUp))
+                } else {
+                    addAction(Notification.Action.Builder(null, "Hang up", hangUp).build())
+                }
+            }
+            .build()
     }
 
     /** Decline, from the ringing notification. */

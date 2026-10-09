@@ -38,6 +38,7 @@ class CallActivity : Activity() {
     private lateinit var mute: ImageButton
     private lateinit var camera: ImageButton
     private lateinit var speaker: ImageButton
+    private lateinit var flip: ImageButton
     private lateinit var remote: ImageView
     private lateinit var local: TextureView
     private var unlisten: (() -> Unit)? = null
@@ -49,6 +50,8 @@ class CallActivity : Activity() {
         }
     }
     private var feed: CallCamera? = null
+    /** Which camera `feed` is. */
+    private var feedFront = true
     /** Which drawing thread is current: each start makes a new one, and older ones stop. */
     private val watching = java.util.concurrent.atomic.AtomicInteger(0)
 
@@ -111,6 +114,22 @@ class CallActivity : Activity() {
         speaker = round(R.drawable.ic_speaker, "Speaker", idle, text) {
             Calls.current?.let { Calls.setSpeaker(this, !it.speaker) }
         }
+        // Over our own picture: front or back camera, when there are both.
+        flip = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_cameraswitch)
+            imageTintList = android.content.res.ColorStateList.valueOf(white)
+            contentDescription = "Switch camera"
+            tooltipText = "Switch camera"
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(140, 0, 0, 0))
+            }
+            visibility = View.GONE
+            setOnClickListener { v ->
+                Design.mediumHaptic(v)
+                Calls.switchCamera()
+            }
+        }
         activeRow = row(
             mute,
             camera,
@@ -155,6 +174,10 @@ class CallActivity : Activity() {
                 topMargin = dp(Design.xxl * 3)
                 marginEnd = dp(Design.lg)
             })
+            addView(flip, FrameLayout.LayoutParams(dp(40), dp(40), Gravity.TOP or Gravity.END).apply {
+                topMargin = dp(Design.xxl * 3) + dp(144) - dp(48)
+                marginEnd = dp(Design.lg) + dp(8)
+            })
         }
         setContentView(frame)
         fitSystemBars(frame, content, content)
@@ -173,6 +196,7 @@ class CallActivity : Activity() {
         unlisten = Calls.listen { runOnUiThread { show() } }
         ticker.post(tick)
         watchVideo()
+        Calls.pauseVideo(false)
         show()
     }
 
@@ -181,6 +205,7 @@ class CallActivity : Activity() {
         ticker.removeCallbacks(tick)
         watching.incrementAndGet()
         stopCamera()
+        Calls.pauseVideo(true)
         super.onStop()
     }
 
@@ -193,9 +218,12 @@ class CallActivity : Activity() {
     private fun cameraIfWanted() {
         val c = Calls.current
         if (c == null || !c.video || c.state == "incoming") return stopCamera()
+        // Switched: close this camera and open the other.
+        if (feed != null && feedFront != c.frontCamera) stopCamera()
         if (feed != null) return
         val st = local.surfaceTexture ?: return
-        feed = CallCamera(applicationContext, c.node).also { it.start(st) }
+        feedFront = c.frontCamera
+        feed = CallCamera(applicationContext, c.node, c.frontCamera).also { it.start(st) }
     }
 
     private fun stopCamera() {
@@ -260,6 +288,7 @@ class CallActivity : Activity() {
         activeRow.visibility = if (ringing) View.GONE else View.VISIBLE
         remote.visibility = if (c.peerVideo && !ringing) View.VISIBLE else View.GONE
         local.visibility = if (c.video && !ringing) View.VISIBLE else View.GONE
+        flip.visibility = if (c.video && !ringing && CallCamera.canSwitch(this)) View.VISIBLE else View.GONE
         mute.alpha = if (c.muted) 1f else 0.6f
         mute.contentDescription = if (c.muted) "Unmute" else "Mute"
         camera.alpha = if (c.video) 1f else 0.6f

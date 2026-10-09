@@ -24,6 +24,17 @@ pub struct CallRecord {
     pub answered_ms: u64,
 }
 
+/// How the current call's media is moving, for diagnostics: counts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct CallStats {
+    pub sent_datagrams: u64,
+    pub sent_stream: u64,
+    pub send_failed: u64,
+    pub received: u64,
+    pub rejected: u64,
+    pub dropped: u64,
+}
+
 /// A frame of the peer's video, ready to draw.
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct VideoFrame {
@@ -154,6 +165,16 @@ impl ThrenodyNode {
         self.node.hangup_call(id);
     }
 
+    /// Whether calls use the microphone and speaker (on by default). Off,
+    /// they send silence and play nothing: for test peers and bots, whose
+    /// speaker would otherwise echo into their own microphone.
+    pub fn set_call_devices(&self, on: bool) {
+        #[cfg(feature = "calls")]
+        self.media.set_devices(on);
+        #[cfg(not(feature = "calls"))]
+        let _ = on;
+    }
+
     /// Mutes or unmutes our microphone in the current call.
     pub fn set_call_muted(&self, muted: bool) {
         #[cfg(feature = "calls")]
@@ -205,6 +226,18 @@ impl ThrenodyNode {
             let _ = timeout_ms;
             None
         }
+    }
+
+    /// How the current call's media is moving (counts only).
+    pub fn call_stats(&self) -> Option<CallStats> {
+        self.node.call_stats().map(|s| CallStats {
+            sent_datagrams: s.sent_datagrams,
+            sent_stream: s.sent_stream,
+            send_failed: s.send_failed,
+            received: s.received,
+            rejected: s.rejected,
+            dropped: s.dropped,
+        })
     }
 
     /// The current call, if any.

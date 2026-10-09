@@ -14,7 +14,7 @@ use std::time::Duration;
 use futures_lite::StreamExt;
 use libwebrtc::media_stream_track::MediaStreamTrack;
 use libwebrtc::native::yuv_helper;
-use libwebrtc::video_frame::{I420Buffer, VideoBuffer, VideoRotation};
+use libwebrtc::video_frame::{BoxVideoFrame, I420Buffer, VideoBuffer, VideoRotation};
 use libwebrtc::video_stream::native::NativeVideoStream;
 use threnody_net::Node;
 use tokio::sync::{Notify, mpsc};
@@ -53,10 +53,13 @@ pub struct Frame {
 }
 
 /// The newest remote frame, and a wake-up for whoever waits for it. Older
-/// ones are dropped: a late frame isn't worth drawing.
+/// ones are dropped: a late frame isn't worth drawing. Kept as decoded and
+/// turned into pixels only when asked for ([`Driver::next_frame`]), so a
+/// screen that isn't drawing (an app in the background) costs nothing,
+/// and the conversion happens on the app's thread, not the call's.
 #[derive(Default)]
 struct Latest {
-    frame: Mutex<Option<Frame>>,
+    frame: Mutex<Option<BoxVideoFrame>>,
     ready: Notify,
 }
 
@@ -66,6 +69,8 @@ pub struct Driver {
     tx: mpsc::UnboundedSender<Cmd>,
     current: Current,
     latest: Arc<Latest>,
+    /// Calls use the microphone and speaker (else silence, played nowhere).
+    devices: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Driver {
@@ -74,12 +79,28 @@ impl Driver {
         let (tx, rx) = mpsc::unbounded_channel();
         let current: Current = Arc::default();
         let latest: Arc<Latest> = Arc::default();
-        tokio::spawn(run(node, rx, on_state, current.clone(), latest.clone()));
+        let devices = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        tokio::spawn(run(
+            node,
+            rx,
+            on_state,
+            current.clone(),
+            latest.clone(),
+            devices.clone(),
+        ));
         Self {
             tx,
             current,
             latest,
+            devices,
         }
+    }
+
+    /// Whether calls from now on use the microphone and speaker (on by
+    /// default). Off, they send silence and play nothing: for test peers
+    /// and bots, whose speaker would otherwise echo into their microphone.
+    pub fn set_devices(&self, on: bool) {
+        self.devices.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Starts `call`'s media, sending video from the start if `video`.
@@ -141,11 +162,11 @@ impl Driver {
     /// The newest frame of the peer's video, waiting up to `timeout` for
     /// one; each frame is returned once.
     pub async fn next_frame(&self, timeout: Duration) -> Option<Frame> {
-        if let Some(f) = lock(&self.latest.frame).take() {
-            return Some(f);
+        if lock(&self.latest.frame).is_none() {
+            let _ = tokio::time::timeout(timeout, self.latest.ready.notified()).await;
         }
-        let _ = tokio::time::timeout(timeout, self.latest.ready.notified()).await;
-        lock(&self.latest.frame).take()
+        let f = lock(&self.latest.frame).take()?;
+        Some(pixels(&f))
     }
 }
 
@@ -161,29 +182,34 @@ fn copy_plane(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usize, 
     }
 }
 
-/// Reads the peer's video into `latest`, as RGBA, until the track ends.
+/// A decoded frame as RGBA.
+fn pixels(f: &BoxVideoFrame) -> Frame {
+    let b = f.buffer.to_i420();
+    let (w, h) = (b.width(), b.height());
+    let (sy, su, sv) = b.strides();
+    let (y, u, v) = b.data();
+    let mut rgba = vec![0u8; w as usize * h as usize * 4];
+    // libyuv's "ABGR" is R, G, B, A in memory.
+    yuv_helper::i420_to_abgr(y, sy, u, su, v, sv, &mut rgba, w * 4, w as i32, h as i32);
+    let rotation = match f.rotation {
+        VideoRotation::VideoRotation90 => 90,
+        VideoRotation::VideoRotation180 => 180,
+        VideoRotation::VideoRotation270 => 270,
+        VideoRotation::VideoRotation0 => 0,
+    };
+    Frame {
+        width: w,
+        height: h,
+        rotation,
+        rgba,
+    }
+}
+
+/// Keeps the peer's newest frame in `latest` until the track ends.
 async fn watch_video(track: libwebrtc::video_track::RtcVideoTrack, latest: Arc<Latest>) {
     let mut stream = NativeVideoStream::new(track);
     while let Some(f) = stream.next().await {
-        let b = f.buffer.to_i420();
-        let (w, h) = (b.width(), b.height());
-        let (sy, su, sv) = b.strides();
-        let (y, u, v) = b.data();
-        let mut rgba = vec![0u8; w as usize * h as usize * 4];
-        // libyuv's "ABGR" is R, G, B, A in memory.
-        yuv_helper::i420_to_abgr(y, sy, u, su, v, sv, &mut rgba, w * 4, w as i32, h as i32);
-        let rotation = match f.rotation {
-            VideoRotation::VideoRotation90 => 90,
-            VideoRotation::VideoRotation180 => 180,
-            VideoRotation::VideoRotation270 => 270,
-            VideoRotation::VideoRotation0 => 0,
-        };
-        *lock(&latest.frame) = Some(Frame {
-            width: w,
-            height: h,
-            rotation,
-            rgba,
-        });
+        *lock(&latest.frame) = Some(f);
         latest.ready.notify_waiters();
     }
 }
@@ -194,6 +220,7 @@ async fn run(
     on_state: OnState,
     current: Current,
     latest: Arc<Latest>,
+    devices: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut early: Vec<(u64, Vec<u8>)> = Vec::new();
     while let Some(cmd) = rx.recv().await {
@@ -207,7 +234,11 @@ async fn run(
                 let started = CallMedia::start(
                     &node,
                     call,
-                    AudioIn::Device,
+                    if devices.load(std::sync::atomic::Ordering::Relaxed) {
+                        AudioIn::Device
+                    } else {
+                        AudioIn::None
+                    },
                     move |t| {
                         if let MediaStreamTrack::Video(v) = t.track {
                             rt.spawn(watch_video(v, frames.clone()));

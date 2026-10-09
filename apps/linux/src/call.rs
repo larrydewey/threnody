@@ -44,6 +44,10 @@ pub struct CallBar {
     status: gtk::Label,
     mute: gtk::ToggleButton,
     camera_button: gtk::ToggleButton,
+    /// Next camera, when there's more than one.
+    flip: gtk::Button,
+    /// Which camera we send (of `camera::count`).
+    which: Cell<usize>,
     video: gtk::Overlay,
     remote: gtk::Picture,
     local: gtk::Picture,
@@ -80,6 +84,13 @@ impl CallBar {
         };
         let mute = round("microphone-sensitivity-high-symbolic", "Mute");
         let camera_button = round("camera-disabled-symbolic", "Turn camera on");
+        let flip = gtk::Button::builder()
+            .icon_name("camera-switch-symbolic")
+            .tooltip_text("Switch camera")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        flip.add_css_class("circular");
         let hangup = gtk::Button::builder()
             .icon_name("call-stop-symbolic")
             .tooltip_text("Hang up")
@@ -92,6 +103,7 @@ impl CallBar {
         row.add_css_class("call-bar");
         row.append(&gtk::Image::from_icon_name("call-start-symbolic"));
         row.append(&text);
+        row.append(&flip);
         row.append(&camera_button);
         row.append(&mute);
         row.append(&hangup);
@@ -137,6 +149,8 @@ impl CallBar {
             status,
             mute,
             camera_button,
+            flip,
+            which: Cell::new(0),
             video,
             remote,
             local,
@@ -164,6 +178,12 @@ impl CallBar {
             b.set_tooltip_text(Some(if muted { "Unmute" } else { "Mute" }));
             if let Some(node) = this.node() {
                 bg_quiet(move || node.set_call_muted(muted));
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.flip.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.switch_camera();
             }
         });
         let weak = Rc::downgrade(&this);
@@ -337,9 +357,22 @@ impl CallBar {
         }
     }
 
+    /// The next camera, if there's more than one.
+    fn switch_camera(self: &Rc<Self>) {
+        let n = crate::camera::count();
+        if n < 2 || self.camera.borrow().is_none() {
+            return;
+        }
+        self.which.set((self.which.get() + 1) % n);
+        // Close this one first: some can't run alongside another.
+        self.camera.borrow_mut().take();
+        self.start_camera();
+    }
+
     /// Shows the video area while either side sends video.
     fn layout(&self) {
         let ours = self.camera.borrow().is_some();
+        self.flip.set_visible(ours && crate::camera::count() > 1);
         self.local.set_visible(ours);
         self.video.set_visible(ours || self.peer_video.get());
     }
@@ -385,6 +418,7 @@ impl CallBar {
         let (tx, rx) = async_channel::bounded::<Picture>(1);
         let sender = node.clone();
         let started = Camera::start(
+            self.which.get(),
             Box::new(move |w, h, i420| {
                 sender.send_video_frame(w, h, 0, i420.to_vec());
             }),

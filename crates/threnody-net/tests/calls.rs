@@ -256,4 +256,12 @@ async fn calls_over_tcp_move_to_quic() {
         .unwrap();
     assert_eq!(got, (1, b"after the move".to_vec()));
     assert_eq!(alice.call().unwrap().phase, CallPhase::Active);
+    // Neither side saw a disconnection while it moved, nor once the old
+    // session closed after its grace period.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for rx in [&mut arx, &mut brx] {
+        while let Ok(e) = rx.try_recv() {
+            assert!(!matches!(e, Event::Disconnected { .. }), "{e:?}");
+        }
+    }
 }

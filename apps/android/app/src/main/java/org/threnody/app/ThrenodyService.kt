@@ -20,8 +20,26 @@ class ThrenodyService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        running = this
+        foreground(intent?.action == ACTION_CALL || Calls.current != null)
+        // Restarted by the system without the Activity: bring the node up here.
+        Thread { Threnody.start(applicationContext) }.start()
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        if (running === this) running = null
+        super.onDestroy()
+    }
+
+    /**
+     * In a call, the service holds the microphone too: without that, Android
+     * cuts a backgrounded app off from it, and the call fails.
+     */
+    private fun foreground(call: Boolean) {
         channels(this)
-        val n = Notification.Builder(this, CHANNEL_SERVICE)
+        // In a call, the call's own notification (back to it, Hang up).
+        val n = Calls.callNotification(this).takeIf { call } ?: Notification.Builder(this, CHANNEL_SERVICE)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Threnody is running")
             .setContentText("Connected peers can reach you.")
@@ -29,13 +47,17 @@ class ThrenodyService : Service() {
             .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(ID_SERVICE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            if (call && Calls.hasMicrophone(this)) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            try {
+                startForeground(ID_SERVICE, n, types)
+            } catch (e: Exception) {
+                // Not allowed the microphone just now (in the background): carry on without.
+                startForeground(ID_SERVICE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+            }
         } else {
             startForeground(ID_SERVICE, n)
         }
-        // Restarted by the system without the Activity: bring the node up here.
-        Thread { Threnody.start(applicationContext) }.start()
-        return START_STICKY
     }
 
     companion object {
@@ -46,6 +68,23 @@ class ThrenodyService : Service() {
 
         fun start(ctx: Context) {
             ctx.startForegroundService(Intent(ctx, ThrenodyService::class.java))
+        }
+
+        private const val ACTION_CALL = "org.threnody.app.IN_CALL"
+        @Volatile private var running: ThrenodyService? = null
+
+        /**
+         * A call started (`on`, while the app is in front, as Android
+         * requires for the microphone) or ended: the service holds the
+         * microphone, or lets go.
+         */
+        fun inCall(ctx: Context, on: Boolean) {
+            val s = running
+            if (s != null) {
+                android.os.Handler(android.os.Looper.getMainLooper()).post { s.foreground(on) }
+            } else if (on) {
+                ctx.startForegroundService(Intent(ctx, ThrenodyService::class.java).setAction(ACTION_CALL))
+            }
         }
 
         /** Shows an incoming message while its chat isn't on screen. */

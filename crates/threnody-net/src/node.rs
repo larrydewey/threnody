@@ -393,6 +393,9 @@ impl Route {
     }
 }
 
+/// How long a replaced session lingers (see `spawn_session`).
+const REPLACED_GRACE: Duration = Duration::from_secs(2);
+
 struct SessionHandle {
     id: u64,
     tx: mpsc::UnboundedSender<AppMessage>,
@@ -1340,7 +1343,7 @@ impl Node {
             },
         );
         self.shared.emit(Event::ReachNote {
-            note: match old {
+            note: match &old {
                 Some(o) => format!(
                     "{note}, replacing one {} {} ms old",
                     if o.info.outbound {
@@ -1353,6 +1356,15 @@ impl Node {
                 None => note,
             },
         });
+        // The replaced session ends a moment later, not at once: had it
+        // closed now, the peer could see that before the new session reaches
+        // it, and report a disconnection (a call moving to QUIC, say).
+        if let Some(o) = old {
+            tokio::spawn(async move {
+                tokio::time::sleep(REPLACED_GRACE).await;
+                drop(o);
+            });
+        }
         self.shared.emit(Event::Connected {
             peer,
             addr,

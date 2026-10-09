@@ -17,30 +17,39 @@ import android.view.Surface
 import uniffi.threnody_ffi.ThrenodyNode
 
 /**
- * The front camera, for video calls: each frame goes to the call as I420
- * (with how far to turn it to be upright), and, if given, to a preview
- * surface for our own picture. Nothing is kept. [stop] closes the camera
- * (the indicator goes off).
+ * A camera, for video calls: each frame goes to the call as I420 (with how
+ * far to turn it to be upright), and, if given, to a preview surface for
+ * our own picture. Nothing is kept. [stop] closes the camera (the
+ * indicator goes off).
  */
-class CallCamera(private val ctx: Context, private val node: ThrenodyNode) {
+class CallCamera(private val ctx: Context, private val node: ThrenodyNode, private val front: Boolean = true) {
     private val thread = HandlerThread("call-camera").apply { start() }
     private val handler = Handler(thread.looper)
+    // Frames on a thread of their own: closing the camera waits for its
+    // buffers to come back, which can't happen on the thread doing the
+    // closing.
+    private val frameThread = HandlerThread("call-camera-frames").apply { start() }
+    private val frameHandler = Handler(frameThread.looper)
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
+    /** Our preview's surface: released with the camera, so the next one can use the view. */
+    private var previewSurface: Surface? = null
+    /** Set by [stop]: callbacks still on their way find the camera gone. */
+    @Volatile private var stopped = false
+    /** Counted down once the camera has really closed (not just been asked to). */
+    private val closed = java.util.concurrent.CountDownLatch(1)
     /** Reused for every frame: width × height luma, then U, then V. */
     private var i420 = ByteArray(0)
 
-    /** Opens the front camera; `preview` (a TextureView's) shows our own picture. */
+    /** Opens the front (or back) camera; `preview` (a TextureView's) shows our own picture. */
     @SuppressLint("MissingPermission") // CallActivity asks for the camera first.
     fun start(preview: SurfaceTexture?) {
         val cm = ctx.getSystemService(CameraManager::class.java) ?: return
-        val id = cm.cameraIdList.firstOrNull {
-            cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-        } ?: cm.cameraIdList.firstOrNull() ?: return
+        val id = idFor(ctx, front) ?: cm.cameraIdList.firstOrNull() ?: return
         val chars = cm.getCameraCharacteristics(id)
         // The phone is held upright (the call screen is portrait): the
-        // sensor's own angle is how far to turn each frame.
+        // sensor's own angle is how far to turn each frame, front or back.
         val rotation = (chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0).toUInt()
         val r = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
         r.setOnImageAvailableListener({ ir ->
@@ -50,33 +59,45 @@ class CallCamera(private val ctx: Context, private val node: ThrenodyNode) {
             } finally {
                 img.close()
             }
-        }, handler)
+        }, frameHandler)
         reader = r
         val surfaces = mutableListOf(r.surface)
         preview?.let {
             it.setDefaultBufferSize(WIDTH, HEIGHT)
-            surfaces.add(Surface(it))
+            surfaces.add(Surface(it).also { s -> previewSurface = s })
         }
         cm.openCamera(id, object : CameraDevice.StateCallback() {
             override fun onOpened(d: CameraDevice) {
                 device = d
-                @Suppress("DEPRECATION") // The list form works back to API 29.
-                d.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(s: CameraCaptureSession) {
-                        session = s
-                        val req = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                            surfaces.forEach { addTarget(it) }
-                            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(15, 30))
+                if (stopped) return d.close()
+                try {
+                    @Suppress("DEPRECATION") // The list form works back to API 29.
+                    d.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(s: CameraCaptureSession) {
+                            session = s
+                            // Stopped meanwhile (the screen went): its preview is gone.
+                            if (stopped) return s.close()
+                            try {
+                                val req = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                    surfaces.forEach { addTarget(it) }
+                                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(15, 30))
+                                }
+                                s.setRepeatingRequest(req.build(), null, handler)
+                            } catch (e: Exception) {
+                                Threnody.say("! camera: ${e.javaClass.simpleName}")
+                            }
                         }
-                        s.setRepeatingRequest(req.build(), null, handler)
-                    }
 
-                    override fun onConfigureFailed(s: CameraCaptureSession) {
-                        Threnody.say("! camera: couldn't configure")
-                    }
-                }, handler)
+                        override fun onConfigureFailed(s: CameraCaptureSession) {
+                            if (!stopped) Threnody.say("! camera: couldn't configure")
+                        }
+                    }, handler)
+                } catch (e: Exception) {
+                    Threnody.say("! camera: ${e.javaClass.simpleName}")
+                }
             }
 
+            override fun onClosed(d: CameraDevice) = closed.countDown()
             override fun onDisconnected(d: CameraDevice) = d.close()
             override fun onError(d: CameraDevice, error: Int) {
                 Threnody.say("! camera error $error")
@@ -85,16 +106,29 @@ class CallCamera(private val ctx: Context, private val node: ThrenodyNode) {
         }, handler)
     }
 
+    /**
+     * Closes the camera and waits (briefly) until it is: another camera,
+     * opened next (a switch), often can't start while this one holds the
+     * camera system.
+     */
     fun stop() {
+        stopped = true
         handler.post {
             session?.close()
-            device?.close()
-            reader?.close()
+            // onClosed follows, on this thread, once it has let go.
+            device?.close() ?: closed.countDown()
             session = null
             device = null
+        }
+        closed.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        frameHandler.post {
+            reader?.close()
+            previewSurface?.release()
             reader = null
+            previewSurface = null
         }
         thread.quitSafely()
+        frameThread.quitSafely()
     }
 
     /** Copies a YUV_420_888 image (any strides) into I420. */
@@ -127,5 +161,17 @@ class CallCamera(private val ctx: Context, private val node: ThrenodyNode) {
     companion object {
         const val WIDTH = 640
         const val HEIGHT = 480
+
+        /** The first front (or back) camera, if the phone has one. */
+        fun idFor(ctx: Context, front: Boolean): String? {
+            val cm = ctx.getSystemService(CameraManager::class.java) ?: return null
+            val want = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            return try {
+                cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want }
+            } catch (_: Exception) { null }
+        }
+
+        /** Whether there's both a front and a back camera to switch between. */
+        fun canSwitch(ctx: Context) = idFor(ctx, true) != null && idFor(ctx, false) != null
     }
 }

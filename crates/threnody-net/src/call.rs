@@ -61,8 +61,24 @@ pub struct CallInfo {
     pub answered_ms: u64,
 }
 
+/// How a call's media is moving, for diagnostics: counts only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallStats {
+    /// Packets sent as QUIC datagrams, in the session stream, and those
+    /// that couldn't be sent (the link was congested or gone).
+    pub sent_datagrams: u64,
+    pub sent_stream: u64,
+    pub send_failed: u64,
+    /// Packets received that opened, that didn't, and that the media layer
+    /// was too far behind to take.
+    pub received: u64,
+    pub rejected: u64,
+    pub dropped: u64,
+}
+
 struct Call {
     info: CallInfo,
+    stats: CallStats,
     /// The secret we contributed (offer or answer), and the offer's when
     /// we're the callee.
     secret: Zeroizing<[u8; 32]>,
@@ -126,6 +142,7 @@ impl Node {
                 answered_ms: 0,
             },
             secret,
+            stats: CallStats::default(),
             offer_secret: None,
             keys: None,
             last_rx_ms: 0,
@@ -245,14 +262,32 @@ impl Node {
             let keys = c.keys.as_mut().ok_or(NetError::Closed)?;
             (c.info.peer, keys.seal(stream, payload)?)
         };
-        if let Some(conn) = self.datagrams_to(&peer)
+        let (sent, datagram) = if let Some(conn) = self.datagrams_to(&peer)
             && conn.max_datagram_size().is_some_and(|m| packet.len() <= m)
         {
-            return Ok(conn.send_datagram(packet.into()).is_ok());
+            (conn.send_datagram(packet.into()).is_ok(), true)
+        } else {
+            // No datagrams on this link: the stream keeps order and
+            // delivers everything, late or not.
+            (self.send(&peer, AppMessage::Media(packet)).is_ok(), false)
+        };
+        if let Some(c) = lock(&self.shared.calls)
+            .current
+            .as_mut()
+            .filter(|c| c.info.call == id)
+        {
+            match (sent, datagram) {
+                (true, true) => c.stats.sent_datagrams += 1,
+                (true, false) => c.stats.sent_stream += 1,
+                (false, _) => c.stats.send_failed += 1,
+            }
         }
-        // No datagrams on this link: the stream keeps order and delivers
-        // everything, late or not.
-        self.send(&peer, AppMessage::Media(packet)).map(|()| true)
+        Ok(sent)
+    }
+
+    /// How the current call's media is moving (counts only).
+    pub fn call_stats(&self) -> Option<CallStats> {
+        lock(&self.shared.calls).current.as_ref().map(|c| c.stats)
     }
 
     /// Whether media to `peer` goes as datagrams (else in the session
@@ -393,6 +428,7 @@ impl Node {
                 answered_ms: 0,
             },
             secret: Zeroizing::new(random_bytes::<32>()),
+            stats: CallStats::default(),
             offer_secret: Some(Zeroizing::new(offer)),
             keys: None,
             last_rx_ms: 0,
@@ -424,10 +460,16 @@ impl Node {
         let (Some(keys), Some(tx)) = (c.keys.as_mut(), c.media_tx.as_ref()) else {
             return;
         };
-        if let Ok(m) = keys.open(packet) {
-            c.last_rx_ms = now_ms();
-            // Full: the media layer is behind; dropping is what it'd do.
-            let _ = tx.try_send(m);
+        match keys.open(packet) {
+            Ok(m) => {
+                c.last_rx_ms = now_ms();
+                c.stats.received += 1;
+                // Full: the media layer is behind; dropping is what it'd do.
+                if tx.try_send(m).is_err() {
+                    c.stats.dropped += 1;
+                }
+            }
+            Err(_) => c.stats.rejected += 1,
         }
     }
 

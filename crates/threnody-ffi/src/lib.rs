@@ -28,7 +28,7 @@ pub use volunteer::{
     CredentialAskRecord, CredentialOfferRecord, CredentialRecord, DirectoryRecord,
 };
 
-pub use calls::{CallRecord, VideoFrame};
+pub use calls::{CallRecord, CallStats, VideoFrame};
 pub use groups::{GroupInfo, GroupInvite};
 use threnody_groups::node::GroupNode;
 
