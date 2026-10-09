@@ -1727,35 +1727,74 @@ impl App {
                 ui::choose(
                     &this.window,
                     "Your devices",
-                    "Devices in one account share contacts and message history. Click one to rename it.",
+                    "Devices in one account share contacts and message history. \
+                     Click one to rename it, or to remove a lost or retired one.",
                     &names,
                     None,
                     move |i| {
                         let Some(this) = weak.upgrade() else { return };
                         let d = devices[i].clone();
-                        let weak = Rc::downgrade(&this);
-                        ui::ask_text(
+                        if d.this_device || devices.len() < 2 {
+                            this.rename_device(d);
+                            return;
+                        }
+                        let (weak, name) = (Rc::downgrade(&this), d.name.clone());
+                        ui::choose(
                             &this.window,
-                            "Rename device",
-                            "Your other devices and your contacts see this name.",
-                            "Name",
-                            &d.name,
-                            "Save",
-                            move |name| {
-                                if let (Some(t), false) = (weak.upgrade(), name.is_empty()) {
-                                    let fp = d.fingerprint.clone();
-                                    let ok = format!("Renamed to {name}");
-                                    t.run(
-                                        None,
-                                        "rename",
-                                        move |n| n.rename_device(fp, name),
-                                        Some(ok),
-                                    );
+                            &name,
+                            "",
+                            &["Rename".to_owned(), "Remove from account".to_owned()],
+                            None,
+                            move |i| {
+                                let Some(this) = weak.upgrade() else { return };
+                                if i == 0 {
+                                    this.rename_device(d.clone());
+                                } else {
+                                    this.remove_device(d.clone());
                                 }
                             },
                         );
                     },
                 );
+            },
+        );
+    }
+
+    fn rename_device(self: &Rc<Self>, d: threnody_ffi::DeviceInfo) {
+        let weak = Rc::downgrade(self);
+        ui::ask_text(
+            &self.window,
+            "Rename device",
+            "Your other devices and your contacts see this name.",
+            "Name",
+            &d.name,
+            "Save",
+            move |name| {
+                if let (Some(t), false) = (weak.upgrade(), name.is_empty()) {
+                    let fp = d.fingerprint.clone();
+                    let ok = format!("Renamed to {name}");
+                    t.run(None, "rename", move |n| n.rename_device(fp, name), Some(ok));
+                }
+            },
+        );
+    }
+
+    fn remove_device(self: &Rc<Self>, d: threnody_ffi::DeviceInfo) {
+        let weak = Rc::downgrade(self);
+        ui::confirm(
+            &self.window,
+            &format!("Remove {}?", d.name),
+            "It leaves your account: your other devices and your contacts stop trusting it, \
+             and it gets no more of your messages. Do this for a lost or retired device. \
+             To use it again, link it anew.",
+            "Remove",
+            true,
+            move || {
+                if let Some(t) = weak.upgrade() {
+                    let fp = d.fingerprint.clone();
+                    let ok = format!("Removed {}", d.name);
+                    t.run(None, "remove", move |n| n.remove_device(fp), Some(ok));
+                }
             },
         );
     }

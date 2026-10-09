@@ -584,6 +584,11 @@ object Threnody {
                             "Proved who they are. Open the chat to add them.", persona)
                     }
                 }
+                is NodeEvent.ThisDeviceRemoved -> {
+                    say("! this device was removed from its account")
+                    ThrenodyService.notifyAccount(ctx, "This device was removed from your account. " +
+                        "Your contacts no longer accept it as you.")
+                }
                 is NodeEvent.AccountChanged -> {
                     say("· $e")
                     // A verified contact gained a device we haven't verified.

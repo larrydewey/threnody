@@ -1608,6 +1608,25 @@ PersistentKeepalive = 25\n",
         self.node.rename_device(&d, &name).map_err(fail)
     }
 
+    /// Removes a device from our account (`device` = fingerprint): a lost
+    /// or retired one, or this one (it then leaves the account). Every
+    /// sibling and contact stops trusting it; this device gets
+    /// `ThisDeviceRemoved` if it's the one. The account's only device
+    /// can't be removed.
+    pub fn remove_device(&self, device: String) -> Result<()> {
+        let d = self
+            .node
+            .account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, _)| *d)
+            .find(|d| fp(d) == device || d.fingerprint().compact() == device)
+            .ok_or_else(|| fail("not a device of this account"))?;
+        let _guard = self.rt.enter();
+        self.node.remove_device(&d).map_err(fail)
+    }
+
     /// A one-time code for a new device to join this account.
     pub fn create_link_code(&self, addr: String) -> String {
         self.node.create_link_code(addr).to_string()
@@ -2415,6 +2434,18 @@ mod tests {
         bob.reconnect();
         let e = wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
         assert!(matches!(e, NodeEvent::Connected { peer, .. } if peer == a_fp));
+    }
+
+    #[test]
+    fn the_only_device_or_a_stranger_cant_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let node =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let me = node.device_fingerprint();
+        assert_eq!(node.devices().len(), 1);
+        assert!(node.remove_device(me).is_err(), "the account's only device");
+        assert!(node.remove_device("not a device".into()).is_err());
+        assert_eq!(node.devices().len(), 1);
     }
 
     #[test]

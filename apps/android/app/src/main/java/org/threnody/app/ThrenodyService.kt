@@ -96,6 +96,24 @@ class ThrenodyService : Service() {
             post(ctx, notificationKey(key, persona), titled(from, persona), text, open)
         }
 
+        /** About this device's account (it was removed from it); opens the app. */
+        fun notifyAccount(ctx: Context, text: String) {
+            channels(ctx)
+            val n = Notification.Builder(ctx, CHANNEL_MESSAGES)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Threnody")
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setContentIntent(PendingIntent.getActivity(ctx, "account".hashCode(),
+                    Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+                .setAutoCancel(true)
+                .build()
+            try {
+                ctx.getSystemService(NotificationManager::class.java)?.notify("account", ID_MESSAGE, n)
+            } catch (_: SecurityException) {
+            }
+        }
+
         /** Conversations of different identities never share a notification. */
         fun notificationKey(key: String, persona: String?) = if (persona == null) key else "$persona:$key"
 
