@@ -28,7 +28,7 @@ pub use volunteer::{
     CredentialAskRecord, CredentialOfferRecord, CredentialRecord, DirectoryRecord,
 };
 
-pub use calls::CallRecord;
+pub use calls::{CallRecord, VideoFrame};
 pub use groups::{GroupInfo, GroupInvite};
 use threnody_groups::node::GroupNode;
 
@@ -2010,7 +2010,54 @@ mod tests {
             until(&brx, &connected);
             eprintln!("call {round}: audio connected after {:?}", t0.elapsed());
             bob.set_call_muted(true);
-            std::thread::sleep(Duration::from_secs(2));
+            // Alice turns her camera on; Bob sees her frames.
+            alice.set_call_video(true).unwrap();
+            until(&brx, &|e| {
+                matches!(e, NodeEvent::CallVideo { video: true, .. })
+            });
+            let frame = [vec![90u8; 320 * 240], vec![128u8; 2 * 160 * 120]].concat();
+            let (sender, stop) = (
+                alice.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            let s2 = stop.clone();
+            let pusher = std::thread::spawn(move || {
+                while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert!(sender.send_video_frame(320, 240, 90, frame.clone()));
+                    std::thread::sleep(Duration::from_millis(33));
+                }
+            });
+            // The first frames can be WebRTC's black ones (sent before ours
+            // arrive): wait for the grey picture.
+            let mut got = None;
+            for _ in 0..100 {
+                if let Some(f) = bob.next_video_frame(100)
+                    && f.rgba.chunks(4).any(|p| p[0] > 40)
+                {
+                    got = Some(f);
+                    break;
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            pusher.join().unwrap();
+            let f = got.expect("Bob got a video frame");
+            assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
+            // Upright either way: turned by the sender, or tagged to turn.
+            let upright = if f.rotation % 180 == 90 {
+                (f.height, f.width)
+            } else {
+                (f.width, f.height)
+            };
+            assert!(
+                upright.0 < upright.1,
+                "sent portrait (320x240 turned 90°): {f:?}"
+            );
+            eprintln!(
+                "call {round}: video {}x{} after {:?}",
+                f.width,
+                f.height,
+                t0.elapsed()
+            );
             alice.hangup_call(id);
             until(&brx, &|e| matches!(e, NodeEvent::CallEnded { .. }));
             std::thread::sleep(Duration::from_millis(500));

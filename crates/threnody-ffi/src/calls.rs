@@ -24,6 +24,28 @@ pub struct CallRecord {
     pub answered_ms: u64,
 }
 
+/// A frame of the peer's video, ready to draw.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct VideoFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Degrees clockwise to turn it to be upright.
+    pub rotation: u32,
+    /// `width × height` pixels, 4 bytes each: red, green, blue, alpha.
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for VideoFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not the pixels: megabytes, and not for logs.
+        write!(
+            f,
+            "VideoFrame({}x{}, {}°)",
+            self.width, self.height, self.rotation
+        )
+    }
+}
+
 /// Words for why a call ended, for `NodeEvent::CallEnded`.
 pub(crate) fn reason(r: HangupReason) -> String {
     match r {
@@ -86,12 +108,8 @@ impl ThrenodyNode {
         match e {
             threnody_net::Event::CallStarted { call, .. } => {
                 // The callee started its media when it answered.
-                if self
-                    .node
-                    .call()
-                    .is_some_and(|c| c.call == *call && c.outgoing)
-                {
-                    self.media.start(*call);
+                if let Some(c) = self.node.call().filter(|c| c.call == *call && c.outgoing) {
+                    self.media.start(*call, c.video);
                 }
             }
             threnody_net::Event::CallSignal { call, data, .. } => {
@@ -127,7 +145,7 @@ impl ThrenodyNode {
         let _guard = self.rt.enter();
         self.node.answer_call(id, video).map_err(fail)?;
         #[cfg(feature = "calls")]
-        self.media.start(id);
+        self.media.start(id, video);
         Ok(())
     }
 
@@ -142,6 +160,51 @@ impl ThrenodyNode {
         self.media.set_muted(muted);
         #[cfg(not(feature = "calls"))]
         let _ = muted;
+    }
+
+    /// Turns our video on or off in the current call; the peer gets
+    /// `CallVideo`. Frames come from `send_video_frame`.
+    pub fn set_call_video(&self, on: bool) -> Result<()> {
+        let c = self.node.call().ok_or_else(|| fail("not in a call"))?;
+        self.node.set_call_video(c.call, on).map_err(fail)?;
+        #[cfg(feature = "calls")]
+        self.media.set_video(on);
+        Ok(())
+    }
+
+    /// One camera frame for the current call: I420, the `width × height`
+    /// luma plane then the U and V planes at half size, turned `rotation`
+    /// degrees clockwise to be upright. False when there's no call to send
+    /// it in (or the frame is the wrong size).
+    pub fn send_video_frame(&self, width: u32, height: u32, rotation: u32, i420: Vec<u8>) -> bool {
+        #[cfg(feature = "calls")]
+        return self.media.send_video(width, height, rotation, &i420);
+        #[cfg(not(feature = "calls"))]
+        {
+            let _ = (width, height, rotation, i420);
+            false
+        }
+    }
+
+    /// The newest frame of the peer's video, waiting up to `timeout_ms`;
+    /// each is returned once, and older ones are skipped.
+    pub fn next_video_frame(&self, timeout_ms: u32) -> Option<VideoFrame> {
+        #[cfg(feature = "calls")]
+        {
+            let wait = std::time::Duration::from_millis(u64::from(timeout_ms));
+            let f = self.rt.block_on(self.media.next_frame(wait))?;
+            Some(VideoFrame {
+                width: f.width,
+                height: f.height,
+                rotation: f.rotation,
+                rgba: f.rgba,
+            })
+        }
+        #[cfg(not(feature = "calls"))]
+        {
+            let _ = timeout_ms;
+            None
+        }
     }
 
     /// The current call, if any.

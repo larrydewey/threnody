@@ -4,6 +4,7 @@
 //! opens here as it is.
 
 mod call;
+mod camera;
 mod chat;
 mod core;
 mod keyring;

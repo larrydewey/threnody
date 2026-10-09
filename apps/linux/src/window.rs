@@ -987,10 +987,10 @@ impl App {
                 ));
                 (None, None)
             }
-            NodeEvent::CallIncoming { peer, call, .. } => {
+            NodeEvent::CallIncoming { peer, call, video } => {
                 let title = self.title_of(persona.as_deref(), peer);
                 self.call
-                    .incoming(persona.clone(), *call, &title, &self.window);
+                    .incoming(persona.clone(), *call, &title, *video, &self.window);
                 if !self.window.is_active() {
                     self.notify_call(&title);
                 }
@@ -1000,8 +1000,14 @@ impl App {
                 self.call.ringing(*call);
                 (None, None)
             }
-            NodeEvent::CallStarted { call, .. } => {
-                self.call.started(*call);
+            NodeEvent::CallStarted {
+                call, peer_video, ..
+            } => {
+                self.call.started(*call, *peer_video);
+                (None, None)
+            }
+            NodeEvent::CallVideo { call, video, .. } => {
+                self.call.peer_video(*call, *video);
                 (None, None)
             }
             NodeEvent::CallMedia { call, state } => {
@@ -1096,8 +1102,8 @@ impl App {
 
     /// Shows a notification; unless the user turned private notifications
     /// off, it says only "New message".
-    /// Calls `conv` (a contact).
-    pub fn start_call(self: &Rc<Self>, conv: &Conversation) {
+    /// Calls `conv` (a contact), with our camera on if `video`.
+    pub fn start_call(self: &Rc<Self>, conv: &Conversation, video: bool) {
         if self.call.busy() {
             return self.toast("You're already in a call.");
         }
@@ -1108,11 +1114,11 @@ impl App {
         let (device, title) = (conv.device.clone(), conv.title.clone());
         let weak = Rc::downgrade(self);
         bg(
-            move || node.start_call(device, false),
+            move || node.start_call(device, video),
             move |r| {
                 let Some(this) = weak.upgrade() else { return };
                 match r {
-                    Ok(id) => this.call.outgoing(persona, id, &title),
+                    Ok(id) => this.call.outgoing(persona, id, &title, video),
                     Err(e) => this.toast(&format!("Couldn't call {title}: {e}")),
                 }
             },

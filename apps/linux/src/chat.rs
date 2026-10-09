@@ -140,18 +140,23 @@ impl ChatView {
             .sync_create()
             .build();
         header.pack_end(&find);
-        // Calls are with contacts (not groups, yet).
+        // Calls are with contacts (not groups, yet): voice, or video.
         if conv.group.is_none() && conv.invite.is_none() {
-            let call = gtk::Button::from_icon_name("call-start-symbolic");
-            call.set_tooltip_text(Some("Call"));
-            let weak_app = Rc::downgrade(app);
-            let c = conv.clone();
-            call.connect_clicked(move |_| {
-                if let Some(app) = weak_app.upgrade() {
-                    app.start_call(&c);
-                }
-            });
-            header.pack_end(&call);
+            for (icon, tip, video) in [
+                ("camera-video-symbolic", "Video call", true),
+                ("call-start-symbolic", "Call", false),
+            ] {
+                let call = gtk::Button::from_icon_name(icon);
+                call.set_tooltip_text(Some(tip));
+                let weak_app = Rc::downgrade(app);
+                let c = conv.clone();
+                call.connect_clicked(move |_| {
+                    if let Some(app) = weak_app.upgrade() {
+                        app.start_call(&c, video);
+                    }
+                });
+                header.pack_end(&call);
+            }
         }
 
         let banner = gtk::Box::new(gtk::Orientation::Vertical, 6);

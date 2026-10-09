@@ -124,3 +124,12 @@ windowtitle.warning .subtitle {
     background-color: alpha(@accent_bg_color, 0.15);
     border-bottom: 1px solid alpha(@borders, 0.5);
 }
+
+/* Video in a call: the peer on black, ourselves in the corner. */
+.call-video {
+    background-color: black;
+}
+.call-self {
+    border-radius: 8px;
+    border: 1px solid alpha(white, 0.4);
+}

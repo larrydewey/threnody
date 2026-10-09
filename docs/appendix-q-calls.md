@@ -1,6 +1,6 @@
 # Appendix Q: Voice and Video Calls (v1)
 
-Status: signalling, media keys and transport implemented in `threnody-core::call` and `threnody-net::call`. Media (WebRTC) is in `threnody-media`; the FFI, the Linux app and the Android app use it. Audio only so far: video and group calls are not done yet.
+Status: signalling, media keys and transport implemented in `threnody-core::call` and `threnody-net::call`. Media (WebRTC) is in `threnody-media`; the FFI, the Linux app and the Android app use it. Voice and video between two people; group calls are not done yet.
 
 ## Overview
 
@@ -59,6 +59,16 @@ packet = call (8) || seq (8) || ChaCha20-Poly1305(k_dir, nonce = 0^4 || seq,
 - **Size limit.** The largest payload is 1400 bytes.
 - **QUIC paths.** Over a QUIC session, packets go as QUIC datagrams (RFC 9221). Quinn's send buffer is small (64 KiB), so under congestion old media is dropped, not queued. A packet too large for the path's current datagram size goes in the stream instead.
 - **Other links.** On links without datagrams (TCP, Bluetooth, relays), packets go as `AppMessage::Media` (kind 26) in the session stream: delivered in order and late rather than lost.
+- **Moving to QUIC.** When a call starts on a direct TCP session, the side that dialed it also dials the peer's QUIC endpoint at the same address (nodes listen on both). The new session replaces the TCP one, and the call carries on, since its keys aren't the session's. Only the dialer does this, so the two sides never race. Over TCP on a phone's Wi-Fi, video stalled for seconds behind single late packets. Over QUIC it ran at a steady 25 to 30 frames a second.
+
+## Video
+
+Every call negotiates an audio and a video track from the start, on both sides. The video track stays disabled until that side turns its camera on (`CallMsg::Update`), so a camera never needs a new offer, and the two sides can't collide by renegotiating at once.
+
+- **Apps send frames.** They give the call I420 frames, 640×480 (WebRTC scales them and adapts to the bandwidth), with how far to turn each to be upright. The Android app reads the front camera (Camera2) and gives the sensor's orientation. The Linux app reads the camera through GStreamer (`v4l2src`).
+- **Apps receive frames.** They get the peer's newest frame as RGBA, with its rotation, through `next_video_frame`. Older frames are dropped, since a late frame isn't worth drawing.
+- **Previews.** Each app shows its own picture from the camera directly, mirrored. It never goes through the call.
+- **Camera lifetime.** The camera runs only while the call wants video. On Android it also needs the call screen open. It stops when the call ends.
 
 ## The loopback TURN server
 
@@ -86,7 +96,7 @@ Inside, WebRTC still runs DTLS-SRTP. Its certificate fingerprints travel only in
 
 ## Not yet
 
-- Video (capture, rendering, the `update` flag's UI).
+- Video: switching cameras, screen sharing, hardware-texture rendering (frames are copied as RGBA), and a frame size limited to the path's QUIC datagrams before path MTU discovery.
 - Android: a calls foreground-service type (the microphone in the background), and Telecom integration (`ConnectionService`: Bluetooth headsets, car audio, other calls).
 - Ringing every device of an account, with `answered elsewhere` and `declined elsewhere`.
 - Group calls.

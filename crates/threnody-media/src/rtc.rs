@@ -26,10 +26,24 @@ use libwebrtc::peer_connection_factory::{
     IceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
 };
 use libwebrtc::session_description::{SdpType, SessionDescription};
+use libwebrtc::video_frame::{I420Buffer, VideoFrame, VideoRotation};
+use libwebrtc::video_source::VideoResolution;
+use libwebrtc::video_source::native::NativeVideoSource;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::turn::{Output, Turn};
+
+/// The resolution video is negotiated at; WebRTC scales what it's given
+/// and adapts to the bandwidth.
+pub const VIDEO_WIDTH: u32 = 640;
+pub const VIDEO_HEIGHT: u32 = 480;
+
+fn time_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64)
+}
 
 /// One factory per process: it owns WebRTC's threads and audio device.
 pub fn factory() -> &'static PeerConnectionFactory {
@@ -124,6 +138,9 @@ pub struct MediaSession {
     device: bool,
     /// What we send, to mute.
     audio: Option<MediaStreamTrack>,
+    /// Our camera's frames go here (see [`MediaSession::send_video`]).
+    video: NativeVideoSource,
+    video_track: MediaStreamTrack,
 }
 
 impl MediaSession {
@@ -174,6 +191,21 @@ impl MediaSession {
         pc.on_track(Some(Box::new(on_track)));
         pc.on_connection_state_change(Some(Box::new(on_state)));
 
+        // Video is negotiated from the start, off until the camera turns
+        // on: turning it on then needs no new offer (and no glare when both
+        // sides do it at once).
+        let video = NativeVideoSource::new(
+            VideoResolution {
+                width: VIDEO_WIDTH,
+                height: VIDEO_HEIGHT,
+            },
+            false,
+        );
+        let video_track =
+            MediaStreamTrack::Video(factory().create_video_track("video", video.clone()));
+        video_track.set_enabled(false);
+        pc.add_track(video_track.clone(), &["call"])
+            .map_err(|e| anyhow!("video track: {e:?}"))?;
         let mut session = Self {
             pc,
             from_peer,
@@ -181,6 +213,8 @@ impl MediaSession {
             signal,
             device: false,
             audio: None,
+            video,
+            video_track,
         };
         if matches!(audio, AudioIn::Device) {
             // Microphone and speaker for as long as this call lasts
@@ -211,6 +245,7 @@ impl MediaSession {
                 .pc
                 .create_offer(OfferOptions {
                     offer_to_receive_audio: true,
+                    offer_to_receive_video: true,
                     ..Default::default()
                 })
                 .await
@@ -291,6 +326,26 @@ impl MediaSession {
         if let Some(t) = &self.audio {
             t.set_enabled(!muted);
         }
+    }
+
+    /// Starts (or stops) sending our video; frames come from
+    /// [`MediaSession::send_video`].
+    pub fn set_video(&self, on: bool) {
+        self.video_track.set_enabled(on);
+    }
+
+    /// One camera frame (I420), turned `rotation` degrees clockwise to be
+    /// upright.
+    pub fn send_video(&self, frame: &I420Buffer, rotation: u32) {
+        let rotation = match rotation {
+            90 => VideoRotation::VideoRotation90,
+            180 => VideoRotation::VideoRotation180,
+            270 => VideoRotation::VideoRotation270,
+            _ => VideoRotation::VideoRotation0,
+        };
+        let mut f = VideoFrame::new(rotation, frame);
+        f.timestamp_us = time_us();
+        self.video.capture_frame(&f);
     }
 
     pub fn state(&self) -> PeerConnectionState {

@@ -23,6 +23,8 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 async-channel = "2.5"
 keyring = "4.2"
 zeroize.workspace = true
+gstreamer = "0.25.4"
+gstreamer-app = "0.25.2"
 
 [lints]
 workspace = true

@@ -7,7 +7,7 @@ apps/linux/install.sh               # build, then install for this user (~/.loca
 cargo run -p threnody-desktop       # or run it from the source tree
 ```
 
-It needs GTK 4.14 or newer and libadwaita 1.5 or newer, plus their development headers to build. On Debian or Ubuntu that's `libgtk-4-dev libadwaita-1-dev`, on Fedora `gtk4-devel libadwaita-devel`, and on Arch `gtk4 libadwaita`. The keyring is used through the Secret Service, so `libdbus-1-dev` is needed too.
+It needs GTK 4.14 or newer and libadwaita 1.5 or newer, plus their development headers to build. On Debian or Ubuntu that's `libgtk-4-dev libadwaita-1-dev`, on Fedora `gtk4-devel libadwaita-devel`, and on Arch `gtk4 libadwaita`. The keyring is used through the Secret Service, so `libdbus-1-dev` is needed too. Video calls read the camera through GStreamer: `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` (Debian, Ubuntu), `gstreamer1-devel gstreamer1-plugins-base-devel` (Fedora) or `gstreamer gst-plugins-base` (Arch), with the `v4l2src` element from the good plugins (`gstreamer1.0-plugins-good`, `gstreamer1-plugins-good`, `gst-plugins-good`).
 
 **One identity with the CLI.** The app uses the CLI's data directory (`$THRENODY_HOME`, else `~/.local/share/threnody`) and the same keyring entry. An identity created with `threnody init` opens without a prompt, and one created here works with the CLI. Don't run both on the same directory at once: two nodes with one identity fight over sessions. Only one copy of the app runs per data directory. If port 7450 is taken, the app picks another and keeps it for later runs, so invites stay valid.
 

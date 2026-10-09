@@ -108,13 +108,16 @@ async fn audio_crosses_only_through_the_call() {
         }
     });
 
-    let track = tokio::time::timeout(Duration::from_secs(10), track_rx.recv())
-        .await
-        .expect("a remote track")
-        .unwrap();
-    let MediaStreamTrack::Audio(track) = track else {
-        panic!("expected audio")
-    };
+    // Sessions carry a video track too (off here): the audio one.
+    let track = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MediaStreamTrack::Audio(t)) = track_rx.recv().await {
+                return t;
+            }
+        }
+    })
+    .await
+    .expect("a remote audio track");
     let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
     let loud = tokio::time::timeout(Duration::from_secs(10), async {
         let mut loud = 0;

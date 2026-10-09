@@ -161,6 +161,7 @@ impl Node {
         c.last_rx_ms = now_ms();
         let (peer, peer_video) = (c.info.peer, c.info.peer_video);
         drop(calls);
+        self.upgrade_for_media(peer);
         self.emit(Event::CallStarted {
             peer,
             call: id,
@@ -261,6 +262,28 @@ impl Node {
             .is_some_and(|c| c.max_datagram_size().is_some())
     }
 
+    /// A call over a TCP session we dialed: also dial the peer's QUIC
+    /// endpoint (the same address; nodes listen on both), so media can go
+    /// as datagrams. The new session replaces the TCP one; the call, whose
+    /// keys aren't the session's, carries on. Only the dialer does this, so
+    /// the two sides never race.
+    fn upgrade_for_media(&self, peer: PublicIdentity) {
+        let Some(s) = self
+            .sessions()
+            .into_iter()
+            .find(|s| s.peer == peer && s.via.is_none() && s.outbound && s.transport == "tcp")
+        else {
+            return;
+        };
+        if self.media_datagrams(&peer) || self.quic().is_none() {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            let _ = node.connect_quic(s.addr, Some(peer.fingerprint())).await;
+        });
+    }
+
     pub(crate) fn on_call(&self, peer: PublicIdentity, payload: &[u8]) {
         let Ok(m) = CallMsg::decode(payload) else {
             return;
@@ -295,6 +318,7 @@ impl Node {
                 c.info.answered_ms = now_ms();
                 c.last_rx_ms = now_ms();
                 drop(calls);
+                self.upgrade_for_media(peer);
                 self.emit(Event::CallStarted {
                     peer,
                     call: id,

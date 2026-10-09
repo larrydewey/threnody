@@ -22,9 +22,10 @@ import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
 
 /**
- * Voice calls (Appendix Q). The node runs the call and its audio (WebRTC
- * on the microphone and earpiece or speaker); this keeps track of the one
- * call, routes its audio, rings for incoming ones and opens [CallActivity].
+ * Calls (Appendix Q). The node runs the call and its audio (WebRTC on the
+ * microphone and earpiece or speaker); this keeps track of the one call,
+ * routes its audio, rings for incoming ones and opens [CallActivity], which
+ * runs the camera ([CallCamera]) and shows the video.
  */
 object Calls {
     /** The call in progress, as the screen shows it. */
@@ -41,6 +42,10 @@ object Calls {
         val since: Long = 0,
         val muted: Boolean = false,
         val speaker: Boolean = false,
+        /** We send video (the camera runs while the call screen is open). */
+        val video: Boolean = false,
+        /** They say they send video. */
+        val peerVideo: Boolean = false,
     )
 
     @Volatile var current: Call? = null
@@ -73,25 +78,31 @@ object Calls {
         }
     }
 
-    fun hasMicrophone(ctx: Context) =
-        ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    /** The permissions a call needs: the microphone, and the camera for video. */
+    private fun missing(ctx: Context, video: Boolean) =
+        listOfNotNull(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA.takeIf { video },
+        ).filter { ctx.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
 
-    /** Calls a contact (asking for the microphone first if need be). */
-    fun start(a: Activity, node: ThrenodyNode, persona: String?, device: String, title: String) {
+    /** Calls a contact, with our camera on if `video` (asking for permissions first if need be). */
+    fun start(a: Activity, node: ThrenodyNode, persona: String?, device: String, title: String, video: Boolean = false) {
         if (current != null) return Toast.makeText(a, "You're already in a call.", Toast.LENGTH_SHORT).show()
-        if (!hasMicrophone(a)) {
-            pendingCall = { start(a, node, persona, device, title) }
-            return a.requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), MICROPHONE)
+        val need = missing(a, video)
+        if (need.isNotEmpty()) {
+            pendingCall = { start(a, node, persona, device, title, video) }
+            return a.requestPermissions(need.toTypedArray(), MICROPHONE)
         }
         Threading.background {
-            val id = try { node.startCall(device, false) } catch (e: Exception) {
+            val id = try { node.startCall(device, video) } catch (e: Exception) {
                 return@background a.runOnUiThread {
                     Toast.makeText(a, "Couldn't call $title: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
             ended = null
-            current = Call(node, persona, id, device, title, outgoing = true, state = "calling")
+            current = Call(node, persona, id, device, title, outgoing = true, state = "calling", video = video, speaker = video)
             inCall(a, true)
+            if (video) route(a, true)
             changed()
             a.startActivity(Intent(a, CallActivity::class.java))
         }
@@ -109,18 +120,21 @@ object Calls {
         if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) run?.invoke()
     }
 
-    fun answer(a: Activity) {
+    /** Answers the incoming call, with our camera on if `video`. */
+    fun answer(a: Activity, video: Boolean = false) {
         val c = current?.takeIf { it.state == "incoming" } ?: return
-        if (!hasMicrophone(a)) {
-            pendingCall = { answer(a) }
-            return a.requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), MICROPHONE)
+        val need = missing(a, video)
+        if (need.isNotEmpty()) {
+            pendingCall = { answer(a, video) }
+            return a.requestPermissions(need.toTypedArray(), MICROPHONE)
         }
         cancelRinging(a)
         Threading.background {
             try {
-                c.node.answerCall(c.id, false)
-                current = c.copy(state = "connecting")
+                c.node.answerCall(c.id, video)
+                current = c.copy(state = "connecting", video = video, speaker = video)
                 inCall(a, true)
+                if (video) route(a, true)
             } catch (e: Exception) {
                 Threnody.say("! answer: ${e.message}")
             }
@@ -142,6 +156,22 @@ object Calls {
         changed()
     }
 
+    /** Turns our camera on or off (asking for it first if need be); the peer is told. */
+    fun setVideo(a: Activity, on: Boolean) {
+        val c = current ?: return
+        if (on && missing(a, true).isNotEmpty()) {
+            pendingCall = { setVideo(a, true) }
+            return a.requestPermissions(missing(a, true).toTypedArray(), MICROPHONE)
+        }
+        current = c.copy(video = on)
+        Threading.background {
+            try { c.node.setCallVideo(on) } catch (e: Exception) { Threnody.say("! video: ${e.message}") }
+        }
+        // Video is for a speaker, not an ear.
+        if (on && !c.speaker) setSpeaker(a, true)
+        changed()
+    }
+
     fun setSpeaker(ctx: Context, on: Boolean) {
         val c = current ?: return
         current = c.copy(speaker = on)
@@ -154,11 +184,13 @@ object Calls {
         when (e) {
             is NodeEvent.CallIncoming -> {
                 ended = null
-                current = Call(node, persona, e.call, e.peer, Threnody.nameOf(node, e.peer), outgoing = false, state = "incoming")
+                current = Call(node, persona, e.call, e.peer, Threnody.nameOf(node, e.peer), outgoing = false,
+                    state = "incoming", peerVideo = e.video)
                 ring(ctx)
             }
             is NodeEvent.CallRinging -> update(e.call) { it.copy(state = "ringing") }
-            is NodeEvent.CallStarted -> update(e.call) { it.copy(state = "connecting") }
+            is NodeEvent.CallStarted -> update(e.call) { it.copy(state = "connecting", peerVideo = e.peerVideo) }
+            is NodeEvent.CallVideo -> update(e.call) { it.copy(peerVideo = e.video) }
             is NodeEvent.CallMedia -> update(e.call) {
                 when (e.state) {
                     "connected" -> it.copy(state = "connected", since = if (it.since == 0L) SystemClock.elapsedRealtime() else it.since)

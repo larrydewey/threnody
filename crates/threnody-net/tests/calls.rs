@@ -207,3 +207,53 @@ async fn declined_busy_and_requests() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(bob.call().is_none(), "requests don't ring");
 }
+
+/// A call over a TCP session moves to QUIC (for datagrams) when both
+/// sides have a QUIC endpoint, and carries on there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calls_over_tcp_move_to_quic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    // Bob listens on TCP and QUIC on the same port, as nodes do.
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    bob.listen_quic(&addr.to_string()).await.unwrap();
+    let b_id = alice
+        .connect(&addr.to_string(), Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    bob.accept_contact(&alice.identity());
+    timeout(Duration::from_secs(10), async {
+        while !(alice.supports(&b_id, FEATURE_CALLS)
+            && bob.supports(&alice.identity(), FEATURE_CALLS))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!alice.media_datagrams(&b_id), "a TCP session");
+
+    let id = alice.start_call(&b_id, false).unwrap();
+    next(&mut brx, 10, |e| matches!(e, Event::CallIncoming { .. })).await;
+    bob.answer_call(id, false).unwrap();
+    next(&mut arx, 10, |e| matches!(e, Event::CallStarted { .. })).await;
+    timeout(Duration::from_secs(10), async {
+        while !(alice.media_datagrams(&b_id) && bob.media_datagrams(&alice.identity())) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("moved to QUIC");
+    assert!(alice.sessions().iter().all(|s| s.transport == "quic"));
+    // The call survived the new session.
+    let mut at_bob = bob.call_media(id).unwrap();
+    assert!(alice.send_media(id, 1, b"after the move").unwrap());
+    let got = timeout(Duration::from_secs(5), at_bob.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, (1, b"after the move".to_vec()));
+    assert_eq!(alice.call().unwrap().phase, CallPhase::Active);
+}

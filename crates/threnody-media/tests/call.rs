@@ -163,13 +163,16 @@ async fn talk(quic: bool, cover: bool) {
             }
         }
     });
-    let MediaStreamTrack::Audio(track) = timeout(Duration::from_secs(10), track_rx.recv())
-        .await
-        .expect("a remote track")
-        .unwrap()
-    else {
-        panic!("expected audio")
-    };
+    // Calls carry a video track too (off here): the audio one.
+    let track = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MediaStreamTrack::Audio(t)) = track_rx.recv().await {
+                return t;
+            }
+        }
+    })
+    .await
+    .expect("a remote audio track");
     let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
     let loud = timeout(Duration::from_secs(10), async {
         let mut loud = 0;
@@ -207,4 +210,141 @@ async fn audio_call_over_tcp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn audio_call_under_cover_traffic() {
     talk(false, true).await;
+}
+
+/// Video both ways would be the same; one way, checked for shape and
+/// content: a left-dark, right-light picture stays that way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_call_over_quic_datagrams() {
+    use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
+    use libwebrtc::video_stream::native::NativeVideoStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, arx) = node(&dir, "alice", false);
+    let (bob, brx) = node(&dir, "bob", false);
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    let addr = bob.listen_quic("127.0.0.1:0").await.unwrap();
+    let b_id = alice
+        .connect_quic(addr, Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    bob.accept_contact(&alice.identity());
+    timeout(Duration::from_secs(10), async {
+        while !(alice.supports(&b_id, FEATURE_CALLS)
+            && bob.supports(&alice.identity(), FEATURE_CALLS))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (a_media, b_media) = (Arc::new(OnceCell::new()), Arc::new(OnceCell::new()));
+    let mut arx = route(arx, a_media.clone());
+    let mut brx = route(brx, b_media.clone());
+
+    let id = alice.start_call(&b_id, true).unwrap();
+    wait(&mut brx, |e| matches!(e, Event::CallIncoming { .. })).await;
+    bob.answer_call(id, false).unwrap();
+    let (track_tx, mut track_rx) = mpsc::unbounded_channel();
+    let m = CallMedia::start(
+        &bob,
+        id,
+        AudioIn::None,
+        move |t| {
+            let _ = track_tx.send(t.track);
+        },
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let _ = b_media.set(m);
+    wait(&mut arx, |e| matches!(e, Event::CallStarted { .. })).await;
+    let (state_tx, mut state_rx) = mpsc::unbounded_channel();
+    let m = CallMedia::start(
+        &alice,
+        id,
+        AudioIn::None,
+        |_| {},
+        move |s| {
+            let _ = state_tx.send(s);
+        },
+    )
+    .await
+    .unwrap();
+    m.set_video(true);
+    let _ = a_media.set(m);
+    timeout(Duration::from_secs(20), async {
+        while state_rx.recv().await != Some(PeerConnectionState::Connected) {}
+    })
+    .await
+    .expect("connected");
+
+    // 640×480 frames, dark on the left, light on the right, ~30 a second.
+    let sender = a_media.clone();
+    tokio::spawn(async move {
+        let mut frame = I420Buffer::new(640, 480);
+        let (sy, _, _) = frame.strides();
+        let (y, u, v) = frame.data_mut();
+        for row in 0..480 {
+            for col in 0..640 {
+                y[row * sy as usize + col] = if col < 320 { 30 } else { 220 };
+            }
+        }
+        u.fill(128);
+        v.fill(128);
+        loop {
+            if let Some(m) = sender.get() {
+                m.send_video(&frame, 0);
+            }
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+    });
+
+    let video = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MediaStreamTrack::Video(t)) = track_rx.recv().await {
+                return t;
+            }
+        }
+    })
+    .await
+    .expect("a remote video track");
+    let mut stream = NativeVideoStream::new(video);
+    let (frames, sides) = timeout(Duration::from_secs(15), async {
+        let mut n = 0;
+        let mut last = (0u32, 0u32, 0u64, 0u64);
+        while let Some(f) = stream.next().await {
+            let b = f.buffer.to_i420();
+            let (w, h) = (b.width(), b.height());
+            let (sy, _, _) = b.strides();
+            let (y, _, _) = b.data();
+            let mid = (h / 2) as usize * sy as usize;
+            let left: u64 = y[mid..mid + (w / 4) as usize]
+                .iter()
+                .map(|&p| u64::from(p))
+                .sum();
+            let right: u64 = y[mid + (3 * w / 4) as usize..mid + w as usize]
+                .iter()
+                .map(|&p| u64::from(p))
+                .sum();
+            last = (w, h, left, right);
+            n += 1;
+            if n >= 30 {
+                break;
+            }
+        }
+        (n, last)
+    })
+    .await
+    .expect("video frames arrived");
+    let (w, h, left, right) = sides;
+    eprintln!("received {frames} frames, last {w}x{h}");
+    assert!(frames >= 30 && w > 0 && h > 0);
+    assert!(
+        right > left * 3,
+        "the picture survived: left {left}, right {right}"
+    );
+    assert!(alice.media_datagrams(&b_id));
+    alice.hangup_call(id);
+    wait(&mut brx, |e| matches!(e, Event::CallEnded { .. })).await;
 }

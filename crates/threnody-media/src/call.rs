@@ -65,6 +65,17 @@ impl CallMedia {
         self.session.set_muted(muted);
     }
 
+    /// Starts or stops sending our video (the peer hears about it through
+    /// `Node::set_call_video`).
+    pub fn set_video(&self, on: bool) {
+        self.session.set_video(on);
+    }
+
+    /// One camera frame, turned `rotation` degrees clockwise to be upright.
+    pub fn send_video(&self, frame: &libwebrtc::video_frame::I420Buffer, rotation: u32) {
+        self.session.send_video(frame, rotation);
+    }
+
     pub fn state(&self) -> PeerConnectionState {
         self.session.state()
     }

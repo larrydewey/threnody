@@ -1,15 +1,18 @@
-//! Voice calls: the bar across the top of the window while a call rings
-//! or runs, and the dialog for an incoming one. The audio itself is the
-//! node's (WebRTC on the default microphone and speaker); this only shows
-//! the call and passes on the user's choices.
+//! Calls: the bar across the top of the window while a call rings or runs,
+//! the dialog for an incoming one, and the video while either side sends
+//! it. The audio is the node's (WebRTC on the default microphone and
+//! speaker); our video comes from the camera ([`crate::camera`]) and the
+//! peer's from the node, drawn here.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
+use crate::camera::Camera;
 use crate::core::Core;
 use crate::ui::{self, bg, bg_quiet};
 
@@ -21,6 +24,17 @@ struct Shown {
     /// When audio connected (for the timer); `None` before.
     since: Option<std::time::Instant>,
     dialog: Option<adw::AlertDialog>,
+    /// We want to send video once the call runs.
+    video: bool,
+    /// The peer's video reaches us while this is set.
+    watching: Arc<AtomicBool>,
+}
+
+/// A frame for one of the two pictures.
+struct Picture {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 pub struct CallBar {
@@ -29,9 +43,17 @@ pub struct CallBar {
     who: gtk::Label,
     status: gtk::Label,
     mute: gtk::ToggleButton,
+    camera_button: gtk::ToggleButton,
+    video: gtk::Overlay,
+    remote: gtk::Picture,
+    local: gtk::Picture,
     shown: RefCell<Option<Shown>>,
+    camera: RefCell<Option<Camera>>,
+    peer_video: Cell<bool>,
     /// The one-second timer while a call runs.
     ticking: Cell<bool>,
+    /// Set while `camera_button` is changed from here, not by a click.
+    syncing: Cell<bool>,
 }
 
 impl CallBar {
@@ -47,12 +69,17 @@ impl CallBar {
         text.append(&who);
         text.append(&status);
 
-        let mute = gtk::ToggleButton::builder()
-            .icon_name("microphone-sensitivity-high-symbolic")
-            .tooltip_text("Mute")
-            .valign(gtk::Align::Center)
-            .build();
-        mute.add_css_class("circular");
+        let round = |icon: &str, tip: &str| {
+            let b = gtk::ToggleButton::builder()
+                .icon_name(icon)
+                .tooltip_text(tip)
+                .valign(gtk::Align::Center)
+                .build();
+            b.add_css_class("circular");
+            b
+        };
+        let mute = round("microphone-sensitivity-high-symbolic", "Mute");
+        let camera_button = round("camera-disabled-symbolic", "Turn camera on");
         let hangup = gtk::Button::builder()
             .icon_name("call-stop-symbolic")
             .tooltip_text("Hang up")
@@ -65,10 +92,40 @@ impl CallBar {
         row.add_css_class("call-bar");
         row.append(&gtk::Image::from_icon_name("call-start-symbolic"));
         row.append(&text);
+        row.append(&camera_button);
         row.append(&mute);
         row.append(&hangup);
+
+        // The peer fills the area; we're in the corner.
+        let remote = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Contain)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        let local = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .width_request(160)
+            .height_request(120)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .margin_end(12)
+            .margin_bottom(12)
+            .build();
+        local.add_css_class("call-self");
+        local.set_visible(false);
+        let video = gtk::Overlay::builder()
+            .child(&remote)
+            .height_request(360)
+            .build();
+        video.add_css_class("call-video");
+        video.add_overlay(&local);
+        video.set_visible(false);
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&row);
+        column.append(&video);
         let widget = gtk::Revealer::builder()
-            .child(&row)
+            .child(&column)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
             .reveal_child(false)
             .build();
@@ -79,8 +136,15 @@ impl CallBar {
             who,
             status,
             mute,
+            camera_button,
+            video,
+            remote,
+            local,
             shown: RefCell::new(None),
+            camera: RefCell::new(None),
+            peer_video: Cell::new(false),
             ticking: Cell::new(false),
+            syncing: Cell::new(false),
         });
         let weak = Rc::downgrade(&this);
         hangup.connect_clicked(move |_| {
@@ -102,6 +166,13 @@ impl CallBar {
                 bg_quiet(move || node.set_call_muted(muted));
             }
         });
+        let weak = Rc::downgrade(&this);
+        this.camera_button.connect_toggled(move |b| {
+            let Some(this) = weak.upgrade() else { return };
+            if !this.syncing.get() {
+                this.set_video(b.is_active());
+            }
+        });
         this
     }
 
@@ -115,11 +186,14 @@ impl CallBar {
         self.shown.borrow().is_some()
     }
 
-    fn show(&self, persona: Option<String>, id: u64, title: &str, status: &str) {
+    fn show(&self, persona: Option<String>, id: u64, title: &str, status: &str, video: bool) {
         self.who.set_label(title);
         self.status.set_label(status);
         self.mute.set_active(false);
         self.mute.set_visible(false);
+        self.camera_button.set_visible(false);
+        self.show_camera_button(false);
+        self.peer_video.set(false);
         self.widget.set_reveal_child(true);
         *self.shown.borrow_mut() = Some(Shown {
             persona,
@@ -127,6 +201,8 @@ impl CallBar {
             title: title.to_owned(),
             since: None,
             dialog: None,
+            video,
+            watching: Arc::default(),
         });
     }
 
@@ -134,37 +210,58 @@ impl CallBar {
         self.shown.borrow().as_ref().is_some_and(|s| s.id == id)
     }
 
-    /// We called: shown until it's answered or ends.
-    pub fn outgoing(&self, persona: Option<String>, id: u64, title: &str) {
-        self.show(persona, id, title, "Calling…");
+    /// We called (with video or not): shown until it's answered or ends.
+    pub fn outgoing(&self, persona: Option<String>, id: u64, title: &str, video: bool) {
+        let what = if video {
+            "Video calling…"
+        } else {
+            "Calling…"
+        };
+        self.show(persona, id, title, what, video);
     }
 
-    /// Someone calls: the bar, and a dialog to answer or decline.
+    /// Someone calls: the bar, and a dialog to answer (with video too, if
+    /// they offer theirs) or decline.
     pub fn incoming(
         self: &Rc<Self>,
         persona: Option<String>,
         id: u64,
         title: &str,
+        video: bool,
         parent: &impl IsA<gtk::Widget>,
     ) {
-        self.show(persona, id, title, "Incoming call");
+        let what = if video {
+            "Incoming video call"
+        } else {
+            "Incoming call"
+        };
+        self.show(persona, id, title, what, false);
+        let mut responses = vec![("decline", "Decline"), ("answer", "Voice")];
+        if video {
+            responses.push(("video", "Video"));
+        } else {
+            responses[1].1 = "Answer";
+        }
         let d = ui::alert(
-            &format!("{title} is calling"),
-            "Answer with your microphone and speaker.",
-            &[("decline", "Decline"), ("answer", "Answer")],
+            &format!("{title} is {}calling", if video { "video " } else { "" }),
+            "Answer with your microphone and speaker; with Video, your camera too.",
+            &responses,
         );
         d.set_response_appearance("decline", adw::ResponseAppearance::Destructive);
-        d.set_response_appearance("answer", adw::ResponseAppearance::Suggested);
+        d.set_response_appearance(
+            if video { "video" } else { "answer" },
+            adw::ResponseAppearance::Suggested,
+        );
         let weak = Rc::downgrade(self);
         d.connect_response(None, move |_, r| {
             let Some(this) = weak.upgrade() else { return };
             if let Some(s) = this.shown.borrow_mut().as_mut() {
                 s.dialog = None;
             }
-            if r == "answer" {
-                this.answer(id);
-            } else {
-                this.hang_up();
+            match r {
+                "answer" => this.answer(id, false),
+                "video" => this.answer(id, true),
+                _ => this.hang_up(),
             }
         });
         d.present(Some(parent));
@@ -173,18 +270,20 @@ impl CallBar {
         }
     }
 
-    fn answer(self: &Rc<Self>, id: u64) {
+    fn answer(self: &Rc<Self>, id: u64, video: bool) {
         let Some(node) = self.node() else { return };
         self.status.set_label("Connecting…");
+        if let Some(s) = self.shown.borrow_mut().as_mut() {
+            s.video = video;
+        }
         let weak = Rc::downgrade(self);
         bg(
-            move || node.answer_call(id, false),
+            move || node.answer_call(id, video),
             move |r| {
                 let Some(this) = weak.upgrade() else { return };
-                if let Err(e) = r {
-                    this.status.set_label(&format!("Couldn't answer: {e}"));
-                } else {
-                    this.mute.set_visible(true);
+                match r {
+                    Err(e) => this.status.set_label(&format!("Couldn't answer: {e}")),
+                    Ok(()) => this.running(),
                 }
             },
         );
@@ -205,11 +304,151 @@ impl CallBar {
         }
     }
 
-    pub fn started(&self, id: u64) {
+    /// Our call was answered; `peer_video` says whether they send video.
+    pub fn started(self: &Rc<Self>, id: u64, peer_video: bool) {
         if self.is(id) {
             self.status.set_label("Connecting…");
-            self.mute.set_visible(true);
+            self.peer_video.set(peer_video);
+            self.running();
         }
+    }
+
+    /// The call runs: the controls, the peer's video, and our camera if
+    /// we wanted it.
+    fn running(self: &Rc<Self>) {
+        self.mute.set_visible(true);
+        self.camera_button.set_visible(true);
+        self.watch_video();
+        let wanted = self.shown.borrow().as_ref().is_some_and(|s| s.video);
+        if wanted {
+            self.start_camera();
+        }
+        self.layout();
+    }
+
+    /// The peer turned its video on or off.
+    pub fn peer_video(&self, id: u64, on: bool) {
+        if self.is(id) {
+            self.peer_video.set(on);
+            if !on {
+                self.remote.set_paintable(gdk::Paintable::NONE);
+            }
+            self.layout();
+        }
+    }
+
+    /// Shows the video area while either side sends video.
+    fn layout(&self) {
+        let ours = self.camera.borrow().is_some();
+        self.local.set_visible(ours);
+        self.video.set_visible(ours || self.peer_video.get());
+    }
+
+    fn show_camera_button(&self, on: bool) {
+        self.syncing.set(true);
+        self.camera_button.set_active(on);
+        self.syncing.set(false);
+        self.camera_button.set_icon_name(if on {
+            "camera-video-symbolic"
+        } else {
+            "camera-disabled-symbolic"
+        });
+        self.camera_button.set_tooltip_text(Some(if on {
+            "Turn camera off"
+        } else {
+            "Turn camera on"
+        }));
+    }
+
+    /// Turns our camera on or off, telling the peer.
+    fn set_video(self: &Rc<Self>, on: bool) {
+        if on {
+            self.start_camera();
+        } else {
+            self.camera.borrow_mut().take();
+            self.local.set_paintable(gdk::Paintable::NONE);
+            self.show_camera_button(false);
+            if let Some(node) = self.node() {
+                bg_quiet(move || {
+                    let _ = node.set_call_video(false);
+                });
+            }
+        }
+        self.layout();
+    }
+
+    fn start_camera(self: &Rc<Self>) {
+        let Some(node) = self.node() else { return };
+        if self.camera.borrow().is_some() {
+            return;
+        }
+        let (tx, rx) = async_channel::bounded::<Picture>(1);
+        let sender = node.clone();
+        let started = Camera::start(
+            Box::new(move |w, h, i420| {
+                sender.send_video_frame(w, h, 0, i420.to_vec());
+            }),
+            Box::new(move |width, height, rgba| {
+                // The screen takes what it can; a busy one skips frames.
+                let _ = tx.try_send(Picture {
+                    width,
+                    height,
+                    rgba: rgba.to_vec(),
+                });
+            }),
+        );
+        match started {
+            Ok(c) => {
+                *self.camera.borrow_mut() = Some(c);
+                self.show_camera_button(true);
+                bg_quiet(move || {
+                    let _ = node.set_call_video(true);
+                });
+                let local = self.local.clone();
+                glib::spawn_future_local(async move {
+                    while let Ok(p) = rx.recv().await {
+                        local.set_paintable(Some(&texture(p)));
+                    }
+                });
+            }
+            Err(e) => {
+                self.show_camera_button(false);
+                self.status.set_label(&format!("No camera: {e}"));
+            }
+        }
+        self.layout();
+    }
+
+    /// Draws the peer's video while the call lasts (a worker waits for its
+    /// frames; only the newest is drawn).
+    fn watch_video(&self) {
+        let Some(node) = self.node() else { return };
+        let Some(watching) = self.shown.borrow().as_ref().map(|s| s.watching.clone()) else {
+            return;
+        };
+        if watching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (tx, rx) = async_channel::bounded::<Picture>(1);
+        let w = watching.clone();
+        std::thread::spawn(move || {
+            while w.load(Ordering::SeqCst) {
+                if let Some(f) = node.next_video_frame(250) {
+                    let (width, height, rgba) = upright(f.width, f.height, f.rotation, f.rgba);
+                    let _ = tx.try_send(Picture {
+                        width,
+                        height,
+                        rgba,
+                    });
+                }
+            }
+        });
+        let remote = self.remote.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(p) = rx.recv().await {
+                remote.set_paintable(Some(&texture(p)));
+            }
+        });
     }
 
     /// The call's audio: "connected", "interrupted" or "failed".
@@ -268,9 +507,16 @@ impl CallBar {
             return None;
         }
         let s = self.shown.borrow_mut().take()?;
+        s.watching.store(false, Ordering::SeqCst);
         if let Some(d) = s.dialog {
             d.force_close();
         }
+        // The camera light goes off with the call.
+        self.camera.borrow_mut().take();
+        self.remote.set_paintable(gdk::Paintable::NONE);
+        self.local.set_paintable(gdk::Paintable::NONE);
+        self.peer_video.set(false);
+        self.layout();
         self.widget.set_reveal_child(false);
         let what = match (reason, by_us) {
             ("declined", false) => "declined",
@@ -282,5 +528,55 @@ impl CallBar {
             _ => return None,
         };
         Some(format!("{}: {what}", s.title))
+    }
+}
+
+fn texture(p: Picture) -> gdk::MemoryTexture {
+    let stride = p.width as usize * 4;
+    gdk::MemoryTexture::new(
+        p.width as i32,
+        p.height as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_owned(p.rgba),
+        stride,
+    )
+}
+
+/// Turns an RGBA picture `rotation` degrees clockwise.
+fn upright(width: u32, height: u32, rotation: u32, rgba: Vec<u8>) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (width as usize, height as usize);
+    if rotation.is_multiple_of(360) || rgba.len() < w * h * 4 {
+        return (width, height, rgba);
+    }
+    let mut out = vec![0u8; w * h * 4];
+    let (ow, oh) = if rotation % 180 == 90 { (h, w) } else { (w, h) };
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = match rotation % 360 {
+                90 => (h - 1 - y, x),
+                180 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let (src, dst) = ((y * w + x) * 4, (ny * ow + nx) * 4);
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    (ow as u32, oh as u32, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turns_pictures_upright() {
+        // 2×1: red, blue. Turned 90° clockwise: 1×2, red over blue.
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let px = [red, blue].concat();
+        assert_eq!(upright(2, 1, 90, px.clone()), (1, 2, [red, blue].concat()));
+        assert_eq!(upright(2, 1, 180, px.clone()), (2, 1, [blue, red].concat()));
+        assert_eq!(upright(2, 1, 270, px.clone()), (1, 2, [blue, red].concat()));
+        assert_eq!(upright(2, 1, 0, px.clone()).2, px);
     }
 }

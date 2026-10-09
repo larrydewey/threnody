@@ -2,7 +2,9 @@
 //! second person: it accepts whoever connects, answers every call with
 //! this machine's microphone and speaker, logs how the call goes, and
 //! hangs up after a while. With `BOT_CALL=1` it calls whoever connects
-//! instead, to test ringing on the other side.
+//! instead, to test ringing on the other side. With `BOT_VIDEO=1` it sends
+//! moving colour bars as its video and logs the frames it receives (their
+//! size and brightness, nothing more).
 //!
 //! ```sh
 //! cargo run -p threnody-ffi --features calls --example call_bot -- <home> [port] [seconds]
@@ -28,6 +30,11 @@ fn main() {
     println!("calls supported: {}", node.calls_supported());
 
     let calls_out = std::env::var_os("BOT_CALL").is_some();
+    let video = std::env::var_os("BOT_VIDEO").is_some();
+    if video {
+        bars(node.clone());
+        watch(node.clone());
+    }
     let mut answered: Option<(u64, Instant)> = None;
     loop {
         if let Some((id, at)) = answered
@@ -47,7 +54,7 @@ fn main() {
                 if calls_out {
                     // Give the peer's Hello (and its call support) a moment.
                     std::thread::sleep(Duration::from_secs(2));
-                    match node.start_call(peer, false) {
+                    match node.start_call(peer, video) {
                         Ok(id) => println!("calling: {id:x}"),
                         Err(e) => println!("call failed: {e}"),
                     }
@@ -55,7 +62,7 @@ fn main() {
             }
             NodeEvent::CallIncoming { peer, call, .. } => {
                 println!("call {call:x} from {peer}: answering");
-                match node.answer_call(call, false) {
+                match node.answer_call(call, video) {
                     Ok(()) => answered = Some((call, Instant::now())),
                     Err(e) => println!("answer failed: {e}"),
                 }
@@ -79,4 +86,60 @@ fn main() {
             _ => {}
         }
     }
+}
+
+/// Sends moving colour bars (I420, 640×480, ~30 a second) whenever a call
+/// runs.
+fn bars(node: std::sync::Arc<ThrenodyNode>) {
+    std::thread::spawn(move || {
+        let (w, h) = (640usize, 480usize);
+        let mut t = 0usize;
+        loop {
+            // Eight bars of rising brightness, scrolling sideways.
+            let mut f = vec![0u8; w * h + 2 * (w / 2) * (h / 2)];
+            for y in 0..h {
+                for x in 0..w {
+                    f[y * w + x] = (((x + t * 8) / 80 % 8) * 32 + 16) as u8;
+                }
+            }
+            let (u, v) = f[w * h..].split_at_mut((w / 2) * (h / 2));
+            for (i, (u, v)) in u.iter_mut().zip(v.iter_mut()).enumerate() {
+                *u = ((i % (w / 2)) * 255 / (w / 2)) as u8;
+                *v = 255 - *u;
+            }
+            node.send_video_frame(w as u32, h as u32, 0, f);
+            t += 1;
+            std::thread::sleep(Duration::from_millis(33));
+        }
+    });
+}
+
+/// Logs, every two seconds, how many frames of the peer's video arrived,
+/// their size and their average brightness.
+fn watch(node: std::sync::Arc<ThrenodyNode>) {
+    std::thread::spawn(move || {
+        let (mut n, mut last, mut at) = (0u32, None, Instant::now());
+        loop {
+            if let Some(f) = node.next_video_frame(250) {
+                n += 1;
+                let luma: u64 = f
+                    .rgba
+                    .chunks(4)
+                    .map(|p| (u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2])) / 3)
+                    .sum();
+                last = Some((
+                    f.width,
+                    f.height,
+                    f.rotation,
+                    luma / u64::from((f.width * f.height).max(1)),
+                ));
+            }
+            if at.elapsed() >= Duration::from_secs(2) {
+                if let Some((w, h, r, l)) = last {
+                    println!("video in: {n} frames in 2s, {w}x{h} rot {r}, brightness {l}");
+                }
+                (n, at) = (0, Instant::now());
+            }
+        }
+    });
 }
