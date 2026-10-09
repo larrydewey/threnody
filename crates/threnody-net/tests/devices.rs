@@ -149,6 +149,8 @@ async fn removing_a_device_revokes_it_everywhere() {
     let pid = phone.node.identity();
     wait_for(|| bob.node.account_of(&pid).is_some()).await;
 
+    // Not a device of ours: refused.
+    assert!(laptop.node.remove_device(&bob.node.identity()).is_err());
     // Lost phone: the laptop removes it.
     laptop.node.remove_device(&pid).unwrap();
     next(&mut phone.rx, |e| matches!(e, Event::ThisDeviceRemoved)).await;
@@ -158,6 +160,8 @@ async fn removing_a_device_revokes_it_everywhere() {
     )
     .await;
     assert!(laptop.node.account().state().removed.contains(&pid));
+    // The laptop is now the account's only device: it can't remove itself.
+    assert!(laptop.node.remove_device(&laptop.node.identity()).is_err());
 
     // Bob now refuses the removed phone.
     let _ = phone.node.connect(&bob.addr, None).await;

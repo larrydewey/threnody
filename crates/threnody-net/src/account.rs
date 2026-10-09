@@ -615,7 +615,9 @@ impl Node {
     /// own single-device account is replaced. Returns the account id.
     pub async fn link_with(&self, code: &LinkCode) -> Result<AccountId> {
         if self.shared.persona {
-            return Err(NetError::NotAllowed("%s".into()));
+            return Err(NetError::NotAllowed(
+                "an anonymous identity has no other devices".into(),
+            ));
         }
         let existing = self.connect(&code.addr, Some(code.device)).await?;
         let session_id = self
@@ -700,8 +702,22 @@ impl Node {
 
     /// Removes one of our devices (possibly this one) from the account.
     pub fn remove_device(&self, device: &PublicIdentity) -> Result<()> {
+        if self.shared.persona {
+            return Err(NetError::NotAllowed(
+                "an anonymous identity has no other devices".into(),
+            ));
+        }
         {
             let mut own = lock(&self.shared.account);
+            let state = own.state();
+            if !state.has(device) {
+                return Err(NetError::NotAllowed("not a device of this account".into()));
+            }
+            if state.devices.len() < 2 {
+                return Err(NetError::NotAllowed(
+                    "it's the account's only device".into(),
+                ));
+            }
             let mut link = own.propose(Action::Remove { device: *device });
             link.sign(self.identity_ref())?;
             own.append(link)?;
@@ -720,7 +736,9 @@ impl Node {
     /// and tells every peer; contacts see the new name too.
     pub fn rename_device(&self, device: &PublicIdentity, name: &str) -> Result<()> {
         if self.shared.persona {
-            return Err(NetError::NotAllowed("%s".into()));
+            return Err(NetError::NotAllowed(
+                "an anonymous identity has no other devices".into(),
+            ));
         }
         let name = threnody_core::account::clean_name(name.trim());
         if name.is_empty() {

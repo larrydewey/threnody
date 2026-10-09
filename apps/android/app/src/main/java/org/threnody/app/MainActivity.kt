@@ -26,6 +26,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.graphics.drawable.ColorDrawable
 import java.net.Inet4Address
+import uniffi.threnody_ffi.DeviceInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.ThrenodyNode
 import uniffi.threnody_ffi.qrMatrix
@@ -844,7 +845,7 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** This account's devices; tap one to rename it. */
+    /** This account's devices; tap one to rename it, or to remove another one. */
     private fun devices() {
         val n = node ?: return
         Threading.background {
@@ -855,12 +856,45 @@ class MainActivity : Activity() {
                 }
                 SecureBuilder(this)
                     .setTitle("Your devices")
-                    .setItems(labels.toTypedArray()) { _, i -> renameDevice(list[i].fingerprint, list[i].name) }
+                    .setItems(labels.toTypedArray()) { _, i -> deviceActions(list[i], list.size) }
                     .setPositiveButton("Link a new device") { _, _ -> linkDevice() }
                     .setNegativeButton("Close", null)
                     .show()
             }
         }
+    }
+
+    /** Rename; for another device (not the account's only one), remove it too. */
+    private fun deviceActions(d: DeviceInfo, count: Int) {
+        if (d.thisDevice || count < 2) return renameDevice(d.fingerprint, d.name)
+        SecureBuilder(this)
+            .setTitle(d.name)
+            .setItems(arrayOf("Rename", "Remove from account")) { _, i ->
+                if (i == 0) renameDevice(d.fingerprint, d.name) else removeDevice(d)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun removeDevice(d: DeviceInfo) {
+        SecureBuilder(this)
+            .setTitle("Remove ${d.name}?")
+            .setMessage("It leaves your account: your other devices and your contacts stop trusting it, " +
+                "and it gets no more of your messages. Do this for a lost or retired device. " +
+                "To use it again, link it anew.")
+            .setPositiveButton("Remove") { _, _ ->
+                val n = node ?: return@setPositiveButton
+                Threading.background {
+                    try {
+                        n.removeDevice(d.fingerprint)
+                        runOnUiThread { Toast.makeText(this, "Removed ${d.name}", Toast.LENGTH_SHORT).show() }
+                    } catch (e: Exception) {
+                        runOnUiThread { failed("Couldn't remove it: ${e.message}") }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun renameDevice(fingerprint: String, current: String) {
