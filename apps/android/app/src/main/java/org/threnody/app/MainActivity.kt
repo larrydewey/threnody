@@ -983,17 +983,33 @@ class MainActivity : Activity() {
         addView(v, matchWrap)
     }
 
-    private fun addContact(prefill: String?) {
+    /** `scanned`: the invite came from a QR code, so naming them comes next. */
+    private fun addContact(prefill: String?, scanned: Boolean = false) {
         // A copied invite (say, from the camera app) fills itself in.
         val field = input("threnody://… or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
-        SecureBuilder(this)
-            .setTitle("Add a contact")
-            .setMessage("Scan or paste their invite. You'll check their safety number together later.")
-            .setView(padded(field))
-            .setPositiveButton("Connect") { _, _ -> connect(field.text.toString().trim()) }
+        val name = input("Name (optional; only you see it)", null,
+            InputType.TYPE_TEXT_FLAG_CAP_WORDS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+        val fields = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(field, matchWrap)
+            addView(name, matchWrap)
+        }
+        val dialog = SecureBuilder(this)
+            .setTitle(if (scanned) "Add the scanned contact" else "Add a contact")
+            .setMessage(
+                if (scanned) "Give them a name you'll recognise, if you like. You'll check their safety number together later."
+                else "Scan or paste their invite. You'll check their safety number together later."
+            )
+            .setView(fields)
+            .setPositiveButton("Connect") { _, _ -> connect(field.text.toString().trim(), name.text.toString().trim()) }
             .setNeutralButton("Scan") { _, _ -> scan() }
             .setNegativeButton("Cancel", null)
             .show()
+        if (scanned) {
+            name.requestFocus()
+            dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        }
     }
 
     private val scanLauncher = ActivityResultRegistry.get(this)
@@ -1003,7 +1019,7 @@ class MainActivity : Activity() {
             if (resultCode != RESULT_OK) return@launch
             val text = data?.getStringExtra(ScanActivity.RESULT)?.trim() ?: return@launch
             when {
-                text.startsWith("threnody://") -> addContact(text)
+                text.startsWith("threnody://") -> addContact(text, scanned = true)
                 text.startsWith("threnody-link://") -> joinAccount(text)
                 text.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, text)
                 else -> failed("That QR code isn't a Threnody invite, link code or directory link.")
@@ -1060,13 +1076,17 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun connect(target: String) {
+    /** Dials `target`; a `name` given is what we call them (only here). */
+    private fun connect(target: String, name: String = "") {
         if (target.isEmpty()) return
         val n = node ?: return
         Toast.makeText(this, "Connecting…", Toast.LENGTH_SHORT).show()
         Threading.background {
             try {
                 val peer = n.connect(target)
+                if (name.isNotEmpty()) {
+                    try { n.setName(peer, name) } catch (e: Exception) { Threnody.say("! naming a contact: ${e.message}") }
+                }
                 val key = Threnody.key(n.contacts(), peer)
                 runOnUiThread { openChat(key, peer) }
             } catch (e: Exception) {
