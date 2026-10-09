@@ -5,9 +5,10 @@
 //!
 //! ```text
 //! CallMsg = { 0: op, 1: call uint, ? 2: secret bstr(32), ? 3: flags uint,
-//!             ? 4: reason uint, ? 5: data bstr }
+//!             ? 4: reason uint, ? 5: data bstr, ? 6: emoji tstr }
 //! op: 1 offer (secret, flags), 2 ringing, 3 answer (secret, flags),
-//!     4 hangup (reason), 5 update (flags), 6 signal (data)
+//!     4 hangup (reason), 5 update (flags), 6 signal (data),
+//!     7 reaction (emoji)
 //! flags: 1 = video
 //! ```
 //!
@@ -47,6 +48,8 @@ use crate::error::{Error, Result};
 pub const MAX_PAYLOAD: usize = 1400;
 /// Largest media-layer signalling message (an SDP, say).
 pub const MAX_SIGNAL: usize = 64 * 1024;
+/// Longest reaction, in bytes: one emoji, with its skin tone and joiners.
+pub const MAX_REACTION: usize = 32;
 /// Media plaintext (stream, length, payload) is padded to a multiple of this.
 pub const PAD_TO: usize = 32;
 /// Bytes a sealed packet adds before padding: call, seq, stream, length, tag.
@@ -120,6 +123,12 @@ pub enum CallMsg {
         call: u64,
         data: Vec<u8>,
     },
+    /// An emoji the sender wants floated over both sides' video, at most
+    /// [`MAX_REACTION`] bytes.
+    Reaction {
+        call: u64,
+        emoji: String,
+    },
 }
 
 impl std::fmt::Debug for CallMsg {
@@ -132,6 +141,7 @@ impl std::fmt::Debug for CallMsg {
             Self::Hangup { call, reason } => write!(f, "Hangup({call:x}, {reason:?})"),
             Self::Update { call, video } => write!(f, "Update({call:x}, video={video})"),
             Self::Signal { call, data } => write!(f, "Signal({call:x}, {} bytes)", data.len()),
+            Self::Reaction { call, .. } => write!(f, "Reaction({call:x})"),
         }
     }
 }
@@ -144,7 +154,8 @@ impl CallMsg {
             | Self::Answer { call, .. }
             | Self::Hangup { call, .. }
             | Self::Update { call, .. }
-            | Self::Signal { call, .. } => *call,
+            | Self::Signal { call, .. }
+            | Self::Reaction { call, .. } => *call,
         }
     }
 
@@ -195,6 +206,11 @@ impl CallMsg {
                     e.u8(1)?.u64(*call)?;
                     e.u8(5)?.bytes(data)?;
                 }
+                Self::Reaction { call, emoji } => {
+                    e.map_len(3)?.u8(0)?.u8(7)?;
+                    e.u8(1)?.u64(*call)?;
+                    e.u8(6)?.str(emoji)?;
+                }
             }
             Ok(())
         })
@@ -203,7 +219,7 @@ impl CallMsg {
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut op, mut call, mut secret, mut flags, mut reason) = (None, None, None, 0, 0);
-        let mut data = None;
+        let (mut data, mut emoji) = (None, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => op = Some(d.u8()?),
@@ -212,6 +228,7 @@ impl CallMsg {
                 3 => flags = d.u64()?,
                 4 => reason = d.u64()?,
                 5 => data = Some(d.bytes()?.to_vec()),
+                6 => emoji = Some(d.str()?.to_owned()),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -246,9 +263,25 @@ impl CallMsg {
                 }
                 Self::Signal { call, data }
             }
+            7 => {
+                let emoji = required(emoji, "call reaction")?;
+                if !valid_reaction(&emoji) {
+                    return Err(Error::Malformed("call reaction"));
+                }
+                Self::Reaction { call, emoji }
+            }
             _ => return Err(Error::Malformed("call op")),
         })
     }
+}
+
+/// Whether `emoji` can be a call reaction: not empty, at most
+/// [`MAX_REACTION`] bytes, and nothing but visible characters (no
+/// control characters, so it can't break the line it's drawn on).
+pub fn valid_reaction(emoji: &str) -> bool {
+    !emoji.is_empty()
+        && emoji.len() <= MAX_REACTION
+        && !emoji.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// The call id a sealed packet is for, to find its keys.
@@ -427,6 +460,10 @@ mod tests {
                 call: 7,
                 data: b"v=0".to_vec(),
             },
+            CallMsg::Reaction {
+                call: 7,
+                emoji: "👍🏽".into(),
+            },
         ];
         for m in msgs.clone() {
             assert_eq!(CallMsg::decode(&m.encode().unwrap()).unwrap(), m);
@@ -468,6 +505,15 @@ mod tests {
             data: vec![0; MAX_SIGNAL + 1],
         };
         assert!(CallMsg::decode(&big.encode().unwrap()).is_err());
+        // Reactions: one emoji, no line breaks or whitespace, not too long.
+        for bad in ["", "a\nb", " ", &"❤".repeat(11)] {
+            let m = CallMsg::Reaction {
+                call: 1,
+                emoji: bad.to_owned(),
+            };
+            assert!(CallMsg::decode(&m.encode().unwrap()).is_err(), "{bad:?}");
+        }
+        assert!(valid_reaction("👨‍👩‍👧‍👦") && valid_reaction("❤️"));
         // Unknown hang-up reasons are a plain end.
         let odd = raw(&|e| {
             e.map_len(3)?.u8(0)?.u8(4)?.u8(1)?.u64(1)?.u8(4)?.u64(99)?;

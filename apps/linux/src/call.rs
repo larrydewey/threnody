@@ -58,7 +58,18 @@ pub struct CallBar {
     ticking: Cell<bool>,
     /// Set while `camera_button` is changed from here, not by a click.
     syncing: Cell<bool>,
+    /// Sends an emoji to float over both sides' video.
+    react: gtk::MenuButton,
+    /// Where emoji float up, over the whole bar (takes no clicks).
+    floats: gtk::Fixed,
 }
+
+/// The emoji the reaction button offers first; the rest are a click away.
+const QUICK_REACTIONS: [&str; 8] = ["❤️", "😂", "👍", "😮", "😢", "🎉", "🔥", "😘"];
+/// How long an emoji takes to float up and fade.
+const FLOAT_MS: u32 = 2800;
+/// Emoji floating at once; the oldest give way to a flood.
+const MAX_FLOATING: usize = 24;
 
 impl CallBar {
     pub fn new(core: Arc<Core>) -> Rc<Self> {
@@ -99,10 +110,19 @@ impl CallBar {
         hangup.add_css_class("circular");
         hangup.add_css_class("destructive-action");
 
+        let react = gtk::MenuButton::builder()
+            .icon_name("face-smile-symbolic")
+            .tooltip_text("Send a reaction")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        react.add_css_class("circular");
+
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         row.add_css_class("call-bar");
         row.append(&gtk::Image::from_icon_name("call-start-symbolic"));
         row.append(&text);
+        row.append(&react);
         row.append(&flip);
         row.append(&camera_button);
         row.append(&mute);
@@ -136,8 +156,13 @@ impl CallBar {
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&row);
         column.append(&video);
+        let floats = gtk::Fixed::new();
+        floats.set_can_target(false);
+        let over = gtk::Overlay::builder().child(&column).build();
+        over.add_overlay(&floats);
+        over.set_clip_overlay(&floats, true);
         let widget = gtk::Revealer::builder()
-            .child(&column)
+            .child(&over)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
             .reveal_child(false)
             .build();
@@ -159,7 +184,10 @@ impl CallBar {
             peer_video: Cell::new(false),
             ticking: Cell::new(false),
             syncing: Cell::new(false),
+            react,
+            floats,
         });
+        this.react.set_popover(Some(&this.reaction_picker()));
         let weak = Rc::downgrade(&this);
         hangup.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -194,6 +222,110 @@ impl CallBar {
             }
         });
         this
+    }
+
+    /// The reaction button's popover: the usual emoji, and all of them.
+    fn reaction_picker(self: &Rc<Self>) -> gtk::Popover {
+        let pop = gtk::Popover::new();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        for em in QUICK_REACTIONS {
+            let b = gtk::Button::with_label(em);
+            b.add_css_class("flat");
+            b.add_css_class("reaction-pick");
+            b.set_tooltip_text(Some(&format!("Send {em}")));
+            let (weak, p) = (Rc::downgrade(self), pop.clone());
+            b.connect_clicked(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.send_reaction(em);
+                }
+                p.popdown();
+            });
+            row.append(&b);
+        }
+        let more = gtk::MenuButton::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("More emoji")
+            .build();
+        more.add_css_class("flat");
+        let chooser = gtk::EmojiChooser::new();
+        let (weak, p) = (Rc::downgrade(self), pop.clone());
+        chooser.connect_emoji_picked(move |_, em| {
+            if let Some(this) = weak.upgrade() {
+                this.send_reaction(em);
+            }
+            p.popdown();
+        });
+        more.set_popover(Some(&chooser));
+        row.append(&more);
+        pop.set_child(Some(&row));
+        pop
+    }
+
+    /// Floats `emoji` here and over the peer's video.
+    fn send_reaction(&self, emoji: &str) {
+        self.float(emoji);
+        if let Some(node) = self.node() {
+            let emoji = emoji.to_owned();
+            bg_quiet(move || {
+                let _ = node.send_call_reaction(emoji);
+            });
+        }
+    }
+
+    /// The peer's reaction in call `id`.
+    pub fn reaction(&self, id: u64, emoji: &str) {
+        if self.is(id) {
+            self.float(emoji);
+        }
+    }
+
+    /// Floats `emoji` up from the bottom of the bar, swaying a little, and
+    /// fades it out.
+    fn float(&self, emoji: &str) {
+        let (w, h) = (
+            f64::from(self.floats.width()),
+            f64::from(self.floats.height()),
+        );
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let mut n = 0;
+        let mut child = self.floats.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            n += 1;
+            if n > MAX_FLOATING {
+                self.floats.remove(&c);
+            }
+        }
+        let label = gtk::Label::new(Some(emoji));
+        label.add_css_class("call-float");
+        let x = w * (0.15 + 0.6 * glib::random_double());
+        let sway = if glib::random_double() < 0.5 {
+            16.0
+        } else {
+            -16.0
+        };
+        let (from, to) = (h * 0.8, h * 0.1);
+        self.floats.put(&label, x, from);
+        let (fixed, l) = (self.floats.clone(), label.clone());
+        let target = adw::CallbackAnimationTarget::new(move |t| {
+            l.set_opacity(if t < 2.0 / 3.0 { 1.0 } else { (1.0 - t) * 3.0 });
+            fixed.move_(
+                &l,
+                x + sway * (t * 3.0 * std::f64::consts::PI).sin(),
+                from + (to - from) * t,
+            );
+        });
+        let anim = adw::TimedAnimation::new(&self.floats, 0.0, 1.0, FLOAT_MS, target);
+        anim.set_easing(adw::Easing::EaseOutCubic);
+        let (fixed, l) = (self.floats.clone(), label);
+        anim.connect_done(move |_| {
+            if l.parent().is_some() {
+                fixed.remove(&l);
+            }
+        });
+        anim.play();
     }
 
     fn node(&self) -> Option<crate::core::Node> {
@@ -499,6 +631,7 @@ impl CallBar {
                     self.log_media(id);
                 }
                 self.tick();
+                self.react.set_visible(true);
             }
             "interrupted" => self.status.set_label("Reconnecting…"),
             _ => self.status.set_label("Call failed"),
@@ -584,6 +717,10 @@ impl CallBar {
         self.local.set_paintable(gdk::Paintable::NONE);
         self.peer_video.set(false);
         self.layout();
+        self.react.set_visible(false);
+        while let Some(c) = self.floats.first_child() {
+            self.floats.remove(&c);
+        }
         self.widget.set_reveal_child(false);
         let what = match (reason, by_us) {
             ("declined", false) => "declined",

@@ -145,6 +145,24 @@ async fn call_and_talk(quic: bool) {
     };
     assert!(video);
 
+    // Reactions: one emoji at a time, and not too fast.
+    assert!(bob.send_call_reaction(id, "not one\nemoji").is_err());
+    bob.send_call_reaction(id, "🎉").unwrap();
+    bob.send_call_reaction(id, "🎈").unwrap();
+    let Event::CallReaction { emoji, peer, .. } =
+        next(&mut arx, 10, |e| matches!(e, Event::CallReaction { .. })).await
+    else {
+        unreachable!()
+    };
+    assert!(emoji == "🎉" && peer == b_id);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(e) = arx.try_recv() {
+        assert!(
+            !matches!(e, Event::CallReaction { .. }),
+            "the second came too soon"
+        );
+    }
+
     alice.hangup_call(id);
     let Event::CallEnded { reason, by_us, .. } =
         next(&mut brx, 10, |e| matches!(e, Event::CallEnded { .. })).await

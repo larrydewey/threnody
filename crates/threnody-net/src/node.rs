@@ -213,6 +213,12 @@ pub enum Event {
         call: u64,
         video: bool,
     },
+    /// `peer` sent an emoji to float over the call's video.
+    CallReaction {
+        peer: PublicIdentity,
+        call: u64,
+        emoji: String,
+    },
     /// The call is over; `by_us` when this side ended it (including
     /// timeouts here).
     CallEnded {

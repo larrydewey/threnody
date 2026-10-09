@@ -66,6 +66,24 @@ object Calls {
 
     private fun changed() = listeners.forEach { it() }
 
+    private val reactionListeners = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
+
+    /** Emoji to float over the video: the peer's, and ours as we send them. */
+    fun listenReactions(l: (String) -> Unit): () -> Unit {
+        reactionListeners.add(l)
+        return { reactionListeners.remove(l) }
+    }
+
+    /** Floats `emoji` over both sides' video. */
+    fun react(ctx: Context, emoji: String) {
+        val c = current?.takeIf { it.state == "connected" || it.state == "interrupted" } ?: return
+        EmojiPicker.remember(ctx, emoji)
+        reactionListeners.forEach { it(emoji) }
+        Threading.background {
+            try { c.node.sendCallReaction(emoji) } catch (e: Exception) { Threnody.say("! reaction: ${e.message}") }
+        }
+    }
+
     /**
      * Hands WebRTC what it needs before the node opens: loading the library
      * through Android (not only JNA) runs WebRTC's own JNI_OnLoad, which
@@ -215,6 +233,7 @@ object Calls {
             is NodeEvent.CallRinging -> update(e.call) { it.copy(state = "ringing") }
             is NodeEvent.CallStarted -> update(e.call) { it.copy(state = "connecting", peerVideo = e.peerVideo) }
             is NodeEvent.CallVideo -> update(e.call) { it.copy(peerVideo = e.video) }
+            is NodeEvent.CallReaction -> if (current?.id == e.call) reactionListeners.forEach { it(e.emoji) }
             is NodeEvent.CallMedia -> update(e.call) {
                 when (e.state) {
                     "connected" -> it.copy(state = "connected", since = if (it.since == 0L) SystemClock.elapsedRealtime() else it.since)

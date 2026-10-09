@@ -1010,6 +1010,10 @@ impl App {
                 self.call.peer_video(*call, *video);
                 (None, None)
             }
+            NodeEvent::CallReaction { call, emoji, .. } => {
+                self.call.reaction(*call, emoji);
+                (None, None)
+            }
             NodeEvent::CallMedia { call, state } => {
                 self.call.media(*call, state);
                 (None, None)

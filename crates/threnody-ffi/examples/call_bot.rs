@@ -6,6 +6,7 @@
 //! moving colour bars as its video and logs the frames it receives (their
 //! size and brightness, nothing more). It sends silence and plays
 //! nothing unless `BOT_MIC=1`: a bot's speaker echoes into its microphone.
+//! It sends back every reaction it gets, so both float on the app's screen.
 //!
 //! ```sh
 //! cargo run -p threnody-ffi --features calls --example call_bot -- <home> [port] [seconds]
@@ -77,6 +78,15 @@ fn main() {
             NodeEvent::CallMedia { call, state } => println!("call {call:x} audio: {state}"),
             NodeEvent::CallVideo { call, video, .. } => {
                 println!("call {call:x} peer video: {video}")
+            }
+            NodeEvent::CallReaction { call, emoji, .. } => {
+                println!("call {call:x} reaction {emoji}");
+                let n = node.clone();
+                // After a moment, so the two don't float on top of each other.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    let _ = n.send_call_reaction(emoji);
+                });
             }
             NodeEvent::CallEnded {
                 call,

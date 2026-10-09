@@ -18,9 +18,10 @@ WebRTC ◀──TURN (loopback)── threnody-media::turn ◀── Node::call_
 
 ```
 CallMsg = { 0: op, 1: call uint, ? 2: secret bstr(32), ? 3: flags uint,
-            ? 4: reason uint, ? 5: data bstr }
+            ? 4: reason uint, ? 5: data bstr, ? 6: emoji tstr }
 op: 1 offer (secret, flags), 2 ringing, 3 answer (secret, flags),
-    4 hangup (reason), 5 update (flags), 6 signal (data ≤ 64 KiB)
+    4 hangup (reason), 5 update (flags), 6 signal (data ≤ 64 KiB),
+    7 reaction (emoji)
 flags: 1 = video
 reason: 0 ended, 1 declined, 2 busy, 3 unanswered, 4 failed,
         5 answered elsewhere, 6 declined elsewhere (unknown = ended)
@@ -31,6 +32,7 @@ reason: 0 ended, 1 declined, 2 busy, 3 unanswered, 4 failed,
 - **Busy.** An offer while a call is in progress gets `busy`.
 - **Answer.** The callee answers with its own fresh secret.
 - **Signal.** This carries the media layer's session descriptions and ICE candidates. It is tracked, so it survives a replaced session. Apps never see it, and neither do their logs.
+- **Reaction.** One emoji, at most 32 bytes with no control characters or whitespace, that both apps float up over the call's video for a few seconds. It's only accepted in an answered call, and reactions arriving less than 150 ms after the last one are dropped, so a peer can't flood the screen. It isn't stored or shown anywhere else. A peer that predates it rejects it as an unknown op, and nothing floats there.
 - **Timeouts.** An unanswered call ends after 60 s. An answered call whose media stops arriving for 30 s ends as `failed`.
 - **Pacing.** Call messages and stream-carried media go out immediately, even under constant-rate cover traffic. A call's media reveals the call anyway, and setup can't wait for 2-second ticks.
 

@@ -596,7 +596,7 @@ object Threnody {
                     }
                 }
                 is NodeEvent.CallIncoming, is NodeEvent.CallRinging, is NodeEvent.CallStarted,
-                is NodeEvent.CallMedia, is NodeEvent.CallVideo, is NodeEvent.CallEnded -> {
+                is NodeEvent.CallMedia, is NodeEvent.CallVideo, is NodeEvent.CallReaction, is NodeEvent.CallEnded -> {
                     // The log is for transports: that a call happened, not with whom.
                     if (e is NodeEvent.CallIncoming || e is NodeEvent.CallEnded) say("* call: ${e::class.simpleName}")
                     Calls.onEvent(ctx, node, persona, e)

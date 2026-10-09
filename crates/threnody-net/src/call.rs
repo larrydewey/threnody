@@ -33,6 +33,8 @@ pub const MEDIA_TIMEOUT: Duration = Duration::from_secs(30);
 /// Received media payloads waiting for the media layer; more are dropped
 /// (late media is useless).
 const MEDIA_QUEUE: usize = 512;
+/// Reactions faster than this are dropped: a peer can't flood the screen.
+const REACTION_GAP_MS: u64 = 150;
 const WATCH_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +87,9 @@ struct Call {
     offer_secret: Option<Zeroizing<[u8; 32]>>,
     keys: Option<MediaKeys>,
     last_rx_ms: u64,
+    /// When the peer's last reaction was shown; more come no faster than
+    /// [`REACTION_GAP_MS`] apart.
+    last_reaction_ms: u64,
     media_tx: Option<mpsc::Sender<(u8, Vec<u8>)>>,
     media_rx: Option<mpsc::Receiver<(u8, Vec<u8>)>>,
 }
@@ -146,6 +151,7 @@ impl Node {
             offer_secret: None,
             keys: None,
             last_rx_ms: 0,
+            last_reaction_ms: 0,
             media_tx: None,
             media_rx: None,
         });
@@ -216,6 +222,25 @@ impl Node {
         let m = CallMsg::Update {
             call: id,
             video: on,
+        };
+        self.send(&peer, AppMessage::Call(m.encode()?))
+    }
+
+    /// Floats `emoji` over the peer's video (and the app floats it over
+    /// ours): one emoji, see [`call::valid_reaction`]. Only in an answered
+    /// call.
+    pub fn send_call_reaction(&self, id: u64, emoji: &str) -> Result<()> {
+        if !call::valid_reaction(emoji) {
+            return Err(NetError::NotAllowed("not a reaction".into()));
+        }
+        let peer = self
+            .call()
+            .filter(|c| c.call == id && c.phase == Phase::Active)
+            .map(|c| c.peer)
+            .ok_or_else(|| NetError::NoRoute("no such call".into()))?;
+        let m = CallMsg::Reaction {
+            call: id,
+            emoji: emoji.to_owned(),
         };
         self.send(&peer, AppMessage::Call(m.encode()?))
     }
@@ -377,6 +402,24 @@ impl Node {
                     });
                 }
             }
+            CallMsg::Reaction { emoji, .. } => {
+                let mut calls = lock(&self.shared.calls);
+                let now = now_ms();
+                if let Some(c) = calls.current.as_mut().filter(|c| {
+                    c.info.call == id
+                        && c.info.peer == peer
+                        && c.info.phase == Phase::Active
+                        && now.saturating_sub(c.last_reaction_ms) >= REACTION_GAP_MS
+                }) {
+                    c.last_reaction_ms = now;
+                    drop(calls);
+                    self.emit(Event::CallReaction {
+                        peer,
+                        call: id,
+                        emoji,
+                    });
+                }
+            }
             CallMsg::Update { video, .. } => {
                 let mut calls = lock(&self.shared.calls);
                 if let Some(c) = calls
@@ -432,6 +475,7 @@ impl Node {
             offer_secret: Some(Zeroizing::new(offer)),
             keys: None,
             last_rx_ms: 0,
+            last_reaction_ms: 0,
             media_tx: None,
             media_rx: None,
         });
