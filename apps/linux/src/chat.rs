@@ -1691,11 +1691,13 @@ impl ChatView {
             let core = app.core.clone();
             d.connect_response(None, move |_, r| {
                 let Some(t) = weak.upgrade() else { return };
+                // Once this dialog has gone: one presented while it closes
+                // never shows.
                 if r == "giphy" {
                     core.settings().set_flag(settings::GIPHY, true);
-                    t.gifs();
+                    glib::idle_add_local_once(move || t.gifs());
                 } else if r == "files" {
-                    t.pick_files();
+                    glib::idle_add_local_once(move || t.pick_files());
                 }
             });
             d.present(Some(&app.window));
@@ -1714,13 +1716,17 @@ impl ChatView {
                 move |k| {
                     if let (Some(t), false) = (weak.upgrade(), k.is_empty()) {
                         core.settings().set_text(settings::GIPHY_KEY, &k);
-                        t.gifs();
+                        glib::idle_add_local_once(move || t.gifs());
                     }
                 },
             );
             return;
         }
-        let (files, weak) = (self.weak_self.clone(), self.weak_self.clone());
+        let (files, weak, core) = (
+            self.weak_self.clone(),
+            self.weak_self.clone(),
+            app.core.clone(),
+        );
         gifs::picker(
             &app.window,
             key,
@@ -1729,6 +1735,7 @@ impl ChatView {
                     t.pick_files();
                 }
             },
+            move || core.settings().set_text(settings::GIPHY_KEY, ""),
             move |g| {
                 if let Some(t) = weak.upgrade() {
                     t.send_gif(g);

@@ -21,6 +21,7 @@ const LIMIT: u32 = 30;
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Previews are small; anything bigger than this isn't one.
 const MAX_PREVIEW: u64 = 2 * 1024 * 1024;
+const REFUSED: &str = "GIPHY refused the API key";
 /// Search answers are JSON of a few hundred kilobytes.
 const MAX_ANSWER: u64 = 1024 * 1024;
 
@@ -113,7 +114,7 @@ pub fn get(url: &str, max: u64) -> Result<Vec<u8>, String> {
     let r = client.get(url).send().map_err(|e| e.to_string())?;
     match r.status().as_u16() {
         200 => {}
-        401 | 403 => return Err("GIPHY refused the API key".into()),
+        401 | 403 => return Err(REFUSED.into()),
         code => return Err(format!("GIPHY answered {code}")),
     }
     if r.content_length().is_some_and(|n| n > max) {
@@ -136,6 +137,7 @@ pub fn picker(
     parent: &impl IsA<gtk::Widget>,
     key: String,
     files: impl Fn() + 'static,
+    refused: impl Fn() + 'static,
     pick: impl Fn(Gif) + 'static,
 ) {
     let d = adw::Dialog::builder()
@@ -174,10 +176,9 @@ pub fn picker(
     body.append(&scroll);
     // GIPHY asks apps to say where the GIFs come from.
     let foot = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    foot.append(&crate::ui::label(
-        "Powered by GIPHY",
-        &["caption", "dim-label"],
-    ));
+    let powered = crate::ui::label("Powered by GIPHY", &["caption", "dim-label"]);
+    powered.set_wrap(false);
+    foot.append(&powered);
     foot.append(&gtk::Box::builder().hexpand(true).build());
     foot.append(&own);
     body.append(&foot);
@@ -187,6 +188,7 @@ pub fn picker(
     d.set_child(Some(&view));
 
     let pick: Rc<dyn Fn(Gif)> = Rc::new(pick);
+    let refused: Rc<dyn Fn()> = Rc::new(refused);
     let generation = Rc::new(Cell::new(0u32));
     let run = {
         let (grid, status, d) = (grid.clone(), status.clone(), d.clone());
@@ -198,13 +200,14 @@ pub fn picker(
             while let Some(c) = grid.first_child() {
                 grid.remove(&c);
             }
-            let (key, generation, grid, status, d, pick) = (
+            let (key, generation, grid, status, d, pick, refused) = (
                 key.clone(),
                 generation.clone(),
                 grid.clone(),
                 status.clone(),
                 d.clone(),
                 pick.clone(),
+                refused.clone(),
             );
             bg(
                 move || search(&key, &query),
@@ -220,6 +223,11 @@ pub fn picker(
                             for g in gifs {
                                 grid.append(&tile(&g, &d, &pick));
                             }
+                        }
+                        Err(e) if e == REFUSED => {
+                            // Forgotten, so the next try asks for another.
+                            refused();
+                            status.set_label("GIPHY refused the API key. Try again with another.");
                         }
                         Err(e) => status.set_label(&format!("Couldn't reach GIPHY: {e}")),
                     }
