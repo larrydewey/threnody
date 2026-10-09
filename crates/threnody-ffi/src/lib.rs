@@ -2058,7 +2058,9 @@ mod tests {
                 f.height,
                 t0.elapsed()
             );
-            let report = alice.call_media_report().expect("a report while the call runs");
+            let report = alice
+                .call_media_report()
+                .expect("a report while the call runs");
             assert!(report.contains("video out"), "{report}");
             eprintln!("call {round}: {report}");
             alice.hangup_call(id);
