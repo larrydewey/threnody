@@ -1349,24 +1349,51 @@ impl App {
     }
 
     pub fn add_contact(self: &Rc<Self>, initial: &str) {
-        let weak = Rc::downgrade(self);
-        ui::ask_text(
-            &self.window,
+        let d = ui::alert(
             "Add a contact",
-            "Paste their invite link. You'll compare safety numbers together later.",
-            "threnody://…",
-            initial,
-            "Connect",
-            move |link| {
-                if let Some(this) = weak.upgrade() {
-                    this.connect(link);
-                }
-            },
+            "Paste their invite link, and give them a name you'll recognise if you like. \
+             You'll compare safety numbers together later.",
+            &[("cancel", "Cancel"), ("ok", "Connect")],
         );
+        d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        let link = gtk::Entry::builder()
+            .placeholder_text("threnody://…")
+            .text(initial)
+            .activates_default(true)
+            .build();
+        let name = gtk::Entry::builder()
+            .placeholder_text("Name (optional; only you see it)")
+            .activates_default(true)
+            .build();
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        b.append(&link);
+        b.append(&name);
+        d.set_extra_child(Some(&b));
+        let weak = Rc::downgrade(self);
+        let (l, n) = (link.clone(), name.clone());
+        d.connect_response(None, move |_, r| {
+            if r == "ok"
+                && let Some(this) = weak.upgrade()
+            {
+                this.connect_named(l.text().trim().to_owned(), n.text().trim().to_owned());
+            }
+        });
+        d.present(Some(&self.window));
+        // A link already filled in: naming them comes next.
+        let focus: gtk::Entry = if initial.is_empty() { link } else { name };
+        glib::idle_add_local_once(move || {
+            focus.grab_focus();
+        });
     }
 
     /// Dials an invite (or offers to join for a device link code).
     pub fn connect(self: &Rc<Self>, link: String) {
+        self.connect_named(link, String::new());
+    }
+
+    /// As [`connect`](Self::connect), calling the contact `name` (only
+    /// here) if one is given.
+    pub fn connect_named(self: &Rc<Self>, link: String, name: String) {
         if link.is_empty() {
             return;
         }
@@ -1377,8 +1404,16 @@ impl App {
         let core = self.core.clone();
         let weak = Rc::downgrade(self);
         bg(
-            move || core.main.connect(link).map_err(|e| e.to_string()),
-            move |r| {
+            move || {
+                let peer = core.main.connect(link).map_err(|e| e.to_string())?;
+                if !name.is_empty()
+                    && let Err(e) = core.main.set_name(peer.clone(), name)
+                {
+                    core.say(format!("! naming a contact: {e}"));
+                }
+                Ok(peer)
+            },
+            move |r: Result<String, String>| {
                 let Some(this) = weak.upgrade() else { return };
                 match r {
                     Ok(peer) => {
