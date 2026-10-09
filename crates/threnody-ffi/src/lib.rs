@@ -294,6 +294,12 @@ pub enum NodeEvent {
         call: u64,
         video: bool,
     },
+    /// `peer` sent an emoji to float over the call's video for a moment.
+    CallReaction {
+        peer: String,
+        call: u64,
+        emoji: String,
+    },
     /// The call is over: "ended", "declined", "busy", "unanswered",
     /// "failed", …; `by_us` when this side ended it.
     CallEnded {
@@ -793,6 +799,11 @@ fn convert(e: Event) -> NodeEvent {
             peer: fp(&peer),
             call,
             video,
+        },
+        Event::CallReaction { peer, call, emoji } => NodeEvent::CallReaction {
+            peer: fp(&peer),
+            call,
+            emoji,
         },
         Event::CallEnded {
             peer,

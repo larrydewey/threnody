@@ -193,6 +193,13 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Floats one emoji over the peer's video in the current call (they
+    /// get `CallReaction`); the app floats it over its own screen too.
+    pub fn send_call_reaction(&self, emoji: String) -> Result<()> {
+        let c = self.node.call().ok_or_else(|| fail("not in a call"))?;
+        self.node.send_call_reaction(c.call, &emoji).map_err(fail)
+    }
+
     /// One camera frame for the current call: I420, the `width × height`
     /// luma plane then the U and V planes at half size, turned `rotation`
     /// degrees clockwise to be upright. False when there's no call to send

@@ -42,6 +42,12 @@ class CallActivity : Activity() {
     private lateinit var remote: ImageView
     private lateinit var local: TextureView
     private var unlisten: (() -> Unit)? = null
+    private var unlistenReactions: (() -> Unit)? = null
+    /** Emoji floating up over the video, ours and the peer's (draws only, takes no touches). */
+    private lateinit var floats: FrameLayout
+    /** The emoji button, and the row of emoji it opens. */
+    private lateinit var reactions: LinearLayout
+    private lateinit var picks: android.widget.HorizontalScrollView
     private val ticker = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
@@ -156,6 +162,42 @@ class CallActivity : Activity() {
             }
         }
 
+        floats = FrameLayout(this)
+        val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        picks = android.widget.HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            background = rounded(Color.argb(140, 0, 0, 0), dp(26).toFloat())
+            setPadding(dp(6), dp(2), dp(6), dp(2))
+            visibility = View.GONE
+            addView(strip)
+        }
+        val emojiButton = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_emoji)
+            imageTintList = android.content.res.ColorStateList.valueOf(white)
+            contentDescription = "Send a reaction"
+            tooltipText = "Send a reaction"
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(140, 0, 0, 0))
+            }
+            setOnClickListener { v ->
+                Design.lightHaptic(v)
+                if (picks.visibility == View.VISIBLE) {
+                    picks.visibility = View.GONE
+                } else {
+                    fillPicks(strip)
+                    picks.visibility = View.VISIBLE
+                }
+            }
+        }
+        reactions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            visibility = View.GONE
+            addView(picks, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginEnd = dp(Design.sm) })
+            addView(emojiButton, LinearLayout.LayoutParams(dp(52), dp(52)))
+        }
+
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -163,12 +205,14 @@ class CallActivity : Activity() {
             addView(who, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(Design.sm) })
             addView(View(this@CallActivity), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+            addView(reactions, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(Design.lg) })
             addView(ringingRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(activeRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
         val frame = FrameLayout(this).apply {
             setBackgroundColor(color(R.color.background))
             addView(remote, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(floats, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(local, FrameLayout.LayoutParams(dp(108), dp(144), Gravity.TOP or Gravity.END).apply {
                 topMargin = dp(Design.xxl * 3)
@@ -194,6 +238,7 @@ class CallActivity : Activity() {
     override fun onStart() {
         super.onStart()
         unlisten = Calls.listen { runOnUiThread { show() } }
+        unlistenReactions = Calls.listenReactions { e -> runOnUiThread { float(e) } }
         ticker.post(tick)
         watchVideo()
         Calls.pauseVideo(false)
@@ -202,6 +247,8 @@ class CallActivity : Activity() {
 
     override fun onStop() {
         unlisten?.invoke()
+        unlistenReactions?.invoke()
+        floats.removeAllViews()
         ticker.removeCallbacks(tick)
         watching.incrementAndGet()
         stopCamera()
@@ -286,6 +333,9 @@ class CallActivity : Activity() {
         ringingRow.visibility = if (ringing) View.VISIBLE else View.GONE
         answerVideo.visibility = if (c.peerVideo) View.VISIBLE else View.GONE
         activeRow.visibility = if (ringing) View.GONE else View.VISIBLE
+        val talking = c.state == "connected" || c.state == "interrupted"
+        reactions.visibility = if (talking) View.VISIBLE else View.GONE
+        if (!talking) picks.visibility = View.GONE
         remote.visibility = if (c.peerVideo && !ringing) View.VISIBLE else View.GONE
         local.visibility = if (c.video && !ringing) View.VISIBLE else View.GONE
         flip.visibility = if (c.video && !ringing && CallCamera.canSwitch(this)) View.VISIBLE else View.GONE
@@ -297,6 +347,68 @@ class CallActivity : Activity() {
         cameraIfWanted()
     }
 
+    /** The row of emoji to send: recent ones first, then the usual; ＋ opens them all. */
+    private fun fillPicks(strip: LinearLayout) {
+        strip.removeAllViews()
+        fun pick(text: String, desc: String, onClick: () -> Unit) = strip.addView(TextView(this).apply {
+            this.text = text
+            textSize = 28f
+            gravity = Gravity.CENTER
+            contentDescription = desc
+            setTextColor(Color.WHITE)
+            setOnClickListener { v ->
+                Design.lightHaptic(v)
+                onClick()
+            }
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
+        for (e in (EmojiPicker.recent(this) + QUICK).distinct().take(QUICK.size)) {
+            pick(e, "Send $e") { Calls.react(this, e) }
+        }
+        pick("＋", "All emoji") {
+            EmojiPicker(this, "Reaction", stay = true) { e -> Calls.react(this, e) }.show()
+        }
+    }
+
+    /**
+     * Floats `emoji` up from the bottom of the screen, swaying a little,
+     * and fades it out. A flood is capped: the oldest give way.
+     */
+    private fun float(emoji: String) {
+        if (floats.width == 0) return
+        while (floats.childCount >= MAX_FLOATING) floats.removeViewAt(0)
+        val v = TextView(this).apply {
+            text = emoji
+            textSize = 40f
+            gravity = Gravity.CENTER
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        val rnd = java.util.Random()
+        val x = floats.width * (0.15f + 0.6f * rnd.nextFloat())
+        floats.addView(v, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START))
+        val (from, to) = floats.height * 0.8f to floats.height * 0.15f
+        val sway = dp(16) * (if (rnd.nextBoolean()) 1f else -1f)
+        android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = FLOAT_MS
+            interpolator = android.view.animation.DecelerateInterpolator()
+            addUpdateListener {
+                val t = it.animatedValue as Float
+                v.translationX = x + sway * kotlin.math.sin(t * 3 * Math.PI).toFloat()
+                v.translationY = from + (to - from) * t
+                val grow = 0.6f + 0.6f * kotlin.math.min(1f, t * 4)
+                v.scaleX = grow
+                v.scaleY = grow
+                // Fades over the last third of the way up.
+                v.alpha = if (t < 2f / 3) 1f else (1 - t) * 3
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) {
+                    floats.removeView(v)
+                }
+            })
+            start()
+        }
+    }
+
     private fun duration(ms: Long): String {
         val s = ms / 1000
         return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
@@ -304,6 +416,9 @@ class CallActivity : Activity() {
 
     companion object {
         const val ANSWER = "org.threnody.app.ANSWER"
+        private const val FLOAT_MS = 2800L
+        private const val MAX_FLOATING = 24
+        private val QUICK = listOf("❤️", "😂", "👍", "😮", "😢", "🎉", "🔥", "😘")
     }
 
     // The call carries on without the screen; Back just leaves it.

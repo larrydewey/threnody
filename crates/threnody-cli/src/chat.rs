@@ -1119,6 +1119,7 @@ impl Ui {
             | Event::CallStarted { .. }
             | Event::CallSignal { .. }
             | Event::CallVideo { .. }
+            | Event::CallReaction { .. }
             | Event::CallEnded { .. } => {}
             Event::Typing { peer, active } => {
                 if active {
