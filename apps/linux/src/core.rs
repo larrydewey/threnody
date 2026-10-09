@@ -674,7 +674,7 @@ impl Core {
 
     /// Keeps a received file: photos privately, others in
     /// Downloads/Threnody. A persona keeps everything privately.
-    fn keep(&self, persona: Option<&str>, name: &str, data: &[u8]) -> Option<String> {
+    pub fn keep(&self, persona: Option<&str>, name: &str, data: &[u8]) -> Option<String> {
         let dir = if persona.is_some() || is_image(name) {
             self.media_dir(persona)
         } else {

@@ -15,6 +15,11 @@ pub const TIMER: &str = "default_timer";
 pub const VOLUNTEERS: &str = "use_volunteers";
 pub const SEND_READ: &str = "send_read_receipts";
 pub const SEND_TYPING: &str = "send_typing";
+/// GIF search through GIPHY: off until the user agrees to GIPHY seeing
+/// their searches and IP address.
+pub const GIPHY: &str = "giphy_search";
+/// A GIPHY API key the user entered (it wins over the build's).
+pub const GIPHY_KEY: &str = "giphy_api_key";
 
 /// Cover interval on unmetered networks, and on metered ones.
 pub const COVER_UNMETERED_MS: u32 = 2_000;
@@ -74,6 +79,25 @@ impl Settings {
 
     pub fn set_flag(&mut self, key: &str, on: bool) {
         self.values.insert(key.to_owned(), on.to_string());
+        self.save();
+    }
+
+    /// A switch that stays off until the user turns it on.
+    pub fn opted_in(&self, key: &str) -> bool {
+        self.values.get(key).is_some_and(|v| v == "true")
+    }
+
+    pub fn text(&self, key: &str) -> Option<&str> {
+        self.values
+            .get(key)
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+    }
+
+    pub fn set_text(&mut self, key: &str, value: &str) {
+        // One line per key: a newline would split it.
+        let value: String = value.chars().filter(|c| !c.is_control()).collect();
+        self.values.insert(key.to_owned(), value.trim().to_owned());
         self.save();
     }
 

@@ -1971,6 +1971,19 @@ impl App {
             "Send typing indicators",
             "Contacts see “…” while you write to them",
         );
+        // Off until chosen, unlike the switches above: it tells GIPHY things.
+        let giphy = adw::SwitchRow::builder()
+            .title("GIF search with GIPHY")
+            .subtitle(
+                "GIPHY sees your searches and this computer's IP address, not who you send GIFs to",
+            )
+            .active(self.core.settings().opted_in(settings::GIPHY))
+            .build();
+        let core = self.core.clone();
+        giphy.connect_active_notify(move |r| {
+            core.settings().set_flag(settings::GIPHY, r.is_active());
+        });
+        messages.add(&giphy);
         toggle(
             &messages,
             settings::BACKGROUND,

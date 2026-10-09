@@ -9,9 +9,9 @@ use gtk::{gdk, gio, glib};
 use threnody_ffi::{FileOptions, HistoryEntry};
 
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target};
-use crate::settings;
 use crate::ui::{self, bg};
 use crate::window::App;
+use crate::{gifs, settings};
 
 /// How many messages a chat loads (more to reach an older search match).
 const HISTORY: u32 = 1000;
@@ -217,6 +217,28 @@ impl ChatView {
         attach.add_css_class("flat");
         attach.add_css_class("circular");
         attach.set_valign(gtk::Align::End);
+        // Emoji go in at the cursor; the chooser stays for more.
+        let emoji = gtk::MenuButton::builder()
+            .icon_name("face-smile-symbolic")
+            .tooltip_text("Emoji")
+            .valign(gtk::Align::End)
+            .build();
+        emoji.add_css_class("flat");
+        emoji.add_css_class("circular");
+        let chooser = gtk::EmojiChooser::new();
+        let buffer = input.buffer();
+        chooser.connect_emoji_picked(move |_, em| {
+            buffer.delete_selection(true, true);
+            buffer.insert_at_cursor(em);
+        });
+        emoji.set_popover(Some(&chooser));
+        let gif = gtk::Button::builder()
+            .label("GIF")
+            .tooltip_text("Send a GIF")
+            .valign(gtk::Align::End)
+            .build();
+        gif.add_css_class("flat");
+        gif.add_css_class("gif-button");
         let send = gtk::Button::from_icon_name("go-up-symbolic");
         send.set_tooltip_text(Some("Send (Enter)"));
         send.add_css_class("suggested-action");
@@ -248,6 +270,8 @@ impl ChatView {
         let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         composer.add_css_class("composer");
         composer.append(&attach);
+        composer.append(&emoji);
+        composer.append(&gif);
         composer.append(&overlay);
         composer.append(&send);
         let composer_clamp = adw::Clamp::builder()
@@ -314,6 +338,12 @@ impl ChatView {
         attach.connect_clicked(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.pick_files();
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        gif.connect_clicked(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.gifs();
             }
         });
         // Enter sends; Shift+Enter starts a new line.
@@ -1132,6 +1162,7 @@ impl ChatView {
                 return b.upcast();
             }
             let pic = gtk::Picture::for_filename(p);
+            animate(&pic, p);
             pic.set_can_shrink(true);
             pic.set_content_fit(gtk::ContentFit::Contain);
             pic.set_size_request(240, 180);
@@ -1641,6 +1672,111 @@ impl ChatView {
         self.scroll_to_end();
     }
 
+    /// GIPHY's GIFs once the user has agreed to GIPHY seeing their
+    /// searches; until then, or without an API key, GIF files of their own.
+    fn gifs(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        if !app.core.settings().opted_in(settings::GIPHY) {
+            let d = ui::alert(
+                "Search GIFs with GIPHY?",
+                "GIPHY will see what you search for and this computer's IP address. \
+                 It won't see who you send GIFs to, and your contacts' devices never contact it. \
+                 You can turn this off in Preferences.",
+                &[("files", "Choose a GIF file"), ("giphy", "Use GIPHY")],
+            );
+            d.set_response_appearance("giphy", adw::ResponseAppearance::Suggested);
+            let weak = self.weak_self.clone();
+            let core = app.core.clone();
+            d.connect_response(None, move |_, r| {
+                let Some(t) = weak.upgrade() else { return };
+                // Once this dialog has gone: one presented while it closes
+                // never shows.
+                if r == "giphy" {
+                    core.settings().set_flag(settings::GIPHY, true);
+                    glib::idle_add_local_once(move || t.gifs());
+                } else if r == "files" {
+                    glib::idle_add_local_once(move || t.pick_files());
+                }
+            });
+            d.present(Some(&app.window));
+            return;
+        }
+        let key = gifs::key(app.core.settings().text(settings::GIPHY_KEY));
+        if key.is_empty() {
+            let (weak, core) = (self.weak_self.clone(), app.core.clone());
+            ui::ask_text(
+                &app.window,
+                "GIPHY API key",
+                "This copy of Threnody was built without one. Get a free key at developers.giphy.com.",
+                "API key",
+                "",
+                "Save",
+                move |k| {
+                    if let (Some(t), false) = (weak.upgrade(), k.is_empty()) {
+                        core.settings().set_text(settings::GIPHY_KEY, &k);
+                        glib::idle_add_local_once(move || t.gifs());
+                    }
+                },
+            );
+            return;
+        }
+        let (files, weak, core) = (
+            self.weak_self.clone(),
+            self.weak_self.clone(),
+            app.core.clone(),
+        );
+        gifs::picker(
+            &app.window,
+            key,
+            move || {
+                if let Some(t) = files.upgrade() {
+                    t.pick_files();
+                }
+            },
+            move || core.settings().set_text(settings::GIPHY_KEY, ""),
+            move |g| {
+                if let Some(t) = weak.upgrade() {
+                    t.send_gif(g);
+                }
+            },
+        );
+    }
+
+    /// Downloads a GIF from GIPHY, keeps it with the chat's photos, and
+    /// offers to send it like a picked one.
+    fn send_gif(self: &Rc<Self>, g: gifs::Gif) {
+        let (Some(app), Some(node)) = (self.app.upgrade(), self.node()) else {
+            return;
+        };
+        self.toast("Getting the GIF…");
+        let (core, persona, weak) = (app.core.clone(), self.persona(), self.weak_self.clone());
+        bg(
+            move || {
+                let bytes = gifs::get(&g.full, node.max_file_size())?;
+                let id: String =
+                    g.id.chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .take(32)
+                        .collect();
+                let name = format!(
+                    "gif-{}.gif",
+                    if id.is_empty() { "giphy".into() } else { id }
+                );
+                core.keep(persona.as_deref(), &name, &bytes)
+                    .ok_or_else(|| "couldn't save it".to_owned())
+            },
+            move |kept: Result<String, String>| {
+                let Some(t) = weak.upgrade() else { return };
+                match kept {
+                    Ok(path) => t.confirm_files(vec![path.into()]),
+                    Err(e) => t.toast(&format!("Couldn't get the GIF: {e}")),
+                }
+            },
+        );
+    }
+
     fn pick_files(self: &Rc<Self>) {
         let Some(app) = self.app.upgrade() else {
             return;
@@ -1734,6 +1870,10 @@ impl ChatView {
     ) {
         let Some(node) = self.node() else { return };
         let (group, device) = (self.group(), self.device());
+        let strip = self
+            .app
+            .upgrade()
+            .is_none_or(|a| a.core.settings().flag(settings::STRIP));
         self.toast(if paths.len() == 1 {
             "Sending…"
         } else {
@@ -1750,19 +1890,32 @@ impl ChatView {
                 let max = node.max_file_size();
                 let mut failed = Vec::new();
                 for (i, p) in paths.iter().enumerate() {
-                    let name = p
+                    let mut name = p
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
                     let data = match std::fs::read(p) {
-                        Ok(d) if d.len() as u64 <= max => d,
-                        Ok(_) => {
-                            failed.push(format!("{name} is larger than {}", ui::human_size(max)));
-                            continue;
-                        }
+                        Ok(d) if !strip => d,
+                        Ok(d) => match prepare(p, name.clone(), d) {
+                            Ok((n, d)) => {
+                                name = n;
+                                d
+                            }
+                            Err(e) => {
+                                failed.push(e);
+                                continue;
+                            }
+                        },
                         Err(e) => {
                             failed.push(format!("{name}: {e}"));
+                            continue;
+                        }
+                    };
+                    let data = match data {
+                        d if d.len() as u64 <= max => d,
+                        _ => {
+                            failed.push(format!("{name} is larger than {}", ui::human_size(max)));
                             continue;
                         }
                     };
@@ -2613,4 +2766,106 @@ fn linkify(text: &str) -> Option<String> {
     }
     out.push_str(&glib::markup_escape_text(rest));
     Some(out)
+}
+
+/// Plays an animated GIF in `pic` (GTK draws only its first frame) while
+/// the picture exists; it only advances while it's on screen.
+fn animate(pic: &gtk::Picture, path: &std::path::Path) {
+    let is_gif = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+    if !is_gif {
+        return;
+    }
+    let Ok(anim) = gdk::gdk_pixbuf::PixbufAnimation::from_file(path) else {
+        return;
+    };
+    if anim.is_static_image() {
+        return;
+    }
+    let iter = anim.iter(None);
+    let weak = pic.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+        let Some(pic) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if pic.is_mapped() && iter.advance(std::time::SystemTime::now()) {
+            pic.set_paintable(Some(&gdk::Texture::for_pixbuf(&iter.pixbuf())));
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Image formats the node can't strip metadata from (it does JPEG, PNG
+/// and WebP; GIFs carry none worth the name): they're sent as JPEG.
+const CONVERT: [&str; 6] = ["heic", "heif", "avif", "bmp", "tif", "tiff"];
+/// Larger images are refused rather than decoded (decompression bombs).
+const MAX_PIXELS: i64 = 100_000_000;
+/// Converted photos are scaled to fit this, as the Android app does.
+const MAX_SIDE: i32 = 4096;
+
+/// An image the node can't strip, re-encoded as JPEG (which then carries
+/// no metadata): the name and bytes to send. Others pass through.
+fn prepare(
+    path: &std::path::Path,
+    name: String,
+    data: Vec<u8>,
+) -> Result<(String, Vec<u8>), String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !CONVERT.contains(&ext.as_str()) {
+        return Ok((name, data));
+    }
+    let unreadable =
+        || format!("{name}: can't remove its location and camera details, so it wasn't sent");
+    let (_, w, h) = gdk::gdk_pixbuf::Pixbuf::file_info(path).ok_or_else(unreadable)?;
+    if i64::from(w) * i64::from(h) > MAX_PIXELS || w <= 0 || h <= 0 {
+        return Err(format!("{name} is too large a picture"));
+    }
+    let pixbuf = if w.max(h) > MAX_SIDE {
+        gdk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, MAX_SIDE, MAX_SIDE, true)
+    } else {
+        gdk::gdk_pixbuf::Pixbuf::from_file(path)
+    }
+    .map_err(|_| unreadable())?;
+    // Turned upright as the camera meant, since the turn itself is metadata.
+    let upright = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+    let jpeg = upright
+        .save_to_bufferv("jpeg", &[("quality", "92")])
+        .map_err(|_| unreadable())?;
+    let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+    Ok((format!("{stem}.jpg"), jpeg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn photos_the_node_cant_strip_go_as_jpeg() {
+        let dir = std::env::temp_dir().join(format!("threnody-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tiff = dir.join("scan.tiff");
+        let p = gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, 40, 30)
+            .unwrap();
+        p.fill(0x3366_99ff);
+        p.savev(&tiff, "tiff", &[]).unwrap();
+        let data = std::fs::read(&tiff).unwrap();
+        let (name, out) = prepare(&tiff, "scan.tiff".into(), data).unwrap();
+        assert_eq!(name, "scan.jpg");
+        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
+
+        // Formats the node strips itself pass through untouched.
+        let png = dir.join("a.png");
+        let (name, out) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
+        assert!(name == "a.png" && out == b"as is");
+
+        // One it can't read isn't sent with its metadata.
+        let heic = dir.join("broken.heic");
+        std::fs::write(&heic, b"not a picture").unwrap();
+        assert!(prepare(&heic, "broken.heic".into(), b"not a picture".to_vec()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

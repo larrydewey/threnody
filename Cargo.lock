@@ -5838,6 +5838,8 @@ dependencies = [
  "gtk4",
  "keyring",
  "libadwaita",
+ "reqwest",
+ "serde_json",
  "threnody-core",
  "threnody-ffi",
  "zeroize",
