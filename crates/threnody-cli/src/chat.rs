@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use threnody_core::history::{ConversationId, FileNote, Query};
+use threnody_core::message::Clip;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Fingerprint, Identity, PublicIdentity, safety_number};
 use threnody_net::history::OutgoingFile;
@@ -426,10 +427,11 @@ impl Ui {
                 sensitive,
                 caption,
                 album,
+                clip,
                 ..
             } => {
                 let saved = save_download(&self.downloads, &name, &data);
-                let mark = if sensitive { " [sensitive]" } else { "" };
+                let mark = file_mark(sensitive, clip);
                 match &saved {
                     Ok(p) => println!(
                         "* {who} sent {name}{mark} ({} bytes) -> {}",
@@ -449,6 +451,7 @@ impl Ui {
                         location: saved.ok().map(|p| p.display().to_string()),
                         sensitive,
                         album,
+                        clip,
                     },
                     &caption,
                     id,
@@ -2186,6 +2189,7 @@ pub(crate) async fn read_files(arg: &str) -> Result<Vec<OutgoingFile>> {
                 .ok()
                 .map(|p| p.display().to_string()),
             sensitive,
+            clip: None,
             caption: if i == 0 {
                 caption.to_owned()
             } else {
@@ -2199,6 +2203,21 @@ pub(crate) async fn read_files(arg: &str) -> Result<Vec<OutgoingFile>> {
 
 /// Saves a received file under `dir` using only its final path component,
 /// never overwriting an existing file.
+/// What to say after a received file's name: whether it is sensitive,
+/// and whether it is a voice or video message (and how long).
+pub(crate) fn file_mark(sensitive: bool, clip: Option<Clip>) -> String {
+    let mut mark = String::new();
+    if let Some(c) = clip {
+        let kind = if c.video { "video" } else { "voice" };
+        let s = c.duration_ms / 1000;
+        mark += &format!(" [{kind} message, {}:{:02}]", s / 60, s % 60);
+    }
+    if sensitive {
+        mark += " [sensitive]";
+    }
+    mark
+}
+
 pub(crate) fn save_download(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let base: String = Path::new(name)

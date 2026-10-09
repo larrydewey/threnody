@@ -325,6 +325,7 @@ mod tests {
                 sensitive: false,
                 caption: String::new(),
                 album: 0,
+                clip: None,
             },
             Tag::NONE,
         );
@@ -367,6 +368,7 @@ mod tests {
             sensitive: false,
             caption: String::new(),
             album: 0,
+            clip: None,
         };
         for _ in 0..6 {
             d.track(&p, big.clone(), Tag::NONE);

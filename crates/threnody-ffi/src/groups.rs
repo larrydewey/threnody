@@ -116,6 +116,7 @@ fn event(u: Update) -> NodeEvent {
             caption,
             album,
             id,
+            clip,
         } => NodeEvent::GroupFile {
             id,
             group: hex(&group),
@@ -126,6 +127,7 @@ fn event(u: Update) -> NodeEvent {
             sensitive,
             caption,
             album,
+            clip: clip.map(Into::into),
         },
     }
 }
@@ -298,6 +300,7 @@ impl ThrenodyNode {
             sensitive: options.sensitive,
             caption: options.caption,
             album: options.album,
+            clip: options.clip.map(Into::into),
         };
         self.group_node()
             .send_file(&self.node, &g, file)
@@ -336,6 +339,7 @@ impl ThrenodyNode {
                 location,
                 sensitive: options.sensitive,
                 album: options.album,
+                clip: options.clip.map(Into::into),
             },
             &options.caption,
             id,

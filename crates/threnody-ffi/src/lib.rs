@@ -179,15 +179,48 @@ pub struct FileInfo {
     /// Files sent together share an album id (0 = alone); the caption is
     /// the text of the album's first entry.
     pub album: u64,
+    /// A voice or video message: play it in the chat.
+    pub clip: Option<Clip>,
 }
 
-/// What goes with a file: whether it is sensitive, its caption, and the
-/// album it belongs to (0 = alone; see `album_id`).
+/// A voice or video message, recorded in the app: a file that plays in
+/// the chat. Peers without clips see an ordinary file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct Clip {
+    /// Video with sound, rather than sound alone.
+    pub video: bool,
+    /// How long it plays, as its sender measured it (0 = unknown).
+    pub duration_ms: u32,
+}
+
+impl From<threnody_core::message::Clip> for Clip {
+    fn from(c: threnody_core::message::Clip) -> Self {
+        Self {
+            video: c.video,
+            duration_ms: c.duration_ms,
+        }
+    }
+}
+
+impl From<Clip> for threnody_core::message::Clip {
+    fn from(c: Clip) -> Self {
+        Self {
+            video: c.video,
+            duration_ms: c.duration_ms.min(threnody_core::message::MAX_CLIP_MS),
+        }
+    }
+}
+
+/// What goes with a file: whether it is sensitive, its caption, the
+/// album it belongs to (0 = alone; see `album_id`), and whether it is a
+/// voice or video message.
 #[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
 pub struct FileOptions {
     pub sensitive: bool,
     pub caption: String,
     pub album: u64,
+    #[uniffi(default = None)]
+    pub clip: Option<Clip>,
 }
 
 /// A fresh album id for photos or files sent together.
@@ -331,6 +364,7 @@ pub enum NodeEvent {
         sensitive: bool,
         caption: String,
         album: u64,
+        clip: Option<Clip>,
     },
     /// `peer` edited a message: reload its conversation.
     MessageEdited {
@@ -430,6 +464,7 @@ pub enum NodeEvent {
         sensitive: bool,
         caption: String,
         album: u64,
+        clip: Option<Clip>,
     },
     /// `peer` says it displayed our outgoing messages `ids` (their
     /// sender-ids, as recorded on our side): ticks update on reload.
@@ -608,6 +643,7 @@ fn history_entries(entries: &[threnody_core::history::Entry], me: [u8; 32]) -> V
                 location: f.location.clone(),
                 sensitive: f.sensitive,
                 album: f.album,
+                clip: f.clip.map(Into::into),
             }),
             delivered: e.delivered,
             read: e.read_ms != 0,
@@ -660,6 +696,7 @@ fn convert(e: Event) -> NodeEvent {
                     sensitive,
                     caption,
                     album,
+                    clip,
                     ..
                 },
         } => NodeEvent::File {
@@ -670,6 +707,7 @@ fn convert(e: Event) -> NodeEvent {
             sensitive,
             caption,
             album,
+            clip: clip.map(Into::into),
         },
         Event::MessageEdited { peer, .. } => NodeEvent::MessageEdited { peer: fp(&peer) },
         Event::MessagesDeleted { peer, count } => NodeEvent::MessagesDeleted {
@@ -1259,6 +1297,7 @@ PersistentKeepalive = 25\n",
                     sensitive: options.sensitive,
                     caption: options.caption,
                     album: options.album,
+                    clip: options.clip.map(Into::into),
                 },
             )
             .map_err(fail)
@@ -1284,6 +1323,7 @@ PersistentKeepalive = 25\n",
                 location,
                 sensitive: options.sensitive,
                 album: options.album,
+                clip: options.clip.map(Into::into),
             },
             &options.caption,
             id,
@@ -2160,14 +2200,33 @@ mod tests {
                     sensitive: true,
                     caption: "read these".into(),
                     album: 0,
+                    clip: None,
                 },
             )
             .unwrap();
         let f = wait(&bob, |e| matches!(e, NodeEvent::File { .. }));
         assert!(
-            matches!(f, NodeEvent::File { name, data, sensitive: true, caption, .. }
+            matches!(f, NodeEvent::File { name, data, sensitive: true, caption, clip: None, .. }
                 if name == "notes.txt" && data == b"some notes" && caption == "read these")
         );
+        let video = Clip {
+            video: true,
+            duration_ms: 7_000,
+        };
+        alice
+            .send_file(
+                bob_fp.clone(),
+                "video.mp4".into(),
+                vec![9; 64],
+                None,
+                FileOptions {
+                    clip: Some(video),
+                    ..FileOptions::default()
+                },
+            )
+            .unwrap();
+        let f = wait(&bob, |e| matches!(e, NodeEvent::File { .. }));
+        assert!(matches!(f, NodeEvent::File { clip: Some(c), .. } if c == video));
         let too_big = vec![0u8; usize::try_from(alice.max_file_size()).unwrap() + 1];
         assert!(
             alice
@@ -2190,6 +2249,7 @@ mod tests {
                 sensitive: true,
                 caption: "read these".into(),
                 album: 0,
+                clip: None,
             },
         )
         .unwrap();
@@ -2240,10 +2300,15 @@ mod tests {
         assert!(reason == "ended" && !by_us);
         assert!(alice.current_call().is_none() && bob.current_call().is_none());
         let h = alice.history(bob_fp.clone(), 10).unwrap();
-        assert_eq!(h.len(), 3, "the request, the same text again, the file");
+        assert_eq!(
+            h.len(),
+            4,
+            "the request, the same text again, the file, the video message"
+        );
         assert!(h[0].outgoing && h[0].text == "hello from an app");
         let f = h[2].file.as_ref().unwrap();
         assert!(h[2].outgoing && f.name == "notes.txt" && f.size == 10);
+        assert_eq!(h[3].file.as_ref().unwrap().clip, Some(video));
         // Search: within the chat, and across every conversation.
         let found = alice
             .search_messages(bob_fp.clone(), "FROM an".into(), 10)
@@ -2584,6 +2649,10 @@ mod tests {
                     sensitive: true,
                     caption: "tomorrow".into(),
                     album: 0,
+                    clip: Some(Clip {
+                        video: false,
+                        duration_ms: 2_500,
+                    }),
                 },
             )
             .unwrap();
@@ -2598,6 +2667,7 @@ mod tests {
                 sensitive,
                 caption,
                 album,
+                clip,
             } = all.until(i, |e| matches!(e, NodeEvent::GroupFile { .. }))
             else {
                 unreachable!()
@@ -2607,10 +2677,18 @@ mod tests {
                 (&g, &a_fp, "route.gpx", 3000, false)
             );
             assert!(sensitive && caption == "tomorrow" && album == 0);
+            assert_eq!(
+                clip,
+                Some(Clip {
+                    video: false,
+                    duration_ms: 2_500
+                })
+            );
             let options = FileOptions {
                 sensitive,
                 caption,
                 album,
+                clip,
             };
             member
                 .record_received_group_file(group, from, name, 3000, Some("/x".into()), id, options)
@@ -2619,6 +2697,7 @@ mod tests {
             let f = h.last().unwrap().file.clone().unwrap();
             assert_eq!((f.name.as_str(), f.size), ("route.gpx", 3000));
             assert!(f.sensitive && h.last().unwrap().text == "tomorrow");
+            assert_eq!(f.clip, clip, "the clip is kept in history");
             assert_eq!(
                 h.last().unwrap().id,
                 id,
@@ -2747,6 +2826,7 @@ mod tests {
             sensitive: false,
             caption: String::new(),
             album: 0,
+            clip: None,
         };
         alice.node.send(&b_id, file("to-bob")).unwrap();
         bob.node.send(&a_id, file("to-alice")).unwrap();

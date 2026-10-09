@@ -15,6 +15,7 @@
 //! message crosses at most one forwarding member.
 
 use threnody_core::history::{ConversationId, Entry, FileNote};
+use threnody_core::message::Clip;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::OutgoingFile;
@@ -89,6 +90,7 @@ pub enum Update {
         caption: String,
         album: u64,
         id: u64,
+        clip: Option<Clip>,
     },
     /// `from` changed its reactions on a message in `group`.
     Reacted {
@@ -326,6 +328,7 @@ impl GroupNode {
             location: file.location,
             sensitive: file.sensitive,
             album: file.album,
+            clip: file.clip,
         };
         let id = threnody_net::history::local_id();
         let content = Content::File {
@@ -335,6 +338,7 @@ impl GroupNode {
             caption: file.caption,
             album: file.album,
             id,
+            clip: file.clip,
         };
         self.send(node, group, &content, Some(note), id)
     }
@@ -700,6 +704,7 @@ impl GroupNode {
                 caption,
                 album,
                 id,
+                clip,
             } => Update::File {
                 group,
                 from,
@@ -710,6 +715,7 @@ impl GroupNode {
                 caption,
                 album,
                 id,
+                clip,
             },
             GroupEvent::React {
                 group,

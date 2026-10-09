@@ -19,6 +19,43 @@ pub const PAD_STEP_MAX: usize = 64 * 1024;
 pub const MAX_FILE: usize = 8 * 1024 * 1024;
 /// `File` flag (key 6): the sender marked it sensitive.
 pub const FILE_SENSITIVE: u64 = 1;
+/// `File` flag (key 6): a voice message recorded in the app.
+pub const FILE_VOICE: u64 = 2;
+/// `File` flag (key 6): a video message recorded in the app.
+pub const FILE_VIDEO: u64 = 4;
+/// Longest voice or video message, in milliseconds.
+pub const MAX_CLIP_MS: u32 = 10 * 60 * 1000;
+
+/// A voice or video message: a file recorded in the app to be played in
+/// the chat, rather than one picked to send. Peers that don't know clips
+/// show it as an ordinary file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clip {
+    /// Video (with sound) rather than sound alone.
+    pub video: bool,
+    /// How long it plays, as the sender measured it (0 = unknown).
+    pub duration_ms: u32,
+}
+
+impl Clip {
+    /// The `File` flag bit for this clip.
+    pub fn flag(self) -> u64 {
+        if self.video { FILE_VIDEO } else { FILE_VOICE }
+    }
+
+    /// The clip `flags` and `duration_ms` describe, if any. Both clip bits
+    /// at once are malformed.
+    pub fn from_flags(flags: u64, duration_ms: u32) -> Result<Option<Self>> {
+        match (flags & FILE_VOICE != 0, flags & FILE_VIDEO != 0) {
+            (true, true) => Err(Error::Malformed("voice and video clip")),
+            (false, false) => Ok(None),
+            (_, video) => Ok(Some(Self {
+                video,
+                duration_ms: duration_ms.min(MAX_CLIP_MS),
+            })),
+        }
+    }
+}
 /// `Hello` feature bit: this side acknowledges `Tracked` messages with
 /// `Ack` and accepts them (so the other side may send both).
 pub const FEATURE_ACKS: u64 = 1;
@@ -89,6 +126,8 @@ pub enum AppMessage {
         /// Files sent together share a random album id (0 = alone); the
         /// caption comes with the first.
         album: u64,
+        /// A voice or video message rather than a plain file.
+        clip: Option<Clip>,
     },
     /// Our current mesh/tunnel approval of the peer (spec §5.2). Sent at
     /// session start and whenever it changes.
@@ -330,12 +369,17 @@ impl AppMessage {
                     sensitive,
                     caption,
                     album,
+                    clip,
                 } => {
+                    let flags =
+                        (u64::from(*sensitive) * FILE_SENSITIVE) | clip.map_or(0, |c| c.flag());
+                    let duration = clip.map_or(0, |c| c.duration_ms);
                     e.map_len(
                         4 + usize::from(*id != 0)
-                            + usize::from(*sensitive)
+                            + usize::from(flags != 0)
                             + usize::from(!caption.is_empty())
-                            + usize::from(*album != 0),
+                            + usize::from(*album != 0)
+                            + usize::from(duration != 0),
                     )?
                     .u8(0)?
                     .uint(kind::FILE)?;
@@ -345,14 +389,17 @@ impl AppMessage {
                     if *id != 0 {
                         e.u8(5)?.uint(*id)?;
                     }
-                    if *sensitive {
-                        e.u8(6)?.uint(FILE_SENSITIVE)?;
+                    if flags != 0 {
+                        e.u8(6)?.uint(flags)?;
                     }
                     if !caption.is_empty() {
                         e.u8(7)?.str(caption)?;
                     }
                     if *album != 0 {
                         e.u8(8)?.uint(*album)?;
+                    }
+                    if duration != 0 {
+                        e.u8(9)?.u32(duration)?;
                     }
                 }
                 Self::TunnelOffer { wg_public, port } => {
@@ -479,7 +526,7 @@ impl AppMessage {
         let mut five = None;
         let mut conv = None;
         let mut flags = 0;
-        let (mut caption, mut album) = (None, 0);
+        let (mut caption, mut album, mut duration) = (None, 0, 0);
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -499,6 +546,7 @@ impl AppMessage {
                 6 => flags = d.u64()?,
                 7 => caption = Some(d.str()?.to_owned()),
                 8 => album = d.u64()?,
+                9 => duration = d.u32()?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -599,6 +647,7 @@ impl AppMessage {
                     sensitive: flags & FILE_SENSITIVE != 0,
                     caption: caption.unwrap_or_default(),
                     album,
+                    clip: Clip::from_flags(flags, duration)?,
                 }
             }
             kind::GROUP
@@ -727,6 +776,7 @@ mod tests {
                     sensitive: false,
                     caption: String::new(),
                     album: 0,
+                    clip: None,
                 }),
             },
             AppMessage::Ack(vec![]),
@@ -761,6 +811,7 @@ mod tests {
                 sensitive: false,
                 caption: String::new(),
                 album: 0,
+                clip: None,
             },
             AppMessage::File {
                 sent_ms: 2,
@@ -770,6 +821,33 @@ mod tests {
                 sensitive: true,
                 caption: "from the summit".into(),
                 album: u64::MAX,
+                clip: None,
+            },
+            AppMessage::File {
+                sent_ms: 3,
+                name: "voice.m4a".into(),
+                data: vec![1; 40],
+                id: 10,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+                clip: Some(Clip {
+                    video: false,
+                    duration_ms: 4_200,
+                }),
+            },
+            AppMessage::File {
+                sent_ms: 4,
+                name: "video.mp4".into(),
+                data: vec![2; 40],
+                id: 11,
+                sensitive: true,
+                caption: "look".into(),
+                album: 0,
+                clip: Some(Clip {
+                    video: true,
+                    duration_ms: 0,
+                }),
             },
             AppMessage::React {
                 conversation: vec![1; 33],
@@ -852,6 +930,41 @@ mod tests {
         let mut no_id = acked.encode().unwrap();
         no_id[0] = 0xa2;
         assert!(AppMessage::decode(&no_id).is_err());
+    }
+
+    #[test]
+    fn clips_are_flagged_files() {
+        let file = |flags: u64| {
+            let b = cbor::to_vec(32, |e| {
+                e.map_len(5)?.u8(0)?.uint(kind::FILE)?;
+                e.u8(1)?.uint(1)?;
+                e.u8(2)?.bytes(&[1, 2])?;
+                e.u8(3)?.str("a.ogg")?;
+                e.u8(6)?.uint(flags)?;
+                Ok(())
+            })
+            .unwrap();
+            AppMessage::decode(&b)
+        };
+        let clip = |m: AppMessage| match m {
+            AppMessage::File {
+                clip, sensitive, ..
+            } => (clip, sensitive),
+            _ => panic!("not a file"),
+        };
+        assert_eq!(
+            clip(file(FILE_VOICE | FILE_SENSITIVE).unwrap()),
+            (
+                Some(Clip {
+                    video: false,
+                    duration_ms: 0
+                }),
+                true
+            )
+        );
+        assert!(file(FILE_VOICE | FILE_VIDEO).is_err());
+        // Bits from a later version are ignored, as before.
+        assert_eq!(clip(file(1 << 40).unwrap()), (None, false));
     }
 
     #[test]

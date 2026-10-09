@@ -341,6 +341,7 @@ async fn history_marks_messages_delivered_when_acknowledged() {
                     sensitive: true,
                     caption: "the view".into(),
                     album: 5,
+                    clip: None,
                     ..Default::default()
                 },
             )

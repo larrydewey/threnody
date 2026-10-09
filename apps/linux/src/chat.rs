@@ -1,17 +1,17 @@
 //! One open conversation: header, trust banner, messages and composer.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use threnody_ffi::{FileOptions, HistoryEntry};
+use threnody_ffi::{Clip, FileOptions, HistoryEntry};
 
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target};
 use crate::ui::{self, bg};
 use crate::window::App;
-use crate::{gifs, settings};
+use crate::{clip, gifs, settings};
 
 /// How many messages a chat loads (more to reach an older search match).
 const HISTORY: u32 = 1000;
@@ -71,6 +71,9 @@ pub struct ChatView {
     revealed_known: Cell<bool>,
     /// Sensitive photos the user uncovered, by time and sender.
     shown: RefCell<Vec<(u64, String)>>,
+    /// Voice and video messages by file, kept across redraws so one
+    /// playing goes on playing when a message arrives.
+    players: RefCell<HashMap<std::path::PathBuf, gtk::MediaFile>>,
     /// Typing indicator row (shown when peer is typing in 1:1 chats).
     typing_row: gtk::Box,
     /// Whether the peer is currently typing.
@@ -239,6 +242,16 @@ impl ChatView {
             .build();
         gif.add_css_class("flat");
         gif.add_css_class("gif-button");
+        let voice = gtk::Button::from_icon_name("audio-input-microphone-symbolic");
+        voice.set_tooltip_text(Some("Record a voice message"));
+        voice.add_css_class("flat");
+        voice.add_css_class("circular");
+        voice.set_valign(gtk::Align::End);
+        let video = gtk::Button::from_icon_name("camera-web-symbolic");
+        video.set_tooltip_text(Some("Record a video message"));
+        video.add_css_class("flat");
+        video.add_css_class("circular");
+        video.set_valign(gtk::Align::End);
         let send = gtk::Button::from_icon_name("go-up-symbolic");
         send.set_tooltip_text(Some("Send (Enter)"));
         send.add_css_class("suggested-action");
@@ -273,6 +286,8 @@ impl ChatView {
         composer.append(&emoji);
         composer.append(&gif);
         composer.append(&overlay);
+        composer.append(&voice);
+        composer.append(&video);
         composer.append(&send);
         let composer_clamp = adw::Clamp::builder()
             .maximum_size(860)
@@ -318,6 +333,7 @@ impl ChatView {
             loaded: Cell::new(false),
             revealed_known: Cell::new(true),
             shown: RefCell::new(Vec::new()),
+            players: RefCell::new(HashMap::new()),
             typing_row,
             peer_typing: Cell::new(false),
             sent_read: RefCell::new(HashSet::new()),
@@ -346,6 +362,14 @@ impl ChatView {
                 t.gifs();
             }
         });
+        for (button, is_video) in [(&voice, false), (&video, true)] {
+            let weak = Rc::downgrade(&this);
+            button.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.record(is_video);
+                }
+            });
+        }
         // Enter sends; Shift+Enter starts a new line.
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1143,6 +1167,27 @@ impl ChatView {
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         let key = (e.at_ms, e.device.clone());
+        if let (Some(c), Some(p)) = (f.clip, &path) {
+            if f.sensitive && !e.outgoing && !self.shown.borrow().contains(&key) {
+                let b = gtk::Button::with_label(if c.video {
+                    "Sensitive video message · click to show"
+                } else {
+                    "Sensitive voice message · click to show"
+                });
+                b.add_css_class("sensitive-cover");
+                b.set_size_request(240, if c.video { 160 } else { -1 });
+                let weak = self.weak_self.clone();
+                b.connect_clicked(move |_| {
+                    if let Some(t) = weak.upgrade() {
+                        t.shown.borrow_mut().push(key.clone());
+                        let entries = t.entries.borrow().clone();
+                        t.display_entries(entries);
+                    }
+                });
+                return b.upcast();
+            }
+            return self.clip_view(c, p);
+        }
         if core::is_image(&f.name)
             && let Some(p) = &path
         {
@@ -1186,16 +1231,23 @@ impl ChatView {
         }
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         row.add_css_class("file-row");
-        let icon = gtk::Image::from_icon_name(if core::is_image(&f.name) {
-            "image-x-generic-symbolic"
-        } else {
-            "text-x-generic-symbolic"
+        let icon = gtk::Image::from_icon_name(match f.clip {
+            Some(c) if c.video => "camera-web-symbolic",
+            Some(_) => "audio-input-microphone-symbolic",
+            None if core::is_image(&f.name) => "image-x-generic-symbolic",
+            None => "text-x-generic-symbolic",
         });
         icon.set_pixel_size(32);
         row.append(&icon);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let label = match f.clip {
+            Some(c) => core::file_label(&f.name, false, "", Some(c))
+                .split_once(' ')
+                .map_or_else(String::new, |(_, l)| l.to_owned()),
+            None => f.name.clone(),
+        };
         let name = gtk::Label::builder()
-            .label(&f.name)
+            .label(&label)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .max_width_chars(36)
@@ -1247,6 +1299,188 @@ impl ChatView {
             row.append(&folder);
         }
         row.upcast()
+    }
+
+    /// A voice or video message that plays in the chat.
+    fn clip_view(&self, c: Clip, path: &std::path::Path) -> gtk::Widget {
+        let media = self
+            .players
+            .borrow_mut()
+            .entry(path.to_owned())
+            .or_insert_with(|| gtk::MediaFile::for_filename(path))
+            .clone();
+        if c.video {
+            let v = gtk::Video::new();
+            v.set_media_stream(Some(&media));
+            v.set_autoplay(false);
+            v.set_size_request(320, 240);
+            v.add_css_class("photo");
+            return v.upcast();
+        }
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.add_css_class("voice-message");
+        let icon = gtk::Image::from_icon_name("audio-input-microphone-symbolic");
+        row.append(&icon);
+        let controls = gtk::MediaControls::new(Some(&media));
+        controls.set_size_request(260, -1);
+        controls.set_hexpand(true);
+        row.append(&controls);
+        row.upcast()
+    }
+
+    /// Records a voice or video message, then sends it on *Send*.
+    fn record(self: &Rc<Self>, video: bool) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let path = match app.core.clip_path(self.persona().as_deref(), video) {
+            Ok(p) => p,
+            Err(e) => return self.toast(&format!("Couldn't record: {e}")),
+        };
+        type Frame = (u32, u32, Vec<u8>);
+        let frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>> = Default::default();
+        let latest = frame.clone();
+        let preview: clip::OnFrame = Box::new(move |w, h, rgba| {
+            if let Ok(mut f) = latest.lock() {
+                *f = Some((w, h, rgba.to_vec()));
+            }
+        });
+        let rec = match clip::Recorder::start(&path, video, 0, Some(preview)) {
+            Ok(r) => r,
+            Err(e) => return self.toast(&format!("Couldn't record: {e}")),
+        };
+        let limit = rec.limit();
+        let rec = Rc::new(RefCell::new(Some(rec)));
+        let d = ui::alert(
+            if video {
+                "Video message"
+            } else {
+                "Voice message"
+            },
+            "",
+            &[("cancel", "Cancel"), ("send", "Send")],
+        );
+        d.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let picture = gtk::Picture::new();
+        if video {
+            picture.set_size_request(320, 240);
+            picture.add_css_class("photo");
+            b.append(&picture);
+        }
+        let time = gtk::Label::new(Some(&format!(
+            "● 0:00 / {}",
+            clip::clock(limit.as_millis() as u64)
+        )));
+        time.add_css_class("recording");
+        time.add_css_class("numeric");
+        b.append(&time);
+        d.set_extra_child(Some(&b));
+        let (weak, r, dialog) = (self.weak_self.clone(), rec.clone(), d.clone());
+        let tick = glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let Some(rec) = r.borrow().as_ref().map(|x| (x.elapsed(), x.error())) else {
+                return glib::ControlFlow::Break;
+            };
+            if let Some(e) = rec.1 {
+                r.borrow_mut().take();
+                if let Some(t) = weak.upgrade() {
+                    t.toast(&format!("Recording stopped: {e}"));
+                }
+                dialog.close();
+                return glib::ControlFlow::Break;
+            }
+            time.set_label(&format!(
+                "● {} / {}",
+                clip::clock(rec.0.as_millis() as u64),
+                clip::clock(limit.as_millis() as u64)
+            ));
+            if let Some((w, h, rgba)) = frame.lock().ok().and_then(|mut f| f.take()) {
+                let tex = gdk::MemoryTexture::new(
+                    w as i32,
+                    h as i32,
+                    gdk::MemoryFormat::R8g8b8a8,
+                    &glib::Bytes::from_owned(rgba),
+                    w as usize * 4,
+                );
+                picture.set_paintable(Some(&tex));
+            }
+            if rec.0 >= limit {
+                // Long enough: it goes as it is.
+                if let (Some(t), Some(rec)) = (weak.upgrade(), r.borrow_mut().take()) {
+                    t.send_clip(rec, video);
+                }
+                dialog.close();
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+        let tick = Rc::new(RefCell::new(Some(tick)));
+        let (weak, r) = (self.weak_self.clone(), rec.clone());
+        d.connect_response(None, move |_, response| {
+            if let Some(t) = tick.borrow_mut().take()
+                && glib::MainContext::default().find_source_by_id(&t).is_some()
+            {
+                t.remove();
+            }
+            // Cancelling drops the recording, which deletes it.
+            let rec = r.borrow_mut().take();
+            if response == "send"
+                && let (Some(t), Some(rec)) = (weak.upgrade(), rec)
+            {
+                t.send_clip(rec, video);
+            }
+        });
+        d.present(Some(&app.window));
+    }
+
+    /// Finishes a recording and sends it.
+    fn send_clip(self: &Rc<Self>, rec: clip::Recorder, video: bool) {
+        let Some(node) = self.node() else { return };
+        let (group, device) = (self.group(), self.device());
+        self.toast("Sending…");
+        let weak = self.weak_self.clone();
+        bg(
+            move || -> Result<(), String> {
+                let done = rec.finish()?;
+                let data = std::fs::read(&done.path).map_err(|e| e.to_string())?;
+                if data.len() as u64 > node.max_file_size() {
+                    let _ = std::fs::remove_file(&done.path);
+                    return Err(format!(
+                        "it's larger than {}",
+                        ui::human_size(node.max_file_size())
+                    ));
+                }
+                let name = done
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let options = FileOptions {
+                    clip: Some(Clip {
+                        video,
+                        duration_ms: done.duration_ms,
+                    }),
+                    ..FileOptions::default()
+                };
+                let location = Some(done.path.display().to_string());
+                match &group {
+                    Some(g) => node.send_group_file(g.clone(), name, data, location, options),
+                    None => node.send_file(device, name, data, location, options),
+                }
+                .map_err(|e| e.to_string())
+            },
+            move |r| {
+                let Some(t) = weak.upgrade() else { return };
+                if let Err(e) = r {
+                    t.toast(&format!("Couldn't send: {e}"));
+                }
+                t.reload();
+                if let Some(a) = t.app.upgrade() {
+                    a.refresh_soon();
+                }
+            },
+        );
     }
 
     fn open_file(&self, path: &std::path::Path) {
@@ -1764,7 +1998,7 @@ impl ChatView {
                     "gif-{}.gif",
                     if id.is_empty() { "giphy".into() } else { id }
                 );
-                core.keep(persona.as_deref(), &name, &bytes)
+                core.keep(persona.as_deref(), &name, &bytes, false)
                     .ok_or_else(|| "couldn't save it".to_owned())
             },
             move |kept: Result<String, String>| {
@@ -1928,6 +2162,7 @@ impl ChatView {
                             String::new()
                         },
                         album,
+                        clip: None,
                     };
                     let location = Some(p.display().to_string());
                     let r = match &group {

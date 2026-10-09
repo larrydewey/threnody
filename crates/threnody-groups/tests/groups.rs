@@ -96,6 +96,7 @@ fn create_invite_chat_and_remove() {
         sensitive: true,
         caption: "the route".into(),
         album: 3,
+        clip: None,
         id: 0,
     };
     let out = net.node(&pc).send(&g, &file).unwrap();
@@ -109,6 +110,7 @@ fn create_invite_chat_and_remove() {
             sensitive: true,
             caption: "the route".into(),
             album: 3,
+            clip: None,
             id: 0,
         }));
     }

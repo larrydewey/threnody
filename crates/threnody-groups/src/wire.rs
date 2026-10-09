@@ -12,6 +12,7 @@
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
+use threnody_core::message::Clip;
 use threnody_core::{Error, Result};
 
 /// Group ids are 16 random bytes.
@@ -175,9 +176,11 @@ impl GroupWire {
 /// Content = text (UTF-8, as first sent; no id)
 ///         / 0xFF || { 0: kind uint, ? 1: text, file name or emoji tstr,
 ///                     ? 2: data bstr, ? 3: flags uint, ? 4: caption tstr,
-///                     ? 5: album uint, ? 6: message id uint }
+///                     ? 5: album uint, ? 6: message id uint,
+///                     ? 7: clip duration_ms uint }
 /// kind: 1 text, 2 file, 3 reaction
-/// flags: 1 sensitive (file), 1 remove (reaction)
+/// flags: 1 sensitive, 2 voice message, 4 video message (file);
+///        1 remove (reaction)
 /// ```
 ///
 /// 0xFF never starts UTF-8, so plain text stays as it was. Text and files
@@ -196,6 +199,8 @@ pub enum Content {
         caption: String,
         album: u64,
         id: u64,
+        /// A voice or video message rather than a plain file.
+        clip: Option<Clip>,
     },
     /// Add (or with `add` false, take away) the sender's `emoji` on
     /// message `id`.
@@ -210,8 +215,8 @@ const TAGGED: u8 = 0xFF;
 
 impl Content {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        // (kind, text, data, flags, caption, album, id)
-        let (kind, text, data, flags, caption, album, id): (
+        // (kind, text, data, flags, caption, album, id, duration)
+        let (kind, text, data, flags, caption, album, id, duration): (
             u8,
             &str,
             Option<&[u8]>,
@@ -219,10 +224,11 @@ impl Content {
             &str,
             u64,
             u64,
+            u32,
         ) = match self {
             // Without an id, exactly as the first versions sent it.
             Self::Text { text, id: 0 } => return Ok(text.as_bytes().to_vec()),
-            Self::Text { text, id } => (1, text, None, 0, "", 0, *id),
+            Self::Text { text, id } => (1, text, None, 0, "", 0, *id, 0),
             Self::File {
                 name,
                 data,
@@ -230,16 +236,18 @@ impl Content {
                 caption,
                 album,
                 id,
+                clip,
             } => (
                 2,
                 name,
                 Some(data),
-                u64::from(*sensitive),
+                u64::from(*sensitive) | clip.map_or(0, |c| c.flag()),
                 caption,
                 *album,
                 *id,
+                clip.map_or(0, |c| c.duration_ms),
             ),
-            Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id),
+            Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id, 0),
         };
         let size = text.len() + data.map_or(0, <[u8]>::len) + caption.len() + 48;
         let body = cbor::to_vec(size, |e| {
@@ -248,7 +256,8 @@ impl Content {
                     + usize::from(flags != 0)
                     + usize::from(!caption.is_empty())
                     + usize::from(album != 0)
-                    + usize::from(id != 0),
+                    + usize::from(id != 0)
+                    + usize::from(duration != 0),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.str(text)?;
@@ -266,6 +275,9 @@ impl Content {
             }
             if id != 0 {
                 e.u8(6)?.u64(id)?;
+            }
+            if duration != 0 {
+                e.u8(7)?.u32(duration)?;
             }
             Ok(())
         })?;
@@ -285,6 +297,7 @@ impl Content {
         let mut dec = Decoder::new(rest);
         let (mut kind, mut text, mut data) = (None, None, None);
         let (mut flags, mut caption, mut album, mut id) = (0, String::new(), 0, 0);
+        let mut duration = 0;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -294,6 +307,7 @@ impl Content {
                 4 => caption = d.str()?.to_owned(),
                 5 => album = d.u64()?,
                 6 => id = d.u64()?,
+                7 => duration = d.u32()?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -311,6 +325,7 @@ impl Content {
                 caption,
                 album,
                 id,
+                clip: Clip::from_flags(flags, duration)?,
             },
             3 => {
                 let emoji = required(text, "emoji")?;
@@ -364,6 +379,7 @@ mod tests {
                 caption: String::new(),
                 album: 0,
                 id: 0,
+                clip: None,
             },
             Content::File {
                 name: "IMG.jpg".into(),
@@ -372,6 +388,19 @@ mod tests {
                 caption: "look".into(),
                 album: 5,
                 id: 9,
+                clip: None,
+            },
+            Content::File {
+                name: "voice.ogg".into(),
+                data: vec![2; 10],
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+                id: 10,
+                clip: Some(Clip {
+                    video: false,
+                    duration_ms: 2_000,
+                }),
             },
         ] {
             assert_eq!(Content::decode(&c.encode().unwrap()).unwrap(), c);

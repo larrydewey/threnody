@@ -6,7 +6,7 @@ use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Quer
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
-    FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
+    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
 };
 
 use crate::delivery::Tag;
@@ -46,6 +46,8 @@ pub struct OutgoingFile {
     pub caption: String,
     /// Shared by files sent together (0 = alone); see [`album_id`].
     pub album: u64,
+    /// A voice or video message recorded in the app.
+    pub clip: Option<Clip>,
 }
 
 /// A fresh album id for files sent together.
@@ -722,6 +724,7 @@ impl Node {
             sensitive,
             caption,
             album,
+            clip,
         } = file;
         let data = self.prepare_file(data)?;
         self.accept_contact(peer);
@@ -735,6 +738,7 @@ impl Node {
             sensitive,
             caption: caption.clone(),
             album,
+            clip,
         };
         let tag = Tag {
             local_id,
@@ -757,6 +761,7 @@ impl Node {
                 location,
                 sensitive,
                 album,
+                clip,
             },
             &caption,
             local_id,
