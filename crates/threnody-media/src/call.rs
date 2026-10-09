@@ -79,4 +79,9 @@ impl CallMedia {
     pub fn state(&self) -> PeerConnectionState {
         self.session.state()
     }
+
+    /// One line on how the media is doing (see [`MediaSession::report`]).
+    pub async fn report(&self) -> Option<String> {
+        self.session.report().await
+    }
 }

@@ -159,6 +159,12 @@ impl Driver {
         true
     }
 
+    /// One line on how the current call's media is doing, for the
+    /// diagnostics log: delays, rates and freezes, never what's in it.
+    pub async fn report(&self) -> Option<String> {
+        self.media()?.report().await
+    }
+
     /// The newest frame of the peer's video, waiting up to `timeout` for
     /// one; each frame is returned once.
     pub async fn next_frame(&self, timeout: Duration) -> Option<Frame> {

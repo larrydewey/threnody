@@ -228,6 +228,15 @@ impl ThrenodyNode {
         }
     }
 
+    /// How the current call's media is doing, for the diagnostics log:
+    /// round trip, bitrates, delays and freezes (never what's in it).
+    pub fn call_media_report(&self) -> Option<String> {
+        #[cfg(feature = "calls")]
+        return self.rt.block_on(self.media.report());
+        #[cfg(not(feature = "calls"))]
+        None
+    }
+
     /// How the current call's media is moving (counts only).
     pub fn call_stats(&self) -> Option<CallStats> {
         self.node.call_stats().map(|s| CallStats {

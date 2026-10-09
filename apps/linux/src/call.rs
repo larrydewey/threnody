@@ -492,14 +492,47 @@ impl CallBar {
         }
         match state {
             "connected" => {
-                if let Some(s) = self.shown.borrow_mut().as_mut() {
-                    s.since.get_or_insert_with(std::time::Instant::now);
+                if let Some(s) = self.shown.borrow_mut().as_mut()
+                    && s.since.is_none()
+                {
+                    s.since = Some(std::time::Instant::now());
+                    self.log_media(id);
                 }
                 self.tick();
             }
             "interrupted" => self.status.set_label("Reconnecting…"),
             _ => self.status.set_label("Call failed"),
         }
+    }
+
+    /// For the diagnostics log, every 5 s while call `id` lasts: how its
+    /// media moves and how it's doing (counts, rates and delays only).
+    fn log_media(&self, id: u64) {
+        let Some(node) = self.node() else { return };
+        let core = self.core.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if node.current_call().is_none_or(|c| c.id != id) {
+                    return;
+                }
+                if let Some(s) = node.call_stats() {
+                    core.say(format!(
+                        "* call media: sent {} datagrams, {} in stream, {} failed; \
+                         got {}, {} rejected, {} dropped",
+                        s.sent_datagrams,
+                        s.sent_stream,
+                        s.send_failed,
+                        s.received,
+                        s.rejected,
+                        s.dropped
+                    ));
+                }
+                if let Some(r) = node.call_media_report() {
+                    core.say(format!("* call quality: {r}"));
+                }
+            }
+        });
     }
 
     /// Shows the call's length, every second while it lasts.
