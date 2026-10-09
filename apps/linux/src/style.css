@@ -133,3 +133,14 @@ windowtitle.warning .subtitle {
     border-radius: 8px;
     border: 1px solid alpha(white, 0.4);
 }
+
+.gif-button {
+  font-weight: bold;
+  font-size: 0.8em;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+.gif-tile {
+  padding: 0;
+  border-radius: 6px;
+}

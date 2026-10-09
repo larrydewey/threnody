@@ -7,6 +7,7 @@ mod call;
 mod camera;
 mod chat;
 mod core;
+mod gifs;
 mod keyring;
 mod settings;
 mod ui;
