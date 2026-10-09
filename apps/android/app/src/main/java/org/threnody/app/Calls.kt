@@ -260,6 +260,7 @@ object Calls {
                 val s = try { c.node.callStats() } catch (_: Exception) { null } ?: break
                 Threnody.say("* call media: sent ${s.sentDatagrams} datagrams, ${s.sentStream} in stream, " +
                     "${s.sendFailed} failed; got ${s.received}, ${s.rejected} rejected, ${s.dropped} dropped")
+                try { c.node.callMediaReport() } catch (_: Exception) { null }?.let { Threnody.say("* call quality: $it") }
             }
         }.apply { isDaemon = true; name = "call-stats" }.start()
     }

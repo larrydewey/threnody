@@ -25,7 +25,10 @@ use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 use libwebrtc::peer_connection_factory::{
     IceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
 };
+use libwebrtc::rtp_parameters::{DegradationPreference, RtpEncodingParameters};
+use libwebrtc::rtp_sender::RtpSender;
 use libwebrtc::session_description::{SdpType, SessionDescription};
+use libwebrtc::stats::{QualityLimitationReason, RtcStats};
 use libwebrtc::video_frame::{I420Buffer, VideoFrame, VideoRotation};
 use libwebrtc::video_source::VideoResolution;
 use libwebrtc::video_source::native::NativeVideoSource;
@@ -39,10 +42,20 @@ use crate::turn::{Output, Turn};
 pub const VIDEO_WIDTH: u32 = 640;
 pub const VIDEO_HEIGHT: u32 = 480;
 
+/// The most video sends, in bits a second. Left alone, WebRTC climbs to
+/// what its own estimate allows, above what the call's QUIC link carries
+/// steadily; the excess waits in its pacer, so video falls behind audio
+/// (which skips that queue). 640x480 at 30 frames needs no more.
+pub const VIDEO_MAX_BITRATE: u64 = 700_000;
+
+/// When a camera frame was taken, on a clock that only goes forward (the
+/// wall clock can jump, and frames are ordered by these).
 fn time_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as i64)
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as i64
 }
 
 /// One factory per process: it owns WebRTC's threads and audio device.
@@ -204,8 +217,10 @@ impl MediaSession {
         let video_track =
             MediaStreamTrack::Video(factory().create_video_track("video", video.clone()));
         video_track.set_enabled(false);
-        pc.add_track(video_track.clone(), &["call"])
+        let sender = pc
+            .add_track(video_track.clone(), &["call"])
             .map_err(|e| anyhow!("video track: {e:?}"))?;
+        limit_video(&sender);
         let mut session = Self {
             pc,
             from_peer,
@@ -352,6 +367,13 @@ impl MediaSession {
         self.pc.connection_state()
     }
 
+    /// One line on how the media is doing, for the diagnostics log: delays,
+    /// rates and freezes, never what's in it.
+    pub async fn report(&self) -> Option<String> {
+        let stats = self.pc.get_stats().await.ok()?;
+        Some(Report::from(&stats).to_string())
+    }
+
     pub fn close(&self) {
         self.pc.close();
     }
@@ -363,6 +385,112 @@ impl Drop for MediaSession {
         if self.device {
             factory().release_platform_adm();
         }
+    }
+}
+
+/// Caps the video sender's bitrate (see [`VIDEO_MAX_BITRATE`]); under
+/// pressure it gives up some resolution and some frame rate.
+fn limit_video(sender: &RtpSender) {
+    let mut p = sender.parameters();
+    if p.encodings.is_empty() {
+        p.encodings.push(RtpEncodingParameters::default());
+    }
+    for e in &mut p.encodings {
+        e.max_bitrate = Some(VIDEO_MAX_BITRATE);
+        e.max_framerate = Some(30.0);
+    }
+    p.set_degradation_preference(DegradationPreference::Balanced);
+    let _ = sender.set_parameters(p);
+}
+
+/// What [`MediaSession::report`] says, from WebRTC's statistics.
+#[derive(Default)]
+struct Report {
+    /// Round trip, and what congestion control lets us send (kbit/s).
+    rtt_ms: f64,
+    send_kbps: f64,
+    /// Our video: what the encoder aims for, its frame rate, what holds it
+    /// back, and how long its packets waited to go (the pacer), on average.
+    out_kbps: f64,
+    out_fps: f64,
+    limited: &'static str,
+    pacer_ms: f64,
+    /// The peer's video and audio: average jitter buffer delay, frame
+    /// rate, freezes and frames dropped.
+    video_buffer_ms: f64,
+    in_fps: f64,
+    freezes: u32,
+    dropped: u32,
+    audio_buffer_ms: f64,
+}
+
+impl Report {
+    fn from(stats: &[RtcStats]) -> Self {
+        let avg_ms = |total: f64, n: f64| if n > 0.0 { total / n * 1000.0 } else { 0.0 };
+        let mut r = Self::default();
+        for s in stats {
+            match s {
+                RtcStats::CandidatePair(c) if c.candidate_pair.nominated => {
+                    r.rtt_ms = c.candidate_pair.current_round_trip_time * 1000.0;
+                    r.send_kbps = c.candidate_pair.available_outgoing_bitrate / 1000.0;
+                }
+                RtcStats::OutboundRtp(o) if o.stream.kind == "video" => {
+                    r.out_kbps = o.outbound.target_bitrate / 1000.0;
+                    r.out_fps = o.outbound.frames_per_second;
+                    r.limited = match o.outbound.quality_limitation_reason {
+                        QualityLimitationReason::None => "nothing",
+                        QualityLimitationReason::Cpu => "cpu",
+                        QualityLimitationReason::Bandwidth => "bandwidth",
+                        QualityLimitationReason::Other => "other",
+                    };
+                    r.pacer_ms = avg_ms(
+                        o.outbound.total_packet_send_delay,
+                        o.sent.packets_sent as f64,
+                    );
+                }
+                RtcStats::InboundRtp(i) => {
+                    let n = &i.inbound;
+                    let buffer =
+                        avg_ms(n.jitter_buffer_delay, n.jitter_buffer_emitted_count as f64);
+                    if i.stream.kind == "video" {
+                        r.video_buffer_ms = buffer;
+                        r.in_fps = n.frames_per_second;
+                        r.freezes = n.freeze_count;
+                        r.dropped = n.frames_dropped;
+                    } else if i.stream.kind == "audio" {
+                        r.audio_buffer_ms = buffer;
+                    }
+                }
+                _ => {}
+            }
+        }
+        r
+    }
+}
+
+impl std::fmt::Display for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rtt {:.0} ms, may send {:.0} kbit/s; video out {:.0} kbit/s {:.0} fps \
+             (limited by {}), paced {:.0} ms; video in {:.0} fps, buffered {:.0} ms, \
+             {} freezes, {} dropped; audio in buffered {:.0} ms",
+            self.rtt_ms,
+            self.send_kbps,
+            self.out_kbps,
+            self.out_fps,
+            if self.limited.is_empty() {
+                "nothing"
+            } else {
+                self.limited
+            },
+            self.pacer_ms,
+            self.in_fps,
+            self.video_buffer_ms,
+            self.freezes,
+            self.dropped,
+            self.audio_buffer_ms,
+        )
     }
 }
 
