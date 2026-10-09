@@ -18,7 +18,9 @@ import android.text.format.DateFormat
 import android.text.format.Formatter
 import android.text.style.ForegroundColorSpan
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.EditText
@@ -27,9 +29,11 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Date
+import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupInfo
 import uniffi.threnody_ffi.HistoryEntry
@@ -73,6 +77,32 @@ class ChatActivity : Activity() {
     private val pickFileLauncher = ActivityResultRegistry.get(this)
     private val viewPhotoLauncher = ActivityResultRegistry.get(this)
     private val annotateLauncher = ActivityResultRegistry.get(this)
+    private val clipLauncher = ActivityResultRegistry.get(this)
+    /** Send (with text to send) or record a voice message (without). */
+    private lateinit var sendButton: ImageButton
+    private lateinit var micButton: ImageButton
+    /** Over the message box while a voice message records. */
+    private lateinit var recordingBar: LinearLayout
+    private lateinit var recordingTime: TextView
+    private lateinit var recordingHint: TextView
+    private var voice: VoiceRecorder? = null
+    /** Slid up: it goes on recording without a finger on the button. */
+    private var voiceLocked = false
+    private var pressX = 0f
+    private var pressY = 0f
+    private val recordTick = object : Runnable {
+        override fun run() {
+            val v = voice ?: return
+            recordingTime.text = "● " + Clips.clock(v.elapsed)
+            typingHandler.postDelayed(this, 200)
+        }
+    }
+    /** Plays voice messages, one at a time; made when first needed. */
+    private var clipPlayer: ClipPlayer? = null
+    /** Voice messages on screen by location: play button, bar, time. */
+    private val voiceViews = mutableMapOf<String, Triple<ImageButton, SeekBar, TextView>>()
+    /** Sensitive voice and video messages uncovered, by [mark]. */
+    private val shownClips = mutableSetOf<String>()
     /** Incoming message ids already reported read. */
     private val sentRead = mutableSetOf<ULong>()
     /** On screen (between onStart and onStop): only then are messages read. */
@@ -208,6 +238,12 @@ class ChatActivity : Activity() {
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
                 override fun afterTextChanged(s: Editable?) {
                     typingHandler.removeCallbacks(stopTyping)
+                    if (::sendButton.isInitialized) {
+                        // A microphone until there's text to send.
+                        val blank = s.toString().isBlank()
+                        sendButton.visibility = if (blank) View.GONE else View.VISIBLE
+                        micButton.visibility = if (blank) View.VISIBLE else View.GONE
+                    }
                     if (s.toString().isBlank()) return sendTyping(false)
                     sendTyping(true)
                     typingHandler.postDelayed(stopTyping, TYPING_IDLE_MS)
@@ -236,9 +272,311 @@ class ChatActivity : Activity() {
                 }.show()
             }, LinearLayout.LayoutParams(dp(44), dp(48)))
             addView(button(R.drawable.ic_gif, "GIF", R.color.muted) { gifs() }, LinearLayout.LayoutParams(dp(44), dp(48)))
-            addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
-            addView(button(R.drawable.ic_send, "Send", R.color.accent) { send() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            recordingTime = label("● 0:00", 16f, R.color.warning).apply { setTypeface(typeface, Typeface.BOLD) }
+            recordingHint = label("‹ Slide to cancel · slide up to lock", 13f, R.color.muted).apply {
+                gravity = Gravity.END
+            }
+            recordingBar = LinearLayout(this@ChatActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                visibility = View.GONE
+                background = rounded(color(R.color.field), dp(22).toFloat())
+                setPadding(dp(4), 0, dp(14), 0)
+                addView(button(R.drawable.ic_delete, "Cancel the voice message", R.color.muted) { cancelVoice() },
+                    LinearLayout.LayoutParams(dp(44), dp(44)))
+                addView(recordingTime, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+                addView(recordingHint, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(8) })
+            }
+            val field = android.widget.FrameLayout(this@ChatActivity).apply {
+                addView(compose, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                addView(recordingBar, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            }
+            addView(field, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
+            sendButton = button(R.drawable.ic_send, "Send", R.color.accent) { send() }.apply { visibility = View.GONE }
+            addView(sendButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+            micButton = button(R.drawable.ic_mic, "Hold to record a voice message", R.color.accent) {}
+            micButton.setOnTouchListener { v, ev -> voiceTouch(v, ev) }
+            addView(micButton, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
+    }
+
+    // ----- Voice and video messages -----
+
+    /**
+     * Hold the microphone to record; let go to send. Sliding left cancels,
+     * sliding up locks it on (then the button sends).
+     */
+    private fun voiceTouch(v: View, ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (voice != null && voiceLocked) return true
+                pressX = ev.rawX
+                pressY = ev.rawY
+                startVoice(v)
+            }
+            MotionEvent.ACTION_MOVE -> if (voice != null && !voiceLocked) {
+                if (pressX - ev.rawX > dp(120)) cancelVoice()
+                else if (pressY - ev.rawY > dp(80)) lockVoice()
+            }
+            MotionEvent.ACTION_UP -> {
+                val rec = voice ?: return true
+                if (voiceLocked || rec.elapsed >= Clips.MIN_MS) finishVoice()
+                else {
+                    cancelVoice()
+                    Toast.makeText(this, "Hold to record a voice message", Toast.LENGTH_SHORT).show()
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> if (!voiceLocked) cancelVoice()
+        }
+        return true
+    }
+
+    private fun startVoice(v: View) {
+        if (!::node.isInitialized || voice != null) return
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), VOICE_PERMISSION)
+        }
+        clipPlayer?.stop()
+        voice = try {
+            VoiceRecorder(this, Clips.file(this, persona, video = false)) { runOnUiThread { finishVoice() } }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Couldn't record: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+        Design.lightHaptic(v)
+        voiceLocked = false
+        recordingHint.text = "‹ Slide to cancel · slide up to lock"
+        recordingBar.visibility = View.VISIBLE
+        compose.visibility = View.INVISIBLE
+        typingHandler.post(recordTick)
+    }
+
+    private fun lockVoice() {
+        voiceLocked = true
+        recordingHint.text = "Tap send when done"
+        micButton.setImageResource(R.drawable.ic_send)
+        micButton.contentDescription = "Send the voice message"
+    }
+
+    private fun endVoice() {
+        typingHandler.removeCallbacks(recordTick)
+        voice = null
+        voiceLocked = false
+        recordingBar.visibility = View.GONE
+        compose.visibility = View.VISIBLE
+        micButton.setImageResource(R.drawable.ic_mic)
+        micButton.contentDescription = "Hold to record a voice message"
+    }
+
+    private fun cancelVoice() {
+        val rec = voice ?: return
+        endVoice()
+        rec.cancel()
+    }
+
+    private fun finishVoice() {
+        val rec = voice ?: return
+        endVoice()
+        val (file, ms) = rec.stop() ?: return
+        sendClip(file, ms, video = false)
+    }
+
+    /** Records a video message on a screen of its own, then sends it. */
+    private fun recordVideo() {
+        if (!::node.isInitialized) return
+        val need = arrayOf(android.Manifest.permission.CAMERA, android.Manifest.permission.RECORD_AUDIO)
+            .filter { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
+        if (need.isNotEmpty()) return requestPermissions(need.toTypedArray(), VIDEO_PERMISSION)
+        clipPlayer?.stop()
+        clipLauncher.launch(
+            Intent(this, VideoClipActivity::class.java)
+                .putExtra(VideoClipActivity.PERSONA, persona)
+                .putExtra(VideoClipActivity.MAX_BYTES, node.maxFileSize().toLong())
+        ) { resultCode, data ->
+            val path = data?.getStringExtra(VideoClipActivity.RESULT_PATH)
+            if (resultCode != RESULT_OK || path == null) return@launch
+            sendClip(java.io.File(path), data.getLongExtra(VideoClipActivity.RESULT_DURATION_MS, 0), video = true)
+        }
+    }
+
+    /** Sends a recorded voice or video message from where it was recorded. */
+    private fun sendClip(file: java.io.File, measured: Long, video: Boolean) {
+        Threnody.touch()
+        Threading.background {
+            val location = Uri.fromFile(file).toString()
+            // The file's own length when it says, else as timed.
+            val ms = try {
+                android.media.MediaMetadataRetriever().use {
+                    it.setDataSource(file.path)
+                    it.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                }
+            } catch (_: Exception) {
+                null
+            } ?: measured
+            val error = try {
+                val data = file.readBytes()
+                if (data.size.toULong() > node.maxFileSize()) {
+                    "it's larger than " + Formatter.formatShortFileSize(this, node.maxFileSize().toLong())
+                } else {
+                    val options = FileOptions(false, "", 0uL, Clip(video, ms.coerceIn(0, Int.MAX_VALUE.toLong()).toUInt()))
+                    val g = group
+                    if (g != null) node.sendGroupFile(g, file.name, data, location, options)
+                    else node.sendFile(device, file.name, data, location, options)
+                    null
+                }
+            } catch (e: Exception) {
+                e.message ?: "error"
+            }
+            if (error != null) {
+                Media.forget(this, location)
+                runOnUiThread { Toast.makeText(this, "Couldn't send: $error", Toast.LENGTH_LONG).show() }
+            }
+            refresh()
+        }
+    }
+
+    private fun player(): ClipPlayer = clipPlayer ?: ClipPlayer(this).also { p ->
+        clipPlayer = p
+        p.listener = object : ClipPlayer.Listener {
+            override fun progress(location: String, positionMs: Int, durationMs: Int, playing: Boolean) {
+                val (button, bar, time) = voiceViews[location] ?: return
+                button.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+                button.contentDescription = if (playing) "Pause" else "Play"
+                if (durationMs > 0) bar.progress = (positionMs * 1000L / durationMs).toInt()
+                else bar.progress = 0
+                if (playing || positionMs > 0) time.text = Clips.clock(positionMs.toLong())
+                else time.tag?.let { time.text = it as String }
+            }
+        }
+    }
+
+    /**
+     * A voice message (play button, bar, length) or a video message (a
+     * still to tap). A sensitive one arrives covered.
+     */
+    private fun clipView(f: uniffi.threnody_ffi.FileInfo, clip: Clip, e: HistoryEntry, fg: Int): View {
+        val location = f.location
+        val what = if (clip.video) "video message" else "voice message"
+        val length = if (clip.durationMs > 0u) Clips.clock(clip.durationMs.toLong()) else ""
+        if (location == null || (f.sensitive && !e.outgoing && mark(e) !in shownClips)) {
+            val cover = label(
+                if (location == null) "${if (clip.video) "🎥" else "🎤"} ${what.replaceFirstChar { it.uppercase() }}\nnot on this device"
+                else "🔒\nSensitive $what\nTap to play",
+                14f, R.color.on_cover,
+            ).apply {
+                gravity = Gravity.CENTER
+                setTypeface(typeface, Typeface.BOLD)
+                background = rounded(color(R.color.cover), dp(12).toFloat()).apply { setStroke(dp(1), color(R.color.cover_edge)) }
+                setPadding(dp(16), dp(16), dp(16), dp(16))
+                minWidth = dp(200)
+                contentDescription = if (location == null) "$what not available" else "Sensitive $what, tap to uncover"
+            }
+            if (location != null) cover.setOnClickListener {
+                shownClips.add(mark(e))
+                val parent = cover.parent as? ViewGroup ?: return@setOnClickListener
+                val at = parent.indexOfChild(cover)
+                parent.removeViewAt(at)
+                parent.addView(clipView(f, clip, e, fg), at)
+            }
+            return cover
+        }
+        if (clip.video) {
+            val side = minOf(dp(220), resources.displayMetrics.widthPixels - dp(140))
+            val still = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = rounded(android.graphics.Color.BLACK, dp(12).toFloat())
+                clipToOutline = true
+            }
+            Clips.still(this, location, side) { b -> runOnUiThread { still.setImageBitmap(b) } }
+            val play = ImageView(this).apply {
+                setImageResource(R.drawable.ic_play)
+                imageTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(android.graphics.Color.argb(140, 0, 0, 0))
+                }
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+            }
+            return android.widget.FrameLayout(this).apply {
+                addView(still, android.widget.FrameLayout.LayoutParams(side, side * 4 / 3))
+                addView(play, android.widget.FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER))
+                if (length.isNotEmpty()) addView(label(length, 12f, R.color.on_cover).apply {
+                    setTextColor(android.graphics.Color.WHITE)
+                    setShadowLayer(4f, 0f, 0f, android.graphics.Color.BLACK)
+                    setPadding(dp(8), dp(4), dp(8), dp(6))
+                }, android.widget.FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.END))
+                contentDescription = "Video message" + if (length.isNotEmpty()) ", $length" else ""
+                // On the still and button too: the bubble's long press makes them take touches.
+                val open = View.OnClickListener { playVideo(location) }
+                setOnClickListener(open)
+                still.setOnClickListener(open)
+                play.setOnClickListener(open)
+            }
+        }
+        val tint = android.content.res.ColorStateList.valueOf(fg)
+        val button = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_play)
+            imageTintList = tint
+            background = ripple(borderless = true)
+            contentDescription = "Play"
+            setOnClickListener { player().toggle(location) }
+        }
+        val bar = SeekBar(this).apply {
+            max = 1000
+            progressTintList = tint
+            thumbTintList = tint
+            progressBackgroundTintList = tint
+            contentDescription = "Voice message position"
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                    if (fromUser) clipPlayer?.seek(location, p / 1000f)
+                }
+                override fun onStartTrackingTouch(s: SeekBar) {}
+                override fun onStopTrackingTouch(s: SeekBar) {}
+            })
+        }
+        val time = label(length.ifEmpty { "0:00" }, 12f, R.color.text).apply {
+            setTextColor(fg)
+            tag = length.ifEmpty { "0:00" }
+        }
+        voiceViews[location] = Triple(button, bar, time)
+        // Playing on from before a reload: show where it is.
+        clipPlayer?.position(location)?.let { (pos, len) ->
+            if (len > 0) bar.progress = (pos * 1000L / len).toInt()
+            time.text = Clips.clock(pos.toLong())
+            if (clipPlayer?.playing == true) button.setImageResource(R.drawable.ic_pause)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(button, LinearLayout.LayoutParams(dp(44), dp(44)))
+            addView(bar, LinearLayout.LayoutParams(dp(160), WRAP_CONTENT))
+            addView(time, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        }
+    }
+
+    /** Plays a video message full screen, inside the app. */
+    private fun playVideo(location: String) {
+        clipPlayer?.stop()
+        val dialog = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val video = android.widget.VideoView(this)
+        val box = android.widget.FrameLayout(this).apply {
+            setBackgroundColor(android.graphics.Color.BLACK)
+            addView(video, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER))
+            setOnClickListener { dialog.dismiss() }
+        }
+        video.setMediaController(android.widget.MediaController(this).apply { setAnchorView(box) })
+        video.setVideoURI(Uri.parse(location))
+        video.setOnPreparedListener { video.start() }
+        video.setOnErrorListener { _, _, _ ->
+            Toast.makeText(this, "Couldn't play this video", Toast.LENGTH_SHORT).show()
+            dialog.dismiss()
+            true
+        }
+        dialog.setContentView(box)
+        dialog.setOnDismissListener { video.stopPlayback() }
+        Privacy.secure(dialog)
+        dialog.show()
     }
 
     /** Whether the contact was last told we are typing, and when. */
@@ -303,6 +641,9 @@ class ChatActivity : Activity() {
 
     override fun onStop() {
         started = false
+        // Leaving the chat stops a voice message, and drops one recording.
+        clipPlayer?.stop()
+        cancelVoice()
         typingHandler.removeCallbacks(stopTyping)
         sendTyping(false)
         Threnody.visible--
@@ -567,6 +908,7 @@ class ChatActivity : Activity() {
         messages.removeAllViews()
         bubbles.clear()
         texts.clear()
+        voiceViews.clear()
         if (items.isEmpty()) {
             val text = if (group != null) "No messages yet. Group messages are end-to-end encrypted with MLS."
             else "No messages yet. Messages are end-to-end encrypted and stored encrypted on this device."
@@ -823,7 +1165,18 @@ class ChatActivity : Activity() {
         val file = e.file
         val time = if (item.sending) "sending…" else time(e.atMs.toLong())
         val pictures = run.all { it.entry.file?.let { f -> Media.isImage(f.name) } == true }
-        val meta = if (file != null && pictures) {
+        val clip = file?.clip
+        val meta = if (file != null && clip != null) {
+            body.addView(clipView(file, clip, e, fg))
+            if (e.text.isNotBlank()) {
+                body.addView(TextView(this).apply {
+                    searchable(e, e.text)
+                    textSize = 16f
+                    setTextColor(fg)
+                })
+            }
+            time
+        } else if (file != null && pictures) {
             body.setPadding(dp(4), dp(4), dp(4), dp(6))
             body.addView(photos(run))
             if (e.text.isNotBlank()) {
@@ -1064,6 +1417,7 @@ class ChatActivity : Activity() {
         PopupMenu(this, anchor).apply {
             menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
             menu.add("File").setOnMenuItemClickListener { pick(photos = false); true }
+            menu.add("Video message").setOnMenuItemClickListener { recordVideo(); true }
         }.show()
     }
 
@@ -1736,6 +2090,10 @@ class ChatActivity : Activity() {
         super.onRequestPermissionsResult(code, perms, results)
         Calls.permissionResult(code, results)
         if (code == WIFI_DIRECT && results.isNotEmpty() && results.all { it == 0 }) wifiDirect()
+        if (code == VIDEO_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) recordVideo()
+        if (code == VOICE_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) {
+            Toast.makeText(this, "Hold the microphone to record", Toast.LENGTH_SHORT).show()
+        }
     }
 
     /** Runs a node call, reporting failure, then refreshes. */
@@ -1773,6 +2131,8 @@ class ChatActivity : Activity() {
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2
+        private const val VOICE_PERMISSION = 5
+        private const val VIDEO_PERMISSION = 6
         /** We're taken to have stopped typing after this long without a keystroke. */
         private const val TYPING_IDLE_MS = 5_000L
         /** The contact's "…" goes after this long without word (refreshed while it types). */

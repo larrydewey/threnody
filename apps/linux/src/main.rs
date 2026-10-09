@@ -6,6 +6,7 @@
 mod call;
 mod camera;
 mod chat;
+mod clip;
 mod core;
 mod gifs;
 mod keyring;

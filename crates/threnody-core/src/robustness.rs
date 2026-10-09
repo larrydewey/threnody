@@ -74,6 +74,10 @@ fn parsers_survive_mutated_input() {
         sensitive: false,
         caption: String::new(),
         album: 0,
+        clip: Some(crate::message::Clip {
+            video: true,
+            duration_ms: 1_000,
+        }),
     }
     .encode()
     .unwrap();

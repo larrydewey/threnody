@@ -11,6 +11,7 @@ use const_cbor::Decoder;
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
+use crate::message::Clip;
 use crate::store::Home;
 
 /// Entries kept per conversation; the oldest are dropped first.
@@ -160,6 +161,8 @@ pub struct FileNote {
     /// Files sent together share an album id (0 = alone). An album's
     /// caption is the text of its first entry.
     pub album: u64,
+    /// A voice or video message, played in the chat.
+    pub clip: Option<Clip>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -283,7 +286,8 @@ impl History {
                     enc.u8(6)?.map_len(
                         2 + usize::from(f.location.is_some())
                             + usize::from(f.sensitive)
-                            + usize::from(f.album != 0),
+                            + usize::from(f.album != 0)
+                            + usize::from(f.clip.is_some()),
                     )?;
                     enc.u8(0)?.str(&f.name)?;
                     enc.u8(1)?.u64(f.size)?;
@@ -295,6 +299,9 @@ impl History {
                     }
                     if f.album != 0 {
                         enc.u8(4)?.u64(f.album)?;
+                    }
+                    if let Some(c) = f.clip {
+                        enc.u8(5)?.array_len(2)?.bool(c.video)?.u32(c.duration_ms)?;
                     }
                 }
                 if e.local_id != 0 {
@@ -418,6 +425,7 @@ impl History {
 
 fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
     let (mut name, mut size, mut location, mut sensitive, mut album) = (None, None, None, false, 0);
+    let mut clip = None;
     read_map(d, |k, d| {
         match k {
             0 => name = Some(d.str()?.to_owned()),
@@ -425,6 +433,15 @@ fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
             2 => location = Some(d.str()?.to_owned()),
             3 => sensitive = d.bool()?,
             4 => album = d.u64()?,
+            5 => {
+                if d.array_len()? != 2 {
+                    return Err(Error::Malformed("clip"));
+                }
+                clip = Some(Clip {
+                    video: d.bool()?,
+                    duration_ms: d.u32()?,
+                });
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -435,6 +452,7 @@ fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
         location,
         sensitive,
         album,
+        clip,
     })
 }
 
@@ -992,6 +1010,7 @@ mod tests {
                     location: Some("content://media/1".into()),
                     sensitive: true,
                     album: 77,
+                    clip: None,
                 }),
                 ..entry(MAX_ENTRIES as u64 + 6, "", None)
             },
@@ -1000,11 +1019,15 @@ mod tests {
         h.push(
             Entry {
                 file: Some(FileNote {
-                    name: "notes.txt".into(),
+                    name: "voice.m4a".into(),
                     size: 0,
                     location: None,
                     sensitive: false,
                     album: 0,
+                    clip: Some(Clip {
+                        video: false,
+                        duration_ms: 3_500,
+                    }),
                 }),
                 ..entry(MAX_ENTRIES as u64 + 7, "", None)
             },
@@ -1042,6 +1065,7 @@ mod tests {
                 location: None,
                 sensitive: false,
                 album: 0,
+                clip: None,
             }),
             ..entry(2, "beach day", None)
         };

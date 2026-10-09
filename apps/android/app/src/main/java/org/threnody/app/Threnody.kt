@@ -11,6 +11,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.ContactInfo
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.NodeEvent
@@ -187,7 +188,15 @@ object Threnody {
     }
 
     /** What a notification or the chat list says for a file. */
-    fun fileLabel(name: String, sensitive: Boolean, caption: String): String = when {
+    fun fileLabel(name: String, sensitive: Boolean, caption: String, clip: Clip? = null): String = when {
+        clip != null -> {
+            val (icon, what) = if (clip.video) "🎥" to "Video message" else "🎤" to "Voice message"
+            when {
+                sensitive -> "$icon Sensitive ${what.lowercase()}"
+                clip.durationMs == 0u -> "$icon $what"
+                else -> "$icon $what (${Clips.clock(clip.durationMs.toLong())})"
+            }
+        }
         sensitive && Media.isImage(name) -> "📷 Sensitive photo"
         sensitive -> "📎 Sensitive file"
         Media.isImage(name) -> "📷 " + caption.ifBlank { "Photo" }
@@ -195,11 +204,12 @@ object Threnody {
     }
 
     /**
-     * Keeps a received file: images privately, others in Downloads. A
-     * persona keeps everything privately, so burning it leaves nothing.
+     * Keeps a received file: images and voice or video messages privately,
+     * others in Downloads. A persona keeps everything privately, so
+     * burning it leaves nothing.
      */
-    private fun keep(ctx: Context, name: String, data: ByteArray, persona: String?): String? =
-        if (persona != null || Media.isImage(name)) Media.savePrivate(ctx, name, data, persona)
+    private fun keep(ctx: Context, name: String, data: ByteArray, persona: String?, clip: Boolean): String? =
+        if (persona != null || clip || Media.isImage(name)) Media.savePrivate(ctx, name, data, persona)
         else saveDownload(ctx, name, data)?.toString()
 
     /**
@@ -506,17 +516,17 @@ object Threnody {
                 is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
                 is NodeEvent.File -> {
                     say("* ${short(e.peer)} sent a file (${e.data.size} bytes)")
-                    val location = keep(ctx, e.name, e.data, persona)
+                    val location = keep(ctx, e.name, e.data, persona, e.clip != null)
                     try {
                         node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), location, e.id,
-                            FileOptions(e.sensitive, e.caption, e.album))
+                            FileOptions(e.sensitive, e.caption, e.album, e.clip))
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")
                     }
                     if (visible == 0 || e.peer !in visibleChat) {
                         val contacts = node.contacts()
                         ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer),
-                            fileLabel(e.name, e.sensitive, e.caption), persona)
+                            fileLabel(e.name, e.sensitive, e.caption, e.clip), persona)
                     }
                 }
                 is NodeEvent.GroupMessage -> {
@@ -529,17 +539,17 @@ object Threnody {
                 }
                 is NodeEvent.GroupFile -> {
                     say("* group ${e.group.take(6)}: ${short(e.from)} sent a file (${e.data.size} bytes)")
-                    val location = keep(ctx, e.name, e.data, persona)
+                    val location = keep(ctx, e.name, e.data, persona, e.clip != null)
                     try {
                         node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location, e.id,
-                            FileOptions(e.sensitive, e.caption, e.album))
+                            FileOptions(e.sensitive, e.caption, e.album, e.clip))
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")
                     }
                     if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group",
-                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption)}", persona)
+                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption, e.clip)}", persona)
                     }
                 }
                 is NodeEvent.GroupInvited -> {

@@ -354,7 +354,7 @@ class MainActivity : Activity() {
         scroll.scrollTo(0, 0)
     }
 
-    private fun preview(e: HistoryEntry) = e.file?.let { Threnody.fileLabel(it.name, it.sensitive, e.text) } ?: e.text
+    private fun preview(e: HistoryEntry) = e.file?.let { Threnody.fileLabel(it.name, it.sensitive, e.text, it.clip) } ?: e.text
 
     private fun status(c: Conversation) = when {
         c.approved && c.verified -> "Approved · verified"

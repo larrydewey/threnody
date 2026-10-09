@@ -639,6 +639,7 @@ impl App {
         let snippet = match &e.file {
             // As the list shows them: not even the name.
             Some(file) if file.sensitive => None,
+            Some(file) if file.clip.is_some() => None,
             Some(file) => ui::snippet_markup(&e.text, terms, 100).or_else(|| {
                 let icon = if core::is_image(&file.name) {
                     "📷"
@@ -811,12 +812,13 @@ impl App {
                 name,
                 sensitive,
                 caption,
+                clip,
                 ..
             } => (
                 Some(peer.clone()),
                 Some((
                     self.title_of(persona.as_deref(), peer),
-                    core::file_label(name, *sensitive, caption),
+                    core::file_label(name, *sensitive, caption, *clip),
                 )),
             ),
             NodeEvent::GroupMessage {
@@ -840,6 +842,7 @@ impl App {
                 ours,
                 sensitive,
                 caption,
+                clip,
                 ..
             } => (
                 Some(group.clone()),
@@ -849,7 +852,7 @@ impl App {
                         format!(
                             "{}: {}",
                             self.name(persona.as_deref(), from),
-                            core::file_label(name, *sensitive, caption)
+                            core::file_label(name, *sensitive, caption, *clip)
                         ),
                     )
                 }),

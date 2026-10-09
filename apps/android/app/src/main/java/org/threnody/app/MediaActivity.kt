@@ -168,7 +168,8 @@ class MediaActivity : Activity() {
         for (e in list) {
             val f = e.file ?: continue
             row(
-                (if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name,
+                f.clip?.let { Threnody.fileLabel(f.name, f.sensitive, "", it) }
+                    ?: ((if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name),
                 Formatter.formatShortFileSize(this, f.size.toLong()) + " · " + date(e) +
                     (if (e.text.isNotBlank()) " · ${e.text}" else ""),
             ) {

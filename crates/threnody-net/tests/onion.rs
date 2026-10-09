@@ -130,6 +130,7 @@ async fn two_relay_onion_circuit_carries_a_session() {
         sensitive: false,
         caption: String::new(),
         album: 0,
+        clip: None,
     };
     c.node.send(&a.node.identity(), big.clone()).unwrap();
     next(

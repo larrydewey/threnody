@@ -72,6 +72,17 @@ pub fn count() -> usize {
     cameras().len()
 }
 
+/// A GStreamer source for camera number `which` (of [`count`]; the
+/// default camera when there's no such one).
+pub fn source(which: usize) -> Result<gst::Element, String> {
+    match cameras().get(which) {
+        Some(d) => d.create_element(None).map_err(|e| e.to_string()),
+        None => gst::ElementFactory::make("v4l2src")
+            .build()
+            .map_err(|e| e.to_string()),
+    }
+}
+
 impl Camera {
     /// Starts camera number `which` (of [`count`]; the default camera
     /// when there's no such one). `send` gets I420 frames for the call,
@@ -92,12 +103,7 @@ impl Camera {
             .map_err(|e| e.to_string())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| "not a pipeline".to_owned())?;
-        let source = match cameras().get(which) {
-            Some(d) => d.create_element(None).map_err(|e| e.to_string())?,
-            None => gst::ElementFactory::make("v4l2src")
-                .build()
-                .map_err(|e| e.to_string())?,
-        };
+        let source = source(which)?;
         let head = pipeline.by_name("head").ok_or("no head")?;
         pipeline.add(&source).map_err(|e| e.to_string())?;
         source.link(&head).map_err(|e| e.to_string())?;

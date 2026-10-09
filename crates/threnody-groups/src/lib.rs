@@ -25,6 +25,7 @@ use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::signatures::{Signer, SignerError};
 use threnody_core::crypto::random_bytes;
+use threnody_core::message::Clip;
 use threnody_core::{Identity, PublicIdentity};
 
 pub use wire::{Content, GroupId, GroupWire};
@@ -134,6 +135,7 @@ pub enum GroupEvent {
         caption: String,
         album: u64,
         id: u64,
+        clip: Option<Clip>,
     },
     /// `from` added (or took away) its `emoji` on message `id`.
     React {
@@ -949,6 +951,7 @@ impl Groups {
                         caption,
                         album,
                         id,
+                        clip,
                     } => GroupEvent::File {
                         group,
                         from: sender,
@@ -958,6 +961,7 @@ impl Groups {
                         caption,
                         album,
                         id,
+                        clip,
                     },
                     Content::React { id, emoji, add } => GroupEvent::React {
                         group,

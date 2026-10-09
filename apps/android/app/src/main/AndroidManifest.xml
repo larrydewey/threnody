@@ -72,6 +72,9 @@
         <activity android:name=".AnnotateActivity" android:exported="false"
             android:parentActivityName=".ImageActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+        <activity android:name=".VideoClipActivity" android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
         <activity android:name=".LogActivity" android:exported="false"
             android:parentActivityName=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />

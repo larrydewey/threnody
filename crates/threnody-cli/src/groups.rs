@@ -145,6 +145,7 @@ impl GroupUi {
                     caption,
                     album,
                     id,
+                    clip,
                 } => {
                     let who = if ours {
                         format!("me, on {}", name(&from))
@@ -152,7 +153,7 @@ impl GroupUi {
                         name(&from)
                     };
                     let saved = crate::chat::save_download(&self.downloads, &file, &data);
-                    let mark = if sensitive { " [sensitive]" } else { "" };
+                    let mark = crate::chat::file_mark(sensitive, clip);
                     match &saved {
                         Ok(p) => println!(
                             "[{}] <{who}> sent {file}{mark} ({} bytes) -> {}",
@@ -171,6 +172,7 @@ impl GroupUi {
                         location: saved.ok().map(|p| p.display().to_string()),
                         sensitive,
                         album,
+                        clip,
                     };
                     self.groups
                         .record_file(node, &group, &from, note, &caption, id);

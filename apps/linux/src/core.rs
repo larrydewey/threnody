@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use threnody_ffi::{
-    ContactInfo, FileOptions, GroupInfo, GroupInvite, HistoryEntry, NodeEvent, PersonaRecord,
+    Clip, ContactInfo, FileOptions, GroupInfo, GroupInvite, HistoryEntry, NodeEvent, PersonaRecord,
     SearchHit, ThrenodyNode,
 };
 
@@ -672,10 +672,29 @@ impl Core {
         base.join("media")
     }
 
-    /// Keeps a received file: photos privately, others in
-    /// Downloads/Threnody. A persona keeps everything privately.
-    pub fn keep(&self, persona: Option<&str>, name: &str, data: &[u8]) -> Option<String> {
-        let dir = if persona.is_some() || is_image(name) {
+    /// Where to record a voice or video message, beside received photos.
+    pub fn clip_path(&self, persona: Option<&str>, video: bool) -> Result<PathBuf, String> {
+        let dir = self.media_dir(persona);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let name = if video {
+            format!("video-{}.webm", threnody_core::now_ms())
+        } else {
+            format!("voice-{}.ogg", threnody_core::now_ms())
+        };
+        Ok(free_path(&dir, &name))
+    }
+
+    /// Keeps a received file: photos and voice or video messages
+    /// privately, others in Downloads/Threnody. A persona keeps everything
+    /// privately.
+    pub fn keep(
+        &self,
+        persona: Option<&str>,
+        name: &str,
+        data: &[u8],
+        clip: bool,
+    ) -> Option<String> {
+        let dir = if persona.is_some() || clip || is_image(name) {
             self.media_dir(persona)
         } else {
             gtk::glib::user_special_dir(gtk::glib::UserDirectory::Downloads)
@@ -778,17 +797,19 @@ impl Core {
                 sensitive,
                 caption,
                 album,
+                clip,
             } => {
                 self.say(format!(
                     "* {} sent a file ({} bytes)",
                     short(&peer),
                     data.len()
                 ));
-                let location = self.keep(persona, &name, &data);
+                let location = self.keep(persona, &name, &data, clip.is_some());
                 let options = FileOptions {
                     sensitive,
                     caption: caption.clone(),
                     album,
+                    clip,
                 };
                 if let Err(x) = node.record_received_file(
                     peer.clone(),
@@ -808,6 +829,7 @@ impl Core {
                     sensitive,
                     caption,
                     album,
+                    clip,
                 }
             }
             NodeEvent::GroupFile {
@@ -820,6 +842,7 @@ impl Core {
                 sensitive,
                 caption,
                 album,
+                clip,
             } => {
                 self.say(format!(
                     "* group {}: {} sent a file ({} bytes)",
@@ -827,11 +850,12 @@ impl Core {
                     short(&from),
                     data.len()
                 ));
-                let location = self.keep(persona, &name, &data);
+                let location = self.keep(persona, &name, &data, clip.is_some());
                 let options = FileOptions {
                     sensitive,
                     caption: caption.clone(),
                     album,
+                    clip,
                 };
                 if let Err(x) = node.record_received_group_file(
                     group.clone(),
@@ -854,6 +878,7 @@ impl Core {
                     sensitive,
                     caption,
                     album,
+                    clip,
                 }
             }
             e => {
@@ -1078,7 +1103,19 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// What the list or a notification says for a file.
-pub fn file_label(name: &str, sensitive: bool, caption: &str) -> String {
+pub fn file_label(name: &str, sensitive: bool, caption: &str, clip: Option<Clip>) -> String {
+    if let Some(c) = clip {
+        let (icon, what) = if c.video {
+            ("🎥", "Video message")
+        } else {
+            ("🎤", "Voice message")
+        };
+        return match (sensitive, c.duration_ms) {
+            (true, _) => format!("{icon} Sensitive {}", what.to_lowercase()),
+            (false, 0) => format!("{icon} {what}"),
+            (false, ms) => format!("{icon} {what} ({})", crate::clip::clock(u64::from(ms))),
+        };
+    }
     match (sensitive, is_image(name)) {
         (true, true) => "📷 Sensitive photo".into(),
         (true, false) => "📎 Sensitive file".into(),
@@ -1090,7 +1127,7 @@ pub fn file_label(name: &str, sensitive: bool, caption: &str) -> String {
 /// A one-line preview of a stored message.
 pub fn preview(e: &HistoryEntry) -> String {
     match &e.file {
-        Some(f) => file_label(&f.name, f.sensitive, &e.text),
+        Some(f) => file_label(&f.name, f.sensitive, &e.text, f.clip),
         None => e.text.lines().next().unwrap_or("").to_owned(),
     }
 }
