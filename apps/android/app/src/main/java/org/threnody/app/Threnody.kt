@@ -508,7 +508,7 @@ object Threnody {
                     say("* message from ${short(e.peer)} (${e.text.length} chars)")
                     val contacts = node.contacts()
                     val k = key(contacts, e.peer)
-                    if (visible == 0 || e.peer !in visibleChat) {
+                    if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
                         val name = contacts.firstOrNull { it.fingerprint == e.peer }?.name ?: short(e.peer)
                         ThrenodyService.notifyMessage(ctx, k, e.peer, name, e.text, persona)
                     }
@@ -523,7 +523,7 @@ object Threnody {
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")
                     }
-                    if (visible == 0 || e.peer !in visibleChat) {
+                    if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
                         val contacts = node.contacts()
                         ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer),
                             fileLabel(e.name, e.sensitive, e.caption, e.clip), persona)
@@ -532,7 +532,7 @@ object Threnody {
                 is NodeEvent.GroupMessage -> {
                     say("* group ${e.group.take(6)}: message from ${short(e.from)} (${e.text.length} chars)")
                     // Our own other device's messages aren't news.
-                    if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
+                    if (!e.ours && !e.quiet && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}", persona)
                     }
@@ -546,7 +546,7 @@ object Threnody {
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")
                     }
-                    if (!e.ours && (visible == 0 || e.group !in visibleChat)) {
+                    if (!e.ours && !e.quiet && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group",
                             "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption, e.clip)}", persona)

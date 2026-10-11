@@ -132,12 +132,20 @@ impl GroupUi {
                     from,
                     text,
                     ours: true,
+                    ..
                 } => {
                     println!("[{}] <me, on {}> {text}", self.label(&group), name(&from));
                 }
                 Update::Text {
-                    group, from, text, ..
+                    group,
+                    from,
+                    text,
+                    mentioned,
+                    ..
                 } => {
+                    if mentioned {
+                        print!("\x07");
+                    }
                     println!("[{}] <{}> {text}", self.label(&group), name(&from));
                 }
                 Update::File {

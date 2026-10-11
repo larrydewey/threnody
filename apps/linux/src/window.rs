@@ -826,6 +826,7 @@ impl App {
                 from,
                 text,
                 ours,
+                ..
             } => (
                 Some(group.clone()),
                 (!ours).then(|| {
@@ -1092,7 +1093,17 @@ impl App {
                 && watching.as_ref() != Some(&chat)
             {
                 *self.unread.borrow_mut().entry(chat.clone()).or_default() += 1;
-                self.notify(&chat, &title, &body);
+                // The chat's notification setting may say to stay quiet.
+                let quiet = matches!(
+                    event,
+                    NodeEvent::Message { quiet: true, .. }
+                        | NodeEvent::File { quiet: true, .. }
+                        | NodeEvent::GroupMessage { quiet: true, .. }
+                        | NodeEvent::GroupFile { quiet: true, .. }
+                );
+                if !quiet {
+                    self.notify(&chat, &title, &body);
+                }
             }
         }
         self.refresh_soon();

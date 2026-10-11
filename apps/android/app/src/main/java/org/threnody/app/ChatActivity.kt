@@ -36,6 +36,8 @@ import java.util.Date
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupInfo
+import uniffi.threnody_ffi.MentionInfo
+import uniffi.threnody_ffi.NotifyLevel
 import uniffi.threnody_ffi.QuoteInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
@@ -132,6 +134,8 @@ class ChatActivity : Activity() {
     /** Each message's bubble and texts on screen, by [mark], to scroll to and highlight. */
     private val bubbles = mutableMapOf<String, View>()
     private val texts = mutableMapOf<String, MutableList<Pair<TextView, String>>>()
+    /** Messages with mentions, by [mark]: their text as shown, and where the mentions are. */
+    private val mentionRanges = mutableMapOf<String, Pair<String, List<Triple<Int, Int, Boolean>>>>()
     /** A message to bring into view once loaded: its [mark] and time. */
     private var jump: Pair<String, ULong>? = null
     /**
@@ -200,6 +204,11 @@ class ChatActivity : Activity() {
             addView(messages, MATCH_PARENT, WRAP_CONTENT)
         }
         composeBar = composeBar()
+        // In groups, "@" offers the other members to mention.
+        if (group != null) Mentions.attach(compose) {
+            if (!::node.isInitialized) emptyList()
+            else info?.members.orEmpty().filter { it != myDevice }.map { it to Threnody.nameOf(node, it) }
+        }
         replyBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -780,7 +789,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote), sending = true) }
+            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList()), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         val pinned = try { if (g != null) node.groupPinned(g) else node.pinned(device) } catch (_: Exception) { emptyList() }
@@ -958,6 +967,7 @@ class ChatActivity : Activity() {
         val y = scroll.scrollY
         messages.removeAllViews()
         bubbles.clear()
+        mentionRanges.clear()
         onScreen = items.map { it.entry }
         texts.clear()
         voiceViews.clear()
@@ -1069,8 +1079,11 @@ class ChatActivity : Activity() {
         for ((k, views) in texts) for ((v, raw) in views) v.text = marked(k, raw)
     }
 
-    private fun marked(k: String, raw: String): CharSequence =
-        if (terms.isEmpty()) raw else Search.highlight(raw, terms, k == hits.getOrNull(hit)?.let(::mark))
+    private fun marked(k: String, raw: String): CharSequence {
+        val base = if (terms.isEmpty()) raw else Search.highlight(raw, terms, k == hits.getOrNull(hit)?.let(::mark))
+        val m = mentionRanges[k]
+        return if (m != null && m.first == raw) Mentions.style(base, m.second, color(R.color.accent)) else base
+    }
 
     /** A bubble's text, kept so search can mark matches in it. */
     private fun TextView.searchable(e: HistoryEntry, raw: String): TextView {
@@ -1247,8 +1260,10 @@ class ChatActivity : Activity() {
             }
             time
         } else if (file == null) {
+            val (shown, ranges) = Mentions.display(e) { Threnody.nameOf(node, it) }
+            if (ranges.isNotEmpty()) mentionRanges[mark(e)] = shown to ranges
             body.addView(TextView(this).apply {
-                searchable(e, e.text)
+                searchable(e, shown)
                 textSize = 16f
                 setTextColor(fg)
             })
@@ -1571,8 +1586,10 @@ class ChatActivity : Activity() {
     private fun time(ms: Long) = DateFormat.getTimeFormat(this).format(Date(ms))
 
     private fun send() {
-        val text = compose.text.toString().trim()
+        val raw = compose.text.toString()
+        val text = raw.trim()
         if (text.isEmpty() || !::node.isInitialized) return
+        val mentions = if (group != null) Mentions.of(compose.text, raw.indexOf(text), text) else emptyList()
         val to = replyTo
         val quote = to?.let { QuoteInfo(it.id, it.device, snippet(it).take(MAX_QUOTE_CHARS)) }
         val item = text to quote
@@ -1586,7 +1603,8 @@ class ChatActivity : Activity() {
             val g = group
             val error = try {
                 if (g != null) {
-                    if (to != null) node.sendGroupReply(g, text, to.atMs, to.device) else node.sendGroupText(g, text)
+                    if (to != null || mentions.isNotEmpty()) node.sendGroupMessage(g, text, to?.atMs, to?.device, mentions)
+                    else node.sendGroupText(g, text)
                     null
                 } else if ((if (to != null) node.sendReply(device, text, to.atMs, to.device) else node.sendText(device, text)) == 0u) {
                     // Reaches the contact directly, by relay, or sealed for mailboxes.
@@ -1954,6 +1972,7 @@ class ChatActivity : Activity() {
                 menu.add("Approve").setOnMenuItemClickListener { setApproval(true); true }
             }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
+            menu.add("Notifications").setOnMenuItemClickListener { notifications(); true }
             menu.add("Offer a credential…").setOnMenuItemClickListener {
                 CredentialUi.offer(this@ChatActivity, node, device, c?.title ?: "They"); true
             }
@@ -2236,6 +2255,39 @@ class ChatActivity : Activity() {
     }
 
     /** Sets this conversation's disappearing timer (any of the choices, or off). */
+    /** When this chat notifies: always, only for mentions and replies (groups), or never. */
+    private fun notifications() {
+        val g = group
+        val levels = if (g != null) listOf(NotifyLevel.ALL, NotifyLevel.MENTIONS, NotifyLevel.OFF)
+        else listOf(NotifyLevel.ALL, NotifyLevel.OFF)
+        val names = levels.map {
+            when (it) {
+                NotifyLevel.ALL -> "All messages"
+                NotifyLevel.MENTIONS -> "Only mentions and replies to me"
+                NotifyLevel.OFF -> "Off"
+            }
+        }
+        Threading.background {
+            val current = try {
+                if (g != null) node.groupNotifyLevel(g) else node.notifyLevel(device)
+            } catch (_: Exception) { NotifyLevel.ALL }
+            runOnUiThread {
+                SecureBuilder(this)
+                    .setTitle("Notifications")
+                    .setSingleChoiceItems(names.toTypedArray(), levels.indexOf(current).coerceAtLeast(0)) { d, i ->
+                        d.dismiss()
+                        Threading.background {
+                            run("change notifications") {
+                                if (g != null) node.setGroupNotifyLevel(g, levels[i]) else node.setNotifyLevel(device, levels[i])
+                            }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
     private fun disappearing() {
         val choices = Privacy.TIMERS
         Threading.background {

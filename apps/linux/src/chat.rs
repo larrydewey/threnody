@@ -96,10 +96,22 @@ pub struct ChatView {
     pin_shown: Cell<usize>,
     /// In a group: whether we may pin (owner or admin).
     may_pin: Cell<bool>,
+    /// Members offered for an "@" being typed.
+    mention_popover: gtk::Popover,
+    /// Mentions in the composer: where ("@Name" between two marks), whose
+    /// device, and the label put in.
+    mentions: RefCell<Vec<(gtk::TextMark, gtk::TextMark, String, String)>>,
     /// The message the next one replies to.
     reply_to: RefCell<Option<HistoryEntry>>,
     /// Weak reference to self for creating weak pointers in callbacks.
     weak_self: Weak<ChatView>,
+}
+
+impl Drop for ChatView {
+    fn drop(&mut self) {
+        // A popover's parent doesn't take it down with itself.
+        self.mention_popover.unparent();
+    }
 }
 
 impl ChatView {
@@ -370,6 +382,15 @@ impl ChatView {
             pins: RefCell::new(Vec::new()),
             pin_shown: Cell::new(0),
             may_pin: Cell::new(false),
+            mention_popover: {
+                let p = gtk::Popover::new();
+                p.set_autohide(false);
+                p.set_has_arrow(false);
+                p.set_position(gtk::PositionType::Top);
+                p.set_parent(&input_scroll);
+                p
+            },
+            mentions: RefCell::new(Vec::new()),
             weak_self: weak_self.clone(),
             peer_quiet: RefCell::new(None),
             typing_sent_at: Cell::new(None),
@@ -447,6 +468,7 @@ impl ChatView {
                 let Some(t) = weak.upgrade() else { return };
                 let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
                 placeholder.set_visible(text.is_empty());
+                t.offer_mentions(buf);
                 if let Some(id) = t.typing_timeout.borrow_mut().take() {
                     id.remove();
                 }
@@ -899,6 +921,7 @@ impl ChatView {
             }
             add("Media, files and links", "media", Self::media);
             add("Disappearing messages", "timer", Self::disappearing);
+            add("Notifications", "notify", Self::notifications);
             add("Clear chat…", "clear", Self::clear);
             add(
                 if g.owned {
@@ -919,6 +942,7 @@ impl ChatView {
                 add("Approve", "approve", Self::approve);
             }
             add("Disappearing messages", "timer", Self::disappearing);
+            add("Notifications", "notify", Self::notifications);
             add("Share your profile…", "share", Self::share_profile);
             add(
                 "Offer a credential…",
@@ -1097,8 +1121,13 @@ impl ChatView {
             let text = ui::label(&e.text, &["message-text"]);
             text.set_selectable(true);
             text.set_max_width_chars(60);
-            // Links are clickable.
-            if let Some(markup) = linkify(&e.text) {
+            // Links are clickable; mentions show our name for them.
+            let markup = if e.mentions.is_empty() {
+                linkify(&e.text)
+            } else {
+                Some(self.mention_markup(e))
+            };
+            if let Some(markup) = markup {
                 text.set_markup(&markup);
                 // Links ask before opening in the browser.
                 let weak = self.app.clone();
@@ -1759,6 +1788,142 @@ impl ChatView {
         );
     }
 
+    /// `e`'s text as markup, with mentions as "@" and our name for them
+    /// (ours highlighted), and links clickable.
+    fn mention_markup(&self, e: &HistoryEntry) -> String {
+        let chars: Vec<char> = e.text.chars().collect();
+        let segment = |a: usize, b: usize| -> String {
+            let t: String = chars[a.min(chars.len())..b.min(chars.len())]
+                .iter()
+                .collect();
+            linkify(&t).unwrap_or_else(|| glib::markup_escape_text(&t).to_string())
+        };
+        let mut out = String::new();
+        let mut from = 0usize;
+        for m in &e.mentions {
+            let (a, b) = (m.start as usize, (m.start + m.len) as usize);
+            if a < from || b > chars.len() {
+                continue;
+            }
+            out.push_str(&segment(from, a));
+            let name = glib::markup_escape_text(&format!("@{}", self.quote_author(&m.device)));
+            if m.mine {
+                out.push_str(&format!(
+                    "<span weight=\"bold\" bgcolor=\"#3584e4\" bgalpha=\"25%\">{name}</span>"
+                ));
+            } else {
+                out.push_str(&format!("<b>{name}</b>"));
+            }
+            from = b;
+        }
+        out.push_str(&segment(from, chars.len()));
+        out
+    }
+
+    /// In a group, offers the members matching an "@" being typed.
+    fn offer_mentions(self: &Rc<Self>, buf: &gtk::TextBuffer) {
+        let pop = &self.mention_popover;
+        // An edited mention is just text again.
+        self.mentions.borrow_mut().retain(|(a, b, _, label)| {
+            let keep =
+                buf.text(&buf.iter_at_mark(a), &buf.iter_at_mark(b), false) == label.as_str();
+            if !keep {
+                buf.delete_mark(a);
+                buf.delete_mark(b);
+            }
+            keep
+        });
+        let Some(info) = self.conv.borrow().group.clone() else {
+            return pop.popdown();
+        };
+        let Some(node) = self.node() else { return };
+        let cursor = buf.iter_at_mark(&buf.get_insert());
+        let line_start = {
+            let mut i = cursor;
+            i.set_line_offset(0);
+            i
+        };
+        let before = buf.text(&line_start, &cursor, false).to_string();
+        let Some(at) = before.rfind('@') else {
+            return pop.popdown();
+        };
+        let query = &before[at + 1..];
+        let starts_word = before[..at].chars().last().is_none_or(char::is_whitespace);
+        if !starts_word || query.chars().any(char::is_whitespace) {
+            return pop.popdown();
+        }
+        let me = node.device_fingerprint();
+        let hits: Vec<(String, String)> = info
+            .members
+            .iter()
+            .filter(|m| **m != me)
+            .map(|m| (m.clone(), Core::name_of(&node, m)))
+            .filter(|(_, n)| n.to_lowercase().starts_with(&query.to_lowercase()))
+            .take(6)
+            .collect();
+        if hits.is_empty() {
+            return pop.popdown();
+        }
+        let list = gtk::ListBox::new();
+        list.add_css_class("navigation-sidebar");
+        for (_, name) in &hits {
+            list.append(&ui::label(name, &[]));
+        }
+        let at_chars = before[..at].chars().count() as i32;
+        let (weak, hits2) = (self.weak_self.clone(), hits.clone());
+        list.connect_row_activated(move |_, row| {
+            let Some(t) = weak.upgrade() else { return };
+            let Some((device, name)) = hits2.get(row.index() as usize).cloned() else {
+                return;
+            };
+            let buf = t.input.buffer();
+            let mut start = buf.iter_at_mark(&buf.get_insert());
+            start.set_line_offset(at_chars);
+            let mut end = buf.iter_at_mark(&buf.get_insert());
+            buf.delete(&mut start, &mut end);
+            let label = format!("@{name}");
+            let a = buf.create_mark(None, &start, true);
+            buf.insert(&mut start, &label);
+            let b = buf.create_mark(None, &start, true);
+            buf.insert(&mut start, " ");
+            t.mentions.borrow_mut().push((a, b, device, label));
+            t.mention_popover.popdown();
+            t.input.grab_focus();
+        });
+        pop.set_child(Some(&list));
+        pop.popup();
+    }
+
+    /// The mentions in the composer, as the node counts (characters), and
+    /// forgets them.
+    fn take_mentions(&self, buf: &gtk::TextBuffer) -> Vec<threnody_ffi::MentionInfo> {
+        let full = buf
+            .text(&buf.start_iter(), &buf.end_iter(), false)
+            .to_string();
+        let lead = (full.chars().count() - full.trim_start().chars().count()) as i32;
+        let mut out: Vec<threnody_ffi::MentionInfo> = self
+            .mentions
+            .borrow()
+            .iter()
+            .filter_map(|(a, b, device, label)| {
+                let (a, b) = (buf.iter_at_mark(a), buf.iter_at_mark(b));
+                (buf.text(&a, &b, false) == label.as_str()).then(|| threnody_ffi::MentionInfo {
+                    start: (a.offset() - lead).max(0) as u32,
+                    len: (b.offset() - a.offset()) as u32,
+                    device: device.clone(),
+                    mine: false,
+                })
+            })
+            .collect();
+        out.sort_by_key(|m| m.start);
+        for (a, b, ..) in self.mentions.borrow_mut().drain(..) {
+            buf.delete_mark(&a);
+            buf.delete_mark(&b);
+        }
+        self.mention_popover.popdown();
+        out
+    }
+
     /// Who sent a quoted message, by device: us, or their name.
     fn quote_author(&self, author: &str) -> String {
         match self.node() {
@@ -2115,6 +2280,7 @@ impl ChatView {
             return;
         }
         let Some(node) = self.node() else { return };
+        let mentions = self.take_mentions(&buf);
         // Clearing the composer also says we stopped typing.
         buf.set_text("");
         let (group, device) = (self.group(), self.device());
@@ -2128,10 +2294,12 @@ impl ChatView {
         let sent = text.clone();
         bg(
             move || match group {
-                Some(g) if let Some((at, d)) = quote => node
-                    .send_group_reply(g, sent, at, d)
-                    .map(|()| None)
-                    .map_err(|e| e.to_string()),
+                Some(g) if quote.is_some() || !mentions.is_empty() => {
+                    let (at, d) = quote.unzip();
+                    node.send_group_message(g, sent, at, d, mentions)
+                        .map(|()| None)
+                        .map_err(|e| e.to_string())
+                }
                 Some(g) => node
                     .send_group_text(g, sent)
                     .map(|()| None)
@@ -2634,6 +2802,57 @@ impl ChatView {
                     );
                 });
                 d.present(Some(&app.window));
+            },
+        );
+    }
+
+    /// When this chat notifies: always, only for mentions and replies
+    /// (groups), or never.
+    fn notifications(self: &Rc<Self>) {
+        use threnody_ffi::NotifyLevel;
+        let Some(node) = self.node() else { return };
+        let (group, device) = (self.group(), self.device());
+        let current = match &group {
+            Some(g) => node.group_notify_level(g.clone()),
+            None => node.notify_level(device.clone()),
+        }
+        .unwrap_or(NotifyLevel::All);
+        let levels: Vec<(NotifyLevel, &str)> = if group.is_some() {
+            vec![
+                (NotifyLevel::All, "All messages"),
+                (NotifyLevel::Mentions, "Only mentions and replies to me"),
+                (NotifyLevel::Off, "Off"),
+            ]
+        } else {
+            vec![
+                (NotifyLevel::All, "All messages"),
+                (NotifyLevel::Off, "Off"),
+            ]
+        };
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let options: Vec<String> = levels.iter().map(|(_, l)| (*l).to_owned()).collect();
+        let at = levels.iter().position(|(l, _)| *l == current);
+        let weak = self.weak_self.clone();
+        ui::choose(
+            &app.window,
+            "Notifications",
+            "Messages still arrive and count as unread; this only decides what notifies.",
+            &options,
+            at,
+            move |i| {
+                let Some(t) = weak.upgrade() else { return };
+                let level = levels[i].0;
+                let (group, device) = (group.clone(), device.clone());
+                t.run(
+                    "change notifications",
+                    move |n| match group {
+                        Some(g) => n.set_group_notify_level(g, level),
+                        None => n.set_notify_level(device, level),
+                    },
+                    None,
+                );
             },
         );
     }

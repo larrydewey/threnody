@@ -98,6 +98,36 @@ pub const FEATURES: u64 = FEATURE_ACKS
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
+/// Most mentions one message carries.
+pub const MAX_MENTIONS: usize = 32;
+
+/// Someone a group message mentions: the characters `start..start+len`
+/// of its text (as written, "@Name"), and who (an account, or a device
+/// whose account isn't known). Receivers show their own name for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mention {
+    pub start: u32,
+    pub len: u32,
+    pub who: [u8; 32],
+}
+
+impl Mention {
+    /// The mentions of `list` that fit `text`, in order and apart, at most
+    /// [`MAX_MENTIONS`]: what a receiver keeps.
+    pub fn valid(list: Vec<Mention>, text: &str) -> Vec<Mention> {
+        let chars = text.chars().count() as u64;
+        let mut out: Vec<Mention> = Vec::new();
+        for m in list {
+            let end = u64::from(m.start) + u64::from(m.len);
+            let after = out.last().is_none_or(|p| p.start + p.len <= m.start);
+            if m.len > 0 && end <= chars && after && out.len() < MAX_MENTIONS {
+                out.push(m);
+            }
+        }
+        out
+    }
+}
+
 /// The earlier message a reply quotes: its id, who sent it (a device),
 /// and the start of its text, so the reply reads even where the original
 /// isn't (deleted, expired, or from before we joined).

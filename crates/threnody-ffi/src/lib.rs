@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use threnody_core::history::{ConversationId, FileNote};
+use threnody_core::history::{ConversationId, FileNote, Notify};
 use threnody_core::store::{Home, Lookup};
 use threnody_core::{AppMessage, Fingerprint, PublicIdentity, safety_number};
 use threnody_net::history::OutgoingFile;
@@ -150,6 +150,48 @@ pub struct HistoryEntry {
     pub reactions: Vec<ReactionInfo>,
     /// The message this one replies to.
     pub quote: Option<QuoteInfo>,
+    /// Who it mentions, in order.
+    pub mentions: Vec<MentionInfo>,
+}
+
+/// Someone a message mentions: characters `start..start+len` of its text
+/// (as the sender wrote it), shown as `@` and the name of `device` (one of
+/// theirs). `mine`: it's us.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MentionInfo {
+    pub start: u32,
+    pub len: u32,
+    pub device: String,
+    pub mine: bool,
+}
+
+/// When a chat's new messages notify (`quiet` on its events otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotifyLevel {
+    All,
+    /// In groups, only messages that mention us or reply to us.
+    Mentions,
+    Off,
+}
+
+impl From<Notify> for NotifyLevel {
+    fn from(n: Notify) -> Self {
+        match n {
+            Notify::All => Self::All,
+            Notify::Mentions => Self::Mentions,
+            Notify::Off => Self::Off,
+        }
+    }
+}
+
+impl From<NotifyLevel> for Notify {
+    fn from(n: NotifyLevel) -> Self {
+        match n {
+            NotifyLevel::All => Self::All,
+            NotifyLevel::Mentions => Self::Mentions,
+            NotifyLevel::Off => Self::Off,
+        }
+    }
 }
 
 /// What a reply quotes: the message's id (as [`HistoryEntry::id`]), its
@@ -365,6 +407,8 @@ pub enum NodeEvent {
         peer: String,
         text: String,
         offline: bool,
+        /// The chat's notification setting says not to notify.
+        quiet: bool,
     },
     /// `id` is the sender's id for it: pass it to `record_received_file`,
     /// with the caption, sensitivity and album.
@@ -377,6 +421,8 @@ pub enum NodeEvent {
         caption: String,
         album: u64,
         clip: Option<Clip>,
+        /// As for `Message`.
+        quiet: bool,
     },
     /// `peer` edited a message: reload its conversation.
     MessageEdited {
@@ -462,6 +508,10 @@ pub enum NodeEvent {
         from: String,
         text: String,
         ours: bool,
+        /// It mentions us, or replies to one of our messages.
+        mentioned: bool,
+        /// The group's notification setting says not to notify.
+        quiet: bool,
     },
     /// A file from a group member: save it, then call
     /// `record_received_group_file`.
@@ -477,6 +527,8 @@ pub enum NodeEvent {
         caption: String,
         album: u64,
         clip: Option<Clip>,
+        /// As for `GroupMessage`.
+        quiet: bool,
     },
     /// `peer` says it displayed our outgoing messages `ids` (their
     /// sender-ids, as recorded on our side): ticks update on reload.
@@ -643,10 +695,38 @@ fn reactions(e: &threnody_core::history::Entry, me: &[u8; 32]) -> Vec<ReactionIn
     out
 }
 
-fn history_entries(entries: &[threnody_core::history::Entry], me: [u8; 32]) -> Vec<HistoryEntry> {
+/// A device of whoever `who` (a reactor: an account, or a device) is,
+/// to name them by: ours, a contact's, or `who` itself.
+fn device_of(node: &threnody_net::Node, who: &[u8; 32]) -> String {
+    if node.reactor_of(&node.identity()) == *who {
+        return fp(&node.identity());
+    }
+    node.contacts()
+        .iter()
+        .find(|c| node.reactor_of(&c.key) == *who)
+        .map(|c| fp(&c.key))
+        .or_else(|| PublicIdentity::from_bytes(who).ok().map(|d| fp(&d)))
+        .unwrap_or_default()
+}
+
+fn history_entries(
+    node: &threnody_net::Node,
+    entries: &[threnody_core::history::Entry],
+    me: [u8; 32],
+) -> Vec<HistoryEntry> {
     entries
         .iter()
         .map(|e| HistoryEntry {
+            mentions: e
+                .mentions
+                .iter()
+                .map(|m| MentionInfo {
+                    start: m.start,
+                    len: m.len,
+                    device: device_of(node, &m.who),
+                    mine: m.who == me,
+                })
+                .collect(),
             reactions: reactions(e, &me),
             at_ms: e.at_ms,
             outgoing: e.outgoing,
@@ -715,11 +795,13 @@ fn convert(e: Event) -> NodeEvent {
             peer: fp(&peer),
             text: text_of(&msg).unwrap_or_default(),
             offline: false,
+            quiet: false,
         },
         Event::OfflineMessage { from, msg, .. } if text_of(&msg).is_some() => NodeEvent::Message {
             peer: fp(&from),
             text: text_of(&msg).unwrap_or_default(),
             offline: true,
+            quiet: false,
         },
         Event::Message {
             peer,
@@ -743,6 +825,7 @@ fn convert(e: Event) -> NodeEvent {
             caption,
             album,
             clip: clip.map(Into::into),
+            quiet: false,
         },
         Event::MessageEdited { peer, .. } => NodeEvent::MessageEdited { peer: fp(&peer) },
         Event::MessagesDeleted { peer, count } => NodeEvent::MessagesDeleted {
@@ -1440,7 +1523,7 @@ PersistentKeepalive = 25\n",
             .history(self.node.conversation_for(&p))
             .map_err(fail)?;
         let me = self.node.reactor_of(&self.node.identity());
-        Ok(history_entries(h.recent(limit as usize), me))
+        Ok(history_entries(&self.node, h.recent(limit as usize), me))
     }
 
     /// Messages with `peer` matching `query`, newest first, at most
@@ -1460,7 +1543,7 @@ PersistentKeepalive = 25\n",
             .map_err(fail)?;
         let me = self.node.reactor_of(&self.node.identity());
         let entries: Vec<_> = hits.into_iter().map(|h| h.entry).collect();
-        Ok(history_entries(&entries, me))
+        Ok(history_entries(&self.node, &entries, me))
     }
 
     /// Messages in every conversation (contacts and groups) matching
@@ -1498,7 +1581,7 @@ PersistentKeepalive = 25\n",
                 SearchHit {
                     peer,
                     group,
-                    entry: history_entries(std::slice::from_ref(&h.entry), me)
+                    entry: history_entries(&self.node, std::slice::from_ref(&h.entry), me)
                         .pop()
                         .expect("one entry"),
                 }
@@ -1564,11 +1647,29 @@ PersistentKeepalive = 25\n",
         Ok(self.node.pin(&p, id, pin))
     }
 
+    /// When new messages in our chat with `peer` notify.
+    pub fn notify_level(&self, peer: String) -> Result<NotifyLevel> {
+        let p = self.resolve(&peer)?;
+        let h = self
+            .node
+            .history(self.node.conversation_for(&p))
+            .map_err(fail)?;
+        Ok(h.notify.into())
+    }
+
+    pub fn set_notify_level(&self, peer: String, level: NotifyLevel) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node
+            .set_notify(self.node.conversation_for(&p), level.into())
+            .map_err(fail)
+    }
+
     /// The pinned messages in our chat with `peer`, oldest pin first.
     pub fn pinned(&self, peer: String) -> Result<Vec<HistoryEntry>> {
         let p = self.resolve(&peer)?;
         let me = self.node.reactor_of(&self.node.identity());
         Ok(history_entries(
+            &self.node,
             &self.node.pinned(self.node.conversation_for(&p)),
             me,
         ))
@@ -1877,6 +1978,51 @@ PersistentKeepalive = 25\n",
 
     /// Waits up to `timeout_ms` for the next event.
     pub fn next_event(&self, timeout_ms: u32) -> Option<NodeEvent> {
+        self.next_event_raw(timeout_ms).map(|e| self.hush(e))
+    }
+}
+
+impl ThrenodyNode {
+    /// Sets `quiet` on message events by the conversation's notification
+    /// setting (and, in groups, whether we're mentioned).
+    fn hush(&self, mut e: NodeEvent) -> NodeEvent {
+        let level = |conv| {
+            self.node
+                .history(conv)
+                .map(|h| h.notify)
+                .unwrap_or_default()
+        };
+        match &mut e {
+            NodeEvent::Message { peer, quiet, .. } | NodeEvent::File { peer, quiet, .. } => {
+                if let Ok(p) = self.resolve(peer) {
+                    *quiet = level(self.node.conversation_for(&p)) != Notify::All;
+                }
+            }
+            NodeEvent::GroupMessage {
+                group,
+                mentioned,
+                quiet,
+                ..
+            } => {
+                if let Ok(g) = self.group_id(group) {
+                    *quiet = match level(ConversationId::Group(g)) {
+                        Notify::All => false,
+                        Notify::Mentions => !*mentioned,
+                        Notify::Off => true,
+                    };
+                }
+            }
+            NodeEvent::GroupFile { group, quiet, .. } => {
+                if let Ok(g) = self.group_id(group) {
+                    *quiet = level(ConversationId::Group(g)) != Notify::All;
+                }
+            }
+            _ => {}
+        }
+        e
+    }
+
+    fn next_event_raw(&self, timeout_ms: u32) -> Option<NodeEvent> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             if let Some(e) = self.queued().pop_front() {
@@ -1931,7 +2077,10 @@ PersistentKeepalive = 25\n",
             }
         }
     }
+}
 
+#[uniffi::export]
+impl ThrenodyNode {
     /// Stops listening and closes every session.
     pub fn shutdown(&self) {
         self.node.shutdown();
@@ -2268,7 +2417,8 @@ mod tests {
             NodeEvent::Message {
                 peer: alice.device_fingerprint(),
                 text: "hello from an app".into(),
-                offline: false
+                offline: false,
+                quiet: false,
             }
         );
         alice
@@ -2675,6 +2825,8 @@ mod tests {
                     from: c_fp.clone(),
                     text: "hi all".into(),
                     ours: false,
+                    mentioned: false,
+                    quiet: false,
                 }
             );
         }
@@ -2749,6 +2901,7 @@ mod tests {
                 caption,
                 album,
                 clip,
+                ..
             } = all.until(i, |e| matches!(e, NodeEvent::GroupFile { .. }))
             else {
                 unreachable!()

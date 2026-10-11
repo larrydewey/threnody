@@ -15,7 +15,7 @@
 //! message crosses at most one forwarding member.
 
 use threnody_core::history::{ConversationId, Entry, FileNote};
-use threnody_core::message::{Clip, Quote};
+use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::OutgoingFile;
@@ -79,6 +79,8 @@ pub enum Update {
         from: PublicIdentity,
         text: String,
         ours: bool,
+        /// It mentions us, or replies to one of our messages.
+        mentioned: bool,
     },
     /// A file from a member. Save it, then record it with
     /// [`GroupNode::record_file`], passing `id`.
@@ -309,11 +311,24 @@ impl GroupNode {
         text: &str,
         quote: Option<Quote>,
     ) -> Result<()> {
+        self.send_message(node, group, text, quote, Vec::new())
+    }
+
+    /// [`Self::send_text`], with what it quotes and who it mentions.
+    pub fn send_message(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        text: &str,
+        quote: Option<Quote>,
+        mentions: Vec<Mention>,
+    ) -> Result<()> {
         let id = threnody_net::history::local_id();
         let content = Content::Text {
             text: text.to_owned(),
             id,
             quote,
+            mentions: Mention::valid(mentions, text),
         };
         self.send(node, group, &content, None, id)
     }
@@ -445,6 +460,7 @@ impl GroupNode {
                     Content::Text { quote, .. } => quote.clone(),
                     _ => None,
                 },
+                mentions: Vec::new(),
             },
         );
         Ok(())
@@ -484,6 +500,7 @@ impl GroupNode {
                 read_ms: 0,
                 reactions: Vec::new(),
                 quote: None,
+                mentions: Vec::new(),
             },
         );
     }
@@ -854,10 +871,19 @@ impl GroupNode {
                 text,
                 id,
                 quote,
+                mentions,
             } => {
                 // What our other devices send to the group is ours too.
                 let ours = node.is_own_device(&from);
                 let timer = node.effective_timer(ConversationId::Group(group));
+                let me = node.reactor_of(&node.identity());
+                let mine = |d: &[u8; 32]| {
+                    *d == *node.identity().as_bytes()
+                        || PublicIdentity::from_bytes(d).is_ok_and(|p| node.is_own_device(&p))
+                };
+                let mentioned = !ours
+                    && (mentions.iter().any(|m| m.who == me || mine(&m.who))
+                        || quote.as_ref().is_some_and(|q| mine(&q.author)));
                 node.record_with_id(
                     ConversationId::Group(group),
                     *from.as_bytes(),
@@ -867,12 +893,14 @@ impl GroupNode {
                     timer,
                     id,
                     quote,
+                    mentions,
                 );
                 Update::Text {
                     group,
                     from,
                     text,
                     ours,
+                    mentioned,
                 }
             }
             GroupEvent::File {
