@@ -11,7 +11,7 @@ use const_cbor::Decoder;
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
-use crate::message::Clip;
+use crate::message::{Clip, Quote};
 use crate::store::Home;
 
 /// Entries kept per conversation; the oldest are dropped first.
@@ -100,6 +100,8 @@ pub struct Entry {
     /// Reactions: who (an account, or a device whose account isn't known)
     /// and which emoji. Anyone may add several different ones.
     pub reactions: Vec<([u8; 32], String)>,
+    /// The message this one replies to.
+    pub quote: Option<Quote>,
 }
 
 /// Reaction limits: per person on one message, per message, and per emoji.
@@ -140,7 +142,8 @@ impl Entry {
     /// The id other devices know this message by: ours if we sent it, the
     /// sender's otherwise (0 = none).
     pub fn message_id(&self) -> u64 {
-        if self.outgoing {
+        // A sibling's message is ours, under the sender's id.
+        if self.outgoing && self.local_id != 0 {
             self.local_id
         } else {
             self.remote_id
@@ -244,13 +247,33 @@ impl History {
     /// anything was removed.
     pub fn prune(&mut self, now_ms: u64) -> bool {
         let before = self.entries.len();
+        let expired: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| e.expires_at_ms.is_some_and(|t| t <= now_ms))
+            .map(Entry::message_id)
+            .collect();
         self.entries
             .retain(|e| e.expires_at_ms.is_none_or(|t| t > now_ms));
+        self.forget_quotes(&expired);
         if self.entries.len() > MAX_ENTRIES {
             let extra = self.entries.len() - MAX_ENTRIES;
             self.entries.drain(..extra);
         }
         self.entries.len() != before
+    }
+
+    /// Blanks what replies quote of the messages `gone` (by
+    /// [`Entry::message_id`]): a quote mustn't outlive its message.
+    pub fn forget_quotes(&mut self, gone: &[u64]) {
+        for e in &mut self.entries {
+            if let Some(q) = &mut e.quote
+                && q.id != 0
+                && gone.contains(&q.id)
+            {
+                q.text.clear();
+            }
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -284,7 +307,8 @@ impl History {
                         + usize::from(e.remote_id != 0)
                         + usize::from(e.edited_ms != 0)
                         + usize::from(!e.reactions.is_empty())
-                        + usize::from(e.read_ms != 0),
+                        + usize::from(e.read_ms != 0)
+                        + usize::from(e.quote.is_some()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -337,6 +361,13 @@ impl History {
                 if e.read_ms != 0 {
                     enc.u8(14)?.u64(e.read_ms)?;
                 }
+                if let Some(q) = &e.quote {
+                    enc.u8(15)?
+                        .array_len(3)?
+                        .u64(q.id)?
+                        .bytes(&q.author)?
+                        .str(&q.text)?;
+                }
                 if !e.reactions.is_empty() {
                     enc.u8(13)?.array_len(e.reactions.len())?;
                     for (who, emoji) in &e.reactions {
@@ -363,6 +394,7 @@ impl History {
                         let (mut recipients, mut delivered_to) = (0, Vec::new());
                         let (mut remote_id, mut edited_ms) = (0, 0);
                         let (mut reactions, mut read_ms) = (Vec::new(), 0);
+                        let mut quote = None;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -385,6 +417,14 @@ impl History {
                                 11 => remote_id = d.u64()?,
                                 12 => edited_ms = d.u64()?,
                                 14 => read_ms = d.u64()?,
+                                15 => {
+                                    if d.array_len()? != 3 {
+                                        return Err(Error::Malformed("quote"));
+                                    }
+                                    let id = d.u64()?;
+                                    let author = fixed_bytes::<32>(d)?;
+                                    quote = Some(Quote::new(id, author, d.str()?));
+                                }
                                 13 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 2 {
@@ -417,6 +457,7 @@ impl History {
                             edited_ms,
                             read_ms,
                             reactions,
+                            quote,
                         });
                     }
                 }
@@ -677,7 +718,14 @@ impl Home {
     ) -> Result<usize> {
         let mut h = self.load_history(identity, c, now_ms)?;
         let before = h.entries.len();
+        let ids: Vec<u64> = h
+            .entries
+            .iter()
+            .filter(|e| pick(e))
+            .map(Entry::message_id)
+            .collect();
         h.entries.retain(|e| !pick(e));
+        h.forget_quotes(&ids);
         let gone = before - h.entries.len();
         if gone > 0 {
             self.save_history(identity, c, &h)?;
@@ -852,6 +900,7 @@ mod tests {
             edited_ms: 0,
             read_ms: 0,
             reactions: Vec::new(),
+            quote: None,
         }
     }
 
@@ -1160,5 +1209,39 @@ mod tests {
             History::decode(&h.encode().unwrap()).unwrap().entries()[0].reactions,
             e.reactions
         );
+    }
+
+    #[test]
+    fn quotes_persist_and_go_with_their_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([1; 32]);
+        let mut original = entry(1, "the plan", Some(100));
+        original.remote_id = 5;
+        let mut reply = entry(3, "yes", None);
+        reply.remote_id = 6;
+        reply.quote = Some(Quote::new(5, [7; 32], "the plan"));
+        let mut other = entry(5, "and this", None);
+        other.remote_id = 8;
+        other.quote = Some(Quote::new(6, [7; 32], "yes"));
+        for e in [original, reply, other] {
+            home.append_history(&id, c, e, 1).unwrap();
+        }
+        let quotes = |now| {
+            home.load_history(&id, c, now)
+                .unwrap()
+                .entries()
+                .iter()
+                .filter_map(|e| e.quote.clone().map(|q| q.text))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(quotes(2), ["the plan", "yes"]);
+        // The original disappears: so does what quotes it.
+        assert_eq!(quotes(200), ["", "yes"]);
+        // Deleting a message blanks its quotes too.
+        home.delete_entries(&id, c, 200, |e| e.remote_id == 6)
+            .unwrap();
+        assert_eq!(quotes(200), [""]);
     }
 }

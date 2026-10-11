@@ -182,3 +182,66 @@ async fn an_owner_adds_its_own_linked_device() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn replies_quote_what_they_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let aid = alice.node.identity();
+    let quotes = |n: &N, conv: ConversationId| -> Vec<Option<(String, [u8; 32])>> {
+        n.node
+            .history(conv)
+            .map(|h| {
+                h.entries()
+                    .iter()
+                    .map(|e| e.quote.as_ref().map(|q| (q.text.clone(), q.author)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // 1:1: Bob answers Alice's question, quoting it.
+    alice.node.send_text(&bid, "lunch?").unwrap();
+    let bconv = bob.node.conversation_for(&aid);
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[1]
+            .node
+            .history(bconv)
+            .is_ok_and(|h| h.entries().len() == 1)
+    })
+    .await;
+    let asked = bob.node.history(bconv).unwrap().entries()[0].message_id();
+    let q = bob.node.quote_of(bconv, asked);
+    bob.node.send_reply(&aid, "yes!", q).unwrap();
+    let aconv = alice.node.conversation_for(&bid);
+    until(&mut [&mut alice, &mut bob], |ns| {
+        quotes(ns[0], aconv).len() == 2
+    })
+    .await;
+    let want = vec![None, Some(("lunch?".to_owned(), *aid.as_bytes()))];
+    assert_eq!(quotes(&alice, aconv), want);
+    assert_eq!(quotes(&bob, bconv), want);
+
+    // A group: Alice quotes Bob's message.
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &aid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[0].in_group(&g)).await;
+    bob.groups.send_text(&bob.node, &g, "ship it?").unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[0].texts(&g) == ["ship it?"]
+    })
+    .await;
+    let gc = ConversationId::Group(g);
+    let id = alice.node.history(gc).unwrap().entries()[0].message_id();
+    let q = alice.node.quote_of(gc, id);
+    alice
+        .groups
+        .send_reply(&alice.node, &g, "shipped", q)
+        .unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[1].texts(&g).len() == 2).await;
+    let want = vec![None, Some(("ship it?".to_owned(), *bid.as_bytes()))];
+    assert_eq!(quotes(&bob, gc), want);
+    assert_eq!(quotes(&alice, gc), want);
+}

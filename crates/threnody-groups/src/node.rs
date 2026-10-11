@@ -15,7 +15,7 @@
 //! message crosses at most one forwarding member.
 
 use threnody_core::history::{ConversationId, Entry, FileNote};
-use threnody_core::message::Clip;
+use threnody_core::message::{Clip, Quote};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::OutgoingFile;
@@ -292,10 +292,22 @@ impl GroupNode {
     /// Sends text to every other member and records it in the group's
     /// history, to be marked as members acknowledge their copies.
     pub fn send_text(&mut self, node: &Node, group: &GroupId, text: &str) -> Result<()> {
+        self.send_reply(node, group, text, None)
+    }
+
+    /// [`Self::send_text`], replying to (quoting) an earlier message.
+    pub fn send_reply(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        text: &str,
+        quote: Option<Quote>,
+    ) -> Result<()> {
         let id = threnody_net::history::local_id();
         let content = Content::Text {
             text: text.to_owned(),
             id,
+            quote,
         };
         self.send(node, group, &content, None, id)
     }
@@ -389,6 +401,10 @@ impl GroupNode {
                 edited_ms: 0,
                 read_ms: 0,
                 reactions: Vec::new(),
+                quote: match content {
+                    Content::Text { quote, .. } => quote.clone(),
+                    _ => None,
+                },
             },
         );
         Ok(())
@@ -427,6 +443,7 @@ impl GroupNode {
                 edited_ms: 0,
                 read_ms: 0,
                 reactions: Vec::new(),
+                quote: None,
             },
         );
     }
@@ -796,6 +813,7 @@ impl GroupNode {
                 from,
                 text,
                 id,
+                quote,
             } => {
                 // What our other devices send to the group is ours too.
                 let ours = node.is_own_device(&from);
@@ -808,6 +826,7 @@ impl GroupNode {
                     false,
                     timer,
                     id,
+                    quote,
                 );
                 Update::Text {
                     group,

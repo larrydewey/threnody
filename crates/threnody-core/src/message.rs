@@ -92,6 +92,30 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_TYPING
     | FEATURE_READ
     | FEATURE_CALLS;
+/// Longest quote snippet, in characters.
+pub const MAX_QUOTE_CHARS: usize = 200;
+
+/// The earlier message a reply quotes: its id, who sent it (a device),
+/// and the start of its text, so the reply reads even where the original
+/// isn't (deleted, expired, or from before we joined).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Quote {
+    pub id: u64,
+    pub author: [u8; 32],
+    pub text: String,
+}
+
+impl Quote {
+    /// A quote with `text` cut to [`MAX_QUOTE_CHARS`].
+    pub fn new(id: u64, author: [u8; 32], text: &str) -> Self {
+        Self {
+            id,
+            author,
+            text: text.chars().take(MAX_QUOTE_CHARS).collect(),
+        }
+    }
+}
+
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -112,6 +136,8 @@ pub enum AppMessage {
         /// The sender's id for this message, so it can later be deleted
         /// for everyone (0 = none).
         id: u64,
+        /// The message this one replies to.
+        quote: Option<Quote>,
     },
     File {
         sent_ms: u64,
@@ -348,10 +374,15 @@ impl AppMessage {
                     body,
                     expires_in_s,
                     id,
+                    quote,
                 } => {
-                    e.map_len(3 + usize::from(expires_in_s.is_some()) + usize::from(*id != 0))?
-                        .u8(0)?
-                        .uint(kind::TEXT)?;
+                    e.map_len(
+                        3 + usize::from(expires_in_s.is_some())
+                            + usize::from(*id != 0)
+                            + 3 * usize::from(quote.is_some()),
+                    )?
+                    .u8(0)?
+                    .uint(kind::TEXT)?;
                     e.u8(1)?.uint(*sent_ms)?;
                     e.u8(2)?.str(body)?;
                     if let Some(x) = expires_in_s {
@@ -359,6 +390,11 @@ impl AppMessage {
                     }
                     if *id != 0 {
                         e.u8(5)?.uint(*id)?;
+                    }
+                    if let Some(q) = quote {
+                        e.u8(10)?.uint(q.id)?;
+                        e.u8(11)?.bytes(&q.author)?;
+                        e.u8(12)?.str(&q.text)?;
                     }
                 }
                 Self::File {
@@ -487,7 +523,9 @@ impl AppMessage {
 
     fn size_hint(&self) -> usize {
         match self {
-            Self::Text { body, .. } => body.len() + 32,
+            Self::Text { body, quote, .. } => {
+                body.len() + quote.as_ref().map_or(0, |q| q.text.len() + 48) + 32
+            }
             Self::File {
                 name,
                 data,
@@ -527,6 +565,7 @@ impl AppMessage {
         let mut conv = None;
         let mut flags = 0;
         let (mut caption, mut album, mut duration) = (None, 0, 0);
+        let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -547,6 +586,9 @@ impl AppMessage {
                 7 => caption = Some(d.str()?.to_owned()),
                 8 => album = d.u64()?,
                 9 => duration = d.u32()?,
+                10 => quote_id = d.u64()?,
+                11 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
+                12 => quote_text = Some(d.str()?.to_owned()),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -633,6 +675,10 @@ impl AppMessage {
                 body: required(text, "text body")?,
                 expires_in_s: expiry,
                 id: five.unwrap_or(0),
+                // A quote names a message; one that doesn't is dropped.
+                quote: quote_author
+                    .filter(|_| quote_id != 0)
+                    .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
             },
             kind::FILE => {
                 let data = required(bytes, "file data")?;
@@ -749,6 +795,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quotes_are_cut_short_and_need_an_id() {
+        let long = "x".repeat(MAX_QUOTE_CHARS * 2);
+        assert_eq!(
+            Quote::new(1, [0; 32], &long).text.chars().count(),
+            MAX_QUOTE_CHARS
+        );
+        let m = AppMessage::Text {
+            sent_ms: 1,
+            body: "hi".into(),
+            expires_in_s: None,
+            id: 2,
+            quote: Some(Quote::new(0, [1; 32], "nothing")),
+        };
+        let AppMessage::Text { quote, .. } = AppMessage::decode(&m.encode().unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(quote, None, "a quote without an id is dropped");
+    }
+
+    #[test]
     fn messages_round_trip() {
         for m in [
             AppMessage::Hello { features: 0 },
@@ -779,6 +846,13 @@ mod tests {
                     clip: None,
                 }),
             },
+            AppMessage::Text {
+                sent_ms: 3,
+                body: "agreed".into(),
+                expires_in_s: None,
+                id: 9,
+                quote: Some(Quote::new(5, [4; 32], "shall we?")),
+            },
             AppMessage::Ack(vec![]),
             AppMessage::Ack(vec![1, u64::MAX]),
             AppMessage::Delete {
@@ -796,12 +870,14 @@ mod tests {
                 body: "héllo".into(),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             },
             AppMessage::Text {
                 sent_ms: 43,
                 body: "gone soon".into(),
                 expires_in_s: Some(30),
                 id: 0,
+                quote: None,
             },
             AppMessage::File {
                 sent_ms: 1,

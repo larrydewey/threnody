@@ -148,6 +148,18 @@ pub struct HistoryEntry {
     pub delivered_to: u32,
     /// Reactions, one per emoji in the order first added.
     pub reactions: Vec<ReactionInfo>,
+    /// The message this one replies to.
+    pub quote: Option<QuoteInfo>,
+}
+
+/// What a reply quotes: the message's id (as [`HistoryEntry::id`]), its
+/// sender's device, and the start of its text (empty once the message is
+/// deleted or has disappeared).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct QuoteInfo {
+    pub id: u64,
+    pub author: String,
+    pub text: String,
 }
 
 /// A message found by `search_all`: where it is, and the message. For a
@@ -651,6 +663,13 @@ fn history_entries(entries: &[threnody_core::history::Entry], me: [u8; 32]) -> V
             edited: e.edited_ms != 0,
             recipients: e.recipients,
             delivered_to: u32::try_from(e.delivered_to.len()).unwrap_or(u32::MAX),
+            quote: e.quote.as_ref().map(|q| QuoteInfo {
+                id: q.id,
+                author: PublicIdentity::from_bytes(&q.author)
+                    .map(|d| fp(&d))
+                    .unwrap_or_default(),
+                text: q.text.clone(),
+            }),
         })
         .collect()
 }
@@ -1262,6 +1281,18 @@ PersistentKeepalive = 25\n",
         self.try_reach(&p);
         let _guard = self.rt.enter();
         let r = self.node.send_text(&p, &text).map_err(fail)?;
+        Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
+    }
+
+    /// `send_text`, replying to message `quote_id` (a [`HistoryEntry::id`])
+    /// in the chat with `peer`, which the reply quotes.
+    pub fn send_reply(&self, peer: String, text: String, quote_id: u64) -> Result<u32> {
+        let p = self.resolve(&peer)?;
+        let quote = self.node.quote_of(self.node.conversation_for(&p), quote_id);
+        self.node.seek(&p);
+        self.try_reach(&p);
+        let _guard = self.rt.enter();
+        let r = self.node.send_reply(&p, &text, quote).map_err(fail)?;
         Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
     }
 

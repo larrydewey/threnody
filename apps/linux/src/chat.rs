@@ -88,6 +88,10 @@ pub struct ChatView {
     typing_sent_at: Cell<Option<std::time::Instant>>,
     /// Hides the peer's "…" if its "stopped" never comes.
     peer_quiet: RefCell<Option<glib::SourceId>>,
+    /// Above the composer while replying: what the reply quotes.
+    reply_bar: gtk::Box,
+    /// The message the next one replies to.
+    reply_to: RefCell<Option<HistoryEntry>>,
     /// Weak reference to self for creating weak pointers in callbacks.
     weak_self: Weak<ChatView>,
 }
@@ -301,6 +305,15 @@ impl ChatView {
         root.add_top_bar(&header);
         root.add_top_bar(&search_bar);
         root.set_content(Some(&body));
+        let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reply_bar.add_css_class("reply-bar");
+        reply_bar.set_visible(false);
+        root.add_bottom_bar(
+            &adw::Clamp::builder()
+                .maximum_size(860)
+                .child(&reply_bar)
+                .build(),
+        );
         root.add_bottom_bar(&composer_clamp);
 
         let this = Rc::new_cyclic(|weak_self| Self {
@@ -339,6 +352,8 @@ impl ChatView {
             sent_read: RefCell::new(HashSet::new()),
             typing_timeout: RefCell::new(None),
             sending_typing: Cell::new(false),
+            reply_bar,
+            reply_to: RefCell::new(None),
             weak_self: weak_self.clone(),
             peer_quiet: RefCell::new(None),
             typing_sent_at: Cell::new(None),
@@ -1037,6 +1052,9 @@ impl ChatView {
             let l = ui::label(&s, &["caption-heading", "accent"]);
             bubble.append(&l);
         }
+        if let Some(q) = &e.quote {
+            bubble.append(&self.quote_view(q));
+        }
         if let Some(f) = &e.file {
             bubble.append(&self.file_view(e, f));
             if !e.text.is_empty() {
@@ -1559,6 +1577,17 @@ impl ChatView {
             });
             b.append(&btn);
         };
+        if e.id != 0 {
+            let (weak, entry) = (self.weak_self.clone(), e.clone());
+            item(
+                "Reply",
+                Box::new(move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.reply(Some(entry.clone()));
+                    }
+                }),
+            );
+        }
         if e.file.is_none() && !e.text.is_empty() {
             let (text, a) = (e.text.clone(), anchor.clone());
             item("Copy text", Box::new(move || a.clipboard().set_text(&text)));
@@ -1597,6 +1626,97 @@ impl ChatView {
         }
         pop.set_child(Some(&b));
         pop.popup();
+    }
+
+    /// Who sent a quoted message, by device: us, or their name.
+    fn quote_author(&self, author: &str) -> String {
+        match self.node() {
+            Some(n) if n.device_fingerprint() == author => "You".into(),
+            Some(n) => Core::name_of(&n, author),
+            None => core::short(author),
+        }
+    }
+
+    /// What a reply quotes, above its text; clicking it shows the original.
+    fn quote_view(&self, q: &threnody_ffi::QuoteInfo) -> gtk::Widget {
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        b.add_css_class("quote");
+        b.append(&ui::label(
+            &self.quote_author(&q.author),
+            &["caption-heading", "accent"],
+        ));
+        let text = if q.text.is_empty() {
+            ui::label("Original message not found", &["caption", "dim-label"])
+        } else {
+            ui::label(&q.text, &["caption"])
+        };
+        text.set_lines(3);
+        text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        text.set_max_width_chars(50);
+        b.append(&text);
+        let button = gtk::Button::builder().child(&b).build();
+        button.add_css_class("flat");
+        button.add_css_class("quote-button");
+        button.set_tooltip_text(Some("Show the original"));
+        let (weak, id) = (self.weak_self.clone(), q.id);
+        button.connect_clicked(move |_| {
+            let Some(t) = weak.upgrade() else { return };
+            let key = t
+                .entries
+                .borrow()
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| (e.at_ms, e.device.clone()));
+            match key {
+                Some(k) => t.jump_to(k),
+                None => t.toast("The original isn't loaded here."),
+            }
+        });
+        button.upcast()
+    }
+
+    /// Starts (or with `None`, cancels) a reply to `e`.
+    fn reply(self: &Rc<Self>, e: Option<HistoryEntry>) {
+        while let Some(c) = self.reply_bar.first_child() {
+            self.reply_bar.remove(&c);
+        }
+        self.reply_bar.set_visible(e.is_some());
+        if let Some(e) = &e {
+            let who = if e.outgoing {
+                "yourself".to_owned()
+            } else {
+                self.quote_author(&e.device)
+            };
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            text.set_hexpand(true);
+            text.append(&ui::label(
+                &format!("Replying to {who}"),
+                &["caption-heading", "accent"],
+            ));
+            let snippet = if e.text.is_empty() {
+                e.file.as_ref().map(|f| f.name.clone()).unwrap_or_default()
+            } else {
+                e.text.clone()
+            };
+            let l = ui::label(&snippet, &["caption", "dim-label"]);
+            l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            text.append(&l);
+            self.reply_bar.append(&text);
+            let close = gtk::Button::from_icon_name("window-close-symbolic");
+            close.add_css_class("flat");
+            close.add_css_class("circular");
+            close.set_valign(gtk::Align::Center);
+            close.set_tooltip_text(Some("Cancel the reply"));
+            let weak = self.weak_self.clone();
+            close.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.reply(None);
+                }
+            });
+            self.reply_bar.append(&close);
+            self.input.grab_focus();
+        }
+        *self.reply_to.borrow_mut() = e;
     }
 
     fn react(self: &Rc<Self>, e: &HistoryEntry, emoji: String, add: bool) {
@@ -1866,16 +1986,26 @@ impl ChatView {
         // Clearing the composer also says we stopped typing.
         buf.set_text("");
         let (group, device) = (self.group(), self.device());
+        let quote = self.reply_to.borrow().as_ref().map_or(0, |e| e.id);
+        self.reply(None);
         let weak = self.weak_self.clone();
         let sent = text.clone();
         bg(
             move || match group {
+                Some(g) if quote != 0 => node
+                    .send_group_reply(g, sent, quote)
+                    .map(|()| None)
+                    .map_err(|e| e.to_string()),
                 Some(g) => node
                     .send_group_text(g, sent)
                     .map(|()| None)
                     .map_err(|e| e.to_string()),
                 // It reaches the contact directly, by relay, or sealed for mailboxes.
-                None => match node.send_text(device, sent) {
+                None => match if quote != 0 {
+                    node.send_reply(device, sent, quote)
+                } else {
+                    node.send_text(device, sent)
+                } {
                     Ok(0) => Ok(Some(
                         "Not delivered: they're offline and no mutual contact can hold it.",
                     )),

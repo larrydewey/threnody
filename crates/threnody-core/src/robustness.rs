@@ -64,6 +64,7 @@ fn parsers_survive_mutated_input() {
             body: "x".into(),
             expires_in_s: None,
             id: 0,
+            quote: None,
         })
         .unwrap();
     let app = AppMessage::File {
@@ -116,6 +117,7 @@ fn parsers_survive_mutated_input() {
             body: "x".into(),
             expires_in_s: None,
             id: 0,
+            quote: None,
         }
     );
 }

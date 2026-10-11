@@ -287,6 +287,19 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
+    /// `send_group_text`, replying to message `quote_id` (a
+    /// [`crate::HistoryEntry::id`]) in the group, which the reply quotes.
+    pub fn send_group_reply(&self, group: String, text: String, quote_id: u64) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let quote = self
+            .node
+            .quote_of(threnody_core::history::ConversationId::Group(g), quote_id);
+        let _guard = self.rt.enter();
+        self.group_node()
+            .send_reply(&self.node, &g, &text, quote)
+            .map_err(fail)
+    }
+
     /// Sends a file to every other member, recorded in the group's history
     /// with `location` (where it is on this device).
     pub fn send_group_file(

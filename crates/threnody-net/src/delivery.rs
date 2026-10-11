@@ -271,6 +271,7 @@ mod tests {
             body: s.into(),
             expires_in_s: None,
             id: 0,
+            quote: None,
         }
     }
 
