@@ -903,7 +903,13 @@ class ChatActivity : Activity() {
         banner.addView(row, matchWrap)
     }
 
+    /** What the chat last drew, so a refresh that changes nothing leaves it be. */
+    private var lastShown: Pair<List<Item>, Map<String, String>>? = null
+
     private fun show(items: List<Item>, names: Map<String, String>) {
+        // Redrawing reloads photos and stills, which flickers.
+        if (lastShown == items to names) return
+        lastShown = items to names
         val atEnd = !scroll.canScrollVertically(1)
         messages.removeAllViews()
         bubbles.clear()

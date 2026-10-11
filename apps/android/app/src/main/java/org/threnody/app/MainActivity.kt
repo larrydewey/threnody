@@ -146,6 +146,9 @@ class MainActivity : Activity() {
         enum class Section { Requests, Invites, Contacts, Groups, Anonymous }
     }
 
+    /** What the list last drew (see [shown]); null after a search or before the first draw. */
+    private var lastShown: List<Any?>? = null
+
     /** A refresh is queued and hasn't started yet. */
     private val refreshQueued = java.util.concurrent.atomic.AtomicBoolean(false)
     /** Counts refreshes, so only the newest one is drawn. */
@@ -332,6 +335,7 @@ class MainActivity : Activity() {
 
     private fun showFound(found: Pair<List<Row>, List<Row>>) {
         val (named, messages) = found
+        lastShown = null
         list.removeAllViews()
         list.layoutAnimation = null
         emptyStateContainer.visibility = View.GONE
@@ -362,7 +366,17 @@ class MainActivity : Activity() {
         else -> "Not approved yet"
     }
 
+    /** What a list of rows looks like, without their actions. */
+    private fun shown(rows: List<Row>): List<Any?> = rows.map {
+        listOf(it.title, it.avatarKey, it.preview.toString(), it.atMs, it.connected, it.section, it.isSectionHeader, it.sectionTitle, it.manage != null)
+    }
+
     private fun show(rows: List<Row>) {
+        // Most events change nothing here: redrawing would flicker.
+        val now = shown(rows)
+        if (now == lastShown) return
+        val first = lastShown == null
+        lastShown = now
         list.removeAllViews()
 
         val hasContent = rows.any { !it.isSectionHeader }
@@ -371,6 +385,12 @@ class MainActivity : Activity() {
 
         if (!hasContent) return
 
+        if (!first) {
+            list.layoutAnimation = null
+            addRows(rows)
+            return
+        }
+
         // Apply staggered entrance animation
         val animation = AnimationUtils.loadAnimation(this, android.R.anim.fade_in)
         animation.duration = Design.durationFast.toLong()
@@ -378,7 +398,11 @@ class MainActivity : Activity() {
         controller.delay = 0.1f
         controller.order = LayoutAnimationController.ORDER_NORMAL
         list.layoutAnimation = controller
+        addRows(rows)
+        list.startLayoutAnimation()
+    }
 
+    private fun addRows(rows: List<Row>) {
         var lastSection: Row.Section? = null
         for (r in rows) {
             // Add divider between sections
@@ -392,8 +416,6 @@ class MainActivity : Activity() {
                 list.addView(row(r))
             }
         }
-
-        list.startLayoutAnimation()
     }
 
     private fun addSectionHeader(title: String) {
