@@ -36,6 +36,7 @@ import java.util.Date
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupInfo
+import uniffi.threnody_ffi.QuoteInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
@@ -73,7 +74,13 @@ class ChatActivity : Activity() {
     /** The contact's "typing" went quiet (its "stopped" may be lost). */
     private val peerStopped = Runnable { showTyping(false) }
     /** Messages being sent, shown until history has them. */
-    private val pending = mutableListOf<String>()
+    /** Messages being sent: their text, and what they quote. */
+    private val pending = mutableListOf<Pair<String, QuoteInfo?>>()
+    /** The message the next one replies to, shown above the compose bar. */
+    private var replyTo: HistoryEntry? = null
+    private lateinit var replyBar: LinearLayout
+    /** The messages on screen, so a quote can jump to what it quotes. */
+    private var onScreen: List<HistoryEntry> = emptyList()
     private var unsubscribe: (() -> Unit)? = null
     private var myDevice = ""
     private val pickFileLauncher = ActivityResultRegistry.get(this)
@@ -187,9 +194,17 @@ class ChatActivity : Activity() {
             addView(messages, MATCH_PARENT, WRAP_CONTENT)
         }
         composeBar = composeBar()
+        replyBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(color(R.color.bar))
+            setPadding(dp(12), dp(6), dp(4), 0)
+            visibility = View.GONE
+        }
         root.addView(bar, matchWrap)
         root.addView(banner, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(replyBar, matchWrap)
         root.addView(composeBar, matchWrap)
         setContentView(root)
         fitSystemBars(root, bar, composeBar)
@@ -747,7 +762,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = it, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList()), sending = true) }
+            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         // Credential offers and requests from this contact, waiting for an answer.
@@ -921,6 +936,7 @@ class ChatActivity : Activity() {
         val y = scroll.scrollY
         messages.removeAllViews()
         bubbles.clear()
+        onScreen = items.map { it.entry }
         texts.clear()
         voiceViews.clear()
         if (items.isEmpty()) {
@@ -1181,6 +1197,7 @@ class ChatActivity : Activity() {
         if (sender != null) {
             body.addView(label(sender, 13f, R.color.accent).apply { setTypeface(typeface, Typeface.BOLD) })
         }
+        e.quote?.let { body.addView(quoteView(it, fg), matchWrap) }
         val file = e.file
         val time = if (item.sending) "sending…" else time(e.atMs.toLong())
         val pictures = run.all { it.entry.file?.let { f -> Media.isImage(f.name) } == true }
@@ -1275,11 +1292,87 @@ class ChatActivity : Activity() {
             }
             all(body)
         }
-        return LinearLayout(this).apply {
+        val row = LinearLayout(this).apply {
             gravity = if (outgoing) Gravity.END else Gravity.START
             setPadding(if (outgoing) dp(48) else 0, dp(3), if (outgoing) 0 else dp(48), dp(3))
             addView(body, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
+        // Swiping a message to the right replies to it.
+        return if (item.sending) row else SwipeToReply(this, row, color(R.color.muted)) { replyingTo(e) }
+    }
+
+    /** Who sent a quoted message, by device: us, or their name. */
+    private fun quoteAuthor(author: String) =
+        if (author == myDevice) "You" else Threnody.nameOf(node, author)
+
+    /** What a reply quotes, above its text; tapping it shows the original. */
+    private fun quoteView(q: QuoteInfo, fg: Int): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = rounded(androidx.core.graphics.ColorUtils.setAlphaComponent(fg, 0x22), dp(8).toFloat())
+        setPadding(dp(10), dp(6), dp(10), dp(6))
+        layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(4) }
+        addView(TextView(this@ChatActivity).apply {
+            text = quoteAuthor(q.author)
+            textSize = 13f
+            setTextColor(if (fg == color(R.color.text)) color(R.color.accent) else fg)
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        addView(TextView(this@ChatActivity).apply {
+            text = q.text.ifEmpty { "Original message not found" }
+            textSize = 14f
+            setTextColor(fg)
+            alpha = if (q.text.isEmpty()) 0.6f else 0.85f
+            if (q.text.isEmpty()) setTypeface(typeface, Typeface.ITALIC)
+            maxLines = 3
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        })
+        contentDescription = "Reply to ${quoteAuthor(q.author)}: ${q.text}"
+        setOnClickListener {
+            val original = onScreen.lastOrNull { quotes(q, it) }
+            if (original != null) reveal(mark(original))
+            else Toast.makeText(this@ChatActivity, "The original isn't loaded here.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** What a quote of `e` shows: its text, or a file's name. */
+    private fun snippet(e: HistoryEntry) = e.text.ifEmpty { e.file?.name ?: "" }
+
+    /** Whether `q` quotes `e`: by id, or for a message too old to have one, by sender and text. */
+    private fun quotes(q: QuoteInfo, e: HistoryEntry) =
+        if (q.id != 0uL) e.id == q.id
+        else e.device == q.author && q.text.isNotEmpty() && snippet(e).startsWith(q.text)
+
+    /** Starts (or with null, cancels) a reply to `e`. */
+    private fun replyingTo(e: HistoryEntry?) {
+        replyTo = e
+        replyBar.removeAllViews()
+        if (e == null) {
+            replyBar.visibility = View.GONE
+            return
+        }
+        val snippet = snippet(e)
+        replyBar.addView(View(this).apply { setBackgroundColor(color(R.color.accent)) },
+            LinearLayout.LayoutParams(dp(3), MATCH_PARENT).apply { marginEnd = dp(10) })
+        replyBar.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label("Replying to ${if (e.outgoing) "yourself" else quoteAuthor(e.device)}", 13f, R.color.accent)
+                .apply { setTypeface(typeface, Typeface.BOLD) })
+            addView(label(snippet, 14f, R.color.muted).apply {
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        replyBar.addView(ImageButton(this).apply {
+            setImageResource(R.drawable.ic_close)
+            imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.muted))
+            contentDescription = "Cancel the reply"
+            background = ripple(borderless = true)
+            setOnClickListener { replyingTo(null) }
+        }, LinearLayout.LayoutParams(dp(Design.touchTargetMin), dp(Design.touchTargetMin)))
+        replyBar.visibility = View.VISIBLE
+        compose.requestFocus()
+        getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+            ?.showSoftInput(compose, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
     }
 
     /** Delete for me, or (our own 1:1 messages) for everyone; an album goes whole. */
@@ -1289,6 +1382,7 @@ class ChatActivity : Activity() {
         val mine = g == null && e.outgoing && e.device == myDevice && entries.all { it.id != 0uL }
         val canEdit = mine && e.file == null
         val options = buildList {
+            add("Reply")
             // Text isn't selectable in the bubble (it would take the long
             // press), so copying is offered here.
             if (e.text.isNotEmpty()) {
@@ -1301,6 +1395,7 @@ class ChatActivity : Activity() {
         }
         fun pick(option: String) {
             if (option == "Edit") return editMessage(e)
+            if (option == "Reply") return replyingTo(e)
             if (option == "Copy text") {
                 getSystemService(android.content.ClipboardManager::class.java)
                     ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
@@ -1405,25 +1500,29 @@ class ChatActivity : Activity() {
     private fun send() {
         val text = compose.text.toString().trim()
         if (text.isEmpty() || !::node.isInitialized) return
+        val to = replyTo
+        val quote = to?.let { QuoteInfo(it.id, it.device, snippet(it).take(MAX_QUOTE_CHARS)) }
+        val item = text to quote
+        replyingTo(null)
         typingHandler.removeCallbacks(stopTyping)
         compose.setText("") // also says we stopped typing
         Threnody.touch()
-        synchronized(pending) { pending.add(text) }
+        synchronized(pending) { pending.add(item) }
         refreshSoon()
         Threading.background {
             val g = group
             val error = try {
                 if (g != null) {
-                    node.sendGroupText(g, text)
+                    if (to != null) node.sendGroupReply(g, text, to.atMs, to.device) else node.sendGroupText(g, text)
                     null
-                } else if (node.sendText(device, text) == 0u) {
+                } else if ((if (to != null) node.sendReply(device, text, to.atMs, to.device) else node.sendText(device, text)) == 0u) {
                     // Reaches the contact directly, by relay, or sealed for mailboxes.
                     "Not delivered: they're offline and no mutual contact can hold it."
                 } else null
             } catch (e: Exception) {
                 "Couldn't send: ${e.message}"
             }
-            synchronized(pending) { pending.remove(text) }
+            synchronized(pending) { pending.remove(item) }
             refresh()
             if (error != null) runOnUiThread {
                 Toast.makeText(this, error, Toast.LENGTH_LONG).show()
@@ -2134,6 +2233,8 @@ class ChatActivity : Activity() {
     }
 
     companion object {
+        /** Longest quote snippet, as the node cuts it. */
+        const val MAX_QUOTE_CHARS = 200
         const val KEY = "key"
         const val DEVICE = "device"
         const val GROUP = "group"

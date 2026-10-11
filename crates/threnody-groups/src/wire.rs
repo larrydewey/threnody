@@ -12,7 +12,7 @@
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
-use threnody_core::message::Clip;
+use threnody_core::message::{Clip, Quote};
 use threnody_core::{Error, Result};
 
 /// Group ids are 16 random bytes.
@@ -187,7 +187,8 @@ impl GroupWire {
 ///         / 0xFF || { 0: kind uint, ? 1: text, file name or emoji tstr,
 ///                     ? 2: data bstr, ? 3: flags uint, ? 4: caption tstr,
 ///                     ? 5: album uint, ? 6: message id uint,
-///                     ? 7: clip duration_ms uint }
+///                     ? 7: clip duration_ms uint, ? 8: quoted id uint,
+///                     ? 9: quoted author bstr, ? 10: quoted text tstr }
 /// kind: 1 text, 2 file, 3 reaction
 /// flags: 1 sensitive, 2 voice message, 4 video message (file);
 ///        1 remove (reaction)
@@ -201,6 +202,8 @@ pub enum Content {
     Text {
         text: String,
         id: u64,
+        /// The message this one replies to.
+        quote: Option<Quote>,
     },
     File {
         name: String,
@@ -214,11 +217,7 @@ pub enum Content {
     },
     /// Add (or with `add` false, take away) the sender's `emoji` on
     /// message `id`.
-    React {
-        id: u64,
-        emoji: String,
-        add: bool,
-    },
+    React { id: u64, emoji: String, add: bool },
 }
 
 const TAGGED: u8 = 0xFF;
@@ -237,8 +236,12 @@ impl Content {
             u32,
         ) = match self {
             // Without an id, exactly as the first versions sent it.
-            Self::Text { text, id: 0 } => return Ok(text.as_bytes().to_vec()),
-            Self::Text { text, id } => (1, text, None, 0, "", 0, *id, 0),
+            Self::Text {
+                text,
+                id: 0,
+                quote: None,
+            } => return Ok(text.as_bytes().to_vec()),
+            Self::Text { text, id, .. } => (1, text, None, 0, "", 0, *id, 0),
             Self::File {
                 name,
                 data,
@@ -259,7 +262,15 @@ impl Content {
             ),
             Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id, 0),
         };
-        let size = text.len() + data.map_or(0, <[u8]>::len) + caption.len() + 48;
+        let quote = match self {
+            Self::Text { quote, .. } => quote.as_ref(),
+            _ => None,
+        };
+        let size = text.len()
+            + data.map_or(0, <[u8]>::len)
+            + caption.len()
+            + quote.map_or(0, |q| q.text.len() + 48)
+            + 48;
         let body = cbor::to_vec(size, |e| {
             e.map_len(
                 2 + usize::from(data.is_some())
@@ -267,7 +278,8 @@ impl Content {
                     + usize::from(!caption.is_empty())
                     + usize::from(album != 0)
                     + usize::from(id != 0)
-                    + usize::from(duration != 0),
+                    + usize::from(duration != 0)
+                    + 3 * usize::from(quote.is_some()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.str(text)?;
@@ -289,6 +301,11 @@ impl Content {
             if duration != 0 {
                 e.u8(7)?.u32(duration)?;
             }
+            if let Some(q) = quote {
+                e.u8(8)?.u64(q.id)?;
+                e.u8(9)?.bytes(&q.author)?;
+                e.u8(10)?.str(&q.text)?;
+            }
             Ok(())
         })?;
         let mut out = Vec::with_capacity(body.len() + 1);
@@ -302,12 +319,14 @@ impl Content {
             return Ok(Self::Text {
                 text: String::from_utf8_lossy(b).into_owned(),
                 id: 0,
+                quote: None,
             });
         };
         let mut dec = Decoder::new(rest);
         let (mut kind, mut text, mut data) = (None, None, None);
         let (mut flags, mut caption, mut album, mut id) = (0, String::new(), 0, 0);
         let mut duration = 0;
+        let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -318,6 +337,9 @@ impl Content {
                 5 => album = d.u64()?,
                 6 => id = d.u64()?,
                 7 => duration = d.u32()?,
+                8 => quote_id = d.u64()?,
+                9 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
+                10 => quote_text = Some(d.str()?.to_owned()),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -327,6 +349,8 @@ impl Content {
             1 => Self::Text {
                 text: text.unwrap_or_default(),
                 id,
+                quote: quote_author
+                    .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
             },
             2 => Self::File {
                 name: required(text, "file name")?,
@@ -363,14 +387,22 @@ mod tests {
             Content::Text {
                 text: "hello".into(),
                 id: 0,
+                quote: None,
             },
             Content::Text {
                 text: String::new(),
                 id: 0,
+                quote: None,
             },
             Content::Text {
                 text: "with an id".into(),
                 id: 42,
+                quote: None,
+            },
+            Content::Text {
+                text: "a reply".into(),
+                id: 43,
+                quote: Some(Quote::new(42, [3; 32], "with an id")),
             },
             Content::React {
                 id: 42,
@@ -419,7 +451,8 @@ mod tests {
             Content::decode("hi ✓".as_bytes()).unwrap(),
             Content::Text {
                 text: "hi ✓".into(),
-                id: 0
+                id: 0,
+                quote: None,
             }
         );
         // A tagged text, as a later sender might write it.
@@ -428,7 +461,8 @@ mod tests {
             Content::decode(&tagged).unwrap(),
             Content::Text {
                 text: "ok".into(),
-                id: 0
+                id: 0,
+                quote: None,
             }
         );
         assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());

@@ -66,6 +66,7 @@ async fn chat_and_mutual_approval_over_tcp() {
                 body: "hi bob".into(),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             },
         )
         .unwrap();
@@ -83,6 +84,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             body: "hi bob".into(),
             expires_in_s: None,
             id: 0,
+            quote: None,
         }
     );
 
@@ -93,6 +95,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             body: "hi alice".into(),
             expires_in_s: None,
             id: 0,
+            quote: None,
         },
     )
     .unwrap();
@@ -172,6 +175,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
                 body: "steady".into(),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             },
         )
         .unwrap();
@@ -186,6 +190,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
             body: "steady".into(),
             expires_in_s: None,
             id: 0,
+            quote: None,
         }
     );
 }
@@ -203,6 +208,7 @@ async fn cover_traffic_can_be_switched_on_and_off_live() {
         body: s.into(),
         expires_in_s: None,
         id: 0,
+        quote: None,
     };
     for (rate, body) in [
         (Some(Duration::from_millis(20)), "at a constant rate"),
@@ -291,6 +297,7 @@ async fn no_tunnel_without_mutual_approval() {
                 body: "sync".into(),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             },
         )
         .unwrap();
@@ -465,6 +472,7 @@ async fn sessions_run_over_any_byte_stream() {
                 body: "over a pipe".into(),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             },
         )
         .unwrap();

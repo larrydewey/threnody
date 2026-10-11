@@ -74,6 +74,7 @@ Type a line to send it to the current peer. Commands:
   /requests   /accept <peer>   /block <peer>   /delete <peer>   message requests
   /del <n> [all]                        delete message n of the last /history (all: for everyone)
   /edit <n> <text>                      edit your message n of the last /history
+  /reply <n> <text>                     reply to message n of the last /history, quoting it
   /react <n> <emoji> [off]              react to message n of the last /history (again to take it back)
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
@@ -419,7 +420,12 @@ impl Ui {
             None => self.name(&peer),
         };
         match msg {
-            AppMessage::Text { body, .. } => println!("<{who}> {body}"),
+            AppMessage::Text { body, quote, .. } => {
+                if let Some(q) = quote {
+                    println!("<{who}> {}", quoted(&q, &|d| self.name(d)));
+                }
+                println!("<{who}> {body}");
+            }
             AppMessage::File {
                 name,
                 data,
@@ -606,6 +612,9 @@ impl Ui {
                     })
                     .collect();
                 mark.push_str(&format!("  [{}]", shown.join(" ")));
+            }
+            if let Some(q) = &e.quote {
+                print!("  {}\n   ", quoted(q, &|d| self.name(d)));
             }
             match &e.file {
                 Some(f) => println!(
@@ -1512,6 +1521,20 @@ impl Ui {
                 }
                 println!("* {} {emoji}", if add { "reacted" } else { "took back" });
             }
+            "reply" => {
+                let (n, body) = arg
+                    .and_then(|a| a.split_once(' '))
+                    .ok_or_else(|| anyhow!("usage: /reply <n> <text> (n from /history)"))?;
+                let n: usize = n.parse().map_err(|_| anyhow!("usage: /reply <n> <text>"))?;
+                let (peer, shown) = self.shown.borrow().clone();
+                let peer =
+                    peer.ok_or_else(|| anyhow!("run /history first; /reply uses its numbers"))?;
+                let e = shown
+                    .get(n.wrapping_sub(1))
+                    .ok_or_else(|| anyhow!("no message {n} in the last /history"))?;
+                let quote = threnody_core::message::Quote::of(e);
+                self.node.send_reply(&peer, body.trim(), Some(quote))?;
+            }
             "edit" => {
                 let (n, body) = arg
                     .and_then(|a| a.split_once(' '))
@@ -1943,6 +1966,20 @@ impl Ui {
                 let node = self.node.clone();
                 self.groups.list(&|p: &PublicIdentity| name_of(&node, p));
             }
+            "ghistory" => {
+                let node = self.node.clone();
+                self.groups.history(
+                    &self.node,
+                    &|p: &PublicIdentity| name_of(&node, p),
+                    arg.ok_or_else(|| anyhow!("usage: /ghistory <group> [count]"))?,
+                )?;
+            }
+            "gr" => {
+                self.groups.reply(
+                    &self.node,
+                    arg.ok_or_else(|| anyhow!("usage: /gr <group> <n> <text>"))?,
+                )?;
+            }
             "g" => {
                 self.groups.say(
                     &self.node,
@@ -2325,7 +2362,7 @@ fn reachable(listen: std::net::SocketAddr) -> std::net::SocketAddr {
 }
 
 /// `HH:MM` in local time, with the date if it isn't today.
-fn clock(ms: u64) -> String {
+pub(crate) fn clock(ms: u64) -> String {
     let tz = jiff::tz::TimeZone::system();
     let Ok(t) = jiff::Timestamp::from_millisecond(i64::try_from(ms).unwrap_or(i64::MAX)) else {
         return "?".into();
@@ -2400,4 +2437,17 @@ fn fmt_time(ms: u64) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+/// A quote as a line above the reply: `> who: text`.
+pub(crate) fn quoted(
+    q: &threnody_core::message::Quote,
+    name: &dyn Fn(&PublicIdentity) -> String,
+) -> String {
+    let who = PublicIdentity::from_bytes(&q.author).map_or_else(|_| "?".into(), |d| name(&d));
+    if q.text.is_empty() {
+        format!("> {who}: (message gone)")
+    } else {
+        format!("> {who}: {}", q.text)
+    }
 }

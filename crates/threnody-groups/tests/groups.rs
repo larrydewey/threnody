@@ -123,7 +123,8 @@ fn create_invite_chat_and_remove() {
             group: g,
             from: pb,
             text: "hello group".into(),
-            id: 0
+            id: 0,
+            quote: None,
         }));
     }
 
@@ -156,7 +157,8 @@ fn create_invite_chat_and_remove() {
         group: g,
         from: pa,
         text: "after".into(),
-        id: 0
+        id: 0,
+        quote: None,
     }));
 }
 
@@ -270,7 +272,8 @@ fn groups_survive_export_and_restore() {
         group: g,
         from: pb,
         text: "still here".into(),
-        id: 0
+        id: 0,
+        quote: None,
     }));
     let (_, name, owner, members) = net.node(&pb).list().pop().unwrap();
     assert_eq!((name.as_str(), owner, members.len()), ("persist", pa, 2));
@@ -319,7 +322,8 @@ fn members_forward_messages_for_each_other() {
         group: g,
         from: pc,
         text: "via alice".into(),
-        id: 0
+        id: 0,
+        quote: None,
     }));
 
     // Only members forward, only to members, and never to themselves.

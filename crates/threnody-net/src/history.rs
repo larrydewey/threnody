@@ -6,7 +6,7 @@ use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Quer
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
-    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
+    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING, Quote,
 };
 
 use crate::delivery::Tag;
@@ -633,6 +633,23 @@ impl Node {
     /// connected, sealed for mailboxes otherwise), applying and recording
     /// the conversation's disappearing-message timer.
     pub fn send_text(&self, peer: &PublicIdentity, body: &str) -> Result<SendReport> {
+        self.send_reply(peer, body, None)
+    }
+
+    /// A quote of the message in `conv` that `pick` chooses (the newest
+    /// such), to reply to it with; `None` if there's none.
+    pub fn quote_of(&self, conv: ConversationId, pick: impl Fn(&Entry) -> bool) -> Option<Quote> {
+        let h = self.history(conv).ok()?;
+        h.entries().iter().rev().find(|e| pick(e)).map(Quote::of)
+    }
+
+    /// [`Node::send_text`], replying to (quoting) an earlier message.
+    pub fn send_reply(
+        &self,
+        peer: &PublicIdentity,
+        body: &str,
+        quote: Option<Quote>,
+    ) -> Result<SendReport> {
         // Writing to someone accepts them.
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
@@ -644,6 +661,7 @@ impl Node {
             body: body.to_owned(),
             expires_in_s: timer,
             id: local_id,
+            quote: quote.clone(),
         };
         let devices: Vec<PublicIdentity> = match self.account_of(peer) {
             Some(a) if !self.is_own_device(peer) => {
@@ -689,6 +707,7 @@ impl Node {
                 edited_ms: 0,
                 read_ms: 0,
                 reactions: Vec::new(),
+                quote,
             },
         );
         Ok(r)
@@ -910,7 +929,7 @@ impl Node {
         offline: bool,
         timer: Option<u32>,
     ) {
-        self.record_with_id(conv, device, outgoing, text, offline, timer, 0);
+        self.record_with_id(conv, device, outgoing, text, offline, timer, 0, None);
     }
 
     /// [`Node::record`] for an incoming message with the sender's id.
@@ -924,6 +943,7 @@ impl Node {
         offline: bool,
         timer: Option<u32>,
         remote_id: u64,
+        quote: Option<Quote>,
     ) {
         let now = now_ms();
         let entry = Entry {
@@ -942,6 +962,7 @@ impl Node {
             edited_ms: 0,
             read_ms: 0,
             reactions: Vec::new(),
+            quote,
         };
         let _ = self
             .shared
@@ -1005,6 +1026,7 @@ impl Node {
                 edited_ms: 0,
                 read_ms: 0,
                 reactions: Vec::new(),
+                quote: None,
             },
         );
     }
@@ -1015,6 +1037,7 @@ impl Node {
             body,
             expires_in_s,
             id,
+            quote,
             ..
         } = msg
         else {
@@ -1039,6 +1062,7 @@ impl Node {
             offline,
             *expires_in_s,
             *id,
+            quote.clone(),
         );
     }
 

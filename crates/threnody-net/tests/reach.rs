@@ -46,6 +46,7 @@ fn text(body: &str) -> AppMessage {
         body: body.into(),
         expires_in_s: None,
         id: 0,
+        quote: None,
     }
 }
 

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
-use threnody_core::history::FileNote;
+use threnody_core::history::{ConversationId, FileNote};
 use threnody_core::store::Home;
 use threnody_core::{Identity, PublicIdentity};
 use threnody_groups::GroupId;
@@ -20,12 +20,16 @@ pub const HELP: &str = "\
   /group leave <group>                  leave (or, as owner, delete) a group
   /groups                               list groups and members
   /g <group> <text>                     send to a group
+  /ghistory <group> [count]             a group's recent messages, numbered
+  /gr <group> <n> <text>                reply to message n of the last /ghistory, quoting it
   /gfile <group> [-s] <path>... [| caption]
                                         send files (photos) to a group";
 
 pub struct GroupUi {
     groups: GroupNode,
     downloads: PathBuf,
+    /// What the last `/ghistory` numbered, for `/gr`.
+    shown: Option<(GroupId, Vec<threnody_core::history::Entry>)>,
 }
 
 fn short(id: &GroupId) -> String {
@@ -38,6 +42,7 @@ impl GroupUi {
         Ok(Self {
             groups: GroupNode::load(home, identity)?,
             downloads,
+            shown: None,
         })
     }
 
@@ -357,6 +362,62 @@ impl GroupUi {
             self.groups.send_file(node, &g, f)?;
         }
         Ok((n, len))
+    }
+
+    /// `/ghistory <group> [count]`: the latest messages, numbered for `/gr`.
+    pub fn history(
+        &mut self,
+        node: &Node,
+        name: &dyn Fn(&PublicIdentity) -> String,
+        args: &str,
+    ) -> Result<()> {
+        let mut it = args.split_whitespace();
+        let g = self.find(it.next().unwrap_or(""))?;
+        let n: usize = it.next().map_or(Ok(20), str::parse)?;
+        let h = node.history(ConversationId::Group(g))?;
+        let recent = h.recent(n).to_vec();
+        for (i, e) in recent.iter().enumerate() {
+            let who = if e.outgoing {
+                "me".to_owned()
+            } else {
+                PublicIdentity::from_bytes(&e.device).map_or_else(|_| "?".into(), |d| name(&d))
+            };
+            if let Some(q) = &e.quote {
+                println!("     {}", crate::chat::quoted(q, name));
+            }
+            println!(
+                "{:>3}  [{}] <{who}> {}",
+                i + 1,
+                crate::chat::clock(e.at_ms),
+                threnody_core::history::snippet(e)
+            );
+        }
+        self.shown = Some((g, recent));
+        Ok(())
+    }
+
+    /// `/gr <group> <n> <text>`: replies to message `n` of the last
+    /// `/ghistory`, quoting it.
+    pub fn reply(&mut self, node: &Node, args: &str) -> Result<()> {
+        let mut it = args.splitn(3, ' ');
+        let (Some(g), Some(n), Some(text)) = (it.next(), it.next(), it.next()) else {
+            bail!("usage: /gr <group> <n> <text>");
+        };
+        let g = self.find(g)?;
+        let n: usize = n
+            .parse()
+            .map_err(|_| anyhow!("usage: /gr <group> <n> <text>"))?;
+        let e = match &self.shown {
+            Some((s, shown)) if *s == g => shown.get(n.wrapping_sub(1)).cloned(),
+            _ => bail!(
+                "run /ghistory {} first; /gr uses its numbers",
+                self.label(&g)
+            ),
+        }
+        .ok_or_else(|| anyhow!("no message {n} in the last /ghistory"))?;
+        let quote = threnody_core::message::Quote::of(&e);
+        self.groups.send_reply(node, &g, text.trim(), Some(quote))?;
+        Ok(())
     }
 
     /// `/g <group> <text>`.

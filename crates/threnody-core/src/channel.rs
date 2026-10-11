@@ -93,6 +93,7 @@ mod tests {
                 body: "a".into(),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             })
             .unwrap();
         let longer = ca
@@ -101,6 +102,7 @@ mod tests {
                 body: "a".repeat(150),
                 expires_in_s: None,
                 id: 0,
+                quote: None,
             })
             .unwrap();
         assert_eq!(

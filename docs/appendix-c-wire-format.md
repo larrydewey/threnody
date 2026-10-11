@@ -36,7 +36,8 @@ AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Rela
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials); absent = 0
-Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint }  ; sent_ms, body, disappear after (s), sender's message id
+Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
+             ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
              ? 6 => uint, ? 7 => tstr, ? 8 => uint, ? 9 => uint }      ; flags (1 sensitive, 2 voice, 4 video), caption,
                                                                        ; album id, clip duration (ms)
@@ -90,6 +91,12 @@ Texts and files carry the sender's message id (its history entry's local id). Th
 ### Reactions
 
 `React` adds or removes one emoji on a message, named by the same id as `Edit` and `Delete` use: the message's local id on the side that sent it, recorded as the remote id (history key 11) on the other. Anyone in the conversation may react to any message, with several different emoji each. Each history entry keeps the set of reactions (key 13: `[* [reactor (32), emoji]]`). The reactor is the account (or, until it's known, the device), so a person's devices count as one. A person may put at most 16 emoji on a message, and a message holds at most 256. An emoji is at most 32 bytes, with no control characters. Like `Edit`, a reaction goes to the peer's devices and to our own (with the conversation id), as tracked messages, only to devices whose `Hello` has feature bit 16. In groups, reactions travel inside MLS (Appendix F).
+
+### Replies
+
+A reply quotes an earlier message, as `Text` keys 10 to 12: the quoted message's id (as `Delete` names it), the device that sent it, and at most 200 characters of its text (a file's name, if it has no text). The snippet travels with the reply, so it reads even where the original doesn't exist: deleted, expired, or sent before a group member joined. A message from before ids existed is quoted with id 0, and matched by sender and text instead. A quote without a sender is ignored. Older receivers ignore the keys and see the reply alone, so no feature bit is needed.
+
+Receivers store the quote with the entry (history key 15: `[id, device (32), text]`). A quote must not outlive what it quotes. When a message is deleted (for me or for everyone) or disappears, the text of every quote of it is blanked, and apps show "Original message not found". In groups, replies travel inside MLS (Appendix F).
 
 ### Photos and files
 
