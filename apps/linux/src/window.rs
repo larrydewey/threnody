@@ -50,6 +50,8 @@ pub struct App {
     tabs: gtk::Box,
     /// The folders, and the chats each shows (chat keys).
     folders: RefCell<Vec<threnody_ffi::FolderInfo>>,
+    /// The Lists window, while open.
+    lists: RefCell<Option<Rc<crate::lists::ListsWindow>>>,
     folder_chats: RefCell<HashMap<u64, HashSet<String>>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
     chat: RefCell<Option<Rc<ChatView>>>,
@@ -180,6 +182,9 @@ impl App {
             .build();
         header.pack_end(&menu_button);
         header.pack_end(&add_button);
+        let lists_button = gtk::Button::from_icon_name("view-list-bullet-symbolic");
+        lists_button.set_tooltip_text(Some("Lists"));
+        header.pack_start(&lists_button);
 
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&header);
@@ -244,6 +249,7 @@ impl App {
             rows: RefCell::new(Vec::new()),
             tabs: tabs.clone(),
             folders: RefCell::new(Vec::new()),
+            lists: RefCell::new(None),
             folder_chats: RefCell::new(HashMap::new()),
             unread: RefCell::new(HashMap::new()),
             chat: RefCell::new(None),
@@ -257,6 +263,12 @@ impl App {
         this.watch_window();
         this.watch_network();
 
+        let weak = Rc::downgrade(&this);
+        lists_button.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.open_lists(None);
+            }
+        });
         let weak = Rc::downgrade(&this);
         this.list.connect_row_selected(move |_, row| {
             let (Some(this), Some(row)) = (weak.upgrade(), row) else {
@@ -360,7 +372,11 @@ impl App {
         for i in &rows {
             let c = &convs[*i];
             let n = unread.get(&c.chat).copied().unwrap_or(0).max(c.unread);
-            self.list.append(&self.row(c, n));
+            let row = self.row(c, n);
+            if !c.key.is_empty() && !c.archived {
+                self.draggable(&row, c);
+            }
+            self.list.append(&row);
         }
         drop(unread);
         self.draw_tabs(&convs);
@@ -385,6 +401,90 @@ impl App {
             self.show_list();
         }
         self.rebuilding.set(false);
+    }
+
+    /// Opens the Lists window (at list `id`, from a chat).
+    pub fn open_lists(self: &Rc<Self>, id: Option<String>) {
+        let w = self
+            .lists
+            .borrow_mut()
+            .get_or_insert_with(|| crate::lists::ListsWindow::new(self))
+            .clone();
+        if let Some(id) = id {
+            w.reload();
+            w.show(&id);
+        }
+        w.present();
+    }
+
+    /// Lets a chat be dragged onto another: among the pinned chats it's
+    /// pinned there; below them it's unpinned (the rest follow recent
+    /// activity).
+    fn draggable(self: &Rc<Self>, row: &gtk::ListBoxRow, c: &Conversation) {
+        let source = gtk::DragSource::new();
+        source.set_actions(gtk::gdk::DragAction::MOVE);
+        let key = c.key.clone();
+        source.connect_prepare(move |_, _, _| {
+            Some(gtk::gdk::ContentProvider::for_value(&key.to_value()))
+        });
+        row.add_controller(source);
+        let target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        let (weak, here, r) = (Rc::downgrade(self), c.key.clone(), row.clone());
+        target.connect_drop(move |_, value, _, y| {
+            let Some(this) = weak.upgrade() else { return false };
+            let Ok(moved) = value.get::<String>() else { return false };
+            if moved == here {
+                return false;
+            }
+            // The chats shown, in order, that can be pinned.
+            let shown: Vec<Conversation> = {
+                let convs = this.convs.borrow();
+                this.rows
+                    .borrow()
+                    .iter()
+                    .map(|i| convs[*i].clone())
+                    .filter(|c| !c.key.is_empty() && !c.archived)
+                    .collect()
+            };
+            let Some(was) = shown.iter().find(|c| c.key == moved).cloned() else {
+                return false;
+            };
+            let others: Vec<&Conversation> = shown.iter().filter(|c| c.key != moved).collect();
+            let Some(at) = others.iter().position(|c| c.key == here) else {
+                return false;
+            };
+            let to = at + usize::from(y > f64::from(r.height()) / 2.0);
+            let pinned_here = others.iter().filter(|c| c.pinned.is_some()).count();
+            // Every pinned chat, the hidden ones too, in order.
+            let mut pinned: Vec<(usize, String)> = this
+                .convs
+                .borrow()
+                .iter()
+                .filter(|c| c.key != moved && !c.key.is_empty())
+                .filter_map(|c| c.pinned.map(|p| (p, c.key.clone())))
+                .collect();
+            pinned.sort();
+            let mut order: Vec<String> = pinned.into_iter().map(|(_, k)| k).collect();
+            order.dedup();
+            if to <= pinned_here {
+                // Next to the pinned chat it now follows, or before the first.
+                let at = match to.checked_sub(1).and_then(|i| others.get(i)) {
+                    Some(before) => order.iter().position(|k| *k == before.key).map_or(order.len(), |i| i + 1),
+                    None => others
+                        .iter()
+                        .find(|c| c.pinned.is_some())
+                        .and_then(|f| order.iter().position(|k| *k == f.key))
+                        .unwrap_or(0),
+                };
+                order.insert(at.min(order.len()), moved);
+            } else if was.pinned.is_none() {
+                this.toast("Drop it among the pinned chats to pin it there; the others follow recent activity.");
+                return false;
+            }
+            this.run(None, "reorder the chats", move |n| n.set_pinned_chats(order), None);
+            true
+        });
+        row.add_controller(target);
     }
 
     /// Whether `tab` shows `c`: archived chats only in the archive.
@@ -1403,6 +1503,13 @@ impl App {
             }
             NodeEvent::DeviceLinked { .. } => {
                 self.toast("A new device joined your account.");
+                (None, None)
+            }
+            NodeEvent::ListChanged { .. } => {
+                let open = self.lists.borrow().clone();
+                if let Some(w) = open {
+                    w.reload();
+                }
                 (None, None)
             }
             _ => (None, None),

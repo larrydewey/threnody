@@ -514,3 +514,91 @@ async fn folders_sync_and_archived_chats_come_back() {
     laptop.node.mark_seen(conv);
     assert_eq!(unread(&laptop), 0);
 }
+
+#[tokio::test]
+async fn lists_are_shared_and_edited_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let cid = approve(&mut alice, &mut carol).await;
+    let aid = alice.node.identity();
+
+    // Alice's shopping list, shared with Bob.
+    let id = alice.node.create_list("Groceries");
+    alice.node.edit_list(&id, |l, s| {
+        let milk = l.add(None, "milk", false, s);
+        l.add(Some(milk), "eggs", false, s);
+        true
+    });
+    alice
+        .node
+        .share_list(&id, alice.node.conversation_for(&bid));
+    let texts = |n: &N| -> Vec<(String, bool)> {
+        n.node
+            .list(&id)
+            .map(|l| {
+                l.list
+                    .items()
+                    .iter()
+                    .map(|i| (i.text.clone(), i.done))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    until(&mut [&mut alice, &mut bob], |ns| texts(ns[1]).len() == 2).await;
+    // Bob's chat with Alice says so, and opens the list.
+    let bconv = bob.node.conversation_for(&aid);
+    let h = bob.node.history(bconv).unwrap();
+    assert_eq!(h.entries().last().unwrap().list, Some(id));
+
+    // Both change it at once: Bob ticks milk, Alice adds bread.
+    let milk = bob.node.list(&id).unwrap().list.items()[0].id;
+    bob.node
+        .edit_list(&id, |l, s| l.change(milk, s, |i| i.done = true));
+    alice.node.edit_list(&id, |l, s| {
+        let last = l.items().last().map(|i| i.id);
+        l.add(last, "bread", false, s);
+        true
+    });
+    let want = vec![
+        ("milk".to_owned(), true),
+        ("eggs".to_owned(), false),
+        ("bread".to_owned(), false),
+    ];
+    until(&mut [&mut alice, &mut bob], |ns| {
+        texts(ns[0]) == want && texts(ns[1]) == want
+    })
+    .await;
+
+    // Shared with a group too: Carol gets it through MLS, and her change
+    // reaches Alice.
+    let g = alice.groups.create("family").unwrap();
+    alice.groups.invite(&alice.node, &g, &cid).unwrap();
+    until(&mut [&mut alice, &mut carol], |ns| ns[1].in_group(&g)).await;
+    if let Some((bytes, groups)) = alice.node.share_list(&id, ConversationId::Group(g)) {
+        for gg in groups {
+            alice
+                .groups
+                .send_list(&alice.node, &gg, bytes.clone())
+                .unwrap();
+        }
+    }
+    until(&mut [&mut alice, &mut carol], |ns| texts(ns[1]).len() == 3).await;
+    if let Some((bytes, groups)) = carol.node.edit_list(&id, |l, s| {
+        let eggs = l.items()[1].id;
+        l.change(eggs, s, |i| i.done = true)
+    }) {
+        for gg in groups {
+            carol
+                .groups
+                .send_list(&carol.node, &gg, bytes.clone())
+                .unwrap();
+        }
+    }
+    until(&mut [&mut alice, &mut carol], |ns| {
+        texts(ns[0]).get(1).is_some_and(|(_, done)| *done)
+    })
+    .await;
+}

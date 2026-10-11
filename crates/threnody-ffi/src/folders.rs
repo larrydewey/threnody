@@ -382,6 +382,27 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Sets the pinned chats, in order (at most ten; others are unpinned).
+    pub fn set_pinned_chats(&self, chats: Vec<String>) -> Result<()> {
+        let mut pinned = Vec::new();
+        for k in &chats {
+            let c = self.chat_conv(k)?;
+            if !pinned.contains(&c) {
+                pinned.push(c);
+            }
+        }
+        pinned.truncate(threnody_core::folders::MAX_PINNED_CHATS);
+        self.node.update_folders(|all| {
+            if all.pinned == pinned {
+                return false;
+            }
+            all.archived.retain(|c| !pinned.contains(c));
+            all.pinned = pinned;
+            true
+        });
+        Ok(())
+    }
+
     /// Archived chats: hidden from the lists until a message arrives.
     pub fn archived_chats(&self) -> Vec<String> {
         self.node

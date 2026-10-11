@@ -63,6 +63,11 @@
         <activity android:name=".ScanActivity" android:exported="false"
             android:parentActivityName=".MainActivity"
             android:screenOrientation="portrait" />
+        <activity android:name=".ListsActivity" android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity android:name=".ListActivity" android:exported="false"
+            android:parentActivityName=".ListsActivity"
+            android:windowSoftInputMode="adjustResize" />
         <activity android:name=".MediaActivity" android:exported="false"
             android:parentActivityName=".ChatActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />

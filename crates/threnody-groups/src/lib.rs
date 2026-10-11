@@ -180,6 +180,12 @@ pub enum GroupEvent {
         from: PublicIdentity,
         id: u64,
     },
+    /// `from` shared (or changed) a list in the group.
+    List {
+        group: GroupId,
+        from: PublicIdentity,
+        list: Vec<u8>,
+    },
 }
 
 /// Results of handling one input.
@@ -1048,6 +1054,11 @@ impl Groups {
                         group,
                         from: sender,
                         id,
+                    },
+                    Content::List(list) => GroupEvent::List {
+                        group,
+                        from: sender,
+                        list,
                     },
                 });
             }

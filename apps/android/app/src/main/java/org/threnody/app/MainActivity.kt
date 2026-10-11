@@ -67,6 +67,7 @@ class MainActivity : Activity() {
             title.text = "Threnody"
             title.setTextAppearance(Design.styleTitleLarge)
             action(R.drawable.ic_search, "Search messages") { search.open() }
+            action(R.drawable.ic_list, "Lists") { startActivity(Intent(this@MainActivity, ListsActivity::class.java)) }
             action(R.drawable.ic_qr, "My invite") { showInvite() }
             action(R.drawable.ic_add, "New conversation") { add(it) }
             action(R.drawable.ic_more, "More") { more(it) }
@@ -595,7 +596,8 @@ class MainActivity : Activity() {
 
     /** What a list of rows looks like, without their actions. */
     private fun shown(rows: List<Row>): List<Any?> = rows.map {
-        listOf(it.title, it.avatarKey, it.preview.toString(), it.atMs, it.connected, it.section, it.isSectionHeader, it.sectionTitle, it.manage != null)
+        listOf(it.title, it.avatarKey, it.preview.toString(), it.atMs, it.connected, it.section, it.isSectionHeader,
+            it.sectionTitle, it.manage != null, it.unread, it.pinned, it.archived)
     }
 
     private fun show(rows: List<Row>) {
@@ -631,6 +633,8 @@ class MainActivity : Activity() {
 
     private fun addRows(rows: List<Row>) {
         var lastSection: Row.Section? = null
+        // Runs of chats between headings: a chat is dragged within its own.
+        val runs = mutableListOf(mutableListOf<Pair<View, Row>>())
         for (r in rows) {
             // Add divider between sections
             if (r.isSectionHeader) {
@@ -639,9 +643,56 @@ class MainActivity : Activity() {
                 }
                 addSectionHeader(r.sectionTitle!!)
                 lastSection = r.section
+                runs += mutableListOf<Pair<View, Row>>()
             } else {
-                list.addView(row(r))
+                val v = row(r)
+                list.addView(v)
+                if (r.chatKey != null && !r.archived) runs.last() += v to r
             }
+        }
+        // Long-press and drag a chat to reorder the pinned ones (dropping it
+        // among them pins it); a long press alone opens its menu.
+        for (run in runs) for ((v, r) in run) {
+            val manage = r.manage ?: continue
+            DragReorder.attach(list, v, { run.map { it.first } }, { from, to -> reorderChat(run.map { it.second }, from, to) }) {
+                manage()
+            }
+        }
+    }
+
+    /**
+     * A chat dragged from `from` to `to` among `run`: where pinned chats
+     * are, it's pinned there; below them, it's unpinned (the rest follow
+     * recent activity).
+     */
+    private fun reorderChat(run: List<Row>, from: Int, to: Int) {
+        val n = node ?: return
+        val moved = run.getOrNull(from) ?: return
+        val key = moved.chatKey ?: return
+        val others = run.filterIndexed { i, _ -> i != from }
+        val pinnedHere = others.count { it.pinned >= 0 }
+        val all = allRows.filter { !it.isSectionHeader && it.pinned >= 0 && it.chatKey != null }
+            .sortedBy { it.pinned }.map { it.chatKey!! }.distinct().filter { it != key }.toMutableList()
+        if (to > pinnedHere) {
+            if (moved.pinned < 0) {
+                Toast.makeText(this, "Drag it up among the pinned chats to pin it there; the others follow recent activity.",
+                    Toast.LENGTH_LONG).show()
+                return
+            }
+        } else {
+            // Next to the pinned chat it now follows (or before the first here).
+            val before = others.getOrNull(to - 1)?.chatKey
+            val first = others.firstOrNull { it.pinned >= 0 }?.chatKey
+            val at = when {
+                before != null -> all.indexOf(before) + 1
+                first != null -> all.indexOf(first).coerceAtLeast(0)
+                else -> all.size
+            }
+            all.add(at.coerceIn(0, all.size), key)
+        }
+        Threading.background {
+            try { n.setPinnedChats(all) } catch (_: Exception) {}
+            refresh()
         }
     }
 

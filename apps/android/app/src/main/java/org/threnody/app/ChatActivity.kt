@@ -799,7 +799,7 @@ class ChatActivity : Activity() {
         // On screen: what's here is read now.
         if (started) try { node.markSeen(if (note) "notes" else g ?: key) } catch (_: Exception) {}
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null, forwarded = false), sending = true) }
+            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null, forwarded = false, list = null), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         val pinned = try {
@@ -1320,6 +1320,25 @@ class ChatActivity : Activity() {
                 val g = group ?: return@view
                 Threading.background { run("vote") { node.voteInGroup(g, e.id, choices) } }
             }, matchWrap)
+            time
+        } else if (file == null && e.list != null) {
+            val listId = e.list!!
+            body.addView(TextView(this).apply {
+                searchable(e, e.text)
+                textSize = 16f
+                setTextColor(fg)
+                setTypeface(typeface, Typeface.BOLD)
+            })
+            body.addView(TextView(this).apply {
+                text = if (outgoing) "You shared a list · tap to open" else "Shared a list · tap to open"
+                textSize = 13f
+                setTextColor(fg)
+                alpha = 0.75f
+            })
+            // The bubble's texts take taps (see the long press below).
+            val open = View.OnClickListener { Lists.open(this, listId) }
+            body.setOnClickListener(open)
+            for (i in 0 until body.childCount) body.getChildAt(i).setOnClickListener(open)
             time
         } else if (file == null) {
             val (shown, ranges) = Mentions.display(e) { Threnody.nameOf(node, it) }

@@ -36,7 +36,7 @@ AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Rela
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
-                                                           ; 512 read, 1024 calls, 2048 pin); absent = 0
+                                                           ; 512 read, 1024 calls, 2048 pin, 4096 lists); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
@@ -108,6 +108,12 @@ A conversation may keep a draft, what the user started writing and hasn't sent (
 ### Pinned messages
 
 `Pin` (`{ 0 => 27, 3 => conversation, 5 => message id, ? 6 => 1 }`, key 6 present to unpin) pins a message in a conversation for everyone in it, named by the same id as `React`. It travels like `React`: to the peer's devices and our own, tracked, only to devices whose `Hello` has feature bit 2048. Either side of a 1:1 chat may pin. A conversation holds at most three pins (history key 3, oldest first); pinning a fourth unpins the oldest. A deleted or expired message loses its pin. In groups, pins travel inside MLS, and only the owner's and admins' count (Appendix F).
+
+### Lists
+
+A list is a checklist that merges rather than being replaced, since everyone who has it may change it at once: `{ 0: id (16), 1: title, 2: [ms, author (32)], 3: [* item] }`, an item being `[id, text, flags (1 done, 2 heading, 4 deleted), indent (0-3), position (an IEEE 754 double, as its 64 bits), ms, author (32)]`. Each item, and the title, is a register: the larger `[ms, author]` wins. A deleted item stays as a tombstone so its deletion spreads. Items sort by position, then id; an item inserted between two takes the mean of their positions. The author is the account (or a device without one), so a person's devices count as one. At most 1000 items, 500 characters each.
+
+A list shared with a contact goes to their devices as `AppMessage::List` (`{ 0 => 28, 2 => list }`, tracked, to devices whose `Hello` has bit 4096); one shared with a group goes inside MLS (Appendix F). Receivers merge it if it's shared with that conversation; a list new to them is kept as shared with it, and a history entry there records it (history key 19: the list id). A device that merges something new passes the list on to the other conversations it's shared with, so everyone converges; a merge that changes nothing stops there. Our own devices exchange lists with whom each is shared (Appendix J).
 
 ### Photos and files
 

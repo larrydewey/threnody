@@ -192,7 +192,8 @@ impl GroupWire {
 ///                     ? 9: quoted author bstr, ? 10: quoted text tstr,
 ///                     ? 11: mentions [* [start uint, len uint, who bstr]] }
 /// kind: 1 text, 2 file, 3 reaction, 4 pin, 5 poll (1: question,
-/// 12: options, flag 1 multiple choice), 6 vote (13: choices), 7 close poll
+/// 12: options, flag 1 multiple choice), 6 vote (13: choices), 7 close poll,
+/// 8 list (2: the list)
 /// flags: 1 sensitive, 2 voice message, 4 video message, 8 forwarded (file);
 ///        8 forwarded (text);
 ///        1 remove (reaction)
@@ -242,6 +243,8 @@ pub enum Content {
     Vote { id: u64, choices: Vec<u32> },
     /// Closes poll `id` (its author only).
     ClosePoll { id: u64 },
+    /// A list shared with the group (`threnody_core::lists::List`), to merge.
+    List(Vec<u8>),
 }
 
 const TAGGED: u8 = 0xFF;
@@ -313,6 +316,7 @@ impl Content {
             } => (5, question, None, u64::from(*multi), "", 0, *id, 0),
             Self::Vote { id, .. } => (6, "", None, 0, "", 0, *id, 0),
             Self::ClosePoll { id } => (7, "", None, 0, "", 0, *id, 0),
+            Self::List(l) => (8, "", Some(l.as_slice()), 0, "", 0, 0, 0),
         };
         let (options, choices): (&[String], &[u32]) = match self {
             Self::Poll { options, .. } => (options, &[]),
@@ -501,6 +505,7 @@ impl Content {
             },
             6 if id != 0 => Self::Vote { id, choices },
             7 if id != 0 => Self::ClosePoll { id },
+            8 => Self::List(required(data, "list")?),
             4 if id != 0 => Self::Pin {
                 id,
                 pin: flags & 1 == 0,
@@ -589,6 +594,7 @@ mod tests {
                 choices: vec![],
             },
             Content::ClosePoll { id: 50 },
+            Content::List(vec![1, 2, 3]),
             Content::Pin { id: 42, pin: false },
             Content::File {
                 name: "a.txt".into(),

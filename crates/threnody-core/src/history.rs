@@ -108,6 +108,8 @@ pub struct Entry {
     pub poll: Option<Poll>,
     /// Forwarded from another chat.
     pub forwarded: bool,
+    /// A list shared here (see `crate::lists`): the entry opens it.
+    pub list: Option<[u8; 16]>,
 }
 
 /// Most options a poll has, and longest question and option, in
@@ -602,7 +604,8 @@ impl History {
                         + usize::from(e.quote.is_some())
                         + usize::from(!e.mentions.is_empty())
                         + usize::from(e.poll.is_some())
-                        + usize::from(e.forwarded),
+                        + usize::from(e.forwarded)
+                        + usize::from(e.list.is_some()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -669,6 +672,9 @@ impl History {
                 if e.forwarded {
                     enc.u8(18)?.bool(true)?;
                 }
+                if let Some(l) = &e.list {
+                    enc.u8(19)?.bytes(l)?;
+                }
                 if let Some(p) = &e.poll {
                     enc.u8(17)?.array_len(4)?;
                     enc.array_len(p.options.len())?;
@@ -724,6 +730,7 @@ impl History {
                         let mut mentions = Vec::new();
                         let mut poll = None;
                         let mut forwarded = false;
+                        let mut list = None;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -748,6 +755,7 @@ impl History {
                                 14 => read_ms = d.u64()?,
                                 17 => poll = Some(decode_poll(d)?),
                                 18 => forwarded = d.bool()?,
+                                19 => list = Some(fixed_bytes::<16>(d)?),
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -802,6 +810,7 @@ impl History {
                             mentions,
                             poll,
                             forwarded,
+                            list,
                         });
                     }
                 }
@@ -1388,6 +1397,7 @@ mod tests {
             mentions: Vec::new(),
             poll: None,
             forwarded: false,
+            list: None,
         }
     }
 
