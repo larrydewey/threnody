@@ -11,7 +11,7 @@ use const_cbor::Decoder;
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
-use crate::message::{Clip, Quote};
+use crate::message::{Clip, Mention, Quote};
 use crate::store::Home;
 
 /// Entries kept per conversation; the oldest are dropped first.
@@ -102,6 +102,8 @@ pub struct Entry {
     pub reactions: Vec<([u8; 32], String)>,
     /// The message this one replies to.
     pub quote: Option<Quote>,
+    /// Who it mentions (group messages).
+    pub mentions: Vec<Mention>,
 }
 
 /// Reaction limits: per person on one message, per message, and per emoji.
@@ -176,6 +178,36 @@ pub struct History {
     /// Pinned messages, by [`Entry::message_id`], oldest pin first; at
     /// most [`MAX_PINS`].
     pinned: Vec<u64>,
+    /// When new messages here should notify.
+    pub notify: Notify,
+}
+
+/// When a conversation's new messages notify.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Notify {
+    #[default]
+    All,
+    /// Only messages that mention us (in groups), or reply to us.
+    Mentions,
+    Off,
+}
+
+impl Notify {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::All => 0,
+            Self::Mentions => 1,
+            Self::Off => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Mentions,
+            2 => Self::Off,
+            _ => Self::All,
+        }
+    }
 }
 
 /// Most messages pinned in one conversation; pinning another unpins the
@@ -258,6 +290,7 @@ impl History {
             timer_s: None,
             entries,
             pinned: Vec::new(),
+            notify: Notify::All,
         }
     }
 
@@ -350,11 +383,16 @@ impl History {
             + 32;
         cbor::to_vec(size, |enc| {
             enc.map_len(
-                2 + usize::from(self.timer_s.is_some()) + usize::from(!self.pinned.is_empty()),
+                2 + usize::from(self.timer_s.is_some())
+                    + usize::from(!self.pinned.is_empty())
+                    + usize::from(self.notify != Notify::All),
             )?;
             enc.u8(0)?.u64(VERSION)?;
             if let Some(t) = self.timer_s {
                 enc.u8(1)?.u32(t)?;
+            }
+            if self.notify != Notify::All {
+                enc.u8(4)?.u8(self.notify.to_u8())?;
             }
             if !self.pinned.is_empty() {
                 enc.u8(3)?.array_len(self.pinned.len())?;
@@ -375,7 +413,8 @@ impl History {
                         + usize::from(e.edited_ms != 0)
                         + usize::from(!e.reactions.is_empty())
                         + usize::from(e.read_ms != 0)
-                        + usize::from(e.quote.is_some()),
+                        + usize::from(e.quote.is_some())
+                        + usize::from(!e.mentions.is_empty()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -435,6 +474,12 @@ impl History {
                         .bytes(&q.author)?
                         .str(&q.text)?;
                 }
+                if !e.mentions.is_empty() {
+                    enc.u8(16)?.array_len(e.mentions.len())?;
+                    for m in &e.mentions {
+                        enc.array_len(3)?.u32(m.start)?.u32(m.len)?.bytes(&m.who)?;
+                    }
+                }
                 if !e.reactions.is_empty() {
                     enc.u8(13)?.array_len(e.reactions.len())?;
                     for (who, emoji) in &e.reactions {
@@ -450,6 +495,7 @@ impl History {
         let mut dec = Decoder::new(b);
         let (mut ver, mut timer, mut entries) = (None, None, Vec::new());
         let mut pinned = Vec::new();
+        let mut notify = Notify::All;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -463,6 +509,7 @@ impl History {
                         let (mut remote_id, mut edited_ms) = (0, 0);
                         let (mut reactions, mut read_ms) = (Vec::new(), 0);
                         let mut quote = None;
+                        let mut mentions = Vec::new();
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -485,6 +532,16 @@ impl History {
                                 11 => remote_id = d.u64()?,
                                 12 => edited_ms = d.u64()?,
                                 14 => read_ms = d.u64()?,
+                                16 => {
+                                    for _ in 0..d.array_len()? {
+                                        if d.array_len()? != 3 {
+                                            return Err(Error::Malformed("mention"));
+                                        }
+                                        let (start, len) = (d.u32()?, d.u32()?);
+                                        let who = fixed_bytes::<32>(d)?;
+                                        mentions.push(Mention { start, len, who });
+                                    }
+                                }
                                 15 => {
                                     if d.array_len()? != 3 {
                                         return Err(Error::Malformed("quote"));
@@ -526,9 +583,11 @@ impl History {
                             read_ms,
                             reactions,
                             quote,
+                            mentions,
                         });
                     }
                 }
+                4 => notify = Notify::from_u8(d.u8()?),
                 3 => {
                     for _ in 0..d.array_len()? {
                         let p = d.u64()?;
@@ -549,6 +608,7 @@ impl History {
             timer_s: timer,
             entries,
             pinned,
+            notify,
         })
     }
 }
@@ -832,6 +892,22 @@ impl Home {
         Ok(n)
     }
 
+    /// Sets when `c`'s new messages notify.
+    pub fn set_notify(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        n: Notify,
+    ) -> Result<()> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        if h.notify != n {
+            h.notify = n;
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(())
+    }
+
     /// Pins (or unpins) message `id` in `c`; returns true if that changed
     /// anything.
     pub fn pin_entry(
@@ -991,6 +1067,7 @@ mod tests {
             read_ms: 0,
             reactions: Vec::new(),
             quote: None,
+            mentions: Vec::new(),
         }
     }
 

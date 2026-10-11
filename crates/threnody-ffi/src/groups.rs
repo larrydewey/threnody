@@ -4,13 +4,15 @@
 
 use threnody_core::PublicIdentity;
 use threnody_core::history::{ConversationId, FileNote};
+use threnody_core::message::Mention;
 use threnody_groups::GroupId;
 use threnody_groups::node::{Invite, Update};
 
 use threnody_net::history::OutgoingFile;
 
 use crate::{
-    FileOptions, HistoryEntry, NodeEvent, Result, ThrenodyNode, fail, fp, history_entries,
+    FileOptions, HistoryEntry, MentionInfo, NodeEvent, NotifyLevel, Result, ThrenodyNode, fail, fp,
+    history_entries,
 };
 
 /// A group this device belongs to.
@@ -105,11 +107,14 @@ fn event(u: Update) -> NodeEvent {
             from,
             text,
             ours,
+            mentioned,
         } => NodeEvent::GroupMessage {
             group: hex(&group),
             from: fp(&from),
             text,
             ours,
+            mentioned,
+            quiet: false,
         },
         Update::File {
             group,
@@ -133,6 +138,7 @@ fn event(u: Update) -> NodeEvent {
             caption,
             album,
             clip: clip.map(Into::into),
+            quiet: false,
         },
     }
 }
@@ -168,7 +174,7 @@ impl ThrenodyNode {
     }
 
     /// A group (or invitation) by hex id prefix.
-    fn group_id(&self, id: &str) -> Result<GroupId> {
+    pub(crate) fn group_id(&self, id: &str) -> Result<GroupId> {
         let gn = self.group_node();
         let id = id.to_ascii_lowercase();
         let mut hits: Vec<GroupId> = gn
@@ -397,6 +403,61 @@ impl ThrenodyNode {
         self.group_node().pin(&self.node, &g, id, pin).map_err(fail)
     }
 
+    /// When new messages in `group` notify.
+    pub fn group_notify_level(&self, group: String) -> Result<NotifyLevel> {
+        let g = self.group_id(&group)?;
+        let h = self.node.history(ConversationId::Group(g)).map_err(fail)?;
+        Ok(h.notify.into())
+    }
+
+    pub fn set_group_notify_level(&self, group: String, level: NotifyLevel) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.node
+            .set_notify(ConversationId::Group(g), level.into())
+            .map_err(fail)
+    }
+
+    /// Sends text to the group, mentioning `mentions` (each naming a
+    /// member's device; `start` and `len` count characters of `text`) and,
+    /// with `quote_at_ms` and `quote_device`, replying to that message.
+    pub fn send_group_message(
+        &self,
+        group: String,
+        text: String,
+        quote_at_ms: Option<u64>,
+        quote_device: Option<String>,
+        mentions: Vec<MentionInfo>,
+    ) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let conv = ConversationId::Group(g);
+        let quote = match (quote_at_ms, &quote_device) {
+            (Some(at), Some(d)) => self.node.quote_of(conv, crate::entry_at(at, d)),
+            _ => None,
+        };
+        let members = self
+            .group_node()
+            .list()
+            .into_iter()
+            .find(|(id, ..)| *id == g)
+            .map(|(.., m)| m)
+            .unwrap_or_default();
+        let mentions = mentions
+            .iter()
+            .filter_map(|m| {
+                let d = members.iter().find(|d| fp(d) == m.device)?;
+                Some(Mention {
+                    start: m.start,
+                    len: m.len,
+                    who: self.node.reactor_of(d),
+                })
+            })
+            .collect();
+        let _guard = self.rt.enter();
+        self.group_node()
+            .send_message(&self.node, &g, &text, quote, mentions)
+            .map_err(fail)
+    }
+
     /// Whether we may pin messages in `group` (we own it, or are an admin).
     pub fn may_pin_in_group(&self, group: String) -> Result<bool> {
         let g = self.group_id(&group)?;
@@ -408,6 +469,7 @@ impl ThrenodyNode {
         let g = self.group_id(&group)?;
         let me = self.node.reactor_of(&self.node.identity());
         Ok(history_entries(
+            &self.node,
             &self.node.pinned(ConversationId::Group(g)),
             me,
         ))
@@ -454,7 +516,7 @@ impl ThrenodyNode {
             .map_err(fail)?;
         let me = self.node.reactor_of(&self.node.identity());
         let entries: Vec<_> = hits.into_iter().map(|h| h.entry).collect();
-        Ok(history_entries(&entries, me))
+        Ok(history_entries(&self.node, &entries, me))
     }
 
     /// The last `limit` messages in a group (oldest first).
@@ -462,6 +524,6 @@ impl ThrenodyNode {
         let g = self.group_id(&group)?;
         let h = self.node.history(ConversationId::Group(g)).map_err(fail)?;
         let me = self.node.reactor_of(&self.node.identity());
-        Ok(history_entries(h.recent(limit as usize), me))
+        Ok(history_entries(&self.node, h.recent(limit as usize), me))
     }
 }

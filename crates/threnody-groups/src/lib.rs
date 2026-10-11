@@ -25,7 +25,7 @@ use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::signatures::{Signer, SignerError};
 use threnody_core::crypto::random_bytes;
-use threnody_core::message::{Clip, Quote};
+use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::{Identity, PublicIdentity};
 
 pub use wire::{Content, GroupId, GroupWire};
@@ -127,6 +127,8 @@ pub enum GroupEvent {
         id: u64,
         /// The message it replies to.
         quote: Option<Quote>,
+        /// Who it mentions.
+        mentions: Vec<Mention>,
     },
     File {
         group: GroupId,
@@ -684,6 +686,7 @@ impl Groups {
                 text: text.to_owned(),
                 id: 0,
                 quote: None,
+                mentions: Vec::new(),
             },
         )
     }
@@ -948,12 +951,18 @@ impl Groups {
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app) => {
                 events.push(match Content::decode(&app.into_bytes())? {
-                    Content::Text { text, id, quote } => GroupEvent::Text {
+                    Content::Text {
+                        text,
+                        id,
+                        quote,
+                        mentions,
+                    } => GroupEvent::Text {
                         group,
                         from: sender,
                         text,
                         id,
                         quote,
+                        mentions,
                     },
                     Content::File {
                         name,

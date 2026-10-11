@@ -42,12 +42,13 @@ Content = text                         ; UTF-8, as the first versions sent (no i
         / 0xFF || { 0: kind, ? 1: text, file name or emoji, ? 2: file data,
                     ? 3: flags, ? 4: caption, ? 5: album id, ? 6: message id,
                     ? 7: clip duration in ms, ? 8: quoted message id,
-                    ? 9: quoted sender's device, ? 10: quoted text }
+                    ? 9: quoted sender's device, ? 10: quoted text,
+                    ? 11: mentions [* [start, len, who (32)]] }
 kind: 1 text, 2 file (at most 8 MiB, as in 1:1), 3 reaction, 4 pin (6: message id; flag 1 unpins)
 flags: 1 sensitive, 2 voice message, 4 video message (file); 1 remove (reaction)
 ```
 
-A UTF-8 string never starts with the byte 0xFF, so plain text from older members still reads as text. Text and files carry the sender's id for the message, which receivers record (history key 11). A reply quotes a message by that id, its sender and its start, as in 1:1 chats (Appendix C, *Replies*). A pin names a message by that id too. Members apply it only if the sender is the owner or an admin, and keep at most three, as in 1:1 chats (Appendix C, *Pinned messages*). A reaction names a message by that id; members apply it under the reactor's account, as in 1:1 chats (Appendix C). Receivers save a file and record it in the group's history with where they saved it. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
+A UTF-8 string never starts with the byte 0xFF, so plain text from older members still reads as text. Text and files carry the sender's id for the message, which receivers record (history key 11). A reply quotes a message by that id, its sender and its start, as in 1:1 chats (Appendix C, *Replies*). A text may mention members: each mention covers characters `start..start+len` of the text (as written, "@Name") and names who (an account, or a device whose account isn't known, as reactions do). Receivers keep mentions that fit the text, in order and apart, at most 32, store them (history key 16: `[* [start, len, who]]`), and show their own name for each. A message that mentions us, or replies to one of ours, counts as mentioning us. Each conversation has a notification setting (history key 4: 0 all, 1 only mentions and replies to us, 2 off), on each device; messages still arrive and count as unread. A pin names a message by that id too. Members apply it only if the sender is the owner or an admin, and keep at most three, as in 1:1 chats (Appendix C, *Pinned messages*). A reaction names a message by that id; members apply it under the reactor's account, as in 1:1 chats (Appendix C). Receivers save a file and record it in the group's history with where they saved it. Since that traffic also travels inside the pairwise ratchets, the network sees nothing group-specific.
 
 ### Reaching every member
 

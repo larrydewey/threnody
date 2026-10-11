@@ -798,6 +798,7 @@ impl Core {
                 caption,
                 album,
                 clip,
+                quiet,
             } => {
                 self.say(format!(
                     "* {} sent a file ({} bytes)",
@@ -830,6 +831,7 @@ impl Core {
                     caption,
                     album,
                     clip,
+                    quiet,
                 }
             }
             NodeEvent::GroupFile {
@@ -843,6 +845,7 @@ impl Core {
                 caption,
                 album,
                 clip,
+                quiet,
             } => {
                 self.say(format!(
                     "* group {}: {} sent a file ({} bytes)",
@@ -879,6 +882,7 @@ impl Core {
                     caption,
                     album,
                     clip,
+                    quiet,
                 }
             }
             e => {

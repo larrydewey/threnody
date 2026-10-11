@@ -7,7 +7,7 @@ use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
     Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_PIN, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
-    Quote,
+    Mention, Quote,
 };
 
 use crate::delivery::Tag;
@@ -256,6 +256,18 @@ impl Node {
             .home
             .pin_entry(self.identity_ref(), conv, now_ms(), id, pin)
             .unwrap_or(false)
+    }
+
+    /// Sets when `conv`'s new messages notify, on this device.
+    pub fn set_notify(
+        &self,
+        conv: ConversationId,
+        n: threnody_core::history::Notify,
+    ) -> Result<()> {
+        self.shared
+            .home
+            .set_notify(self.identity_ref(), conv, now_ms(), n)
+            .map_err(NetError::from)
     }
 
     /// Pinned messages in `conv`, oldest pin first.
@@ -811,6 +823,7 @@ impl Node {
                 read_ms: 0,
                 reactions: Vec::new(),
                 quote,
+                mentions: Vec::new(),
             },
         );
         Ok(r)
@@ -1032,7 +1045,17 @@ impl Node {
         offline: bool,
         timer: Option<u32>,
     ) {
-        self.record_with_id(conv, device, outgoing, text, offline, timer, 0, None);
+        self.record_with_id(
+            conv,
+            device,
+            outgoing,
+            text,
+            offline,
+            timer,
+            0,
+            None,
+            Vec::new(),
+        );
     }
 
     /// [`Node::record`] for an incoming message with the sender's id.
@@ -1047,6 +1070,7 @@ impl Node {
         timer: Option<u32>,
         remote_id: u64,
         quote: Option<Quote>,
+        mentions: Vec<Mention>,
     ) {
         let now = now_ms();
         let entry = Entry {
@@ -1066,6 +1090,7 @@ impl Node {
             read_ms: 0,
             reactions: Vec::new(),
             quote,
+            mentions,
         };
         let _ = self
             .shared
@@ -1130,6 +1155,7 @@ impl Node {
                 read_ms: 0,
                 reactions: Vec::new(),
                 quote: None,
+                mentions: Vec::new(),
             },
         );
     }
@@ -1166,6 +1192,7 @@ impl Node {
             *expires_in_s,
             *id,
             quote.clone(),
+            Vec::new(),
         );
     }
 

@@ -12,7 +12,7 @@
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
-use threnody_core::message::{Clip, Quote};
+use threnody_core::message::{Clip, MAX_MENTIONS, Mention, Quote};
 use threnody_core::{Error, Result};
 
 /// Group ids are 16 random bytes.
@@ -188,7 +188,8 @@ impl GroupWire {
 ///                     ? 2: data bstr, ? 3: flags uint, ? 4: caption tstr,
 ///                     ? 5: album uint, ? 6: message id uint,
 ///                     ? 7: clip duration_ms uint, ? 8: quoted id uint,
-///                     ? 9: quoted author bstr, ? 10: quoted text tstr }
+///                     ? 9: quoted author bstr, ? 10: quoted text tstr,
+///                     ? 11: mentions [* [start uint, len uint, who bstr]] }
 /// kind: 1 text, 2 file, 3 reaction, 4 pin
 /// flags: 1 sensitive, 2 voice message, 4 video message (file);
 ///        1 remove (reaction)
@@ -204,6 +205,8 @@ pub enum Content {
         id: u64,
         /// The message this one replies to.
         quote: Option<Quote>,
+        /// Who it mentions.
+        mentions: Vec<Mention>,
     },
     File {
         name: String,
@@ -242,7 +245,8 @@ impl Content {
                 text,
                 id: 0,
                 quote: None,
-            } => return Ok(text.as_bytes().to_vec()),
+                mentions,
+            } if mentions.is_empty() => return Ok(text.as_bytes().to_vec()),
             Self::Text { text, id, .. } => (1, text, None, 0, "", 0, *id, 0),
             Self::File {
                 name,
@@ -265,14 +269,17 @@ impl Content {
             Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id, 0),
             Self::Pin { id, pin } => (4, "", None, u64::from(!*pin), "", 0, *id, 0),
         };
-        let quote = match self {
-            Self::Text { quote, .. } => quote.as_ref(),
-            _ => None,
+        let (quote, mentions) = match self {
+            Self::Text {
+                quote, mentions, ..
+            } => (quote.as_ref(), mentions.as_slice()),
+            _ => (None, &[][..]),
         };
         let size = text.len()
             + data.map_or(0, <[u8]>::len)
             + caption.len()
             + quote.map_or(0, |q| q.text.len() + 48)
+            + mentions.len() * 48
             + 48;
         let body = cbor::to_vec(size, |e| {
             e.map_len(
@@ -282,7 +289,8 @@ impl Content {
                     + usize::from(album != 0)
                     + usize::from(id != 0)
                     + usize::from(duration != 0)
-                    + 3 * usize::from(quote.is_some()),
+                    + 3 * usize::from(quote.is_some())
+                    + usize::from(!mentions.is_empty()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.str(text)?;
@@ -309,6 +317,12 @@ impl Content {
                 e.u8(9)?.bytes(&q.author)?;
                 e.u8(10)?.str(&q.text)?;
             }
+            if !mentions.is_empty() {
+                e.u8(11)?.array_len(mentions.len())?;
+                for m in mentions {
+                    e.array_len(3)?.u32(m.start)?.u32(m.len)?.bytes(&m.who)?;
+                }
+            }
             Ok(())
         })?;
         let mut out = Vec::with_capacity(body.len() + 1);
@@ -323,6 +337,7 @@ impl Content {
                 text: String::from_utf8_lossy(b).into_owned(),
                 id: 0,
                 quote: None,
+                mentions: Vec::new(),
             });
         };
         let mut dec = Decoder::new(rest);
@@ -330,6 +345,7 @@ impl Content {
         let (mut flags, mut caption, mut album, mut id) = (0, String::new(), 0, 0);
         let mut duration = 0;
         let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
+        let mut mentions = Vec::new();
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -343,6 +359,18 @@ impl Content {
                 8 => quote_id = d.u64()?,
                 9 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
                 10 => quote_text = Some(d.str()?.to_owned()),
+                11 => {
+                    for _ in 0..d.array_len()? {
+                        if d.array_len()? != 3 {
+                            return Err(Error::Malformed("mention"));
+                        }
+                        let (start, len) = (d.u32()?, d.u32()?);
+                        let who = cbor::fixed_bytes::<32>(d)?;
+                        if mentions.len() < MAX_MENTIONS {
+                            mentions.push(Mention { start, len, who });
+                        }
+                    }
+                }
                 _ => return Ok(false),
             }
             Ok(true)
@@ -350,6 +378,7 @@ impl Content {
         finish(&dec)?;
         Ok(match required(kind, "content kind")? {
             1 => Self::Text {
+                mentions: Mention::valid(mentions, text.as_deref().unwrap_or("")),
                 text: text.unwrap_or_default(),
                 id,
                 quote: quote_author
@@ -395,21 +424,42 @@ mod tests {
                 text: "hello".into(),
                 id: 0,
                 quote: None,
+                mentions: Vec::new(),
             },
             Content::Text {
                 text: String::new(),
                 id: 0,
                 quote: None,
+                mentions: Vec::new(),
             },
             Content::Text {
                 text: "with an id".into(),
                 id: 42,
                 quote: None,
+                mentions: Vec::new(),
             },
             Content::Text {
                 text: "a reply".into(),
                 id: 43,
                 quote: Some(Quote::new(42, [3; 32], "with an id")),
+                mentions: Vec::new(),
+            },
+            Content::Text {
+                text: "@Bo and @Al".into(),
+                id: 44,
+                quote: None,
+                mentions: vec![
+                    Mention {
+                        start: 0,
+                        len: 3,
+                        who: [1; 32],
+                    },
+                    Mention {
+                        start: 8,
+                        len: 3,
+                        who: [2; 32],
+                    },
+                ],
             },
             Content::React {
                 id: 42,
@@ -462,6 +512,7 @@ mod tests {
                 text: "hi ✓".into(),
                 id: 0,
                 quote: None,
+                mentions: Vec::new(),
             }
         );
         // A tagged text, as a later sender might write it.
@@ -472,6 +523,7 @@ mod tests {
                 text: "ok".into(),
                 id: 0,
                 quote: None,
+                mentions: Vec::new(),
             }
         );
         assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());

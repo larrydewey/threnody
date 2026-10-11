@@ -7,7 +7,7 @@ use std::time::Duration;
 use threnody_core::history::ConversationId;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, PublicIdentity};
-use threnody_groups::node::GroupNode;
+use threnody_groups::node::{GroupNode, Update};
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
@@ -17,6 +17,8 @@ struct N {
     rx: UnboundedReceiver<Event>,
     addr: String,
     groups: GroupNode,
+    /// What incoming group traffic produced, for the app to show.
+    updates: Vec<Update>,
 }
 
 async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
@@ -37,6 +39,7 @@ async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
         rx,
         addr,
         groups,
+        updates: Vec::new(),
     }
 }
 
@@ -54,7 +57,9 @@ impl N {
                     msg: AppMessage::Group(b),
                     ..
                 } => {
-                    let _ = self.groups.incoming(&self.node, peer, &b);
+                    if let Ok(u) = self.groups.incoming(&self.node, peer, &b) {
+                        self.updates.extend(u);
+                    }
                 }
                 Event::Connected { peer, .. } => self.groups.connected(&self.node, &peer),
                 Event::DeviceLinked { device } => self.groups.linked(&self.node, &device),
@@ -302,4 +307,50 @@ async fn pins_reach_both_sides_and_only_admins_pin_in_groups() {
     })
     .await;
     assert_eq!(pins(&bob, gc), ["agenda"]);
+}
+
+#[tokio::test]
+async fn mentions_reach_who_they_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let cid = approve(&mut alice, &mut carol).await;
+    let g = alice.groups.create("team").unwrap();
+    alice.groups.invite(&alice.node, &g, &bid).unwrap();
+    alice.groups.invite(&alice.node, &g, &cid).unwrap();
+    until(&mut [&mut alice, &mut bob, &mut carol], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+    let mention = threnody_core::message::Mention {
+        start: 0,
+        len: 4,
+        who: alice.node.reactor_of(&bid),
+    };
+    alice
+        .groups
+        .send_message(&alice.node, &g, "@Bob look", None, vec![mention])
+        .unwrap();
+    let mentioned = |n: &N| {
+        n.updates.iter().find_map(|u| match u {
+            Update::Text { mentioned, .. } => Some(*mentioned),
+            _ => None,
+        })
+    };
+    until(&mut [&mut alice, &mut bob, &mut carol], |ns| {
+        mentioned(ns[1]).is_some() && mentioned(ns[2]).is_some()
+    })
+    .await;
+    assert_eq!(mentioned(&bob), Some(true));
+    assert_eq!(mentioned(&carol), Some(false));
+    let stored = bob
+        .node
+        .history(ConversationId::Group(g))
+        .unwrap()
+        .entries()[0]
+        .mentions
+        .clone();
+    assert_eq!(stored, [mention]);
 }
