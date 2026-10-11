@@ -483,6 +483,12 @@ pub enum NodeEvent {
     Read {
         peer: String,
     },
+    /// `peer` pinned (or unpinned) a message in our chat, or in `group`.
+    Pinned {
+        peer: String,
+        group: Option<String>,
+        pin: bool,
+    },
     /// `peer` changed reactions in our chat, or in `group`; reload it.
     Reacted {
         peer: String,
@@ -773,6 +779,11 @@ fn convert(e: Event) -> NodeEvent {
         Event::Typing { peer, active } => NodeEvent::Typing {
             peer: fp(&peer),
             active,
+        },
+        Event::Pinned { peer, pin, .. } => NodeEvent::Pinned {
+            peer: fp(&peer),
+            group: None,
+            pin,
         },
         Event::Reacted { peer, .. } => NodeEvent::Reacted {
             peer: fp(&peer),
@@ -1542,6 +1553,25 @@ PersistentKeepalive = 25\n",
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();
         Ok(self.node.react(&p, id, &emoji, add))
+    }
+
+    /// Pins (or unpins) message `id` (a [`HistoryEntry::id`]) in our chat
+    /// with `peer`, for both sides; at most three stay pinned. Returns
+    /// false if there's no such message.
+    pub fn pin(&self, peer: String, id: u64, pin: bool) -> Result<bool> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        Ok(self.node.pin(&p, id, pin))
+    }
+
+    /// The pinned messages in our chat with `peer`, oldest pin first.
+    pub fn pinned(&self, peer: String) -> Result<Vec<HistoryEntry>> {
+        let p = self.resolve(&peer)?;
+        let me = self.node.reactor_of(&self.node.identity());
+        Ok(history_entries(
+            &self.node.pinned(self.node.conversation_for(&p)),
+            me,
+        ))
     }
 
     /// Clears the messages with `peer`, here and on our other devices;

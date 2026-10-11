@@ -35,7 +35,8 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
-                                                           ; 32 observed, 64 paths, 128 credentials); absent = 0
+                                                           ; 32 observed, 64 paths, 128 credentials, 256 typing,
+                                                           ; 512 read, 1024 calls, 2048 pin); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
@@ -97,6 +98,10 @@ Texts and files carry the sender's message id (its history entry's local id). Th
 A reply quotes an earlier message, as `Text` keys 10 to 12: the quoted message's id (as `Delete` names it), the device that sent it, and at most 200 characters of its text (a file's name, if it has no text). The snippet travels with the reply, so it reads even where the original doesn't exist: deleted, expired, or sent before a group member joined. A message from before ids existed is quoted with id 0, and matched by sender and text instead. A quote without a sender is ignored. Older receivers ignore the keys and see the reply alone, so no feature bit is needed.
 
 Receivers store the quote with the entry (history key 15: `[id, device (32), text]`). A quote must not outlive what it quotes. When a message is deleted (for me or for everyone) or disappears, the text of every quote of it is blanked, and apps show "Original message not found". In groups, replies travel inside MLS (Appendix F).
+
+### Pinned messages
+
+`Pin` (`{ 0 => 27, 3 => conversation, 5 => message id, ? 6 => 1 }`, key 6 present to unpin) pins a message in a conversation for everyone in it, named by the same id as `React`. It travels like `React`: to the peer's devices and our own, tracked, only to devices whose `Hello` has feature bit 2048. Either side of a 1:1 chat may pin. A conversation holds at most three pins (history key 3, oldest first); pinning a fourth unpins the oldest. A deleted or expired message loses its pin. In groups, pins travel inside MLS, and only the owner's and admins' count (Appendix F).
 
 ### Photos and files
 

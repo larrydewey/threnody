@@ -75,6 +75,8 @@ Type a line to send it to the current peer. Commands:
   /del <n> [all]                        delete message n of the last /history (all: for everyone)
   /edit <n> <text>                      edit your message n of the last /history
   /reply <n> <text>                     reply to message n of the last /history, quoting it
+  /pin <n> [off]                        pin (or unpin) message n of the last /history
+  /pins                                 the current chat's pinned messages
   /react <n> <emoji> [off]              react to message n of the last /history (again to take it back)
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
@@ -1141,6 +1143,11 @@ impl Ui {
             Event::Reacted { peer, .. } => {
                 println!("* {} reacted (see /history)", self.name(&peer));
             }
+            Event::Pinned { peer, pin, .. } => println!(
+                "* {} {} a message (see /pins)",
+                self.name(&peer),
+                if pin { "pinned" } else { "unpinned" }
+            ),
             Event::ProfileChanged { peer } => {
                 let shown = self
                     .node
@@ -1520,6 +1527,40 @@ impl Ui {
                     );
                 }
                 println!("* {} {emoji}", if add { "reacted" } else { "took back" });
+            }
+            "pin" => {
+                let mut it = arg.unwrap_or("").split_whitespace();
+                let n: usize = it
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| anyhow!("usage: /pin <n> [off] (n from /history)"))?;
+                let pin = it.next() != Some("off");
+                let (peer, shown) = self.shown.borrow().clone();
+                let peer =
+                    peer.ok_or_else(|| anyhow!("run /history first; /pin uses its numbers"))?;
+                let e = shown
+                    .get(n.wrapping_sub(1))
+                    .ok_or_else(|| anyhow!("no message {n} in the last /history"))?;
+                if !self.node.pin(&peer, e.message_id(), pin) {
+                    bail!("that message can't be pinned (gone, or too old to have an id)");
+                }
+                println!("* {}", if pin { "pinned" } else { "unpinned" });
+            }
+            "pins" => {
+                let peer = self
+                    .current
+                    .ok_or_else(|| anyhow!("no current peer; /to <peer>"))?;
+                let pins = self.node.pinned(self.node.conversation_for(&peer));
+                if pins.is_empty() {
+                    println!("No pinned messages.");
+                }
+                for e in pins {
+                    println!(
+                        "  📌 [{}] {}",
+                        clock(e.at_ms),
+                        threnody_core::history::snippet(&e)
+                    );
+                }
             }
             "reply" => {
                 let (n, body) = arg

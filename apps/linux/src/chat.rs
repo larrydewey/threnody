@@ -90,6 +90,12 @@ pub struct ChatView {
     peer_quiet: RefCell<Option<glib::SourceId>>,
     /// Above the composer while replying: what the reply quotes.
     reply_bar: gtk::Box,
+    /// Under the header: the pinned messages; clicking steps through them.
+    pin_bar: gtk::Button,
+    pins: RefCell<Vec<HistoryEntry>>,
+    pin_shown: Cell<usize>,
+    /// In a group: whether we may pin (owner or admin).
+    may_pin: Cell<bool>,
     /// The message the next one replies to.
     reply_to: RefCell<Option<HistoryEntry>>,
     /// Weak reference to self for creating weak pointers in callbacks.
@@ -300,6 +306,12 @@ impl ChatView {
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&banner);
+        let pin_bar = gtk::Button::new();
+        pin_bar.add_css_class("flat");
+        pin_bar.add_css_class("pin-bar");
+        pin_bar.set_visible(false);
+        pin_bar.set_tooltip_text(Some("Show the pinned message"));
+        body.append(&pin_bar);
         body.append(&stack);
         let root = adw::ToolbarView::new();
         root.add_top_bar(&header);
@@ -354,11 +366,21 @@ impl ChatView {
             sending_typing: Cell::new(false),
             reply_bar,
             reply_to: RefCell::new(None),
+            pin_bar,
+            pins: RefCell::new(Vec::new()),
+            pin_shown: Cell::new(0),
+            may_pin: Cell::new(false),
             weak_self: weak_self.clone(),
             peer_quiet: RefCell::new(None),
             typing_sent_at: Cell::new(None),
         });
 
+        let weak = Rc::downgrade(&this);
+        this.pin_bar.connect_clicked(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.next_pin();
+            }
+        });
         let weak = Rc::downgrade(&this);
         send.connect_clicked(move |_| {
             if let Some(t) = weak.upgrade() {
@@ -947,12 +969,21 @@ impl ChatView {
                     n = n.saturating_mul(4);
                     entries = fetch(n);
                 }
-                (n, entries)
+                let (pins, may_pin) = match &group {
+                    Some(g) => (
+                        node.group_pinned(g.clone()).unwrap_or_default(),
+                        node.may_pin_in_group(g.clone()).unwrap_or(false),
+                    ),
+                    None => (node.pinned(device.clone()).unwrap_or_default(), true),
+                };
+                (n, entries, pins, may_pin)
             },
-            move |(n, entries)| {
+            move |(n, entries, pins, may_pin)| {
                 let Some(t) = weak.upgrade() else { return };
                 t.loading.set(false);
                 t.limit.set(n);
+                t.may_pin.set(may_pin);
+                t.show_pins(pins);
                 if !t.loaded.replace(true) || *t.entries.borrow() != entries {
                     t.display_entries(entries);
                 }
@@ -1588,6 +1619,18 @@ impl ChatView {
                 }),
             );
         }
+        if e.id != 0 && self.may_pin.get() {
+            let pinned = self.pins.borrow().iter().any(|p| p.id == e.id);
+            let (weak, entry) = (self.weak_self.clone(), e.clone());
+            item(
+                if pinned { "Unpin" } else { "Pin" },
+                Box::new(move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.pin(&entry, !pinned);
+                    }
+                }),
+            );
+        }
         if e.file.is_none() && !e.text.is_empty() {
             let (text, a) = (e.text.clone(), anchor.clone());
             item("Copy text", Box::new(move || a.clipboard().set_text(&text)));
@@ -1626,6 +1669,94 @@ impl ChatView {
         }
         pop.set_child(Some(&b));
         pop.popup();
+    }
+
+    /// Shows the pinned messages in the bar (the newest first).
+    fn show_pins(self: &Rc<Self>, pins: Vec<HistoryEntry>) {
+        let same = pins
+            .iter()
+            .map(|e| e.id)
+            .eq(self.pins.borrow().iter().map(|e| e.id));
+        if !same {
+            self.pin_shown.set(0);
+        }
+        *self.pins.borrow_mut() = pins;
+        self.draw_pin_bar();
+    }
+
+    fn draw_pin_bar(self: &Rc<Self>) {
+        let pins = self.pins.borrow();
+        self.pin_bar.set_visible(!pins.is_empty());
+        let Some(e) = pins
+            .iter()
+            .rev()
+            .nth(self.pin_shown.get().min(pins.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        b.append(&gtk::Image::from_icon_name("view-pin-symbolic"));
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        text.set_hexpand(true);
+        let title = if pins.len() > 1 {
+            format!(
+                "Pinned message {} of {}",
+                self.pin_shown.get() + 1,
+                pins.len()
+            )
+        } else {
+            "Pinned message".into()
+        };
+        text.append(&ui::label(&title, &["caption-heading", "accent"]));
+        let snippet = if e.text.is_empty() {
+            e.file.as_ref().map(|f| f.name.clone()).unwrap_or_default()
+        } else {
+            e.text.clone()
+        };
+        let l = ui::label(&snippet, &["caption"]);
+        l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        text.append(&l);
+        b.append(&text);
+        self.pin_bar.set_child(Some(&b));
+    }
+
+    /// Shows the pinned message in the bar, then puts the next one there.
+    fn next_pin(self: &Rc<Self>) {
+        let key = {
+            let pins = self.pins.borrow();
+            if pins.is_empty() {
+                return;
+            }
+            let i = self.pin_shown.get().min(pins.len() - 1);
+            self.pin_shown.set((i + 1) % pins.len());
+            pins.iter()
+                .rev()
+                .nth(i)
+                .map(|e| (e.at_ms, e.device.clone()))
+        };
+        if let Some(k) = key {
+            self.jump_to(k);
+        }
+        self.draw_pin_bar();
+    }
+
+    fn pin(self: &Rc<Self>, e: &HistoryEntry, pin: bool) {
+        let Some(node) = self.node() else { return };
+        let (group, device, id) = (self.group(), self.device(), e.id);
+        let weak = self.weak_self.clone();
+        bg(
+            move || match group {
+                Some(g) => node.pin_in_group(g, id, pin).map_err(|e| e.to_string()),
+                None => node.pin(device, id, pin).map_err(|e| e.to_string()),
+            },
+            move |r| {
+                let Some(t) = weak.upgrade() else { return };
+                if let Err(e) = r {
+                    t.toast(&format!("Couldn't pin: {e}"));
+                }
+                t.reload();
+            },
+        );
     }
 
     /// Who sent a quoted message, by device: us, or their name.

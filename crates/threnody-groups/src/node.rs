@@ -99,6 +99,12 @@ pub enum Update {
         group: GroupId,
         from: PublicIdentity,
     },
+    /// `from` pinned (or unpinned) a message in `group`.
+    Pinned {
+        group: GroupId,
+        from: PublicIdentity,
+        pin: bool,
+    },
 }
 
 pub struct GroupNode {
@@ -337,6 +343,40 @@ impl GroupNode {
         Ok(true)
     }
 
+    /// Pins (or unpins) message `id` in `group` for every member. Only the
+    /// owner and admins may; returns false if there's no such message.
+    pub fn pin(&mut self, node: &Node, group: &GroupId, id: u64, pin: bool) -> Result<bool> {
+        if !self.may_pin(group, &node.identity()) {
+            return Err(GroupError::NotOwner);
+        }
+        let conv = ConversationId::Group(*group);
+        let known = node
+            .history(conv)
+            .is_ok_and(|h| id != 0 && h.entries().iter().any(|e| e.message_id() == id));
+        if !known {
+            return Ok(false);
+        }
+        node.pin_in(conv, id, pin);
+        let out = self.groups.send(group, &Content::Pin { id, pin })?;
+        self.apply(node, out, true);
+        Ok(true)
+    }
+
+    /// Whether `who` may pin messages in `group`: its owner and admins.
+    pub fn may_pin(&self, group: &GroupId, who: &PublicIdentity) -> bool {
+        self.groups
+            .list_with_roles()
+            .into_iter()
+            .find(|(g, ..)| g == group)
+            .and_then(|(.., members, roles)| {
+                members
+                    .iter()
+                    .position(|m| m == who)
+                    .and_then(|i| roles.get(i).copied())
+            })
+            .is_some_and(|r| r.can_commit())
+    }
+
     /// Sends a file to every other member and records it (with
     /// `file.location`, where it is on this device) in the group's history.
     pub fn send_file(&mut self, node: &Node, group: &GroupId, file: OutgoingFile) -> Result<()> {
@@ -386,7 +426,7 @@ impl GroupNode {
                 device: *node.identity().as_bytes(),
                 text: match content {
                     Content::Text { text: t, .. } | Content::File { caption: t, .. } => t.clone(),
-                    Content::React { .. } => String::new(),
+                    Content::React { .. } | Content::Pin { .. } => String::new(),
                 },
                 offline: false,
                 expires_at_ms: node
@@ -867,6 +907,20 @@ impl GroupNode {
                 let who = node.reactor_of(&from);
                 node.apply_reaction(ConversationId::Group(group), who, id, &emoji, add);
                 Update::Reacted { group, from }
+            }
+            GroupEvent::Pin {
+                group,
+                from,
+                id,
+                pin,
+            } => {
+                // Only the owner's and admins' pins count.
+                if !self.may_pin(&group, &from)
+                    || !node.pin_in(ConversationId::Group(group), id, pin)
+                {
+                    return;
+                }
+                Update::Pinned { group, from, pin }
             }
         });
     }

@@ -147,6 +147,13 @@ pub enum GroupEvent {
         emoji: String,
         add: bool,
     },
+    /// `from` pinned (or unpinned) message `id`.
+    Pin {
+        group: GroupId,
+        from: PublicIdentity,
+        id: u64,
+        pin: bool,
+    },
 }
 
 /// Results of handling one input.
@@ -973,6 +980,12 @@ impl Groups {
                         id,
                         emoji,
                         add,
+                    },
+                    Content::Pin { id, pin } => GroupEvent::Pin {
+                        group,
+                        from: sender,
+                        id,
+                        pin,
                     },
                 });
             }

@@ -81,6 +81,8 @@ pub const FEATURE_READ: u64 = 512;
 /// The peer understands `AppMessage::Call` and `AppMessage::Media`
 /// (voice and video calls, see `crate::call`).
 pub const FEATURE_CALLS: u64 = 1024;
+/// The peer understands `AppMessage::Pin` (pinned messages).
+pub const FEATURE_PIN: u64 = 2048;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -91,7 +93,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_CREDENTIALS
     | FEATURE_TYPING
     | FEATURE_READ
-    | FEATURE_CALLS;
+    | FEATURE_CALLS
+    | FEATURE_PIN;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -116,6 +119,8 @@ impl Quote {
     }
 }
 
+/// `Pin` flag (key 6): unpin.
+const PIN_REMOVE: u64 = 1;
 /// `React` flag (key 6): take the reaction away.
 const REACT_REMOVE: u64 = 1;
 /// Most ids one `Ack` carries.
@@ -224,6 +229,14 @@ pub enum AppMessage {
         emoji: String,
         add: bool,
     },
+    /// Pin (or with `pin` false, unpin) message `id` in a conversation
+    /// (`conversation` as for `React`). Only sent to peers whose `Hello`
+    /// has [`FEATURE_PIN`].
+    Pin {
+        conversation: Vec<u8>,
+        id: u64,
+        pin: bool,
+    },
     /// The address and port the sender sees us at (Appendix N): our
     /// outside address, for rendezvous. Only to a peer whose `Hello` has
     /// [`FEATURE_OBSERVED`].
@@ -272,6 +285,7 @@ mod kind {
     pub const READ: u64 = 24;
     pub const CALL: u64 = 25;
     pub const MEDIA: u64 = 26;
+    pub const PIN: u64 = 27;
 }
 
 impl AppMessage {
@@ -293,6 +307,21 @@ impl AppMessage {
                 return cbor::to_vec(packed.len() + 16, |e| {
                     e.map_len(2)?.u8(0)?.uint(kind::ACK)?;
                     e.u8(2)?.bytes(&packed)?;
+                    Ok(())
+                });
+            }
+            Self::Pin {
+                conversation,
+                id,
+                pin,
+            } => {
+                return cbor::to_vec(conversation.len() + 32, |e| {
+                    e.map_len(3 + usize::from(!*pin))?.u8(0)?.uint(kind::PIN)?;
+                    e.u8(3)?.bytes(conversation)?;
+                    e.u8(5)?.uint(*id)?;
+                    if !*pin {
+                        e.u8(6)?.uint(PIN_REMOVE)?;
+                    }
                     Ok(())
                 });
             }
@@ -363,7 +392,8 @@ impl AppMessage {
                 | Self::Delete { .. }
                 | Self::Edit { .. }
                 | Self::React { .. }
-                | Self::Read { .. } => {
+                | Self::Read { .. }
+                | Self::Pin { .. } => {
                     unreachable!("encoded above")
                 }
                 Self::Cover => {
@@ -608,6 +638,11 @@ impl AppMessage {
                     inner: Box::new(inner),
                 }
             }
+            kind::PIN => Self::Pin {
+                conversation: required(conv, "conversation")?,
+                id: required(five, "message id")?,
+                pin: flags & PIN_REMOVE == 0,
+            },
             kind::EDIT => Self::Edit {
                 conversation: required(conv, "conversation")?,
                 id: required(five, "message id")?,
@@ -860,6 +895,16 @@ mod tests {
                 expires_in_s: None,
                 id: 9,
                 quote: Some(Quote::new(5, [4; 32], "shall we?")),
+            },
+            AppMessage::Pin {
+                conversation: vec![0; 33],
+                id: 4,
+                pin: true,
+            },
+            AppMessage::Pin {
+                conversation: vec![1; 17],
+                id: u64::MAX,
+                pin: false,
             },
             AppMessage::Ack(vec![]),
             AppMessage::Ack(vec![1, u64::MAX]),

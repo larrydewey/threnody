@@ -60,6 +60,12 @@ class ChatActivity : Activity() {
     private var convo: Conversation? = null
     private lateinit var bar: TopBar
     private lateinit var banner: LinearLayout
+    /** The pinned messages, newest pin shown; tapping steps through them. */
+    private lateinit var pinBar: LinearLayout
+    private var pins: List<HistoryEntry> = emptyList()
+    private var pinShown = 0
+    /** In a group: whether we may pin (owner or admin). */
+    private var mayPin = false
     private lateinit var messages: LinearLayout
     private lateinit var scroll: ScrollView
     /** The chat is at its newest message, and stays there as it grows. */
@@ -203,6 +209,16 @@ class ChatActivity : Activity() {
         }
         root.addView(bar, matchWrap)
         root.addView(banner, matchWrap)
+        pinBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(color(R.color.bar))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            visibility = View.GONE
+            background = ripple()
+            setOnClickListener { nextPin() }
+        }
+        root.addView(pinBar, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(replyBar, matchWrap)
         root.addView(composeBar, matchWrap)
@@ -687,6 +703,7 @@ class ChatActivity : Activity() {
                 is NodeEvent.GroupLeft -> e.group == g
                 is NodeEvent.Delivered -> e.group == g
                 is NodeEvent.Reacted -> e.group == g
+                is NodeEvent.Pinned -> e.group == g
                 else -> false
             }
         }
@@ -702,6 +719,7 @@ class ChatActivity : Activity() {
             is NodeEvent.Delivered -> e.peer
             is NodeEvent.ProfileChanged -> e.peer
             is NodeEvent.Reacted -> if (e.group == null) e.peer else return false
+            is NodeEvent.Pinned -> if (e.group == null) e.peer else return false
             is NodeEvent.IdentityRevealed -> e.peer
             is NodeEvent.Typing -> e.peer
             is NodeEvent.Read -> e.peer
@@ -765,6 +783,8 @@ class ChatActivity : Activity() {
             pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
+        val pinned = try { if (g != null) node.groupPinned(g) else node.pinned(device) } catch (_: Exception) { emptyList() }
+        val canPin = g == null || try { node.mayPinInGroup(g) } catch (_: Exception) { false }
         // Credential offers and requests from this contact, waiting for an answer.
         val mine = c?.devices ?: listOf(device)
         val offers = if (g == null) node.credentialOffers().filter { it.peer in mine } else emptyList()
@@ -774,6 +794,8 @@ class ChatActivity : Activity() {
             if (gen != refreshGen.get()) return@runOnUiThread
             convo = c
             info = gi
+            mayPin = canPin
+            showPins(pinned)
             if (Threnody.visibleChat.isNotEmpty()) {
                 Threnody.visibleChat = setOf(key, device) + (c?.devices ?: emptyList())
             }
@@ -1334,6 +1356,55 @@ class ChatActivity : Activity() {
         }
     }
 
+    /** Shows the pinned messages (newest first in the bar). */
+    private fun showPins(list: List<HistoryEntry>) {
+        if (list.map { it.id } != pins.map { it.id }) pinShown = 0
+        pins = list
+        pinBar.removeAllViews()
+        if (list.isEmpty()) {
+            pinBar.visibility = View.GONE
+            return
+        }
+        val e = list[list.size - 1 - pinShown.coerceIn(0, list.size - 1)]
+        pinBar.addView(ImageView(this).apply {
+            setImageResource(R.drawable.ic_pin)
+            imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.accent))
+        }, LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(12) })
+        pinBar.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label(if (list.size > 1) "Pinned message ${pinShown + 1} of ${list.size}" else "Pinned message",
+                12f, R.color.accent).apply { setTypeface(typeface, Typeface.BOLD) })
+            addView(label(snippet(e), 14f, R.color.text).apply {
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        pinBar.contentDescription = "Pinned: ${snippet(e)}. Tap to show it."
+        pinBar.visibility = View.VISIBLE
+    }
+
+    /** Shows the pinned message in the bar, then puts the next one there. */
+    private fun nextPin() {
+        if (pins.isEmpty()) return
+        val e = pins[pins.size - 1 - pinShown.coerceIn(0, pins.size - 1)]
+        val k = mark(e)
+        if (k in bubbles) reveal(k) else {
+            jump = k to e.atMs
+            if (!allLoaded && oldestLoaded > e.atMs) loadUntil(e.atMs)
+        }
+        pinShown = (pinShown + 1) % pins.size
+        showPins(pins)
+    }
+
+    private fun pin(e: HistoryEntry, pin: Boolean) {
+        val g = group
+        Threading.background {
+            run(if (pin) "pin" else "unpin") {
+                if (g != null) node.pinInGroup(g, e.id, pin) else node.pin(device, e.id, pin)
+            }
+        }
+    }
+
     /** What a quote of `e` shows: its text, or a file's name. */
     private fun snippet(e: HistoryEntry) = e.text.ifEmpty { e.file?.name ?: "" }
 
@@ -1383,6 +1454,7 @@ class ChatActivity : Activity() {
         val canEdit = mine && e.file == null
         val options = buildList {
             add("Reply")
+            if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
             // Text isn't selectable in the bubble (it would take the long
             // press), so copying is offered here.
             if (e.text.isNotEmpty()) {
@@ -1396,6 +1468,7 @@ class ChatActivity : Activity() {
         fun pick(option: String) {
             if (option == "Edit") return editMessage(e)
             if (option == "Reply") return replyingTo(e)
+            if (option == "Pin" || option == "Unpin") return pin(e, option == "Pin")
             if (option == "Copy text") {
                 getSystemService(android.content.ClipboardManager::class.java)
                     ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))

@@ -6,7 +6,8 @@ use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Quer
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
-    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING, Quote,
+    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_PIN, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
+    Quote,
 };
 
 use crate::delivery::Tag;
@@ -245,6 +246,108 @@ impl Node {
                     .map(|a| a.0)
             })
             .unwrap_or(*peer.as_bytes())
+    }
+
+    /// Pins (or with `pin` false, unpins) message `id` in `conv` on this
+    /// device only (groups tell members themselves). Returns true if that
+    /// changed anything.
+    pub fn pin_in(&self, conv: ConversationId, id: u64, pin: bool) -> bool {
+        self.shared
+            .home
+            .pin_entry(self.identity_ref(), conv, now_ms(), id, pin)
+            .unwrap_or(false)
+    }
+
+    /// Pinned messages in `conv`, oldest pin first.
+    pub fn pinned(&self, conv: ConversationId) -> Vec<Entry> {
+        let Ok(h) = self.history(conv) else {
+            return Vec::new();
+        };
+        h.pinned()
+            .iter()
+            .filter_map(|id| h.entries().iter().find(|e| e.message_id() == *id))
+            .cloned()
+            .collect()
+    }
+
+    /// Pins (or unpins) message `id` in our conversation with `peer`, for
+    /// both sides: tells their devices and ours. Returns false if there's
+    /// no such message.
+    pub fn pin(&self, peer: &PublicIdentity, id: u64, pin: bool) -> bool {
+        let conv = self.conversation_for(peer);
+        let known = self
+            .history(conv)
+            .is_ok_and(|h| id != 0 && h.entries().iter().any(|e| e.message_id() == id));
+        if !known {
+            return false;
+        }
+        self.pin_in(conv, id, pin);
+        let msg = AppMessage::Pin {
+            conversation: conv.to_bytes(),
+            id,
+            pin,
+        };
+        for d in self.account_targets(peer) {
+            if !self.supports(&d, FEATURE_PIN) {
+                continue;
+            }
+            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
+                let _ = self.send_offline(&d, &msg);
+            }
+        }
+        true
+    }
+
+    /// `peer` (or one of our devices) pinned or unpinned message `id`.
+    pub(crate) fn on_pin(&self, from: &PublicIdentity, conversation: &[u8], id: u64, pin: bool) {
+        let Some(conv) = self.conversation_from(from, conversation) else {
+            return;
+        };
+        if self.pin_in(conv, id, pin) {
+            self.emit(Event::Pinned {
+                peer: *from,
+                id,
+                pin,
+            });
+        }
+    }
+
+    /// The conversation a message from `from` names: ours with `from`, or
+    /// for one of our own devices, the one it names (its chat with us
+    /// being ours with it).
+    fn conversation_from(
+        &self,
+        from: &PublicIdentity,
+        conversation: &[u8],
+    ) -> Option<ConversationId> {
+        if !self.is_own_device(from) {
+            return Some(self.conversation_for(from));
+        }
+        match ConversationId::from_bytes(conversation)? {
+            ConversationId::Peer(k) if k == *self.identity().as_bytes() => {
+                Some(self.conversation_for(from))
+            }
+            c => Some(c),
+        }
+    }
+
+    /// Every device of `peer`'s account and our other connected devices,
+    /// except this one: where a change to our chat with `peer` goes.
+    fn account_targets(&self, peer: &PublicIdentity) -> Vec<PublicIdentity> {
+        let mut targets: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .map(|s| s.peer)
+            .filter(|p| self.is_own_device(p))
+            .collect();
+        match self.account_of(peer) {
+            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
+            None => targets.push(*peer),
+        }
+        targets.sort_unstable_by_key(|p| *p.as_bytes());
+        targets.dedup();
+        targets.retain(|d| *d != self.identity());
+        targets
     }
 
     /// Adds (or with `add` false, takes away) our `emoji` on message `id`

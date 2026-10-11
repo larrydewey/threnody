@@ -906,7 +906,9 @@ impl App {
             | NodeEvent::MessagesDeleted { peer, .. }
             | NodeEvent::ApprovalChanged { peer, .. }
             | NodeEvent::ProfileChanged { peer } => (Some(peer.clone()), None),
-            NodeEvent::Delivered { peer, group } | NodeEvent::Reacted { peer, group } => {
+            NodeEvent::Delivered { peer, group }
+            | NodeEvent::Reacted { peer, group }
+            | NodeEvent::Pinned { peer, group, .. } => {
                 (Some(group.clone().unwrap_or_else(|| peer.clone())), None)
             }
             NodeEvent::Typing { peer, active } => {

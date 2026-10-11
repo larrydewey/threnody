@@ -245,3 +245,61 @@ async fn replies_quote_what_they_answer() {
     assert_eq!(quotes(&bob, gc), want);
     assert_eq!(quotes(&alice, gc), want);
 }
+
+#[tokio::test]
+async fn pins_reach_both_sides_and_only_admins_pin_in_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let aid = alice.node.identity();
+    let pins = |n: &N, conv: ConversationId| -> Vec<String> {
+        n.node.pinned(conv).into_iter().map(|e| e.text).collect()
+    };
+
+    // 1:1: either side pins, and both see it.
+    alice.node.send_text(&bid, "the address").unwrap();
+    let (aconv, bconv) = (
+        alice.node.conversation_for(&bid),
+        bob.node.conversation_for(&aid),
+    );
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[1]
+            .node
+            .history(bconv)
+            .is_ok_and(|h| h.entries().len() == 1)
+    })
+    .await;
+    let id = bob.node.history(bconv).unwrap().entries()[0].message_id();
+    assert!(bob.node.pin(&aid, id, true));
+    until(&mut [&mut alice, &mut bob], |ns| {
+        pins(ns[0], aconv) == ["the address"]
+    })
+    .await;
+    assert_eq!(pins(&bob, bconv), ["the address"]);
+    assert!(alice.node.pin(&bid, id, false));
+    until(&mut [&mut alice, &mut bob], |ns| {
+        pins(ns[1], bconv).is_empty()
+    })
+    .await;
+
+    // A group: the owner pins for everyone; a member can't.
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &aid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[0].in_group(&g)).await;
+    alice.groups.send_text(&alice.node, &g, "agenda").unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[1].texts(&g) == ["agenda"]
+    })
+    .await;
+    let gc = ConversationId::Group(g);
+    let id = bob.node.history(gc).unwrap().entries()[0].message_id();
+    assert!(!alice.groups.may_pin(&g, &aid));
+    assert!(alice.groups.pin(&alice.node, &g, id, true).is_err());
+    assert!(bob.groups.pin(&bob.node, &g, id, true).unwrap());
+    until(&mut [&mut alice, &mut bob], |ns| {
+        pins(ns[0], gc) == ["agenda"]
+    })
+    .await;
+    assert_eq!(pins(&bob, gc), ["agenda"]);
+}
