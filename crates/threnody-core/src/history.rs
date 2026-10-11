@@ -184,6 +184,18 @@ fn same(a: &Entry, b: &Entry) -> bool {
     if a.outgoing && a.local_id != 0 && b.local_id != 0 {
         return a.local_id == b.local_id;
     }
+    // The sender's id for the message, where both have it: an outgoing
+    // one's local id is that id, and a sibling records it as remote.
+    let id = |e: &Entry| {
+        if e.local_id != 0 {
+            e.local_id
+        } else {
+            e.remote_id
+        }
+    };
+    if id(a) != 0 && id(b) != 0 {
+        return id(a) == id(b);
+    }
     content && a.at_ms.abs_diff(b.at_ms) <= 10 * 60 * 1000
 }
 

@@ -730,7 +730,7 @@ impl Groups {
                 group, to, message, ..
             } => self.on_forward(from, group, to, message),
             // Delivery bookkeeping, not group state: see `node::GroupNode`.
-            GroupWire::Receipt { .. } => Ok(Output::default()),
+            GroupWire::Receipt { .. } | GroupWire::AddDevice { .. } => Ok(Output::default()),
             GroupWire::Leave { group } => {
                 // Only the owner commits; it removes a member who asks.
                 if self.group(&group)?.owner != self.me {

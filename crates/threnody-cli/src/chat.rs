@@ -1379,10 +1379,13 @@ impl Ui {
                 self.name(&device),
                 account.fingerprint()
             ),
-            Event::DeviceLinked { device } => println!(
-                "* linked new device {} into your account",
-                self.name(&device)
-            ),
+            Event::DeviceLinked { device } => {
+                println!(
+                    "* linked new device {} into your account",
+                    self.name(&device)
+                );
+                self.groups.linked(&self.node, &device);
+            }
             Event::LinkRejected { device } => {
                 println!("! rejected a link attempt from {}", self.name(&device))
             }

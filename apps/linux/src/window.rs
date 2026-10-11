@@ -1047,8 +1047,13 @@ impl App {
         let conv = about
             .as_deref()
             .and_then(|a| self.conversation_of(persona.as_deref(), a));
-        // Reload the open chat if it's about it.
-        if let Some(chat) = self.chat.borrow().as_ref() {
+        // Reload the open chat if it's about it; history from our other
+        // devices may be about any chat.
+        if let Some(chat) = self.chat.borrow().as_ref()
+            && matches!(event, NodeEvent::HistorySynced { .. })
+        {
+            chat.reload();
+        } else if let Some(chat) = self.chat.borrow().as_ref() {
             let open = chat.chat();
             let matches = conv.as_ref().is_some_and(|c| c.chat == open)
                 || about.as_deref().is_some_and(|a| match &open.target {

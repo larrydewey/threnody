@@ -198,6 +198,11 @@ impl GroupUi {
         }
     }
 
+    /// Adds our newly linked `device` to our groups.
+    pub fn linked(&mut self, node: &Node, device: &PublicIdentity) {
+        self.groups.linked(node, device);
+    }
+
     /// Sends group messages held for `peer`, who just connected.
     pub fn connected(
         &mut self,

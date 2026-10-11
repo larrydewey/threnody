@@ -5869,6 +5869,7 @@ dependencies = [
  "openmls",
  "openmls_rust_crypto",
  "openmls_traits",
+ "tempfile",
  "thiserror 2.0.21",
  "threnody-core",
  "threnody-net",

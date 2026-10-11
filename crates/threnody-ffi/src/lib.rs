@@ -1841,8 +1841,10 @@ PersistentKeepalive = 25\n",
                 // media only, and never reaches the app or its logs.
                 ref e @ Event::CallSignal { .. } => self.call_event(e),
                 other => {
-                    if let Event::Connected { peer, .. } = &other {
-                        self.group_connected(peer);
+                    match &other {
+                        Event::Connected { peer, .. } => self.group_connected(peer),
+                        Event::DeviceLinked { device } => self.group_linked(device),
+                        _ => {}
                     }
                     self.call_event(&other);
                     return Some(convert(other));

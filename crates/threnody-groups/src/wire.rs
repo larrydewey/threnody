@@ -52,6 +52,10 @@ pub enum GroupWire {
     },
     /// To the owner: remove me (the sender) from the group.
     Leave { group: GroupId },
+    /// Between devices of one account: add `device` (another device of the
+    /// sender's account) to this group. To the owner, a request; to
+    /// `device` itself, word to accept the invitation that follows.
+    AddDevice { group: GroupId, device: [u8; 32] },
 }
 
 impl GroupWire {
@@ -63,7 +67,8 @@ impl GroupWire {
             | Self::Message { group, .. }
             | Self::Forward { group, .. }
             | Self::Receipt { group, .. }
-            | Self::Leave { group } => group,
+            | Self::Leave { group }
+            | Self::AddDevice { group, .. } => group,
         }
     }
 
@@ -90,6 +95,7 @@ impl GroupWire {
                 member, reference, ..
             } => (6, None, None, Some(member), *reference),
             Self::Leave { .. } => (7, None, None, None, 0),
+            Self::AddDevice { device, .. } => (8, None, None, Some(device), 0),
         };
         let size = payload.map_or(0, <[u8]>::len) + name.map_or(0, str::len) + 48;
         cbor::to_vec(size, |e| {
@@ -165,6 +171,10 @@ impl GroupWire {
                 reference,
             },
             7 => Self::Leave { group },
+            8 => Self::AddDevice {
+                group,
+                device: required(to, "device")?,
+            },
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -464,6 +474,10 @@ mod tests {
                 reference: 3,
             },
             GroupWire::Leave { group: g },
+            GroupWire::AddDevice {
+                group: g,
+                device: [7; 32],
+            },
         ] {
             assert_eq!(GroupWire::decode(&m.encode().unwrap()).unwrap(), m);
         }

@@ -8,13 +8,15 @@
 //!   connected (`AccountMsg::Transcript`);
 //! - when a session with one of our devices starts, we send it our outgoing
 //!   entries newer than what it has had from us. The first time, we send
-//!   all of our 1:1 history, so a newly linked device starts complete.
+//!   all of our history, 1:1 and group, so a newly linked device starts
+//!   complete.
 //!
 //! Receivers merge entries, skipping ones already present, and only from
 //! devices of our own account. Files travel as records (name, size), not
-//! contents. Group history isn't sent: a device only reads a group from
-//! when it joined (MLS), and sees what our other devices send there as a
-//! member.
+//! contents. A device reads a group's messages (MLS) only from when it
+//! joined, so for groups we also send every entry, ours or not, newer
+//! than what it has had from us: that covers the time between being
+//! linked and being added.
 
 use std::collections::HashMap;
 
@@ -83,9 +85,7 @@ impl Node {
         let now = now_ms();
         let mut out = Vec::new();
         for conv in self.shared.home.conversations() {
-            if !matches!(conv, ConversationId::Peer(_)) {
-                continue;
-            }
+            let group = matches!(conv, ConversationId::Group(_));
             let Ok(h) = self.history(conv) else { continue };
             let entries: Vec<Entry> = h
                 .entries()
@@ -93,7 +93,7 @@ impl Node {
                 .filter(|e| match since {
                     // First sync: everything we have.
                     None => true,
-                    Some(t) => e.outgoing && e.device == me && e.at_ms > t,
+                    Some(t) => e.at_ms > t && (group || (e.outgoing && e.device == me)),
                 })
                 .cloned()
                 .map(portable)
@@ -153,9 +153,6 @@ impl Node {
         else {
             return;
         };
-        if !matches!(conv, ConversationId::Peer(_)) {
-            return;
-        }
         // Nothing from before the user cleared this chat.
         let cleared = self.cleared_at(conv);
         let entries: Vec<Entry> = h
