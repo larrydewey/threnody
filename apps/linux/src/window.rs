@@ -372,7 +372,11 @@ impl App {
         for i in &rows {
             let c = &convs[*i];
             let n = unread.get(&c.chat).copied().unwrap_or(0).max(c.unread);
-            self.list.append(&self.row(c, n));
+            let row = self.row(c, n);
+            if !c.key.is_empty() && !c.archived {
+                self.draggable(&row, c);
+            }
+            self.list.append(&row);
         }
         drop(unread);
         self.draw_tabs(&convs);
@@ -411,6 +415,76 @@ impl App {
             w.show(&id);
         }
         w.present();
+    }
+
+    /// Lets a chat be dragged onto another: among the pinned chats it's
+    /// pinned there; below them it's unpinned (the rest follow recent
+    /// activity).
+    fn draggable(self: &Rc<Self>, row: &gtk::ListBoxRow, c: &Conversation) {
+        let source = gtk::DragSource::new();
+        source.set_actions(gtk::gdk::DragAction::MOVE);
+        let key = c.key.clone();
+        source.connect_prepare(move |_, _, _| {
+            Some(gtk::gdk::ContentProvider::for_value(&key.to_value()))
+        });
+        row.add_controller(source);
+        let target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        let (weak, here, r) = (Rc::downgrade(self), c.key.clone(), row.clone());
+        target.connect_drop(move |_, value, _, y| {
+            let Some(this) = weak.upgrade() else { return false };
+            let Ok(moved) = value.get::<String>() else { return false };
+            if moved == here {
+                return false;
+            }
+            // The chats shown, in order, that can be pinned.
+            let shown: Vec<Conversation> = {
+                let convs = this.convs.borrow();
+                this.rows
+                    .borrow()
+                    .iter()
+                    .map(|i| convs[*i].clone())
+                    .filter(|c| !c.key.is_empty() && !c.archived)
+                    .collect()
+            };
+            let Some(was) = shown.iter().find(|c| c.key == moved).cloned() else {
+                return false;
+            };
+            let others: Vec<&Conversation> = shown.iter().filter(|c| c.key != moved).collect();
+            let Some(at) = others.iter().position(|c| c.key == here) else {
+                return false;
+            };
+            let to = at + usize::from(y > f64::from(r.height()) / 2.0);
+            let pinned_here = others.iter().filter(|c| c.pinned.is_some()).count();
+            // Every pinned chat, the hidden ones too, in order.
+            let mut pinned: Vec<(usize, String)> = this
+                .convs
+                .borrow()
+                .iter()
+                .filter(|c| c.key != moved && !c.key.is_empty())
+                .filter_map(|c| c.pinned.map(|p| (p, c.key.clone())))
+                .collect();
+            pinned.sort();
+            let mut order: Vec<String> = pinned.into_iter().map(|(_, k)| k).collect();
+            order.dedup();
+            if to <= pinned_here {
+                // Next to the pinned chat it now follows, or before the first.
+                let at = match to.checked_sub(1).and_then(|i| others.get(i)) {
+                    Some(before) => order.iter().position(|k| *k == before.key).map_or(order.len(), |i| i + 1),
+                    None => others
+                        .iter()
+                        .find(|c| c.pinned.is_some())
+                        .and_then(|f| order.iter().position(|k| *k == f.key))
+                        .unwrap_or(0),
+                };
+                order.insert(at.min(order.len()), moved);
+            } else if was.pinned.is_none() {
+                this.toast("Drop it among the pinned chats to pin it there; the others follow recent activity.");
+                return false;
+            }
+            this.run(None, "reorder the chats", move |n| n.set_pinned_chats(order), None);
+            true
+        });
+        row.add_controller(target);
     }
 
     /// Whether `tab` shows `c`: archived chats only in the archive.

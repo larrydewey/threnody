@@ -340,7 +340,25 @@ class ListActivity : Activity() {
                 gravity = Gravity.CENTER
             }, matchWrap)
         }
-        for (item in l.items) content.addView(row(item), matchWrap)
+        rows.clear()
+        for (item in l.items) {
+            val r = row(item)
+            rows += r
+            content.addView(r, matchWrap)
+            // Long-press and drag to move it; a long press alone opens its menu.
+            DragReorder.attach(content, r, { rows }, { from, to -> moveItem(l, from, to) }) { itemMenu(item) }
+        }
+    }
+
+    /** The item rows on screen, in order (for dragging). */
+    private val rows = mutableListOf<View>()
+
+    /** Moves the item at `from` so it ends up at `to`. */
+    private fun moveItem(l: ListInfo, from: Int, to: Int) {
+        val item = l.items.getOrNull(from) ?: return
+        val others = l.items.filter { it.id != item.id }
+        val after = if (to == 0) null else others.getOrNull(to - 1)?.id
+        change { it.moveListItem(listId, item.id, after) }
     }
 
     private fun row(item: ListItemInfo): View {
@@ -367,7 +385,6 @@ class ListActivity : Activity() {
                     change { it.editListItem(listId, item.id, t) }
                 }
             }
-            setOnLongClickListener { v -> Design.mediumHaptic(v); itemMenu(item); true }
         }
     }
 

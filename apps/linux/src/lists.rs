@@ -378,6 +378,51 @@ impl ListsWindow {
         popover.set_child(Some(&pop));
         more.set_popover(Some(&popover));
         b.append(&more);
+
+        // Drag an item onto another to move it there (above it, or below
+        // it when dropped on its lower half).
+        let source = gtk::DragSource::new();
+        source.set_actions(gtk::gdk::DragAction::MOVE);
+        let iid = item.id;
+        source.connect_prepare(move |_, _, _| {
+            Some(gtk::gdk::ContentProvider::for_value(
+                &iid.to_string().to_value(),
+            ))
+        });
+        b.add_controller(source);
+        let target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        let (weak, lid, here, row) = (self.weak_self.clone(), l.id.clone(), item.id, b.clone());
+        let ids: Vec<u64> = l.items.iter().map(|i| i.id).collect();
+        target.connect_drop(move |_, value, _, y| {
+            let Some(t) = weak.upgrade() else {
+                return false;
+            };
+            let Some(moved) = value
+                .get::<String>()
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            else {
+                return false;
+            };
+            if moved == here {
+                return false;
+            }
+            let others: Vec<u64> = ids.iter().copied().filter(|i| *i != moved).collect();
+            let at = others.iter().position(|i| *i == here).unwrap_or(0);
+            let below = y > f64::from(row.height()) / 2.0;
+            let after = if below {
+                Some(here)
+            } else if at == 0 {
+                None
+            } else {
+                Some(others[at - 1])
+            };
+            let lid = lid.clone();
+            t.change(move |n| n.move_list_item(lid, moved, after));
+            true
+        });
+        b.add_controller(target);
+        b.set_tooltip_text(Some("Drag to move; click the text to edit"));
         b.upcast()
     }
 
