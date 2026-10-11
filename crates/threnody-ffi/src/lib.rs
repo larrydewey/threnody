@@ -21,6 +21,7 @@ uniffi::setup_scaffolding!();
 
 mod calls;
 mod folders;
+pub use folders::{ChatUnread, FolderInfo, QuietSlotInfo};
 mod groups;
 mod persona;
 mod volunteer;

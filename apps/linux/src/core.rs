@@ -142,6 +142,13 @@ pub struct Conversation {
     pub last: Option<HistoryEntry>,
     /// What we started writing here and haven't sent.
     pub draft: String,
+    /// The chat's key (as folders name chats), for the main identity's
+    /// chats; empty otherwise.
+    pub key: String,
+    pub unread: u32,
+    /// Where it is among the pinned chats.
+    pub pinned: Option<usize>,
+    pub archived: bool,
 }
 
 impl Conversation {
@@ -419,8 +426,26 @@ impl Core {
         for (id, node) in personas {
             out.extend(conversations(&node, Some(id)));
         }
-        out.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
+        // Requests and invitations, then pinned chats in order, then newest.
+        out.sort_by_key(|c| {
+            let (top, at) = c.sort_key();
+            (
+                std::cmp::Reverse(top),
+                c.pinned.unwrap_or(usize::MAX),
+                std::cmp::Reverse(at),
+            )
+        });
         out
+    }
+
+    /// The main identity's folders, and the chats each shows now.
+    pub fn folders(&self) -> (Vec<threnody_ffi::FolderInfo>, HashMap<u64, HashSet<String>>) {
+        let f = self.main.folders();
+        let chats = f
+            .iter()
+            .map(|x| (x.id, self.main.folder_chats(x.id).into_iter().collect()))
+            .collect();
+        (f, chats)
     }
 
     /// A contact's name, "You" for this device, else a short fingerprint.
@@ -981,6 +1006,35 @@ impl Core {
 
 /// One entry per contact account and group of `node`.
 fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
+    // Folders, pins, the archive and unread counts: the main identity's.
+    let main = persona.is_none();
+    let unread: HashMap<String, u32> = if main {
+        node.unread_counts()
+            .into_iter()
+            .map(|u| (u.chat, u.unread))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let pinned = if main {
+        node.pinned_chats()
+    } else {
+        Vec::new()
+    };
+    let archived: HashSet<String> = if main {
+        node.archived_chats().into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+    let mark = |mut c: Conversation, key: &str| {
+        if main {
+            c.key = key.to_owned();
+            c.unread = unread.get(key).copied().unwrap_or(0);
+            c.pinned = pinned.iter().position(|p| p == key);
+            c.archived = archived.contains(key);
+        }
+        c
+    };
     let mine = node.account_fingerprint();
     let me = node.device_fingerprint();
     let mut by_key: Vec<(String, Vec<ContactInfo>)> = Vec::new();
@@ -1006,82 +1060,105 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             .history(best.fingerprint.clone(), 1)
             .ok()
             .and_then(|mut h| h.pop());
-        out.push(Conversation {
-            chat: ChatRef {
-                persona: persona.clone(),
-                target: Target::Contact(key),
+        let k = key.clone();
+        out.push(mark(
+            Conversation {
+                chat: ChatRef {
+                    persona: persona.clone(),
+                    target: Target::Contact(key),
+                },
+                title: name.unwrap_or_else(|| short(&best.fingerprint)),
+                device: best.fingerprint.clone(),
+                connected: devices.iter().any(|d| d.connected),
+                approved: devices.iter().any(|d| d.local_approved),
+                verified: devices.iter().all(|d| d.verified),
+                any_verified: devices.iter().any(|d| d.verified),
+                unverified: devices
+                    .iter()
+                    .filter(|d| !d.verified)
+                    .map(|d| d.fingerprint.clone())
+                    .collect(),
+                accepted: devices.iter().any(|d| d.accepted),
+                revealed: devices.iter().find_map(|d| d.revealed.clone()),
+                revealed_invite: devices.iter().find_map(|d| d.revealed_invite.clone()),
+                devices: devices.iter().map(|d| d.fingerprint.clone()).collect(),
+                group: None,
+                invite: None,
+                draft: node.draft(best.fingerprint.clone()).unwrap_or_default(),
+                last,
+                key: String::new(),
+                unread: 0,
+                pinned: None,
+                archived: false,
             },
-            title: name.unwrap_or_else(|| short(&best.fingerprint)),
-            device: best.fingerprint.clone(),
-            connected: devices.iter().any(|d| d.connected),
-            approved: devices.iter().any(|d| d.local_approved),
-            verified: devices.iter().all(|d| d.verified),
-            any_verified: devices.iter().any(|d| d.verified),
-            unverified: devices
-                .iter()
-                .filter(|d| !d.verified)
-                .map(|d| d.fingerprint.clone())
-                .collect(),
-            accepted: devices.iter().any(|d| d.accepted),
-            revealed: devices.iter().find_map(|d| d.revealed.clone()),
-            revealed_invite: devices.iter().find_map(|d| d.revealed_invite.clone()),
-            devices: devices.iter().map(|d| d.fingerprint.clone()).collect(),
-            group: None,
-            invite: None,
-            draft: node.draft(best.fingerprint.clone()).unwrap_or_default(),
-            last,
-        });
+            &k,
+        ));
     }
     for g in node.groups() {
         let last = node
             .group_history(g.id.clone(), 1)
             .ok()
             .and_then(|mut h| h.pop());
-        out.push(Conversation {
-            chat: ChatRef {
-                persona: persona.clone(),
-                target: Target::Group(g.id.clone()),
+        let k = g.id.clone();
+        out.push(mark(
+            Conversation {
+                chat: ChatRef {
+                    persona: persona.clone(),
+                    target: Target::Group(g.id.clone()),
+                },
+                title: g.name.clone(),
+                device: String::new(),
+                devices: Vec::new(),
+                connected: false,
+                approved: true,
+                verified: true,
+                any_verified: false,
+                unverified: Vec::new(),
+                accepted: true,
+                revealed: None,
+                revealed_invite: None,
+                draft: node.group_draft(g.id.clone()).unwrap_or_default(),
+                group: Some(g),
+                invite: None,
+                last,
+                key: String::new(),
+                unread: 0,
+                pinned: None,
+                archived: false,
             },
-            title: g.name.clone(),
-            device: String::new(),
-            devices: Vec::new(),
-            connected: false,
-            approved: true,
-            verified: true,
-            any_verified: false,
-            unverified: Vec::new(),
-            accepted: true,
-            revealed: None,
-            revealed_invite: None,
-            draft: node.group_draft(g.id.clone()).unwrap_or_default(),
-            group: Some(g),
-            invite: None,
-            last,
-        });
+            &k,
+        ));
     }
     // Notes to self, for the main identity.
     if persona.is_none() {
-        out.push(Conversation {
-            chat: ChatRef {
-                persona: None,
-                target: Target::Note,
+        out.push(mark(
+            Conversation {
+                chat: ChatRef {
+                    persona: None,
+                    target: Target::Note,
+                },
+                title: "Note to self".into(),
+                device: String::new(),
+                devices: Vec::new(),
+                connected: false,
+                approved: true,
+                verified: true,
+                any_verified: false,
+                unverified: Vec::new(),
+                accepted: true,
+                revealed: None,
+                revealed_invite: None,
+                group: None,
+                invite: None,
+                draft: node.note_draft(),
+                last: node.note_history(1).ok().and_then(|mut h| h.pop()),
+                key: String::new(),
+                unread: 0,
+                pinned: None,
+                archived: false,
             },
-            title: "Note to self".into(),
-            device: String::new(),
-            devices: Vec::new(),
-            connected: false,
-            approved: true,
-            verified: true,
-            any_verified: false,
-            unverified: Vec::new(),
-            accepted: true,
-            revealed: None,
-            revealed_invite: None,
-            group: None,
-            invite: None,
-            draft: node.note_draft(),
-            last: node.note_history(1).ok().and_then(|mut h| h.pop()),
-        });
+            "notes",
+        ));
     }
     for i in node.group_invites() {
         out.push(Conversation {
@@ -1104,6 +1181,10 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             invite: Some(i),
             last: None,
             draft: String::new(),
+            key: String::new(),
+            unread: 0,
+            pinned: None,
+            archived: false,
         });
     }
     out
