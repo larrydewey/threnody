@@ -33,6 +33,11 @@
   border-radius: 6px;
   background-color: alpha(currentColor, 0.08);
 }
+.pin-bar {
+  border-radius: 0;
+  padding: 6px 16px;
+  border-bottom: 1px solid alpha(currentColor, 0.1);
+}
 .reply-bar {
   padding: 6px 12px 0 12px;
   border-left: 3px solid @accent_color;

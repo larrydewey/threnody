@@ -189,7 +189,7 @@ impl GroupWire {
 ///                     ? 5: album uint, ? 6: message id uint,
 ///                     ? 7: clip duration_ms uint, ? 8: quoted id uint,
 ///                     ? 9: quoted author bstr, ? 10: quoted text tstr }
-/// kind: 1 text, 2 file, 3 reaction
+/// kind: 1 text, 2 file, 3 reaction, 4 pin
 /// flags: 1 sensitive, 2 voice message, 4 video message (file);
 ///        1 remove (reaction)
 /// ```
@@ -218,6 +218,8 @@ pub enum Content {
     /// Add (or with `add` false, take away) the sender's `emoji` on
     /// message `id`.
     React { id: u64, emoji: String, add: bool },
+    /// Pin (or with `pin` false, unpin) message `id` (owner and admins).
+    Pin { id: u64, pin: bool },
 }
 
 const TAGGED: u8 = 0xFF;
@@ -261,6 +263,7 @@ impl Content {
                 clip.map_or(0, |c| c.duration_ms),
             ),
             Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id, 0),
+            Self::Pin { id, pin } => (4, "", None, u64::from(!*pin), "", 0, *id, 0),
         };
         let quote = match self {
             Self::Text { quote, .. } => quote.as_ref(),
@@ -372,6 +375,10 @@ impl Content {
                     add: flags & 1 == 0,
                 }
             }
+            4 if id != 0 => Self::Pin {
+                id,
+                pin: flags & 1 == 0,
+            },
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -414,6 +421,8 @@ mod tests {
                 emoji: "🎉".into(),
                 add: false,
             },
+            Content::Pin { id: 42, pin: true },
+            Content::Pin { id: 42, pin: false },
             Content::File {
                 name: "a.txt".into(),
                 data: vec![0xFF; 3000],

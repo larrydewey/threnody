@@ -91,6 +91,11 @@ fn event(u: Update) -> NodeEvent {
             member: fp(&member),
             role: role as u8,
         },
+        Update::Pinned { group, from, pin } => NodeEvent::Pinned {
+            peer: fp(&from),
+            group: Some(hex(&group)),
+            pin,
+        },
         Update::Reacted { group, from } => NodeEvent::Reacted {
             peer: fp(&from),
             group: Some(hex(&group)),
@@ -381,6 +386,31 @@ impl ThrenodyNode {
         self.group_node()
             .react(&self.node, &g, id, &emoji, add)
             .map_err(fail)
+    }
+
+    /// Pins (or unpins) message `id` in `group` for every member; only the
+    /// owner and admins may (see `may_pin_in_group`). Returns false if
+    /// there's no such message.
+    pub fn pin_in_group(&self, group: String, id: u64, pin: bool) -> Result<bool> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node().pin(&self.node, &g, id, pin).map_err(fail)
+    }
+
+    /// Whether we may pin messages in `group` (we own it, or are an admin).
+    pub fn may_pin_in_group(&self, group: String) -> Result<bool> {
+        let g = self.group_id(&group)?;
+        Ok(self.group_node().may_pin(&g, &self.node.identity()))
+    }
+
+    /// The pinned messages in `group`, oldest pin first.
+    pub fn group_pinned(&self, group: String) -> Result<Vec<HistoryEntry>> {
+        let g = self.group_id(&group)?;
+        let me = self.node.reactor_of(&self.node.identity());
+        Ok(history_entries(
+            &self.node.pinned(ConversationId::Group(g)),
+            me,
+        ))
     }
 
     /// Clears a group's messages on this device; members keep theirs.

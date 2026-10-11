@@ -173,7 +173,14 @@ pub struct History {
     /// Disappearing-message timer for new messages, in seconds.
     pub timer_s: Option<u32>,
     entries: Vec<Entry>,
+    /// Pinned messages, by [`Entry::message_id`], oldest pin first; at
+    /// most [`MAX_PINS`].
+    pinned: Vec<u64>,
 }
+
+/// Most messages pinned in one conversation; pinning another unpins the
+/// oldest pin.
+pub const MAX_PINS: usize = 3;
 
 /// Whether two entries record the same message: outgoing ones by their
 /// local id (or time and content), incoming ones by sender and content
@@ -250,6 +257,7 @@ impl History {
         Self {
             timer_s: None,
             entries,
+            pinned: Vec::new(),
         }
     }
 
@@ -287,12 +295,37 @@ impl History {
         self.entries.len() != before
     }
 
-    /// Blanks what replies quote of the messages `gone`: a quote mustn't
-    /// outlive its message.
+    /// Pinned messages, oldest pin first.
+    pub fn pinned(&self) -> &[u64] {
+        &self.pinned
+    }
+
+    /// Pins (or with `pin` false, unpins) message `id`, if it's here.
+    /// Returns true if that changed anything.
+    pub fn pin(&mut self, id: u64, pin: bool) -> bool {
+        let had = self.pinned.contains(&id);
+        if !pin {
+            self.pinned.retain(|p| *p != id);
+            return had;
+        }
+        if had || id == 0 || !self.entries.iter().any(|e| e.message_id() == id) {
+            return false;
+        }
+        self.pinned.push(id);
+        if self.pinned.len() > MAX_PINS {
+            self.pinned.remove(0);
+        }
+        true
+    }
+
+    /// Forgets what referred to the messages `gone`: replies' quotes of
+    /// them, and their pins. A quote mustn't outlive its message.
     pub fn forget_quotes(&mut self, gone: &[Entry]) {
         if gone.is_empty() {
             return;
         }
+        let ids: Vec<u64> = gone.iter().map(Entry::message_id).collect();
+        self.pinned.retain(|p| !ids.contains(p));
         for e in &mut self.entries {
             if let Some(q) = &mut e.quote
                 && gone.iter().any(|g| quotes(q, g))
@@ -316,10 +349,18 @@ impl History {
             .sum::<usize>()
             + 32;
         cbor::to_vec(size, |enc| {
-            enc.map_len(2 + usize::from(self.timer_s.is_some()))?;
+            enc.map_len(
+                2 + usize::from(self.timer_s.is_some()) + usize::from(!self.pinned.is_empty()),
+            )?;
             enc.u8(0)?.u64(VERSION)?;
             if let Some(t) = self.timer_s {
                 enc.u8(1)?.u32(t)?;
+            }
+            if !self.pinned.is_empty() {
+                enc.u8(3)?.array_len(self.pinned.len())?;
+                for p in &self.pinned {
+                    enc.u64(*p)?;
+                }
             }
             enc.u8(2)?.array_len(self.entries.len())?;
             for e in &self.entries {
@@ -408,6 +449,7 @@ impl History {
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut ver, mut timer, mut entries) = (None, None, Vec::new());
+        let mut pinned = Vec::new();
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -487,6 +529,14 @@ impl History {
                         });
                     }
                 }
+                3 => {
+                    for _ in 0..d.array_len()? {
+                        let p = d.u64()?;
+                        if pinned.len() < MAX_PINS {
+                            pinned.push(p);
+                        }
+                    }
+                }
                 _ => return Ok(false),
             }
             Ok(true)
@@ -498,6 +548,7 @@ impl History {
         Ok(Self {
             timer_s: timer,
             entries,
+            pinned,
         })
     }
 }
@@ -779,6 +830,24 @@ impl Home {
             self.save_history(identity, c, &h)?;
         }
         Ok(n)
+    }
+
+    /// Pins (or unpins) message `id` in `c`; returns true if that changed
+    /// anything.
+    pub fn pin_entry(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        id: u64,
+        pin: bool,
+    ) -> Result<bool> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let changed = h.pin(id, pin);
+        if changed {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(changed)
     }
 
     /// Replaces the text of the entries `pick` chooses; returns how many.
@@ -1277,5 +1346,36 @@ mod tests {
         home.delete_entries(&id, c, 200, |e| e.text == "an old message")
             .unwrap();
         assert_eq!(quotes(200), ["", ""]);
+    }
+
+    #[test]
+    fn pins_hold_three_persist_and_go_with_their_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([1; 32]);
+        for i in 1..=5u64 {
+            let mut e = entry(i * 2 + 1, "m", None);
+            e.remote_id = i;
+            home.append_history(&id, c, e, 1).unwrap();
+        }
+        let pinned = || home.load_history(&id, c, 1).unwrap().pinned().to_vec();
+        assert!(
+            !home.pin_entry(&id, c, 1, 99, true).unwrap(),
+            "no such message"
+        );
+        for i in 1..=4 {
+            assert!(home.pin_entry(&id, c, 1, i, true).unwrap());
+        }
+        assert_eq!(pinned(), [2, 3, 4], "the oldest pin goes");
+        assert!(
+            !home.pin_entry(&id, c, 1, 3, true).unwrap(),
+            "already pinned"
+        );
+        assert!(home.pin_entry(&id, c, 1, 3, false).unwrap());
+        assert_eq!(pinned(), [2, 4]);
+        home.delete_entries(&id, c, 1, |e| e.remote_id == 4)
+            .unwrap();
+        assert_eq!(pinned(), [2], "a deleted message's pin goes");
     }
 }

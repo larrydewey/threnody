@@ -147,6 +147,12 @@ pub enum Event {
         from: PublicIdentity,
         added: usize,
     },
+    /// `peer` (or one of our devices) pinned (or unpinned) message `id`.
+    Pinned {
+        peer: PublicIdentity,
+        id: u64,
+        pin: bool,
+    },
     /// `peer` (or one of our devices) changed reactions on message `id`.
     Reacted {
         peer: PublicIdentity,
@@ -1653,6 +1659,7 @@ where
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
                         AppMessage::Identity(payload) => node.on_identity(peer, &payload),
                         AppMessage::React { conversation, id, emoji, add } => node.on_react(&peer, &conversation, id, &emoji, add),
+                        AppMessage::Pin { conversation, id, pin } => node.on_pin(&peer, &conversation, id, pin),
                         AppMessage::Read { conversation, ids } => node.on_read(&peer, &conversation, &ids),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover

@@ -185,6 +185,12 @@ impl GroupUi {
                 Update::Reacted { group, from } => {
                     println!("[{}] * {} reacted", self.label(&group), name(&from));
                 }
+                Update::Pinned { group, from, pin } => println!(
+                    "[{}] * {} {} a message",
+                    self.label(&group),
+                    name(&from),
+                    if pin { "pinned" } else { "unpinned" }
+                ),
             }
         }
     }
