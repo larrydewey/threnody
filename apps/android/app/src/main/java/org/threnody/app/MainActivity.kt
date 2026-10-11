@@ -443,7 +443,7 @@ class MainActivity : Activity() {
                 bottomMargin = dp(Design.md)
             }
             background = color(R.color.divider).let { ColorDrawable(it) }
-        }, matchWrap)
+        })
     }
 
     private fun row(r: Row): View {
