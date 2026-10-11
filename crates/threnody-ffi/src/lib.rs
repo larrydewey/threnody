@@ -154,6 +154,8 @@ pub struct HistoryEntry {
     pub mentions: Vec<MentionInfo>,
     /// A poll (its question is `text`).
     pub poll: Option<PollInfo>,
+    /// Forwarded from another chat.
+    pub forwarded: bool,
 }
 
 /// A poll: its options with how many chose each and whether we did, and
@@ -294,6 +296,9 @@ pub struct FileOptions {
     pub album: u64,
     #[uniffi(default = None)]
     pub clip: Option<Clip>,
+    /// Forwarded from another chat.
+    #[uniffi(default = false)]
+    pub forwarded: bool,
 }
 
 /// A fresh album id for photos or files sent together.
@@ -442,6 +447,8 @@ pub enum NodeEvent {
         clip: Option<Clip>,
         /// As for `Message`.
         quiet: bool,
+        /// Forwarded from another chat: pass it on in `FileOptions`.
+        forwarded: bool,
     },
     /// `peer` edited a message: reload its conversation.
     MessageEdited {
@@ -548,6 +555,8 @@ pub enum NodeEvent {
         clip: Option<Clip>,
         /// As for `GroupMessage`.
         quiet: bool,
+        /// As for `File`.
+        forwarded: bool,
     },
     /// `peer` says it displayed our outgoing messages `ids` (their
     /// sender-ids, as recorded on our side): ticks update on reload.
@@ -736,6 +745,7 @@ fn history_entries(
     entries
         .iter()
         .map(|e| HistoryEntry {
+            forwarded: e.forwarded || e.file.as_ref().is_some_and(|f| f.forwarded),
             poll: e.poll.as_ref().map(|p| {
                 let counts = p.counts();
                 let mine: Vec<u32> = p
@@ -857,6 +867,7 @@ fn convert(e: Event) -> NodeEvent {
                     caption,
                     album,
                     clip,
+                    forwarded,
                     ..
                 },
         } => NodeEvent::File {
@@ -869,6 +880,7 @@ fn convert(e: Event) -> NodeEvent {
             album,
             clip: clip.map(Into::into),
             quiet: false,
+            forwarded,
         },
         Event::MessageEdited { peer, .. } => NodeEvent::MessageEdited { peer: fp(&peer) },
         Event::MessagesDeleted { peer, count } => NodeEvent::MessagesDeleted {
@@ -1066,6 +1078,10 @@ impl ThrenodyNode {
         let _ = self.rt.block_on(async {
             tokio::time::timeout(Duration::from_secs(15), self.node.reach_peer(p)).await
         });
+    }
+
+    pub(crate) fn draft_in(&self, conv: ConversationId) -> String {
+        self.node.history(conv).map(|h| h.draft).unwrap_or_default()
     }
 
     pub(crate) fn resolve(&self, peer: &str) -> Result<PublicIdentity> {
@@ -1431,6 +1447,19 @@ PersistentKeepalive = 25\n",
         Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
     }
 
+    /// `send_text`, marked as forwarded from another chat.
+    pub fn forward_text(&self, peer: String, text: String) -> Result<u32> {
+        let p = self.resolve(&peer)?;
+        self.node.seek(&p);
+        self.try_reach(&p);
+        let _guard = self.rt.enter();
+        let r = self
+            .node
+            .send_message(&p, &text, None, true)
+            .map_err(fail)?;
+        Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
+    }
+
     /// `send_text`, replying to the message in the chat with `peer` that
     /// `at_ms` and `device` name (as in [`HistoryEntry`]), which it quotes.
     pub fn send_reply(
@@ -1484,6 +1513,7 @@ PersistentKeepalive = 25\n",
                     caption: options.caption,
                     album: options.album,
                     clip: options.clip.map(Into::into),
+                    forwarded: options.forwarded,
                 },
             )
             .map_err(fail)
@@ -1510,6 +1540,7 @@ PersistentKeepalive = 25\n",
                 sensitive: options.sensitive,
                 album: options.album,
                 clip: options.clip.map(Into::into),
+                forwarded: options.forwarded,
             },
             &options.caption,
             id,
@@ -1688,6 +1719,95 @@ PersistentKeepalive = 25\n",
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();
         Ok(self.node.pin(&p, id, pin))
+    }
+
+    /// What we started writing to `peer` and haven't sent ("" if nothing).
+    pub fn draft(&self, peer: String) -> Result<String> {
+        let p = self.resolve(&peer)?;
+        Ok(self.draft_in(self.node.conversation_for(&p)))
+    }
+
+    /// Keeps what we started writing to `peer` (encrypted, on this device).
+    pub fn set_draft(&self, peer: String, text: String) -> Result<()> {
+        let p = self.resolve(&peer)?;
+        self.node
+            .set_draft(self.node.conversation_for(&p), &text)
+            .map_err(fail)
+    }
+
+    /// Notes to self (a chat with our own account, on all our devices):
+    /// the last `limit`, oldest first.
+    pub fn note_history(&self, limit: u32) -> Result<Vec<HistoryEntry>> {
+        let h = self.node.history(self.node.notes()).map_err(fail)?;
+        let me = self.node.reactor_of(&self.node.identity());
+        Ok(history_entries(&self.node, h.recent(limit as usize), me))
+    }
+
+    /// Writes a note to self, optionally replying to the note at
+    /// `quote_at_ms` from `quote_device`.
+    pub fn write_note(
+        &self,
+        text: String,
+        quote_at_ms: Option<u64>,
+        quote_device: Option<String>,
+    ) -> Result<()> {
+        let conv = self.node.notes();
+        let quote = match (quote_at_ms, &quote_device) {
+            (Some(at), Some(d)) => self.node.quote_of(conv, entry_at(at, d)),
+            _ => None,
+        };
+        let _guard = self.rt.enter();
+        self.node.write_note(&text, quote, None);
+        Ok(())
+    }
+
+    /// Keeps a file among the notes to self: it stays at `location` on this
+    /// device; our other devices get its record.
+    pub fn add_note_file(
+        &self,
+        name: String,
+        size: u64,
+        location: Option<String>,
+        options: FileOptions,
+    ) -> Result<()> {
+        let _guard = self.rt.enter();
+        self.node.write_note(
+            &options.caption,
+            None,
+            Some(FileNote {
+                name,
+                size,
+                location,
+                sensitive: options.sensitive,
+                album: options.album,
+                clip: options.clip.map(Into::into),
+                forwarded: options.forwarded,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Deletes the note at `at_ms` from `device`, on this device.
+    pub fn delete_note(&self, at_ms: u64, device: String) -> Result<u32> {
+        Ok(self.delete_any(self.node.notes(), at_ms, &device))
+    }
+
+    /// Pins (or unpins) note `id` (on this device).
+    pub fn pin_note(&self, id: u64, pin: bool) -> bool {
+        self.node.pin_in(self.node.notes(), id, pin)
+    }
+
+    pub fn pinned_notes(&self) -> Vec<HistoryEntry> {
+        let me = self.node.reactor_of(&self.node.identity());
+        history_entries(&self.node, &self.node.pinned(self.node.notes()), me)
+    }
+
+    pub fn note_draft(&self) -> String {
+        self.draft_in(self.node.notes())
+    }
+
+    pub fn set_note_draft(&self, text: String) -> Result<()> {
+        self.node.set_draft(self.node.notes(), &text).map_err(fail)
     }
 
     /// When new messages in our chat with `peer` notify.
@@ -2475,6 +2595,7 @@ mod tests {
                     caption: "read these".into(),
                     album: 0,
                     clip: None,
+                    forwarded: false,
                 },
             )
             .unwrap();
@@ -2524,6 +2645,7 @@ mod tests {
                 caption: "read these".into(),
                 album: 0,
                 clip: None,
+                forwarded: false,
             },
         )
         .unwrap();
@@ -2929,6 +3051,7 @@ mod tests {
                         video: false,
                         duration_ms: 2_500,
                     }),
+                    forwarded: false,
                 },
             )
             .unwrap();
@@ -2966,6 +3089,7 @@ mod tests {
                 caption,
                 album,
                 clip,
+                forwarded: false,
             };
             member
                 .record_received_group_file(group, from, name, 3000, Some("/x".into()), id, options)
@@ -3104,6 +3228,7 @@ mod tests {
             caption: String::new(),
             album: 0,
             clip: None,
+            forwarded: false,
         };
         alice.node.send(&b_id, file("to-bob")).unwrap();
         bob.node.send(&a_id, file("to-alice")).unwrap();

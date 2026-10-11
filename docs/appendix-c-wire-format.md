@@ -99,6 +99,12 @@ A reply quotes an earlier message, as `Text` keys 10 to 12: the quoted message's
 
 Receivers store the quote with the entry (history key 15: `[id, device (32), text]`). A quote must not outlive what it quotes. When a message is deleted (for me or for everyone) or disappears, the text of every quote of it is blanked, and apps show "Original message not found". In groups, replies travel inside MLS (Appendix F).
 
+### Forwarding and drafts
+
+A forwarded text or file carries flag 8 in key 6 (`FORWARDED`; for files alongside the other file flags). Receivers record it (history key 18 for a text, file key 6 for a file) and show the message as forwarded. Older receivers ignore the flag. Nothing says where it came from.
+
+A conversation may keep a draft, what the user started writing and hasn't sent (history key 5). Drafts stay on the device, encrypted with the rest of the history; they're never sent.
+
 ### Pinned messages
 
 `Pin` (`{ 0 => 27, 3 => conversation, 5 => message id, ? 6 => 1 }`, key 6 present to unpin) pins a message in a conversation for everyone in it, named by the same id as `React`. It travels like `React`: to the peer's devices and our own, tracked, only to devices whose `Hello` has feature bit 2048. Either side of a 1:1 chat may pin. A conversation holds at most three pins (history key 3, oldest first); pinning a fourth unpins the oldest. A deleted or expired message loses its pin. In groups, pins travel inside MLS, and only the owner's and admins' count (Appendix F).

@@ -397,3 +397,57 @@ async fn polls_collect_votes_until_closed() {
     .await;
     assert!(!bob.groups.vote(&bob.node, &g, id, &[0]).unwrap());
 }
+
+#[tokio::test]
+async fn forwards_drafts_and_notes_to_self() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut laptop, &mut bob).await;
+    let lid = laptop.node.identity();
+
+    // A forwarded message arrives marked.
+    laptop.node.send_message(&bid, "fwd", None, true).unwrap();
+    let bconv = bob.node.conversation_for(&lid);
+    until(&mut [&mut laptop, &mut bob], |ns| {
+        ns[1]
+            .node
+            .history(bconv)
+            .is_ok_and(|h| h.entries().len() == 1)
+    })
+    .await;
+    assert!(bob.node.history(bconv).unwrap().entries()[0].forwarded);
+
+    // Drafts stay, encrypted, until cleared.
+    let lconv = laptop.node.conversation_for(&bid);
+    laptop.node.set_draft(lconv, "half a thought").unwrap();
+    assert_eq!(laptop.node.history(lconv).unwrap().draft, "half a thought");
+    laptop.node.set_draft(lconv, "").unwrap();
+    assert_eq!(laptop.node.history(lconv).unwrap().draft, "");
+
+    // Notes to self reach a device linked later, and new ones follow.
+    laptop.node.write_note("buy milk", None, None);
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let notes = |n: &N| -> Vec<String> {
+        n.node
+            .history(n.node.notes())
+            .map(|h| h.entries().iter().map(|e| e.text.clone()).collect())
+            .unwrap_or_default()
+    };
+    until(&mut [&mut laptop, &mut phone], |ns| {
+        notes(ns[1]) == ["buy milk"]
+    })
+    .await;
+    assert_eq!(
+        laptop.node.notes(),
+        phone.node.notes(),
+        "one account, one chat"
+    );
+    phone.node.write_note("and eggs", None, None);
+    until(&mut [&mut laptop, &mut phone], |ns| {
+        notes(ns[0]) == ["buy milk", "and eggs"]
+    })
+    .await;
+}

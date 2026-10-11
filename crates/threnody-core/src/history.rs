@@ -106,6 +106,8 @@ pub struct Entry {
     pub mentions: Vec<Mention>,
     /// A poll (its question is `text`).
     pub poll: Option<Poll>,
+    /// Forwarded from another chat.
+    pub forwarded: bool,
 }
 
 /// Most options a poll has, and longest question and option, in
@@ -252,6 +254,8 @@ pub struct FileNote {
     pub album: u64,
     /// A voice or video message, played in the chat.
     pub clip: Option<Clip>,
+    /// Forwarded from another chat.
+    pub forwarded: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -264,6 +268,8 @@ pub struct History {
     pinned: Vec<u64>,
     /// When new messages here should notify.
     pub notify: Notify,
+    /// What the user started writing here and hasn't sent.
+    pub draft: String,
 }
 
 /// When a conversation's new messages notify.
@@ -334,6 +340,41 @@ fn decode_poll(d: &mut Decoder<'_>) -> Result<Poll> {
         votes,
         closed,
     })
+}
+
+/// Held while a conversation's history is read, changed and written
+/// back, so concurrent changes (a message sent while an acknowledgement
+/// arrives) don't lose each other. Re-entrant on one thread.
+pub fn history_lock() -> HistoryLock {
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local!(static DEPTH: Cell<u32> = const { Cell::new(0) });
+    let guard = if DEPTH.get() == 0 {
+        Some(
+            LOCK.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    } else {
+        None
+    };
+    DEPTH.set(DEPTH.get() + 1);
+    HistoryLock {
+        _guard: guard,
+        depth: &DEPTH,
+    }
+}
+
+/// See [`history_lock`].
+pub struct HistoryLock {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    depth: &'static std::thread::LocalKey<std::cell::Cell<u32>>,
+}
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        self.depth.with(|d| d.set(d.get() - 1));
+    }
 }
 
 /// What a quote of `e` shows: its text, or a file's name.
@@ -410,6 +451,7 @@ impl History {
             entries,
             pinned: Vec::new(),
             notify: Notify::All,
+            draft: String::new(),
         }
     }
 
@@ -504,7 +546,8 @@ impl History {
             enc.map_len(
                 2 + usize::from(self.timer_s.is_some())
                     + usize::from(!self.pinned.is_empty())
-                    + usize::from(self.notify != Notify::All),
+                    + usize::from(self.notify != Notify::All)
+                    + usize::from(!self.draft.is_empty()),
             )?;
             enc.u8(0)?.u64(VERSION)?;
             if let Some(t) = self.timer_s {
@@ -512,6 +555,9 @@ impl History {
             }
             if self.notify != Notify::All {
                 enc.u8(4)?.u8(self.notify.to_u8())?;
+            }
+            if !self.draft.is_empty() {
+                enc.u8(5)?.str(&self.draft)?;
             }
             if !self.pinned.is_empty() {
                 enc.u8(3)?.array_len(self.pinned.len())?;
@@ -534,7 +580,8 @@ impl History {
                         + usize::from(e.read_ms != 0)
                         + usize::from(e.quote.is_some())
                         + usize::from(!e.mentions.is_empty())
-                        + usize::from(e.poll.is_some()),
+                        + usize::from(e.poll.is_some())
+                        + usize::from(e.forwarded),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -549,7 +596,8 @@ impl History {
                         2 + usize::from(f.location.is_some())
                             + usize::from(f.sensitive)
                             + usize::from(f.album != 0)
-                            + usize::from(f.clip.is_some()),
+                            + usize::from(f.clip.is_some())
+                            + usize::from(f.forwarded),
                     )?;
                     enc.u8(0)?.str(&f.name)?;
                     enc.u8(1)?.u64(f.size)?;
@@ -564,6 +612,9 @@ impl History {
                     }
                     if let Some(c) = f.clip {
                         enc.u8(5)?.array_len(2)?.bool(c.video)?.u32(c.duration_ms)?;
+                    }
+                    if f.forwarded {
+                        enc.u8(6)?.bool(true)?;
                     }
                 }
                 if e.local_id != 0 {
@@ -593,6 +644,9 @@ impl History {
                         .u64(q.id)?
                         .bytes(&q.author)?
                         .str(&q.text)?;
+                }
+                if e.forwarded {
+                    enc.u8(18)?.bool(true)?;
                 }
                 if let Some(p) = &e.poll {
                     enc.u8(17)?.array_len(4)?;
@@ -631,6 +685,7 @@ impl History {
         let (mut ver, mut timer, mut entries) = (None, None, Vec::new());
         let mut pinned = Vec::new();
         let mut notify = Notify::All;
+        let mut draft = String::new();
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -646,6 +701,7 @@ impl History {
                         let mut quote = None;
                         let mut mentions = Vec::new();
                         let mut poll = None;
+                        let mut forwarded = false;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -669,6 +725,7 @@ impl History {
                                 12 => edited_ms = d.u64()?,
                                 14 => read_ms = d.u64()?,
                                 17 => poll = Some(decode_poll(d)?),
+                                18 => forwarded = d.bool()?,
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -722,10 +779,12 @@ impl History {
                             quote,
                             mentions,
                             poll,
+                            forwarded,
                         });
                     }
                 }
                 4 => notify = Notify::from_u8(d.u8()?),
+                5 => draft = d.str()?.to_owned(),
                 3 => {
                     for _ in 0..d.array_len()? {
                         let p = d.u64()?;
@@ -747,6 +806,7 @@ impl History {
             entries,
             pinned,
             notify,
+            draft,
         })
     }
 }
@@ -754,6 +814,7 @@ impl History {
 fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
     let (mut name, mut size, mut location, mut sensitive, mut album) = (None, None, None, false, 0);
     let mut clip = None;
+    let mut forwarded = false;
     read_map(d, |k, d| {
         match k {
             0 => name = Some(d.str()?.to_owned()),
@@ -761,6 +822,7 @@ fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
             2 => location = Some(d.str()?.to_owned()),
             3 => sensitive = d.bool()?,
             4 => album = d.u64()?,
+            6 => forwarded = d.bool()?,
             5 => {
                 if d.array_len()? != 2 {
                     return Err(Error::Malformed("clip"));
@@ -781,6 +843,7 @@ fn decode_file(d: &mut Decoder<'_>) -> Result<FileNote> {
         sensitive,
         album,
         clip,
+        forwarded,
     })
 }
 
@@ -873,6 +936,7 @@ impl Home {
         c: ConversationId,
         now_ms: u64,
     ) -> Result<History> {
+        let _lock = history_lock();
         let mut h = match self.load_state(identity, &c.state_name())? {
             Some(b) => History::decode(&b)?,
             None => History::default(),
@@ -895,6 +959,7 @@ impl Home {
         e: Entry,
         now_ms: u64,
     ) -> Result<History> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         h.push(e, now_ms);
         self.save_history(identity, c, &h)?;
@@ -912,6 +977,7 @@ impl Home {
         device: [u8; 32],
         now_ms: u64,
     ) -> Result<bool> {
+        let _lock = history_lock();
         if local_id == 0 {
             return Ok(false);
         }
@@ -945,6 +1011,7 @@ impl Home {
         entries: Vec<Entry>,
         now_ms: u64,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let added = h.merge(entries, now_ms);
         if added > 0 {
@@ -963,6 +1030,7 @@ impl Home {
         into: ConversationId,
         now_ms: u64,
     ) -> Result<bool> {
+        let _lock = history_lock();
         if from == into {
             return Ok(false);
         }
@@ -991,6 +1059,7 @@ impl Home {
         now_ms: u64,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let before = h.entries.len();
         let gone: Vec<Entry> = h.entries.iter().filter(|e| pick(e)).cloned().collect();
@@ -1016,6 +1085,7 @@ impl Home {
         add: bool,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let n = h
             .entries
@@ -1041,6 +1111,7 @@ impl Home {
         who: [u8; 32],
         choices: &[u32],
     ) -> Result<bool> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let changed = h
             .entries
@@ -1064,6 +1135,7 @@ impl Home {
         id: u64,
         author: impl Fn(&[u8; 32]) -> bool,
     ) -> Result<bool> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let changed = h
             .entries
@@ -1077,6 +1149,23 @@ impl Home {
         Ok(changed)
     }
 
+    /// Keeps what the user started writing in `c` (empty: none).
+    pub fn set_draft(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        draft: &str,
+    ) -> Result<()> {
+        let _lock = history_lock();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        if h.draft != draft {
+            h.draft = draft.to_owned();
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(())
+    }
+
     /// Sets when `c`'s new messages notify.
     pub fn set_notify(
         &self,
@@ -1085,6 +1174,7 @@ impl Home {
         now_ms: u64,
         n: Notify,
     ) -> Result<()> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         if h.notify != n {
             h.notify = n;
@@ -1103,6 +1193,7 @@ impl Home {
         id: u64,
         pin: bool,
     ) -> Result<bool> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let changed = h.pin(id, pin);
         if changed {
@@ -1120,6 +1211,7 @@ impl Home {
         body: &str,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let mut n = 0;
         for e in h.entries.iter_mut().filter(|e| e.file.is_none() && pick(e)) {
@@ -1142,6 +1234,7 @@ impl Home {
         now_ms: u64,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let mut n = 0;
         for e in h.entries.iter_mut().filter(|e| pick(e) && e.read_ms == 0) {
@@ -1215,6 +1308,7 @@ impl Home {
     /// Prunes expired messages in every conversation; returns how many
     /// conversations changed.
     pub fn sweep_history(&self, identity: &Identity, now_ms: u64) -> usize {
+        let _lock = history_lock();
         self.conversations()
             .into_iter()
             .filter(|c| {
@@ -1254,6 +1348,7 @@ mod tests {
             quote: None,
             mentions: Vec::new(),
             poll: None,
+            forwarded: false,
         }
     }
 
@@ -1425,6 +1520,7 @@ mod tests {
                     sensitive: true,
                     album: 77,
                     clip: None,
+                    forwarded: false,
                 }),
                 ..entry(MAX_ENTRIES as u64 + 6, "", None)
             },
@@ -1442,6 +1538,7 @@ mod tests {
                         video: false,
                         duration_ms: 3_500,
                     }),
+                    forwarded: false,
                 }),
                 ..entry(MAX_ENTRIES as u64 + 7, "", None)
             },
@@ -1480,6 +1577,7 @@ mod tests {
                 sensitive: false,
                 album: 0,
                 clip: None,
+                forwarded: false,
             }),
             ..entry(2, "beach day", None)
         };

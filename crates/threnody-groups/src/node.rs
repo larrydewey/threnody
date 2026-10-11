@@ -18,7 +18,7 @@ use threnody_core::history::{ConversationId, Entry, FileNote, MAX_POLL_QUESTION,
 use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
-use threnody_net::history::OutgoingFile;
+use threnody_net::history::{Extras, OutgoingFile};
 use threnody_net::{Node, Tag};
 
 use crate::{Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, MemberRole, Output};
@@ -95,6 +95,7 @@ pub enum Update {
         album: u64,
         id: u64,
         clip: Option<Clip>,
+        forwarded: bool,
     },
     /// `from` changed its reactions on a message in `group`.
     Reacted {
@@ -328,12 +329,34 @@ impl GroupNode {
         quote: Option<Quote>,
         mentions: Vec<Mention>,
     ) -> Result<()> {
+        self.send_text_with(
+            node,
+            group,
+            text,
+            Extras {
+                quote,
+                mentions,
+                forwarded: false,
+            },
+        )
+    }
+
+    /// [`Self::send_text`], with what it quotes, who it mentions, and
+    /// whether it's forwarded.
+    pub fn send_text_with(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        text: &str,
+        extras: Extras,
+    ) -> Result<()> {
         let id = threnody_net::history::local_id();
         let content = Content::Text {
             text: text.to_owned(),
             id,
-            quote,
-            mentions: Mention::valid(mentions, text),
+            quote: extras.quote,
+            mentions: Mention::valid(extras.mentions, text),
+            forwarded: extras.forwarded,
         };
         self.send(node, group, &content, None, id)
     }
@@ -466,6 +489,7 @@ impl GroupNode {
             sensitive: file.sensitive,
             album: file.album,
             clip: file.clip,
+            forwarded: file.forwarded,
         };
         let id = threnody_net::history::local_id();
         let content = Content::File {
@@ -476,6 +500,7 @@ impl GroupNode {
             album: file.album,
             id,
             clip: file.clip,
+            forwarded: file.forwarded,
         };
         self.send(node, group, &content, Some(note), id)
     }
@@ -531,6 +556,13 @@ impl GroupNode {
                     Content::Poll { options, multi, .. } => Poll::new(options.clone(), *multi),
                     _ => None,
                 },
+                forwarded: matches!(
+                    content,
+                    Content::Text {
+                        forwarded: true,
+                        ..
+                    }
+                ),
             },
         );
         Ok(())
@@ -572,6 +604,7 @@ impl GroupNode {
                 quote: None,
                 mentions: Vec::new(),
                 poll: None,
+                forwarded: false,
             },
         );
     }
@@ -943,6 +976,7 @@ impl GroupNode {
                 id,
                 quote,
                 mentions,
+                forwarded,
             } => {
                 // What our other devices send to the group is ours too.
                 let ours = node.is_own_device(&from);
@@ -963,8 +997,11 @@ impl GroupNode {
                     false,
                     timer,
                     id,
-                    quote,
-                    mentions,
+                    Extras {
+                        quote,
+                        mentions,
+                        forwarded,
+                    },
                 );
                 Update::Text {
                     group,
@@ -984,6 +1021,7 @@ impl GroupNode {
                 album,
                 id,
                 clip,
+                forwarded,
             } => Update::File {
                 group,
                 from,
@@ -995,6 +1033,7 @@ impl GroupNode {
                 album,
                 id,
                 clip,
+                forwarded,
             },
             GroupEvent::React {
                 group,
@@ -1044,6 +1083,7 @@ impl GroupNode {
                         quote: None,
                         mentions: Vec::new(),
                         poll: Some(poll),
+                        forwarded: false,
                     },
                 );
                 Update::Text {

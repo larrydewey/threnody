@@ -13,7 +13,7 @@
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
 use threnody_core::history::{MAX_POLL_OPTIONS, MAX_POLL_QUESTION};
-use threnody_core::message::{Clip, MAX_MENTIONS, Mention, Quote};
+use threnody_core::message::{Clip, FORWARDED, MAX_MENTIONS, Mention, Quote};
 use threnody_core::{Error, Result};
 
 /// Group ids are 16 random bytes.
@@ -193,7 +193,8 @@ impl GroupWire {
 ///                     ? 11: mentions [* [start uint, len uint, who bstr]] }
 /// kind: 1 text, 2 file, 3 reaction, 4 pin, 5 poll (1: question,
 /// 12: options, flag 1 multiple choice), 6 vote (13: choices), 7 close poll
-/// flags: 1 sensitive, 2 voice message, 4 video message (file);
+/// flags: 1 sensitive, 2 voice message, 4 video message, 8 forwarded (file);
+///        8 forwarded (text);
 ///        1 remove (reaction)
 /// ```
 ///
@@ -209,6 +210,8 @@ pub enum Content {
         quote: Option<Quote>,
         /// Who it mentions.
         mentions: Vec<Mention>,
+        /// Forwarded from another chat.
+        forwarded: bool,
     },
     File {
         name: String,
@@ -219,6 +222,8 @@ pub enum Content {
         id: u64,
         /// A voice or video message rather than a plain file.
         clip: Option<Clip>,
+        /// Forwarded from another chat.
+        forwarded: bool,
     },
     /// Add (or with `add` false, take away) the sender's `emoji` on
     /// message `id`.
@@ -260,8 +265,23 @@ impl Content {
                 id: 0,
                 quote: None,
                 mentions,
+                forwarded: false,
             } if mentions.is_empty() => return Ok(text.as_bytes().to_vec()),
-            Self::Text { text, id, .. } => (1, text, None, 0, "", 0, *id, 0),
+            Self::Text {
+                text,
+                id,
+                forwarded,
+                ..
+            } => (
+                1,
+                text,
+                None,
+                u64::from(*forwarded) * FORWARDED,
+                "",
+                0,
+                *id,
+                0,
+            ),
             Self::File {
                 name,
                 data,
@@ -270,11 +290,14 @@ impl Content {
                 album,
                 id,
                 clip,
+                forwarded,
             } => (
                 2,
                 name,
                 Some(data),
-                u64::from(*sensitive) | clip.map_or(0, |c| c.flag()),
+                u64::from(*sensitive)
+                    | clip.map_or(0, |c| c.flag())
+                    | (u64::from(*forwarded) * FORWARDED),
                 caption,
                 *album,
                 *id,
@@ -381,6 +404,7 @@ impl Content {
                 id: 0,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             });
         };
         let mut dec = Decoder::new(rest);
@@ -441,6 +465,7 @@ impl Content {
                 mentions: Mention::valid(mentions, text.as_deref().unwrap_or("")),
                 text: text.unwrap_or_default(),
                 id,
+                forwarded: flags & FORWARDED != 0,
                 quote: quote_author
                     .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
             },
@@ -452,6 +477,7 @@ impl Content {
                 album,
                 id,
                 clip: Clip::from_flags(flags, duration)?,
+                forwarded: flags & FORWARDED != 0,
             },
             3 => {
                 let emoji = required(text, "emoji")?;
@@ -496,24 +522,28 @@ mod tests {
                 id: 0,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             },
             Content::Text {
                 text: String::new(),
                 id: 0,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             },
             Content::Text {
                 text: "with an id".into(),
                 id: 42,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             },
             Content::Text {
                 text: "a reply".into(),
                 id: 43,
                 quote: Some(Quote::new(42, [3; 32], "with an id")),
                 mentions: Vec::new(),
+                forwarded: false,
             },
             Content::Text {
                 text: "@Bo and @Al".into(),
@@ -531,6 +561,7 @@ mod tests {
                         who: [2; 32],
                     },
                 ],
+                forwarded: false,
             },
             Content::React {
                 id: 42,
@@ -567,6 +598,7 @@ mod tests {
                 album: 0,
                 id: 0,
                 clip: None,
+                forwarded: false,
             },
             Content::File {
                 name: "IMG.jpg".into(),
@@ -576,6 +608,7 @@ mod tests {
                 album: 5,
                 id: 9,
                 clip: None,
+                forwarded: false,
             },
             Content::File {
                 name: "voice.ogg".into(),
@@ -588,6 +621,7 @@ mod tests {
                     video: false,
                     duration_ms: 2_000,
                 }),
+                forwarded: false,
             },
         ] {
             assert_eq!(Content::decode(&c.encode().unwrap()).unwrap(), c);
@@ -599,6 +633,7 @@ mod tests {
                 id: 0,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             }
         );
         // A tagged text, as a later sender might write it.
@@ -610,6 +645,7 @@ mod tests {
                 id: 0,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             }
         );
         assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());

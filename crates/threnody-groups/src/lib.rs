@@ -129,6 +129,7 @@ pub enum GroupEvent {
         quote: Option<Quote>,
         /// Who it mentions.
         mentions: Vec<Mention>,
+        forwarded: bool,
     },
     File {
         group: GroupId,
@@ -140,6 +141,7 @@ pub enum GroupEvent {
         album: u64,
         id: u64,
         clip: Option<Clip>,
+        forwarded: bool,
     },
     /// `from` added (or took away) its `emoji` on message `id`.
     React {
@@ -709,6 +711,7 @@ impl Groups {
                 id: 0,
                 quote: None,
                 mentions: Vec::new(),
+                forwarded: false,
             },
         )
     }
@@ -978,6 +981,7 @@ impl Groups {
                         id,
                         quote,
                         mentions,
+                        forwarded,
                     } => GroupEvent::Text {
                         group,
                         from: sender,
@@ -985,6 +989,7 @@ impl Groups {
                         id,
                         quote,
                         mentions,
+                        forwarded,
                     },
                     Content::File {
                         name,
@@ -994,6 +999,7 @@ impl Groups {
                         album,
                         id,
                         clip,
+                        forwarded,
                     } => GroupEvent::File {
                         group,
                         from: sender,
@@ -1004,6 +1010,7 @@ impl Groups {
                         album,
                         id,
                         clip,
+                        forwarded,
                     },
                     Content::React { id, emoji, add } => GroupEvent::React {
                         group,

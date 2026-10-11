@@ -94,6 +94,7 @@ mod tests {
                 expires_in_s: None,
                 id: 0,
                 quote: None,
+                forwarded: false,
             })
             .unwrap();
         let longer = ca
@@ -103,6 +104,7 @@ mod tests {
                 expires_in_s: None,
                 id: 0,
                 quote: None,
+                forwarded: false,
             })
             .unwrap();
         assert_eq!(

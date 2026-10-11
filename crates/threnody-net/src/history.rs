@@ -49,6 +49,16 @@ pub struct OutgoingFile {
     pub album: u64,
     /// A voice or video message recorded in the app.
     pub clip: Option<Clip>,
+    /// Forwarded from another chat.
+    pub forwarded: bool,
+}
+
+/// What a recorded message carries besides its text.
+#[derive(Clone, Debug, Default)]
+pub struct Extras {
+    pub quote: Option<Quote>,
+    pub mentions: Vec<Mention>,
+    pub forwarded: bool,
 }
 
 /// A fresh album id for files sent together.
@@ -268,6 +278,55 @@ impl Node {
             .home
             .set_notify(self.identity_ref(), conv, now_ms(), n)
             .map_err(NetError::from)
+    }
+
+    /// Keeps what the user started writing in `conv` (empty: none), on
+    /// this device.
+    pub fn set_draft(&self, conv: ConversationId, draft: &str) -> Result<()> {
+        self.shared
+            .home
+            .set_draft(self.identity_ref(), conv, now_ms(), draft)
+            .map_err(NetError::from)
+    }
+
+    /// Notes to self: a chat with our own account, kept on all our
+    /// devices (each sends what it writes there to the others).
+    pub fn notes(&self) -> ConversationId {
+        ConversationId::Peer(self.account().id().0)
+    }
+
+    /// Writes a note to self, optionally quoting an earlier one, or with a
+    /// file (kept where it is on this device; the others get its record).
+    pub fn write_note(&self, text: &str, quote: Option<Quote>, file: Option<FileNote>) {
+        let now = now_ms();
+        let conv = self.notes();
+        self.append(
+            conv,
+            Entry {
+                at_ms: now,
+                outgoing: true,
+                device: *self.identity().as_bytes(),
+                text: text.to_owned(),
+                offline: false,
+                expires_at_ms: self
+                    .effective_timer(conv)
+                    .map(|s| now + u64::from(s) * 1000),
+                file,
+                local_id: local_id(),
+                // Nobody else to deliver to.
+                delivered: true,
+                recipients: 0,
+                delivered_to: Vec::new(),
+                remote_id: 0,
+                edited_ms: 0,
+                read_ms: 0,
+                reactions: Vec::new(),
+                quote,
+                mentions: Vec::new(),
+                poll: None,
+                forwarded: false,
+            },
+        );
     }
 
     /// Sets `who`'s vote in poll `id` in `conv`, on this device; returns
@@ -788,6 +847,17 @@ impl Node {
         body: &str,
         quote: Option<Quote>,
     ) -> Result<SendReport> {
+        self.send_message(peer, body, quote, false)
+    }
+
+    /// [`Node::send_text`], quoting `quote`, and marked `forwarded`.
+    pub fn send_message(
+        &self,
+        peer: &PublicIdentity,
+        body: &str,
+        quote: Option<Quote>,
+        forwarded: bool,
+    ) -> Result<SendReport> {
         // Writing to someone accepts them.
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
@@ -800,6 +870,7 @@ impl Node {
             expires_in_s: timer,
             id: local_id,
             quote: quote.clone(),
+            forwarded,
         };
         let devices: Vec<PublicIdentity> = match self.account_of(peer) {
             Some(a) if !self.is_own_device(peer) => {
@@ -848,6 +919,7 @@ impl Node {
                 quote,
                 mentions: Vec::new(),
                 poll: None,
+                forwarded,
             },
         );
         Ok(r)
@@ -884,6 +956,7 @@ impl Node {
             caption,
             album,
             clip,
+            forwarded,
         } = file;
         let data = self.prepare_file(data)?;
         self.accept_contact(peer);
@@ -898,6 +971,7 @@ impl Node {
             caption: caption.clone(),
             album,
             clip,
+            forwarded,
         };
         let tag = Tag {
             local_id,
@@ -921,6 +995,7 @@ impl Node {
                 sensitive,
                 album,
                 clip,
+                forwarded,
             },
             &caption,
             local_id,
@@ -988,6 +1063,7 @@ impl Node {
     /// [`Node::set_timer`] for any conversation (groups too: their timer
     /// applies on this device).
     pub fn set_conversation_timer(&self, conv: ConversationId, secs: Option<u32>) -> Result<()> {
+        let _lock = threnody_core::history::history_lock();
         let mut h = self.history(conv)?;
         // 0 records "off on purpose", unlike no setting (the default).
         h.timer_s = Some(secs.unwrap_or(0));
@@ -1077,8 +1153,7 @@ impl Node {
             offline,
             timer,
             0,
-            None,
-            Vec::new(),
+            Extras::default(),
         );
     }
 
@@ -1093,8 +1168,7 @@ impl Node {
         offline: bool,
         timer: Option<u32>,
         remote_id: u64,
-        quote: Option<Quote>,
-        mentions: Vec<Mention>,
+        extras: Extras,
     ) {
         let now = now_ms();
         let entry = Entry {
@@ -1113,9 +1187,10 @@ impl Node {
             edited_ms: 0,
             read_ms: 0,
             reactions: Vec::new(),
-            quote,
-            mentions,
+            quote: extras.quote,
+            mentions: extras.mentions,
             poll: None,
+            forwarded: extras.forwarded,
         };
         let _ = self
             .shared
@@ -1182,6 +1257,7 @@ impl Node {
                 quote: None,
                 mentions: Vec::new(),
                 poll: None,
+                forwarded: false,
             },
         );
     }
@@ -1193,12 +1269,14 @@ impl Node {
             expires_in_s,
             id,
             quote,
+            forwarded,
             ..
         } = msg
         else {
             return;
         };
         let conv = self.conversation_for(from);
+        let lock = threnody_core::history::history_lock();
         if self.effective_timer(conv) != *expires_in_s
             && let Ok(mut h) = self.history(conv)
         {
@@ -1209,6 +1287,7 @@ impl Node {
                 secs: *expires_in_s,
             });
         }
+        drop(lock);
         self.record_with_id(
             conv,
             *from.as_bytes(),
@@ -1217,8 +1296,11 @@ impl Node {
             offline,
             *expires_in_s,
             *id,
-            quote.clone(),
-            Vec::new(),
+            Extras {
+                quote: quote.clone(),
+                forwarded: *forwarded,
+                ..Extras::default()
+            },
         );
     }
 

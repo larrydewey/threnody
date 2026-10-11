@@ -23,6 +23,8 @@ pub const FILE_SENSITIVE: u64 = 1;
 pub const FILE_VOICE: u64 = 2;
 /// `File` flag (key 6): a video message recorded in the app.
 pub const FILE_VIDEO: u64 = 4;
+/// `Text` and `File` flag (key 6): forwarded from another chat.
+pub const FORWARDED: u64 = 8;
 /// Longest voice or video message, in milliseconds.
 pub const MAX_CLIP_MS: u32 = 10 * 60 * 1000;
 
@@ -173,6 +175,8 @@ pub enum AppMessage {
         id: u64,
         /// The message this one replies to.
         quote: Option<Quote>,
+        /// Forwarded from another chat.
+        forwarded: bool,
     },
     File {
         sent_ms: u64,
@@ -189,6 +193,8 @@ pub enum AppMessage {
         album: u64,
         /// A voice or video message rather than a plain file.
         clip: Option<Clip>,
+        /// Forwarded from another chat.
+        forwarded: bool,
     },
     /// Our current mesh/tunnel approval of the peer (spec §5.2). Sent at
     /// session start and whenever it changes.
@@ -435,10 +441,12 @@ impl AppMessage {
                     expires_in_s,
                     id,
                     quote,
+                    forwarded,
                 } => {
                     e.map_len(
                         3 + usize::from(expires_in_s.is_some())
                             + usize::from(*id != 0)
+                            + usize::from(*forwarded)
                             + 3 * usize::from(quote.is_some()),
                     )?
                     .u8(0)?
@@ -450,6 +458,9 @@ impl AppMessage {
                     }
                     if *id != 0 {
                         e.u8(5)?.uint(*id)?;
+                    }
+                    if *forwarded {
+                        e.u8(6)?.uint(FORWARDED)?;
                     }
                     if let Some(q) = quote {
                         e.u8(10)?.uint(q.id)?;
@@ -466,9 +477,11 @@ impl AppMessage {
                     caption,
                     album,
                     clip,
+                    forwarded,
                 } => {
-                    let flags =
-                        (u64::from(*sensitive) * FILE_SENSITIVE) | clip.map_or(0, |c| c.flag());
+                    let flags = (u64::from(*sensitive) * FILE_SENSITIVE)
+                        | clip.map_or(0, |c| c.flag())
+                        | (u64::from(*forwarded) * FORWARDED);
                     let duration = clip.map_or(0, |c| c.duration_ms);
                     e.map_len(
                         4 + usize::from(*id != 0)
@@ -740,6 +753,7 @@ impl AppMessage {
                 body: required(text, "text body")?,
                 expires_in_s: expiry,
                 id: five.unwrap_or(0),
+                forwarded: flags & FORWARDED != 0,
                 // A quote names its message's sender (and, but for messages
                 // from before ids, its id); one that doesn't is dropped.
                 quote: quote_author
@@ -756,6 +770,7 @@ impl AppMessage {
                     data,
                     id: five.unwrap_or(0),
                     sensitive: flags & FILE_SENSITIVE != 0,
+                    forwarded: flags & FORWARDED != 0,
                     caption: caption.unwrap_or_default(),
                     album,
                     clip: Clip::from_flags(flags, duration)?,
@@ -872,6 +887,7 @@ mod tests {
             expires_in_s: None,
             id: 2,
             quote: Some(Quote::new(0, [1; 32], "nothing")),
+            forwarded: false,
         };
         // Messages from before ids are quoted by sender and text alone.
         assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
@@ -917,6 +933,7 @@ mod tests {
                     caption: String::new(),
                     album: 0,
                     clip: None,
+                    forwarded: false,
                 }),
             },
             AppMessage::Text {
@@ -925,6 +942,7 @@ mod tests {
                 expires_in_s: None,
                 id: 9,
                 quote: Some(Quote::new(5, [4; 32], "shall we?")),
+                forwarded: false,
             },
             AppMessage::Pin {
                 conversation: vec![0; 33],
@@ -954,6 +972,7 @@ mod tests {
                 expires_in_s: None,
                 id: 0,
                 quote: None,
+                forwarded: false,
             },
             AppMessage::Text {
                 sent_ms: 43,
@@ -961,6 +980,7 @@ mod tests {
                 expires_in_s: Some(30),
                 id: 0,
                 quote: None,
+                forwarded: false,
             },
             AppMessage::File {
                 sent_ms: 1,
@@ -971,6 +991,7 @@ mod tests {
                 caption: String::new(),
                 album: 0,
                 clip: None,
+                forwarded: false,
             },
             AppMessage::File {
                 sent_ms: 2,
@@ -981,6 +1002,7 @@ mod tests {
                 caption: "from the summit".into(),
                 album: u64::MAX,
                 clip: None,
+                forwarded: false,
             },
             AppMessage::File {
                 sent_ms: 3,
@@ -994,6 +1016,7 @@ mod tests {
                     video: false,
                     duration_ms: 4_200,
                 }),
+                forwarded: false,
             },
             AppMessage::File {
                 sent_ms: 4,
@@ -1007,6 +1030,7 @@ mod tests {
                     video: true,
                     duration_ms: 0,
                 }),
+                forwarded: false,
             },
             AppMessage::React {
                 conversation: vec![1; 33],
