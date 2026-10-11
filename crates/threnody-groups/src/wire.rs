@@ -350,7 +350,6 @@ impl Content {
                 text: text.unwrap_or_default(),
                 id,
                 quote: quote_author
-                    .filter(|_| quote_id != 0)
                     .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
             },
             2 => Self::File {

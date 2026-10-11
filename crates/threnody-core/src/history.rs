@@ -178,6 +178,30 @@ pub struct History {
 /// Whether two entries record the same message: outgoing ones by their
 /// local id (or time and content), incoming ones by sender and content
 /// within ten minutes (each device stamps its own receipt time).
+/// What a quote of `e` shows: its text, or a file's name.
+pub fn snippet(e: &Entry) -> &str {
+    match &e.file {
+        Some(f) if e.text.is_empty() => &f.name,
+        _ => &e.text,
+    }
+}
+
+impl Quote {
+    /// A quote of `e`, to reply to it with.
+    pub fn of(e: &Entry) -> Self {
+        Self::new(e.message_id(), e.device, snippet(e))
+    }
+}
+
+/// Whether `q` quotes `e`: by the sender's id for the message, or, for a
+/// message too old to have one, by sender and text.
+pub fn quotes(q: &Quote, e: &Entry) -> bool {
+    if q.id != 0 {
+        return e.message_id() == q.id;
+    }
+    e.device == q.author && !q.text.is_empty() && snippet(e).starts_with(q.text.as_str())
+}
+
 fn same(a: &Entry, b: &Entry) -> bool {
     if a.outgoing != b.outgoing || a.device != b.device {
         return false;
@@ -247,11 +271,11 @@ impl History {
     /// anything was removed.
     pub fn prune(&mut self, now_ms: u64) -> bool {
         let before = self.entries.len();
-        let expired: Vec<u64> = self
+        let expired: Vec<Entry> = self
             .entries
             .iter()
             .filter(|e| e.expires_at_ms.is_some_and(|t| t <= now_ms))
-            .map(Entry::message_id)
+            .cloned()
             .collect();
         self.entries
             .retain(|e| e.expires_at_ms.is_none_or(|t| t > now_ms));
@@ -263,13 +287,15 @@ impl History {
         self.entries.len() != before
     }
 
-    /// Blanks what replies quote of the messages `gone` (by
-    /// [`Entry::message_id`]): a quote mustn't outlive its message.
-    pub fn forget_quotes(&mut self, gone: &[u64]) {
+    /// Blanks what replies quote of the messages `gone`: a quote mustn't
+    /// outlive its message.
+    pub fn forget_quotes(&mut self, gone: &[Entry]) {
+        if gone.is_empty() {
+            return;
+        }
         for e in &mut self.entries {
             if let Some(q) = &mut e.quote
-                && q.id != 0
-                && gone.contains(&q.id)
+                && gone.iter().any(|g| quotes(q, g))
             {
                 q.text.clear();
             }
@@ -718,14 +744,9 @@ impl Home {
     ) -> Result<usize> {
         let mut h = self.load_history(identity, c, now_ms)?;
         let before = h.entries.len();
-        let ids: Vec<u64> = h
-            .entries
-            .iter()
-            .filter(|e| pick(e))
-            .map(Entry::message_id)
-            .collect();
+        let gone: Vec<Entry> = h.entries.iter().filter(|e| pick(e)).cloned().collect();
         h.entries.retain(|e| !pick(e));
-        h.forget_quotes(&ids);
+        h.forget_quotes(&gone);
         let gone = before - h.entries.len();
         if gone > 0 {
             self.save_history(identity, c, &h)?;
@@ -1243,5 +1264,18 @@ mod tests {
         home.delete_entries(&id, c, 200, |e| e.remote_id == 6)
             .unwrap();
         assert_eq!(quotes(200), [""]);
+
+        // A message from before ids is quoted by sender and text.
+        let old = entry(7, "an old message", None);
+        let mut reply = entry(9, "re", None);
+        reply.quote = Some(Quote::of(&old));
+        assert_eq!(reply.quote.as_ref().unwrap().id, 0);
+        for e in [old, reply] {
+            home.append_history(&id, c, e, 1).unwrap();
+        }
+        assert_eq!(quotes(200), ["", "an old message"]);
+        home.delete_entries(&id, c, 200, |e| e.text == "an old message")
+            .unwrap();
+        assert_eq!(quotes(200), ["", ""]);
     }
 }

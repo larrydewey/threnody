@@ -674,6 +674,16 @@ fn history_entries(entries: &[threnody_core::history::Entry], me: [u8; 32]) -> V
         .collect()
 }
 
+/// Picks the history entry received (or sent) at `at_ms` by `device`.
+pub(crate) fn entry_at(
+    at_ms: u64,
+    device: &str,
+) -> impl Fn(&threnody_core::history::Entry) -> bool + '_ {
+    move |e| {
+        e.at_ms == at_ms && PublicIdentity::from_bytes(&e.device).is_ok_and(|d| fp(&d) == device)
+    }
+}
+
 fn fp(p: &PublicIdentity) -> String {
     p.fingerprint().to_string()
 }
@@ -1284,11 +1294,19 @@ PersistentKeepalive = 25\n",
         Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
     }
 
-    /// `send_text`, replying to message `quote_id` (a [`HistoryEntry::id`])
-    /// in the chat with `peer`, which the reply quotes.
-    pub fn send_reply(&self, peer: String, text: String, quote_id: u64) -> Result<u32> {
+    /// `send_text`, replying to the message in the chat with `peer` that
+    /// `at_ms` and `device` name (as in [`HistoryEntry`]), which it quotes.
+    pub fn send_reply(
+        &self,
+        peer: String,
+        text: String,
+        at_ms: u64,
+        device: String,
+    ) -> Result<u32> {
         let p = self.resolve(&peer)?;
-        let quote = self.node.quote_of(self.node.conversation_for(&p), quote_id);
+        let quote = self
+            .node
+            .quote_of(self.node.conversation_for(&p), entry_at(at_ms, &device));
         self.node.seek(&p);
         self.try_reach(&p);
         let _guard = self.rt.enter();

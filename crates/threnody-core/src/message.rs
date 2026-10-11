@@ -675,9 +675,9 @@ impl AppMessage {
                 body: required(text, "text body")?,
                 expires_in_s: expiry,
                 id: five.unwrap_or(0),
-                // A quote names a message; one that doesn't is dropped.
+                // A quote names its message's sender (and, but for messages
+                // from before ids, its id); one that doesn't is dropped.
                 quote: quote_author
-                    .filter(|_| quote_id != 0)
                     .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
             },
             kind::FILE => {
@@ -795,7 +795,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quotes_are_cut_short_and_need_an_id() {
+    fn quotes_are_cut_short_and_need_a_sender() {
         let long = "x".repeat(MAX_QUOTE_CHARS * 2);
         assert_eq!(
             Quote::new(1, [0; 32], &long).text.chars().count(),
@@ -808,11 +808,19 @@ mod tests {
             id: 2,
             quote: Some(Quote::new(0, [1; 32], "nothing")),
         };
+        // Messages from before ids are quoted by sender and text alone.
+        assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
+        let mut b = m.encode().unwrap();
+        // Without its sender (key 11), the quote is dropped.
+        let at = b.windows(2).position(|w| w == [0x0b, 0x58]).unwrap();
+        b.splice(at..at + 3 + 32, []);
+        b[0] -= 1;
+        let m = AppMessage::decode(&b).unwrap();
         let AppMessage::Text { quote, .. } = AppMessage::decode(&m.encode().unwrap()).unwrap()
         else {
             unreachable!()
         };
-        assert_eq!(quote, None, "a quote without an id is dropped");
+        assert_eq!(quote, None, "a quote without a sender is dropped");
     }
 
     #[test]

@@ -1532,10 +1532,7 @@ impl Ui {
                 let e = shown
                     .get(n.wrapping_sub(1))
                     .ok_or_else(|| anyhow!("no message {n} in the last /history"))?;
-                let quote = self
-                    .node
-                    .quote_of(self.node.conversation_for(&peer), e.message_id())
-                    .ok_or_else(|| anyhow!("that message can't be quoted (gone, or too old)"))?;
+                let quote = threnody_core::message::Quote::of(e);
                 self.node.send_reply(&peer, body.trim(), Some(quote))?;
             }
             "edit" => {
@@ -1969,6 +1966,20 @@ impl Ui {
                 let node = self.node.clone();
                 self.groups.list(&|p: &PublicIdentity| name_of(&node, p));
             }
+            "ghistory" => {
+                let node = self.node.clone();
+                self.groups.history(
+                    &self.node,
+                    &|p: &PublicIdentity| name_of(&node, p),
+                    arg.ok_or_else(|| anyhow!("usage: /ghistory <group> [count]"))?,
+                )?;
+            }
+            "gr" => {
+                self.groups.reply(
+                    &self.node,
+                    arg.ok_or_else(|| anyhow!("usage: /gr <group> <n> <text>"))?,
+                )?;
+            }
             "g" => {
                 self.groups.say(
                     &self.node,
@@ -2351,7 +2362,7 @@ fn reachable(listen: std::net::SocketAddr) -> std::net::SocketAddr {
 }
 
 /// `HH:MM` in local time, with the date if it isn't today.
-fn clock(ms: u64) -> String {
+pub(crate) fn clock(ms: u64) -> String {
     let tz = jiff::tz::TimeZone::system();
     let Ok(t) = jiff::Timestamp::from_millisecond(i64::try_from(ms).unwrap_or(i64::MAX)) else {
         return "?".into();
@@ -2429,7 +2440,10 @@ fn fmt_time(ms: u64) -> String {
 }
 
 /// A quote as a line above the reply: `> who: text`.
-fn quoted(q: &threnody_core::message::Quote, name: &dyn Fn(&PublicIdentity) -> String) -> String {
+pub(crate) fn quoted(
+    q: &threnody_core::message::Quote,
+    name: &dyn Fn(&PublicIdentity) -> String,
+) -> String {
     let who = PublicIdentity::from_bytes(&q.author).map_or_else(|_| "?".into(), |d| name(&d));
     if q.text.is_empty() {
         format!("> {who}: (message gone)")

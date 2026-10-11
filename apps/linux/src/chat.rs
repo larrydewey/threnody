@@ -1577,7 +1577,7 @@ impl ChatView {
             });
             b.append(&btn);
         };
-        if e.id != 0 {
+        {
             let (weak, entry) = (self.weak_self.clone(), e.clone());
             item(
                 "Reply",
@@ -1658,14 +1658,15 @@ impl ChatView {
         button.add_css_class("flat");
         button.add_css_class("quote-button");
         button.set_tooltip_text(Some("Show the original"));
-        let (weak, id) = (self.weak_self.clone(), q.id);
+        let (weak, q) = (self.weak_self.clone(), q.clone());
         button.connect_clicked(move |_| {
             let Some(t) = weak.upgrade() else { return };
             let key = t
                 .entries
                 .borrow()
                 .iter()
-                .find(|e| e.id == id)
+                .rev()
+                .find(|e| quotes(&q, e))
                 .map(|e| (e.at_ms, e.device.clone()));
             match key {
                 Some(k) => t.jump_to(k),
@@ -1986,14 +1987,18 @@ impl ChatView {
         // Clearing the composer also says we stopped typing.
         buf.set_text("");
         let (group, device) = (self.group(), self.device());
-        let quote = self.reply_to.borrow().as_ref().map_or(0, |e| e.id);
+        let quote = self
+            .reply_to
+            .borrow()
+            .as_ref()
+            .map(|e| (e.at_ms, e.device.clone()));
         self.reply(None);
         let weak = self.weak_self.clone();
         let sent = text.clone();
         bg(
             move || match group {
-                Some(g) if quote != 0 => node
-                    .send_group_reply(g, sent, quote)
+                Some(g) if let Some((at, d)) = quote => node
+                    .send_group_reply(g, sent, at, d)
                     .map(|()| None)
                     .map_err(|e| e.to_string()),
                 Some(g) => node
@@ -2001,10 +2006,9 @@ impl ChatView {
                     .map(|()| None)
                     .map_err(|e| e.to_string()),
                 // It reaches the contact directly, by relay, or sealed for mailboxes.
-                None => match if quote != 0 {
-                    node.send_reply(device, sent, quote)
-                } else {
-                    node.send_text(device, sent)
+                None => match match quote {
+                    Some((at, d)) => node.send_reply(device, sent, at, d),
+                    None => node.send_text(device, sent),
                 } {
                     Ok(0) => Ok(Some(
                         "Not delivered: they're offline and no mutual contact can hold it.",
@@ -3202,6 +3206,20 @@ fn prepare(
         .map_err(|_| unreadable())?;
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
     Ok((format!("{stem}.jpg"), jpeg))
+}
+
+/// Whether `q` quotes `e`: by message id, or for a message too old to
+/// have one, by sender and text (as the node matches them).
+fn quotes(q: &threnody_ffi::QuoteInfo, e: &HistoryEntry) -> bool {
+    if q.id != 0 {
+        return e.id == q.id;
+    }
+    let snippet = if e.text.is_empty() {
+        e.file.as_ref().map_or("", |f| f.name.as_str())
+    } else {
+        e.text.as_str()
+    };
+    e.device == q.author && !q.text.is_empty() && snippet.starts_with(&q.text)
 }
 
 #[cfg(test)]

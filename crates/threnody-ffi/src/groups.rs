@@ -287,13 +287,20 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
-    /// `send_group_text`, replying to message `quote_id` (a
-    /// [`crate::HistoryEntry::id`]) in the group, which the reply quotes.
-    pub fn send_group_reply(&self, group: String, text: String, quote_id: u64) -> Result<()> {
+    /// `send_group_text`, replying to the message in the group that
+    /// `at_ms` and `device` name (as in [`crate::HistoryEntry`]).
+    pub fn send_group_reply(
+        &self,
+        group: String,
+        text: String,
+        at_ms: u64,
+        device: String,
+    ) -> Result<()> {
         let g = self.group_id(&group)?;
-        let quote = self
-            .node
-            .quote_of(threnody_core::history::ConversationId::Group(g), quote_id);
+        let quote = self.node.quote_of(
+            threnody_core::history::ConversationId::Group(g),
+            crate::entry_at(at_ms, &device),
+        );
         let _guard = self.rt.enter();
         self.group_node()
             .send_reply(&self.node, &g, &text, quote)

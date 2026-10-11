@@ -213,7 +213,7 @@ async fn replies_quote_what_they_answer() {
     })
     .await;
     let asked = bob.node.history(bconv).unwrap().entries()[0].message_id();
-    let q = bob.node.quote_of(bconv, asked);
+    let q = bob.node.quote_of(bconv, |e| e.message_id() == asked);
     bob.node.send_reply(&aid, "yes!", q).unwrap();
     let aconv = alice.node.conversation_for(&bid);
     until(&mut [&mut alice, &mut bob], |ns| {
@@ -235,7 +235,7 @@ async fn replies_quote_what_they_answer() {
     .await;
     let gc = ConversationId::Group(g);
     let id = alice.node.history(gc).unwrap().entries()[0].message_id();
-    let q = alice.node.quote_of(gc, id);
+    let q = alice.node.quote_of(gc, |e| e.message_id() == id);
     alice
         .groups
         .send_reply(&alice.node, &g, "shipped", q)

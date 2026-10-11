@@ -636,19 +636,11 @@ impl Node {
         self.send_reply(peer, body, None)
     }
 
-    /// A quote of message `id` (by [`Entry::message_id`]) in `conv`, to
-    /// reply to it with; `None` if there's no such message.
-    pub fn quote_of(&self, conv: ConversationId, id: u64) -> Option<Quote> {
-        if id == 0 {
-            return None;
-        }
+    /// A quote of the message in `conv` that `pick` chooses (the newest
+    /// such), to reply to it with; `None` if there's none.
+    pub fn quote_of(&self, conv: ConversationId, pick: impl Fn(&Entry) -> bool) -> Option<Quote> {
         let h = self.history(conv).ok()?;
-        let e = h.entries().iter().rev().find(|e| e.message_id() == id)?;
-        let text = match &e.file {
-            Some(f) if e.text.is_empty() => f.name.as_str(),
-            _ => e.text.as_str(),
-        };
-        Some(Quote::new(id, e.device, text))
+        h.entries().iter().rev().find(|e| pick(e)).map(Quote::of)
     }
 
     /// [`Node::send_text`], replying to (quoting) an earlier message.
