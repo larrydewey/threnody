@@ -342,6 +342,41 @@ fn decode_poll(d: &mut Decoder<'_>) -> Result<Poll> {
     })
 }
 
+/// Held while a conversation's history is read, changed and written
+/// back, so concurrent changes (a message sent while an acknowledgement
+/// arrives) don't lose each other. Re-entrant on one thread.
+pub fn history_lock() -> HistoryLock {
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local!(static DEPTH: Cell<u32> = const { Cell::new(0) });
+    let guard = if DEPTH.get() == 0 {
+        Some(
+            LOCK.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    } else {
+        None
+    };
+    DEPTH.set(DEPTH.get() + 1);
+    HistoryLock {
+        _guard: guard,
+        depth: &DEPTH,
+    }
+}
+
+/// See [`history_lock`].
+pub struct HistoryLock {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    depth: &'static std::thread::LocalKey<std::cell::Cell<u32>>,
+}
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        self.depth.with(|d| d.set(d.get() - 1));
+    }
+}
+
 /// What a quote of `e` shows: its text, or a file's name.
 pub fn snippet(e: &Entry) -> &str {
     match &e.file {
@@ -901,6 +936,7 @@ impl Home {
         c: ConversationId,
         now_ms: u64,
     ) -> Result<History> {
+        let _lock = history_lock();
         let mut h = match self.load_state(identity, &c.state_name())? {
             Some(b) => History::decode(&b)?,
             None => History::default(),
@@ -923,6 +959,7 @@ impl Home {
         e: Entry,
         now_ms: u64,
     ) -> Result<History> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         h.push(e, now_ms);
         self.save_history(identity, c, &h)?;
@@ -940,6 +977,7 @@ impl Home {
         device: [u8; 32],
         now_ms: u64,
     ) -> Result<bool> {
+        let _lock = history_lock();
         if local_id == 0 {
             return Ok(false);
         }
@@ -973,6 +1011,7 @@ impl Home {
         entries: Vec<Entry>,
         now_ms: u64,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let added = h.merge(entries, now_ms);
         if added > 0 {
@@ -991,6 +1030,7 @@ impl Home {
         into: ConversationId,
         now_ms: u64,
     ) -> Result<bool> {
+        let _lock = history_lock();
         if from == into {
             return Ok(false);
         }
@@ -1019,6 +1059,7 @@ impl Home {
         now_ms: u64,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let before = h.entries.len();
         let gone: Vec<Entry> = h.entries.iter().filter(|e| pick(e)).cloned().collect();
@@ -1044,6 +1085,7 @@ impl Home {
         add: bool,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let n = h
             .entries
@@ -1069,6 +1111,7 @@ impl Home {
         who: [u8; 32],
         choices: &[u32],
     ) -> Result<bool> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let changed = h
             .entries
@@ -1092,6 +1135,7 @@ impl Home {
         id: u64,
         author: impl Fn(&[u8; 32]) -> bool,
     ) -> Result<bool> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let changed = h
             .entries
@@ -1113,6 +1157,7 @@ impl Home {
         now_ms: u64,
         draft: &str,
     ) -> Result<()> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         if h.draft != draft {
             h.draft = draft.to_owned();
@@ -1129,6 +1174,7 @@ impl Home {
         now_ms: u64,
         n: Notify,
     ) -> Result<()> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         if h.notify != n {
             h.notify = n;
@@ -1147,6 +1193,7 @@ impl Home {
         id: u64,
         pin: bool,
     ) -> Result<bool> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let changed = h.pin(id, pin);
         if changed {
@@ -1164,6 +1211,7 @@ impl Home {
         body: &str,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let mut n = 0;
         for e in h.entries.iter_mut().filter(|e| e.file.is_none() && pick(e)) {
@@ -1186,6 +1234,7 @@ impl Home {
         now_ms: u64,
         pick: impl Fn(&Entry) -> bool,
     ) -> Result<usize> {
+        let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let mut n = 0;
         for e in h.entries.iter_mut().filter(|e| pick(e) && e.read_ms == 0) {
@@ -1259,6 +1308,7 @@ impl Home {
     /// Prunes expired messages in every conversation; returns how many
     /// conversations changed.
     pub fn sweep_history(&self, identity: &Identity, now_ms: u64) -> usize {
+        let _lock = history_lock();
         self.conversations()
             .into_iter()
             .filter(|c| {

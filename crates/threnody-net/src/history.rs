@@ -1063,6 +1063,7 @@ impl Node {
     /// [`Node::set_timer`] for any conversation (groups too: their timer
     /// applies on this device).
     pub fn set_conversation_timer(&self, conv: ConversationId, secs: Option<u32>) -> Result<()> {
+        let _lock = threnody_core::history::history_lock();
         let mut h = self.history(conv)?;
         // 0 records "off on purpose", unlike no setting (the default).
         h.timer_s = Some(secs.unwrap_or(0));
@@ -1275,6 +1276,7 @@ impl Node {
             return;
         };
         let conv = self.conversation_for(from);
+        let lock = threnody_core::history::history_lock();
         if self.effective_timer(conv) != *expires_in_s
             && let Ok(mut h) = self.history(conv)
         {
@@ -1285,6 +1287,7 @@ impl Node {
                 secs: *expires_in_s,
             });
         }
+        drop(lock);
         self.record_with_id(
             conv,
             *from.as_bytes(),
