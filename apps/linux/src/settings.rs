@@ -20,6 +20,8 @@ pub const SEND_TYPING: &str = "send_typing";
 pub const GIPHY: &str = "giphy_search";
 /// A GIPHY API key the user entered (it wins over the build's).
 pub const GIPHY_KEY: &str = "giphy_api_key";
+/// Which conversations the list shows: "all", "chats" or "groups".
+pub const LIST_TAB: &str = "list_tab";
 
 /// Cover interval on unmetered networks, and on metered ones.
 pub const COVER_UNMETERED_MS: u32 = 2_000;
