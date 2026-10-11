@@ -1424,11 +1424,15 @@ class ChatActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.END
         })
         contentDescription = "Reply to ${quoteAuthor(q.author)}: ${q.text}"
-        setOnClickListener {
+        val show = View.OnClickListener {
             val original = onScreen.lastOrNull { quotes(q, it) }
             if (original != null) reveal(mark(original))
             else Toast.makeText(this@ChatActivity, "The original isn't loaded here.", Toast.LENGTH_SHORT).show()
         }
+        // The bubble's long press makes its text take touches: the quote's
+        // text has to answer taps too.
+        setOnClickListener(show)
+        for (i in 0 until childCount) getChildAt(i).setOnClickListener(show)
     }
 
     /** Shows the pinned messages (newest first in the bar). */

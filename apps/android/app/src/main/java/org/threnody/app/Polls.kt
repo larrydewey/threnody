@@ -116,16 +116,25 @@ object Polls {
             }, LinearLayout.LayoutParams(MATCH_PARENT, (6 * dp).toInt()).apply { topMargin = (4 * dp).toInt() })
             row.contentDescription = "${o.text}: ${o.votes} vote${if (o.votes == 1u) "" else "s"}" +
                 (if (o.mine) ", your choice" else "")
-            if (!p.closed) row.setOnClickListener {
+            if (!p.closed) {
                 val choice = i.toUInt()
-                vote(
-                    when {
-                        p.multi && choice in mine -> mine - choice
-                        p.multi -> mine + choice
-                        choice in mine -> emptyList()
-                        else -> listOf(choice)
-                    },
-                )
+                val tap = View.OnClickListener {
+                    vote(
+                        when {
+                            p.multi && choice in mine -> mine - choice
+                            p.multi -> mine + choice
+                            choice in mine -> emptyList()
+                            else -> listOf(choice)
+                        },
+                    )
+                }
+                // The bubble's long press makes its text take touches, so the
+                // option's text and bar vote too, not only the row's edges.
+                fun all(v: View) {
+                    v.setOnClickListener(tap)
+                    if (v is android.view.ViewGroup) for (c in 0 until v.childCount) all(v.getChildAt(c))
+                }
+                all(row)
             }
             box.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
