@@ -270,6 +270,9 @@ pub struct History {
     pub notify: Notify,
     /// What the user started writing here and hasn't sent.
     pub draft: String,
+    /// When the user last looked at the conversation: incoming messages
+    /// after it are unread (on this device).
+    pub seen_ms: u64,
 }
 
 /// When a conversation's new messages notify.
@@ -452,6 +455,7 @@ impl History {
             pinned: Vec::new(),
             notify: Notify::All,
             draft: String::new(),
+            seen_ms: 0,
         }
     }
 
@@ -487,6 +491,19 @@ impl History {
             self.entries.drain(..extra);
         }
         self.entries.len() != before
+    }
+
+    /// Incoming messages since the user last looked. History from before
+    /// this was kept (`seen_ms` 0) counts as read.
+    pub fn unread(&self) -> impl Iterator<Item = &Entry> {
+        let seen = if self.seen_ms == 0 {
+            u64::MAX
+        } else {
+            self.seen_ms
+        };
+        self.entries
+            .iter()
+            .filter(move |e| !e.outgoing && e.at_ms > seen)
     }
 
     /// Pinned messages, oldest pin first.
@@ -547,7 +564,8 @@ impl History {
                 2 + usize::from(self.timer_s.is_some())
                     + usize::from(!self.pinned.is_empty())
                     + usize::from(self.notify != Notify::All)
-                    + usize::from(!self.draft.is_empty()),
+                    + usize::from(!self.draft.is_empty())
+                    + usize::from(self.seen_ms != 0),
             )?;
             enc.u8(0)?.u64(VERSION)?;
             if let Some(t) = self.timer_s {
@@ -558,6 +576,9 @@ impl History {
             }
             if !self.draft.is_empty() {
                 enc.u8(5)?.str(&self.draft)?;
+            }
+            if self.seen_ms != 0 {
+                enc.u8(6)?.u64(self.seen_ms)?;
             }
             if !self.pinned.is_empty() {
                 enc.u8(3)?.array_len(self.pinned.len())?;
@@ -686,6 +707,7 @@ impl History {
         let mut pinned = Vec::new();
         let mut notify = Notify::All;
         let mut draft = String::new();
+        let mut seen_ms = 0;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -785,6 +807,7 @@ impl History {
                 }
                 4 => notify = Notify::from_u8(d.u8()?),
                 5 => draft = d.str()?.to_owned(),
+                6 => seen_ms = d.u64()?,
                 3 => {
                     for _ in 0..d.array_len()? {
                         let p = d.u64()?;
@@ -807,6 +830,7 @@ impl History {
             pinned,
             notify,
             draft,
+            seen_ms,
         })
     }
 }
@@ -961,6 +985,10 @@ impl Home {
     ) -> Result<History> {
         let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
+        // Start counting unread messages: what came before is read.
+        if h.seen_ms == 0 {
+            h.seen_ms = h.entries.last().map_or(1, |l| l.at_ms.max(1));
+        }
         h.push(e, now_ms);
         self.save_history(identity, c, &h)?;
         Ok(h)
@@ -1147,6 +1175,17 @@ impl Home {
             self.save_history(identity, c, &h)?;
         }
         Ok(changed)
+    }
+
+    /// Notes that the user looked at `c` now: its messages are read.
+    pub fn mark_seen(&self, identity: &Identity, c: ConversationId, now_ms: u64) -> Result<()> {
+        let _lock = history_lock();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        if h.unread().next().is_some() {
+            h.seen_ms = now_ms;
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(())
     }
 
     /// Keeps what the user started writing in `c` (empty: none).

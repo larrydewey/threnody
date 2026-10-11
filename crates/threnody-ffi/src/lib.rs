@@ -20,6 +20,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 uniffi::setup_scaffolding!();
 
 mod calls;
+mod folders;
 mod groups;
 mod persona;
 mod volunteer;
@@ -563,6 +564,8 @@ pub enum NodeEvent {
     Read {
         peer: String,
     },
+    /// Our other device changed the folders, pinned or archived chats.
+    FoldersChanged,
     /// `peer` pinned (or unpinned) a message in our chat, or in `group`.
     Pinned {
         peer: String,
@@ -918,6 +921,7 @@ fn convert(e: Event) -> NodeEvent {
             peer: fp(&peer),
             active,
         },
+        Event::FoldersChanged { .. } => NodeEvent::FoldersChanged,
         Event::Pinned { peer, pin, .. } => NodeEvent::Pinned {
             peer: fp(&peer),
             group: None,
@@ -2155,29 +2159,40 @@ impl ThrenodyNode {
                 .map(|h| h.notify)
                 .unwrap_or_default()
         };
+        // A folder may quiet it too, unless the sender keeps writing to
+        // us directly (its breakthrough); the chat's own "off" stays off.
+        let device = |s: &str| self.resolve(s).ok().map(|p| *p.as_bytes());
         match &mut e {
             NodeEvent::Message { peer, quiet, .. } | NodeEvent::File { peer, quiet, .. } => {
                 if let Ok(p) = self.resolve(peer) {
-                    *quiet = level(self.node.conversation_for(&p)) != Notify::All;
+                    let conv = self.node.conversation_for(&p);
+                    *quiet = level(conv) != Notify::All
+                        || self.folder_quiets(conv, true, true, Some(*p.as_bytes()));
                 }
             }
             NodeEvent::GroupMessage {
                 group,
+                from,
                 mentioned,
                 quiet,
                 ..
             } => {
                 if let Ok(g) = self.group_id(group) {
-                    *quiet = match level(ConversationId::Group(g)) {
+                    let conv = ConversationId::Group(g);
+                    *quiet = match level(conv) {
                         Notify::All => false,
                         Notify::Mentions => !*mentioned,
                         Notify::Off => true,
-                    };
+                    } || self.folder_quiets(conv, *mentioned, false, device(from));
                 }
             }
-            NodeEvent::GroupFile { group, quiet, .. } => {
+            NodeEvent::GroupFile {
+                group, from, quiet, ..
+            } => {
                 if let Ok(g) = self.group_id(group) {
-                    *quiet = level(ConversationId::Group(g)) != Notify::All;
+                    let conv = ConversationId::Group(g);
+                    *quiet = level(conv) != Notify::All
+                        || self.folder_quiets(conv, false, false, device(from));
                 }
             }
             _ => {}

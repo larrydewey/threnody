@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod directory;
 pub mod discovery;
 pub mod error;
+pub mod folders;
 pub mod handshake;
 pub mod history;
 pub mod identity;
