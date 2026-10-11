@@ -596,7 +596,8 @@ class MainActivity : Activity() {
 
     /** What a list of rows looks like, without their actions. */
     private fun shown(rows: List<Row>): List<Any?> = rows.map {
-        listOf(it.title, it.avatarKey, it.preview.toString(), it.atMs, it.connected, it.section, it.isSectionHeader, it.sectionTitle, it.manage != null)
+        listOf(it.title, it.avatarKey, it.preview.toString(), it.atMs, it.connected, it.section, it.isSectionHeader,
+            it.sectionTitle, it.manage != null, it.unread, it.pinned, it.archived)
     }
 
     private fun show(rows: List<Row>) {
