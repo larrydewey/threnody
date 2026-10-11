@@ -2015,6 +2015,14 @@ impl Ui {
                     arg.ok_or_else(|| anyhow!("usage: /ghistory <group> [count]"))?,
                 )?;
             }
+            "gpoll" => self.groups.poll(
+                &self.node,
+                arg.ok_or_else(|| anyhow!("usage: /gpoll <group> <question> | <option>..."))?,
+            )?,
+            "gvote" => self.groups.vote(
+                &self.node,
+                arg.ok_or_else(|| anyhow!("usage: /gvote <group> <n> [choice...]"))?,
+            )?,
             "gr" => {
                 self.groups.reply(
                     &self.node,

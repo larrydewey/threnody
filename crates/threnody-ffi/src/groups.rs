@@ -93,6 +93,10 @@ fn event(u: Update) -> NodeEvent {
             member: fp(&member),
             role: role as u8,
         },
+        Update::Voted { group, from } => NodeEvent::Reacted {
+            peer: fp(&from),
+            group: Some(hex(&group)),
+        },
         Update::Pinned { group, from, pin } => NodeEvent::Pinned {
             peer: fp(&from),
             group: Some(hex(&group)),
@@ -401,6 +405,41 @@ impl ThrenodyNode {
         let g = self.group_id(&group)?;
         let _guard = self.rt.enter();
         self.group_node().pin(&self.node, &g, id, pin).map_err(fail)
+    }
+
+    /// Asks `group` a question with 2 to 12 `options`; `multi` lets members
+    /// choose several.
+    pub fn send_group_poll(
+        &self,
+        group: String,
+        question: String,
+        options: Vec<String>,
+        multi: bool,
+    ) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node()
+            .send_poll(&self.node, &g, &question, options, multi)
+            .map_err(fail)
+    }
+
+    /// Sets our vote in poll `id` (a [`HistoryEntry::id`]) in `group`, by
+    /// option index; none takes it back. False if nothing changed.
+    pub fn vote_in_group(&self, group: String, id: u64, choices: Vec<u32>) -> Result<bool> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node()
+            .vote(&self.node, &g, id, &choices)
+            .map_err(fail)
+    }
+
+    /// Closes our poll `id` in `group`: it takes no more votes.
+    pub fn close_group_poll(&self, group: String, id: u64) -> Result<bool> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node()
+            .close_poll(&self.node, &g, id)
+            .map_err(fail)
     }
 
     /// When new messages in `group` notify.

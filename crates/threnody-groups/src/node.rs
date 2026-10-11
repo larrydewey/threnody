@@ -14,7 +14,7 @@
 //! A forwarder delivers the same way but never forwards again, so a
 //! message crosses at most one forwarding member.
 
-use threnody_core::history::{ConversationId, Entry, FileNote};
+use threnody_core::history::{ConversationId, Entry, FileNote, MAX_POLL_QUESTION, Poll};
 use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
@@ -98,6 +98,11 @@ pub enum Update {
     },
     /// `from` changed its reactions on a message in `group`.
     Reacted {
+        group: GroupId,
+        from: PublicIdentity,
+    },
+    /// `from` voted in (or closed) a poll in `group`.
+    Voted {
         group: GroupId,
         from: PublicIdentity,
     },
@@ -358,6 +363,62 @@ impl GroupNode {
         Ok(true)
     }
 
+    /// Asks the group `question`, with 2 to 12 `options`; `multi` lets
+    /// members choose several.
+    pub fn send_poll(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        question: &str,
+        options: Vec<String>,
+        multi: bool,
+    ) -> Result<()> {
+        let question: String = question.trim().chars().take(MAX_POLL_QUESTION).collect();
+        let poll = Poll::new(options, multi)
+            .filter(|_| !question.is_empty())
+            .ok_or(GroupError::Unexpected(
+                "a poll needs a question and 2 to 12 options",
+            ))?;
+        let id = threnody_net::history::local_id();
+        let content = Content::Poll {
+            id,
+            question,
+            options: poll.options,
+            multi,
+        };
+        self.send(node, group, &content, None, id)
+    }
+
+    /// Sets our vote in poll `id` (no choices: takes it back), for every
+    /// member. Returns false if that changed nothing (or the poll's closed).
+    pub fn vote(&mut self, node: &Node, group: &GroupId, id: u64, choices: &[u32]) -> Result<bool> {
+        let me = node.reactor_of(&node.identity());
+        if !node.vote_in(ConversationId::Group(*group), id, me, choices) {
+            return Ok(false);
+        }
+        let content = Content::Vote {
+            id,
+            choices: choices.to_vec(),
+        };
+        let out = self.groups.send(group, &content)?;
+        self.apply(node, out, true);
+        Ok(true)
+    }
+
+    /// Closes our poll `id` for every member: it takes no more votes.
+    pub fn close_poll(&mut self, node: &Node, group: &GroupId, id: u64) -> Result<bool> {
+        let ours = |d: &[u8; 32]| {
+            *d == *node.identity().as_bytes()
+                || PublicIdentity::from_bytes(d).is_ok_and(|p| node.is_own_device(&p))
+        };
+        if !node.close_poll_in(ConversationId::Group(*group), id, ours) {
+            return Ok(false);
+        }
+        let out = self.groups.send(group, &Content::ClosePoll { id })?;
+        self.apply(node, out, true);
+        Ok(true)
+    }
+
     /// Pins (or unpins) message `id` in `group` for every member. Only the
     /// owner and admins may; returns false if there's no such message.
     pub fn pin(&mut self, node: &Node, group: &GroupId, id: u64, pin: bool) -> Result<bool> {
@@ -440,8 +501,10 @@ impl GroupNode {
                 outgoing: true,
                 device: *node.identity().as_bytes(),
                 text: match content {
-                    Content::Text { text: t, .. } | Content::File { caption: t, .. } => t.clone(),
-                    Content::React { .. } | Content::Pin { .. } => String::new(),
+                    Content::Text { text: t, .. }
+                    | Content::File { caption: t, .. }
+                    | Content::Poll { question: t, .. } => t.clone(),
+                    _ => String::new(),
                 },
                 offline: false,
                 expires_at_ms: node
@@ -460,7 +523,14 @@ impl GroupNode {
                     Content::Text { quote, .. } => quote.clone(),
                     _ => None,
                 },
-                mentions: Vec::new(),
+                mentions: match content {
+                    Content::Text { mentions, .. } => mentions.clone(),
+                    _ => Vec::new(),
+                },
+                poll: match content {
+                    Content::Poll { options, multi, .. } => Poll::new(options.clone(), *multi),
+                    _ => None,
+                },
             },
         );
         Ok(())
@@ -501,6 +571,7 @@ impl GroupNode {
                 reactions: Vec::new(),
                 quote: None,
                 mentions: Vec::new(),
+                poll: None,
             },
         );
     }
@@ -935,6 +1006,77 @@ impl GroupNode {
                 let who = node.reactor_of(&from);
                 node.apply_reaction(ConversationId::Group(group), who, id, &emoji, add);
                 Update::Reacted { group, from }
+            }
+            GroupEvent::Poll {
+                group,
+                from,
+                id,
+                question,
+                options,
+                multi,
+            } => {
+                let Some(poll) = Poll::new(options, multi) else {
+                    return;
+                };
+                let conv = ConversationId::Group(group);
+                let ours = node.is_own_device(&from);
+                let now = threnody_core::now_ms();
+                node.append(
+                    conv,
+                    Entry {
+                        at_ms: now,
+                        outgoing: ours,
+                        device: *from.as_bytes(),
+                        text: question.clone(),
+                        offline: false,
+                        expires_at_ms: node
+                            .effective_timer(conv)
+                            .map(|s| now + u64::from(s) * 1000),
+                        file: None,
+                        local_id: 0,
+                        delivered: false,
+                        recipients: 0,
+                        delivered_to: Vec::new(),
+                        remote_id: id,
+                        edited_ms: 0,
+                        read_ms: 0,
+                        reactions: Vec::new(),
+                        quote: None,
+                        mentions: Vec::new(),
+                        poll: Some(poll),
+                    },
+                );
+                Update::Text {
+                    group,
+                    from,
+                    text: format!("📊 {question}"),
+                    ours,
+                    mentioned: false,
+                }
+            }
+            GroupEvent::Vote {
+                group,
+                from,
+                id,
+                choices,
+            } => {
+                let who = node.reactor_of(&from);
+                if !node.vote_in(ConversationId::Group(group), id, who, &choices) {
+                    return;
+                }
+                Update::Voted { group, from }
+            }
+            GroupEvent::ClosePoll { group, from, id } => {
+                // Only its author (any device of their account) closes a poll.
+                let who = node.reactor_of(&from);
+                let author = |d: &[u8; 32]| {
+                    *d == *from.as_bytes()
+                        || PublicIdentity::from_bytes(d).is_ok_and(|p| node.reactor_of(&p) == who)
+                };
+                if !node.close_poll_in(ConversationId::Group(group), id, author) {
+                    return;
+                }
+                Update::Voted { group, from }
             }
             GroupEvent::Pin {
                 group,

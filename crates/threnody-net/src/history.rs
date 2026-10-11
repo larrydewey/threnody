@@ -270,6 +270,29 @@ impl Node {
             .map_err(NetError::from)
     }
 
+    /// Sets `who`'s vote in poll `id` in `conv`, on this device; returns
+    /// true if that changed anything.
+    pub fn vote_in(&self, conv: ConversationId, id: u64, who: [u8; 32], choices: &[u32]) -> bool {
+        self.shared
+            .home
+            .vote_entry(self.identity_ref(), conv, now_ms(), id, who, choices)
+            .unwrap_or(false)
+    }
+
+    /// Closes poll `id` in `conv`, on this device, if `author` accepts the
+    /// device that sent it; returns true if that changed anything.
+    pub fn close_poll_in(
+        &self,
+        conv: ConversationId,
+        id: u64,
+        author: impl Fn(&[u8; 32]) -> bool,
+    ) -> bool {
+        self.shared
+            .home
+            .close_poll(self.identity_ref(), conv, now_ms(), id, author)
+            .unwrap_or(false)
+    }
+
     /// Pinned messages in `conv`, oldest pin first.
     pub fn pinned(&self, conv: ConversationId) -> Vec<Entry> {
         let Ok(h) = self.history(conv) else {
@@ -824,6 +847,7 @@ impl Node {
                 reactions: Vec::new(),
                 quote,
                 mentions: Vec::new(),
+                poll: None,
             },
         );
         Ok(r)
@@ -1091,6 +1115,7 @@ impl Node {
             reactions: Vec::new(),
             quote,
             mentions,
+            poll: None,
         };
         let _ = self
             .shared
@@ -1156,6 +1181,7 @@ impl Node {
                 reactions: Vec::new(),
                 quote: None,
                 mentions: Vec::new(),
+                poll: None,
             },
         );
     }

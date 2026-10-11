@@ -920,6 +920,7 @@ impl ChatView {
                 add("Invite contacts", "invite", Self::invite_to_group);
             }
             add("Media, files and links", "media", Self::media);
+            add("New poll…", "poll", Self::new_poll);
             add("Disappearing messages", "timer", Self::disappearing);
             add("Notifications", "notify", Self::notifications);
             add("Clear chat…", "clear", Self::clear);
@@ -1110,7 +1111,13 @@ impl ChatView {
         if let Some(q) = &e.quote {
             bubble.append(&self.quote_view(q));
         }
-        if let Some(f) = &e.file {
+        if let (Some(p), None) = (&e.poll, &e.file) {
+            let q = ui::label(&e.text, &["message-text", "heading"]);
+            q.set_selectable(true);
+            q.set_max_width_chars(60);
+            bubble.append(&q);
+            bubble.append(&self.poll_view(e, p));
+        } else if let Some(f) = &e.file {
             bubble.append(&self.file_view(e, f));
             if !e.text.is_empty() {
                 let caption = ui::label(&e.text, &["message-text"]);
@@ -1648,6 +1655,23 @@ impl ChatView {
                 }),
             );
         }
+        if e.outgoing && e.poll.as_ref().is_some_and(|p| !p.closed) {
+            let (weak, id) = (self.weak_self.clone(), e.id);
+            item(
+                "End poll",
+                Box::new(move || {
+                    if let Some(t) = weak.upgrade()
+                        && let Some(g) = t.group()
+                    {
+                        t.run(
+                            "end the poll",
+                            move |n| n.close_group_poll(g, id).map(|_| ()),
+                            None,
+                        );
+                    }
+                }),
+            );
+        }
         if e.id != 0 && self.may_pin.get() {
             let pinned = self.pins.borrow().iter().any(|p| p.id == e.id);
             let (weak, entry) = (self.weak_self.clone(), e.clone());
@@ -1786,6 +1810,136 @@ impl ChatView {
                 t.reload();
             },
         );
+    }
+
+    /// A poll's options with their share of the votes; clicking one votes.
+    fn poll_view(&self, e: &HistoryEntry, p: &threnody_ffi::PollInfo) -> gtk::Widget {
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let mut status = vec![
+            if p.multi { "Choose any" } else { "Choose one" }.to_owned(),
+            format!("{} voted", p.voters),
+        ];
+        if p.closed {
+            status.push("closed".into());
+        }
+        b.append(&ui::label(&status.join(" · "), &["caption", "dim-label"]));
+        let mine: Vec<u32> = (0..p.options.len() as u32)
+            .filter(|i| p.options[*i as usize].mine)
+            .collect();
+        for (i, o) in p.options.iter().enumerate() {
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let text = ui::label(
+                &format!("{}{}", if o.mine { "✓ " } else { "" }, o.text),
+                if o.mine { &["heading"] } else { &[] },
+            );
+            text.set_hexpand(true);
+            top.append(&text);
+            top.append(&ui::label(&o.votes.to_string(), &["caption", "dim-label"]));
+            row.append(&top);
+            let bar = gtk::LevelBar::for_interval(0.0, f64::from(p.voters.max(1)));
+            bar.set_value(f64::from(o.votes));
+            row.append(&bar);
+            let button = gtk::Button::builder().child(&row).build();
+            button.add_css_class("flat");
+            button.add_css_class("poll-option");
+            button.set_sensitive(!p.closed);
+            let choice = i as u32;
+            let choices: Vec<u32> = match (p.multi, mine.contains(&choice)) {
+                (true, true) => mine.iter().copied().filter(|c| *c != choice).collect(),
+                (true, false) => mine.iter().copied().chain([choice]).collect(),
+                (false, true) => Vec::new(),
+                (false, false) => vec![choice],
+            };
+            let (weak, id) = (self.weak_self.clone(), e.id);
+            button.connect_clicked(move |_| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(g) = t.group() else { return };
+                let c = choices.clone();
+                t.run("vote", move |n| n.vote_in_group(g, id, c).map(|_| ()), None);
+            });
+            b.append(&button);
+        }
+        b.upcast()
+    }
+
+    /// Asks the group a question.
+    fn new_poll(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let d = ui::alert(
+            "New poll",
+            "Members pick from the options; you can end the poll later.",
+            &[("cancel", "Cancel"), ("ok", "Send")],
+        );
+        d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        let form = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let question = gtk::Entry::builder().placeholder_text("Question").build();
+        form.append(&question);
+        let options = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let add_option = {
+            let options = options.clone();
+            move || {
+                let n = {
+                    let mut n = 0;
+                    let mut c = options.first_child();
+                    while let Some(w) = c {
+                        n += 1;
+                        c = w.next_sibling();
+                    }
+                    n
+                };
+                if n < 12 {
+                    options.append(
+                        &gtk::Entry::builder()
+                            .placeholder_text(format!("Option {}", n + 1))
+                            .build(),
+                    );
+                }
+            }
+        };
+        add_option();
+        add_option();
+        form.append(&options);
+        let more = gtk::Button::with_label("Add an option");
+        more.add_css_class("flat");
+        more.connect_clicked(move |_| add_option());
+        form.append(&more);
+        let multi = gtk::CheckButton::with_label("Allow several choices");
+        form.append(&multi);
+        d.set_extra_child(Some(&form));
+        let weak = self.weak_self.clone();
+        d.connect_response(None, move |_, r| {
+            if r != "ok" {
+                return;
+            }
+            let Some(t) = weak.upgrade() else { return };
+            let Some(g) = t.group() else { return };
+            let mut opts = Vec::new();
+            let mut c = options.first_child();
+            while let Some(w) = c {
+                if let Some(e) = w.downcast_ref::<gtk::Entry>() {
+                    let o = e.text().trim().to_owned();
+                    if !o.is_empty() {
+                        opts.push(o);
+                    }
+                }
+                c = w.next_sibling();
+            }
+            let q = question.text().trim().to_owned();
+            if q.is_empty() || opts.len() < 2 {
+                t.toast("A poll needs a question and at least two options.");
+                return;
+            }
+            let multi = multi.is_active();
+            t.run(
+                "send the poll",
+                move |n| n.send_group_poll(g, q, opts, multi),
+                None,
+            );
+        });
+        d.present(Some(&app.window));
     }
 
     /// `e`'s text as markup, with mentions as "@" and our name for them

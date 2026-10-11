@@ -789,7 +789,7 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList()), sending = true) }
+            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         val pinned = try { if (g != null) node.groupPinned(g) else node.pinned(device) } catch (_: Exception) { emptyList() }
@@ -1259,6 +1259,19 @@ class ChatActivity : Activity() {
                 })
             }
             time
+        } else if (file == null && e.poll != null) {
+            val p = e.poll!!
+            body.addView(TextView(this).apply {
+                searchable(e, e.text)
+                textSize = 16f
+                setTextColor(fg)
+                setTypeface(typeface, Typeface.BOLD)
+            })
+            body.addView(Polls.view(this, p, fg, color(R.color.accent)) { choices ->
+                val g = group ?: return@view
+                Threading.background { run("vote") { node.voteInGroup(g, e.id, choices) } }
+            }, matchWrap)
+            time
         } else if (file == null) {
             val (shown, ranges) = Mentions.display(e) { Threnody.nameOf(node, it) }
             if (ranges.isNotEmpty()) mentionRanges[mark(e)] = shown to ranges
@@ -1470,6 +1483,7 @@ class ChatActivity : Activity() {
         val options = buildList {
             add("Reply")
             if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
+            if (e.poll != null && e.outgoing && e.poll?.closed == false) add("End poll")
             // Text isn't selectable in the bubble (it would take the long
             // press), so copying is offered here.
             if (e.text.isNotEmpty()) {
@@ -1484,6 +1498,11 @@ class ChatActivity : Activity() {
             if (option == "Edit") return editMessage(e)
             if (option == "Reply") return replyingTo(e)
             if (option == "Pin" || option == "Unpin") return pin(e, option == "Pin")
+            if (option == "End poll") {
+                val g = group ?: return
+                Threading.background { run("end the poll") { node.closeGroupPoll(g, e.id) } }
+                return
+            }
             if (option == "Copy text") {
                 getSystemService(android.content.ClipboardManager::class.java)
                     ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
@@ -1627,6 +1646,13 @@ class ChatActivity : Activity() {
             menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
             menu.add("File").setOnMenuItemClickListener { pick(photos = false); true }
             menu.add("Video message").setOnMenuItemClickListener { recordVideo(); true }
+            val g = group
+            if (g != null) menu.add("Poll").setOnMenuItemClickListener {
+                Polls.compose(this@ChatActivity) { q, options, multi ->
+                    Threading.background { run("send the poll") { node.sendGroupPoll(g, q, options, multi) } }
+                }
+                true
+            }
         }.show()
     }
 

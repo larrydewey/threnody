@@ -152,6 +152,25 @@ pub struct HistoryEntry {
     pub quote: Option<QuoteInfo>,
     /// Who it mentions, in order.
     pub mentions: Vec<MentionInfo>,
+    /// A poll (its question is `text`).
+    pub poll: Option<PollInfo>,
+}
+
+/// A poll: its options with how many chose each and whether we did, and
+/// how many voted.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PollInfo {
+    pub options: Vec<PollOption>,
+    pub multi: bool,
+    pub closed: bool,
+    pub voters: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PollOption {
+    pub text: String,
+    pub votes: u32,
+    pub mine: bool,
 }
 
 /// Someone a message mentions: characters `start..start+len` of its text
@@ -717,6 +736,30 @@ fn history_entries(
     entries
         .iter()
         .map(|e| HistoryEntry {
+            poll: e.poll.as_ref().map(|p| {
+                let counts = p.counts();
+                let mine: Vec<u32> = p
+                    .votes
+                    .iter()
+                    .find(|(w, _)| *w == me)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                PollInfo {
+                    options: p
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, o)| PollOption {
+                            text: o.clone(),
+                            votes: counts.get(i).copied().unwrap_or(0),
+                            mine: mine.contains(&(i as u32)),
+                        })
+                        .collect(),
+                    multi: p.multi,
+                    closed: p.closed,
+                    voters: u32::try_from(p.votes.len()).unwrap_or(u32::MAX),
+                }
+            }),
             mentions: e
                 .mentions
                 .iter()

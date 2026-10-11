@@ -12,6 +12,7 @@
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
+use threnody_core::history::{MAX_POLL_OPTIONS, MAX_POLL_QUESTION};
 use threnody_core::message::{Clip, MAX_MENTIONS, Mention, Quote};
 use threnody_core::{Error, Result};
 
@@ -190,7 +191,8 @@ impl GroupWire {
 ///                     ? 7: clip duration_ms uint, ? 8: quoted id uint,
 ///                     ? 9: quoted author bstr, ? 10: quoted text tstr,
 ///                     ? 11: mentions [* [start uint, len uint, who bstr]] }
-/// kind: 1 text, 2 file, 3 reaction, 4 pin
+/// kind: 1 text, 2 file, 3 reaction, 4 pin, 5 poll (1: question,
+/// 12: options, flag 1 multiple choice), 6 vote (13: choices), 7 close poll
 /// flags: 1 sensitive, 2 voice message, 4 video message (file);
 ///        1 remove (reaction)
 /// ```
@@ -223,6 +225,18 @@ pub enum Content {
     React { id: u64, emoji: String, add: bool },
     /// Pin (or with `pin` false, unpin) message `id` (owner and admins).
     Pin { id: u64, pin: bool },
+    /// A poll, message `id`: a question, its options, and whether several
+    /// may be chosen.
+    Poll {
+        id: u64,
+        question: String,
+        options: Vec<String>,
+        multi: bool,
+    },
+    /// The sender's choices in poll `id` (none: takes the vote back).
+    Vote { id: u64, choices: Vec<u32> },
+    /// Closes poll `id` (its author only).
+    ClosePoll { id: u64 },
 }
 
 const TAGGED: u8 = 0xFF;
@@ -268,6 +282,19 @@ impl Content {
             ),
             Self::React { id, emoji, add } => (3, emoji, None, u64::from(!*add), "", 0, *id, 0),
             Self::Pin { id, pin } => (4, "", None, u64::from(!*pin), "", 0, *id, 0),
+            Self::Poll {
+                id,
+                question,
+                multi,
+                ..
+            } => (5, question, None, u64::from(*multi), "", 0, *id, 0),
+            Self::Vote { id, .. } => (6, "", None, 0, "", 0, *id, 0),
+            Self::ClosePoll { id } => (7, "", None, 0, "", 0, *id, 0),
+        };
+        let (options, choices): (&[String], &[u32]) = match self {
+            Self::Poll { options, .. } => (options, &[]),
+            Self::Vote { choices, .. } => (&[], choices),
+            _ => (&[], &[]),
         };
         let (quote, mentions) = match self {
             Self::Text {
@@ -280,6 +307,8 @@ impl Content {
             + caption.len()
             + quote.map_or(0, |q| q.text.len() + 48)
             + mentions.len() * 48
+            + options.iter().map(|o| o.len() + 4).sum::<usize>()
+            + choices.len() * 5
             + 48;
         let body = cbor::to_vec(size, |e| {
             e.map_len(
@@ -290,7 +319,9 @@ impl Content {
                     + usize::from(id != 0)
                     + usize::from(duration != 0)
                     + 3 * usize::from(quote.is_some())
-                    + usize::from(!mentions.is_empty()),
+                    + usize::from(!mentions.is_empty())
+                    + usize::from(!options.is_empty())
+                    + usize::from(!choices.is_empty()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.str(text)?;
@@ -316,6 +347,18 @@ impl Content {
                 e.u8(8)?.u64(q.id)?;
                 e.u8(9)?.bytes(&q.author)?;
                 e.u8(10)?.str(&q.text)?;
+            }
+            if !options.is_empty() {
+                e.u8(12)?.array_len(options.len())?;
+                for o in options {
+                    e.str(o)?;
+                }
+            }
+            if !choices.is_empty() {
+                e.u8(13)?.array_len(choices.len())?;
+                for c in choices {
+                    e.u32(*c)?;
+                }
             }
             if !mentions.is_empty() {
                 e.u8(11)?.array_len(mentions.len())?;
@@ -346,6 +389,7 @@ impl Content {
         let mut duration = 0;
         let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
         let mut mentions = Vec::new();
+        let (mut options, mut choices) = (Vec::new(), Vec::new());
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -359,6 +403,22 @@ impl Content {
                 8 => quote_id = d.u64()?,
                 9 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
                 10 => quote_text = Some(d.str()?.to_owned()),
+                12 => {
+                    for _ in 0..d.array_len()? {
+                        let o = d.str()?.to_owned();
+                        if options.len() < MAX_POLL_OPTIONS {
+                            options.push(o);
+                        }
+                    }
+                }
+                13 => {
+                    for _ in 0..d.array_len()? {
+                        let c = d.u32()?;
+                        if choices.len() < MAX_POLL_OPTIONS {
+                            choices.push(c);
+                        }
+                    }
+                }
                 11 => {
                     for _ in 0..d.array_len()? {
                         if d.array_len()? != 3 {
@@ -404,6 +464,17 @@ impl Content {
                     add: flags & 1 == 0,
                 }
             }
+            5 if id != 0 => Self::Poll {
+                id,
+                question: required(text, "poll question")?
+                    .chars()
+                    .take(MAX_POLL_QUESTION)
+                    .collect(),
+                options,
+                multi: flags & 1 != 0,
+            },
+            6 if id != 0 => Self::Vote { id, choices },
+            7 if id != 0 => Self::ClosePoll { id },
             4 if id != 0 => Self::Pin {
                 id,
                 pin: flags & 1 == 0,
@@ -472,6 +543,21 @@ mod tests {
                 add: false,
             },
             Content::Pin { id: 42, pin: true },
+            Content::Poll {
+                id: 50,
+                question: "Lunch?".into(),
+                options: vec!["Pizza".into(), "Tacos".into()],
+                multi: true,
+            },
+            Content::Vote {
+                id: 50,
+                choices: vec![1],
+            },
+            Content::Vote {
+                id: 50,
+                choices: vec![],
+            },
+            Content::ClosePoll { id: 50 },
             Content::Pin { id: 42, pin: false },
             Content::File {
                 name: "a.txt".into(),
