@@ -156,6 +156,28 @@ pub enum GroupEvent {
         id: u64,
         pin: bool,
     },
+    /// `from` asks the group a question.
+    Poll {
+        group: GroupId,
+        from: PublicIdentity,
+        id: u64,
+        question: String,
+        options: Vec<String>,
+        multi: bool,
+    },
+    /// `from` voted in poll `id` (no choices: took its vote back).
+    Vote {
+        group: GroupId,
+        from: PublicIdentity,
+        id: u64,
+        choices: Vec<u32>,
+    },
+    /// `from` closed its poll `id`.
+    ClosePoll {
+        group: GroupId,
+        from: PublicIdentity,
+        id: u64,
+    },
 }
 
 /// Results of handling one input.
@@ -995,6 +1017,30 @@ impl Groups {
                         from: sender,
                         id,
                         pin,
+                    },
+                    Content::Poll {
+                        id,
+                        question,
+                        options,
+                        multi,
+                    } => GroupEvent::Poll {
+                        group,
+                        from: sender,
+                        id,
+                        question,
+                        options,
+                        multi,
+                    },
+                    Content::Vote { id, choices } => GroupEvent::Vote {
+                        group,
+                        from: sender,
+                        id,
+                        choices,
+                    },
+                    Content::ClosePoll { id } => GroupEvent::ClosePoll {
+                        group,
+                        from: sender,
+                        id,
                     },
                 });
             }

@@ -104,6 +104,90 @@ pub struct Entry {
     pub quote: Option<Quote>,
     /// Who it mentions (group messages).
     pub mentions: Vec<Mention>,
+    /// A poll (its question is `text`).
+    pub poll: Option<Poll>,
+}
+
+/// Most options a poll has, and longest question and option, in
+/// characters.
+pub const MAX_POLL_OPTIONS: usize = 12;
+pub const MAX_POLL_QUESTION: usize = 300;
+pub const MAX_POLL_OPTION: usize = 100;
+
+/// A poll: its options, whether several may be chosen, the votes (by
+/// voter: an account, or a device whose account isn't known), and
+/// whether its author closed it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Poll {
+    pub options: Vec<String>,
+    pub multi: bool,
+    pub votes: Vec<([u8; 32], Vec<u32>)>,
+    pub closed: bool,
+}
+
+impl Poll {
+    /// A poll of `options` (trimmed and cut short), if there are 2 to
+    /// [`MAX_POLL_OPTIONS`] non-empty ones.
+    pub fn new(options: Vec<String>, multi: bool) -> Option<Self> {
+        let options: Vec<String> = options
+            .iter()
+            .map(|o| o.trim().chars().take(MAX_POLL_OPTION).collect::<String>())
+            .filter(|o| !o.is_empty())
+            .collect();
+        (2..=MAX_POLL_OPTIONS)
+            .contains(&options.len())
+            .then_some(Self {
+                options,
+                multi,
+                votes: Vec::new(),
+                closed: false,
+            })
+    }
+
+    /// Sets `who`'s choices (none: takes the vote back). Choices out of
+    /// range are ignored, and a single-choice poll keeps the first. Returns
+    /// true if that changed anything; a closed poll takes no votes.
+    pub fn vote(&mut self, who: [u8; 32], choices: &[u32]) -> bool {
+        if self.closed {
+            return false;
+        }
+        let mut c: Vec<u32> = choices
+            .iter()
+            .copied()
+            .filter(|i| (*i as usize) < self.options.len())
+            .collect();
+        c.sort_unstable();
+        c.dedup();
+        if !self.multi {
+            c.truncate(1);
+        }
+        let before = self
+            .votes
+            .iter()
+            .find(|(w, _)| *w == who)
+            .map(|(_, v)| v.clone());
+        if before.as_ref() == Some(&c) || (before.is_none() && c.is_empty()) {
+            return false;
+        }
+        self.votes.retain(|(w, _)| *w != who);
+        if !c.is_empty() {
+            self.votes.push((who, c));
+        }
+        true
+    }
+
+    /// How many voters chose each option.
+    pub fn counts(&self) -> Vec<u32> {
+        let mut n = vec![0u32; self.options.len()];
+        for (_, v) in &self.votes {
+            for i in v {
+                if let Some(x) = n.get_mut(*i as usize) {
+                    *x += 1;
+                }
+            }
+        }
+        n
+    }
 }
 
 /// Reaction limits: per person on one message, per message, and per emoji.
@@ -217,6 +301,41 @@ pub const MAX_PINS: usize = 3;
 /// Whether two entries record the same message: outgoing ones by their
 /// local id (or time and content), incoming ones by sender and content
 /// within ten minutes (each device stamps its own receipt time).
+fn decode_poll(d: &mut Decoder<'_>) -> Result<Poll> {
+    if d.array_len()? != 4 {
+        return Err(Error::Malformed("poll"));
+    }
+    let mut options = Vec::new();
+    for _ in 0..d.array_len()? {
+        let o = d.str()?.to_owned();
+        if options.len() < MAX_POLL_OPTIONS {
+            options.push(o);
+        }
+    }
+    let (multi, closed) = (d.bool()?, d.bool()?);
+    let mut votes = Vec::new();
+    for _ in 0..d.array_len()? {
+        if d.array_len()? != 2 {
+            return Err(Error::Malformed("poll vote"));
+        }
+        let who = fixed_bytes::<32>(d)?;
+        let mut v = Vec::new();
+        for _ in 0..d.array_len()? {
+            let i = d.u32()?;
+            if (i as usize) < MAX_POLL_OPTIONS {
+                v.push(i);
+            }
+        }
+        votes.push((who, v));
+    }
+    Ok(Poll {
+        options,
+        multi,
+        votes,
+        closed,
+    })
+}
+
 /// What a quote of `e` shows: its text, or a file's name.
 pub fn snippet(e: &Entry) -> &str {
     match &e.file {
@@ -414,7 +533,8 @@ impl History {
                         + usize::from(!e.reactions.is_empty())
                         + usize::from(e.read_ms != 0)
                         + usize::from(e.quote.is_some())
-                        + usize::from(!e.mentions.is_empty()),
+                        + usize::from(!e.mentions.is_empty())
+                        + usize::from(e.poll.is_some()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -474,6 +594,21 @@ impl History {
                         .bytes(&q.author)?
                         .str(&q.text)?;
                 }
+                if let Some(p) = &e.poll {
+                    enc.u8(17)?.array_len(4)?;
+                    enc.array_len(p.options.len())?;
+                    for o in &p.options {
+                        enc.str(o)?;
+                    }
+                    enc.bool(p.multi)?.bool(p.closed)?;
+                    enc.array_len(p.votes.len())?;
+                    for (who, v) in &p.votes {
+                        enc.array_len(2)?.bytes(who)?.array_len(v.len())?;
+                        for i in v {
+                            enc.u32(*i)?;
+                        }
+                    }
+                }
                 if !e.mentions.is_empty() {
                     enc.u8(16)?.array_len(e.mentions.len())?;
                     for m in &e.mentions {
@@ -510,6 +645,7 @@ impl History {
                         let (mut reactions, mut read_ms) = (Vec::new(), 0);
                         let mut quote = None;
                         let mut mentions = Vec::new();
+                        let mut poll = None;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -532,6 +668,7 @@ impl History {
                                 11 => remote_id = d.u64()?,
                                 12 => edited_ms = d.u64()?,
                                 14 => read_ms = d.u64()?,
+                                17 => poll = Some(decode_poll(d)?),
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -584,6 +721,7 @@ impl History {
                             reactions,
                             quote,
                             mentions,
+                            poll,
                         });
                     }
                 }
@@ -892,6 +1030,53 @@ impl Home {
         Ok(n)
     }
 
+    /// Sets `who`'s vote on poll `id` in `c` (no choices: takes it back);
+    /// returns true if that changed anything.
+    pub fn vote_entry(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        id: u64,
+        who: [u8; 32],
+        choices: &[u32],
+    ) -> Result<bool> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let changed = h
+            .entries
+            .iter_mut()
+            .find(|e| id != 0 && e.message_id() == id)
+            .and_then(|e| e.poll.as_mut())
+            .is_some_and(|p| p.vote(who, choices));
+        if changed {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(changed)
+    }
+
+    /// Closes poll `id` in `c` if `author` accepts its sender's device;
+    /// returns true if that changed anything.
+    pub fn close_poll(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        id: u64,
+        author: impl Fn(&[u8; 32]) -> bool,
+    ) -> Result<bool> {
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let changed = h
+            .entries
+            .iter_mut()
+            .find(|e| id != 0 && e.message_id() == id && author(&e.device))
+            .and_then(|e| e.poll.as_mut())
+            .is_some_and(|p| !std::mem::replace(&mut p.closed, true));
+        if changed {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(changed)
+    }
+
     /// Sets when `c`'s new messages notify.
     pub fn set_notify(
         &self,
@@ -1068,6 +1253,7 @@ mod tests {
             reactions: Vec::new(),
             quote: None,
             mentions: Vec::new(),
+            poll: None,
         }
     }
 
@@ -1454,5 +1640,28 @@ mod tests {
         home.delete_entries(&id, c, 1, |e| e.remote_id == 4)
             .unwrap();
         assert_eq!(pinned(), [2], "a deleted message's pin goes");
+    }
+
+    #[test]
+    fn polls_count_votes_and_persist() {
+        assert!(Poll::new(vec!["only".into(), "  ".into()], false).is_none());
+        let mut p = Poll::new(vec!["a".into(), " b ".into(), "c".into()], false).unwrap();
+        assert_eq!(p.options, ["a", "b", "c"]);
+        assert!(p.vote([1; 32], &[2, 0]), "single choice keeps one");
+        assert!(!p.vote([1; 32], &[0]), "same vote again");
+        assert!(p.vote([2; 32], &[0, 9]), "out of range ignored");
+        assert_eq!(p.counts(), [2, 0, 0]);
+        assert!(p.vote([1; 32], &[]), "taken back");
+        assert_eq!(p.counts(), [1, 0, 0]);
+        p.multi = true;
+        assert!(p.vote([3; 32], &[1, 2, 1]));
+        assert_eq!(p.counts(), [1, 1, 1]);
+        p.closed = true;
+        assert!(!p.vote([4; 32], &[0]), "closed");
+
+        let mut e = entry(1, "lunch?", None);
+        e.poll = Some(p);
+        let h = History::transcript(vec![e]);
+        assert_eq!(History::decode(&h.encode().unwrap()).unwrap(), h);
     }
 }

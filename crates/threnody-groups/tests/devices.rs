@@ -354,3 +354,46 @@ async fn mentions_reach_who_they_name() {
         .clone();
     assert_eq!(stored, [mention]);
 }
+
+#[tokio::test]
+async fn polls_collect_votes_until_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let g = alice.groups.create("team").unwrap();
+    alice.groups.invite(&alice.node, &g, &bid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[1].in_group(&g)).await;
+    alice
+        .groups
+        .send_poll(
+            &alice.node,
+            &g,
+            "Lunch?",
+            vec!["Pizza".into(), "Tacos".into()],
+            false,
+        )
+        .unwrap();
+    let gc = ConversationId::Group(g);
+    let poll = |n: &N| {
+        n.node
+            .history(gc)
+            .ok()
+            .and_then(|h| h.entries().first().and_then(|e| e.poll.clone()))
+    };
+    until(&mut [&mut alice, &mut bob], |ns| poll(ns[1]).is_some()).await;
+    let id = bob.node.history(gc).unwrap().entries()[0].message_id();
+    assert!(bob.groups.vote(&bob.node, &g, id, &[1]).unwrap());
+    until(&mut [&mut alice, &mut bob], |ns| {
+        poll(ns[0]).is_some_and(|p| p.counts() == [0, 1])
+    })
+    .await;
+    // Bob can't close Alice's poll; she can, and then it takes no votes.
+    assert!(!bob.groups.close_poll(&bob.node, &g, id).unwrap());
+    assert!(alice.groups.close_poll(&alice.node, &g, id).unwrap());
+    until(&mut [&mut alice, &mut bob], |ns| {
+        poll(ns[1]).is_some_and(|p| p.closed)
+    })
+    .await;
+    assert!(!bob.groups.vote(&bob.node, &g, id, &[0]).unwrap());
+}

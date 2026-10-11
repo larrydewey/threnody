@@ -22,6 +22,9 @@ pub const HELP: &str = "\
   /g <group> <text>                     send to a group
   /ghistory <group> [count]             a group's recent messages, numbered
   /gr <group> <n> <text>                reply to message n of the last /ghistory, quoting it
+  /gpoll <group> [-m] <question> | <option> | <option>...
+                                        ask a poll (-m: several choices allowed)
+  /gvote <group> <n> [choice...]        vote in poll n of the last /ghistory (none: take it back)
   /gfile <group> [-s] <path>... [| caption]
                                         send files (photos) to a group";
 
@@ -192,6 +195,9 @@ impl GroupUi {
                 }
                 Update::Reacted { group, from } => {
                     println!("[{}] * {} reacted", self.label(&group), name(&from));
+                }
+                Update::Voted { group, from } => {
+                    println!("[{}] * {} voted", self.label(&group), name(&from));
                 }
                 Update::Pinned { group, from, pin } => println!(
                     "[{}] * {} {} a message",
@@ -400,11 +406,20 @@ impl GroupUi {
                 println!("     {}", crate::chat::quoted(q, name));
             }
             println!(
-                "{:>3}  [{}] <{who}> {}",
+                "{:>3}  [{}] <{who}> {}{}",
                 i + 1,
                 crate::chat::clock(e.at_ms),
+                if e.poll.is_some() { "📊 " } else { "" },
                 threnody_core::history::snippet(e)
             );
+            if let Some(p) = &e.poll {
+                for (j, (o, n)) in p.options.iter().zip(p.counts()).enumerate() {
+                    println!("       {}. {o} ({n})", j + 1);
+                }
+                if p.closed {
+                    println!("       (closed)");
+                }
+            }
         }
         self.shown = Some((g, recent));
         Ok(())
@@ -431,6 +446,50 @@ impl GroupUi {
         .ok_or_else(|| anyhow!("no message {n} in the last /ghistory"))?;
         let quote = threnody_core::message::Quote::of(&e);
         self.groups.send_reply(node, &g, text.trim(), Some(quote))?;
+        Ok(())
+    }
+
+    /// `/gpoll <group> [-m] <question> | <option> | <option>...`
+    pub fn poll(&mut self, node: &Node, args: &str) -> Result<()> {
+        let usage = "usage: /gpoll <group> [-m] <question> | <option> | <option>...";
+        let (g, rest) = args.split_once(' ').ok_or_else(|| anyhow!(usage))?;
+        let g = self.find(g)?;
+        let (multi, rest) = match rest.trim_start().strip_prefix("-m ") {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let mut parts = rest.split('|').map(str::trim);
+        let question = parts.next().unwrap_or("");
+        let options: Vec<String> = parts.map(str::to_owned).collect();
+        self.groups.send_poll(node, &g, question, options, multi)?;
+        Ok(())
+    }
+
+    /// `/gvote <group> <n> [choice...]`: choices count from 1.
+    pub fn vote(&mut self, node: &Node, args: &str) -> Result<()> {
+        let mut it = args.split_whitespace();
+        let (Some(g), Some(n)) = (it.next(), it.next()) else {
+            bail!("usage: /gvote <group> <n> [choice...]");
+        };
+        let g = self.find(g)?;
+        let n: usize = n.parse()?;
+        let choices = it
+            .map(|c| c.parse::<u32>().map(|c| c.saturating_sub(1)))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let e = match &self.shown {
+            Some((s, shown)) if *s == g => shown.get(n.wrapping_sub(1)).cloned(),
+            _ => bail!(
+                "run /ghistory {} first; /gvote uses its numbers",
+                self.label(&g)
+            ),
+        }
+        .ok_or_else(|| anyhow!("no message {n} in the last /ghistory"))?;
+        if e.poll.is_none() {
+            bail!("message {n} isn't a poll");
+        }
+        if !self.groups.vote(node, &g, e.message_id(), &choices)? {
+            bail!("nothing changed (or the poll is closed)");
+        }
         Ok(())
     }
 
