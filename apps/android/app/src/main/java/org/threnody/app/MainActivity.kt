@@ -196,9 +196,15 @@ class MainActivity : Activity() {
         }
 
         // Section: Contacts
-        val contacts = all.filter { it.accepted }.map { c ->
+        val notes = try { n.noteHistory(1u).lastOrNull() } catch (_: Exception) { null }
+        val noteDraft = try { n.noteDraft() } catch (_: Exception) { "" }
+        val noteRow = Row("Note to self", "notes",
+            if (noteDraft.isNotEmpty()) "Draft: $noteDraft" else notes?.let { preview(it) } ?: "Notes on all your devices",
+            notes?.atMs?.toLong() ?: 0, null, open = { openNote() }, section = Row.Section.Contacts)
+        val contacts = listOf(noteRow) + all.filter { it.accepted }.map { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
-            Row(c.title, c.key, last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
+            val draft = try { n.draft(c.device) } catch (_: Exception) { "" }
+            Row(c.title, c.key, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
                 last?.atMs?.toLong() ?: 0, c.connected,
                 open = { openChat(c.key, c.device) },
                 manage = { manage(n, c.title, c.device, null) },
@@ -213,7 +219,8 @@ class MainActivity : Activity() {
         val groups = n.groups().map { g ->
             val last = try { n.groupHistory(g.id, 1u).lastOrNull() } catch (_: Exception) { null }
             val who = last?.let { if (it.outgoing) "You" else Threnody.nameOf(n, it.device) }
-            Row(g.name, g.id, last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
+            val draft = try { n.groupDraft(g.id) } catch (_: Exception) { "" }
+            Row(g.name, g.id, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
                 last?.atMs?.toLong() ?: 0, null,
                 open = { openGroup(g.id) },
                 manage = { manage(n, g.name, null, g.id) },
@@ -573,6 +580,10 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun openNote() {
+        startActivity(Intent(this, ChatActivity::class.java).putExtra(ChatActivity.NOTE, true))
     }
 
     private fun openGroup(id: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null) {

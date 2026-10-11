@@ -65,6 +65,7 @@ fn parsers_survive_mutated_input() {
             expires_in_s: None,
             id: 0,
             quote: None,
+            forwarded: false,
         })
         .unwrap();
     let app = AppMessage::File {
@@ -79,6 +80,7 @@ fn parsers_survive_mutated_input() {
             video: true,
             duration_ms: 1_000,
         }),
+        forwarded: false,
     }
     .encode()
     .unwrap();
@@ -118,6 +120,7 @@ fn parsers_survive_mutated_input() {
             expires_in_s: None,
             id: 0,
             quote: None,
+            forwarded: false,
         }
     );
 }

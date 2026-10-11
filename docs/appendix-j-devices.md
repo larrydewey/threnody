@@ -81,6 +81,7 @@ Contacts send to every device of an account, so each device receives incoming me
 - **Reliability.** Transcripts are sent tracked (Appendix C, *Acknowledgements*), so one lost with a dying session is resent.
 - **Files.** A file entry travels without its location; the contents stay on the device that has them.
 - **Groups.** A device can only read a group's messages from when it joined (MLS), so its siblings transcribe the group's history to it, and have it added to the group (Appendix F, *Linked devices*). When catching up, a device sends every group entry newer than what that sibling last had, not only its own, to cover the time between linking and joining. Once a member, a device receives the group's messages itself; those a sibling sends reach it as a member and are recorded as the account's own.
+- **Notes to self.** Each account has a chat with itself, `0 ‖ account id`. A device writes notes there like outgoing messages, and they reach the other devices as transcripts (live, catching up, and on linking). A file note stays on the device that has it; the others get its record.
 - **Conversation ids.** A device that has a contact from contact sync, but hasn't seen the contact's account chain, files the chat under the account recorded in its contact book. Its siblings do the same, so transcripts land in the right conversation.
 
 Apps show a sibling's messages as yours, without delivery ticks: the sending device collects those.

@@ -111,6 +111,7 @@ impl Drop for ChatView {
     fn drop(&mut self) {
         // A popover's parent doesn't take it down with itself.
         self.mention_popover.unparent();
+        self.save_draft();
     }
 }
 
@@ -564,8 +565,114 @@ impl ChatView {
     fn group(&self) -> Option<String> {
         match &self.conv.borrow().chat.target {
             Target::Group(g) => Some(g.clone()),
-            Target::Contact(_) => None,
+            Target::Contact(_) | Target::Note => None,
         }
+    }
+
+    /// Notes to self rather than a chat with someone.
+    fn is_note(&self) -> bool {
+        self.conv.borrow().chat.target == Target::Note
+    }
+
+    fn dest(&self) -> Dest {
+        match (self.is_note(), self.group()) {
+            (true, _) => Dest::Note,
+            (false, Some(g)) => Dest::Group(g),
+            (false, None) => Dest::Contact(self.device()),
+        }
+    }
+
+    /// Forwards a message to a chat the user picks, marked as forwarded.
+    fn forward(self: &Rc<Self>, e: &HistoryEntry) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let persona = self.persona();
+        let targets: Vec<Conversation> = app
+            .core
+            .conversations()
+            .into_iter()
+            .filter(|c| c.chat.persona == persona && c.invite.is_none() && !c.is_request())
+            .collect();
+        let names: Vec<String> = targets.iter().map(|c| c.title.clone()).collect();
+        let (weak, e) = (self.weak_self.clone(), e.clone());
+        ui::choose(
+            &app.window,
+            "Forward to",
+            "It arrives marked as forwarded.",
+            &names,
+            None,
+            move |i| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(c) = targets.get(i).cloned() else {
+                    return;
+                };
+                let e = e.clone();
+                let title = c.title.clone();
+                t.run(
+                    "forward",
+                    move |n| {
+                        let dest = match &c.chat.target {
+                            Target::Note => Dest::Note,
+                            Target::Group(g) => Dest::Group(g.clone()),
+                            Target::Contact(_) => Dest::Contact(c.device.clone()),
+                        };
+                        match (&e.file, dest) {
+                            (None, Dest::Note) => n.write_note(e.text.clone(), None, None),
+                            (None, Dest::Group(g)) => n.forward_group_text(g, e.text.clone()),
+                            (None, Dest::Contact(d)) => {
+                                n.forward_text(d, e.text.clone()).map(|_| ())
+                            }
+                            (Some(f), dest) => {
+                                let path = f.location.clone().unwrap_or_default();
+                                let data = std::fs::read(&path).map_err(|x| {
+                                    threnody_ffi::ThrenodyError::Failed {
+                                        reason: format!("that file isn't on this device: {x}"),
+                                    }
+                                })?;
+                                let options = FileOptions {
+                                    sensitive: f.sensitive,
+                                    caption: e.text.clone(),
+                                    album: 0,
+                                    clip: f.clip,
+                                    forwarded: true,
+                                };
+                                send_file_to(
+                                    n,
+                                    &dest,
+                                    f.name.clone(),
+                                    data,
+                                    f.location.clone(),
+                                    options,
+                                )
+                            }
+                        }
+                    },
+                    Some(format!("Forwarded to {title}")),
+                );
+            },
+        );
+    }
+
+    /// Keeps what's in the composer, encrypted, for next time.
+    fn save_draft(&self) {
+        let Some(node) = self.node() else { return };
+        if !self.loaded.get() {
+            return;
+        }
+        let buf = self.input.buffer();
+        let text = buf
+            .text(&buf.start_iter(), &buf.end_iter(), false)
+            .to_string();
+        let dest = self.dest();
+        bg(
+            move || match dest {
+                Dest::Note => node.set_note_draft(text),
+                Dest::Group(g) => node.set_group_draft(g, text),
+                Dest::Contact(d) => node.set_draft(d, text),
+            },
+            |_| {},
+        );
     }
 
     fn device(&self) -> String {
@@ -589,7 +696,7 @@ impl ChatView {
     /// Tells the contact (not a group) we started or stopped typing: on a
     /// change, and again now and then while typing goes on.
     fn notify_typing(&self, active: bool) {
-        if self.group().is_some() {
+        if self.group().is_some() || self.is_note() {
             return;
         }
         let again = active
@@ -653,7 +760,7 @@ impl ChatView {
     /// Tells the contact which of its messages are now on screen (1:1
     /// chats, with read receipts on); ids it was told of aren't sent again.
     fn report_read(&self, entries: &[HistoryEntry]) {
-        if self.group().is_some() {
+        if self.group().is_some() || self.is_note() {
             return;
         }
         let Some(app) = self.app.upgrade() else {
@@ -732,7 +839,9 @@ impl ChatView {
         self.banner.remove_css_class("warning");
         let mut can_send = true;
 
-        if let Some(invite) = &c.invite {
+        if c.chat.target == Target::Note {
+            self.title.set_subtitle("On all your devices");
+        } else if let Some(invite) = &c.invite {
             self.title.set_subtitle("invitation");
             let from = self.node().map_or_else(
                 || core::short(&invite.from),
@@ -978,12 +1087,13 @@ impl ChatView {
             self.loading.set(false);
             return;
         };
-        let (group, device) = (self.group(), self.device());
+        let (group, device, note) = (self.group(), self.device(), self.is_note());
         let (limit, until) = (self.limit.get(), self.jump.borrow().as_ref().map(|k| k.0));
         let weak = self.weak_self.clone();
         bg(
             move || {
                 let fetch = |n| match &group {
+                    _ if note => node.note_history(n).unwrap_or_default(),
                     Some(g) => node.group_history(g.clone(), n).unwrap_or_default(),
                     None => node.history(device.clone(), n).unwrap_or_default(),
                 };
@@ -995,16 +1105,29 @@ impl ChatView {
                     entries = fetch(n);
                 }
                 let (pins, may_pin) = match &group {
+                    _ if note => (node.pinned_notes(), true),
                     Some(g) => (
                         node.group_pinned(g.clone()).unwrap_or_default(),
                         node.may_pin_in_group(g.clone()).unwrap_or(false),
                     ),
                     None => (node.pinned(device.clone()).unwrap_or_default(), true),
                 };
-                (n, entries, pins, may_pin)
+                let draft = match &group {
+                    _ if note => node.note_draft(),
+                    Some(g) => node.group_draft(g.clone()).unwrap_or_default(),
+                    None => node.draft(device.clone()).unwrap_or_default(),
+                };
+                (n, entries, pins, may_pin, draft)
             },
-            move |(n, entries, pins, may_pin)| {
+            move |(n, entries, pins, may_pin, draft)| {
                 let Some(t) = weak.upgrade() else { return };
+                // What we left unsent here last time.
+                if !t.loaded.get() && !draft.is_empty() {
+                    let buf = t.input.buffer();
+                    if buf.char_count() == 0 {
+                        buf.set_text(&draft);
+                    }
+                }
                 t.loading.set(false);
                 t.limit.set(n);
                 t.may_pin.set(may_pin);
@@ -1107,6 +1230,9 @@ impl ChatView {
         if let Some(s) = sender {
             let l = ui::label(&s, &["caption-heading", "accent"]);
             bubble.append(&l);
+        }
+        if e.forwarded {
+            bubble.append(&ui::label("↪ Forwarded", &["caption", "dim-label"]));
         }
         if let Some(q) = &e.quote {
             bubble.append(&self.quote_view(q));
@@ -1521,7 +1647,7 @@ impl ChatView {
     /// Finishes a recording and sends it.
     fn send_clip(self: &Rc<Self>, rec: clip::Recorder, video: bool) {
         let Some(node) = self.node() else { return };
-        let (group, device) = (self.group(), self.device());
+        let dest = self.dest();
         self.toast("Sending…");
         let weak = self.weak_self.clone();
         bg(
@@ -1549,11 +1675,7 @@ impl ChatView {
                     ..FileOptions::default()
                 };
                 let location = Some(done.path.display().to_string());
-                match &group {
-                    Some(g) => node.send_group_file(g.clone(), name, data, location, options),
-                    None => node.send_file(device, name, data, location, options),
-                }
-                .map_err(|e| e.to_string())
+                send_file_to(&node, &dest, name, data, location, options).map_err(|e| e.to_string())
             },
             move |r| {
                 let Some(t) = weak.upgrade() else { return };
@@ -1595,7 +1717,7 @@ impl ChatView {
         });
         let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let mine_on = |emoji: &str| e.reactions.iter().any(|r| r.emoji == emoji && r.mine);
-        if e.id != 0 {
+        if e.id != 0 && !self.is_note() {
             let emojis = gtk::Box::new(gtk::Orientation::Horizontal, 2);
             for em in QUICK_REACTIONS {
                 let btn = gtk::ToggleButton::with_label(em);
@@ -1684,11 +1806,23 @@ impl ChatView {
                 }),
             );
         }
+        if e.poll.is_none() {
+            let (weak, entry) = (self.weak_self.clone(), e.clone());
+            item(
+                "Forward",
+                Box::new(move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.forward(&entry);
+                    }
+                }),
+            );
+        }
         if e.file.is_none() && !e.text.is_empty() {
             let (text, a) = (e.text.clone(), anchor.clone());
             item("Copy text", Box::new(move || a.clipboard().set_text(&text)));
         }
-        let group = self.group().is_some();
+        // Notes have no one to edit or delete for.
+        let group = self.group().is_some() || self.is_note();
         if e.outgoing && e.file.is_none() && e.id != 0 && !group {
             let (weak, entry) = (self.weak_self.clone(), e.clone());
             item(
@@ -1796,9 +1930,11 @@ impl ChatView {
     fn pin(self: &Rc<Self>, e: &HistoryEntry, pin: bool) {
         let Some(node) = self.node() else { return };
         let (group, device, id) = (self.group(), self.device(), e.id);
+        let note = self.is_note();
         let weak = self.weak_self.clone();
         bg(
             move || match group {
+                _ if note => Ok(node.pin_note(id, pin)),
                 Some(g) => node.pin_in_group(g, id, pin).map_err(|e| e.to_string()),
                 None => node.pin(device, id, pin).map_err(|e| e.to_string()),
             },
@@ -2223,6 +2359,7 @@ impl ChatView {
             return;
         };
         let (group, device, entry) = (self.group(), self.device(), e.clone());
+        let note = self.is_note();
         let ok = everyone.then(|| {
             "Deleted. Their devices delete it too, if they're running a current version.".to_owned()
         });
@@ -2231,6 +2368,7 @@ impl ChatView {
             "delete",
             move |n| {
                 match group {
+                    _ if note => n.delete_note(entry.at_ms, entry.device),
                     Some(g) => n.delete_group_entry(g, entry.at_ms, entry.device),
                     None if entry.id != 0 => n.delete_messages(device, vec![entry.id], everyone),
                     None => n.delete_entry(device, entry.at_ms, entry.device),
@@ -2446,8 +2584,15 @@ impl ChatView {
         self.reply(None);
         let weak = self.weak_self.clone();
         let sent = text.clone();
+        let note = self.is_note();
         bg(
             move || match group {
+                _ if note => {
+                    let (at, d) = quote.unzip();
+                    node.write_note(sent, at, d)
+                        .map(|()| None)
+                        .map_err(|e| e.to_string())
+                }
                 Some(g) if quote.is_some() || !mentions.is_empty() => {
                     let (at, d) = quote.unzip();
                     node.send_group_message(g, sent, at, d, mentions)
@@ -2690,7 +2835,7 @@ impl ChatView {
         sensitive: bool,
     ) {
         let Some(node) = self.node() else { return };
-        let (group, device) = (self.group(), self.device());
+        let dest = self.dest();
         let strip = self
             .app
             .upgrade()
@@ -2750,16 +2895,10 @@ impl ChatView {
                         },
                         album,
                         clip: None,
+                        forwarded: false,
                     };
                     let location = Some(p.display().to_string());
-                    let r = match &group {
-                        Some(g) => {
-                            node.send_group_file(g.clone(), name.clone(), data, location, options)
-                        }
-                        None => {
-                            node.send_file(device.clone(), name.clone(), data, location, options)
-                        }
-                    };
+                    let r = send_file_to(&node, &dest, name.clone(), data, location, options);
                     if let Err(e) = r {
                         failed.push(format!("{name}: {e}"));
                     }
@@ -3710,6 +3849,30 @@ fn prepare(
         .map_err(|_| unreadable())?;
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
     Ok((format!("{stem}.jpg"), jpeg))
+}
+
+/// Where a chat's messages go.
+#[derive(Clone)]
+enum Dest {
+    Group(String),
+    Contact(String),
+    Note,
+}
+
+/// Sends a file to `dest` (into the notes to self, it stays where it is).
+fn send_file_to(
+    node: &Node,
+    dest: &Dest,
+    name: String,
+    data: Vec<u8>,
+    location: Option<String>,
+    options: FileOptions,
+) -> Result<(), threnody_ffi::ThrenodyError> {
+    match dest {
+        Dest::Group(g) => node.send_group_file(g.clone(), name, data, location, options),
+        Dest::Contact(d) => node.send_file(d.clone(), name, data, location, options),
+        Dest::Note => node.add_note_file(name, data.len() as u64, location, options),
+    }
 }
 
 /// Whether `q` quotes `e`: by message id, or for a message too old to

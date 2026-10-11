@@ -272,6 +272,7 @@ mod tests {
             expires_in_s: None,
             id: 0,
             quote: None,
+            forwarded: false,
         }
     }
 
@@ -327,6 +328,7 @@ mod tests {
                 caption: String::new(),
                 album: 0,
                 clip: None,
+                forwarded: false,
             },
             Tag::NONE,
         );
@@ -370,6 +372,7 @@ mod tests {
             caption: String::new(),
             album: 0,
             clip: None,
+            forwarded: false,
         };
         for _ in 0..6 {
             d.track(&p, big.clone(), Tag::NONE);

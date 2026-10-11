@@ -70,6 +70,7 @@ fn text(s: &str) -> AppMessage {
         expires_in_s: None,
         id: 0,
         quote: None,
+        forwarded: false,
     }
 }
 
@@ -132,6 +133,7 @@ async fn two_relay_onion_circuit_carries_a_session() {
         caption: String::new(),
         album: 0,
         clip: None,
+        forwarded: false,
     };
     c.node.send(&a.node.identity(), big.clone()).unwrap();
     next(

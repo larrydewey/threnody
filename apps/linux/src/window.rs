@@ -377,6 +377,8 @@ impl App {
             format!("Group invitation from {}", core::short(&i.from))
         } else if c.is_request() {
             "Message request · click to review".into()
+        } else if !c.draft.is_empty() {
+            format!("Draft: {}", c.draft)
         } else if let Some(e) = &c.last {
             let who = if e.outgoing {
                 "You: ".into()
@@ -1061,7 +1063,7 @@ impl App {
             let matches = conv.as_ref().is_some_and(|c| c.chat == open)
                 || about.as_deref().is_some_and(|a| match &open.target {
                     Target::Group(g) => g == a && open.persona == persona,
-                    Target::Contact(_) => false,
+                    Target::Contact(_) | Target::Note => false,
                 });
             if matches {
                 chat.reload();
@@ -2479,6 +2481,7 @@ impl App {
                     move |n| match &c.chat.target {
                         Target::Group(g) => n.clear_group_conversation(g.clone()),
                         Target::Contact(_) => n.clear_conversation(c.device.clone()),
+                        Target::Note => Ok(()),
                     },
                     None,
                 );
@@ -2549,8 +2552,9 @@ fn capitalize(s: &str) -> String {
 /// A conversation as a string, for actions and notifications.
 fn chat_variant(c: &ChatRef) -> String {
     let (kind, key) = match &c.target {
-        Target::Contact(k) => ("c", k),
-        Target::Group(g) => ("g", g),
+        Target::Contact(k) => ("c", k.as_str()),
+        Target::Group(g) => ("g", g.as_str()),
+        Target::Note => ("n", ""),
     };
     format!("{}|{kind}|{key}", c.persona.as_deref().unwrap_or(""))
 }
@@ -2564,6 +2568,7 @@ fn parse_chat(s: &str) -> Option<ChatRef> {
         persona: (!persona.is_empty()).then(|| persona.to_owned()),
         target: match kind {
             "g" => Target::Group(key),
+            "n" => Target::Note,
             _ => Target::Contact(key),
         },
     })

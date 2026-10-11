@@ -149,6 +149,11 @@ class ChatActivity : Activity() {
     private var oldestLoaded = 0uL
     private var allLoaded = true
 
+    /** Notes to self: a chat with our own account. */
+    private var note = false
+    /** The saved draft was put in the compose field (once per opening). */
+    private var draftShown = false
+
     /** A history entry, or a message still being sent. */
     private data class Item(val entry: HistoryEntry, val sending: Boolean = false)
 
@@ -157,7 +162,8 @@ class ChatActivity : Activity() {
         Privacy.apply(this)
         group = intent.getStringExtra(GROUP)
         persona = intent.getStringExtra(PERSONA)
-        key = group ?: intent.getStringExtra(KEY) ?: return finish()
+        note = intent.getBooleanExtra(NOTE, false)
+        key = group ?: (if (note) NOTE else intent.getStringExtra(KEY)) ?: return finish()
         device = intent.getStringExtra(DEVICE) ?: key
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -266,7 +272,7 @@ class ChatActivity : Activity() {
             }
             refresh()
             // Not connected: look for them across the internet now.
-            if (group == null) try { node.seek(device) } catch (e: Exception) {
+            if (group == null && !note) try { node.seek(device) } catch (e: Exception) {
                 Threnody.say("! seek: ${e.message}")
             }
         }
@@ -468,8 +474,7 @@ class ChatActivity : Activity() {
                 } else {
                     val options = FileOptions(false, "", 0uL, Clip(video, ms.coerceIn(0, Int.MAX_VALUE.toLong()).toUInt()))
                     val g = group
-                    if (g != null) node.sendGroupFile(g, file.name, data, location, options)
-                    else node.sendFile(device, file.name, data, location, options)
+                    sendFileTo(file.name, data, location, options)
                     null
                 }
             } catch (e: Exception) {
@@ -636,7 +641,7 @@ class ChatActivity : Activity() {
      * change, and again now and then while typing goes on.
      */
     private fun sendTyping(active: Boolean) {
-        if (group != null || !::node.isInitialized) return
+        if (group != null || note || !::node.isInitialized) return
         val now = android.os.SystemClock.elapsedRealtime()
         if (typingSent == active && !(active && now - typingSentAt > TYPING_AGAIN_MS)) return
         if (active && !Privacy.sendTyping(this)) return
@@ -689,6 +694,7 @@ class ChatActivity : Activity() {
 
     override fun onStop() {
         started = false
+        saveDraft()
         // Leaving the chat stops a voice message, and drops one recording.
         clipPlayer?.stop()
         cancelVoice()
@@ -770,7 +776,9 @@ class ChatActivity : Activity() {
         var c: Conversation? = null
         var gi: GroupInfo? = null
         val limit = historyLimit
-        if (g != null) {
+        if (note) {
+            history = try { node.noteHistory(limit) } catch (_: Exception) { emptyList() }
+        } else if (g != null) {
             gi = node.groups().firstOrNull { it.id == g }
             history = try { node.groupHistory(g, limit) } catch (_: Exception) { emptyList() }
         } else {
@@ -789,15 +797,28 @@ class ChatActivity : Activity() {
         val me = node.deviceFingerprint()
         myDevice = me
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null), sending = true) }
+            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null, forwarded = false), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
-        val pinned = try { if (g != null) node.groupPinned(g) else node.pinned(device) } catch (_: Exception) { emptyList() }
+        val pinned = try {
+            when {
+                note -> node.pinnedNotes()
+                g != null -> node.groupPinned(g)
+                else -> node.pinned(device)
+            }
+        } catch (_: Exception) { emptyList() }
+        val draft = if (!draftShown) try {
+            when {
+                note -> node.noteDraft()
+                g != null -> node.groupDraft(g)
+                else -> node.draft(device)
+            }
+        } catch (_: Exception) { "" } else ""
         val canPin = g == null || try { node.mayPinInGroup(g) } catch (_: Exception) { false }
         // Credential offers and requests from this contact, waiting for an answer.
         val mine = c?.devices ?: listOf(device)
-        val offers = if (g == null) node.credentialOffers().filter { it.peer in mine } else emptyList()
-        val asks = if (g == null) node.credentialAsks().filter { it.peer in mine } else emptyList()
+        val offers = if (g == null && !note) node.credentialOffers().filter { it.peer in mine } else emptyList()
+        val asks = if (g == null && !note) node.credentialAsks().filter { it.peer in mine } else emptyList()
         runOnUiThread {
             // A newer refresh will draw instead.
             if (gen != refreshGen.get()) return@runOnUiThread
@@ -805,10 +826,18 @@ class ChatActivity : Activity() {
             info = gi
             mayPin = canPin
             showPins(pinned)
+            // What we left unsent here last time.
+            if (!draftShown) {
+                draftShown = true
+                if (draft.isNotEmpty() && compose.text.isEmpty()) {
+                    compose.setText(draft)
+                    compose.setSelection(compose.text.length)
+                }
+            }
             if (Threnody.visibleChat.isNotEmpty()) {
                 Threnody.visibleChat = setOf(key, device) + (c?.devices ?: emptyList())
             }
-            if (g != null) groupHeader(gi) else header(c)
+            if (note) noteHeader() else if (g != null) groupHeader(gi) else header(c)
             for (o in offers) banner(
                 "${c?.title ?: "They"} offers you a credential (${o.schema}).",
                 "Review" to { CredentialUi.answerOffer(this, node, o) { refreshSoon() } },
@@ -830,7 +859,7 @@ class ChatActivity : Activity() {
                 }
             }
             // Incoming messages now on screen are read (1:1 chats only).
-            if (g == null && started && Privacy.sendReadReceipts(this)) {
+            if (g == null && !note && started && Privacy.sendReadReceipts(this)) {
                 val ids = synchronized(sentRead) {
                     items.filter { !it.entry.outgoing && it.entry.id != 0uL && it.entry.id !in sentRead }.map { it.entry.id }
                 }
@@ -845,6 +874,15 @@ class ChatActivity : Activity() {
                 }
             }
         }
+    }
+
+    private fun noteHeader() {
+        bar.title.text = "Note to self"
+        bar.subtitle.visibility = View.VISIBLE
+        bar.subtitle.text = "On all your devices"
+        bar.subtitle.setTextColor(color(R.color.muted))
+        clearBanner()
+        composeBar.visibility = View.VISIBLE
     }
 
     private fun header(c: Conversation?) {
@@ -1232,6 +1270,15 @@ class ChatActivity : Activity() {
         if (sender != null) {
             body.addView(label(sender, 13f, R.color.accent).apply { setTypeface(typeface, Typeface.BOLD) })
         }
+        if (e.forwarded) {
+            body.addView(TextView(this).apply {
+                text = "↪ Forwarded"
+                textSize = 12f
+                setTextColor(fg)
+                alpha = 0.7f
+                setTypeface(typeface, Typeface.ITALIC)
+            })
+        }
         e.quote?.let { body.addView(quoteView(it, fg), matchWrap) }
         val file = e.file
         val time = if (item.sending) "sending…" else time(e.atMs.toLong())
@@ -1428,7 +1475,11 @@ class ChatActivity : Activity() {
         val g = group
         Threading.background {
             run(if (pin) "pin" else "unpin") {
-                if (g != null) node.pinInGroup(g, e.id, pin) else node.pin(device, e.id, pin)
+                when {
+                    note -> node.pinNote(e.id, pin)
+                    g != null -> node.pinInGroup(g, e.id, pin)
+                    else -> node.pin(device, e.id, pin)
+                }
             }
         }
     }
@@ -1478,10 +1529,11 @@ class ChatActivity : Activity() {
     private fun deleteMessage(entries: List<HistoryEntry>) {
         val e = entries.first()
         val g = group
-        val mine = g == null && e.outgoing && e.device == myDevice && entries.all { it.id != 0uL }
+        val mine = g == null && !note && e.outgoing && e.device == myDevice && entries.all { it.id != 0uL }
         val canEdit = mine && e.file == null
         val options = buildList {
             add("Reply")
+            if (e.poll == null) add("Forward")
             if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
             if (e.poll != null && e.outgoing && e.poll?.closed == false) add("End poll")
             // Text isn't selectable in the bubble (it would take the long
@@ -1497,6 +1549,7 @@ class ChatActivity : Activity() {
         fun pick(option: String) {
             if (option == "Edit") return editMessage(e)
             if (option == "Reply") return replyingTo(e)
+            if (option == "Forward") return forward(entries)
             if (option == "Pin" || option == "Unpin") return pin(e, option == "Pin")
             if (option == "End poll") {
                 val g = group ?: return
@@ -1513,6 +1566,7 @@ class ChatActivity : Activity() {
             Threading.background {
                 run("delete") {
                     when {
+                        note -> entries.forEach { node.deleteNote(it.atMs, it.device) }
                         g != null -> entries.forEach { node.deleteGroupEntry(g, it.atMs, it.device) }
                         entries.all { it.id != 0uL } -> node.deleteMessages(device, entries.map { it.id }, everyone)
                         else -> entries.forEach { node.deleteEntry(device, it.atMs, it.device) }
@@ -1529,7 +1583,7 @@ class ChatActivity : Activity() {
         ReactionPanel(
             this,
             mine = e.reactions.filter { it.mine }.map { it.emoji }.toSet(),
-            canReact = e.id != 0uL,
+            canReact = e.id != 0uL && !note,
             actions = options.map { option -> option to { pick(option) } },
         ) { emoji, add -> react(e, emoji, add) }.show()
     }
@@ -1621,7 +1675,10 @@ class ChatActivity : Activity() {
         Threading.background {
             val g = group
             val error = try {
-                if (g != null) {
+                if (note) {
+                    node.writeNote(text, to?.atMs, to?.device)
+                    null
+                } else if (g != null) {
                     if (to != null || mentions.isNotEmpty()) node.sendGroupMessage(g, text, to?.atMs, to?.device, mentions)
                     else node.sendGroupText(g, text)
                     null
@@ -1952,6 +2009,96 @@ class ChatActivity : Activity() {
         }
     }
 
+    /** Forwards messages (a whole album) to a chat the user picks, marked as forwarded. */
+    private fun forward(entries: List<HistoryEntry>) {
+        Threading.background {
+            data class Target(val title: String, val send: (HistoryEntry) -> Unit)
+            val targets = buildList {
+                add(Target("Note to self") { e ->
+                    val f = e.file
+                    if (f == null) node.writeNote(e.text, null, null)
+                    else node.addNoteFile(f.name, f.size, copyOf(f).second,
+                        FileOptions(f.sensitive, e.text, 0uL, f.clip, true))
+                })
+                for (c in Threnody.conversations(node, persona).filter { it.accepted && !it.blocked }) {
+                    add(Target(c.title) { e ->
+                        val f = e.file
+                        if (f == null) node.forwardText(c.device, e.text)
+                        else copyOf(f).let { (data, loc) ->
+                            node.sendFile(c.device, f.name, data, loc, FileOptions(f.sensitive, e.text, 0uL, f.clip, true))
+                        }
+                    })
+                }
+                for (gi in node.groups()) {
+                    add(Target(gi.name) { e ->
+                        val f = e.file
+                        if (f == null) node.forwardGroupText(gi.id, e.text)
+                        else copyOf(f).let { (data, loc) ->
+                            node.sendGroupFile(gi.id, f.name, data, loc, FileOptions(f.sensitive, e.text, 0uL, f.clip, true))
+                        }
+                    })
+                }
+            }
+            runOnUiThread {
+                SecureBuilder(this)
+                    .setTitle("Forward to")
+                    .setItems(targets.map { it.title }.toTypedArray()) { _, i ->
+                        Threading.background {
+                            run("forward") { entries.forEach { targets[i].send(it) } }
+                            runOnUiThread { Toast.makeText(this, "Forwarded to ${targets[i].title}", Toast.LENGTH_SHORT).show() }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    /**
+     * A file's bytes, and where the forwarded copy is kept: a private copy,
+     * so deleting one message never takes another's file.
+     */
+    private fun copyOf(f: uniffi.threnody_ffi.FileInfo): Pair<ByteArray, String?> {
+        val data = readFile(f.location)
+        return data to (Media.savePrivate(this, f.name, data, persona) ?: f.location)
+    }
+
+    /** A received or sent file's bytes, from where it was kept. */
+    private fun readFile(location: String?): ByteArray {
+        val l = location ?: throw IllegalStateException("that file isn't on this device")
+        return if (l.startsWith("content:") || l.startsWith("file:")) {
+            contentResolver.openInputStream(Uri.parse(l))?.use { it.readBytes() }
+                ?: throw IllegalStateException("that file is gone")
+        } else java.io.File(l).readBytes()
+    }
+
+    /** Keeps what's in the compose field, encrypted, for next time. */
+    private fun saveDraft() {
+        if (!::node.isInitialized || !draftShown) return
+        val text = compose.text.toString()
+        val g = group
+        val d = device
+        Threading.background {
+            try {
+                when {
+                    note -> node.setNoteDraft(text)
+                    g != null -> node.setGroupDraft(g, text)
+                    else -> node.setDraft(d, text)
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    /** Sends a file here: to the group, the contact, or into the notes to self. */
+    private fun sendFileTo(name: String, data: ByteArray, location: String?, options: FileOptions) {
+        val g = group
+        when {
+            note -> node.addNoteFile(name, data.size.toULong(), location, options)
+            g != null -> node.sendGroupFile(g, name, data, location, options)
+            else -> node.sendFile(device, name, data, location, options)
+        }
+    }
+
     private fun sendFiles(picked: List<Picked>, caption: String, sensitive: Boolean) {
         val album = if (picked.size > 1) uniffi.threnody_ffi.albumId() else 0uL
         Threading.background {
@@ -1962,8 +2109,7 @@ class ChatActivity : Activity() {
                 // Keep our own copy of a photo privately, so the chat can show it.
                 val location = if (Media.isImage(p.name)) Media.savePrivate(this, p.name, p.data, persona) else p.uri.toString()
                 try {
-                    if (g != null) node.sendGroupFile(g, p.name, p.data, location, options)
-                    else node.sendFile(device, p.name, p.data, location, options)
+                    sendFileTo(p.name, p.data, location, options)
                 } catch (e: Exception) {
                     Media.forget(this, location)
                     failed = e.message
@@ -1987,6 +2133,7 @@ class ChatActivity : Activity() {
 
     private fun more(anchor: View) {
         if (group != null) return groupMenu(anchor)
+        if (note) return
         val c = convo
         PopupMenu(this, anchor).apply {
             menu.add("Media, files and links").setOnMenuItemClickListener { media(c?.title); true }
@@ -2386,6 +2533,8 @@ class ChatActivity : Activity() {
     companion object {
         /** Longest quote snippet, as the node cuts it. */
         const val MAX_QUOTE_CHARS = 200
+        /** Opens the notes to self. */
+        const val NOTE = "note"
         const val KEY = "key"
         const val DEVICE = "device"
         const val GROUP = "group"

@@ -519,7 +519,7 @@ object Threnody {
                     val location = keep(ctx, e.name, e.data, persona, e.clip != null)
                     try {
                         node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), location, e.id,
-                            FileOptions(e.sensitive, e.caption, e.album, e.clip))
+                            FileOptions(e.sensitive, e.caption, e.album, e.clip, e.forwarded))
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")
                     }
@@ -542,7 +542,7 @@ object Threnody {
                     val location = keep(ctx, e.name, e.data, persona, e.clip != null)
                     try {
                         node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location, e.id,
-                            FileOptions(e.sensitive, e.caption, e.album, e.clip))
+                            FileOptions(e.sensitive, e.caption, e.album, e.clip, e.forwarded))
                     } catch (x: Exception) {
                         say("! recording a file: ${x.message}")
                     }

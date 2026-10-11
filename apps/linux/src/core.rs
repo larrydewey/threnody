@@ -116,6 +116,8 @@ pub enum Target {
     /// The conversation key (account fingerprint, else the device's).
     Contact(String),
     Group(String),
+    /// Notes to self, on all our devices.
+    Note,
 }
 
 /// One row of the conversation list, with what the chat needs to know.
@@ -138,6 +140,8 @@ pub struct Conversation {
     /// A group invitation waiting for an answer.
     pub invite: Option<GroupInvite>,
     pub last: Option<HistoryEntry>,
+    /// What we started writing here and haven't sent.
+    pub draft: String,
 }
 
 impl Conversation {
@@ -799,6 +803,7 @@ impl Core {
                 album,
                 clip,
                 quiet,
+                forwarded,
             } => {
                 self.say(format!(
                     "* {} sent a file ({} bytes)",
@@ -811,6 +816,7 @@ impl Core {
                     caption: caption.clone(),
                     album,
                     clip,
+                    forwarded,
                 };
                 if let Err(x) = node.record_received_file(
                     peer.clone(),
@@ -832,6 +838,7 @@ impl Core {
                     album,
                     clip,
                     quiet,
+                    forwarded,
                 }
             }
             NodeEvent::GroupFile {
@@ -846,6 +853,7 @@ impl Core {
                 album,
                 clip,
                 quiet,
+                forwarded,
             } => {
                 self.say(format!(
                     "* group {}: {} sent a file ({} bytes)",
@@ -859,6 +867,7 @@ impl Core {
                     caption: caption.clone(),
                     album,
                     clip,
+                    forwarded,
                 };
                 if let Err(x) = node.record_received_group_file(
                     group.clone(),
@@ -883,6 +892,7 @@ impl Core {
                     album,
                     clip,
                     quiet,
+                    forwarded,
                 }
             }
             e => {
@@ -1018,6 +1028,7 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             devices: devices.iter().map(|d| d.fingerprint.clone()).collect(),
             group: None,
             invite: None,
+            draft: node.draft(best.fingerprint.clone()).unwrap_or_default(),
             last,
         });
     }
@@ -1042,9 +1053,34 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             accepted: true,
             revealed: None,
             revealed_invite: None,
+            draft: node.group_draft(g.id.clone()).unwrap_or_default(),
             group: Some(g),
             invite: None,
             last,
+        });
+    }
+    // Notes to self, for the main identity.
+    if persona.is_none() {
+        out.push(Conversation {
+            chat: ChatRef {
+                persona: None,
+                target: Target::Note,
+            },
+            title: "Note to self".into(),
+            device: String::new(),
+            devices: Vec::new(),
+            connected: false,
+            approved: true,
+            verified: true,
+            any_verified: false,
+            unverified: Vec::new(),
+            accepted: true,
+            revealed: None,
+            revealed_invite: None,
+            group: None,
+            invite: None,
+            draft: node.note_draft(),
+            last: node.note_history(1).ok().and_then(|mut h| h.pop()),
         });
     }
     for i in node.group_invites() {
@@ -1067,6 +1103,7 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             group: None,
             invite: Some(i),
             last: None,
+            draft: String::new(),
         });
     }
     out

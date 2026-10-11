@@ -81,6 +81,7 @@ fn text(s: &str) -> AppMessage {
         expires_in_s: None,
         id: 0,
         quote: None,
+        forwarded: false,
     }
 }
 

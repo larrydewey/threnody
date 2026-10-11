@@ -155,6 +155,7 @@ impl GroupUi {
                     group,
                     from,
                     name: file,
+                    forwarded: _,
                     data,
                     ours,
                     sensitive,
@@ -189,6 +190,7 @@ impl GroupUi {
                         sensitive,
                         album,
                         clip,
+                        forwarded: false,
                     };
                     self.groups
                         .record_file(node, &group, &from, note, &caption, id);

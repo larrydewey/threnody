@@ -131,6 +131,7 @@ fn event(u: Update) -> NodeEvent {
             album,
             id,
             clip,
+            forwarded,
         } => NodeEvent::GroupFile {
             id,
             group: hex(&group),
@@ -143,6 +144,7 @@ fn event(u: Update) -> NodeEvent {
             album,
             clip: clip.map(Into::into),
             quiet: false,
+            forwarded,
         },
     }
 }
@@ -342,6 +344,7 @@ impl ThrenodyNode {
             caption: options.caption,
             album: options.album,
             clip: options.clip.map(Into::into),
+            forwarded: options.forwarded,
         };
         self.group_node()
             .send_file(&self.node, &g, file)
@@ -381,6 +384,7 @@ impl ThrenodyNode {
                 sensitive: options.sensitive,
                 album: options.album,
                 clip: options.clip.map(Into::into),
+                forwarded: options.forwarded,
             },
             &options.caption,
             id,
@@ -405,6 +409,37 @@ impl ThrenodyNode {
         let g = self.group_id(&group)?;
         let _guard = self.rt.enter();
         self.group_node().pin(&self.node, &g, id, pin).map_err(fail)
+    }
+
+    /// What we started writing to `group` and haven't sent ("" if nothing).
+    pub fn group_draft(&self, group: String) -> Result<String> {
+        let g = self.group_id(&group)?;
+        Ok(self.draft_in(ConversationId::Group(g)))
+    }
+
+    /// Keeps what we started writing to `group` (encrypted, on this device).
+    pub fn set_group_draft(&self, group: String, text: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.node
+            .set_draft(ConversationId::Group(g), &text)
+            .map_err(fail)
+    }
+
+    /// `send_group_text`, marked as forwarded from another chat.
+    pub fn forward_group_text(&self, group: String, text: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.group_node()
+            .send_text_with(
+                &self.node,
+                &g,
+                &text,
+                threnody_net::history::Extras {
+                    forwarded: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(fail)
     }
 
     /// Asks `group` a question with 2 to 12 `options`; `multi` lets members

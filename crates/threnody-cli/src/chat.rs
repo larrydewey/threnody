@@ -460,6 +460,7 @@ impl Ui {
                         sensitive,
                         album,
                         clip,
+                        forwarded: false,
                     },
                     &caption,
                     id,
@@ -2285,6 +2286,7 @@ pub(crate) async fn read_files(arg: &str) -> Result<Vec<OutgoingFile>> {
                 String::new()
             },
             album,
+            forwarded: false,
         });
     }
     Ok(out)

@@ -98,6 +98,7 @@ fn create_invite_chat_and_remove() {
         album: 3,
         clip: None,
         id: 0,
+        forwarded: false,
     };
     let out = net.node(&pc).send(&g, &file).unwrap();
     net.deliver(pc, out);
@@ -112,6 +113,7 @@ fn create_invite_chat_and_remove() {
             album: 3,
             clip: None,
             id: 0,
+            forwarded: false,
         }));
     }
 
@@ -126,6 +128,7 @@ fn create_invite_chat_and_remove() {
             id: 0,
             quote: None,
             mentions: Vec::new(),
+            forwarded: false,
         }));
     }
 
@@ -161,6 +164,7 @@ fn create_invite_chat_and_remove() {
         id: 0,
         quote: None,
         mentions: Vec::new(),
+        forwarded: false,
     }));
 }
 
@@ -277,6 +281,7 @@ fn groups_survive_export_and_restore() {
         id: 0,
         quote: None,
         mentions: Vec::new(),
+        forwarded: false,
     }));
     let (_, name, owner, members) = net.node(&pb).list().pop().unwrap();
     assert_eq!((name.as_str(), owner, members.len()), ("persist", pa, 2));
@@ -328,6 +333,7 @@ fn members_forward_messages_for_each_other() {
         id: 0,
         quote: None,
         mentions: Vec::new(),
+        forwarded: false,
     }));
 
     // Only members forward, only to members, and never to themselves.
