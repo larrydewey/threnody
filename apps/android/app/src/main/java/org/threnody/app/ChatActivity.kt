@@ -61,6 +61,8 @@ class ChatActivity : Activity() {
     private lateinit var banner: LinearLayout
     private lateinit var messages: LinearLayout
     private lateinit var scroll: ScrollView
+    /** The chat is at its newest message, and stays there as it grows. */
+    private var stick = true
     private lateinit var compose: EditText
     private lateinit var composeBar: LinearLayout
     /** "…" below the messages while the contact is typing. */
@@ -194,6 +196,12 @@ class ChatActivity : Activity() {
         // Keep the newest message in view when the keyboard opens (unless
         // a search match is).
         scroll.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, ob -> if (b < ob && hit < 0) toBottom() }
+        // Scrolling up lets go of the newest message; back down holds it again.
+        scroll.setOnScrollChangeListener { _, _, _, _, _ -> stick = !scroll.canScrollVertically(1) }
+        // Redraws and photos loading change the chat's height: follow it.
+        messages.addOnLayoutChangeListener { _, _, t, _, b, _, ot, _, ob ->
+            if (stick && hit < 0 && jump == null && b - t != ob - ot) scroll.post { scroll.scrollTo(0, messages.height) }
+        }
 
         // Opened from a search result: that message, with the search open on it.
         val jumpAt = intent.getLongExtra(JUMP_AT_MS, 0L)
@@ -903,8 +911,14 @@ class ChatActivity : Activity() {
         banner.addView(row, matchWrap)
     }
 
+    /** What the chat last drew, so a refresh that changes nothing leaves it be. */
+    private var lastShown: Pair<List<Item>, Map<String, String>>? = null
+
     private fun show(items: List<Item>, names: Map<String, String>) {
-        val atEnd = !scroll.canScrollVertically(1)
+        // Redrawing reloads photos and stills, which flickers.
+        if (lastShown == items to names) return
+        lastShown = items to names
+        val y = scroll.scrollY
         messages.removeAllViews()
         bubbles.clear()
         texts.clear()
@@ -925,7 +939,9 @@ class ChatActivity : Activity() {
             for (item in run) bubbles[mark(item.entry)] = view
         }
         messages.addView(typingBubble, matchWrap)
-        if (atEnd && hit < 0 && jump == null || items.lastOrNull()?.sending == true) toBottom()
+        if (stick && hit < 0 && jump == null || items.lastOrNull()?.sending == true) toBottom()
+        // Otherwise stay where the reader is, not at the top.
+        else scroll.post { scroll.scrollTo(0, y) }
     }
 
     /** Identifies a message across reloads and search results. */
@@ -1055,7 +1071,10 @@ class ChatActivity : Activity() {
     }
 
     // Not fullScroll(): that moves focus to the last bubble, away from the compose field.
-    private fun toBottom() = scroll.post { scroll.scrollTo(0, messages.height) }
+    private fun toBottom() {
+        stick = true
+        scroll.post { scroll.scrollTo(0, messages.height) }
+    }
 
     /** Consecutive files of one album from one sender go in one bubble. */
     private fun albums(items: List<Item>): List<List<Item>> {
