@@ -26,3 +26,5 @@ workspace = true
 
 [dev-dependencies]
 openmls.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

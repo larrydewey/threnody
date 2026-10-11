@@ -152,6 +152,12 @@ impl ThrenodyNode {
         self.group_node().connected(&self.node, peer);
     }
 
+    /// Adds our newly linked device to our groups.
+    pub(crate) fn group_linked(&self, device: &PublicIdentity) {
+        let _guard = self.rt.enter();
+        self.group_node().linked(&self.node, device);
+    }
+
     fn queue_updates(&self, updates: Vec<Update>) {
         self.queued().extend(updates.into_iter().map(event));
     }
