@@ -178,3 +178,6 @@ windowtitle.warning .subtitle {
   padding: 0;
   border-radius: 6px;
 }
+.list-tabs {
+  margin: 4px 12px 6px 12px;
+}

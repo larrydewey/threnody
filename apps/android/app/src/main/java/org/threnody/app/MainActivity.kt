@@ -37,6 +37,12 @@ class MainActivity : Activity() {
 
     private var node: ThrenodyNode? = null
     private lateinit var list: LinearLayout
+    /** All, Chats or Groups: which conversations the list shows. */
+    private enum class Tab(val label: String) { All("All"), Chats("Chats"), Groups("Groups") }
+    private var tab = Tab.All
+    private lateinit var tabBar: LinearLayout
+    /** Every row from the last refresh, before the tab picks some. */
+    private var allRows: List<Row> = emptyList()
     private lateinit var scroll: ScrollView
     private lateinit var emptyStateContainer: LinearLayout
     private var unsubscribe: (() -> Unit)? = null
@@ -92,7 +98,17 @@ class MainActivity : Activity() {
             addView(scrollContent, MATCH_PARENT, WRAP_CONTENT)
         }
 
+        tab = Tab.entries.firstOrNull {
+            it.name == getSharedPreferences(UI_PREFS, MODE_PRIVATE).getString(TAB, null)
+        } ?: Tab.All
+        tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(Design.screenPadding), dp(Design.xs), dp(Design.screenPadding), dp(Design.sm))
+        }
+        drawTabs()
+
         root.addView(bar, matchWrap)
+        root.addView(tabBar, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
         fitSystemBars(root, bar, scroll)
@@ -265,7 +281,71 @@ class MainActivity : Activity() {
         // Search results stay until the search is cleared.
         runOnUiThread {
             // A newer refresh will draw instead; search results stay put.
-            if (gen == refreshGen.get() && (!search.isOpen || search.text.isEmpty())) show(sortedRows)
+            if (gen == refreshGen.get()) {
+                allRows = sortedRows
+                drawTabs()
+                if (!search.isOpen || search.text.isEmpty()) showTab()
+            }
+        }
+    }
+
+    /** Which sections a tab shows. */
+    private fun Tab.has(s: Row.Section) = when (this) {
+        Tab.All -> true
+        Tab.Chats -> s == Row.Section.Requests || s == Row.Section.Contacts || s == Row.Section.Anonymous
+        Tab.Groups -> s == Row.Section.Invites || s == Row.Section.Groups
+    }
+
+    /** Shows the rows of the current tab; one section needs no heading. */
+    private fun showTab() {
+        val rows = allRows.filter { tab.has(it.section) }
+        val sections = rows.filter { it.isSectionHeader }.size
+        if (rows.none { !it.isSectionHeader }) {
+            if (tab == Tab.Groups) {
+                emptyStateContainer.removeAllViews()
+                emptyStateContainer.addView(emptyState(
+                    title = "No groups yet",
+                    message = "Start one and invite your contacts. Group messages are end-to-end encrypted with MLS.",
+                    actionText = "New group",
+                    action = { newGroup() },
+                    iconRes = R.drawable.ic_add,
+                ))
+            } else {
+                empty()
+            }
+        }
+        show(if (tab != Tab.All && sections == 1) rows.filter { !it.isSectionHeader } else rows)
+    }
+
+    /** The tabs, each with how many need an answer (requests, invitations). */
+    private fun drawTabs() {
+        tabBar.removeAllViews()
+        for (t in Tab.entries) {
+            val waiting = allRows.count {
+                !it.isSectionHeader && t != Tab.All && t.has(it.section) &&
+                    (it.section == Row.Section.Requests || it.section == Row.Section.Invites)
+            }
+            val selected = t == tab
+            tabBar.addView(TextView(this).apply {
+                text = if (waiting > 0) "${t.label} · $waiting" else t.label
+                setTextAppearance(Design.styleLabelMedium)
+                setTypeface(typeface, if (selected) Design.weightMedium else android.graphics.Typeface.NORMAL)
+                setTextColor(color(if (selected) R.color.on_bubble_out else R.color.text))
+                background = if (selected) rounded(color(R.color.accent), dp(18).toFloat())
+                    else rounded(color(R.color.field), dp(18).toFloat())
+                setPadding(dp(16), dp(8), dp(16), dp(8))
+                isSelected = selected
+                contentDescription = "${t.label} tab" + (if (waiting > 0) ", $waiting waiting" else "") +
+                    (if (selected) ", selected" else "")
+                setOnClickListener {
+                    if (tab == t) return@setOnClickListener
+                    tab = t
+                    getSharedPreferences(UI_PREFS, MODE_PRIVATE).edit().putString(TAB, t.name).apply()
+                    drawTabs()
+                    if (!search.isOpen || search.text.isEmpty()) showTab()
+                    scroll.scrollTo(0, 0)
+                }
+            }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(8) })
         }
     }
 
@@ -443,7 +523,7 @@ class MainActivity : Activity() {
                 bottomMargin = dp(Design.md)
             }
             background = color(R.color.divider).let { ColorDrawable(it) }
-        }, matchWrap)
+        })
     }
 
     private fun row(r: Row): View {
@@ -1183,5 +1263,7 @@ class MainActivity : Activity() {
     companion object {
         /** Most messages a search lists. */
         private const val MAX_RESULTS = 200
+        private const val UI_PREFS = "ui"
+        private const val TAB = "list_tab"
     }
 }

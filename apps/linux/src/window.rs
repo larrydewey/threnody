@@ -44,6 +44,10 @@ pub struct App {
     search_gen: Cell<u32>,
     content: adw::NavigationPage,
     convs: RefCell<Vec<Conversation>>,
+    /// Which conversations the list shows, and which of `convs` each row is.
+    tab: Cell<Tab>,
+    rows: RefCell<Vec<usize>>,
+    tabs: gtk::Box,
     unread: RefCell<HashMap<ChatRef, u32>>,
     chat: RefCell<Option<Rc<ChatView>>>,
     refresh_pending: Cell<bool>,
@@ -177,6 +181,11 @@ impl App {
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&header);
         sidebar_view.add_top_bar(&search_bar);
+        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabs.add_css_class("linked");
+        tabs.add_css_class("list-tabs");
+        tabs.set_halign(gtk::Align::Center);
+        sidebar_view.add_top_bar(&tabs);
         sidebar_view.set_content(Some(&list_stack));
         let sidebar = adw::NavigationPage::builder()
             .title("Threnody")
@@ -212,6 +221,7 @@ impl App {
         bp.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(bp);
 
+        let tab = Tab::from_key(core.settings().text(settings::LIST_TAB));
         let this = Rc::new(Self {
             app: app.clone(),
             window: window.clone(),
@@ -227,6 +237,9 @@ impl App {
             search_gen: Cell::new(0),
             content,
             convs: RefCell::new(Vec::new()),
+            tab: Cell::new(tab),
+            rows: RefCell::new(Vec::new()),
+            tabs: tabs.clone(),
             unread: RefCell::new(HashMap::new()),
             chat: RefCell::new(None),
             refresh_pending: Cell::new(false),
@@ -248,6 +261,7 @@ impl App {
                 return;
             }
             let i = usize::try_from(row.index()).unwrap_or(0);
+            let i = this.rows.borrow().get(i).copied().unwrap_or(usize::MAX);
             let conv = this.convs.borrow().get(i).cloned();
             if let Some(c) = conv {
                 this.open_chat(c);
@@ -323,35 +337,80 @@ impl App {
             self.list.remove(&row);
         }
         let unread = self.unread.borrow();
-        for c in &convs {
+        let tab = self.tab.get();
+        let rows: Vec<usize> = (0..convs.len()).filter(|i| tab.has(&convs[*i])).collect();
+        for i in &rows {
+            let c = &convs[*i];
             self.list
                 .append(&self.row(c, unread.get(&c.chat).copied().unwrap_or(0)));
         }
         drop(unread);
+        self.draw_tabs(&convs);
         if let Some(open) = &open
             && let Some(i) = convs.iter().position(|c| c.chat == *open)
+            && let Some(chat) = self.chat.borrow().as_ref()
         {
-            {
-                self.list.select_row(
-                    self.list
-                        .row_at_index(i32::try_from(i).unwrap_or(0))
-                        .as_ref(),
-                );
-                if let Some(chat) = self.chat.borrow().as_ref() {
-                    chat.update(convs[i].clone());
-                }
-            }
+            chat.update(convs[i].clone());
+        }
+        if let Some(open) = &open
+            && let Some(r) = rows.iter().position(|i| convs[*i].chat == *open)
+        {
+            self.list.select_row(
+                self.list
+                    .row_at_index(i32::try_from(r).unwrap_or(0))
+                    .as_ref(),
+            );
         }
         *self.convs.borrow_mut() = convs;
+        *self.rows.borrow_mut() = rows;
         if !self.searching() {
             self.show_list();
         }
         self.rebuilding.set(false);
     }
 
+    /// The tab buttons, each with how many need an answer there.
+    fn draw_tabs(self: &Rc<Self>, convs: &[Conversation]) {
+        while let Some(c) = self.tabs.first_child() {
+            self.tabs.remove(&c);
+        }
+        let mut first: Option<gtk::ToggleButton> = None;
+        for t in [Tab::All, Tab::Chats, Tab::Groups] {
+            let waiting = convs
+                .iter()
+                .filter(|c| t != Tab::All && t.has(c) && (c.invite.is_some() || c.is_request()))
+                .count();
+            let label = if waiting > 0 {
+                format!("{} · {waiting}", t.label())
+            } else {
+                t.label().to_owned()
+            };
+            let b = gtk::ToggleButton::with_label(&label);
+            if let Some(f) = &first {
+                b.set_group(Some(f));
+            } else {
+                first = Some(b.clone());
+            }
+            b.set_active(t == self.tab.get());
+            let weak = Rc::downgrade(self);
+            b.connect_toggled(move |b| {
+                let Some(this) = weak.upgrade() else { return };
+                if !b.is_active() || this.tab.get() == t {
+                    return;
+                }
+                this.tab.set(t);
+                let core = this.core.clone();
+                ui::bg_quiet(move || core.settings().set_text(settings::LIST_TAB, t.key()));
+                let convs = this.convs.borrow().clone();
+                this.show_conversations(convs);
+            });
+            self.tabs.append(&b);
+        }
+    }
+
     fn show_list(&self) {
         self.list_stack
-            .set_visible_child_name(if self.convs.borrow().is_empty() {
+            .set_visible_child_name(if self.rows.borrow().is_empty() {
                 "empty"
             } else {
                 "list"
@@ -2576,4 +2635,47 @@ fn parse_chat(s: &str) -> Option<ChatRef> {
 
 fn notification_id(c: &ChatRef) -> String {
     format!("chat-{}", chat_variant(c).replace('|', "-"))
+}
+
+/// Which conversations the list shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    All,
+    Chats,
+    Groups,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Chats => "Chats",
+            Self::Groups => "Groups",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Chats => "chats",
+            Self::Groups => "groups",
+        }
+    }
+
+    fn from_key(k: Option<&str>) -> Self {
+        match k {
+            Some("chats") => Self::Chats,
+            Some("groups") => Self::Groups,
+            _ => Self::All,
+        }
+    }
+
+    fn has(self, c: &Conversation) -> bool {
+        let group = matches!(c.chat.target, Target::Group(_));
+        match self {
+            Self::All => true,
+            Self::Chats => !group,
+            Self::Groups => group,
+        }
+    }
 }
