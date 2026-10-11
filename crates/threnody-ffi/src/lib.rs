@@ -21,7 +21,9 @@ uniffi::setup_scaffolding!();
 
 mod calls;
 mod folders;
+mod lists;
 pub use folders::{ChatUnread, FolderInfo, QuietSlotInfo};
+pub use lists::{ListInfo, ListItemInfo};
 mod groups;
 mod persona;
 mod volunteer;
@@ -158,6 +160,8 @@ pub struct HistoryEntry {
     pub poll: Option<PollInfo>,
     /// Forwarded from another chat.
     pub forwarded: bool,
+    /// A list shared here (its hex id; open it with `list`).
+    pub list: Option<String>,
 }
 
 /// A poll: its options with how many chose each and whether we did, and
@@ -567,6 +571,10 @@ pub enum NodeEvent {
     },
     /// Our other device changed the folders, pinned or archived chats.
     FoldersChanged,
+    /// A list changed or arrived (hex id); reload it.
+    ListChanged {
+        id: String,
+    },
     /// `peer` pinned (or unpinned) a message in our chat, or in `group`.
     Pinned {
         peer: String,
@@ -750,6 +758,7 @@ fn history_entries(
         .iter()
         .map(|e| HistoryEntry {
             forwarded: e.forwarded || e.file.as_ref().is_some_and(|f| f.forwarded),
+            list: e.list.as_ref().map(lists::list_hex),
             poll: e.poll.as_ref().map(|p| {
                 let counts = p.counts();
                 let mine: Vec<u32> = p
@@ -923,6 +932,9 @@ fn convert(e: Event) -> NodeEvent {
             active,
         },
         Event::FoldersChanged { .. } => NodeEvent::FoldersChanged,
+        Event::ListChanged { id } => NodeEvent::ListChanged {
+            id: lists::list_hex(&id),
+        },
         Event::Pinned { peer, pin, .. } => NodeEvent::Pinned {
             peer: fp(&peer),
             group: None,
@@ -2248,6 +2260,12 @@ impl ThrenodyNode {
                     match &other {
                         Event::Connected { peer, .. } => self.group_connected(peer),
                         Event::DeviceLinked { device } => self.group_linked(device),
+                        Event::ListChanged { .. } => {
+                            let _guard = self.rt.enter();
+                            for (bytes, g) in self.node.take_list_forwards() {
+                                let _ = self.group_node().send_list(&self.node, &g, bytes);
+                            }
+                        }
                         _ => {}
                     }
                     self.call_event(&other);

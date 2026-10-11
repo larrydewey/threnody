@@ -325,6 +325,7 @@ impl Node {
                 mentions: Vec::new(),
                 poll: None,
                 forwarded: false,
+                list: None,
             },
         );
     }
@@ -920,6 +921,7 @@ impl Node {
                 mentions: Vec::new(),
                 poll: None,
                 forwarded,
+                list: None,
             },
         );
         Ok(r)
@@ -1197,6 +1199,7 @@ impl Node {
             mentions: extras.mentions,
             poll: None,
             forwarded: extras.forwarded,
+            list: None,
         };
         let _ = self
             .shared
@@ -1264,6 +1267,7 @@ impl Node {
                 mentions: Vec::new(),
                 poll: None,
                 forwarded: false,
+                list: None,
             },
         );
     }

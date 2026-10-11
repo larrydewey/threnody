@@ -11,6 +11,7 @@ mod core;
 mod folders;
 mod gifs;
 mod keyring;
+mod lists;
 mod settings;
 mod ui;
 mod window;

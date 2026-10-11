@@ -85,6 +85,8 @@ pub const FEATURE_READ: u64 = 512;
 pub const FEATURE_CALLS: u64 = 1024;
 /// The peer understands `AppMessage::Pin` (pinned messages).
 pub const FEATURE_PIN: u64 = 2048;
+/// The peer understands `AppMessage::List` (shared lists).
+pub const FEATURE_LISTS: u64 = 4096;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -96,7 +98,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_TYPING
     | FEATURE_READ
     | FEATURE_CALLS
-    | FEATURE_PIN;
+    | FEATURE_PIN
+    | FEATURE_LISTS;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -206,6 +209,9 @@ pub enum AppMessage {
     TunnelOffer { wg_public: [u8; 32], port: u16 },
     /// An opaque group-layer message (MLS, see `threnody-groups`).
     Group(Vec<u8>),
+    /// A shared list's state (`crate::lists::List`), to merge. Only to
+    /// peers whose `Hello` has [`FEATURE_LISTS`].
+    List(Vec<u8>),
     /// An opaque relay-circuit message (see `threnody-net::relay`).
     Relay(Vec<u8>),
     /// Our prekey bundle for the peer (`prekey::PrekeyBundle`, Appendix H).
@@ -322,6 +328,7 @@ mod kind {
     pub const CALL: u64 = 25;
     pub const MEDIA: u64 = 26;
     pub const PIN: u64 = 27;
+    pub const LIST: u64 = 28;
 }
 
 impl AppMessage {
@@ -568,6 +575,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::DIRECTORY)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::List(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::LIST)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Approval { approved } => {
                     e.map_len(2)?.u8(0)?.uint(kind::APPROVAL)?;
                     e.u8(2)?.bool(*approved)?;
@@ -613,6 +624,7 @@ impl AppMessage {
             | Self::Paths(p)
             | Self::Credential(p)
             | Self::Directory(p)
+            | Self::List(p)
             | Self::Call(p)
             | Self::Media(p)
             | Self::Identity(p) => p.len() + 16,
@@ -788,6 +800,7 @@ impl AppMessage {
             | kind::PATHS
             | kind::CREDENTIAL
             | kind::DIRECTORY
+            | kind::LIST
             | kind::IDENTITY => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
@@ -804,6 +817,7 @@ impl AppMessage {
                     Some(kind::PATHS) => Self::Paths(p),
                     Some(kind::CREDENTIAL) => Self::Credential(p),
                     Some(kind::DIRECTORY) => Self::Directory(p),
+                    Some(kind::LIST) => Self::List(p),
                     Some(kind::CALL) => Self::Call(p),
                     Some(kind::MEDIA) => Self::Media(p),
                     _ => Self::Mailbox(p),
@@ -954,6 +968,7 @@ mod tests {
                 id: u64::MAX,
                 pin: false,
             },
+            AppMessage::List(vec![1, 2, 3]),
             AppMessage::Ack(vec![]),
             AppMessage::Ack(vec![1, u64::MAX]),
             AppMessage::Delete {

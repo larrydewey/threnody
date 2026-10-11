@@ -17,6 +17,7 @@ pub mod folders;
 pub mod handshake;
 pub mod history;
 pub mod identity;
+pub mod lists;
 pub mod media;
 pub mod message;
 pub mod onion;

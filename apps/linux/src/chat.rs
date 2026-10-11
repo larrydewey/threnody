@@ -1332,6 +1332,18 @@ impl ChatView {
             m.add_css_class("read");
         }
         meta.append(&m);
+        if let Some(id) = &e.list {
+            let open = gtk::Button::with_label("Open list");
+            open.add_css_class("pill");
+            open.set_halign(gtk::Align::Start);
+            let (weak, id) = (self.app.clone(), id.clone());
+            open.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    app.open_lists(Some(id.clone()));
+                }
+            });
+            bubble.append(&open);
+        }
         bubble.append(&meta);
         row.append(&bubble);
         self.bubbles

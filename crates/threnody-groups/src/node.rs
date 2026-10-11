@@ -442,6 +442,13 @@ impl GroupNode {
         Ok(true)
     }
 
+    /// Sends a list to every member (see `Node::edit_list`).
+    pub fn send_list(&mut self, node: &Node, group: &GroupId, list: Vec<u8>) -> Result<()> {
+        let out = self.groups.send(group, &Content::List(list))?;
+        self.apply(node, out, true);
+        Ok(())
+    }
+
     /// Pins (or unpins) message `id` in `group` for every member. Only the
     /// owner and admins may; returns false if there's no such message.
     pub fn pin(&mut self, node: &Node, group: &GroupId, id: u64, pin: bool) -> Result<bool> {
@@ -563,6 +570,7 @@ impl GroupNode {
                         ..
                     }
                 ),
+                list: None,
             },
         );
         Ok(())
@@ -605,6 +613,7 @@ impl GroupNode {
                 mentions: Vec::new(),
                 poll: None,
                 forwarded: false,
+                list: None,
             },
         );
     }
@@ -1084,6 +1093,7 @@ impl GroupNode {
                         mentions: Vec::new(),
                         poll: Some(poll),
                         forwarded: false,
+                        list: None,
                     },
                 );
                 Update::Text {
@@ -1105,6 +1115,17 @@ impl GroupNode {
                     return;
                 }
                 Update::Voted { group, from }
+            }
+            GroupEvent::List { group, from, list } => {
+                // The node keeps it and tells the app (`Event::ListChanged`).
+                if let Some((bytes, groups)) =
+                    node.on_shared_list(ConversationId::Group(group), from, &list)
+                {
+                    for g in groups {
+                        let _ = self.send_list(node, &g, bytes.clone());
+                    }
+                }
+                return;
             }
             GroupEvent::ClosePoll { group, from, id } => {
                 // Only its author (any device of their account) closes a poll.

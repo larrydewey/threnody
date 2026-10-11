@@ -50,6 +50,8 @@ pub struct App {
     tabs: gtk::Box,
     /// The folders, and the chats each shows (chat keys).
     folders: RefCell<Vec<threnody_ffi::FolderInfo>>,
+    /// The Lists window, while open.
+    lists: RefCell<Option<Rc<crate::lists::ListsWindow>>>,
     folder_chats: RefCell<HashMap<u64, HashSet<String>>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
     chat: RefCell<Option<Rc<ChatView>>>,
@@ -180,6 +182,9 @@ impl App {
             .build();
         header.pack_end(&menu_button);
         header.pack_end(&add_button);
+        let lists_button = gtk::Button::from_icon_name("view-list-bullet-symbolic");
+        lists_button.set_tooltip_text(Some("Lists"));
+        header.pack_start(&lists_button);
 
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&header);
@@ -244,6 +249,7 @@ impl App {
             rows: RefCell::new(Vec::new()),
             tabs: tabs.clone(),
             folders: RefCell::new(Vec::new()),
+            lists: RefCell::new(None),
             folder_chats: RefCell::new(HashMap::new()),
             unread: RefCell::new(HashMap::new()),
             chat: RefCell::new(None),
@@ -257,6 +263,12 @@ impl App {
         this.watch_window();
         this.watch_network();
 
+        let weak = Rc::downgrade(&this);
+        lists_button.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.open_lists(None);
+            }
+        });
         let weak = Rc::downgrade(&this);
         this.list.connect_row_selected(move |_, row| {
             let (Some(this), Some(row)) = (weak.upgrade(), row) else {
@@ -385,6 +397,20 @@ impl App {
             self.show_list();
         }
         self.rebuilding.set(false);
+    }
+
+    /// Opens the Lists window (at list `id`, from a chat).
+    pub fn open_lists(self: &Rc<Self>, id: Option<String>) {
+        let w = self
+            .lists
+            .borrow_mut()
+            .get_or_insert_with(|| crate::lists::ListsWindow::new(self))
+            .clone();
+        if let Some(id) = id {
+            w.reload();
+            w.show(&id);
+        }
+        w.present();
     }
 
     /// Whether `tab` shows `c`: archived chats only in the archive.
@@ -1403,6 +1429,13 @@ impl App {
             }
             NodeEvent::DeviceLinked { .. } => {
                 self.toast("A new device joined your account.");
+                (None, None)
+            }
+            NodeEvent::ListChanged { .. } => {
+                let open = self.lists.borrow().clone();
+                if let Some(w) = open {
+                    w.reload();
+                }
                 (None, None)
             }
             _ => (None, None),

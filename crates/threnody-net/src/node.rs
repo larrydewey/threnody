@@ -138,6 +138,11 @@ pub enum Event {
     LinkRejected {
         device: PublicIdentity,
     },
+    /// A list changed (here, on our other device, or by someone it's
+    /// shared with), or arrived.
+    ListChanged {
+        id: [u8; 16],
+    },
     /// One of our own devices changed the folders, pinned or archived
     /// chats.
     FoldersChanged {
@@ -468,6 +473,8 @@ pub(crate) struct Shared {
     pub(crate) sync: Mutex<crate::sync::SyncState>,
     /// Folders, pinned and archived chats (see `folders`).
     pub(crate) folders: Mutex<threnody_core::folders::Folders>,
+    /// Lists (see `lists`).
+    pub(crate) lists: Mutex<crate::lists::Lists>,
     /// The QUIC endpoint, once listening (see `quic`).
     pub(crate) quic: Mutex<Option<Arc<crate::quic::Quic>>>,
     /// Reaching contacts across the internet (see `reach`).
@@ -606,6 +613,13 @@ impl Node {
             .flatten()
             .and_then(|b| threnody_core::folders::Folders::decode(&b).ok())
             .unwrap_or_default();
+        let lists = crate::lists::Lists::decode(
+            &cfg.home
+                .load_state(&cfg.identity, crate::lists::STATE)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         let sync = crate::sync::SyncState::decode(
             &cfg.home
                 .load_state(&cfg.identity, "history-sync")
@@ -659,6 +673,7 @@ impl Node {
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
             folders: Mutex::new(folders),
+            lists: Mutex::new(lists),
             peer_features: Mutex::new(HashMap::new()),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
@@ -1675,6 +1690,7 @@ where
                         AppMessage::Identity(payload) => node.on_identity(peer, &payload),
                         AppMessage::React { conversation, id, emoji, add } => node.on_react(&peer, &conversation, id, &emoji, add),
                         AppMessage::Pin { conversation, id, pin } => node.on_pin(&peer, &conversation, id, pin),
+                        AppMessage::List(bytes) => node.on_list_message(peer, &bytes),
                         AppMessage::Read { conversation, ids } => node.on_read(&peer, &conversation, &ids),
                         AppMessage::Hello { .. }
                         | AppMessage::Cover

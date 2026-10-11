@@ -67,6 +67,7 @@ class MainActivity : Activity() {
             title.text = "Threnody"
             title.setTextAppearance(Design.styleTitleLarge)
             action(R.drawable.ic_search, "Search messages") { search.open() }
+            action(R.drawable.ic_list, "Lists") { startActivity(Intent(this@MainActivity, ListsActivity::class.java)) }
             action(R.drawable.ic_qr, "My invite") { showInvite() }
             action(R.drawable.ic_add, "New conversation") { add(it) }
             action(R.drawable.ic_more, "More") { more(it) }

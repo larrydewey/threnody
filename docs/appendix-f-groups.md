@@ -46,7 +46,7 @@ Content = text                         ; UTF-8, as the first versions sent (no i
                     ? 11: mentions [* [start, len, who (32)]] }
 kind: 1 text, 2 file (at most 8 MiB, as in 1:1), 3 reaction, 4 pin (6: message id; flag 1 unpins),
       5 poll (1: question, 12: [* option], flag 1 several choices), 6 vote (6: poll id, 13: [* choice]),
-      7 close poll (6: poll id)
+      7 close poll (6: poll id), 8 list (2: the list, Appendix C *Lists*)
 flags: 1 sensitive, 2 voice message, 4 video message, 8 forwarded (file); 8 forwarded (text);
        1 remove (reaction)
 ```
