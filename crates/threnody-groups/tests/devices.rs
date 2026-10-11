@@ -451,3 +451,66 @@ async fn forwards_drafts_and_notes_to_self() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn folders_sync_and_archived_chats_come_back() {
+    use threnody_core::folders::{Folder, Folders};
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut laptop, &mut bob).await;
+    let conv = laptop.node.conversation_for(&bid);
+
+    // A folder and an archived chat, then a newly linked device gets them.
+    laptop.node.set_folders(Folders {
+        folders: vec![Folder {
+            id: 1,
+            name: "Family".into(),
+            chats: vec![conv],
+            ..Folder::default()
+        }],
+        archived: vec![conv],
+        ..Folders::default()
+    });
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    until(&mut [&mut laptop, &mut phone], |ns| {
+        ns[1]
+            .node
+            .folders()
+            .folders
+            .first()
+            .is_some_and(|f| f.name == "Family")
+    })
+    .await;
+    assert_eq!(phone.node.folders().archived, [conv]);
+
+    // A change on the phone reaches the laptop: newest wins.
+    phone.node.update_folders(|f| {
+        f.folders[0].name = "Fam".into();
+        true
+    });
+    until(&mut [&mut laptop, &mut phone], |ns| {
+        ns[0].node.folders().folders[0].name == "Fam"
+    })
+    .await;
+
+    // Bob writes: the chat leaves the archive, and is unread until seen.
+    bob.node
+        .send_text(&laptop.node.identity(), "dinner?")
+        .unwrap();
+    until(&mut [&mut laptop, &mut bob], |ns| {
+        ns[0].node.folders().archived.is_empty()
+    })
+    .await;
+    let unread = |n: &N| {
+        n.node
+            .history(conv)
+            .map(|h| h.unread().count())
+            .unwrap_or(0)
+    };
+    assert_eq!(unread(&laptop), 1);
+    laptop.node.mark_seen(conv);
+    assert_eq!(unread(&laptop), 0);
+}

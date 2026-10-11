@@ -138,6 +138,11 @@ pub enum Event {
     LinkRejected {
         device: PublicIdentity,
     },
+    /// One of our own devices changed the folders, pinned or archived
+    /// chats.
+    FoldersChanged {
+        from: PublicIdentity,
+    },
     /// One of our own devices sent us contact changes.
     ContactsSynced {
         from: PublicIdentity,
@@ -461,6 +466,8 @@ pub(crate) struct Shared {
     pub(crate) peer_features: Mutex<HashMap<PublicIdentity, u64>>,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
+    /// Folders, pinned and archived chats (see `folders`).
+    pub(crate) folders: Mutex<threnody_core::folders::Folders>,
     /// The QUIC endpoint, once listening (see `quic`).
     pub(crate) quic: Mutex<Option<Arc<crate::quic::Quic>>>,
     /// Reaching contacts across the internet (see `reach`).
@@ -592,6 +599,13 @@ impl Node {
             Some(b) => MailboxStore::decode(&b)?,
             None => MailboxStore::default(),
         };
+        let folders = cfg
+            .home
+            .load_state(&cfg.identity, crate::folders::STATE)
+            .ok()
+            .flatten()
+            .and_then(|b| threnody_core::folders::Folders::decode(&b).ok())
+            .unwrap_or_default();
         let sync = crate::sync::SyncState::decode(
             &cfg.home
                 .load_state(&cfg.identity, "history-sync")
@@ -644,6 +658,7 @@ impl Node {
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
+            folders: Mutex::new(folders),
             peer_features: Mutex::new(HashMap::new()),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),

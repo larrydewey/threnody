@@ -13,6 +13,7 @@ pub mod delivery;
 pub mod direct;
 pub mod discovery;
 pub mod error;
+pub mod folders;
 pub mod frame;
 pub mod handshake;
 pub mod history;

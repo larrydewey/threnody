@@ -8,6 +8,7 @@ mod camera;
 mod chat;
 mod clip;
 mod core;
+mod folders;
 mod gifs;
 mod keyring;
 mod settings;

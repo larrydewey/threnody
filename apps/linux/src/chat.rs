@@ -569,6 +569,24 @@ impl ChatView {
         }
     }
 
+    /// On screen in the active window: what's here is read (unread counts).
+    fn mark_seen(&self) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        if !app.window.is_active() || self.persona().is_some() {
+            return;
+        }
+        let key = match &self.conv.borrow().chat.target {
+            Target::Contact(k) | Target::Group(k) => k.clone(),
+            Target::Note => "notes".into(),
+        };
+        let Some(node) = self.node() else { return };
+        ui::bg_quiet(move || {
+            let _ = node.mark_seen(key);
+        });
+    }
+
     /// Notes to self rather than a chat with someone.
     fn is_note(&self) -> bool {
         self.conv.borrow().chat.target == Target::Note
@@ -760,6 +778,7 @@ impl ChatView {
     /// Tells the contact which of its messages are now on screen (1:1
     /// chats, with read receipts on); ids it was told of aren't sent again.
     fn report_read(&self, entries: &[HistoryEntry]) {
+        self.mark_seen();
         if self.group().is_some() || self.is_note() {
             return;
         }

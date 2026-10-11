@@ -1042,6 +1042,9 @@ impl Node {
     /// Appends an entry to a conversation's history.
     /// Our own outgoing 1:1 entries also go to our other devices.
     pub fn append(&self, conv: ConversationId, entry: Entry) {
+        if !entry.outgoing {
+            self.unarchive(conv);
+        }
         let now = entry.at_ms;
         let ours = entry.outgoing && entry.device == *self.identity().as_bytes();
         let pushed = ours.then(|| entry.clone());
@@ -1170,6 +1173,9 @@ impl Node {
         remote_id: u64,
         extras: Extras,
     ) {
+        if !outgoing {
+            self.unarchive(conv);
+        }
         let now = now_ms();
         let entry = Entry {
             at_ms: now,

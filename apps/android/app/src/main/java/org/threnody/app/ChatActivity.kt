@@ -796,6 +796,8 @@ class ChatActivity : Activity() {
         }
         val me = node.deviceFingerprint()
         myDevice = me
+        // On screen: what's here is read now.
+        if (started) try { node.markSeen(if (note) "notes" else g ?: key) } catch (_: Exception) {}
         val items = history.map { Item(it) } + synchronized(pending) {
             pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null, forwarded = false), sending = true) }
         }

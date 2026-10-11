@@ -1406,6 +1406,9 @@ impl Ui {
             Event::LinkRejected { device } => {
                 println!("! rejected a link attempt from {}", self.name(&device))
             }
+            Event::FoldersChanged { from } => {
+                println!("* folders updated from {}", self.name(&from))
+            }
             Event::ContactsSynced { from } => {
                 println!("* contacts updated from {}", self.name(&from))
             }

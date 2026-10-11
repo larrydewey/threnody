@@ -27,6 +27,7 @@ import android.widget.Toast
 import android.graphics.drawable.ColorDrawable
 import java.net.Inet4Address
 import uniffi.threnody_ffi.DeviceInfo
+import uniffi.threnody_ffi.FolderInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.ThrenodyNode
 import uniffi.threnody_ffi.qrMatrix
@@ -37,10 +38,14 @@ class MainActivity : Activity() {
 
     private var node: ThrenodyNode? = null
     private lateinit var list: LinearLayout
-    /** All, Chats or Groups: which conversations the list shows. */
+    /** The built-in tabs; the user's folders, and the archive, come after. */
     private enum class Tab(val label: String) { All("All"), Chats("Chats"), Groups("Groups") }
-    private var tab = Tab.All
+    /** The tab shown: a built-in's name, "folder:<id>", or [ARCHIVED]. */
+    private var tabKey = Tab.All.name
     private lateinit var tabBar: LinearLayout
+    private var folders: List<FolderInfo> = emptyList()
+    /** The chats each folder shows (chat keys). */
+    private var folderChats: Map<ULong, Set<String>> = emptyMap()
     /** Every row from the last refresh, before the tab picks some. */
     private var allRows: List<Row> = emptyList()
     private lateinit var scroll: ScrollView
@@ -98,9 +103,7 @@ class MainActivity : Activity() {
             addView(scrollContent, MATCH_PARENT, WRAP_CONTENT)
         }
 
-        tab = Tab.entries.firstOrNull {
-            it.name == getSharedPreferences(UI_PREFS, MODE_PRIVATE).getString(TAB, null)
-        } ?: Tab.All
+        tabKey = getSharedPreferences(UI_PREFS, MODE_PRIVATE).getString(TAB, null) ?: Tab.All.name
         tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(Design.screenPadding), dp(Design.xs), dp(Design.screenPadding), dp(Design.sm))
@@ -108,7 +111,10 @@ class MainActivity : Activity() {
         drawTabs()
 
         root.addView(bar, matchWrap)
-        root.addView(tabBar, matchWrap)
+        root.addView(android.widget.HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(tabBar)
+        }, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
         fitSystemBars(root, bar, scroll)
@@ -158,6 +164,12 @@ class MainActivity : Activity() {
         val section: Section = Section.Contacts,
         val isSectionHeader: Boolean = false,
         val sectionTitle: String? = null,
+        /** The chat's key, for the main identity's chats (folders, pins, archive). */
+        val chatKey: String? = null,
+        val unread: Int = 0,
+        /** Where it is among the pinned chats (-1: not pinned). */
+        val pinned: Int = -1,
+        val archived: Boolean = false,
     ) {
         enum class Section { Requests, Invites, Contacts, Groups, Anonymous }
     }
@@ -187,6 +199,13 @@ class MainActivity : Activity() {
         val gen = refreshGen.incrementAndGet()
         val n = node ?: return
         val all = Threnody.conversations(n).filter { !it.blocked }
+        // Quiet hours follow the local time.
+        n.setUtcOffset(java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000)
+        val unread = try { n.unreadCounts().associateBy { it.chat } } catch (_: Exception) { emptyMap() }
+        val pinnedKeys = try { n.pinnedChats() } catch (_: Exception) { emptyList() }
+        val archivedKeys = try { n.archivedChats().toSet() } catch (_: Exception) { emptySet() }
+        val fl = try { n.folders() } catch (_: Exception) { emptyList() }
+        val fc = fl.associate { f -> f.id to (try { n.folderChats(f.id).toSet() } catch (_: Exception) { emptySet() }) }
 
         val rows = mutableListOf<Row>()
 
@@ -216,15 +235,17 @@ class MainActivity : Activity() {
         val noteDraft = try { n.noteDraft() } catch (_: Exception) { "" }
         val noteRow = Row("Note to self", "notes",
             if (noteDraft.isNotEmpty()) "Draft: $noteDraft" else notes?.let { preview(it) } ?: "Notes on all your devices",
-            notes?.atMs?.toLong() ?: 0, null, open = { openNote() }, section = Row.Section.Contacts)
+            notes?.atMs?.toLong() ?: 0, null, open = { openNote() },
+            manage = { manage(n, "Note to self", null, null, "notes") },
+            section = Row.Section.Contacts, chatKey = "notes")
         val contacts = listOf(noteRow) + all.filter { it.accepted }.map { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
             val draft = try { n.draft(c.device) } catch (_: Exception) { "" }
             Row(c.title, c.key, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
                 last?.atMs?.toLong() ?: 0, c.connected,
                 open = { openChat(c.key, c.device) },
-                manage = { manage(n, c.title, c.device, null) },
-                section = Row.Section.Contacts)
+                manage = { manage(n, c.title, c.device, null, c.key) },
+                section = Row.Section.Contacts, chatKey = c.key)
         }
         if (contacts.isNotEmpty()) {
             rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Conversations", section = Row.Section.Contacts))
@@ -239,8 +260,8 @@ class MainActivity : Activity() {
             Row(g.name, g.id, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
                 last?.atMs?.toLong() ?: 0, null,
                 open = { openGroup(g.id) },
-                manage = { manage(n, g.name, null, g.id) },
-                section = Row.Section.Groups)
+                manage = { manage(n, g.name, null, g.id, g.id) },
+                section = Row.Section.Groups, chatKey = g.id)
         }
         if (groups.isNotEmpty()) {
             rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Groups", section = Row.Section.Groups))
@@ -262,7 +283,7 @@ class MainActivity : Activity() {
                     if (c.accepted) last?.atMs?.toLong() ?: 0 else Long.MAX_VALUE,
                     c.connected,
                     open = { openChat(c.key, c.device, id) },
-                    manage = { manage(p, c.title, c.device, null) },
+                    manage = { manage(p, c.title, c.device, null, null) },
                     section = Row.Section.Anonymous)
             }
         }
@@ -271,23 +292,34 @@ class MainActivity : Activity() {
             rows.addAll(anonymous)
         }
 
-        // Sort within sections by time (section headers stay at top of their section)
-        val sortedRows = rows.groupBy { it.section }.flatMap { (section, sectionRows) ->
+        // Unread counts, pins and the archive.
+        val marked = rows.map { r ->
+            val k = r.chatKey ?: return@map r
+            r.copy(unread = unread[k]?.unread?.toInt() ?: 0, pinned = pinnedKeys.indexOf(k), archived = k in archivedKeys)
+        }
+        // Pinned chats first, then newest first, within each section.
+        val sortedRows = marked.groupBy { it.section }.flatMap { (_, sectionRows) ->
             val header = sectionRows.first { it.isSectionHeader }
-            val items = sectionRows.filter { !it.isSectionHeader }.sortedByDescending { it.atMs }
-            listOf(header) + items
+            listOf(header) + sectionRows.filter { !it.isSectionHeader }.sortedWith(byPinThenTime)
         }
 
         // Search results stay until the search is cleared.
         runOnUiThread {
             // A newer refresh will draw instead; search results stay put.
             if (gen == refreshGen.get()) {
+                folders = fl
+                folderChats = fc
+                val gone = tabKey.startsWith(FOLDER) && fl.none { "$FOLDER${it.id}" == tabKey }
+                if (gone) tabKey = Tab.All.name
                 allRows = sortedRows
                 drawTabs()
                 if (!search.isOpen || search.text.isEmpty()) showTab()
             }
         }
     }
+
+    private val byPinThenTime = compareBy<Row> { if (it.pinned >= 0) it.pinned else Int.MAX_VALUE }
+        .thenByDescending { it.atMs }
 
     /** Which sections a tab shows. */
     private fun Tab.has(s: Row.Section) = when (this) {
@@ -296,38 +328,87 @@ class MainActivity : Activity() {
         Tab.Groups -> s == Row.Section.Invites || s == Row.Section.Groups
     }
 
+    /** The rows a tab shows, archived chats aside. */
+    private fun rowsOf(key: String): List<Row> {
+        val items = allRows.filter { !it.isSectionHeader && !it.archived }
+        if (key.startsWith(FOLDER)) {
+            val chats = folderChats[key.removePrefix(FOLDER).toULongOrNull()] ?: emptySet()
+            return items.filter { it.chatKey in chats }.sortedWith(byPinThenTime)
+        }
+        val t = Tab.entries.firstOrNull { it.name == key } ?: Tab.All
+        return allRows.filter { (it.isSectionHeader || !it.archived) && t.has(it.section) }
+    }
+
     /** Shows the rows of the current tab; one section needs no heading. */
     private fun showTab() {
-        val rows = allRows.filter { tab.has(it.section) }
-        val sections = rows.filter { it.isSectionHeader }.size
+        val key = tabKey
+        var rows = if (key == ARCHIVED) allRows.filter { !it.isSectionHeader && it.archived } else rowsOf(key)
+        // Headings of sections left empty go.
+        rows = rows.filterIndexed { i, r ->
+            !r.isSectionHeader || rows.getOrNull(i + 1)?.let { !it.isSectionHeader } == true
+        }
+        if (rows.count { it.isSectionHeader } == 1 && key != Tab.All.name) rows = rows.filter { !it.isSectionHeader }
+        // The archive, at the end of the built-in tabs.
+        if (Tab.entries.any { it.name == key }) {
+            val t = Tab.valueOf(key)
+            val archived = allRows.count { !it.isSectionHeader && it.archived && t.has(it.section) }
+            if (archived > 0) rows = rows + Row("Archived", "archive", "$archived chat${if (archived == 1) "" else "s"}",
+                0, null, open = { selectTab(ARCHIVED) }, section = Row.Section.Contacts)
+        }
         if (rows.none { !it.isSectionHeader }) {
-            if (tab == Tab.Groups) {
-                emptyStateContainer.removeAllViews()
-                emptyStateContainer.addView(emptyState(
+            emptyStateContainer.removeAllViews()
+            val folder = folders.firstOrNull { "$FOLDER${it.id}" == key }
+            when {
+                key == Tab.Groups.name -> emptyStateContainer.addView(emptyState(
                     title = "No groups yet",
                     message = "Start one and invite your contacts. Group messages are end-to-end encrypted with MLS.",
                     actionText = "New group",
                     action = { newGroup() },
                     iconRes = R.drawable.ic_add,
                 ))
-            } else {
-                empty()
+                folder != null -> emptyStateContainer.addView(emptyState(
+                    title = "Nothing in ${folder.name} right now",
+                    message = "Pick chats for it, or change its rules.",
+                    actionText = "Edit folder",
+                    action = { editFolder(folder) },
+                    iconRes = R.drawable.ic_edit,
+                ))
+                key == ARCHIVED -> emptyStateContainer.addView(emptyState(
+                    title = "No archived chats",
+                    message = "Long-press a chat to archive it. A new message brings it back.",
+                    actionText = "Back to all chats",
+                    action = { selectTab(Tab.All.name) },
+                    iconRes = R.drawable.ic_back,
+                ))
+                else -> empty()
             }
         }
-        show(if (tab != Tab.All && sections == 1) rows.filter { !it.isSectionHeader } else rows)
+        show(rows)
     }
 
-    /** The tabs, each with how many need an answer (requests, invitations). */
+    private fun selectTab(key: String) {
+        if (tabKey == key) return
+        tabKey = key
+        getSharedPreferences(UI_PREFS, MODE_PRIVATE).edit().putString(TAB, key).apply()
+        drawTabs()
+        if (!search.isOpen || search.text.isEmpty()) showTab()
+        scroll.scrollTo(0, 0)
+    }
+
+    /**
+     * The tabs: All, Chats, Groups, the folders, and "+" for a new one;
+     * each says how many of its chats are unread or wait for an answer.
+     */
     private fun drawTabs() {
         tabBar.removeAllViews()
-        for (t in Tab.entries) {
-            val waiting = allRows.count {
-                !it.isSectionHeader && t != Tab.All && t.has(it.section) &&
-                    (it.section == Row.Section.Requests || it.section == Row.Section.Invites)
+        fun chip(key: String, label: String, onLong: (() -> Unit)? = null, onClick: () -> Unit) {
+            val selected = key == tabKey
+            val rows = if (key.isEmpty() || key == ARCHIVED) emptyList() else rowsOf(key).filter { !it.isSectionHeader }
+            val waiting = rows.count {
+                key != Tab.All.name && (it.unread > 0 || it.section == Row.Section.Requests || it.section == Row.Section.Invites)
             }
-            val selected = t == tab
             tabBar.addView(TextView(this).apply {
-                text = if (waiting > 0) "${t.label} · $waiting" else t.label
+                text = if (waiting > 0) "$label · $waiting" else label
                 setTextAppearance(Design.styleLabelMedium)
                 setTypeface(typeface, if (selected) Design.weightMedium else android.graphics.Typeface.NORMAL)
                 setTextColor(color(if (selected) R.color.on_bubble_out else R.color.text))
@@ -335,18 +416,77 @@ class MainActivity : Activity() {
                     else rounded(color(R.color.field), dp(18).toFloat())
                 setPadding(dp(16), dp(8), dp(16), dp(8))
                 isSelected = selected
-                contentDescription = "${t.label} tab" + (if (waiting > 0) ", $waiting waiting" else "") +
+                contentDescription = "$label tab" + (if (waiting > 0) ", $waiting unread or waiting" else "") +
                     (if (selected) ", selected" else "")
-                setOnClickListener {
-                    if (tab == t) return@setOnClickListener
-                    tab = t
-                    getSharedPreferences(UI_PREFS, MODE_PRIVATE).edit().putString(TAB, t.name).apply()
-                    drawTabs()
-                    if (!search.isOpen || search.text.isEmpty()) showTab()
-                    scroll.scrollTo(0, 0)
-                }
+                setOnClickListener { onClick() }
+                onLong?.let { l -> setOnLongClickListener { v -> Design.mediumHaptic(v); l(); true } }
             }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(8) })
         }
+        for (t in Tab.entries) chip(t.name, t.label) { selectTab(t.name) }
+        for (f in folders) {
+            val key = "$FOLDER${f.id}"
+            chip(key, listOf(f.emoji, f.name).filter { it.isNotBlank() }.joinToString(" "), onLong = { folderMenu(f) }) {
+                if (tabKey == key) folderMenu(f) else selectTab(key)
+            }
+        }
+        if (tabKey == ARCHIVED) chip(ARCHIVED, "Archived") {}
+        chip("", "+") { editFolder(null) }
+        tabBar.getChildAt(tabBar.childCount - 1)?.contentDescription = "New folder"
+    }
+
+    /** Every chat a folder can hold: key and title. */
+    private fun chatChoices(): List<Pair<String, String>> =
+        allRows.filter { !it.isSectionHeader && it.chatKey != null }.map { it.chatKey!! to it.title }
+            .distinctBy { it.first }
+
+    /** Makes a folder (`f` null) or changes one, on all our devices. */
+    private fun editFolder(f: FolderInfo?) {
+        val n = node ?: return
+        FolderEditor.show(this, f, chatChoices()) { folder ->
+            Threading.background {
+                val id = try { n.saveFolder(folder) } catch (e: Exception) {
+                    runOnUiThread { Toast.makeText(this, "Couldn't save: ${e.message}", Toast.LENGTH_LONG).show() }
+                    return@background
+                }
+                refresh()
+                runOnUiThread { selectTab("$FOLDER$id") }
+            }
+        }
+    }
+
+    /** A folder's tab, long-pressed: change it, move it, or delete it. */
+    private fun folderMenu(f: FolderInfo) {
+        val n = node ?: return
+        val ids = folders.map { it.id }
+        val at = ids.indexOf(f.id)
+        val options = buildList {
+            add("Edit")
+            if (at > 0) add("Move left")
+            if (at < ids.size - 1) add("Move right")
+            add("Delete")
+        }
+        SecureBuilder(this)
+            .setTitle(f.name)
+            .setItems(options.toTypedArray()) { _, i ->
+                when (options[i]) {
+                    "Edit" -> editFolder(f)
+                    "Move left", "Move right" -> {
+                        val to = if (options[i] == "Move left") at - 1 else at + 1
+                        val order = ids.toMutableList().apply { add(to, removeAt(at)) }
+                        Threading.background { n.orderFolders(order); refresh() }
+                    }
+                    else -> SecureBuilder(this)
+                        .setTitle("Delete ${f.name}?")
+                        .setMessage("The folder goes on all your devices. Its chats stay.")
+                        .setPositiveButton("Delete") { _, _ ->
+                            Threading.background { n.deleteFolder(f.id); refresh() }
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /** Searches every conversation, ours and the anonymous identities'. */
@@ -549,15 +689,32 @@ class MainActivity : Activity() {
             addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(Design.xs) })
         }
 
-        val timeText = if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else ""
+        val timeText = (if (r.pinned >= 0) "📌 " else "") + (if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else "")
         val time = label(timeText, Design.typeCaption, R.color.muted, Design.weightRegular).apply {
             isSingleLine = true
+        }
+        if (r.unread > 0) {
+            title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
+            preview.setTextColor(color(R.color.text))
         }
 
         val side = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
             addView(time, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            if (r.unread > 0) {
+                addView(TextView(this@MainActivity).apply {
+                    text = if (r.unread > 99) "99+" else r.unread.toString()
+                    textSize = 12f
+                    setTextColor(color(R.color.on_bubble_out))
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    background = rounded(color(R.color.accent), dp(10).toFloat())
+                    setPadding(dp(7), dp(1), dp(7), dp(1))
+                    gravity = Gravity.CENTER
+                    minWidth = dp(20)
+                    contentDescription = "${r.unread} unread"
+                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(Design.xs); gravity = Gravity.END })
+            }
             if (r.connected != null) {
                 val dot = View(this@MainActivity).apply {
                     background = roundedRes(if (r.connected!!) R.color.online else R.color.muted, dp(5).toFloat())
@@ -615,16 +772,61 @@ class MainActivity : Activity() {
     }
 
     /** Long-press on a conversation: clear it, or delete the contact. */
-    private fun manage(n: ThrenodyNode, title: String, device: String?, group: String?) {
-        val options = if (group != null) listOf("Clear chat") else listOf("Clear chat", "Delete contact")
+    /** Long-press on a conversation: pin, archive, file in folders, clear it, or delete the contact. */
+    private fun manage(n: ThrenodyNode, title: String, device: String?, group: String?, key: String?) {
+        val row = key?.let { k -> allRows.firstOrNull { it.chatKey == k } }
+        val options = buildList {
+            if (key != null) {
+                add(if ((row?.pinned ?: -1) >= 0) "Unpin" else "Pin to top")
+                add(if (row?.archived == true) "Unarchive" else "Archive")
+                add("Folders…")
+            }
+            if (device != null || group != null) add("Clear chat")
+            if (group == null && device != null) add("Delete contact")
+        }
         SecureBuilder(this)
             .setTitle(title)
             .setItems(options.toTypedArray()) { _, i ->
+                val k = key ?: ""
                 when (options[i]) {
+                    "Pin to top", "Unpin" -> Threading.background {
+                        try { n.setChatPinned(k, options[i] == "Pin to top") } catch (_: Exception) {}
+                        refresh()
+                    }
+                    "Archive", "Unarchive" -> Threading.background {
+                        try { n.setChatArchived(k, options[i] == "Archive") } catch (_: Exception) {}
+                        refresh()
+                    }
+                    "Folders…" -> fileInFolders(n, title, k)
                     "Clear chat" -> Chats.clear(this, n, title, device, group) { refreshSoon() }
                     else -> Chats.delete(this, n, title, device!!) { refreshSoon() }
                 }
             }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Puts a chat in folders, or takes it out. */
+    private fun fileInFolders(n: ThrenodyNode, title: String, key: String) {
+        if (folders.isEmpty()) {
+            return editFolder(null)
+        }
+        val on = folders.map { key in it.chats }.toBooleanArray()
+        val start = on.copyOf()
+        SecureBuilder(this)
+            .setTitle("Folders for $title")
+            .setMultiChoiceItems(folders.map { listOf(it.emoji, it.name).filter(String::isNotBlank).joinToString(" ") }.toTypedArray(), on) { _, i, c ->
+                on[i] = c
+            }
+            .setPositiveButton("Done") { _, _ ->
+                Threading.background {
+                    for ((i, f) in folders.withIndex()) if (on[i] != start[i]) {
+                        try { n.setInFolder(f.id, key, on[i]) } catch (_: Exception) {}
+                    }
+                    refresh()
+                }
+            }
+            .setNeutralButton("New folder") { _, _ -> editFolder(null) }
             .setNegativeButton("Cancel", null)
             .show()
     }
@@ -1265,5 +1467,7 @@ class MainActivity : Activity() {
         private const val MAX_RESULTS = 200
         private const val UI_PREFS = "ui"
         private const val TAB = "list_tab"
+        private const val FOLDER = "folder:"
+        private const val ARCHIVED = "archived"
     }
 }

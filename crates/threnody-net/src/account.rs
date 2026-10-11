@@ -50,6 +50,16 @@ enum AccountMsg {
         conversation: Vec<u8>,
         history: Vec<u8>,
     },
+    /// Folders, pinned and archived chats (see `folders`).
+    Folders(Vec<u8>),
+}
+
+/// An `AppMessage` carrying our folders record.
+pub(crate) fn folders_message(record: Vec<u8>) -> Option<AppMessage> {
+    AccountMsg::Folders(record)
+        .encode()
+        .ok()
+        .map(AppMessage::Account)
 }
 
 /// An `AppMessage` carrying a transcript of `history` for `conversation`.
@@ -93,6 +103,9 @@ impl AccountMsg {
                 }
                 Self::SiblingBundle(b) => {
                     e.map_len(2)?.u8(0)?.u8(7)?.u8(1)?.bytes(b)?;
+                }
+                Self::Folders(f) => {
+                    e.map_len(2)?.u8(0)?.u8(9)?.u8(1)?.bytes(f)?;
                 }
                 Self::Transcript {
                     conversation,
@@ -138,6 +151,7 @@ impl AccountMsg {
             5 => Self::ContactSync(required(one, "snapshot")?),
             6 => Self::LinkRefused,
             7 => Self::SiblingBundle(required(one, "bundle")?),
+            9 => Self::Folders(required(one, "folders")?),
             8 => Self::Transcript {
                 conversation: required(one, "conversation")?,
                 history: required(two, "history")?,
@@ -198,6 +212,7 @@ impl Node {
         }
         if self.is_own_device(peer) {
             out.extend(self.contact_sync_message());
+            out.extend(self.folders_hello());
             out.extend(self.transcripts_for(peer));
             if let Some(b) = self.shared_bundle() {
                 out.extend(
@@ -231,6 +246,11 @@ impl Node {
             return;
         }
         if let Some(m) = self.contact_sync_message() {
+            for p in &own {
+                let _ = self.send(p, m.clone());
+            }
+        }
+        if let Some(m) = self.folders_hello() {
             for p in &own {
                 let _ = self.send(p, m.clone());
             }
@@ -286,6 +306,7 @@ impl Node {
                 conversation,
                 history,
             } => self.on_transcript(from, &conversation, &history),
+            AccountMsg::Folders(f) => self.on_folders(from, &f),
             AccountMsg::LinkRefused => {
                 let mut st = lock(&self.shared.linking);
                 if st.joining.as_ref().is_some_and(|(e, _)| *e == from)

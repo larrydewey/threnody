@@ -3,7 +3,7 @@
 //! identities, preferences, diagnostics).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -48,6 +48,9 @@ pub struct App {
     tab: Cell<Tab>,
     rows: RefCell<Vec<usize>>,
     tabs: gtk::Box,
+    /// The folders, and the chats each shows (chat keys).
+    folders: RefCell<Vec<threnody_ffi::FolderInfo>>,
+    folder_chats: RefCell<HashMap<u64, HashSet<String>>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
     chat: RefCell<Option<Rc<ChatView>>>,
     refresh_pending: Cell<bool>,
@@ -240,6 +243,8 @@ impl App {
             tab: Cell::new(tab),
             rows: RefCell::new(Vec::new()),
             tabs: tabs.clone(),
+            folders: RefCell::new(Vec::new()),
+            folder_chats: RefCell::new(HashMap::new()),
             unread: RefCell::new(HashMap::new()),
             chat: RefCell::new(None),
             refresh_pending: Cell::new(false),
@@ -321,9 +326,16 @@ impl App {
         let core = self.core.clone();
         let weak = Rc::downgrade(self);
         bg(
-            move || core.conversations(),
-            move |convs| {
+            move || (core.conversations(), core.folders()),
+            move |(convs, (folders, chats))| {
                 if let Some(this) = weak.upgrade() {
+                    if let Tab::Folder(id) = this.tab.get()
+                        && !folders.iter().any(|f| f.id == id)
+                    {
+                        this.tab.set(Tab::All);
+                    }
+                    *this.folders.borrow_mut() = folders;
+                    *this.folder_chats.borrow_mut() = chats;
                     this.show_conversations(convs);
                 }
             },
@@ -338,11 +350,17 @@ impl App {
         }
         let unread = self.unread.borrow();
         let tab = self.tab.get();
-        let rows: Vec<usize> = (0..convs.len()).filter(|i| tab.has(&convs[*i])).collect();
+        if tab == Tab::Archived && !convs.iter().any(|c| c.archived) {
+            self.tab.set(Tab::All);
+        }
+        let tab = self.tab.get();
+        let rows: Vec<usize> = (0..convs.len())
+            .filter(|i| self.shows(tab, &convs[*i]))
+            .collect();
         for i in &rows {
             let c = &convs[*i];
-            self.list
-                .append(&self.row(c, unread.get(&c.chat).copied().unwrap_or(0)));
+            let n = unread.get(&c.chat).copied().unwrap_or(0).max(c.unread);
+            self.list.append(&self.row(c, n));
         }
         drop(unread);
         self.draw_tabs(&convs);
@@ -369,21 +387,57 @@ impl App {
         self.rebuilding.set(false);
     }
 
-    /// The tab buttons, each with how many need an answer there.
+    /// Whether `tab` shows `c`: archived chats only in the archive.
+    fn shows(&self, tab: Tab, c: &Conversation) -> bool {
+        match tab {
+            Tab::Archived => c.archived,
+            _ if c.archived => false,
+            Tab::Folder(id) => self
+                .folder_chats
+                .borrow()
+                .get(&id)
+                .is_some_and(|s| !c.key.is_empty() && s.contains(&c.key)),
+            t => t.has(c),
+        }
+    }
+
+    /// The tabs: All, Chats, Groups, the folders, the archive when it has
+    /// chats, and "+" for a new folder; each says how many of its chats are
+    /// unread or wait for an answer.
     fn draw_tabs(self: &Rc<Self>, convs: &[Conversation]) {
         while let Some(c) = self.tabs.first_child() {
             self.tabs.remove(&c);
         }
+        let mut tabs: Vec<(Tab, String)> = [Tab::All, Tab::Chats, Tab::Groups]
+            .iter()
+            .map(|t| (*t, t.label().to_owned()))
+            .collect();
+        for f in self.folders.borrow().iter() {
+            let label = [f.emoji.as_str(), f.name.as_str()]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            tabs.push((Tab::Folder(f.id), label));
+        }
+        if convs.iter().any(|c| c.archived) {
+            tabs.push((Tab::Archived, "Archived".into()));
+        }
         let mut first: Option<gtk::ToggleButton> = None;
-        for t in [Tab::All, Tab::Chats, Tab::Groups] {
+        for (t, name) in tabs {
             let waiting = convs
                 .iter()
-                .filter(|c| t != Tab::All && t.has(c) && (c.invite.is_some() || c.is_request()))
+                .filter(|c| {
+                    t != Tab::All
+                        && self.shows(t, c)
+                        && (c.unread > 0 || c.invite.is_some() || c.is_request())
+                })
                 .count();
             let label = if waiting > 0 {
-                format!("{} · {waiting}", t.label())
+                format!("{name} · {waiting}")
             } else {
-                t.label().to_owned()
+                name.clone()
             };
             let b = gtk::ToggleButton::with_label(&label);
             if let Some(f) = &first {
@@ -400,12 +454,231 @@ impl App {
                 }
                 this.tab.set(t);
                 let core = this.core.clone();
-                ui::bg_quiet(move || core.settings().set_text(settings::LIST_TAB, t.key()));
+                let key = t.key();
+                ui::bg_quiet(move || core.settings().set_text(settings::LIST_TAB, &key));
                 let convs = this.convs.borrow().clone();
                 this.show_conversations(convs);
             });
+            if let Tab::Folder(id) = t {
+                // Right-click a folder: change, move or delete it.
+                let click = gtk::GestureClick::new();
+                click.set_button(gtk::gdk::BUTTON_SECONDARY);
+                let weak = Rc::downgrade(self);
+                let anchor = b.clone();
+                click.connect_pressed(move |_, _, _, _| {
+                    if let Some(this) = weak.upgrade() {
+                        this.folder_menu(&anchor, id);
+                    }
+                });
+                b.add_controller(click);
+                b.set_tooltip_text(Some("Right-click to edit, move or delete"));
+            }
             self.tabs.append(&b);
         }
+        let add = gtk::Button::from_icon_name("list-add-symbolic");
+        add.set_tooltip_text(Some("New folder"));
+        let weak = Rc::downgrade(self);
+        add.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.edit_folder(None);
+            }
+        });
+        self.tabs.append(&add);
+    }
+
+    /// Every chat a folder can hold: key and title.
+    fn chat_choices(&self) -> Vec<(String, String)> {
+        self.convs
+            .borrow()
+            .iter()
+            .filter(|c| !c.key.is_empty())
+            .map(|c| (c.key.clone(), c.title.clone()))
+            .collect()
+    }
+
+    /// Makes a folder (`f` None) or changes one, on all our devices.
+    fn edit_folder(self: &Rc<Self>, f: Option<threnody_ffi::FolderInfo>) {
+        let weak = Rc::downgrade(self);
+        crate::folders::edit(&self.window, f, self.chat_choices(), move |folder| {
+            let Some(this) = weak.upgrade() else { return };
+            if folder.name.is_empty() {
+                this.toast("A folder needs a name.");
+                return;
+            }
+            let core = this.core.clone();
+            let weak = Rc::downgrade(&this);
+            bg(
+                move || core.main.save_folder(folder),
+                move |r| {
+                    let Some(this) = weak.upgrade() else { return };
+                    match r {
+                        Ok(id) => {
+                            this.tab.set(Tab::Folder(id));
+                            this.refresh();
+                        }
+                        Err(e) => this.toast(&format!("Couldn't save the folder: {e}")),
+                    }
+                },
+            );
+        });
+    }
+
+    fn folder_menu(self: &Rc<Self>, anchor: &gtk::ToggleButton, id: u64) {
+        let folders = self.folders.borrow().clone();
+        let Some(at) = folders.iter().position(|f| f.id == id) else {
+            return;
+        };
+        let pop = gtk::Popover::new();
+        pop.set_parent(anchor);
+        pop.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let item = |label: &str, f: AppAction| {
+            let btn = gtk::Button::with_label(label);
+            btn.add_css_class("flat");
+            let (weak, p) = (Rc::downgrade(self), pop.clone());
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                if let Some(this) = weak.upgrade() {
+                    f(&this);
+                }
+            });
+            b.append(&btn);
+        };
+        let f = folders[at].clone();
+        item("Edit…", Box::new(move |t| t.edit_folder(Some(f.clone()))));
+        let ids: Vec<u64> = folders.iter().map(|f| f.id).collect();
+        for (label, to) in [
+            ("Move left", at.checked_sub(1)),
+            ("Move right", Some(at + 1)),
+        ] {
+            let Some(to) = to.filter(|t| *t < ids.len()) else {
+                continue;
+            };
+            let mut order = ids.clone();
+            let moved = order.remove(at);
+            order.insert(to, moved);
+            item(
+                label,
+                Box::new(move |t| {
+                    let order = order.clone();
+                    t.run(
+                        None,
+                        "move the folder",
+                        move |n| {
+                            n.order_folders(order);
+                            Ok(())
+                        },
+                        None,
+                    );
+                }),
+            );
+        }
+        let name = folders[at].name.clone();
+        item(
+            "Delete…",
+            Box::new(move |t| {
+                let weak = Rc::downgrade(t);
+                ui::confirm(
+                    &t.window,
+                    &format!("Delete {name}?"),
+                    "The folder goes on all your devices. Its chats stay.",
+                    "Delete",
+                    true,
+                    move || {
+                        if let Some(t) = weak.upgrade() {
+                            t.run(
+                                None,
+                                "delete the folder",
+                                move |n| {
+                                    n.delete_folder(id);
+                                    Ok(())
+                                },
+                                None,
+                            );
+                        }
+                    },
+                );
+            }),
+        );
+        pop.set_child(Some(&b));
+        pop.popup();
+    }
+
+    /// Pins a chat to the top of every list, or unpins it.
+    fn toggle_pin(self: &Rc<Self>, c: &Conversation) {
+        let (key, pin) = (c.key.clone(), c.pinned.is_none());
+        self.run(
+            None,
+            "pin the chat",
+            move |n| n.set_chat_pinned(key, pin),
+            None,
+        );
+    }
+
+    /// Archives a chat (a new message brings it back), or unarchives it.
+    fn toggle_archive(self: &Rc<Self>, c: &Conversation) {
+        let (key, archive) = (c.key.clone(), !c.archived);
+        let ok = archive.then(|| "Archived. A new message brings it back.".to_owned());
+        self.run(
+            None,
+            "archive the chat",
+            move |n| n.set_chat_archived(key, archive),
+            ok,
+        );
+    }
+
+    /// Puts a chat in folders, or takes it out.
+    fn file_in_folders(self: &Rc<Self>, c: &Conversation) {
+        let folders = self.folders.borrow().clone();
+        if folders.is_empty() {
+            return self.edit_folder(None);
+        }
+        let d = ui::alert(
+            &format!("Folders for {}", c.title),
+            "",
+            &[("cancel", "Cancel"), ("ok", "Done")],
+        );
+        d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let checks: Vec<(u64, bool, gtk::CheckButton)> = folders
+            .iter()
+            .map(|f| {
+                let on = f.chats.contains(&c.key);
+                let b = gtk::CheckButton::with_label(&format!("{} {}", f.emoji, f.name));
+                b.set_active(on);
+                list.append(&b);
+                (f.id, on, b)
+            })
+            .collect();
+        d.set_extra_child(Some(&list));
+        let (weak, key) = (Rc::downgrade(self), c.key.clone());
+        d.connect_response(None, move |_, r| {
+            let Some(this) = weak.upgrade() else { return };
+            if r != "ok" {
+                return;
+            }
+            let changes: Vec<(u64, bool)> = checks
+                .iter()
+                .filter(|(_, was, b)| b.is_active() != *was)
+                .map(|(id, _, b)| (*id, b.is_active()))
+                .collect();
+            let key = key.clone();
+            this.run(
+                None,
+                "file the chat",
+                move |n| {
+                    for (id, inside) in changes {
+                        n.set_in_folder(id, key.clone(), inside)?;
+                    }
+                    Ok(())
+                },
+                None,
+            );
+        });
+        d.present(Some(&self.window));
     }
 
     fn show_list(&self) {
@@ -495,6 +768,12 @@ impl App {
             .build();
         t.add_css_class(if unread > 0 { "heading" } else { "body" });
         top.append(&t);
+        if c.pinned.is_some() {
+            let pin = gtk::Image::from_icon_name("view-pin-symbolic");
+            pin.add_css_class("dim-label");
+            pin.set_tooltip_text(Some("Pinned"));
+            top.append(&pin);
+        }
         if let Some(e) = &c.last {
             let time = gtk::Label::new(Some(&ui::list_time(e.at_ms)));
             time.add_css_class("dim-label");
@@ -528,9 +807,30 @@ impl App {
         let row = gtk::ListBoxRow::new();
         row.set_child(Some(&b));
 
-        // Right-click: clear or delete.
+        // Right-click: pin, archive, folders, clear or delete.
         let menu = gio::Menu::new();
         let target = chat_variant(&c.chat);
+        if !c.key.is_empty() {
+            for (label, action) in [
+                (
+                    if c.pinned.is_some() {
+                        "Unpin"
+                    } else {
+                        "Pin to top"
+                    },
+                    "win.pin-chat",
+                ),
+                (
+                    if c.archived { "Unarchive" } else { "Archive" },
+                    "win.archive-chat",
+                ),
+                ("Folders…", "win.chat-folders"),
+            ] {
+                let i = gio::MenuItem::new(Some(label), None);
+                i.set_action_and_target_value(Some(action), Some(&target.to_variant()));
+                menu.append_item(&i);
+            }
+        }
         menu.append_item(&{
             let i = gio::MenuItem::new(Some("Clear chat…"), None);
             i.set_action_and_target_value(Some("win.clear-chat"), Some(&target.to_variant()));
@@ -1361,6 +1661,9 @@ impl App {
             self.window.add_action(&a);
         };
         with_chat("clear-chat", |t, c| t.clear_chat(&c));
+        with_chat("pin-chat", |t, c| t.toggle_pin(&c));
+        with_chat("archive-chat", |t, c| t.toggle_archive(&c));
+        with_chat("chat-folders", |t, c| t.file_in_folders(&c));
         with_chat("delete-contact", |t, c| t.delete_contact(&c));
     }
 
@@ -2637,12 +2940,17 @@ fn notification_id(c: &ChatRef) -> String {
     format!("chat-{}", chat_variant(c).replace('|', "-"))
 }
 
+/// Something a menu item does to the window.
+type AppAction = Box<dyn Fn(&Rc<App>)>;
+
 /// Which conversations the list shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     All,
     Chats,
     Groups,
+    Folder(u64),
+    Archived,
 }
 
 impl Tab {
@@ -2651,14 +2959,18 @@ impl Tab {
             Self::All => "All",
             Self::Chats => "Chats",
             Self::Groups => "Groups",
+            Self::Folder(_) => "Folder",
+            Self::Archived => "Archived",
         }
     }
 
-    fn key(self) -> &'static str {
+    fn key(self) -> String {
         match self {
-            Self::All => "all",
-            Self::Chats => "chats",
-            Self::Groups => "groups",
+            Self::All => "all".into(),
+            Self::Chats => "chats".into(),
+            Self::Groups => "groups".into(),
+            Self::Folder(id) => format!("folder:{id}"),
+            Self::Archived => "archived".into(),
         }
     }
 
@@ -2666,16 +2978,19 @@ impl Tab {
         match k {
             Some("chats") => Self::Chats,
             Some("groups") => Self::Groups,
+            Some("archived") => Self::Archived,
+            Some(f) if f.starts_with("folder:") => f[7..].parse().map_or(Self::All, Self::Folder),
             _ => Self::All,
         }
     }
 
+    /// For the built-in tabs: whether they show `c`.
     fn has(self, c: &Conversation) -> bool {
         let group = matches!(c.chat.target, Target::Group(_));
         match self {
-            Self::All => true,
             Self::Chats => !group,
             Self::Groups => group,
+            _ => true,
         }
     }
 }
