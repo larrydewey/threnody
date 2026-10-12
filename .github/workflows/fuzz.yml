@@ -42,3 +42,4 @@ jobs:
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/
+          retention-days: 14

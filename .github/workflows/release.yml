@@ -111,6 +111,7 @@ jobs:
           name: release-cli-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 1
 
   ffi:
     name: FFI library ${{ matrix.target }}
@@ -148,6 +149,7 @@ jobs:
           name: release-ffi-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
+          retention-days: 1
 
   android:
     name: Android app
@@ -204,6 +206,7 @@ jobs:
           name: release-android
           path: dist/*
           if-no-files-found: error
+          retention-days: 1
 
   publish:
     name: Publish the release
