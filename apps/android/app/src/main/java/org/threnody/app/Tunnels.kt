@@ -3,6 +3,8 @@ package org.threnody.app
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.system.OsConstants
 import android.widget.Toast
@@ -21,8 +23,33 @@ object Tunnels {
     /** The UDP port WireGuard listens on, as on the desktop. */
     const val PORT: UShort = 51820u
 
-    /** Turns tunnels on, asking Android's VPN consent first if needed. */
+    /** Whether a VPN is up that isn't ours (another app's, such as Proton VPN). */
+    private fun otherVpn(ctx: Context): Boolean {
+        val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return false
+        @Suppress("DEPRECATION")
+        return cm.allNetworks.any { n ->
+            cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        } && Threnody.running()?.tunnelDeviceRunning() != true
+    }
+
+    /**
+     * Turns tunnels on, asking Android's VPN consent first if needed.
+     * Android runs one VPN at a time, so when another is up the user
+     * hears what turning tunnels on does to it first.
+     */
     fun enable(a: Activity, node: ThrenodyNode) {
+        if (!otherVpn(a)) return consentThenOn(a, node)
+        SecureBuilder(a)
+            .setTitle("Another VPN is on")
+            .setMessage("Android runs one VPN at a time, so tunnels would disconnect the VPN you use now. " +
+                "If that VPN blocks connections without it (a kill switch, or “Always-on VPN” in " +
+                "Settings), this phone has no connection at all until you turn tunnels off again.")
+            .setPositiveButton("Turn on anyway") { _, _ -> consentThenOn(a, node) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun consentThenOn(a: Activity, node: ThrenodyNode) {
         val consent = VpnService.prepare(a)
         if (consent == null) {
             on(a, node)

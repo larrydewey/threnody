@@ -2515,6 +2515,37 @@ impl App {
         always.add(&relay);
         page.add(&always);
 
+        // Kernel WireGuard to approved contacts (Appendix D).
+        let conf = self.core.wireguard_conf();
+        let tunnels = adw::PreferencesGroup::builder()
+            .title("WireGuard tunnels")
+            .description(format!(
+                "Each mutually approved contact who turns tunnels on too is reachable at their \
+                 overlay address, for apps like ssh. Threnody keeps {} current; bring it up \
+                 with “sudo wg-quick up {}”.",
+                conf.display(),
+                conf.display()
+            ))
+            .build();
+        let peers = self.core.main.tunnel_peers().len();
+        let row = adw::SwitchRow::builder()
+            .title("Offer tunnels")
+            .subtitle(match (self.core.main.tunnel_port().is_some(), peers) {
+                (false, _) => "Off".to_owned(),
+                (true, 1) => "On: a tunnel with 1 contact".to_owned(),
+                (true, n) => format!("On: tunnels with {n} contacts"),
+            })
+            .active(self.core.settings().opted_in(settings::TUNNELS))
+            .build();
+        let core = self.core.clone();
+        row.connect_active_notify(move |r| {
+            core.settings().set_flag(settings::TUNNELS, r.is_active());
+            let core = core.clone();
+            ui::bg_quiet(move || core.apply_privacy());
+        });
+        tunnels.add(&row);
+        page.add(&tunnels);
+
         let messages = adw::PreferencesGroup::builder().title("Messages").build();
         let timers: Vec<&str> = settings::TIMERS.iter().map(|(l, _)| *l).collect();
         let timer = adw::ComboRow::builder()

@@ -42,9 +42,30 @@ Offers travel inside the authenticated ratchet, so only the genuine peer can set
 - Adding `--wg-apply` also pushes every change to the running interface with `wg set`, with the PSK passed on stdin. This needs CAP_NET_ADMIN.
 - `threnody tunnel` shows this device's WireGuard public key, overlay address and overlay network.
 
+### Userspace WireGuard (Android)
+
+Android gives apps no kernel WireGuard, so the node carries tunnels itself with `boringtun` (`threnody-net::wg_userspace`). The app's *WireGuard tunnels* setting (Network & Connectivity, off by default) asks for Android's VPN permission. It then opens a VPN interface with:
+
+- the device's overlay address (`/128`);
+- a route for the overlay `/48` only, so no other traffic, IPv4 included, goes through it;
+- an MTU of 1280.
+
+The node reads and writes whole IPv6 packets on that interface and WireGuard datagrams on the tunnel port's UDP socket (dual-stack):
+
+- A packet to the overlay goes to the peer that owns its destination address.
+- A decrypted packet is delivered only if its source is the sending peer's own overlay address, the same rule as `AllowedIPs`.
+- Peers follow the node's tunnel state, checked every second. A new session's PSK starts a fresh WireGuard session, and revoking approval removes the peer.
+- Authenticated packets update the peer's endpoint, as WireGuard roaming does.
+
+Android runs one VPN at a time, so turning tunnels on displaces any other VPN app, which is why the setting is opt-in. If another VPN takes the slot, tunnels turn off.
+
+The descriptor Android hands over is adopted in `threnody-tun`. It is the one crate in the workspace that allows `unsafe`, kept to the `fcntl`, `read` and `write` calls this needs.
+
+Turning tunnels on mid-session offers them on every direct session with an approved contact at once. A node answers the first offer it accepts in a session with its own, so a contact who offered while this side's tunnels were off still pairs.
+
 ## Not yet done
 
-- A userspace data plane (`boringtun`) for platforms without kernel WireGuard (iOS, Android, unprivileged desktops).
+- The userspace data plane on iOS (a Network Extension) and on unprivileged desktops, which still need a TUN device from somewhere.
 - Endpoint updates when a peer roams without a new session. WireGuard's own roaming covers most of these cases.
 - Relaying tunnel traffic through mesh nodes when no direct UDP path exists (Appendix E, future).
 - Tunnel peers are kept only while the node runs. After a restart, tunnels come back with the next session to each peer.

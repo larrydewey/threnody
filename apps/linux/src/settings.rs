@@ -16,6 +16,9 @@ pub const VOLUNTEERS: &str = "use_volunteers";
 /// The always-on relay: the fingerprint of a contact (a relay node run on
 /// a server) the main identity keeps a session with. None unless chosen.
 pub const ANCHOR: &str = "always_on_relay";
+/// WireGuard tunnels to mutually approved contacts: off unless chosen,
+/// since bringing the interface up needs root.
+pub const TUNNELS: &str = "wireguard_tunnels";
 pub const SEND_READ: &str = "send_read_receipts";
 pub const SEND_TYPING: &str = "send_typing";
 /// GIF search through GIPHY: off until the user agrees to GIPHY seeing
