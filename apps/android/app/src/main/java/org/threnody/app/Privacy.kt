@@ -35,6 +35,7 @@ object Privacy {
     private const val READ_RECEIPTS = "send_read_receipts"
     private const val TYPING = "send_typing"
     private const val GIPHY = "giphy_search"
+    private const val ANCHOR = "always_on_relay"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -67,6 +68,18 @@ object Privacy {
     fun reachInternet(ctx: Context) = prefs(ctx).getBoolean(REACH, true)
     /** Route through volunteer relays from subscribed directories (Appendix P). */
     fun useVolunteers(ctx: Context) = prefs(ctx).getBoolean(VOLUNTEERS, true)
+
+    /**
+     * The always-on relay: a contact (a relay node you run on a server)
+     * this device keeps a session with at all times, so contacts can
+     * reach it through that relay wherever both are. None unless chosen.
+     */
+    fun alwaysOnRelay(ctx: Context): String? = prefs(ctx).getString(ANCHOR, null)
+
+    fun setAlwaysOnRelay(ctx: Context, fingerprint: String?) {
+        prefs(ctx).edit().putString(ANCHOR, fingerprint).apply()
+        Threnody.applyPrivacy(ctx)
+    }
 
     fun sendReadReceipts(ctx: Context) = prefs(ctx).getBoolean(READ_RECEIPTS, true)
 

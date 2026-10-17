@@ -1224,6 +1224,29 @@ impl ThrenodyNode {
         self.node.reach_enabled()
     }
 
+    /// Keeps a session with `peer` at all times, in the background too:
+    /// a mutually approved contact that is always reachable (a relay
+    /// node you run on a server, say). Contacts that keep one with it too
+    /// can then always reach this device through it, wherever both are.
+    /// `None` stops. It dials only the contact's own address, so it works
+    /// with internet reachability off. Apps set it on the main identity
+    /// only.
+    pub fn set_anchor(&self, peer: Option<String>) -> Result<()> {
+        let _guard = self.rt.enter();
+        let p = peer.map(|p| self.resolve(&p)).transpose()?;
+        self.node.set_anchor(p).map_err(fail)
+    }
+
+    /// The always-on contact (`set_anchor`), if any.
+    pub fn anchor(&self) -> Option<String> {
+        self.node.anchor().map(|p| fp(&p))
+    }
+
+    /// Whether this device has a session with its always-on contact now.
+    pub fn anchor_connected(&self) -> bool {
+        self.node.anchor_connected()
+    }
+
     pub fn reachability(&self) -> ReachInfo {
         let r = self.node.reachability();
         ReachInfo {

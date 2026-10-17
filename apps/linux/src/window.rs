@@ -2457,6 +2457,64 @@ impl App {
         relays.add(&dirs);
         page.add(&relays);
 
+        // A relay node of your own (docs/relay-node.md), kept connected.
+        let always = adw::PreferencesGroup::builder()
+            .title("Always-on relay")
+            .description(
+                "A contact that is always reachable, such as a relay node you run on a server. \
+                 This computer keeps a session with it, so contacts who use it too can reach \
+                 you through it wherever you both are.",
+            )
+            .build();
+        let candidates: Vec<(String, String)> = self
+            .core
+            .main
+            .contacts()
+            .into_iter()
+            .filter(|c| c.mutually_approved && !c.blocked)
+            .map(|c| {
+                let name = c
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| core::short(&c.fingerprint));
+                (c.fingerprint, name)
+            })
+            .collect();
+        let mut names = vec!["None"];
+        names.extend(candidates.iter().map(|(_, n)| n.as_str()));
+        let current = self
+            .core
+            .settings()
+            .text(settings::ANCHOR)
+            .map(str::to_owned);
+        let relay = adw::ComboRow::builder()
+            .title("Keep connected")
+            .subtitle(match &current {
+                None => "Off",
+                Some(_) if self.core.main.anchor_connected() => "Connected",
+                Some(_) => "Not connected right now",
+            })
+            .model(&gtk::StringList::new(&names))
+            .build();
+        relay.set_selected(
+            current
+                .and_then(|fp| candidates.iter().position(|(f, _)| *f == fp))
+                .and_then(|i| u32::try_from(i + 1).ok())
+                .unwrap_or(0),
+        );
+        let core = self.core.clone();
+        relay.connect_selected_notify(move |r| {
+            let fp = (r.selected() as usize)
+                .checked_sub(1)
+                .and_then(|i| candidates.get(i))
+                .map_or("", |(f, _)| f.as_str());
+            core.settings().set_text(settings::ANCHOR, fp);
+            let core = core.clone();
+            ui::bg_quiet(move || core.apply_privacy());
+        });
+        always.add(&relay);
+        page.add(&always);
+
         let messages = adw::PreferencesGroup::builder().title("Messages").build();
         let timers: Vec<&str> = settings::TIMERS.iter().map(|(l, _)| *l).collect();
         let timer = adw::ComboRow::builder()

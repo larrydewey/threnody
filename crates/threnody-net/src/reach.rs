@@ -80,6 +80,10 @@ const BACKOFF: [Duration; 3] = [
 const TABLE_REFLECTORS: usize = 6;
 const REFLECT_WAIT: Duration = Duration::from_secs(2);
 const MAX_REFLEXIVE: usize = 4;
+/// Retries of a failed dial to the anchor, backing off between these.
+const ANCHOR_RETRY_MIN: Duration = Duration::from_secs(5);
+const ANCHOR_RETRY_MAX: Duration = Duration::from_secs(60);
+const ANCHOR_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Gathering again this soon while our outside address is unknown.
 const UNKNOWN_REGATHER: Duration = Duration::from_secs(30);
 
@@ -156,6 +160,10 @@ pub(crate) enum Urge {
     /// Its session ended without warning: probe where it may be now, and
     /// dial only if it hasn't reached us in a few seconds (see `recover`).
     Lost,
+    /// A call runs with it over a relay circuit: open a direct path, whose
+    /// session then replaces the circuit and carries the call (better
+    /// latency, and datagrams for media).
+    Upgrade,
 }
 
 struct Punch {
@@ -174,6 +182,9 @@ struct Punch {
     /// The other side is expected to dial: a probe from it means it is
     /// dialing, so don't dial too.
     defer: bool,
+    /// Done only once a direct session exists (a relayed one is up
+    /// already: see [`Urge::Upgrade`]).
+    direct: bool,
 }
 
 struct Published {
@@ -225,6 +236,10 @@ pub(crate) struct ReachState {
     republish: Notify,
     poll: Notify,
     cfg: Mutex<Option<Arc<ReachConfig>>>,
+    /// The always-on contact we keep a session with ([`Node::set_anchor`]).
+    anchor: Mutex<Option<PublicIdentity>>,
+    /// The anchor changed, or the network did: dial it now.
+    anchor_kick: Notify,
 }
 
 impl ReachState {
@@ -239,6 +254,8 @@ impl ReachState {
             republish: Notify::new(),
             poll: Notify::new(),
             cfg: Mutex::new(None),
+            anchor: Mutex::new(None),
+            anchor_kick: Notify::new(),
         }
     }
 }
@@ -362,6 +379,8 @@ impl Node {
     /// The network changed: gather candidates again, publish and poll.
     pub fn network_changed(&self) {
         lock(&self.rdv().inner).backoff.clear();
+        // The anchor needs no DHT: dial it from the new network at once.
+        self.rdv().anchor_kick.notify_one();
         // DHT write tokens are bound to our address: rejoin from the new
         // one, starting from the nodes we knew, so it takes a moment.
         let old = lock(&self.rdv().dht).take();
@@ -390,6 +409,32 @@ impl Node {
 
     pub(crate) fn connected(&self, peer: &PublicIdentity) -> bool {
         self.sessions().iter().any(|s| s.peer == *peer)
+    }
+
+    pub(crate) fn connected_directly(&self, peer: &PublicIdentity) -> bool {
+        self.sessions()
+            .iter()
+            .any(|s| s.peer == *peer && s.via.is_none())
+    }
+
+    /// Our session with `peer` runs over a relay circuit (Appendix G), not
+    /// an onion one: those are relayed on purpose, to hide who talks to
+    /// whom, and stay that way.
+    pub(crate) fn relayed(&self, peer: &PublicIdentity) -> bool {
+        self.sessions()
+            .iter()
+            .any(|s| s.peer == *peer && s.transport == "relay")
+    }
+
+    /// Punches toward the addresses `peer` gave us over our relayed
+    /// session (its `Paths`), so a direct session can take over from the
+    /// circuit. The peer does the same from its side. True if it started.
+    pub(crate) fn upgrade_path(&self, peer: PublicIdentity) -> bool {
+        if !self.relayed(&peer) || self.connected_directly(&peer) {
+            return false;
+        }
+        let targets = self.their_paths(&peer);
+        self.punch(peer, &targets, false, Urge::Upgrade)
     }
 
     /// Mutually approved contacts with discovery keys and no session.
@@ -441,6 +486,9 @@ impl Node {
         }
         if self.rdv().started.swap(true, Ordering::Relaxed) {
             return Ok(());
+        }
+        if cfg.anchor.is_some() {
+            *lock(&self.rdv().anchor) = cfg.anchor;
         }
         let cfg = Arc::new(cfg);
         *lock(&self.rdv().cfg) = Some(cfg.clone());
@@ -504,25 +552,91 @@ impl Node {
         }
     }
 
-    /// Keeps a session with the configured always-on anchor contact so
-    /// our address updates reach it immediately, in the background too.
+    /// The always-on contact this node keeps a session with, if any.
+    pub fn anchor(&self) -> Option<PublicIdentity> {
+        *lock(&self.rdv().anchor)
+    }
+
+    /// Keeps a direct session with `anchor`, an always-on mutually
+    /// approved contact with a public address (a relay node you run, say),
+    /// in the background too, or stops (`None`). Contacts that keep a
+    /// session with it too can then always reach us through it as a relay
+    /// circuit, and our address updates reach it at once. Unlike the DHT
+    /// rendezvous, this works with internet reachability off: it only
+    /// dials the anchor's own address.
+    pub fn set_anchor(&self, anchor: Option<PublicIdentity>) -> Result<()> {
+        if let Some(a) = &anchor
+            && !self
+                .contacts()
+                .get(a)
+                .is_some_and(|c| c.mutually_approved())
+        {
+            return Err(NetError::NotAllowed(
+                "the always-on relay must be a mutually approved contact".into(),
+            ));
+        }
+        *lock(&self.rdv().anchor) = anchor;
+        self.rdv().anchor_kick.notify_one();
+        Ok(())
+    }
+
+    /// Whether we have a direct session with the anchor now.
+    pub fn anchor_connected(&self) -> bool {
+        self.anchor().is_some_and(|a| self.connected_directly(&a))
+    }
+
+    /// Keeps a direct session with the anchor ([`Node::set_anchor`]): dials
+    /// its address when there is none, backing off from 5 s to a minute
+    /// while that fails, and at once when the anchor or the network
+    /// changes.
     async fn anchor_loop(&self) {
+        let mut wait = ANCHOR_RETRY_MIN;
         loop {
-            let anchor = self
-                .reach_config()
-                .and_then(|c| c.anchor)
-                .filter(|_| self.reach_enabled());
-            if let Some(anchor) = anchor
-                && !self.sessions().iter().any(|s| s.peer == anchor)
-            {
-                let _ = self.reach_peer(&anchor).await;
+            match self.anchor() {
+                Some(anchor) if !self.connected_directly(&anchor) => {
+                    if self.dial_anchor(anchor).await {
+                        wait = ANCHOR_RETRY_MIN;
+                    } else {
+                        wait = (wait * 2).min(ANCHOR_RETRY_MAX);
+                    }
+                }
+                _ => wait = ANCHOR_RETRY_MIN,
             }
-            if !self
-                .pause(Duration::from_secs(5), &self.rdv().regather)
-                .await
-            {
-                break;
+            let closed = self.closed();
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = self.rdv().anchor_kick.notified() => wait = ANCHOR_RETRY_MIN,
+                () = closed => break,
             }
+        }
+    }
+
+    /// Dials the anchor at its last known address (directly, never through
+    /// a circuit: a relayed session can't relay for others). Without one,
+    /// asks the DHT where it is.
+    async fn dial_anchor(&self, anchor: PublicIdentity) -> bool {
+        let addr = self
+            .contacts()
+            .get(&anchor)
+            .and_then(|c| c.last_addr.clone());
+        let Some(addr) = addr else {
+            self.seek(&anchor);
+            return false;
+        };
+        match tokio::time::timeout(
+            ANCHOR_DIAL_TIMEOUT,
+            self.connect(&addr, Some(anchor.fingerprint())),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                self.emit(Event::ReachNote {
+                    note: format!("always-on relay {addr}: {e}"),
+                });
+                false
+            }
+            Err(_) => false,
         }
     }
 
@@ -949,7 +1063,9 @@ impl Node {
         let Some(quic) = self.quic() else {
             return false;
         };
-        if !self.reach_enabled() || (self.connected(&peer) && urge != Urge::Moved) {
+        if !self.reach_enabled()
+            || (self.connected(&peer) && !matches!(urge, Urge::Moved | Urge::Upgrade))
+        {
             return false;
         }
         let mut sorted = candidates.to_vec();
@@ -1024,6 +1140,7 @@ impl Node {
                 // On a loss neither side caused, the smaller key dials once
                 // it hears the other; the larger leaves it to that side.
                 defer: urge == Urge::Lost && self.identity().as_bytes() > peer.as_bytes(),
+                direct: urge == Urge::Upgrade,
             });
             inner.punches.insert(peer, p.clone());
             inner.last_punch.insert(peer, now_ms());
@@ -1077,7 +1194,9 @@ impl Node {
         tokio::pin!(closed);
         let ok = loop {
             // However it came about (a punched path, Wi-Fi back), done.
-            if self.connected(&peer) {
+            if (punch.direct && self.connected_directly(&peer))
+                || (!punch.direct && self.connected(&peer))
+            {
                 break true;
             }
             if start.elapsed() >= punch.lasts || !self.reach_enabled() {

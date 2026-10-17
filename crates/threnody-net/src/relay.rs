@@ -172,7 +172,7 @@ impl RelayState {
 
 /// How long an onion attempt may take before falling back to a direct
 /// dial.
-const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Circuits through volunteers cross anonymous links with cover traffic,
 /// which spaces every message: they take longer to build.
 const VOLUNTEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -503,7 +503,7 @@ impl Node {
 
     /// Whether a two-relay onion path to `dest` could exist: a live,
     /// mutually approved neighbour plus another approved contact.
-    fn onion_possible(&self, dest: Fingerprint) -> bool {
+    pub(crate) fn onion_possible(&self, dest: Fingerprint) -> bool {
         let me = self.identity();
         let firsts = self
             .sessions()

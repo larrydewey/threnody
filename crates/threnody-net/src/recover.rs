@@ -284,6 +284,18 @@ impl Node {
         self.save_recovery();
     }
 
+    /// Where `peer` last said it can be reached (its `Paths`): its main
+    /// addresses, then its standby ones.
+    pub(crate) fn their_paths(&self, peer: &PublicIdentity) -> Vec<Candidate> {
+        lock(&self.rec().peers)
+            .get(peer)
+            .map(|p| {
+                let t = &p.theirs;
+                t.main.iter().chain(&t.standby).copied().collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The peer's `Paths`; returns its lease.
     pub(crate) fn on_paths(&self, peer: PublicIdentity, payload: &[u8]) -> Option<Duration> {
         if !self.shared.mutual(&peer) {
