@@ -34,6 +34,7 @@ reason: 0 ended, 1 declined, 2 busy, 3 unanswered, 4 failed,
 - **Signal.** This carries the media layer's session descriptions and ICE candidates. It is tracked, so it survives a replaced session. Apps never see it, and neither do their logs.
 - **Reaction.** One emoji, at most 32 bytes with no control characters or whitespace, that both apps float up over the call's video for a few seconds. It's only accepted in an answered call, and reactions arriving less than 150 ms after the last one are dropped, so a peer can't flood the screen. It isn't stored or shown anywhere else. A peer that predates it rejects it as an unknown op, and nothing floats there.
 - **Timeouts.** An unanswered call ends after 60 s. An answered call whose media stops arriving for 30 s ends as `failed`.
+- **Failover.** A call outlives its session. If the session ends mid-call (Wi-Fi went, the Bluetooth link dropped), each side reaches the peer again at once by every path a new call would use: the last address, the DHT rendezvous, and a relay circuit. Whichever comes up first carries the call, and a relayed one moves to a direct path later. If media stops for 4 s on a session that still looks up (its path may have died before the lease notices), the side punches and dials where the peer may be, as the side that moved does, at most every 15 s. A new session replaces the old one, and the media continues. The phone also keeps its standby path warm during a call (Appendix N, Fast recovery), so losing Wi-Fi costs about a second.
 - **Pacing.** Call messages and stream-carried media go out immediately, even under constant-rate cover traffic. A call's media reveals the call anyway, and setup can't wait for 2-second ticks.
 
 ## Media keys
@@ -92,14 +93,14 @@ Inside, WebRTC still runs DTLS-SRTP. Its certificate fingerprints travel only in
   - *JavaVM, without our own `unsafe`.* WebRTC needs the `JavaVM`. Its prebuilt archive has its own `JNI_OnLoad`. `threnody-ffi/build.rs` passes the linker `android-jni.ld`, an `EXTERN(...)` list of `JNI_OnLoad` and every `Java_livekit_org_webrtc_*` native, so they are kept. It also passes `android-jni.map`, so they are exported. The app calls `System.loadLibrary("threnody_ffi")` before the node opens, since uniffi's JNA loading doesn't run `JNI_OnLoad`. Then it calls `livekit.org.webrtc.ContextUtils.initialize`. `build.sh` copies LiveKit's `libwebrtc.jar` into the app. Regenerate `android-jni.ld` when upgrading `libwebrtc`.
   - *The audio device across calls.* WebRTC terminates its media engine when the last peer connection closes, and initialises it again for the next one. LiveKit's audio-device proxy terminates the Android audio device then, but never re-initialises it, so the second call crashed. An idle peer connection, held for the life of the process, keeps the engine up (`rtc::factory`).
   - *Ringing.* An incoming call posts a `CallStyle` notification with a full-screen intent, insistent, on a channel that plays the phone's ringtone as a ringtone. Silent mode and Do Not Disturb therefore apply, and Answer and Decline work from the lock screen.
-  - *Audio routing.* While a call runs, the app uses `MODE_IN_COMMUNICATION`, routes to the earpiece, and switches to the speaker on request.
+  - *Audio routing.* While a call runs, the app uses `MODE_IN_COMMUNICATION`. Audio goes to the speaker if chosen, else to a connected headset (LE Audio, Bluetooth SCO or a hearing aid), else to the speaker for video or to the earpiece (or a wired headset). The app watches audio devices during the call: when a headset drops, audio moves to the earpiece (the speaker for video) at once, and back when it reconnects. On Android 10 and 11 it starts Bluetooth SCO itself.
   - *Size.* The APK grows by about 20 MB (WebRTC).
 - **macOS, iOS, Windows.** These need their apps, which reach calls through the FFI (`start_call`, `answer_call`, `hangup_call`, `set_call_muted`, `current_call` and the `Call*` events).
 
 ## Not yet
 
 - Video: switching cameras, screen sharing, hardware-texture rendering (frames are copied as RGBA), and a frame size limited to the path's QUIC datagrams before path MTU discovery.
-- Android: a calls foreground-service type (the microphone in the background), and Telecom integration (`ConnectionService`: Bluetooth headsets, car audio, other calls).
+- Android: Telecom integration (`ConnectionService`: car audio, other calls, headset buttons).
 - Ringing every device of an account, with `answered elsewhere` and `declined elsewhere`.
 - Group calls.
 - Media over onion circuits.
