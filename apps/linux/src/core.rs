@@ -327,8 +327,20 @@ impl Core {
     /// Applies the privacy settings (all on unless turned off) to every node.
     pub fn apply_privacy(&self) {
         self.apply_privacy_to(&self.main, false);
+        self.apply_anchor();
         for p in lock(&self.personas).values() {
             self.apply_privacy_to(&p.node, true);
+        }
+    }
+
+    /// The always-on relay, on the main identity only: a persona's
+    /// address stays its own.
+    fn apply_anchor(&self) {
+        let fp = self.settings().text(settings::ANCHOR).map(str::to_owned);
+        if let Err(e) = self.main.set_anchor(fp) {
+            // No longer a mutually approved contact: nothing to keep.
+            self.say(format!("! always-on relay: {e}"));
+            let _ = self.main.set_anchor(None);
         }
     }
 

@@ -998,6 +998,7 @@ class MainActivity : Activity() {
             if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
             else "Only your own contacts relay for you"
         }
+        networkSection.add("Always-on relay").setOnMenuItemClickListener { alwaysOnRelay(); true }
         networkSection.add("Relay directories").setOnMenuItemClickListener { DirectoryUi.show(this@MainActivity); true }
 
         // Messaging
@@ -1209,6 +1210,48 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    /**
+     * Chooses the always-on relay: a mutually approved contact (a relay node
+     * run on a server, docs/relay-node.md) kept connected at all times, so
+     * contacts who use it too can reach this phone through it anywhere.
+     */
+    private fun alwaysOnRelay() {
+        val n = node ?: return
+        Threading.background {
+            val relays = n.contacts().filter { it.mutuallyApproved && !it.blocked }
+            val current = Privacy.alwaysOnRelay(this)
+            val connected = current != null && n.anchorConnected()
+            runOnUiThread {
+                val names = listOf("None") + relays.map { it.name ?: Threnody.short(it.fingerprint) }
+                val checked = if (current == null) 0 else relays.indexOfFirst { it.fingerprint == current } + 1
+                SecureBuilder(this)
+                    .setTitle(
+                        when {
+                            current == null -> "Always-on relay"
+                            connected -> "Always-on relay · connected"
+                            else -> "Always-on relay · not connected"
+                        },
+                    )
+                    .setSingleChoiceItems(names.toTypedArray(), checked) { d, i ->
+                        d.dismiss()
+                        val fp = if (i == 0) null else relays[i - 1].fingerprint
+                        Threading.background {
+                            Privacy.setAlwaysOnRelay(this, fp)
+                            runOnUiThread {
+                                Toast.makeText(
+                                    this,
+                                    if (fp == null) "No always-on relay" else "Keeping ${names[i]} connected",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
     }
 
     /** This account's devices; tap one to rename it, or to remove another one. */

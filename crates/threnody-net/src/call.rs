@@ -40,6 +40,10 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// poll, a record write and a punch on both sides, with room to spare.
 pub const CALL_REACH_TIMEOUT: Duration = Duration::from_secs(45);
 const REACH_CHECK_EVERY: Duration = Duration::from_millis(250);
+const RELAY_RETRY_EVERY: Duration = Duration::from_secs(2);
+/// A call over a relay circuit tries for a direct path this often (each
+/// try punches for a minute).
+const UPGRADE_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -115,9 +119,13 @@ impl Node {
     /// Makes sure there is a session with `peer` before calling it. A
     /// call can't wait in a mailbox, so this tries every path at once:
     /// the DHT rendezvous (our record says we're looking, and hole
-    /// punching starts as soon as either side sees the other's), and a
-    /// dial to the last known address or through relays. It gives up
-    /// after [`CALL_REACH_TIMEOUT`].
+    /// punching starts as soon as either side sees the other's), a dial
+    /// to the last known address, and a relay circuit through a contact
+    /// both of us keep a session with (an always-on anchor, say). With
+    /// onion circuits preferred and possible, the relay waits for the
+    /// onion attempt first. Whichever path comes up first carries the
+    /// call; a relayed one moves to a direct path later if it can (see
+    /// `upgrade_path`). It gives up after [`CALL_REACH_TIMEOUT`].
     pub async fn reach_for_call(&self, peer: &PublicIdentity) -> Result<()> {
         let connected = || self.sessions().iter().any(|s| s.peer == *peer);
         if connected() {
@@ -128,10 +136,30 @@ impl Node {
             let (node, peer) = (self.clone(), *peer);
             tokio::spawn(async move { node.reach_peer(&peer).await })
         };
+        let relay = {
+            let (node, fp) = (self.clone(), peer.fingerprint());
+            let onion_first = self.prefer_onion() && self.onion_possible(fp);
+            tokio::spawn(async move {
+                if onion_first {
+                    tokio::time::sleep(crate::relay::ONION_DIAL_TIMEOUT).await;
+                }
+                // Again and again: a session with the anchor may come up
+                // (after a network change, say) while we look.
+                while node.connect_relayed(fp).await.is_err() {
+                    tokio::time::sleep(RELAY_RETRY_EVERY).await;
+                }
+            })
+        };
         let deadline = tokio::time::Instant::now() + CALL_REACH_TIMEOUT;
+        // A session that comes up later would replace the one carrying
+        // the call: stop the other attempts once one has won.
+        let stop = || {
+            dial.abort();
+            relay.abort();
+        };
         while !connected() {
             if tokio::time::Instant::now() >= deadline {
-                dial.abort();
+                stop();
                 return Err(NetError::NotAllowed(
                     "couldn't reach them: they may be offline, or no network path \
                      between you is open"
@@ -140,6 +168,7 @@ impl Node {
             }
             tokio::time::sleep(REACH_CHECK_EVERY).await;
         }
+        stop();
         Ok(())
     }
 
@@ -578,19 +607,25 @@ impl Node {
     }
 
     /// Ends call `id` when it rings unanswered too long, or when its media
-    /// stops arriving.
+    /// stops arriving. Meanwhile, if the call runs over a relay circuit,
+    /// it looks for a direct path to move to.
     fn watch_call(&self, id: u64) {
         let node = self.clone();
         tokio::spawn(async move {
+            let mut upgraded: Option<tokio::time::Instant> = None;
             loop {
                 tokio::time::sleep(WATCH_EVERY).await;
-                let (phase, started, last_rx) = {
+                let (peer, phase, started, last_rx) = {
                     let calls = lock(&node.shared.calls);
                     match calls.current.as_ref().filter(|c| c.info.call == id) {
-                        Some(c) => (c.info.phase, c.info.started_ms, c.last_rx_ms),
+                        Some(c) => (c.info.peer, c.info.phase, c.info.started_ms, c.last_rx_ms),
                         None => return,
                     }
                 };
+                if upgraded.is_none_or(|t| t.elapsed() >= UPGRADE_EVERY) && node.upgrade_path(peer)
+                {
+                    upgraded = Some(tokio::time::Instant::now());
+                }
                 let now = now_ms();
                 let reason = match phase {
                     Phase::Active

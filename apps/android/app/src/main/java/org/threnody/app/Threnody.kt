@@ -174,8 +174,23 @@ object Threnody {
 
     /** Applies the privacy settings (all on unless turned off) to the node. */
     fun applyPrivacy(ctx: Context) {
-        instance?.let { applyPrivacyTo(ctx, it) }
+        instance?.let {
+            applyPrivacyTo(ctx, it)
+            applyAnchor(ctx, it)
+        }
         for (n in personaNodes.values) applyPrivacyTo(ctx, n)
+    }
+
+    /** The always-on relay, on the main identity only: a persona's address stays its own. */
+    private fun applyAnchor(ctx: Context, node: ThrenodyNode) {
+        val fp = Privacy.alwaysOnRelay(ctx)
+        try {
+            node.setAnchor(fp)
+        } catch (e: Exception) {
+            // No longer a mutually approved contact: nothing to keep a session with.
+            say("! always-on relay: ${e.message}")
+            node.setAnchor(null)
+        }
     }
 
     private fun applyPrivacyTo(ctx: Context, node: ThrenodyNode) {

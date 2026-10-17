@@ -13,6 +13,9 @@ pub const PRIVATE_NOTIFICATIONS: &str = "private_notifications";
 pub const BACKGROUND: &str = "run_in_background";
 pub const TIMER: &str = "default_timer";
 pub const VOLUNTEERS: &str = "use_volunteers";
+/// The always-on relay: the fingerprint of a contact (a relay node run on
+/// a server) the main identity keeps a session with. None unless chosen.
+pub const ANCHOR: &str = "always_on_relay";
 pub const SEND_READ: &str = "send_read_receipts";
 pub const SEND_TYPING: &str = "send_typing";
 /// GIF search through GIPHY: off until the user agrees to GIPHY seeing
