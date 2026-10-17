@@ -113,6 +113,7 @@ object Tunnels {
             .allowFamily(OsConstants.AF_INET)
             .setBlocking(false)
             .establish() ?: return false
+        // The node owns the descriptor from here, and closes it if it fails.
         node.tunnelStartDevice(tun.detachFd())
         return true
     }

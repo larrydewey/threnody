@@ -18,13 +18,21 @@ class ThrenodyVpn : VpnService() {
             try {
                 val node = Threnody.start(applicationContext)
                 if (node.tunnelPort() == null) node.setTunnelPort(Tunnels.PORT)
-                if (Tunnels.establish(this, node)) Threnody.say("* tunnels: overlay network up")
-                else Threnody.say("! tunnels: no VPN permission")
+                if (Tunnels.establish(this, node)) {
+                    Threnody.say("* tunnels: overlay network up")
+                    return@background
+                }
+                Threnody.say("! tunnels: no VPN permission")
             } catch (e: Exception) {
                 Threnody.say("! tunnels: ${e.message}")
             }
+            // Never leave a VPN up that nothing serves: Android would keep
+            // routing apps to it, and the phone would lose its connection.
+            Privacy.setTunnels(this, false)
+            Threnody.running()?.setTunnelPort(null)
+            stopSelf()
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     /** Another VPN took the slot, or the user switched it off in Settings. */
