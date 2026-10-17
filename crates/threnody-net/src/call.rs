@@ -36,6 +36,10 @@ const MEDIA_QUEUE: usize = 512;
 /// Reactions faster than this are dropped: a peer can't flood the screen.
 const REACTION_GAP_MS: u64 = 150;
 const WATCH_EVERY: Duration = Duration::from_secs(1);
+/// How long placing a call looks for a session with the peer: a DHT
+/// poll, a record write and a punch on both sides, with room to spare.
+pub const CALL_REACH_TIMEOUT: Duration = Duration::from_secs(45);
+const REACH_CHECK_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -108,19 +112,52 @@ impl Node {
             .map(|c| c.info.clone())
     }
 
+    /// Makes sure there is a session with `peer` before calling it. A
+    /// call can't wait in a mailbox, so this tries every path at once:
+    /// the DHT rendezvous (our record says we're looking, and hole
+    /// punching starts as soon as either side sees the other's), and a
+    /// dial to the last known address or through relays. It gives up
+    /// after [`CALL_REACH_TIMEOUT`].
+    pub async fn reach_for_call(&self, peer: &PublicIdentity) -> Result<()> {
+        let connected = || self.sessions().iter().any(|s| s.peer == *peer);
+        if connected() {
+            return Ok(());
+        }
+        self.seek(peer);
+        let dial = {
+            let (node, peer) = (self.clone(), *peer);
+            tokio::spawn(async move { node.reach_peer(&peer).await })
+        };
+        let deadline = tokio::time::Instant::now() + CALL_REACH_TIMEOUT;
+        while !connected() {
+            if tokio::time::Instant::now() >= deadline {
+                dial.abort();
+                return Err(NetError::NotAllowed(
+                    "couldn't reach them: they may be offline, or no network path \
+                     between you is open"
+                        .into(),
+                ));
+            }
+            tokio::time::sleep(REACH_CHECK_EVERY).await;
+        }
+        Ok(())
+    }
+
     /// Calls `peer`, which must be connected and support calls. Returns
     /// the call id; [`Event::CallRinging`], [`Event::CallStarted`] or
     /// [`Event::CallEnded`] follow.
     pub fn start_call(&self, peer: &PublicIdentity, video: bool) -> Result<u64> {
         if !self.sessions().iter().any(|s| s.peer == *peer) {
-            return Err(NetError::NoRoute("calls need a connection to them".into()));
+            return Err(NetError::NotAllowed(
+                "calls need a connection to them".into(),
+            ));
         }
         if !self.supports(peer, FEATURE_CALLS) {
-            return Err(NetError::NoRoute("their app can't take calls".into()));
+            return Err(NetError::NotAllowed("their app can't take calls".into()));
         }
         let mut calls = lock(&self.shared.calls);
         if calls.current.is_some() {
-            return Err(NetError::NoRoute("already in a call".into()));
+            return Err(NetError::NotAllowed("already in a call".into()));
         }
         let id = loop {
             let id = u64::from_be_bytes(random_bytes());
@@ -167,7 +204,7 @@ impl Node {
             .current
             .as_mut()
             .filter(|c| c.info.call == id && c.info.phase == Phase::Incoming)
-            .ok_or_else(|| NetError::NoRoute("no such call ringing".into()))?;
+            .ok_or_else(|| NetError::NotAllowed("no such call ringing".into()))?;
         let offer = c.offer_secret.take().ok_or(NetError::Closed)?;
         let answer = CallMsg::Answer {
             call: id,
@@ -215,7 +252,7 @@ impl Node {
             .current
             .as_mut()
             .filter(|c| c.info.call == id)
-            .ok_or_else(|| NetError::NoRoute("no such call".into()))?;
+            .ok_or_else(|| NetError::NotAllowed("no such call".into()))?;
         c.info.video = on;
         let peer = c.info.peer;
         drop(calls);
@@ -237,7 +274,7 @@ impl Node {
             .call()
             .filter(|c| c.call == id && c.phase == Phase::Active)
             .map(|c| c.peer)
-            .ok_or_else(|| NetError::NoRoute("no such call".into()))?;
+            .ok_or_else(|| NetError::NotAllowed("no such call".into()))?;
         let m = CallMsg::Reaction {
             call: id,
             emoji: emoji.to_owned(),
@@ -254,7 +291,7 @@ impl Node {
             .call()
             .filter(|c| c.call == id)
             .map(|c| c.peer)
-            .ok_or_else(|| NetError::NoRoute("no such call".into()))?;
+            .ok_or_else(|| NetError::NotAllowed("no such call".into()))?;
         let m = CallMsg::Signal { call: id, data }.encode()?;
         // Validate as the receiver will.
         CallMsg::decode(&m)?;
@@ -283,7 +320,7 @@ impl Node {
                 .current
                 .as_mut()
                 .filter(|c| c.info.call == id)
-                .ok_or_else(|| NetError::NoRoute("no such call".into()))?;
+                .ok_or_else(|| NetError::NotAllowed("no such call".into()))?;
             let keys = c.keys.as_mut().ok_or(NetError::Closed)?;
             (c.info.peer, keys.seal(stream, payload)?)
         };

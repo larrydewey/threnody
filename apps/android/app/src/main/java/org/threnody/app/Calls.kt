@@ -36,7 +36,7 @@ object Calls {
         val peer: String,
         val title: String,
         val outgoing: Boolean,
-        /** "calling", "ringing", "incoming", "connecting", "connected", "interrupted". */
+        /** "reaching", "calling", "ringing", "incoming", "connecting", "connected", "interrupted". */
         val state: String,
         /** When audio connected ([SystemClock.elapsedRealtime]), 0 before. */
         val since: Long = 0,
@@ -116,20 +116,44 @@ object Calls {
             pendingCall = { start(a, node, persona, device, title, video) }
             return a.requestPermissions(need.toTypedArray(), MICROPHONE)
         }
+        // The screen shows at once: without a session, reaching them first
+        // can take a while (the node gives up after 45 s).
+        ended = null
+        val mine = ++attempt
+        current = Call(node, persona, REACHING, device, title, outgoing = true, state = "reaching", video = video, speaker = video)
+        inCall(a, true)
+        if (video) route(a, true)
+        changed()
+        a.startActivity(Intent(a, CallActivity::class.java))
         Threading.background {
             val id = try { node.startCall(device, video) } catch (e: Exception) {
-                return@background a.runOnUiThread {
-                    Toast.makeText(a, "Couldn't call $title: ${e.message}", Toast.LENGTH_LONG).show()
+                Threnody.say("! call ${Threnody.short(device)}: ${e.message}")
+                if (attempt == mine && current?.id == REACHING) {
+                    current = null
+                    ended = "Couldn't reach $title"
+                    inCall(a, false)
+                    ongoing(a)
+                    changed()
+                    a.runOnUiThread { Toast.makeText(a, "Couldn't call $title: ${e.message}", Toast.LENGTH_LONG).show() }
                 }
+                return@background
             }
-            ended = null
-            current = Call(node, persona, id, device, title, outgoing = true, state = "calling", video = video, speaker = video)
-            inCall(a, true)
-            if (video) route(a, true)
+            val now = current
+            if (now == null || now.id != REACHING || attempt != mine) {
+                // Hung up while we were reaching them.
+                node.hangupCall(id)
+                return@background
+            }
+            current = now.copy(id = id, state = "calling")
             changed()
-            a.startActivity(Intent(a, CallActivity::class.java))
         }
     }
+
+    /** The id of a call still reaching its peer (no node call yet). */
+    private const val REACHING: ULong = 0u
+
+    /** Counts calls placed, so a slow reach can tell whether it's still the one shown. */
+    @Volatile private var attempt = 0
 
     /** A call waiting on the microphone permission. */
     private var pendingCall: (() -> Unit)? = null
@@ -168,6 +192,14 @@ object Calls {
     /** Hangs up, declines or cancels the current call. */
     fun hangUp(ctx: Context) {
         val c = current ?: return
+        if (c.id == REACHING) {
+            // No call in the node yet: `start` hangs it up if it gets one.
+            current = null
+            ended = "Call ended"
+            inCall(ctx, false)
+            ongoing(ctx)
+            return changed()
+        }
         Threading.background { c.node.hangupCall(c.id) }
         cancelRinging(ctx)
     }

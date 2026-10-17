@@ -142,10 +142,15 @@ impl ThrenodyNode {
         cfg!(feature = "calls")
     }
 
-    /// Calls `peer` (connected, and with an app that takes calls). Events
-    /// follow: `CallRinging`, then `CallStarted` or `CallEnded`.
+    /// Calls `peer` (with an app that takes calls), first reaching it if
+    /// there is no session: that can take up to 45 seconds, so call this
+    /// off the UI thread. Events follow: `CallRinging`, then `CallStarted`
+    /// or `CallEnded`.
     pub fn start_call(&self, peer: String, video: bool) -> Result<u64> {
         let p = self.resolve(&peer)?;
+        self.rt
+            .block_on(self.node.reach_for_call(&p))
+            .map_err(fail)?;
         // The call's watchdog runs on the node's runtime.
         let _guard = self.rt.enter();
         self.node.start_call(&p, video).map_err(fail)
