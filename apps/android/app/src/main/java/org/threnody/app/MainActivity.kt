@@ -565,7 +565,6 @@ class MainActivity : Activity() {
         val (named, messages) = found
         lastShown = null
         list.removeAllViews()
-        list.layoutAnimation = null
         emptyStateContainer.visibility = View.GONE
         list.visibility = View.VISIBLE
         if (named.isNotEmpty()) {
@@ -615,12 +614,14 @@ class MainActivity : Activity() {
         if (!hasContent) return
 
         if (!first) {
-            list.layoutAnimation = null
+            // The entrance animation, if any, is left to finish: clearing
+            // the controller while it runs crashes the next frame (Android
+            // asks the missing controller whether it is done).
             addRows(rows)
             return
         }
 
-        // Apply staggered entrance animation
+        // Apply staggered entrance animation (once: it runs only when set)
         val animation = AnimationUtils.loadAnimation(this, android.R.anim.fade_in)
         animation.duration = Design.durationFast.toLong()
         val controller = LayoutAnimationController(animation)
