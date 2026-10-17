@@ -144,8 +144,12 @@ impl Device {
             match self.peers.get_mut(&id) {
                 Some(p) if p.wg_public == tp.wg_public && p.psk == *tp.psk.0 => {
                     if p.offered != tp.endpoint {
+                        // A new session (the peer moved): its UDP path is
+                        // unproven, so data rides the session until an
+                        // authenticated packet arrives over it.
                         p.offered = tp.endpoint;
                         p.endpoint = tp.endpoint;
+                        p.direct_at = None;
                     }
                 }
                 _ => {

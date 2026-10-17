@@ -1594,12 +1594,24 @@ where
             }
             // Offer a tunnel once per session, as soon as approval is mutual.
             // Tunnels need a direct UDP path, so never over relayed sessions.
+            // With the session setup, behind our approval and paths: under
+            // cover traffic on mobile data, queued behind prekeys it went
+            // out 30 s after a network change, and tunnels waited for it.
             if let Some((port, wg_public)) = *lock(&shared.tunnel)
                 && via.is_none()
                 && !offered
                 && shared.mutual(&peer)
             {
-                pending.push_back(AppMessage::TunnelOffer { wg_public, port });
+                let at = pending
+                    .iter()
+                    .rposition(|m| {
+                        matches!(
+                            m,
+                            AppMessage::Hello { .. } | AppMessage::Approval { .. } | AppMessage::Paths(_)
+                        )
+                    })
+                    .map_or(0, |i| i + 1);
+                pending.insert(at, AppMessage::TunnelOffer { wg_public, port });
                 offered = true;
             }
             // Session setup (features, approval, recovery paths) goes at
@@ -1609,7 +1621,12 @@ where
             if ticker.is_some() && chan.can_send() && setup_until > tokio::time::Instant::now() {
                 while matches!(
                     pending.front(),
-                    Some(AppMessage::Hello { .. } | AppMessage::Approval { .. } | AppMessage::Paths(_))
+                    Some(
+                        AppMessage::Hello { .. }
+                            | AppMessage::Approval { .. }
+                            | AppMessage::Paths(_)
+                            | AppMessage::TunnelOffer { .. }
+                    )
                 ) {
                     if let Some(m) = pending.pop_front() {
                         write_frame(&mut wr, &chan.seal(&m)?).await?;
