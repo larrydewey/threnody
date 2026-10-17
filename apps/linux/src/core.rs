@@ -1007,11 +1007,12 @@ impl Core {
                     NodeEvent::ApprovalChanged { peer, mutual } => {
                         self.say(format!("* {} approval: mutual={mutual}", short(peer)));
                     }
-                    NodeEvent::TunnelUp { peer, .. } | NodeEvent::TunnelDown { peer }
-                        if persona.is_none() =>
-                    {
+                    // The tunnel's preshared key stays out of the log.
+                    NodeEvent::TunnelUp { peer, .. } | NodeEvent::TunnelDown { peer } => {
                         self.say(format!("* tunnel change with {}", short(peer)));
-                        self.write_wireguard_conf();
+                        if persona.is_none() {
+                            self.write_wireguard_conf();
+                        }
                     }
                     other => self.say(format!("· {other:?}")),
                 }

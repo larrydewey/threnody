@@ -638,6 +638,8 @@ object Threnody {
                         ctx.startActivity(Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }
                 }
+                // The tunnel's preshared key stays out of the log.
+                is NodeEvent.TunnelUp -> say("* tunnel up with ${short(e.peer)} at ${e.endpoint}")
                 else -> say("· $e")
             }
             for (l in listeners) l(e)
