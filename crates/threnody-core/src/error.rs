@@ -31,6 +31,8 @@ pub enum Error {
     NotReady,
     #[error("this identity is protected by a passphrase")]
     PassphraseRequired,
+    #[error("a backup passphrase needs at least {0} characters")]
+    WeakPassphrase(usize),
     #[error("invalid fingerprint")]
     InvalidFingerprint,
     #[error("storage: {0}")]

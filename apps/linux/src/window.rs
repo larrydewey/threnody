@@ -2578,6 +2578,7 @@ impl App {
             "Closing the window keeps you reachable; quit from the menu",
         );
         page.add(&messages);
+        page.add(&crate::backup::group(self));
         d.add(&page);
         d.present(Some(&self.window));
     }

@@ -65,6 +65,9 @@ pub fn open_main(
     let dir = home.display().to_string();
     let store = threnody_core::store::Home::new(home);
     let failed = |e: threnody_ffi::ThrenodyError| OpenError::Failed(e.to_string());
+    // A restore staged from Preferences (`backup.rs`) finishes here.
+    threnody_ffi::apply_staged_restore(dir.clone())
+        .map_err(|e| OpenError::Failed(format!("finishing a restore from a backup: {e}")))?;
     if !store.has_identity() {
         let pw = match protect.unwrap_or(Protect::Keyring) {
             Protect::Keyring => match keyring::create(home) {

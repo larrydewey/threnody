@@ -43,11 +43,11 @@ impl Home {
         &self.dir
     }
 
-    fn identity_path(&self) -> PathBuf {
+    pub(crate) fn identity_path(&self) -> PathBuf {
         self.dir.join("identity.cbor")
     }
 
-    fn contacts_path(&self) -> PathBuf {
+    pub(crate) fn contacts_path(&self) -> PathBuf {
         self.dir.join("contacts.cbor")
     }
 
@@ -71,7 +71,12 @@ impl Home {
         Ok(id)
     }
 
-    fn store_identity(&self, id: &Identity, passphrase: Option<&[u8]>, p: KdfParams) -> Result<()> {
+    pub(crate) fn store_identity(
+        &self,
+        id: &Identity,
+        passphrase: Option<&[u8]>,
+        p: KdfParams,
+    ) -> Result<()> {
         let seed = id.seed();
         let sealed = passphrase
             .map(|pw| sealed::seal(pw, IDENTITY_PURPOSE, &seed[..], p))
@@ -154,7 +159,7 @@ impl Home {
         write_private(&self.dir, &self.contacts_path(), &c.encode()?)
     }
 
-    fn state_path(&self, name: &str) -> Result<PathBuf> {
+    pub(crate) fn state_path(&self, name: &str) -> Result<PathBuf> {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err(Error::Malformed("state name"));
         }
@@ -174,6 +179,35 @@ impl Home {
         let mut out = nonce.to_vec();
         out.extend(Suite::ChaCha20Poly1305.seal(&key, &nonce, name.as_bytes(), data));
         write_private(&self.dir, &path, &out)
+    }
+
+    /// The names of the state files present.
+    pub(crate) fn state_names(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let file = entry?.file_name();
+            if let Some(name) = file.to_str().and_then(|f| f.strip_suffix(".state"))
+                && self.state_path(name).is_ok()
+            {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Writes a state file exactly as [`Home::save_state`] stored it.
+    pub(crate) fn write_state_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        write_private(&self.dir, &self.state_path(name)?, bytes)
+    }
+
+    /// Writes the identity file exactly as stored.
+    pub(crate) fn write_identity_file(&self, bytes: &[u8]) -> Result<()> {
+        write_private(&self.dir, &self.identity_path(), bytes)
+    }
+
+    /// Writes the contacts file exactly as [`Home::save_contacts`] stored it.
+    pub(crate) fn write_contacts_file(&self, bytes: &[u8]) -> Result<()> {
+        write_private(&self.dir, &self.contacts_path(), bytes)
     }
 
     /// Deletes a state file (no error if absent).
@@ -295,155 +329,6 @@ pub fn secure_delete(path: &Path) -> Result<()> {
 
     fs::remove_file(path)?;
     Ok(())
-}
-
-/// Encrypted backup containing all node state.
-/// File format: nonce (12) || ChaCha20-Poly1305(key, nonce, "backup", data)
-/// where data is CBOR-encoded map of filename -> encrypted file content.
-#[derive(Clone, Debug)]
-pub struct Backup {
-    pub version: u64,
-    pub created_ms: u64,
-    /// Map of state file name -> encrypted content
-    pub files: Vec<(String, Vec<u8>)>,
-}
-
-impl Home {
-    /// Exports all node state as an encrypted backup.
-    /// Includes identity, contacts, history, prekeys, groups, and all other state.
-    /// The backup is encrypted with a key derived from the identity seed.
-    pub fn export_backup(&self, identity: &Identity) -> Result<Vec<u8>> {
-        use crate::cbor::to_vec;
-
-        let mut files = Vec::new();
-
-        // Collect all state files
-        let state_dir = self.dir.join("state");
-        if state_dir.exists() {
-            for entry in fs::read_dir(&state_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".cbor") || name.ends_with(".cbor.tmp") {
-                    continue; // Skip temp files
-                }
-                let path = entry.path();
-                if let Ok(content) = fs::read(&path)
-                    && !content.is_empty()
-                {
-                    files.push((name, content));
-                }
-            }
-        }
-
-        // Also include identity file
-        if let Ok(content) = fs::read(self.identity_path()) {
-            files.push(("identity.cbor".to_string(), content));
-        }
-
-        // Include contacts
-        if let Ok(content) = fs::read(self.contacts_path()) {
-            files.push(("contacts.cbor".to_string(), content));
-        }
-
-        // Include personas list
-        let personas_path = self.dir.join("personas.list.cbor");
-        if let Ok(content) = fs::read(&personas_path) {
-            files.push(("personas.list.cbor".to_string(), content));
-        }
-
-        let backup = Backup {
-            version: 1,
-            created_ms: crate::now_ms(),
-            files,
-        };
-
-        // Encrypt the backup
-        let key = backup_key(identity);
-        let nonce: [u8; 12] = crate::crypto::random_bytes();
-        let plaintext = to_vec(4096, |e| {
-            e.map_len(3)?;
-            e.u8(0)?.u64(backup.version)?;
-            e.u8(1)?.u64(backup.created_ms)?;
-            e.u8(2)?.array_len(backup.files.len())?;
-            for (name, content) in &backup.files {
-                e.array_len(2)?.str(name)?.bytes(content)?;
-            }
-            Ok(())
-        })?;
-
-        let mut out = nonce.to_vec();
-        out.extend(Suite::ChaCha20Poly1305.seal(&key, &nonce, b"backup", &plaintext));
-        Ok(out)
-    }
-
-    /// Imports a backup, replacing all node state.
-    /// The backup must have been created by the same identity.
-    pub fn import_backup(&self, identity: &Identity, backup_data: &[u8]) -> Result<()> {
-        if backup_data.len() < 12 {
-            return Err(Error::Malformed("backup file"));
-        }
-
-        let key = backup_key(identity);
-        let (nonce, ct) = backup_data.split_at(12);
-        let nonce: [u8; 12] = nonce
-            .try_into()
-            .map_err(|_| Error::Malformed("backup file"))?;
-        let plaintext = Suite::ChaCha20Poly1305.open(&key, &nonce, b"backup", ct)?;
-
-        let mut dec = const_cbor::Decoder::new(&plaintext);
-        let mut version = None;
-        let mut created_ms = None;
-        let mut files = Vec::new();
-
-        crate::cbor::read_map(&mut dec, |k, d| {
-            match k {
-                0 => version = Some(d.u64()?),
-                1 => created_ms = Some(d.u64()?),
-                2 => {
-                    let n = d.array_len()?;
-                    for _ in 0..n {
-                        d.array_len()?;
-                        let name = d.str()?.to_string();
-                        let content = d.bytes()?.to_vec();
-                        files.push((name, content));
-                    }
-                }
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
-        crate::cbor::finish(&dec)?;
-
-        if version != Some(1) {
-            return Err(Error::UnsupportedVersion(version.unwrap_or(0)));
-        }
-
-        // Write all files
-        for (name, content) in files {
-            if name == "identity.cbor" {
-                write_private(&self.dir, &self.identity_path(), &content)?;
-            } else if name == "contacts.cbor" {
-                write_private(&self.dir, &self.contacts_path(), &content)?;
-            } else if name == "personas.list.cbor" {
-                let path = self.dir.join("personas.list.cbor");
-                write_private(&self.dir, &path, &content)?;
-            } else {
-                // State files go in state directory
-                let path = self.state_path(&name)?;
-                write_private(&self.dir, &path, &content)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-fn backup_key(identity: &Identity) -> Zeroizing<[u8; 32]> {
-    let seed = identity.seed();
-    Zeroizing::new(crate::crypto::kdf::derive(
-        crate::crypto::kdf::label::STATE_KEY,
-        &[&seed[..], b"backup"],
-    ))
 }
 
 /// A known peer. Identity is the key; everything else is local metadata.

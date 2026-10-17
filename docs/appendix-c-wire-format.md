@@ -160,3 +160,34 @@ Contact = {
   ? 13 => bool,          ; blocked
 }
 ```
+
+## Backups
+
+A backup (spec §6.4) holds everything needed to bring an identity back on a new device after the old one is lost. It is sealed under a passphrase the user chooses, at least 12 characters long (`threnody-core::backup`):
+
+```
+file   = "threnody backup\n" || Sealed
+Sealed = sealed(passphrase, "threnody v1 backup", Backup)   ; Argon2id + ChaCha20-Poly1305, as a passphrase-sealed identity
+```
+
+```cddl
+Backup = {
+  0 => 1,                    ; version
+  1 => uint,                 ; made at (ms)
+  2 => bstr .size 32,        ; identity seed
+  3 => bstr,                 ; ContactsFile, as stored
+  4 => [* [tstr, bstr]],     ; state name, state file as stored (still encrypted under the seed)
+}
+```
+
+A backup leaves out:
+
+- **One-time prekeys,** ours (`prekeys`) and those we hold for contacts (`bundles`). A restored copy would let a sealed message that was already opened be opened again, or seal a second message to a prekey a contact already used. Fresh ones are made and handed out as sessions come up. Messages sealed to the lost device's prekeys can't be opened.
+- **Relay tokens** (`relay-wallet`, Appendix P), each of which can be spent once.
+- **Anonymous identities** (Appendix M). A backup would link them to the main identity.
+- **Received files' contents.** History keeps only where the app saved them.
+
+**Restoring** replaces the identity, contacts, state and personas in a data directory. The backup is opened and checked first, so a wrong passphrase or a damaged file changes nothing. The restored identity is sealed the way a new one would be (the keyring, a passphrase, or the Android Keystore). Apps can't stop their node while they run, so they *stage* a restore in `<data dir>.restore` and restart. The staged files replace the old ones before the node next opens. The user's other files in the data directory, such as downloads, stay.
+
+A restored device has the lost device's identity, so contacts see it as that device. MLS groups that moved on since the backup need a new invite. Restoring onto a device whose identity is still in use elsewhere makes the two fight over sessions; to use two devices as one, link them (Appendix J).
+
