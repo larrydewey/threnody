@@ -45,6 +45,8 @@ Inside `run`, any line you type goes to the current peer. The available commands
 
 `/history [peer] [n]` shows recent messages, numbered and stored encrypted. `/search <words>` finds messages in every conversation, and `/search @<peer|group> <words>` in one; every word must appear (ignoring case, in the text or a file name), and `"quoted words"` match as a phrase. Search decrypts history in memory, so no index of your messages is ever written to disk. Results of a search in one chat are numbered like `/history`'s. `/del <n>` deletes message *n* of that list on all your devices, and `/del <n> all` deletes one of your own messages for everyone too. `/edit <n> <text>` edits one of your own messages everywhere. `/react <n> <emoji>` adds a reaction (several per message are fine; the same command again takes it back). Messages stay unless you choose a timer. `/disappear 1h` (or `30s`, `10m`, `1d`, `1w`, `off`) sets one for the current chat, and the peer adopts it. `--disappear-default <time>` sets one for chats that haven't chosen their own. `/clear [peer]` deletes your messages with someone but keeps them as a contact; `/forget <peer>`, or `threnody forget <peer>`, deletes the contact and the conversation. Both apply on all your devices.
 
+`threnody backup <file>` saves your identity, contacts and history to a file sealed under a passphrase you choose. After losing a device, `threnody restore <file>` puts them on a new one; the apps do the same from their menus (Account & Identity on Android, Preferences on Linux). Anonymous identities and received files' contents aren't in a backup.
+
 To add a device to your account, run `/device add [host:port]` on a device you already have. It prints a one-time code (and a QR code) with this machine's LAN address, or the one given. Then run `threnody link '<code>'` on the new device. `/devices` lists your devices, `/device rename <name> <new name>` renames one, and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices. Your devices share your message history, and a new device gets it all when linked.
 
 ```
@@ -118,7 +120,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.1 1:1 text + files | ✅ voice and video messages, played in the chat; photos and albums with captions, a *sensitive* flag that shows them covered until opened, and metadata (location, camera) stripped before sending by default; including disappearing messages (the timer travels with each message); end-to-end acknowledgements, with resending after a dropped session or a restart |
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; text, files, photos, voice and video messages; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
-| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices (backups not yet) |
+| §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices; passphrase-sealed backups that restore onto a new device ([Appendix C](docs/appendix-c-wire-format.md#backups)) |
 | §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), onion-routed mailbox deposits, each only off when switched off; volunteer relays from subscribed directories (k-of-n listing, Ed25519 + ML-DSA signed), paid with unlinkable rate-limited tokens, entered without revealing who you are ([Appendix P](docs/appendix-p-volunteer-relays.md)) |
@@ -129,7 +131,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 ## Roadmap
 
 0. **Internet reachability (remaining).** 0.3.0 reaches contacts across the internet with no server: sessions over QUIC, rendezvous in the public BitTorrent DHT under keys only the two contacts share, hole punching, and fast recovery that reconnects in under a second when a phone changes network (see [Appendix N](docs/appendix-n-internet-reachability.md)). Still to do: router port mapping, a persistent relay circuit to an always-on contact (instant notice of moves, and reaching phones in the background), and tests between two phones.
-1. **Hardening (remaining).** An iOS keystore, ratchet persistence across reconnects, and an external audit.
+1. **Hardening (remaining).** An iOS keystore and an external audit.
 2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
