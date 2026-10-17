@@ -8,9 +8,6 @@ use threnody_net::Node;
 
 use crate::rtc::{AudioIn, MediaSession, Wires};
 
-/// The stream id WebRTC's packets use in the call's media.
-const WEBRTC: u8 = 0;
-
 pub struct CallMedia {
     session: Arc<MediaSession>,
 }
@@ -39,18 +36,18 @@ impl CallMedia {
             signal: Box::new(move |s| {
                 let _ = n1.send_call_signal(call, s);
             }),
-            media: Box::new(move |m| {
-                let _ = n2.send_media(call, WEBRTC, &m);
+            media: Box::new(move |stream, m| {
+                let _ = n2.send_media(call, stream, &m);
             }),
         };
         let session =
             Arc::new(MediaSession::start(info.outgoing, audio, wires, on_track, on_state).await?);
         let s = session.clone();
         tokio::spawn(async move {
+            // Every stream id is WebRTC's: it names the TURN allocations
+            // a packet is between.
             while let Some((stream, payload)) = from_peer.recv().await {
-                if stream == WEBRTC {
-                    s.on_media(payload);
-                }
+                s.on_media(stream, payload);
             }
         });
         Ok(Self { session })

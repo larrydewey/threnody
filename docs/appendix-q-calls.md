@@ -77,9 +77,10 @@ Every call negotiates an audio and a video track from the start, on both sides. 
 
 `threnody-media::turn` is a TURN server (RFC 8656) for one client and one peer.
 
-- **Credentials.** It uses long-term credentials, random for each call, and answers only the first client that authenticates. Other local programs can neither use it nor read from it.
-- **Relayed addresses.** Each side's relayed address is a fixed TEST-NET-1 address, `192.0.2.1:40000` for the caller and `192.0.2.2:40000` for the callee, so the two sides' relay candidates pair up. The port is high because WebRTC ignores remote candidates on most ports below 1024.
-- **Permissions.** Permissions and channels are granted only for the peer's relayed address.
+- **Credentials.** It uses long-term credentials, random for each call, and serves only clients that authenticate with them. Other local programs can neither use it nor read from it.
+- **Relayed addresses.** Each side's relayed addresses are fixed TEST-NET-1 addresses, `192.0.2.1` for the caller and `192.0.2.2` for the callee, so the two sides' relay candidates pair up. Ports are high because WebRTC ignores remote candidates on most ports below 1024.
+- **One allocation per network.** WebRTC allocates once for each network it sees: on a phone, one for Wi-Fi and one for mobile data. Allocation *i* is relayed at port 40000 + *i* (up to 16; past that, the one quiet longest gives way). The call media's stream id says which allocations a packet is between: the sender's in its high four bits, the receiver's in its low four. WebRTC therefore checks a path over each network and moves to mobile data the moment Wi-Fi goes, without a new offer. When only the first allocations are involved, the stream id is 0, as it was when there was one allocation, so older peers still connect. Before this, the server served only the first client, so a call whose media ran over Wi-Fi died with Wi-Fi even when the session moved to mobile data at once.
+- **Permissions.** Permissions and channels are granted only for the peer's relayed addresses.
 - **No address leaks.** WebRTC is configured with `IceTransportsType::Relay`. With the defaults it would have offered the device's LAN IPv4 and global IPv6 addresses as host candidates. Here it offers none.
 
 Inside, WebRTC still runs DTLS-SRTP. Its certificate fingerprints travel only in the end-to-end signalling, so they are authenticated.
