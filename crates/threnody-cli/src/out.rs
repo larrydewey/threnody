@@ -38,6 +38,7 @@ pub fn say(s: &str) {
 }
 
 /// Runs `f`, returning its result and everything said meanwhile.
+#[cfg(unix)]
 pub async fn capture<T>(f: impl Future<Output = T>) -> (T, String) {
     *CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::new());
     let r = f.await;
