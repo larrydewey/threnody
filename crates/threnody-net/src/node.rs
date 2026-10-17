@@ -66,6 +66,10 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Hands WireGuard packets that came over sessions, with their sender, to
+/// the userspace device.
+pub(crate) type TunnelInbound = mpsc::Sender<(PublicIdentity, Vec<u8>)>;
+
 /// A peer's WireGuard tunnel info.
 #[derive(Clone)]
 pub struct TunnelPeer {
@@ -449,6 +453,9 @@ pub(crate) struct Shared {
     tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
     tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    /// Where WireGuard packets that arrive over sessions go: the userspace
+    /// device (`wg_userspace`), when one runs.
+    tunnel_inbound: Mutex<Option<TunnelInbound>>,
     pub(crate) relay: Mutex<RelayState>,
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
@@ -653,6 +660,7 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
+            tunnel_inbound: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
@@ -1154,15 +1162,68 @@ impl Node {
             .and_then(|h| h.datagrams.clone())
     }
 
-    /// Hands `peer`'s datagrams on `conn` to the call layer until the
-    /// connection closes.
+    /// Hands `peer`'s datagrams on `conn` to the call layer, or to the
+    /// tunnel when they are WireGuard packets, until the connection closes.
     fn read_datagrams(&self, peer: PublicIdentity, conn: quinn::Connection) {
         let node = self.clone();
         tokio::spawn(async move {
             while let Ok(d) = conn.read_datagram().await {
-                node.on_media(peer, &d);
+                if is_wireguard(&d) {
+                    node.on_tunnel_packet(peer, d.to_vec());
+                } else {
+                    node.on_media(peer, &d);
+                }
             }
         });
+    }
+
+    #[cfg(feature = "boringtun")]
+    /// Sends WireGuard packets that arrive over sessions to `tx` (the
+    /// userspace device), or nowhere with `None`.
+    pub(crate) fn set_tunnel_inbound(&self, tx: Option<TunnelInbound>) {
+        *lock(&self.shared.tunnel_inbound) = tx;
+    }
+
+    #[cfg(feature = "boringtun")]
+    /// Stops sending to `tx`, unless another device has taken over since.
+    pub(crate) fn clear_tunnel_inbound(&self, tx: &TunnelInbound) {
+        let mut inbound = lock(&self.shared.tunnel_inbound);
+        if inbound.as_ref().is_some_and(|t| t.same_channel(tx)) {
+            *inbound = None;
+        }
+    }
+
+    /// A WireGuard packet from `peer` over the session, for the tunnel
+    /// with `peer` only. Dropped when the device is behind.
+    pub(crate) fn on_tunnel_packet(&self, peer: PublicIdentity, packet: Vec<u8>) {
+        if let Some(tx) = lock(&self.shared.tunnel_inbound).as_ref() {
+            let _ = tx.try_send((peer, packet));
+        }
+    }
+
+    #[cfg(feature = "boringtun")]
+    /// Sends one WireGuard packet to `peer` over its session, when the
+    /// tunnel's own UDP path is blocked (Appendix D, *Over the session*):
+    /// as a QUIC datagram when the link has them and it fits, else in the
+    /// session stream. Never through onion circuits. False when there is
+    /// no such session.
+    pub(crate) fn send_tunnel_packet(&self, peer: &PublicIdentity, packet: &[u8]) -> bool {
+        if !self.supports(peer, threnody_core::message::FEATURE_TUNNEL) {
+            return false;
+        }
+        let datagrams = {
+            let sessions = lock(&self.shared.sessions);
+            match sessions.get(peer) {
+                Some(h) if h.info.transport != "onion" => h.datagrams.clone(),
+                _ => return false,
+            }
+        };
+        if let Some(conn) = datagrams
+            && conn.max_datagram_size().is_some_and(|m| packet.len() <= m)
+        {
+            return conn.send_datagram(packet.to_vec().into()).is_ok();
+        }
+        self.send(peer, AppMessage::Tunnel(packet.to_vec())).is_ok()
     }
 
     /// Whether `peer` said (in its latest session) it supports `feature`.
@@ -1719,6 +1780,7 @@ where
                         }
                         AppMessage::Call(payload) => node.on_call(peer, &payload),
                         AppMessage::Media(packet) => node.on_media(peer, &packet),
+                        AppMessage::Tunnel(packet) => node.on_tunnel_packet(peer, packet),
                         AppMessage::Typing { active } => {
                             if via.is_none() && !on_standby {
                                 shared.emit(Event::Typing { peer, active });
@@ -1780,11 +1842,19 @@ where
     result
 }
 
-/// Call signalling and media: sent at once even under constant-rate
-/// cover traffic.
+/// Whether a datagram is a WireGuard packet: a message type from 1 to 4,
+/// then three zero bytes. Call media starts with a random call id, so
+/// mistaking one for the other is a one-in-a-billion event that costs one
+/// packet.
+fn is_wireguard(d: &[u8]) -> bool {
+    d.len() >= 32 && (1..=4).contains(&d[0]) && d[1..4] == [0, 0, 0]
+}
+
+/// Call signalling and media, and tunnel packets: sent at once even under
+/// constant-rate cover traffic.
 fn urgent(m: &AppMessage) -> bool {
     match m {
-        AppMessage::Call(_) | AppMessage::Media(_) => true,
+        AppMessage::Call(_) | AppMessage::Media(_) | AppMessage::Tunnel(_) => true,
         AppMessage::Tracked { inner, .. } => urgent(inner),
         _ => false,
     }

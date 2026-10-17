@@ -87,6 +87,9 @@ pub const FEATURE_CALLS: u64 = 1024;
 pub const FEATURE_PIN: u64 = 2048;
 /// The peer understands `AppMessage::List` (shared lists).
 pub const FEATURE_LISTS: u64 = 4096;
+/// The peer understands `AppMessage::Tunnel` and WireGuard packets in
+/// session datagrams (Appendix D, *Over the session*).
+pub const FEATURE_TUNNEL: u64 = 8192;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -99,7 +102,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_READ
     | FEATURE_CALLS
     | FEATURE_PIN
-    | FEATURE_LISTS;
+    | FEATURE_LISTS
+    | FEATURE_TUNNEL;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -230,6 +234,10 @@ pub enum AppMessage {
     /// One sealed call media packet ([`crate::call::MediaKeys`]), on links
     /// that have no datagrams.
     Media(Vec<u8>),
+    /// One WireGuard packet for the tunnel with the peer (Appendix D), on
+    /// links that have no datagrams, when the tunnel's own UDP path is
+    /// blocked. Only sent to peers whose `Hello` has [`FEATURE_TUNNEL`].
+    Tunnel(Vec<u8>),
     /// A profile or a revealed identity ([`crate::persona::IdentityMsg`]).
     Identity(Vec<u8>),
     /// `inner`, which the receiver acknowledges by `id` and delivers once
@@ -329,6 +337,7 @@ mod kind {
     pub const MEDIA: u64 = 26;
     pub const PIN: u64 = 27;
     pub const LIST: u64 = 28;
+    pub const TUNNEL: u64 = 29;
 }
 
 impl AppMessage {
@@ -559,6 +568,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::MEDIA)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Tunnel(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::TUNNEL)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Identity(payload) => {
                     e.map_len(2)?.u8(0)?.uint(kind::IDENTITY)?;
                     e.u8(2)?.bytes(payload)?;
@@ -627,6 +640,7 @@ impl AppMessage {
             | Self::List(p)
             | Self::Call(p)
             | Self::Media(p)
+            | Self::Tunnel(p)
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
@@ -797,6 +811,7 @@ impl AppMessage {
             | kind::DIRECT
             | kind::CALL
             | kind::MEDIA
+            | kind::TUNNEL
             | kind::PATHS
             | kind::CREDENTIAL
             | kind::DIRECTORY
@@ -820,6 +835,7 @@ impl AppMessage {
                     Some(kind::LIST) => Self::List(p),
                     Some(kind::CALL) => Self::Call(p),
                     Some(kind::MEDIA) => Self::Media(p),
+                    Some(kind::TUNNEL) => Self::Tunnel(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -1075,6 +1091,7 @@ mod tests {
             AppMessage::Direct(vec![10]),
             AppMessage::Call(vec![11]),
             AppMessage::Media(vec![12]),
+            AppMessage::Tunnel(vec![13]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }

@@ -160,3 +160,73 @@ async fn packets_cross_the_tunnel_between_approved_nodes() {
         "nothing crosses after revocation"
     );
 }
+
+/// Two approved nodes whose tunnels can't use WireGuard's own UDP port:
+/// each offers a port nobody listens on, as when a carrier's NAT maps it
+/// somewhere unknown. Sessions over `quic` (datagrams) or TCP (stream).
+async fn blocked_pair(quic: bool) -> (Node, Node, WgDevice, WgDevice, Pipes, Pipes) {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    // Offered, but never bound: the direct path goes nowhere.
+    let (a_dead, b_dead) = (free_udp_port(), free_udp_port());
+    let (alice, mut arx) = node(dir, "alice", a_dead);
+    let (bob, mut brx) = node(dir, "bob", b_dead);
+    let bob_id = if quic {
+        let addr = bob.listen_quic("127.0.0.1:0").await.unwrap();
+        alice.listen_quic("127.0.0.1:0").await.unwrap();
+        alice.connect_quic(addr, None).await.unwrap()
+    } else {
+        let addr = bob.listen("127.0.0.1:0").await.unwrap();
+        alice.connect(&addr.to_string(), None).await.unwrap()
+    };
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    up(&mut arx).await;
+    up(&mut brx).await;
+    let (a_tun, a_in, a_out) = mem_tun();
+    let (b_tun, b_in, b_out) = mem_tun();
+    let a = WgDevice::start(alice.clone(), a_tun, 0).await.unwrap();
+    let b = WgDevice::start(bob.clone(), b_tun, 0).await.unwrap();
+    (alice, bob, a, b, (a_in, a_out), (b_in, b_out))
+}
+
+type Pipes = (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>);
+
+async fn crosses_over_the_session(quic: bool) {
+    let (alice, bob, _a, _b, (a_in, mut a_out), (b_in, mut b_out)) = blocked_pair(quic).await;
+    let (a_ip, b_ip) = (
+        overlay_addr(&alice.identity()),
+        overlay_addr(&bob.identity()),
+    );
+    let hello = ipv6_udp(a_ip, b_ip, b"hello over the session");
+    let got = timeout(Duration::from_secs(15), async {
+        loop {
+            a_in.send(hello.clone()).unwrap();
+            if let Ok(Some(p)) = timeout(Duration::from_millis(500), b_out.recv()).await {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("a packet crossed through the session");
+    assert_eq!(got, hello);
+    // Bigger than a QUIC datagram can hold before path MTU discovery:
+    // such packets take the stream instead.
+    let big = ipv6_udp(b_ip, a_ip, &[7u8; 1200]);
+    b_in.send(big.clone()).unwrap();
+    let back = timeout(Duration::from_secs(5), a_out.recv())
+        .await
+        .expect("a full-size reply crossed")
+        .unwrap();
+    assert_eq!(back, big);
+}
+
+#[tokio::test]
+async fn tunnels_fall_back_to_quic_sessions_when_udp_is_blocked() {
+    crosses_over_the_session(true).await;
+}
+
+#[tokio::test]
+async fn tunnels_fall_back_to_tcp_sessions_when_udp_is_blocked() {
+    crosses_over_the_session(false).await;
+}
