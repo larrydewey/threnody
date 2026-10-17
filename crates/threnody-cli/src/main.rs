@@ -1,5 +1,8 @@
 //! `threnody`: command-line client for the Threnody protocol.
 
+#[macro_use]
+mod out;
+
 #[cfg(all(feature = "ble", target_os = "linux"))]
 mod ble;
 mod chat;
@@ -192,6 +195,20 @@ enum Cmd {
         /// used (default: 1 with one subscription, else 2).
         #[arg(long, value_name = "K", default_value_t = 0)]
         directory_threshold: usize,
+        /// Run as a service (systemd, a VPS relay): don't read commands
+        /// from stdin, and take them over a control socket instead
+        /// (`threnody ctl`): `control.sock` in the data directory, or
+        /// `$THRENODY_CONTROL`. Unix only.
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Send one command (as typed in `threnody run`, e.g. `/approve bob`)
+    /// to the node running here as a service (`run --daemon`), and print
+    /// what it says.
+    Ctl {
+        /// The command and its arguments.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Show this device's WireGuard public key and overlay address.
     Tunnel,
@@ -359,18 +376,39 @@ fn keyring_command(home: &Home, action: KeyringAction) -> Result<()> {
     Ok(())
 }
 
-/// Reads a passphrase from `$THRENODY_PASSPHRASE` or the terminal.
+/// Reads a passphrase from `$THRENODY_PASSPHRASE`, the file
+/// `$THRENODY_PASSPHRASE_FILE` names, a systemd credential named
+/// `threnody-passphrase`, or else the terminal.
 fn read_passphrase(prompt: &str) -> Result<zeroize_string::Secret> {
     if let Ok(p) = std::env::var("THRENODY_PASSPHRASE") {
+        return Ok(zeroize_string::Secret(p));
+    }
+    if let Some(path) = passphrase_file() {
+        let mut p = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading the passphrase from {}", path.display()))?;
+        // A file usually ends with a newline that isn't part of it.
+        while p.ends_with(['\n', '\r']) {
+            p.pop();
+        }
         return Ok(zeroize_string::Secret(p));
     }
     Ok(zeroize_string::Secret(rpassword::prompt_password(prompt)?))
 }
 
+/// Where a passphrase given without the terminal is kept, if anywhere.
+fn passphrase_file() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("THRENODY_PASSPHRASE_FILE") {
+        return Some(PathBuf::from(p));
+    }
+    // systemd's LoadCredential= / LoadCredentialEncrypted=.
+    let creds = PathBuf::from(std::env::var_os("CREDENTIALS_DIRECTORY")?);
+    Some(creds.join("threnody-passphrase")).filter(|p| p.exists())
+}
+
 /// Asks for a new passphrase twice.
 fn new_passphrase() -> Result<zeroize_string::Secret> {
     let a = read_passphrase("New passphrase: ")?;
-    if std::env::var_os("THRENODY_PASSPHRASE").is_none() {
+    if std::env::var_os("THRENODY_PASSPHRASE").is_none() && passphrase_file().is_none() {
         let b = read_passphrase("Repeat passphrase: ")?;
         if a.as_bytes() != b.as_bytes() {
             bail!("passphrases do not match");
@@ -678,6 +716,7 @@ fn main() -> Result<()> {
             review_relays,
             no_volunteers,
             directory_threshold,
+            daemon,
         } => {
             let identity = load_identity(&home)?;
             let persona = main_identity.is_some();
@@ -699,6 +738,7 @@ fn main() -> Result<()> {
             } else {
                 listen
             };
+            let control = daemon.then(|| chat::control_path(&home));
             let rt = tokio::runtime::Runtime::new()?;
             let r = rt.block_on(chat::run(chat::Options {
                 home,
@@ -731,13 +771,44 @@ fn main() -> Result<()> {
                 serve_directory: serve_directory.map(|a| (a, review_relays)),
                 use_volunteers: !no_volunteers,
                 directory_threshold,
+                control,
             }));
             // Don't wait on a stdin read still pending after a signal.
             rt.shutdown_timeout(std::time::Duration::from_secs(1));
             r?;
         }
+        Cmd::Ctl { command } => ctl(&home, &command.join(" "))?,
     }
     Ok(())
+}
+
+/// Sends `command` to the service's control socket and prints the answer.
+#[cfg(unix)]
+fn ctl(home: &Home, command: &str) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    let path = chat::control_path(home);
+    let mut s = UnixStream::connect(&path).with_context(|| {
+        format!(
+            "no node running as a service here ({}); start one with `threnody run --daemon`",
+            path.display()
+        )
+    })?;
+    s.write_all(command.as_bytes())?;
+    s.write_all(b"\n")?;
+    s.shutdown(std::net::Shutdown::Write)?;
+    let mut answer = String::new();
+    s.read_to_string(&mut answer)?;
+    print!("{answer}");
+    if answer.lines().any(|l| l.starts_with("! ")) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ctl(_: &Home, _: &str) -> Result<()> {
+    bail!("`threnody ctl` needs Unix (the service's control socket)")
 }
 
 fn find_persona(

@@ -97,23 +97,23 @@ impl GroupUi {
         for u in updates {
             match u {
                 Update::Joined { group, owner, .. } => {
-                    println!(
+                    say!(
                         "* joined group {} (owner {})",
                         self.label(&group),
                         name(&owner)
                     );
                 }
-                Update::Invited(i) => println!(
+                Update::Invited(i) => say!(
                     "* {} invites you to group {:?}. /group accept {} to join",
                     name(&i.from),
                     i.name,
                     self.groups.invites().len()
                 ),
                 Update::MemberAdded { group, member } => {
-                    println!("* {} joined {}", name(&member), self.label(&group));
+                    say!("* {} joined {}", name(&member), self.label(&group));
                 }
                 Update::MemberRemoved { group, member } => {
-                    println!("* {} left {}", name(&member), self.label(&group));
+                    say!("* {} left {}", name(&member), self.label(&group));
                 }
                 Update::RoleChanged {
                     group: _,
@@ -125,10 +125,17 @@ impl GroupUi {
                         threnody_groups::MemberRole::Admin => "admin",
                         threnody_groups::MemberRole::Member => "member",
                     };
-                    println!("* {} is now {}", name(&member), role_str);
+                    say!("* {} is now {}", name(&member), role_str);
                 }
                 Update::Left { group } => {
-                    println!("* you were removed from group #{}", short(&group));
+                    say!("* you were removed from group #{}", short(&group));
+                }
+                Update::Text { group, from, .. } if crate::out::private() => {
+                    say!(
+                        "[{}] <{}> sent a message (/ghistory to read it)",
+                        self.label(&group),
+                        name(&from)
+                    );
                 }
                 Update::Text {
                     group,
@@ -137,7 +144,7 @@ impl GroupUi {
                     ours: true,
                     ..
                 } => {
-                    println!("[{}] <me, on {}> {text}", self.label(&group), name(&from));
+                    say!("[{}] <me, on {}> {text}", self.label(&group), name(&from));
                 }
                 Update::Text {
                     group,
@@ -147,9 +154,9 @@ impl GroupUi {
                     ..
                 } => {
                     if mentioned {
-                        print!("\x07");
+                        say_part!("\x07");
                     }
-                    println!("[{}] <{}> {text}", self.label(&group), name(&from));
+                    say!("[{}] <{}> {text}", self.label(&group), name(&from));
                 }
                 Update::File {
                     group,
@@ -172,16 +179,16 @@ impl GroupUi {
                     let saved = crate::chat::save_download(&self.downloads, &file, &data);
                     let mark = crate::chat::file_mark(sensitive, clip);
                     match &saved {
-                        Ok(p) => println!(
+                        Ok(p) => say!(
                             "[{}] <{who}> sent {file}{mark} ({} bytes) -> {}",
                             self.label(&group),
                             data.len(),
                             p.display()
                         ),
-                        Err(e) => println!("! could not save {file} from {who}: {e:#}"),
+                        Err(e) => say!("! could not save {file} from {who}: {e:#}"),
                     }
-                    if !caption.is_empty() {
-                        println!("[{}] <{who}> {caption}", self.label(&group));
+                    if !caption.is_empty() && !crate::out::private() {
+                        say!("[{}] <{who}> {caption}", self.label(&group));
                     }
                     let note = FileNote {
                         name: file,
@@ -196,12 +203,12 @@ impl GroupUi {
                         .record_file(node, &group, &from, note, &caption, id);
                 }
                 Update::Reacted { group, from } => {
-                    println!("[{}] * {} reacted", self.label(&group), name(&from));
+                    say!("[{}] * {} reacted", self.label(&group), name(&from));
                 }
                 Update::Voted { group, from } => {
-                    println!("[{}] * {} voted", self.label(&group), name(&from));
+                    say!("[{}] * {} voted", self.label(&group), name(&from));
                 }
-                Update::Pinned { group, from, pin } => println!(
+                Update::Pinned { group, from, pin } => say!(
                     "[{}] * {} {} a message",
                     self.label(&group),
                     name(&from),
@@ -221,7 +228,7 @@ impl GroupUi {
     ) {
         match self.groups.incoming(node, peer, payload) {
             Ok(updates) => self.show(node, name, updates),
-            Err(e) => println!("! group message from {}: {e}", name(&peer)),
+            Err(e) => say!("! group message from {}: {e}", name(&peer)),
         }
     }
 
@@ -241,7 +248,7 @@ impl GroupUi {
         self.groups.connected(node, peer);
         let sent = held - self.groups.held_for(peer);
         if sent > 0 {
-            println!("* delivered {sent} held group message(s) to {}", name(peer));
+            say!("* delivered {sent} held group message(s) to {}", name(peer));
         }
     }
 
@@ -287,7 +294,7 @@ impl GroupUi {
                     bail!("usage: /group new <name>");
                 }
                 let id = self.groups.create(&gname)?;
-                println!(
+                say!(
                     "* created {} — invite with /group invite {} <peer>",
                     self.label(&id),
                     self.label(&id)
@@ -300,17 +307,17 @@ impl GroupUi {
                 };
                 let (g, p) = (self.find(g)?, resolve(p)?);
                 let n = self.groups.invite(node, &g, &p)?;
-                println!("* invitation sent to {} ({n} device(s))", name(&p));
+                say!("* invitation sent to {} ({n} device(s))", name(&p));
             }
             "accept" => {
                 let g = self.pending(it.next())?;
-                println!("* accepting {}", self.label(&g));
+                say!("* accepting {}", self.label(&g));
                 let updates = self.groups.accept(node, &g)?;
                 self.show(node, name, updates);
             }
             "decline" => {
                 let g = self.pending(it.next())?;
-                println!("* declined {}", self.label(&g));
+                say!("* declined {}", self.label(&g));
                 self.groups.decline(&g);
             }
             "remove" | "kick" => {
@@ -329,7 +336,7 @@ impl GroupUi {
                 )?;
                 let label = self.label(&g);
                 self.groups.leave(node, &g)?;
-                println!("* left {label}");
+                say!("* left {label}");
             }
             "list" => self.list(name),
             other => bail!("unknown /group {other}; try /help"),
@@ -340,7 +347,7 @@ impl GroupUi {
     pub fn list(&self, name: &dyn Fn(&PublicIdentity) -> String) {
         let groups = self.groups.list();
         if groups.is_empty() {
-            println!("No groups. /group new <name>");
+            say!("No groups. /group new <name>");
         }
         for (id, _, owner, members) in groups {
             let names: Vec<String> = members
@@ -354,7 +361,7 @@ impl GroupUi {
                     }
                 })
                 .collect();
-            println!(
+            say!(
                 "  {}  owner {}  members: {}",
                 self.label(&id),
                 name(&owner),
@@ -362,7 +369,7 @@ impl GroupUi {
             );
         }
         for (i, inv) in self.groups.invites().iter().enumerate() {
-            println!(
+            say!(
                 "  invitation {}: {:?} from {}",
                 i + 1,
                 inv.name,
@@ -405,9 +412,9 @@ impl GroupUi {
                 PublicIdentity::from_bytes(&e.device).map_or_else(|_| "?".into(), |d| name(&d))
             };
             if let Some(q) = &e.quote {
-                println!("     {}", crate::chat::quoted(q, name));
+                say!("     {}", crate::chat::quoted(q, name));
             }
-            println!(
+            say!(
                 "{:>3}  [{}] <{who}> {}{}",
                 i + 1,
                 crate::chat::clock(e.at_ms),
@@ -416,10 +423,10 @@ impl GroupUi {
             );
             if let Some(p) = &e.poll {
                 for (j, (o, n)) in p.options.iter().zip(p.counts()).enumerate() {
-                    println!("       {}. {o} ({n})", j + 1);
+                    say!("       {}. {o} ({n})", j + 1);
                 }
                 if p.closed {
-                    println!("       (closed)");
+                    say!("       (closed)");
                 }
             }
         }
