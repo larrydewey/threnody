@@ -2332,11 +2332,12 @@ impl ThrenodyNode {
             .node
             .tunnel_port()
             .ok_or_else(|| fail("tunnels are off: set a tunnel port first"))?;
+        // Adopting registers the descriptor with the runtime's reactor.
+        let _guard = self.rt.enter();
         let tun = threnody_tun::FdTun::adopt(fd);
         let mut device = self.tunnel_device.lock().unwrap();
         // Free the port before binding it again.
         *device = None;
-        let _guard = self.rt.enter();
         let tun = tun.map_err(fail)?;
         let started = self
             .rt
