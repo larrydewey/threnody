@@ -128,7 +128,9 @@ impl Signal {
 /// Where the call's outgoing signalling and media go.
 pub struct Wires {
     pub signal: Box<dyn Fn(Vec<u8>) + Send + Sync>,
-    pub media: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// Media for the peer: its stream id (which of our TURN allocations
+    /// and which of the peer's, see [`crate::turn::stream_id`]) and payload.
+    pub media: Box<dyn Fn(u8, Vec<u8>) + Send + Sync>,
 }
 
 /// What we send as audio.
@@ -143,7 +145,7 @@ pub enum AudioIn {
 
 pub struct MediaSession {
     pc: PeerConnection,
-    from_peer: mpsc::UnboundedSender<Vec<u8>>,
+    from_peer: mpsc::UnboundedSender<(u8, Vec<u8>)>,
     /// Candidates that came before the remote description.
     early: Mutex<Vec<IceCandidate>>,
     signal: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
@@ -332,8 +334,8 @@ impl MediaSession {
     }
 
     /// Media from the peer (opened call media).
-    pub fn on_media(&self, payload: Vec<u8>) {
-        let _ = self.from_peer.send(payload);
+    pub fn on_media(&self, stream: u8, payload: Vec<u8>) {
+        let _ = self.from_peer.send((stream, payload));
     }
 
     /// Stops (or resumes) sending our audio; the peer hears silence.
@@ -498,8 +500,8 @@ impl std::fmt::Display for Report {
 async fn serve(
     mut turn: Turn,
     socket: UdpSocket,
-    mut from_peer: mpsc::UnboundedReceiver<Vec<u8>>,
-    to_peer: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+    mut from_peer: mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
+    to_peer: Box<dyn Fn(u8, Vec<u8>) + Send + Sync>,
 ) {
     let mut buf = vec![0u8; 2048];
     loop {
@@ -510,13 +512,13 @@ async fn serve(
                     Some(Output::ToClient(to, b)) => {
                         let _ = socket.send_to(&b, to).await;
                     }
-                    Some(Output::ToPeer(p)) => to_peer(p),
+                    Some(Output::ToPeer(stream, p)) => to_peer(stream, p),
                     None => {}
                 }
             }
             p = from_peer.recv() => {
-                let Some(p) = p else { return };
-                if let Some((to, b)) = turn.from_peer(&p) {
+                let Some((stream, p)) = p else { return };
+                if let Some((to, b)) = turn.from_peer(stream, &p) {
                     let _ = socket.send_to(&b, to).await;
                 }
             }

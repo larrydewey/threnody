@@ -20,17 +20,19 @@ const RATE: u32 = 48_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn audio_crosses_only_through_the_call() {
-    // What each side sends the other: (signal?, bytes).
-    let (a_out, mut a_rx) = mpsc::unbounded_channel::<(bool, Vec<u8>)>();
-    let (b_out, mut b_rx) = mpsc::unbounded_channel::<(bool, Vec<u8>)>();
-    let wires = |out: mpsc::UnboundedSender<(bool, Vec<u8>)>| {
+    // What each side sends the other: (media stream, or None for a
+    // signal; bytes).
+    type Out = mpsc::UnboundedSender<(Option<u8>, Vec<u8>)>;
+    let (a_out, mut a_rx) = mpsc::unbounded_channel();
+    let (b_out, mut b_rx) = mpsc::unbounded_channel();
+    let wires = |out: Out| {
         let o = out.clone();
         Wires {
             signal: Box::new(move |s| {
-                let _ = o.send((true, s));
+                let _ = o.send((None, s));
             }),
-            media: Box::new(move |m| {
-                let _ = out.send((false, m));
+            media: Box::new(move |stream, m| {
+                let _ = out.send((Some(stream), m));
             }),
         }
     };
@@ -64,15 +66,16 @@ async fn audio_crosses_only_through_the_call() {
     let (caller, callee) = (Arc::new(caller), Arc::new(callee));
 
     // The "call": everything one side sends goes to the other.
-    let pump = |mut rx: mpsc::UnboundedReceiver<(bool, Vec<u8>)>, to: Arc<MediaSession>| {
+    let pump = |mut rx: mpsc::UnboundedReceiver<(Option<u8>, Vec<u8>)>, to: Arc<MediaSession>| {
         let relayed = relayed.clone();
         tokio::spawn(async move {
-            while let Some((signal, b)) = rx.recv().await {
-                if signal {
-                    to.on_signal(&b).await.unwrap();
-                } else {
-                    *relayed.lock().unwrap() += 1;
-                    to.on_media(b);
+            while let Some((stream, b)) = rx.recv().await {
+                match stream {
+                    None => to.on_signal(&b).await.unwrap(),
+                    Some(stream) => {
+                        *relayed.lock().unwrap() += 1;
+                        to.on_media(stream, b);
+                    }
                 }
             }
         })
@@ -142,8 +145,8 @@ async fn audio_crosses_only_through_the_call() {
 }
 
 fn a_rx_take(
-    rx: &mut mpsc::UnboundedReceiver<(bool, Vec<u8>)>,
-) -> mpsc::UnboundedReceiver<(bool, Vec<u8>)> {
+    rx: &mut mpsc::UnboundedReceiver<(Option<u8>, Vec<u8>)>,
+) -> mpsc::UnboundedReceiver<(Option<u8>, Vec<u8>)> {
     let (_, empty) = mpsc::unbounded_channel();
     std::mem::replace(rx, empty)
 }

@@ -1,17 +1,23 @@
-//! A TURN server (RFC 8656) for exactly one client and one peer, on
+//! A TURN server (RFC 8656) for one call's WebRTC and one peer, on
 //! loopback: how WebRTC's media reaches a Threnody call.
 //!
 //! WebRTC is configured to use only relay candidates, from this server, so
 //! it never reveals or uses the device's own addresses. Everything it
-//! sends to the peer's relayed address comes out of [`Turn::handle`] as
-//! [`Output::ToPeer`], for the call to seal and carry; what the call
-//! receives goes back in through [`Turn::from_peer`] as if it came from
-//! that address. Each side's relayed address is a fixed documentation
-//! address ([`relayed_address`]), so the two sides' candidates pair up.
+//! sends to one of the peer's relayed addresses comes out of
+//! [`Turn::handle`] as [`Output::ToPeer`], for the call to seal and carry;
+//! what the call receives goes back in through [`Turn::from_peer`] as if
+//! it came from that address. Each side's relayed addresses are fixed
+//! documentation addresses ([`relayed_address`]), so the two sides'
+//! candidates pair up.
+//!
+//! WebRTC allocates once per network it sees (on a phone, Wi-Fi and mobile
+//! data), and each allocation gets its own relayed port. The call's media
+//! stream id says which of ours and which of the peer's a packet is
+//! between ([`stream_id`]), so WebRTC checks a path over each network
+//! and moves to the mobile one the moment Wi-Fi goes.
 //!
 //! The server answers only to the credentials it was made with (random per
-//! call) and only to the first client address that authenticates, so other
-//! local programs can't use it.
+//! call), so other local programs can't use it.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -56,13 +62,33 @@ mod attr {
 
 const REALM: &str = "threnody";
 const LIFETIME_S: u32 = 3600;
+/// Allocations at once (four bits of the stream id each way). Past this,
+/// the one quiet longest gives way: its network is likely gone.
+pub const MAX_ALLOCATIONS: usize = 16;
+const BASE_PORT: u16 = 40_000;
 
-/// The relayed address each side's WebRTC gets: one for the caller, one
-/// for the callee (TEST-NET-1, RFC 5737; never routed). The port is high
-/// because WebRTC ignores remote candidates on most ports below 1024.
-pub fn relayed_address(caller: bool) -> SocketAddr {
+/// The relayed address of each side's allocation `index`: the caller's
+/// on one address, the callee's on another (TEST-NET-1, RFC 5737; never
+/// routed). Ports are high because WebRTC ignores remote candidates on
+/// most ports below 1024.
+pub fn relayed_address(caller: bool, index: u8) -> SocketAddr {
     let last = if caller { 1 } else { 2 };
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)), 40_000)
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)),
+        BASE_PORT + u16::from(index),
+    )
+}
+
+/// The media stream id of a packet from the sender's allocation `from`
+/// to the receiver's allocation `to`. Between the first allocations it is
+/// 0, as before there were several, so older peers still understand it.
+pub fn stream_id(from: u8, to: u8) -> u8 {
+    (from & 0x0F) << 4 | (to & 0x0F)
+}
+
+/// The sender's and receiver's allocations of a packet on `stream`.
+pub fn split_stream_id(stream: u8) -> (u8, u8) {
+    (stream >> 4, stream & 0x0F)
 }
 
 fn message_type(method: u16, class: u16) -> u16 {
@@ -250,20 +276,30 @@ fn crc32(b: &[u8]) -> u32 {
 pub enum Output {
     /// Send this datagram back to the client at this address.
     ToClient(SocketAddr, Vec<u8>),
-    /// Carry this payload to the peer.
-    ToPeer(Vec<u8>),
+    /// Carry this payload to the peer, on this media stream (see
+    /// [`stream_id`]).
+    ToPeer(u8, Vec<u8>),
+}
+
+/// One client's allocation.
+struct Allocation {
+    client: SocketAddr,
+    index: u8,
+    /// Channel numbers bound to the peer's allocations, by their index.
+    channels: Vec<(u16, u8)>,
+    /// Packets handled so far when it was last heard from (the oldest
+    /// gives way when all are taken).
+    heard: u64,
 }
 
 pub struct Turn {
     username: String,
     key: [u8; 16],
     nonce: String,
-    relayed: SocketAddr,
-    peer: SocketAddr,
-    /// The client that allocated; nobody else is served after that.
-    client: Option<SocketAddr>,
-    /// Channel number bound to the peer, if any.
-    channel: Option<u16>,
+    caller: bool,
+    allocations: Vec<Allocation>,
+    /// Packets handled, as a clock for [`Allocation::heard`].
+    tick: u64,
 }
 
 impl Turn {
@@ -279,31 +315,42 @@ impl Turn {
             username: username.to_owned(),
             key,
             nonce,
-            relayed: relayed_address(caller),
-            peer: relayed_address(!caller),
-            client: None,
-            channel: None,
+            caller,
+            allocations: Vec::new(),
+            tick: 0,
         }
     }
 
-    /// The client that allocated, once one has.
-    pub fn client(&self) -> Option<SocketAddr> {
-        self.client
+    /// The clients that allocated, oldest first.
+    pub fn clients(&self) -> Vec<SocketAddr> {
+        self.allocations.iter().map(|a| a.client).collect()
+    }
+
+    /// Which of the peer's allocations `a` is the relayed address of.
+    fn peer_index(&self, a: SocketAddr) -> Option<u8> {
+        let first = relayed_address(!self.caller, 0);
+        let i = a.port().checked_sub(first.port())?;
+        (a.ip() == first.ip() && usize::from(i) < MAX_ALLOCATIONS).then_some(i as u8)
     }
 
     /// Handles a datagram from a local client at `from`.
     pub fn handle(&mut self, from: SocketAddr, b: &[u8]) -> Option<Output> {
-        if self.client.is_some_and(|c| c != from) {
-            return None;
+        self.tick += 1;
+        let tick = self.tick;
+        let at = self.allocations.iter().position(|a| a.client == from);
+        if let Some(i) = at {
+            self.allocations[i].heard = tick;
         }
         // ChannelData: 0b01 in the top bits.
         if b.first().is_some_and(|x| x & 0xC0 == 0x40) {
             let ch = u16::from_be_bytes([b[0], *b.get(1)?]);
             let len = u16::from_be_bytes([*b.get(2)?, *b.get(3)?]) as usize;
-            if self.client.is_none() || Some(ch) != self.channel {
-                return None;
-            }
-            return Some(Output::ToPeer(b.get(4..4 + len)?.to_vec()));
+            let a = &self.allocations[at?];
+            let (_, to) = a.channels.iter().find(|c| c.0 == ch)?;
+            return Some(Output::ToPeer(
+                stream_id(a.index, *to),
+                b.get(4..4 + len)?.to_vec(),
+            ));
         }
         let m = Message::parse(b)?;
         match (m.method, m.class) {
@@ -314,16 +361,40 @@ impl Turn {
                     .finish(None),
             )),
             (method::SEND, class::INDICATION) => {
+                let a = &self.allocations[at?];
                 let to = parse_xor_address(m.get(attr::XOR_PEER_ADDRESS)?, &m.txid)?;
-                (self.client.is_some() && to == self.peer)
-                    .then(|| Output::ToPeer(m.get(attr::DATA).unwrap_or_default().to_vec()))
+                let to = self.peer_index(to)?;
+                Some(Output::ToPeer(
+                    stream_id(a.index, to),
+                    m.get(attr::DATA).unwrap_or_default().to_vec(),
+                ))
             }
-            (_, class::REQUEST) => Some(Output::ToClient(from, self.request(from, &m))),
+            (_, class::REQUEST) => Some(Output::ToClient(from, self.request(from, at, &m))),
             _ => None,
         }
     }
 
-    fn request(&mut self, from: SocketAddr, m: &Message<'_>) -> Vec<u8> {
+    /// A new allocation for `from`: a free index, else the one quiet
+    /// longest gives way.
+    fn allocate(&mut self, from: SocketAddr) -> u8 {
+        let index = (0..MAX_ALLOCATIONS as u8)
+            .find(|i| !self.allocations.iter().any(|a| a.index == *i))
+            .unwrap_or_else(|| {
+                let oldest = (0..self.allocations.len())
+                    .min_by_key(|i| self.allocations[*i].heard)
+                    .unwrap_or(0);
+                self.allocations.remove(oldest).index
+            });
+        self.allocations.push(Allocation {
+            client: from,
+            index,
+            channels: Vec::new(),
+            heard: self.tick,
+        });
+        index
+    }
+
+    fn request(&mut self, from: SocketAddr, at: Option<usize>, m: &Message<'_>) -> Vec<u8> {
         let nonce = self.nonce.clone();
         let err = |code: u16, reason: &str, challenge: bool| {
             let mut v = vec![0, 0, (code / 100) as u8, (code % 100) as u8];
@@ -344,27 +415,35 @@ impl Turn {
         }
         let ok = || Builder::new(m.method, class::SUCCESS, &m.txid);
         let lifetime = |b: Builder| b.attr(attr::LIFETIME, &LIFETIME_S.to_be_bytes());
-        let peer_ok = || {
-            m.get(attr::XOR_PEER_ADDRESS)
-                .and_then(|v| parse_xor_address(v, &m.txid))
-                == Some(self.peer)
-        };
-        let reply = match m.method {
-            method::ALLOCATE => {
-                if self.client.is_some() {
-                    return err(437, "Allocation Mismatch", false);
-                }
-                self.client = Some(from);
+        // Only the peer's relayed addresses can be reached.
+        let peer = m
+            .get(attr::XOR_PEER_ADDRESS)
+            .and_then(|v| parse_xor_address(v, &m.txid))
+            .and_then(|a| self.peer_index(a));
+        let reply = match (m.method, at, peer) {
+            (method::ALLOCATE, Some(_), _) => return err(437, "Allocation Mismatch", false),
+            (method::ALLOCATE, None, _) => {
+                let index = self.allocate(from);
                 lifetime(
-                    ok().xor_addr(attr::XOR_RELAYED_ADDRESS, self.relayed, &m.txid)
-                        .xor_addr(attr::XOR_MAPPED_ADDRESS, from, &m.txid),
+                    ok().xor_addr(
+                        attr::XOR_RELAYED_ADDRESS,
+                        relayed_address(self.caller, index),
+                        &m.txid,
+                    )
+                    .xor_addr(attr::XOR_MAPPED_ADDRESS, from, &m.txid),
                 )
             }
-            _ if self.client.is_none() => return err(437, "Allocation Mismatch", false),
-            method::REFRESH => lifetime(ok()),
-            // Only the peer's relayed address can be reached.
-            method::CREATE_PERMISSION if peer_ok() => ok(),
-            method::CHANNEL_BIND if peer_ok() => {
+            (_, None, _) => return err(437, "Allocation Mismatch", false),
+            (method::REFRESH, Some(i), _) => {
+                // A zero lifetime ends the allocation (its network went).
+                if m.get(attr::LIFETIME) == Some(&[0, 0, 0, 0][..]) {
+                    self.allocations.remove(i);
+                    return ok().attr(attr::LIFETIME, &[0; 4]).finish(Some(&self.key));
+                }
+                lifetime(ok())
+            }
+            (method::CREATE_PERMISSION, Some(_), Some(_)) => ok(),
+            (method::CHANNEL_BIND, Some(i), Some(to)) => {
                 let Some(ch) = m
                     .get(attr::CHANNEL_NUMBER)
                     .and_then(|v| v.get(..2))
@@ -373,10 +452,12 @@ impl Turn {
                 else {
                     return err(400, "Bad Request", false);
                 };
-                self.channel = Some(ch);
+                let channels = &mut self.allocations[i].channels;
+                channels.retain(|c| c.0 != ch && c.1 != to);
+                channels.push((ch, to));
                 ok()
             }
-            method::CREATE_PERMISSION | method::CHANNEL_BIND => {
+            (method::CREATE_PERMISSION | method::CHANNEL_BIND, _, _) => {
                 return err(403, "Forbidden", false);
             }
             _ => return err(400, "Bad Request", false),
@@ -384,11 +465,14 @@ impl Turn {
         reply.finish(Some(&self.key))
     }
 
-    /// What to send the client for `payload` from the peer, once it has
-    /// allocated.
-    pub fn from_peer(&self, payload: &[u8]) -> Option<(SocketAddr, Vec<u8>)> {
-        let client = self.client?;
-        let out = match self.channel {
+    /// What to send which client for `payload` from the peer, arriving on
+    /// media stream `stream`: to our allocation it names, as if from the
+    /// peer's relayed address it names.
+    pub fn from_peer(&self, stream: u8, payload: &[u8]) -> Option<(SocketAddr, Vec<u8>)> {
+        let (from, to) = split_stream_id(stream);
+        let a = self.allocations.iter().find(|a| a.index == to)?;
+        let peer = relayed_address(!self.caller, from);
+        let out = match a.channels.iter().find(|c| c.1 == from).map(|c| c.0) {
             Some(ch) => {
                 let mut b = Vec::with_capacity(payload.len() + 4);
                 b.extend_from_slice(&ch.to_be_bytes());
@@ -399,12 +483,12 @@ impl Turn {
             None => {
                 let txid = threnody_core::crypto::random_bytes::<12>();
                 Builder::new(method::DATA, class::INDICATION, &txid)
-                    .xor_addr(attr::XOR_PEER_ADDRESS, self.peer, &txid)
+                    .xor_addr(attr::XOR_PEER_ADDRESS, peer, &txid)
                     .attr(attr::DATA, payload)
                     .finish(None)
             }
         };
-        Some((client, out))
+        Some((a.client, out))
     }
 }
 
@@ -493,16 +577,25 @@ mod tests {
         assert!(m.verify(&t.key), "the reply is authenticated");
         assert_eq!(
             parse_xor_address(m.get(attr::XOR_RELAYED_ADDRESS).unwrap(), &m.txid),
-            Some(relayed_address(true))
+            Some(relayed_address(true, 0))
         );
-        assert_eq!(t.client(), Some(client));
+        assert_eq!(t.clients(), vec![client]);
 
-        // Someone else on this machine is ignored now.
+        // Someone else on this machine, without the credentials, gets
+        // nothing through.
         let other: SocketAddr = "127.0.0.1:6000".parse().unwrap();
-        assert_eq!(t.handle(other, &good), None);
+        assert_eq!(t.handle(other, &[0x40, 0x01, 0, 1, b'x']), None);
+        let send_bare = Builder::new(method::SEND, class::INDICATION, &[7; 12])
+            .attr(
+                attr::XOR_PEER_ADDRESS,
+                &xor_address(relayed_address(false, 0), &[7; 12]),
+            )
+            .attr(attr::DATA, b"x")
+            .finish(None);
+        assert_eq!(t.handle(other, &send_bare), None);
 
-        // Permission and channel only for the peer's relayed address.
-        let peer = xor_address(relayed_address(false), &[7; 12]);
+        // Permission and channel only for the peer's relayed addresses.
+        let peer = xor_address(relayed_address(false, 0), &[7; 12]);
         let elsewhere = xor_address("198.51.100.1:9".parse().unwrap(), &[7; 12]);
         let auth = Some(("u", "secret", nonce.as_str()));
         let perm = |p: &Vec<u8>| {
@@ -532,9 +625,9 @@ mod tests {
             .finish(None);
         assert_eq!(
             t.handle(client, &send),
-            Some(Output::ToPeer(b"rtp".to_vec()))
+            Some(Output::ToPeer(0, b"rtp".to_vec()))
         );
-        let (to, data) = t.from_peer(b"back").unwrap();
+        let (to, data) = t.from_peer(0, b"back").unwrap();
         assert_eq!(to, client);
         let m = Message::parse(&data).unwrap();
         assert_eq!((m.method, m.class), (method::DATA, class::INDICATION));
@@ -557,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             t.handle(client, &[0x40, 0x01, 0, 3, b'a', b'b', b'c']),
-            Some(Output::ToPeer(b"abc".to_vec()))
+            Some(Output::ToPeer(0, b"abc".to_vec()))
         );
         assert_eq!(
             t.handle(client, &[0x40, 0x02, 0, 1, b'x']),
@@ -565,7 +658,7 @@ mod tests {
             "unbound channel"
         );
         assert_eq!(
-            t.from_peer(b"hi").unwrap().1,
+            t.from_peer(0, b"hi").unwrap().1,
             [0x40, 0x01, 0, 2, b'h', b'i']
         );
 
@@ -574,5 +667,78 @@ mod tests {
         let r = reply(t.handle(client, &bind_req));
         let m = Message::parse(&r).unwrap();
         assert_eq!((m.method, m.class), (method::BINDING, class::SUCCESS));
+    }
+
+    /// A second network's socket gets its own allocation and relayed port;
+    /// the stream id routes packets between the two sides' allocations.
+    #[test]
+    fn one_allocation_per_network() {
+        let mut t = Turn::new("u", "secret", false);
+        let transport = vec![17, 0, 0, 0];
+        let r = reply(t.handle(
+            "127.0.0.1:5000".parse().unwrap(),
+            &request(method::ALLOCATE, &[(0x0019, transport.clone())], None),
+        ));
+        let m = Message::parse(&r).unwrap();
+        let nonce = std::str::from_utf8(m.get(attr::NONCE).unwrap())
+            .unwrap()
+            .to_owned();
+        let auth = Some(("u", "secret", nonce.as_str()));
+        let alloc = request(method::ALLOCATE, &[(0x0019, transport)], auth);
+        let (wifi, mobile): (SocketAddr, SocketAddr) = (
+            "127.0.0.1:5001".parse().unwrap(),
+            "127.0.0.1:5002".parse().unwrap(),
+        );
+        for (client, index) in [(wifi, 0), (mobile, 1)] {
+            let r = reply(t.handle(client, &alloc));
+            let m = Message::parse(&r).unwrap();
+            assert_eq!(m.class, class::SUCCESS);
+            assert_eq!(
+                parse_xor_address(m.get(attr::XOR_RELAYED_ADDRESS).unwrap(), &m.txid),
+                Some(relayed_address(false, index))
+            );
+        }
+        // Again from the same socket: a mismatch, as TURN wants.
+        let r = reply(t.handle(mobile, &alloc));
+        assert_eq!(Message::parse(&r).unwrap().class, class::ERROR);
+
+        // The mobile socket binds a channel to the peer's allocation 3.
+        let peer3 = xor_address(relayed_address(true, 3), &[7; 12]);
+        let bind = request(
+            method::CHANNEL_BIND,
+            &[
+                (attr::CHANNEL_NUMBER, vec![0x40, 0x07, 0, 0]),
+                (attr::XOR_PEER_ADDRESS, peer3),
+            ],
+            auth,
+        );
+        let r = reply(t.handle(mobile, &bind));
+        assert_eq!(Message::parse(&r).unwrap().class, class::SUCCESS);
+        assert_eq!(
+            t.handle(mobile, &[0x40, 0x07, 0, 2, b'h', b'i']),
+            Some(Output::ToPeer(stream_id(1, 3), b"hi".to_vec()))
+        );
+        // From the peer's allocation 3 to our 1: the mobile socket, on
+        // its channel; to our 0: the Wi-Fi socket, as a Data indication.
+        assert_eq!(
+            t.from_peer(stream_id(3, 1), b"yo"),
+            Some((mobile, vec![0x40, 0x07, 0, 2, b'y', b'o']))
+        );
+        let (to, data) = t.from_peer(stream_id(3, 0), b"yo").unwrap();
+        assert_eq!(to, wifi);
+        let m = Message::parse(&data).unwrap();
+        assert_eq!(
+            parse_xor_address(m.get(attr::XOR_PEER_ADDRESS).unwrap(), &m.txid),
+            Some(relayed_address(true, 3))
+        );
+        assert_eq!(t.from_peer(stream_id(0, 9), b"nobody"), None);
+        assert_eq!(stream_id(0, 0), 0, "older peers' only stream");
+        assert_eq!(split_stream_id(stream_id(5, 12)), (5, 12));
+
+        // A zero-lifetime refresh ends the mobile allocation.
+        let end = request(method::REFRESH, &[(attr::LIFETIME, vec![0; 4])], auth);
+        let r = reply(t.handle(mobile, &end));
+        assert_eq!(Message::parse(&r).unwrap().class, class::SUCCESS);
+        assert_eq!(t.clients(), vec![wifi]);
     }
 }

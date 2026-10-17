@@ -44,6 +44,12 @@ const RELAY_RETRY_EVERY: Duration = Duration::from_secs(2);
 /// A call over a relay circuit tries for a direct path this often (each
 /// try punches for a minute).
 const UPGRADE_EVERY: Duration = Duration::from_secs(60);
+/// Media silent this long on a session that still looks up: its path may
+/// have died (a network change the platform didn't report; the session's
+/// lease takes longer to notice), so look for a new one meanwhile.
+const MEDIA_STALL: Duration = Duration::from_secs(4);
+/// Gap between those looks.
+const REPATH_EVERY: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -608,11 +614,15 @@ impl Node {
 
     /// Ends call `id` when it rings unanswered too long, or when its media
     /// stops arriving. Meanwhile, if the call runs over a relay circuit,
-    /// it looks for a direct path to move to.
+    /// it looks for a direct path to move to; if its session ends (Wi-Fi or
+    /// Bluetooth went), it reaches the peer again by any path, so the call
+    /// carries on over the new session.
     fn watch_call(&self, id: u64) {
         let node = self.clone();
         tokio::spawn(async move {
             let mut upgraded: Option<tokio::time::Instant> = None;
+            let mut repathed: Option<tokio::time::Instant> = None;
+            let mut rescue = Rescue(None);
             loop {
                 tokio::time::sleep(WATCH_EVERY).await;
                 let (peer, phase, started, last_rx) = {
@@ -627,6 +637,35 @@ impl Node {
                     upgraded = Some(tokio::time::Instant::now());
                 }
                 let now = now_ms();
+                if phase == Phase::Active {
+                    if !node.connected(&peer) {
+                        if rescue.0.as_ref().is_none_or(|h| h.is_finished()) {
+                            node.emit(Event::ReachNote {
+                                note: format!(
+                                    "call with {}: session lost, reaching them again",
+                                    peer.fingerprint()
+                                ),
+                            });
+                            let n = node.clone();
+                            rescue.0 = Some(tokio::spawn(async move {
+                                let _ = n.reach_for_call(&peer).await;
+                            }));
+                        }
+                    } else if now.saturating_sub(last_rx) > MEDIA_STALL.as_millis() as u64
+                        && node.connected_directly(&peer)
+                        && repathed.is_none_or(|t| t.elapsed() >= REPATH_EVERY)
+                        && node.repath(peer)
+                    {
+                        repathed = Some(tokio::time::Instant::now());
+                        node.emit(Event::ReachNote {
+                            note: format!(
+                                "call with {}: no media for {} s, looking for a new path",
+                                peer.fingerprint(),
+                                now.saturating_sub(last_rx) / 1000
+                            ),
+                        });
+                    }
+                }
                 let reason = match phase {
                     Phase::Active
                         if now.saturating_sub(last_rx) > MEDIA_TIMEOUT.as_millis() as u64 =>
@@ -646,5 +685,16 @@ impl Node {
                 return;
             }
         });
+    }
+}
+
+/// The task reaching a call's peer again; stopped with the call.
+struct Rescue(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for Rescue {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
     }
 }

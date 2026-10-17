@@ -60,7 +60,10 @@ const STANDBY_KEEPALIVE_MAX: Duration = Duration::from_secs(300);
 /// socket. Home routers forget UDP mappings within a minute (one did in
 /// under 60 s in testing); refreshing them is cheap on Wi-Fi or wired.
 const HOLE_KEEPALIVE: Duration = Duration::from_secs(20);
-const STANDBY_WAIT: Duration = Duration::from_millis(1500);
+/// How long the standby socket waits for DHT nodes to report its outside
+/// address. An idle mobile radio takes a second or more to wake, so the
+/// first IPv4 answers came too late at 1.5 s in testing.
+const STANDBY_WAIT: Duration = Duration::from_secs(4);
 /// The recovery slot record is per session, so it has no epochs.
 const SLOT_EPOCH: u64 = 0;
 /// State file for recovery slots and peers' paths, so a restarted app can
@@ -303,15 +306,22 @@ impl Node {
         }
         let paths = Paths::decode(payload).ok()?;
         let lease = lease_for(paths.beat_ms);
-        let new_standby = {
+        let (new_standby, new_main) = {
             let mut peers = lock(&self.rec().peers);
             let p = peers.entry(peer).or_default();
             let changed = p.theirs.standby != paths.standby;
+            let main = p.theirs.main != paths.main;
             p.theirs = paths;
             p.updated_ms = now_ms();
-            changed && !p.theirs.standby.is_empty()
+            (changed && !p.theirs.standby.is_empty(), main)
         };
         self.save_recovery();
+        if new_main {
+            // Open our standby socket's hole toward its new addresses now:
+            // the next round may come after the network has changed.
+            self.rec().force.store(true, Ordering::Relaxed);
+            self.rec().kick.notify_one();
+        }
         if new_standby {
             let addrs: Vec<String> = lock(&self.rec().peers)
                 .get(&peer)
@@ -379,6 +389,23 @@ impl Node {
             let node = self.clone();
             tokio::spawn(async move { node.watch_slot(peer, slot, lost_ms).await });
         }
+    }
+
+    /// A call's media stopped arriving over a session that still looks up:
+    /// its path may have died unnoticed. Probe and dial where `peer` may
+    /// be, as the side that moved does; a session that comes up replaces
+    /// the old one, and the call carries on. True if punching started.
+    pub(crate) fn repath(&self, peer: PublicIdentity) -> bool {
+        let Some(pp) = lock(&self.rec().peers).get(&peer).cloned() else {
+            return false;
+        };
+        let mut targets: Vec<Candidate> = pp.theirs.standby.clone();
+        targets.extend(pp.remote.map(|addr| Candidate {
+            kind: CandidateKind::Reflexive,
+            addr,
+        }));
+        targets.extend(pp.theirs.main.iter().copied());
+        !targets.is_empty() && self.punch(peer, &targets, false, Urge::Moved)
     }
 
     /// Reads `peer`'s recovery slot every [`SLOT_POLL`] until it is back or
@@ -740,6 +767,8 @@ impl Node {
             note: format!("standby path addresses: {}", addrs.join(", ")),
         });
         self.broadcast_paths();
+        // A new standby socket (or mapping) has no holes yet: open them now.
+        self.rec().force.store(true, Ordering::Relaxed);
         self.rec().kick.notify_one();
     }
 
