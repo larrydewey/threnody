@@ -49,6 +49,10 @@ impl WgKeys {
         &self.public
     }
 
+    pub fn secret(&self) -> &[u8; 32] {
+        &self.secret
+    }
+
     pub fn secret_base64(&self) -> Zeroizing<String> {
         Zeroizing::new(base64(&self.secret[..]))
     }

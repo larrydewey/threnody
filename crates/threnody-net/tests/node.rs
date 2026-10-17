@@ -658,3 +658,30 @@ async fn wifi_direct_offers_only_between_approved_neighbours() {
     bad.passphrase = "short".into();
     assert!(bob.offer_wifi_direct(&alice.identity(), bad).is_err());
 }
+
+#[tokio::test]
+async fn turning_tunnels_on_mid_session_still_pairs_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    bob.set_tunnel_port(None).unwrap();
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    // Alice's offer reaches Bob while his tunnels are off.
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(bob.tunnel_peers().is_empty());
+
+    bob.set_tunnel_port(Some(51821)).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+    assert_eq!(alice.tunnel_peers(), vec![bob_id]);
+    assert_eq!(bob.tunnel_peers(), vec![alice.identity()]);
+}

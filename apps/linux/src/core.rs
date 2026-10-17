@@ -331,8 +331,44 @@ impl Core {
     pub fn apply_privacy(&self) {
         self.apply_privacy_to(&self.main, false);
         self.apply_anchor();
+        self.apply_tunnels();
         for p in lock(&self.personas).values() {
             self.apply_privacy_to(&p.node, true);
+        }
+    }
+
+    /// WireGuard tunnels (Appendix D), on the main identity only. The node
+    /// offers them to mutually approved contacts, and the config for
+    /// kernel WireGuard is kept current in [`Core::wireguard_conf`].
+    fn apply_tunnels(&self) {
+        let on = self.settings().opted_in(settings::TUNNELS);
+        if on == self.main.tunnel_port().is_some() {
+            return;
+        }
+        let port = on.then_some(threnody_core::tunnel::DEFAULT_PORT);
+        if let Err(e) = self.main.set_tunnel_port(port) {
+            self.say(format!("! tunnels: {e}"));
+        }
+        self.write_wireguard_conf();
+    }
+
+    /// Where the wg-quick config for the tunnels lives, as for the CLI.
+    pub fn wireguard_conf(&self) -> PathBuf {
+        self.home.join("wireguard").join("thr0.conf")
+    }
+
+    fn write_wireguard_conf(&self) {
+        let path = self.wireguard_conf();
+        let r = if self.main.tunnel_port().is_some() {
+            write_private(&path, self.main.wireguard_config().as_bytes())
+        } else {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        };
+        if let Err(e) = r {
+            self.say(format!("! writing {}: {e}", path.display()));
         }
     }
 
@@ -974,6 +1010,13 @@ impl Core {
                     NodeEvent::ApprovalChanged { peer, mutual } => {
                         self.say(format!("* {} approval: mutual={mutual}", short(peer)));
                     }
+                    // The tunnel's preshared key stays out of the log.
+                    NodeEvent::TunnelUp { peer, .. } | NodeEvent::TunnelDown { peer } => {
+                        self.say(format!("* tunnel change with {}", short(peer)));
+                        if persona.is_none() {
+                            self.write_wireguard_conf();
+                        }
+                    }
                     other => self.say(format!("· {other:?}")),
                 }
                 e
@@ -1267,4 +1310,24 @@ pub fn preview(e: &HistoryEntry) -> String {
         Some(f) => file_label(&f.name, f.sensitive, &e.text, f.clip),
         None => e.text.lines().next().unwrap_or("").to_owned(),
     }
+}
+
+/// Writes `data` to `path` (and its directory) readable only by the user:
+/// a WireGuard config holds the private key.
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
 }

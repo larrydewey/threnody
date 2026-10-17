@@ -1007,6 +1007,17 @@ class MainActivity : Activity() {
             else "Only your own contacts relay for you"
         }
         networkSection.add("Always-on relay").setOnMenuItemClickListener { alwaysOnRelay(); true }
+        networkSection.add("WireGuard tunnels").apply {
+            isCheckable = true
+            isChecked = Privacy.tunnels(this@MainActivity)
+            setOnMenuItemClickListener {
+                node?.let { n ->
+                    if (Privacy.tunnels(this@MainActivity)) Tunnels.disable(this@MainActivity, n)
+                    else Tunnels.enable(this@MainActivity, n)
+                }
+                true
+            }
+        }
         networkSection.add("Relay directories").setOnMenuItemClickListener { DirectoryUi.show(this@MainActivity); true }
 
         // Messaging

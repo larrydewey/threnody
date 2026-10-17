@@ -90,5 +90,12 @@
         <receiver android:name=".Calls$Decline" android:exported="false" />
         <service android:name=".ThrenodyService" android:exported="false"
             android:foregroundServiceType="remoteMessaging|microphone" />
+        <!-- WireGuard tunnels to approved contacts, over the overlay network only. -->
+        <service android:name=".ThrenodyVpn" android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

@@ -36,6 +36,7 @@ object Privacy {
     private const val TYPING = "send_typing"
     private const val GIPHY = "giphy_search"
     private const val ANCHOR = "always_on_relay"
+    private const val TUNNELS = "wireguard_tunnels"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -79,6 +80,17 @@ object Privacy {
     fun setAlwaysOnRelay(ctx: Context, fingerprint: String?) {
         prefs(ctx).edit().putString(ANCHOR, fingerprint).apply()
         Threnody.applyPrivacy(ctx)
+    }
+
+    /**
+     * WireGuard tunnels to mutually approved contacts (Appendix D), through
+     * the phone's VPN slot. Off unless chosen: Android runs one VPN at a
+     * time, so this would displace another VPN app.
+     */
+    fun tunnels(ctx: Context) = prefs(ctx).getBoolean(TUNNELS, false)
+
+    fun setTunnels(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(TUNNELS, on).apply()
     }
 
     fun sendReadReceipts(ctx: Context) = prefs(ctx).getBoolean(READ_RECEIPTS, true)

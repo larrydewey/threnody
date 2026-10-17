@@ -27,6 +27,9 @@ import uniffi.threnody_ffi.ThrenodyNode
  */
 object Threnody {
     @Volatile private var instance: ThrenodyNode? = null
+
+    /** The main node, if it has started. */
+    fun running(): ThrenodyNode? = instance
     var listenAddr: String = ""
         private set
     private val log = StringBuilder()
@@ -61,6 +64,7 @@ object Threnody {
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
         openPersonas(ctx.applicationContext, it)
         applyPrivacy(ctx)
+        Tunnels.resume(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)
         keepStandby(ctx.applicationContext, it)
         nameThisDevice(it)
@@ -654,6 +658,8 @@ object Threnody {
                         ctx.startActivity(Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }
                 }
+                // The tunnel's preshared key stays out of the log.
+                is NodeEvent.TunnelUp -> say("* tunnel up with ${short(e.peer)} at ${e.endpoint}")
                 else -> say("· $e")
             }
             for (l in listeners) l(e)

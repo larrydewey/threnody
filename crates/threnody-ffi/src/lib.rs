@@ -775,6 +775,9 @@ pub struct ThrenodyNode {
     /// Call audio (see `calls`).
     #[cfg_attr(not(feature = "calls"), allow(dead_code))]
     media: calls::Media,
+    /// Userspace WireGuard on a TUN descriptor (`tunnel_start_device`).
+    #[cfg(all(feature = "boringtun", unix))]
+    tunnel_device: Mutex<Option<threnody_net::WgDevice>>,
 }
 
 /// Groups an entry's reactions by emoji; `me` is our reactor id.
@@ -1220,6 +1223,8 @@ impl ThrenodyNode {
             groups: Mutex::new(groups),
             queued,
             media,
+            #[cfg(all(feature = "boringtun", unix))]
+            tunnel_device: Mutex::new(None),
         }))
     }
 
@@ -1385,6 +1390,11 @@ impl ThrenodyNode {
         self.node.tunnel_port()
     }
 
+    /// Contacts this device has a WireGuard tunnel with (fingerprints).
+    pub fn tunnel_peers(&self) -> Vec<String> {
+        self.node.tunnel_peers().iter().map(fp).collect()
+    }
+
     /// Returns this device's WireGuard static public key (base64) and
     /// overlay address. The overlay address is an IPv6 ULA in fd00::/8
     /// derived from the identity key.
@@ -1433,10 +1443,9 @@ PersistentKeepalive = 25\n",
         s
     }
 
-    /// Applies current tunnel peers to a running WireGuard interface
-    /// (Linux: `wg set`; Android: via boringtun). Requires
-    /// `CAP_NET_ADMIN` or root on Linux; on Android this pushes to the
-    /// userspace WireGuard implementation.
+    /// Applies current tunnel peers to a running kernel WireGuard
+    /// interface with `wg set` (Linux; needs `CAP_NET_ADMIN`). Without
+    /// kernel WireGuard, use `tunnel_start_device`.
     pub fn wireguard_apply(&self, iface: String) -> Result<()> {
         let _guard = self.rt.enter();
         self.node.apply_wireguard(&iface).map_err(fail)
@@ -2364,28 +2373,42 @@ impl ThrenodyNode {
 /// Userspace WireGuard (boringtun), for platforms without kernel WireGuard
 /// support. Kept in its own block: `#[uniffi::export]` ignores `#[cfg]` on
 /// individual methods.
-#[cfg(feature = "boringtun")]
+#[cfg(all(feature = "boringtun", unix))]
 #[uniffi::export]
 impl ThrenodyNode {
-    /// Starts the userspace WireGuard implementation (boringtun) for
-    /// platforms without kernel WireGuard support (Android, iOS, unprivileged).
-    /// Returns the local UDP port being listened on.
-    pub fn wireguard_start_userspace(&self) -> Result<u16> {
+    /// Carries tunnel traffic through `fd`, a TUN interface such as
+    /// Android's `VpnService` gives, routing the overlay network
+    /// (`wireguard_info`), with userspace WireGuard on the tunnel port
+    /// (`set_tunnel_port`, which must be set). Takes ownership of `fd`.
+    /// Replaces any device already running.
+    pub fn tunnel_start_device(&self, fd: i32) -> Result<()> {
+        let port = self
+            .node
+            .tunnel_port()
+            .ok_or_else(|| fail("tunnels are off: set a tunnel port first"))?;
+        // Adopting registers the descriptor with the runtime's reactor.
         let _guard = self.rt.enter();
-        self.node.start_wg_userspace().map_err(fail)
+        let tun = threnody_tun::FdTun::adopt(fd);
+        let mut device = self.tunnel_device.lock().unwrap();
+        // Free the port before binding it again.
+        *device = None;
+        let tun = tun.map_err(fail)?;
+        let started = self
+            .rt
+            .block_on(threnody_net::WgDevice::start(self.node.clone(), tun, port))
+            .map_err(fail)?;
+        *device = Some(started);
+        Ok(())
     }
 
-    /// Stops the userspace WireGuard implementation.
-    pub fn wireguard_stop_userspace(&self) {
-        let _guard = self.rt.enter();
-        self.node.stop_wg_userspace();
+    /// Stops carrying tunnel traffic and closes the TUN descriptor.
+    pub fn tunnel_stop_device(&self) {
+        *self.tunnel_device.lock().unwrap() = None;
     }
 
-    /// Sends a packet through the userspace WireGuard tunnel to a peer.
-    pub fn wireguard_userspace_send(&self, peer: String, data: Vec<u8>) -> Result<()> {
-        let p = self.resolve(&peer)?;
-        let _guard = self.rt.enter();
-        self.node.wg_userspace_send(&p, &data).map_err(fail)
+    /// Whether a TUN device is carrying tunnel traffic.
+    pub fn tunnel_device_running(&self) -> bool {
+        self.tunnel_device.lock().unwrap().is_some()
     }
 }
 

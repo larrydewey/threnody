@@ -5857,6 +5857,7 @@ dependencies = [
  "threnody-groups",
  "threnody-media",
  "threnody-net",
+ "threnody-tun",
  "tokio",
  "uniffi",
 ]
@@ -5912,8 +5913,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "threnody-core",
+ "threnody-tun",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "threnody-tun"
+version = "0.15.0"
+dependencies = [
+ "libc",
+ "tokio",
 ]
 
 [[package]]

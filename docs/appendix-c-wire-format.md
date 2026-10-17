@@ -36,7 +36,8 @@ AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Rela
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
-                                                           ; 512 read, 1024 calls, 2048 pin, 4096 lists); absent = 0
+                                                           ; 512 read, 1024 calls, 2048 pin, 4096 lists,
+                                                           ; 8192 tunnel); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
@@ -67,6 +68,8 @@ GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bs
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),
           ; group id, payload, name, member (forward target or receipt subject), reference
 ```
+
+`Tunnel` (`{ 0 => 29, 2 => bstr }`) carries one WireGuard packet for the tunnel with the peer (Appendix D, *Over the session*), only to devices whose `Hello` has bit 8192. It is sent at once even under cover traffic, like call media. On QUIC sessions the same packets go as QUIC datagrams when they fit, recognised by WireGuard's header (a message type from 1 to 4, then three zero bytes) rather than a call id.
 
 ## Acknowledgements
 
