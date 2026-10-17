@@ -60,7 +60,10 @@ const STANDBY_KEEPALIVE_MAX: Duration = Duration::from_secs(300);
 /// socket. Home routers forget UDP mappings within a minute (one did in
 /// under 60 s in testing); refreshing them is cheap on Wi-Fi or wired.
 const HOLE_KEEPALIVE: Duration = Duration::from_secs(20);
-const STANDBY_WAIT: Duration = Duration::from_millis(1500);
+/// How long the standby socket waits for DHT nodes to report its outside
+/// address. An idle mobile radio takes a second or more to wake, so the
+/// first IPv4 answers came too late at 1.5 s in testing.
+const STANDBY_WAIT: Duration = Duration::from_secs(4);
 /// The recovery slot record is per session, so it has no epochs.
 const SLOT_EPOCH: u64 = 0;
 /// State file for recovery slots and peers' paths, so a restarted app can

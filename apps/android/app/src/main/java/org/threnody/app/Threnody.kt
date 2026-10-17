@@ -342,12 +342,12 @@ object Threnody {
             cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     nets[network] = wifi
-                    onNetwork(cm, node)
+                    onNetwork(ctx, cm, node)
                 }
 
                 override fun onLost(network: Network) {
                     nets.remove(network)
-                    onNetwork(cm, node)
+                    onNetwork(ctx, cm, node)
                 }
 
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
@@ -362,7 +362,7 @@ object Threnody {
                         }
                     }
                     // Validation decides which one a VPN runs over.
-                    onNetwork(cm, node)
+                    onNetwork(ctx, cm, node)
                 }
             })
         }
@@ -389,8 +389,9 @@ object Threnody {
      * standby to the other network, and redials.
      */
     @Synchronized
-    private fun onNetwork(cm: ConnectivityManager, node: ThrenodyNode) {
+    private fun onNetwork(ctx: Context, cm: ConnectivityManager, node: ThrenodyNode) {
         val network = physicalDefault(cm)
+        network?.let { cm.getNetworkCapabilities(it) }?.let { checkMetered(ctx, it) }
         if (network == defaultNet) {
             // The standby may have a network to go to now.
             chooseStandby(cm, node)
@@ -455,24 +456,31 @@ object Threnody {
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 systemDefault = network
-                onNetwork(cm, node)
+                onNetwork(ctx, cm, node)
             }
 
             override fun onLost(network: Network) {
                 if (systemDefault == network) systemDefault = null
-                onNetwork(cm, node)
+                onNetwork(ctx, cm, node)
             }
 
-            // Cover traffic stays on; on metered data it runs slower.
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-                if (metered != Privacy.metered) {
-                    Privacy.metered = metered
-                    applyPrivacy(ctx)
-                    say("* ${if (metered) "metered" else "unmetered"} network: cover traffic every ${Privacy.coverMs(ctx) ?: "—"} ms")
-                }
+                onNetwork(ctx, cm, node)
             }
         })
+    }
+
+    /**
+     * Cover traffic stays on; on metered data it runs slower. Read from the
+     * physical network: a VPN never says it is unmetered.
+     */
+    private fun checkMetered(ctx: Context, caps: NetworkCapabilities) {
+        val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        if (metered != Privacy.metered) {
+            Privacy.metered = metered
+            applyPrivacy(ctx)
+            say("* ${if (metered) "metered" else "unmetered"} network: cover traffic every ${Privacy.coverMs(ctx) ?: "—"} ms")
+        }
     }
 
     /** Opens the node, its identity sealed under the Android Keystore. */
