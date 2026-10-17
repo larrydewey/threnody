@@ -381,6 +381,23 @@ impl Node {
         }
     }
 
+    /// A call's media stopped arriving over a session that still looks up:
+    /// its path may have died unnoticed. Probe and dial where `peer` may
+    /// be, as the side that moved does; a session that comes up replaces
+    /// the old one, and the call carries on. True if punching started.
+    pub(crate) fn repath(&self, peer: PublicIdentity) -> bool {
+        let Some(pp) = lock(&self.rec().peers).get(&peer).cloned() else {
+            return false;
+        };
+        let mut targets: Vec<Candidate> = pp.theirs.standby.clone();
+        targets.extend(pp.remote.map(|addr| Candidate {
+            kind: CandidateKind::Reflexive,
+            addr,
+        }));
+        targets.extend(pp.theirs.main.iter().copied());
+        !targets.is_empty() && self.punch(peer, &targets, false, Urge::Moved)
+    }
+
     /// Reads `peer`'s recovery slot every [`SLOT_POLL`] until it is back or
     /// [`RECOVER_FOR`] has passed; new addresses there go to the punch.
     async fn watch_slot(&self, peer: PublicIdentity, slot: [u8; 32], lost_ms: u64) {

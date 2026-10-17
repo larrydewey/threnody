@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.RingtoneManager
@@ -120,9 +121,9 @@ object Calls {
         // can take a while (the node gives up after 45 s).
         ended = null
         val mine = ++attempt
-        current = Call(node, persona, REACHING, device, title, outgoing = true, state = "reaching", video = video, speaker = video)
+        current = Call(node, persona, REACHING, device, title, outgoing = true, state = "reaching", video = video,
+            speaker = video && headset(a) == null)
         inCall(a, true)
-        if (video) route(a, true)
         changed()
         a.startActivity(Intent(a, CallActivity::class.java))
         Threading.background {
@@ -179,9 +180,8 @@ object Calls {
         Threading.background {
             try {
                 c.node.answerCall(c.id, video)
-                current = c.copy(state = "connecting", video = video, speaker = video)
+                current = c.copy(state = "connecting", video = video, speaker = video && headset(a) == null)
                 inCall(a, true)
-                if (video) route(a, true)
             } catch (e: Exception) {
                 Threnody.say("! answer: ${e.message}")
             }
@@ -222,8 +222,8 @@ object Calls {
         Threading.background {
             try { c.node.setCallVideo(on) } catch (e: Exception) { Threnody.say("! video: ${e.message}") }
         }
-        // Video is for a speaker, not an ear.
-        if (on && !c.speaker) setSpeaker(a, true)
+        // Video is for a speaker (or a headset), not an ear.
+        if (on && !c.speaker && headset(a) == null) setSpeaker(a, true)
         changed()
     }
 
@@ -249,7 +249,7 @@ object Calls {
     fun setSpeaker(ctx: Context, on: Boolean) {
         val c = current ?: return
         current = c.copy(speaker = on)
-        route(ctx, on)
+        route(ctx)
         changed()
     }
 
@@ -344,19 +344,98 @@ object Calls {
         }
         val am = ctx.getSystemService(AudioManager::class.java) ?: return
         am.mode = if (on) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL
-        if (!on) route(ctx, false)
+        if (on) {
+            route(ctx)
+            if (deviceWatch == null) {
+                val app = ctx.applicationContext
+                deviceWatch = object : AudioDeviceCallback() {
+                    override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) = route(app)
+                    override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) = route(app)
+                }.also { am.registerAudioDeviceCallback(it, android.os.Handler(android.os.Looper.getMainLooper())) }
+            }
+        } else {
+            deviceWatch?.let { am.unregisterAudioDeviceCallback(it) }
+            deviceWatch = null
+            unroute(am)
+        }
+        Threnody.updateStandby()
     }
 
-    /** Speaker or earpiece. */
-    private fun route(ctx: Context, speaker: Boolean) {
+    /** Headsets (Bluetooth, or a hearing aid) take a call's audio when connected, in this order. */
+    private val HEADSETS = listOf(
+        26, // AudioDeviceInfo.TYPE_BLE_HEADSET (API 31)
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_HEARING_AID,
+    )
+
+    /** Watches headsets come and go while a call runs. */
+    private var deviceWatch: AudioDeviceCallback? = null
+
+    /** The connected headset a call's audio would go to, if any. */
+    private fun headset(ctx: Context): AudioDeviceInfo? {
+        val am = ctx.getSystemService(AudioManager::class.java) ?: return null
+        val devices = if (Build.VERSION.SDK_INT >= 31) am.availableCommunicationDevices
+            else am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        return HEADSETS.firstNotNullOfOrNull { t -> devices.firstOrNull { it.type == t } }
+    }
+
+    /** Where the call's audio was last sent, for the log. */
+    @Volatile private var routedTo: String? = null
+
+    /**
+     * Sends the call's audio where it belongs now: the speaker if chosen,
+     * else a connected headset, else the speaker for video or the
+     * earpiece (or a wired headset). Runs again whenever a headset
+     * connects or drops, so audio follows it without a gap to silence.
+     */
+    private fun route(ctx: Context) {
+        val c = current ?: return
         val am = ctx.getSystemService(AudioManager::class.java) ?: return
-        if (Build.VERSION.SDK_INT >= 31) {
-            if (!speaker) return am.clearCommunicationDevice()
-            am.availableCommunicationDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                ?.let { am.setCommunicationDevice(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = speaker
+        val headset = if (c.speaker) null else headset(ctx)
+        val speaker = c.speaker || (headset == null && c.video)
+        val to = when {
+            speaker -> "speaker"
+            headset != null -> headset.productName?.toString()?.takeIf { it.isNotBlank() } ?: "headset"
+            else -> "earpiece"
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                val want = headset ?: if (speaker) {
+                    am.availableCommunicationDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                } else null
+                if (want == null) am.clearCommunicationDevice()
+                else if (am.communicationDevice?.id != want.id) am.setCommunicationDevice(want)
+            } else {
+                legacyRoute(am, speaker, headset?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
+            }
+        } catch (e: Exception) {
+            Threnody.say("! call audio: ${e.javaClass.simpleName}")
+        }
+        if (to != routedTo) {
+            routedTo = to
+            Threnody.say("* call audio: $to")
+        }
+    }
+
+    /** Gives audio routing back to the system after a call. */
+    private fun unroute(am: AudioManager) {
+        routedTo = null
+        try {
+            if (Build.VERSION.SDK_INT >= 31) am.clearCommunicationDevice()
+            else legacyRoute(am, speaker = false, sco = false)
+        } catch (_: Exception) {}
+    }
+
+    /** Android 10 and 11: the speakerphone switch, and Bluetooth SCO by hand. */
+    @Suppress("DEPRECATION")
+    private fun legacyRoute(am: AudioManager, speaker: Boolean, sco: Boolean) {
+        am.isSpeakerphoneOn = speaker
+        if (sco && !am.isBluetoothScoOn) {
+            am.startBluetoothSco()
+            am.isBluetoothScoOn = true
+        } else if (!sco && am.isBluetoothScoOn) {
+            am.isBluetoothScoOn = false
+            am.stopBluetoothSco()
         }
     }
 

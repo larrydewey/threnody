@@ -378,7 +378,14 @@ impl Node {
 
     /// The network changed: gather candidates again, publish and poll.
     pub fn network_changed(&self) {
-        lock(&self.rdv().inner).backoff.clear();
+        {
+            let mut inner = lock(&self.rdv().inner);
+            inner.backoff.clear();
+            // Where peers and DHT nodes saw us is where we were: gathering
+            // now must not offer the old network's address again.
+            inner.observed.clear();
+            inner.reflected.clear();
+        }
         // The anchor needs no DHT: dial it from the new network at once.
         self.rdv().anchor_kick.notify_one();
         // DHT write tokens are bound to our address: rejoin from the new

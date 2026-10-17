@@ -295,8 +295,8 @@ object Threnody {
     /**
      * Keeps holes open through mobile data while on Wi-Fi, so losing Wi-Fi
      * costs a fraction of a second, but only while it matters (the radio
-     * time costs battery): the app is open, a chat was active in the last
-     * ten minutes, or the Wi-Fi signal is weakening.
+     * time costs battery): the app is open, a call runs, a chat was active
+     * in the last ten minutes, or the Wi-Fi signal is weakening.
      */
     fun updateStandby() {
         val n = instance ?: return
@@ -304,12 +304,19 @@ object Threnody {
         // to keep warm; one on mobile data costs radio time.
         val standbyWifi = standbyNet?.let { nets[it] } == true
         val warm = forceWarm ?: (standbyWifi || (onWifi && (visible > 0 || wifiWeak ||
-            System.currentTimeMillis() - lastActivity < ACTIVE_MS)))
+            Calls.current != null || System.currentTimeMillis() - lastActivity < ACTIVE_MS)))
         n.setStandbyWarm(warm)
     }
 
-    /** The default network, as last reported. */
+    /**
+     * The physical network our traffic leaves on, as last acted on. Under a
+     * VPN (ours, for tunnels, or another app's) this isn't the default
+     * network Android reports, which stays the VPN while Wi-Fi and mobile
+     * data come and go beneath it.
+     */
     @Volatile private var defaultNet: Network? = null
+    /** The default network as Android reports it (a VPN, possibly). */
+    @Volatile private var systemDefault: Network? = null
     /** The network the standby socket is bound to, if any. */
     @Volatile private var standbyNet: Network? = null
     /** Wi-Fi and mobile networks that are up: true for Wi-Fi. */
@@ -335,22 +342,85 @@ object Threnody {
             cm.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     nets[network] = wifi
-                    chooseStandby(cm, node)
+                    onNetwork(cm, node)
                 }
 
                 override fun onLost(network: Network) {
                     nets.remove(network)
-                    chooseStandby(cm, node)
+                    onNetwork(cm, node)
+                }
+
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    if (wifi) {
+                        // Read here, not from the default network: under a
+                        // VPN that reports no signal.
+                        val weak = caps.signalStrength != NetworkCapabilities.SIGNAL_STRENGTH_UNSPECIFIED &&
+                            caps.signalStrength < WEAK_WIFI_DBM
+                        if (weak != wifiWeak) {
+                            wifiWeak = weak
+                            updateStandby()
+                        }
+                    }
+                    // Validation decides which one a VPN runs over.
+                    onNetwork(cm, node)
                 }
             })
         }
         Threading.schedulePeriodic(1, 1, TimeUnit.MINUTES) { updateStandby() }
     }
 
+    /**
+     * The physical network traffic leaves on: the default network, or under
+     * a VPN the one Android would pick, a validated Wi-Fi before mobile data.
+     */
+    private fun physicalDefault(cm: ConnectivityManager): Network? {
+        val d = systemDefault ?: return null
+        val caps = cm.getNetworkCapabilities(d)
+        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) != true) return d
+        fun validated(n: Network) =
+            cm.getNetworkCapabilities(n)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val up = nets.entries.sortedByDescending { it.value }.map { it.key }
+        return up.firstOrNull(::validated) ?: up.firstOrNull()
+    }
+
+    /**
+     * Acts on a change of physical network: tells the node first (it dials
+     * through the standby path if that is where we are now), moves the
+     * standby to the other network, and redials.
+     */
+    @Synchronized
+    private fun onNetwork(cm: ConnectivityManager, node: ThrenodyNode) {
+        val network = physicalDefault(cm)
+        if (network == defaultNet) {
+            // The standby may have a network to go to now.
+            chooseStandby(cm, node)
+            return
+        }
+        defaultNet = network
+        if (network == null) {
+            chooseStandby(cm, node)
+            say("* no network")
+            return
+        }
+        val caps = cm.getNetworkCapabilities(network)
+        val cellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        // First, before anything else: this side knows it moved, and may
+        // already have a path open on the new network.
+        node.networkChanged(network == standbyNet, cellular)
+        // The standby moves to the other network, if one is up.
+        chooseStandby(cm, node)
+        say("* network available (${if (cellular) "mobile data" else if (onWifi) "Wi-Fi" else "other"}); reconnecting")
+        node.reconnect()
+        for (n in personaNodes.values) n.reconnect()
+        updateStandby()
+    }
+
     /** Binds the standby socket to a network that is up and not the default. */
     @Synchronized
     private fun chooseStandby(cm: ConnectivityManager, node: ThrenodyNode) {
-        val want = nets.keys.firstOrNull { it != defaultNet }
+        // Until the default is known, any network may turn out to be it.
+        val want = defaultNet?.let { d -> nets.keys.firstOrNull { it != d } }
         if (want == standbyNet) return
         standbyNet = want
         if (want == null) {
@@ -377,37 +447,24 @@ object Threnody {
     }
 
     /**
-     * Redials approved contacts whenever a network becomes available,
-     * including right away if one already is.
+     * Redials approved contacts whenever the network changes, including
+     * right away if one is up.
      */
     private fun redialOnNetwork(ctx: Context, node: ThrenodyNode) {
         val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                val caps = cm.getNetworkCapabilities(network)
-                val cellular = caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
-                onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-                defaultNet = network
-                // First, before anything else: this side knows it moved,
-                // and may already have a path open on the new network.
-                node.networkChanged(network == standbyNet, cellular)
-                // The standby moves to the other network, if one is up.
-                chooseStandby(cm, node)
-                say("* network available (${if (cellular) "mobile data" else if (onWifi) "Wi-Fi" else "other"}); reconnecting")
-                node.reconnect()
-                for (n in personaNodes.values) n.reconnect()
+                systemDefault = network
+                onNetwork(cm, node)
+            }
+
+            override fun onLost(network: Network) {
+                if (systemDefault == network) systemDefault = null
+                onNetwork(cm, node)
             }
 
             // Cover traffic stays on; on metered data it runs slower.
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    val weak = caps.signalStrength != NetworkCapabilities.SIGNAL_STRENGTH_UNSPECIFIED &&
-                        caps.signalStrength < WEAK_WIFI_DBM
-                    if (weak != wifiWeak) {
-                        wifiWeak = weak
-                        updateStandby()
-                    }
-                }
                 val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
                 if (metered != Privacy.metered) {
                     Privacy.metered = metered

@@ -314,3 +314,46 @@ async fn calling_reaches_a_contact_without_a_session() {
     };
     assert_eq!(call, id);
 }
+
+/// A call whose session drops (Wi-Fi or Bluetooth went) reaches the peer
+/// again and carries on over the new session: no hangup, media flows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calls_survive_a_dropped_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let ((alice, mut arx), (bob, mut brx), _) = pair(&dir, false).await;
+    let b_id = bob.identity();
+    let id = alice.start_call(&b_id, false).unwrap();
+    next(&mut brx, 10, |e| matches!(e, Event::CallIncoming { .. })).await;
+    bob.answer_call(id, false).unwrap();
+    next(&mut arx, 10, |e| matches!(e, Event::CallStarted { .. })).await;
+    let mut at_bob = bob.call_media(id).unwrap();
+
+    assert!(alice.disconnect(&b_id));
+    next(&mut arx, 10, |e| matches!(e, Event::Disconnected { .. })).await;
+    // Neither side hangs up; Alice's side reaches Bob again by itself.
+    timeout(Duration::from_secs(15), async {
+        while !alice.sessions().iter().any(|s| s.peer == b_id) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("reconnected during the call");
+    let got = timeout(Duration::from_secs(10), async {
+        loop {
+            alice.send_media(id, 1, b"still here").unwrap();
+            if let Ok(Some(m)) = timeout(Duration::from_millis(200), at_bob.recv()).await {
+                return m;
+            }
+        }
+    })
+    .await
+    .expect("media after the drop");
+    assert_eq!(got, (1, b"still here".to_vec()));
+    assert_eq!(alice.call().unwrap().phase, CallPhase::Active);
+    assert_eq!(bob.call().unwrap().phase, CallPhase::Active);
+    for rx in [&mut arx, &mut brx] {
+        while let Ok(e) = rx.try_recv() {
+            assert!(!matches!(e, Event::CallEnded { .. }), "{e:?}");
+        }
+    }
+}
