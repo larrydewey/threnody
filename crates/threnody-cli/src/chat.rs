@@ -53,6 +53,16 @@ pub struct Options {
     /// Route through volunteer relays from subscribed directories.
     pub use_volunteers: bool,
     pub directory_threshold: usize,
+    /// Run without a terminal, as a service: commands come over this
+    /// control socket ([`control_path`]), not stdin.
+    pub control: Option<PathBuf>,
+}
+
+/// Where a node running as a service takes commands (`threnody ctl`):
+/// `$THRENODY_CONTROL`, else `control.sock` in the data directory.
+pub fn control_path(home: &Home) -> PathBuf {
+    std::env::var_os("THRENODY_CONTROL")
+        .map_or_else(|| home.dir().join("control.sock"), PathBuf::from)
 }
 
 pub struct TunnelOptions {
@@ -136,6 +146,8 @@ struct Ui {
 pub async fn run(opts: Options) -> Result<()> {
     let downloads = opts.home.dir().join("downloads");
     let opts_dir = opts.home.dir().to_path_buf();
+    let control = opts.control.as_deref().map(control::listen).transpose()?;
+    crate::out::set_service(control.is_some());
     let groups =
         GroupUi::load(&opts.home, &opts.identity, downloads.clone()).context("loading groups")?;
     let tunnels = opts
@@ -163,20 +175,20 @@ pub async fn run(opts: Options) -> Result<()> {
     node.set_directory_threshold(opts.directory_threshold);
     if let Some((addr, review)) = &opts.serve_directory {
         let link = node.serve_directory(addr, *review)?;
-        println!("Serving a relay directory. Share this link with people who should use it:");
-        println!("  {link}");
+        say!("Serving a relay directory. Share this link with people who should use it:");
+        say!("  {link}");
         if *review {
-            println!("  Relays wait for /directory list <relay> before they're listed.");
+            say!("  Relays wait for /directory list <relay> before they're listed.");
         }
     }
     if !opts.volunteer_relay.is_empty() {
         if node.directories().is_empty() {
-            println!(
+            say!(
                 "  note: subscribe to a directory (/dir add <link>) to be listed as a volunteer relay"
             );
         }
         node.set_volunteer(Some(opts.volunteer_relay.clone()))?;
-        println!(
+        say!(
             "Volunteering as a relay at {}",
             opts.volunteer_relay.join(", ")
         );
@@ -184,21 +196,21 @@ pub async fn run(opts: Options) -> Result<()> {
     node.set_strip_metadata(opts.strip_metadata);
     node.set_default_timer(opts.default_timer);
     if opts.main_identity.is_some() {
-        println!(
+        say!(
             "Threnody — anonymous identity {}. Nothing links it to your main one unless you /reveal it.",
             node.identity().fingerprint()
         );
     } else {
-        println!("Threnody — you are {}", node.identity().fingerprint());
+        say!("Threnody — you are {}", node.identity().fingerprint());
     }
     if groups.count() > 0 {
-        println!("{} group(s) restored. /groups to list", groups.count());
+        say!("{} group(s) restored. /groups to list", groups.count());
     }
     if let Some(t) = &tunnels {
-        println!("Tunnels on: overlay address {}", t.overlay());
-        println!("  WireGuard config: {}", t.conf_path().display());
+        say!("Tunnels on: overlay address {}", t.overlay());
+        say!("  WireGuard config: {}", t.conf_path().display());
         if opts.tunnel.as_ref().is_some_and(|o| !o.apply) {
-            println!(
+            say!(
                 "  Bring it up with: sudo wg-quick up {}",
                 t.conf_path().display()
             );
@@ -211,7 +223,7 @@ pub async fn run(opts: Options) -> Result<()> {
                 .listen(a)
                 .await
                 .with_context(|| format!("listening on {a}"))?;
-            println!(
+            say!(
                 "Listening on {bound} (tcp). Share: threnody invite <your-ip>:{}",
                 bound.port()
             );
@@ -241,15 +253,15 @@ pub async fn run(opts: Options) -> Result<()> {
                 anchor,
                 ..ReachConfig::default()
             }) {
-                Ok(()) => println!(
+                Ok(()) => say!(
                     "QUIC on udp/{}; reaching approved contacts across the internet \
                      (public DHT rendezvous; --no-rendezvous turns it off)",
                     q.port()
                 ),
-                Err(e) => println!("! internet reachability unavailable: {e}"),
+                Err(e) => say!("! internet reachability unavailable: {e}"),
             }
         } else {
-            println!("QUIC on udp/{}; internet rendezvous off", q.port());
+            say!("QUIC on udp/{}; internet rendezvous off", q.port());
         }
     }
     let mut ui = Ui {
@@ -280,11 +292,9 @@ pub async fn run(opts: Options) -> Result<()> {
         match ui.node.start_discovery(cfg, tcp.port()) {
             Ok(a) => {
                 ui.discovery = Some(a);
-                println!(
-                    "LAN discovery on udp/{port}: approved peers nearby connect automatically."
-                );
+                say!("LAN discovery on udp/{port}: approved peers nearby connect automatically.");
             }
-            Err(e) => println!("! LAN discovery unavailable: {e}"),
+            Err(e) => say!("! LAN discovery unavailable: {e}"),
         }
     }
     for t in &opts.connect {
@@ -294,14 +304,14 @@ pub async fn run(opts: Options) -> Result<()> {
     let _ble = if opts.ble {
         match crate::ble::listen(&ui.node).await {
             Ok(l) => {
-                println!(
+                say!(
                     "Bluetooth LE: advertising, L2CAP psm {}; approved contacts nearby connect automatically",
                     l.psm
                 );
                 Some(l)
             }
             Err(e) => {
-                println!("! Bluetooth LE unavailable: {e:#}");
+                say!("! Bluetooth LE unavailable: {e:#}");
                 None
             }
         }
@@ -310,21 +320,32 @@ pub async fn run(opts: Options) -> Result<()> {
     };
     #[cfg(not(all(feature = "ble", target_os = "linux")))]
     if opts.ble {
-        println!("! this build has no Bluetooth LE support");
+        say!("! this build has no Bluetooth LE support");
     }
-    println!("Type /help for commands.");
+    if control.is_some() {
+        say!("Running as a service. Commands: threnody ctl <command> (/help lists them).");
+    } else {
+        say!("Type /help for commands.");
+    }
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = control
+        .is_none()
+        .then(|| BufReader::new(tokio::io::stdin()).lines());
     let stopped = stop_signal();
     tokio::pin!(stopped);
     loop {
         tokio::select! {
-            line = lines.next_line() => {
+            line = next_line(&mut lines) => {
                 let Some(line) = line? else { break };
                 match ui.handle_line(line.trim()).await {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(e) => println!("! {e:#}"),
+                    Err(e) => say!("! {e:#}"),
+                }
+            }
+            conn = control::accept(control.as_ref()) => {
+                if control::serve(&mut ui, conn).await {
+                    break;
                 }
             }
             Some(ev) = events.recv() => ui.handle_event(ev),
@@ -337,6 +358,132 @@ pub async fn run(opts: Options) -> Result<()> {
         b.shutdown().await;
     }
     Ok(())
+}
+
+/// The next line typed, or never when stdin isn't read (as a service).
+async fn next_line(
+    lines: &mut Option<tokio::io::Lines<BufReader<tokio::io::Stdin>>>,
+) -> std::io::Result<Option<String>> {
+    match lines {
+        Some(l) => l.next_line().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The control socket of a node running as a service: `threnody ctl`
+/// sends one command line and gets back what the node said running it.
+/// The socket is owner-only and lives in the data directory, which is
+/// owner-only too.
+mod control {
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    use anyhow::Context;
+    use anyhow::{Result, bail};
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    use super::Ui;
+
+    /// Longest command line taken.
+    #[cfg(unix)]
+    const MAX_LINE: u64 = 64 * 1024;
+    /// A client gets this long to send its command.
+    #[cfg(unix)]
+    const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[cfg(unix)]
+    pub type Listener = tokio::net::UnixListener;
+    #[cfg(unix)]
+    pub type Conn = tokio::net::UnixStream;
+    #[cfg(not(unix))]
+    pub type Listener = std::convert::Infallible;
+    #[cfg(not(unix))]
+    pub type Conn = std::convert::Infallible;
+
+    #[cfg(unix)]
+    pub fn listen(path: &Path) -> Result<Listener> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        // A socket left by a node that didn't shut down cleanly; nothing
+        // else is ever removed.
+        if let Ok(m) = std::fs::symlink_metadata(path) {
+            if !m.file_type().is_socket() {
+                bail!("{} exists and is not a socket", path.display());
+            }
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                bail!("a node is already running here ({})", path.display());
+            }
+            std::fs::remove_file(path)?;
+        }
+        let l = Listener::bind(path).with_context(|| {
+            format!(
+                "control socket {} (a path over about 100 bytes is too long: \
+                     set THRENODY_CONTROL to a shorter one)",
+                path.display()
+            )
+        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(l)
+    }
+
+    #[cfg(not(unix))]
+    pub fn listen(_: &Path) -> Result<Listener> {
+        bail!("running as a service needs Unix (its control socket)")
+    }
+
+    /// The next client, or never without a socket.
+    pub async fn accept(l: Option<&Listener>) -> Option<Conn> {
+        #[cfg(unix)]
+        if let Some(l) = l {
+            return l.accept().await.ok().map(|(c, _)| c);
+        }
+        #[cfg(not(unix))]
+        let _ = l;
+        std::future::pending().await
+    }
+
+    /// Runs the client's command and answers with what was said; `true`
+    /// when it was /quit.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub async fn serve(ui: &mut Ui, conn: Option<Conn>) -> bool {
+        let Some(conn) = conn else { return false };
+        #[cfg(unix)]
+        {
+            let (rd, mut wr) = conn.into_split();
+            let mut line = String::new();
+            let read = tokio::time::timeout(
+                READ_TIMEOUT,
+                BufReader::new(rd.take(MAX_LINE)).read_line(&mut line),
+            )
+            .await;
+            if !matches!(read, Ok(Ok(n)) if n > 0) {
+                return false;
+            }
+            let line = line.trim();
+            // The log says which command ran, not its arguments or answer
+            // (a plain line is a message).
+            let cmd = line
+                .split_whitespace()
+                .next()
+                .filter(|w| w.starts_with('/'));
+            say!("* control: {}", cmd.unwrap_or("message"));
+            let (r, mut said) = crate::out::capture(ui.handle_line(line)).await;
+            let quit = match r {
+                Ok(q) => q,
+                Err(e) => {
+                    said.push_str(&format!("! {e:#}\n"));
+                    false
+                }
+            };
+            let _ = wr.write_all(said.as_bytes()).await;
+            let _ = wr.shutdown().await;
+            quit
+        }
+        #[cfg(not(unix))]
+        match conn {}
+    }
 }
 
 /// Ctrl-C, or (on Unix) being stopped by a service manager, `kill` or a
@@ -405,12 +552,12 @@ impl Ui {
             let relay_to = known.map(|k| k.fingerprint()).or(pin);
             match relay_to {
                 Some(fp) => {
-                    println!("* {t}: direct path failed ({e:#}); trying relays");
+                    say!("* {t}: direct path failed ({e:#}); trying relays");
                     if let Err(e) = node.connect_relayed(fp).await {
-                        println!("! connect {t}: {e:#}");
+                        say!("! connect {t}: {e:#}");
                     }
                 }
-                None => println!("! connect {t}: {e:#}"),
+                None => say!("! connect {t}: {e:#}"),
             }
         });
     }
@@ -422,11 +569,14 @@ impl Ui {
             None => self.name(&peer),
         };
         match msg {
+            AppMessage::Text { .. } if crate::out::private() => {
+                say!("<{who}> sent a message (/history to read it)");
+            }
             AppMessage::Text { body, quote, .. } => {
                 if let Some(q) = quote {
-                    println!("<{who}> {}", quoted(&q, &|d| self.name(d)));
+                    say!("<{who}> {}", quoted(&q, &|d| self.name(d)));
                 }
-                println!("<{who}> {body}");
+                say!("<{who}> {body}");
             }
             AppMessage::File {
                 name,
@@ -441,15 +591,15 @@ impl Ui {
                 let saved = save_download(&self.downloads, &name, &data);
                 let mark = file_mark(sensitive, clip);
                 match &saved {
-                    Ok(p) => println!(
+                    Ok(p) => say!(
                         "* {who} sent {name}{mark} ({} bytes) -> {}",
                         data.len(),
                         p.display()
                     ),
-                    Err(e) => println!("! could not save file from {who}: {e:#}"),
+                    Err(e) => say!("! could not save file from {who}: {e:#}"),
                 }
-                if !caption.is_empty() {
-                    println!("<{who}> {caption}");
+                if !caption.is_empty() && !crate::out::private() {
+                    say!("<{who}> {caption}");
                 }
                 self.node.record_received_file(
                     &peer,
@@ -480,7 +630,7 @@ impl Ui {
     fn send_to_account(&self, peer: PublicIdentity, body: &str) -> Result<()> {
         let r = self.node.send_text(&peer, body)?;
         if r.live + r.sealed + r.queued > 1 || r.sealed + r.queued > 0 {
-            println!(
+            say!(
                 "* to {} device(s): {} live, {} sealed for mailboxes{}",
                 r.live + r.sealed + r.queued,
                 r.live,
@@ -520,7 +670,7 @@ impl Ui {
         }
         let hits = self.node.search(scope.map(|(_, c)| c), query, LIMIT)?;
         if hits.is_empty() {
-            println!("  no messages match");
+            say!("  no messages match");
             return Ok(());
         }
         // Oldest first, like /history, so the newest is nearest the prompt.
@@ -554,14 +704,14 @@ impl Ui {
                 None => e.text.clone(),
             };
             if scope.is_some_and(|(p, _)| p.is_some()) {
-                print!("{:>3}", i + 1);
+                say_part!("{:>3}", i + 1);
             } else {
-                print!("   ");
+                say_part!("   ");
             }
-            println!("  [{}] {place}<{who}> {body}", clock(e.at_ms));
+            say!("  [{}] {place}<{who}> {body}", clock(e.at_ms));
         }
         if hits.len() == LIMIT {
-            println!("  (the {LIMIT} newest matches; add words to narrow it)");
+            say!("  (the {LIMIT} newest matches; add words to narrow it)");
         }
         Ok(())
     }
@@ -570,14 +720,14 @@ impl Ui {
         let conv = self.node.conversation_for(&peer);
         let h = self.node.history(conv)?;
         if let Some(t) = self.node.timer(&peer) {
-            println!("  (messages disappear after {})", human_secs(t));
+            say!("  (messages disappear after {})", human_secs(t));
         }
         if h.entries().is_empty() {
-            println!("  no history with {}", self.name(&peer));
+            say!("  no history with {}", self.name(&peer));
         }
         *self.shown.borrow_mut() = (Some(peer), h.recent(n).to_vec());
         for (i, e) in h.recent(n).iter().enumerate() {
-            print!("{:>3}", i + 1);
+            say_part!("{:>3}", i + 1);
             let who = if e.outgoing {
                 "me".to_owned()
             } else {
@@ -617,10 +767,10 @@ impl Ui {
                 mark.push_str(&format!("  [{}]", shown.join(" ")));
             }
             if let Some(q) = &e.quote {
-                print!("  {}\n   ", quoted(q, &|d| self.name(d)));
+                say_part!("  {}\n   ", quoted(q, &|d| self.name(d)));
             }
             match &e.file {
-                Some(f) => println!(
+                Some(f) => say!(
                     "  [{}] <{who}> file {}{} ({} bytes){}{}{mark}",
                     clock(e.at_ms),
                     f.name,
@@ -635,7 +785,7 @@ impl Ui {
                         format!(": {}", e.text)
                     }
                 ),
-                None => println!("  [{}] <{who}> {}{mark}", clock(e.at_ms), e.text),
+                None => say!("  [{}] <{who}> {}{mark}", clock(e.at_ms), e.text),
             }
         }
         Ok(())
@@ -661,7 +811,7 @@ impl Ui {
             _ => bail!("usage: /profile [set <key> <value> | unset <key>]"),
         }
         if profile.is_empty() {
-            println!("* your profile is empty. /profile set name <your name>");
+            say!("* your profile is empty. /profile set name <your name>");
         }
         for (k, v) in &profile {
             let who: Vec<String> = self
@@ -676,7 +826,7 @@ impl Ui {
             } else {
                 format!("shared with {}", who.join(", "))
             };
-            println!("  {k}: {v}  ({shown})");
+            say!("  {k}: {v}  ({shown})");
         }
         Ok(())
     }
@@ -705,7 +855,7 @@ impl Ui {
             .map_or_else(|| dest.to_string(), |c| c.label());
         tokio::spawn(async move {
             if let Err(e) = node.connect_relayed(dest).await {
-                println!("! relay to {who}: {e:#}");
+                say!("! relay to {who}: {e:#}");
             }
         });
     }
@@ -715,13 +865,13 @@ impl Ui {
     fn wifi_direct_offer(&self, peer: PublicIdentity, offer: threnody_net::DirectOffer) {
         let who = self.name(&peer);
         if !self.wifi_direct {
-            println!(
+            say!(
                 "* {who} offers a Wi-Fi Direct link ({}); run with --wifi-direct to join",
                 offer.ssid
             );
             return;
         }
-        println!(
+        say!(
             "* {who} offers a Wi-Fi Direct link ({}); joining…",
             offer.ssid
         );
@@ -739,12 +889,12 @@ impl Ui {
                         .push(name);
                 }
                 Err(e) => {
-                    println!("! Wi-Fi Direct join: {e:#}");
+                    say!("! Wi-Fi Direct join: {e:#}");
                     return;
                 }
             }
             if let Err(e) = node.connect(&offer.addr, Some(peer.fingerprint())).await {
-                println!("! Wi-Fi Direct connect to {}: {e:#}", offer.addr);
+                say!("! Wi-Fi Direct connect to {}: {e:#}", offer.addr);
             }
         });
     }
@@ -758,8 +908,8 @@ impl Ui {
         );
         for n in names {
             match crate::wifidirect::leave(&n).await {
-                Ok(()) => println!("* left Wi-Fi Direct group ({n})"),
-                Err(e) => println!("! leaving {n}: {e:#}"),
+                Ok(()) => say!("* left Wi-Fi Direct group ({n})"),
+                Err(e) => say!("! leaving {n}: {e:#}"),
             }
         }
     }
@@ -770,13 +920,13 @@ impl Ui {
             "list" => {
                 let dirs = self.node.directories();
                 if dirs.is_empty() {
-                    println!("No directories. /dir add <threnody-dir://…> subscribes to one.");
+                    say!("No directories. /dir add <threnody-dir://…> subscribes to one.");
                 }
                 for d in dirs {
                     let until = d.valid_until_ms.map_or("no document".to_owned(), |t| {
                         format!("valid until {}", fmt_time(t))
                     });
-                    println!(
+                    say!(
                         "  {}  {} relays, {until}, {} token credential(s)\n    {}",
                         threnody_core::directory::short_id(&d.issuer),
                         d.relays,
@@ -785,7 +935,7 @@ impl Ui {
                     );
                 }
                 let usable = self.node.volunteer_relays().len();
-                println!(
+                say!(
                     "  {usable} volunteer relay(s) usable now; routing through them is {}",
                     if self.node.use_volunteers() {
                         "on"
@@ -798,9 +948,9 @@ impl Ui {
                 let link = words
                     .next()
                     .ok_or_else(|| anyhow!("usage: /dir add <threnody-dir://…>"))?;
-                println!("* subscribing (over an anonymous link)…");
+                say!("* subscribing (over an anonymous link)…");
                 let d = self.node.subscribe_directory(link).await?;
-                println!(
+                say!(
                     "* subscribed to directory {}: {} relays, {} token credential(s)",
                     threnody_core::directory::short_id(&d.issuer),
                     d.relays,
@@ -816,18 +966,18 @@ impl Ui {
                 });
                 match found {
                     Some(d) if self.node.unsubscribe_directory(&d.issuer) => {
-                        println!("* unsubscribed")
+                        say!("* unsubscribed")
                     }
                     _ => bail!("no directory {id}"),
                 }
             }
             "refresh" => {
                 self.node.refresh_directories().await;
-                println!("* directories refreshed");
+                say!("* directories refreshed");
             }
             "relays" => {
                 for r in self.node.volunteer_relays() {
-                    println!("  {}  {}", r.identity.fingerprint(), r.addrs.join(", "));
+                    say!("  {}  {}", r.identity.fingerprint(), r.addrs.join(", "));
                 }
             }
             _ => bail!("usage: /dir [list|add <link>|remove <id>|refresh|relays]"),
@@ -844,10 +994,10 @@ impl Ui {
             "relays" => {
                 let relays = self.node.directory_relays();
                 if relays.is_empty() {
-                    println!("No relays have registered yet.");
+                    say!("No relays have registered yet.");
                 }
                 for r in relays {
-                    println!(
+                    say!(
                         "  {} {}  {}  (descriptor expires {})",
                         if r.listed { "listed " } else { "waiting" },
                         r.identity.fingerprint(),
@@ -873,7 +1023,7 @@ impl Ui {
                     .ok_or_else(|| anyhow!("no registered relay {q}"))?;
                 self.node
                     .set_relay_listed(&relay.identity.fingerprint(), cmd == "list");
-                println!(
+                say!(
                     "* {} {}",
                     relay.identity.fingerprint(),
                     if cmd == "list" { "listed" } else { "unlisted" }
@@ -894,7 +1044,7 @@ impl Ui {
             "list" => {
                 let held = self.node.credentials();
                 if held.is_empty() {
-                    println!("No credentials. Someone you know can /cred offer you one.");
+                    say!("No credentials. Someone you know can /cred offer you one.");
                 }
                 for (i, c) in held.iter().enumerate() {
                     let attrs: Vec<String> = c
@@ -902,7 +1052,7 @@ impl Ui {
                         .iter()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect();
-                    println!(
+                    say!(
                         "  {}. {} from {} (expires day {}): {}",
                         i + 1,
                         c.schema,
@@ -931,7 +1081,7 @@ impl Ui {
                 }
                 let expires = threnody_core::credential::day(threnody_core::now_ms()) + days;
                 let id = self.node.offer_credential(&peer, schema, attrs, expires)?;
-                println!(
+                say!(
                     "* offered {} a credential ({schema}, {id:x})",
                     self.name(&peer)
                 );
@@ -943,7 +1093,7 @@ impl Ui {
                         .iter()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect();
-                    println!(
+                    say!(
                         "  {:x}  {} from {}: {}",
                         o.id,
                         o.schema,
@@ -954,11 +1104,11 @@ impl Ui {
             }
             "accept" => {
                 self.node.accept_credential_offer(parse_id(words.next())?)?;
-                println!("* accepted; waiting for the issuer to sign");
+                say!("* accepted; waiting for the issuer to sign");
             }
             "decline" => {
                 self.node.decline_credential(parse_id(words.next())?)?;
-                println!("* declined");
+                say!("* declined");
             }
             "ask" => {
                 let peer = self.resolve_peer(words.next())?;
@@ -975,14 +1125,14 @@ impl Ui {
                     })
                     .unwrap_or_default();
                 let id = self.node.ask_credential(&peer, schema, keys)?;
-                println!(
+                say!(
                     "* asked {} for a credential ({schema}, {id:x})",
                     self.name(&peer)
                 );
             }
             "asks" => {
                 for a in self.node.credential_asks() {
-                    println!(
+                    say!(
                         "  {:x}  {} asks for {} from {}",
                         a.id,
                         self.name(&a.peer),
@@ -1013,7 +1163,7 @@ impl Ui {
                 };
                 self.node.present_credential(id, cred.id, &keys)?;
                 let shown: Vec<&String> = keys.iter().filter(|k| ask.keys.contains(k)).collect();
-                println!(
+                say!(
                     "* proved to {}: {}",
                     self.name(&ask.peer),
                     if shown.is_empty() {
@@ -1037,7 +1187,7 @@ impl Ui {
                     .get(n.wrapping_sub(1))
                     .ok_or_else(|| anyhow!("no credential {n}"))?;
                 self.node.delete_credential(cred.id);
-                println!("* deleted");
+                say!("* deleted");
             }
             _ => bail!("see /help for /cred commands"),
         }
@@ -1064,7 +1214,7 @@ impl Ui {
                             Some(i) if i.transport == "onion" => "onion circuit, last relay",
                             _ => "relay",
                         };
-                        println!(
+                        say!(
                             "* connected to {who} through {how} {} [{}, end-to-end]",
                             self.name(&v),
                             suite.name()
@@ -1077,15 +1227,15 @@ impl Ui {
                             .into_iter()
                             .find(|s| s.peer == peer)
                             .map_or(("tcp", addr.to_string()), |s| (s.transport, s.remote));
-                        println!("* connected to {who} at {r} [{t}, {}]", suite.name());
+                        say!("* connected to {who} at {r} [{t}, {}]", suite.name());
                     }
                 }
                 if new_contact {
-                    println!("  new contact (trust on first use). Compare safety numbers: /safety");
+                    say!("  new contact (trust on first use). Compare safety numbers: /safety");
                 }
                 if self.current.is_none() {
                     self.current = Some(peer);
-                    println!("  messages now go to {who}");
+                    say!("  messages now go to {who}");
                 }
                 let node = self.node.clone();
                 let name = |p: &PublicIdentity| name_of(&node, p);
@@ -1093,21 +1243,22 @@ impl Ui {
             }
             Event::Message { peer, msg } => self.show_message(peer, msg, None),
             Event::MessageEdited { peer, .. } => {
-                println!(
+                say!(
                     "* {} edited a message (/history to see it)",
                     self.name(&peer)
                 );
             }
             Event::MessagesDeleted { peer, count } => {
-                println!("* {} deleted {count} message(s)", self.name(&peer));
+                say!("* {} deleted {count} message(s)", self.name(&peer));
             }
             Event::MessageRequest { peer, msg } => {
                 let what = match &msg {
+                    AppMessage::Text { .. } if crate::out::private() => "a message".into(),
                     AppMessage::Text { body, .. } => format!("{body:?}"),
                     AppMessage::File { name, .. } => format!("a file ({name})"),
                     _ => "a message".into(),
                 };
-                println!(
+                say!(
                     "? message request from {}: {what} — /accept {p}, /block {p} or /delete {p}",
                     self.name(&peer),
                     p = &peer.fingerprint().to_string()[..9]
@@ -1128,7 +1279,7 @@ impl Ui {
             Event::Delivered { .. } | Event::Read { .. } => {}
             // Calls are for the apps; the terminal only says one rang.
             Event::CallIncoming { peer, .. } => {
-                println!("* {} is calling (answer in the app)", self.name(&peer));
+                say!("* {} is calling (answer in the app)", self.name(&peer));
             }
             Event::CallRinging { .. }
             | Event::CallStarted { .. }
@@ -1138,13 +1289,13 @@ impl Ui {
             | Event::CallEnded { .. } => {}
             Event::Typing { peer, active } => {
                 if active {
-                    println!("* {} is typing", self.name(&peer));
+                    say!("* {} is typing", self.name(&peer));
                 }
             }
             Event::Reacted { peer, .. } => {
-                println!("* {} reacted (see /history)", self.name(&peer));
+                say!("* {} reacted (see /history)", self.name(&peer));
             }
-            Event::Pinned { peer, pin, .. } => println!(
+            Event::Pinned { peer, pin, .. } => say!(
                 "* {} {} a message (see /pins)",
                 self.name(&peer),
                 if pin { "pinned" } else { "unpinned" }
@@ -1157,14 +1308,14 @@ impl Ui {
                     .map(|c| c.profile.clone())
                     .unwrap_or_default();
                 if shown.is_empty() {
-                    println!(
+                    say!(
                         "* {} no longer shares any profile details",
                         self.name(&peer)
                     );
                 } else {
                     let list: Vec<String> =
                         shown.iter().map(|(k, v)| format!("{k}: {v}")).collect();
-                    println!("* {} shares {}", self.name(&peer), list.join(", "));
+                    say!("* {} shares {}", self.name(&peer), list.join(", "));
                 }
             }
             Event::IdentityRevealed {
@@ -1172,21 +1323,21 @@ impl Ui {
                 identity,
                 invite,
             } => {
-                println!(
+                say!(
                     "* {} revealed who they are: {} (proven by its signature)",
                     self.name(&peer),
                     identity.fingerprint()
                 );
                 match invite {
-                    Some(i) => println!("  to add them: /connect {i}"),
-                    None => println!(
+                    Some(i) => say!("  to add them: /connect {i}"),
+                    None => say!(
                         "  they gave no address; add them when you meet: {}",
                         identity.fingerprint()
                     ),
                 }
             }
             Event::HistorySynced { from, added } => {
-                println!(
+                say!(
                     "* {added} message(s) synced from your device {}",
                     self.name(&from)
                 );
@@ -1200,11 +1351,11 @@ impl Ui {
                 let (m, t) = (self.name(&mailbox), self.name(&to));
                 let how = if anonymous { " (sender hidden)" } else { "" };
                 match status {
-                    DepositStatus::Held => println!("* {m} is holding your message for {t}{how}"),
+                    DepositStatus::Held => say!("* {m} is holding your message for {t}{how}"),
                     DepositStatus::Delivered => {
-                        println!("* {m} delivered your message to {t}{how}")
+                        say!("* {m} delivered your message to {t}{how}")
                     }
-                    DepositStatus::Declined => println!(
+                    DepositStatus::Declined => say!(
                         "! {m} declined to hold your message for {t} (it needs mutual approval with both of you)"
                     ),
                 }
@@ -1220,19 +1371,19 @@ impl Ui {
                 } else {
                     "has not approved you"
                 };
-                println!(
+                say!(
                     "* {who} {state}{}",
                     if mutual { " — mutually approved" } else { "" }
                 );
             }
             Event::WifiDirectOffer { peer, offer } => self.wifi_direct_offer(peer, offer),
-            Event::WifiDirectRequested { peer } => println!(
+            Event::WifiDirectRequested { peer } => say!(
                 "* {} asked for a Wi-Fi Direct link; this device can only join groups, not host them",
                 self.name(&peer)
             ),
             Event::Disconnected { peer, reason } => {
                 // Keep `current`: plain lines then go out as sealed messages.
-                println!("* {} disconnected ({reason})", self.name(&peer));
+                say!("* {} disconnected ({reason})", self.name(&peer));
             }
             Event::TunnelUp {
                 peer,
@@ -1244,10 +1395,10 @@ impl Ui {
                 let who = self.name(&peer);
                 if let Some(t) = self.tunnels.as_mut() {
                     match t.up(&peer, wg_public, endpoint, psk) {
-                        Ok(()) => println!(
+                        Ok(()) => say!(
                             "* tunnel to {who}: {overlay} via {endpoint} (PSK from this session)"
                         ),
-                        Err(e) => println!("! tunnel to {who}: {e:#}"),
+                        Err(e) => say!("! tunnel to {who}: {e:#}"),
                     }
                 }
             }
@@ -1255,9 +1406,9 @@ impl Ui {
                 let who = self.name(&peer);
                 if let Some(t) = self.tunnels.as_mut() {
                     match t.down(&peer, wg_public) {
-                        Ok(true) => println!("* tunnel to {who} removed"),
+                        Ok(true) => say!("* tunnel to {who} removed"),
                         Ok(false) => {}
-                        Err(e) => println!("! removing tunnel to {who}: {e:#}"),
+                        Err(e) => say!("! removing tunnel to {who}: {e:#}"),
                     }
                 }
             }
@@ -1267,18 +1418,18 @@ impl Ui {
                 connected,
             } => {
                 if !connected {
-                    println!("* found {} nearby at {addr}", self.name(&peer));
+                    say!("* found {} nearby at {addr}", self.name(&peer));
                 }
             }
             Event::DialFailed { peer, addr, reason } => {
-                println!("! could not reach {} at {addr}: {reason}", self.name(&peer));
+                say!("! could not reach {} at {addr}: {reason}", self.name(&peer));
             }
             Event::Addresses {
                 candidates,
                 symmetric,
             } => {
                 let list: Vec<String> = candidates.iter().map(ToString::to_string).collect();
-                println!(
+                say!(
                     "* internet addresses: {}{}",
                     list.join(", "),
                     if symmetric { " (symmetric NAT)" } else { "" }
@@ -1290,22 +1441,22 @@ impl Ui {
                 dialing,
             } => {
                 let list: Vec<String> = targets.iter().map(ToString::to_string).collect();
-                println!(
+                say!(
                     "* opening a direct path to {} ({}): {}",
                     self.name(&peer),
                     if dialing { "dialing" } else { "probing" },
                     list.join(", ")
                 );
             }
-            Event::ReachNote { note } => println!("  · {note}"),
-            Event::VolunteerNote { note } => println!("  · {note}"),
+            Event::ReachNote { note } => say!("  · {note}"),
+            Event::VolunteerNote { note } => say!("  · {note}"),
             Event::CredentialOffered { offer } => {
                 let attrs: Vec<String> = offer
                     .attributes
                     .iter()
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect();
-                println!(
+                say!(
                     "* {} offers you a credential ({}): {}. /cred accept {:x} or /cred decline {:x}",
                     self.name(&offer.peer),
                     offer.schema,
@@ -1315,13 +1466,13 @@ impl Ui {
                 );
             }
             Event::CredentialReceived { peer, schema } => {
-                println!(
+                say!(
                     "* got a credential ({schema}) from {}. /cred list",
                     self.name(&peer)
                 );
             }
             Event::CredentialAsked { ask } => {
-                println!(
+                say!(
                     "* {} asks you to prove {} from your {} credential. /cred present {:x} <n> or /cred decline {:x}",
                     self.name(&ask.peer),
                     if ask.keys.is_empty() {
@@ -1340,7 +1491,7 @@ impl Ui {
                     .iter()
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect();
-                println!(
+                say!(
                     "* {} proved a credential ({}) issued by {}: {}",
                     self.name(&peer),
                     verified.schema,
@@ -1351,13 +1502,13 @@ impl Ui {
                         attrs.join(", ")
                     }
                 );
-                println!("  pseudonym for you: {}", hex8(&verified.pseudonym));
+                say!("  pseudonym for you: {}", hex8(&verified.pseudonym));
             }
             Event::CredentialFailed { peer, reason, .. } => {
-                println!("! credential exchange with {}: {reason}", self.name(&peer));
+                say!("! credential exchange with {}: {reason}", self.name(&peer));
             }
             Event::PunchFailed { peer } => {
-                println!("* no direct path to {} yet", self.name(&peer));
+                say!("* no direct path to {} yet", self.name(&peer));
             }
             Event::AccountChanged {
                 account,
@@ -1373,59 +1524,59 @@ impl Ui {
                     });
                 for d in added {
                     if verified_before {
-                        println!(
+                        say!(
                             "! SAFETY: account {} added device {} that you haven't verified — /safety {} before trusting it",
                             &a[..9],
                             self.name(&d),
                             &d.fingerprint().to_string()[..9]
                         );
                     } else {
-                        println!("* account {} added device {}", &a[..9], self.name(&d));
+                        say!("* account {} added device {}", &a[..9], self.name(&d));
                     }
                 }
                 for d in removed {
-                    println!(
+                    say!(
                         "! account {} REMOVED device {} — it is no longer trusted",
                         &a[..9],
                         self.name(&d)
                     );
                 }
             }
-            Event::AccountFork { device, account } => println!(
+            Event::AccountFork { device, account } => say!(
                 "! WARNING: {} presented a conflicting history for account {} — possible compromise; ignored",
                 self.name(&device),
                 account.fingerprint()
             ),
             Event::DeviceLinked { device } => {
-                println!(
+                say!(
                     "* linked new device {} into your account",
                     self.name(&device)
                 );
                 self.groups.linked(&self.node, &device);
             }
             Event::LinkRejected { device } => {
-                println!("! rejected a link attempt from {}", self.name(&device))
+                say!("! rejected a link attempt from {}", self.name(&device))
             }
-            Event::ListChanged { .. } => println!("* a list changed"),
+            Event::ListChanged { .. } => say!("* a list changed"),
             Event::FoldersChanged { from } => {
-                println!("* folders updated from {}", self.name(&from))
+                say!("* folders updated from {}", self.name(&from))
             }
             Event::ContactsSynced { from } => {
-                println!("* contacts updated from {}", self.name(&from))
+                say!("* contacts updated from {}", self.name(&from))
             }
             Event::TimerChanged { peer, secs } => match secs {
-                Some(t) => println!(
+                Some(t) => say!(
                     "* {} set messages to disappear after {}",
                     self.name(&peer),
                     human_secs(t)
                 ),
-                None => println!("* {} turned disappearing messages off", self.name(&peer)),
+                None => say!("* {} turned disappearing messages off", self.name(&peer)),
             },
             Event::ThisDeviceRemoved => {
-                println!("! THIS DEVICE WAS REMOVED from its account; peers will refuse it")
+                say!("! THIS DEVICE WAS REMOVED from its account; peers will refuse it")
             }
             Event::Rejected { addr, reason } => {
-                println!("* rejected connection from {addr}: {reason}")
+                say!("* rejected connection from {addr}: {reason}")
             }
         }
     }
@@ -1447,7 +1598,7 @@ impl Ui {
         let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
         match verb {
             "quit" | "q" | "exit" => return Ok(true),
-            "help" | "h" | "?" => println!("{HELP}\n{}", crate::groups::HELP),
+            "help" | "h" | "?" => say!("{HELP}\n{}", crate::groups::HELP),
             "connect" | "c" => {
                 self.connect(arg.ok_or_else(|| anyhow!("usage: /connect <target>"))?)
             }
@@ -1457,7 +1608,7 @@ impl Ui {
                     .ok_or_else(|| anyhow!("usage: /keepalive <seconds>"))?;
                 self.node
                     .set_standby_keepalive(std::time::Duration::from_secs(secs));
-                println!("* keepalives on standby holes every {secs} s");
+                say!("* keepalives on standby holes every {secs} s");
             }
             "to" => {
                 let p =
@@ -1465,12 +1616,12 @@ impl Ui {
                 self.current = Some(p);
                 // Not connected: look for it across the internet now.
                 self.node.seek(&p);
-                println!("* messages now go to {}", self.name(&p));
+                say!("* messages now go to {}", self.name(&p));
             }
             "peers" => {
                 let s = self.node.sessions();
                 if s.is_empty() {
-                    println!("No live sessions.");
+                    say!("No live sessions.");
                 }
                 for i in s {
                     let dir = if i.outbound { "out" } else { "in" };
@@ -1486,7 +1637,7 @@ impl Ui {
                         Some(v) => format!("relay through {}", self.name(&v)),
                         None => format!("{} {}", i.transport, i.remote),
                     };
-                    println!(
+                    say!(
                         "  {} via {path} ({dir}, {})",
                         self.name(&i.peer),
                         i.suite.name()
@@ -1495,7 +1646,7 @@ impl Ui {
             }
             "contacts" => {
                 for c in self.node.contacts().iter() {
-                    println!("  {}", describe_contact(c));
+                    say!("  {}", describe_contact(c));
                 }
             }
             "name" => {
@@ -1508,7 +1659,7 @@ impl Ui {
                         c.petname = Some(name.to_owned());
                     }
                 });
-                println!("* named {}", self.name(&key));
+                say!("* named {}", self.name(&key));
             }
             "react" => {
                 let mut it = arg.unwrap_or("").split_whitespace();
@@ -1531,7 +1682,7 @@ impl Ui {
                         "that message can't take reactions (it's gone, or too old to have an id)"
                     );
                 }
-                println!("* {} {emoji}", if add { "reacted" } else { "took back" });
+                say!("* {} {emoji}", if add { "reacted" } else { "took back" });
             }
             "pin" => {
                 let mut it = arg.unwrap_or("").split_whitespace();
@@ -1549,7 +1700,7 @@ impl Ui {
                 if !self.node.pin(&peer, e.message_id(), pin) {
                     bail!("that message can't be pinned (gone, or too old to have an id)");
                 }
-                println!("* {}", if pin { "pinned" } else { "unpinned" });
+                say!("* {}", if pin { "pinned" } else { "unpinned" });
             }
             "pins" => {
                 let peer = self
@@ -1557,10 +1708,10 @@ impl Ui {
                     .ok_or_else(|| anyhow!("no current peer; /to <peer>"))?;
                 let pins = self.node.pinned(self.node.conversation_for(&peer));
                 if pins.is_empty() {
-                    println!("No pinned messages.");
+                    say!("No pinned messages.");
                 }
                 for e in pins {
-                    println!(
+                    say!(
                         "  📌 [{}] {}",
                         clock(e.at_ms),
                         threnody_core::history::snippet(&e)
@@ -1601,7 +1752,7 @@ impl Ui {
                 if !self.node.edit_message(&peer, e.local_id, body.trim()) {
                     bail!("that message is gone");
                 }
-                println!("* edited");
+                say!("* edited");
             }
             "del" => {
                 let mut it = arg.unwrap_or("").split_whitespace();
@@ -1629,7 +1780,7 @@ impl Ui {
                 } else {
                     self.node.delete_entry(conv, e.at_ms, e.device)
                 };
-                println!(
+                say!(
                     "* deleted {gone} message(s){}",
                     if everyone {
                         " here and for everyone who supports it"
@@ -1647,14 +1798,14 @@ impl Ui {
                     .map(|c| c.key)
                     .collect();
                 if pending.is_empty() {
-                    println!("  no message requests");
+                    say!("  no message requests");
                 }
                 for p in pending {
                     let n = self
                         .node
                         .history(self.node.conversation_for(&p))
                         .map_or(0, |h| h.entries().len());
-                    println!("  {}  {n} message(s)", self.name(&p));
+                    say!("  {}  {n} message(s)", self.name(&p));
                 }
             }
             "accept" | "block" | "delete" => {
@@ -1663,25 +1814,25 @@ impl Ui {
                 match verb {
                     "accept" => {
                         self.node.accept_contact(&p);
-                        println!("* accepted {who}; their messages show normally now");
+                        say!("* accepted {who}; their messages show normally now");
                         self.show_history(p, 20)?;
                     }
                     "block" => {
                         self.node.block_contact(&p);
-                        println!(
+                        say!(
                             "* blocked {who}: no sessions or messages from them, conversation deleted"
                         );
                     }
                     _ => {
                         self.node.delete_request(&p);
-                        println!("* deleted the request from {who}");
+                        say!("* deleted the request from {who}");
                     }
                 }
             }
             "approve" | "revoke" => {
                 let p = self.resolve_peer(arg)?;
                 self.node.set_approval(&p, verb == "approve")?;
-                println!(
+                say!(
                     "* {} {}",
                     if verb == "approve" {
                         "approved"
@@ -1693,7 +1844,7 @@ impl Ui {
             }
             "safety" => {
                 let p = self.resolve_peer(arg)?;
-                println!(
+                say!(
                     "  {}\n  Compare with {} in person or by voice, then /verify.",
                     safety_number(&self.node.identity(), &p),
                     self.name(&p)
@@ -1706,7 +1857,7 @@ impl Ui {
                         c.verified = true;
                     }
                 });
-                println!("* marked {} verified", self.name(&p));
+                say!("* marked {} verified", self.name(&p));
             }
             "file" => {
                 let arg = arg.ok_or_else(|| anyhow!("usage: /file [-s] <path>... [| caption]"))?;
@@ -1719,7 +1870,7 @@ impl Ui {
                 for f in files {
                     self.node.send_file(&peer, f)?;
                 }
-                println!("* sent {n} file(s), {len} bytes, to {}", self.name(&peer));
+                say!("* sent {n} file(s), {len} bytes, to {}", self.name(&peer));
             }
             "drop" => {
                 let p = self.resolve_peer(arg)?;
@@ -1733,16 +1884,16 @@ impl Ui {
                     _ => bail!("usage: /policy anyone|contacts|approved"),
                 };
                 self.node.set_policy(p);
-                println!("* policy: {p:?}");
+                say!("* policy: {p:?}");
             }
             "wifi-direct" | "wd" => match arg.unwrap_or("request") {
                 "request" => {
                     let peer = self.current.ok_or_else(|| anyhow!("no current peer"))?;
                     if !self.wifi_direct {
-                        println!("  note: run with --wifi-direct to join the group offered back");
+                        say!("  note: run with --wifi-direct to join the group offered back");
                     }
                     self.node.request_wifi_direct(&peer)?;
-                    println!("* asked {} for a Wi-Fi Direct link", self.name(&peer));
+                    say!("* asked {} for a Wi-Fi Direct link", self.name(&peer));
                 }
                 "leave" => self.leave_wifi_direct().await,
                 _ => bail!("usage: /wifi-direct [request|leave]"),
@@ -1751,7 +1902,7 @@ impl Ui {
             "dir" => self.dir_command(arg).await?,
             "directory" => self.directory_command(arg)?,
             "volunteer" => match arg {
-                None | Some("") => println!(
+                None | Some("") => say!(
                     "* {}",
                     if self.node.volunteering() {
                         "volunteering as a relay"
@@ -1761,12 +1912,12 @@ impl Ui {
                 ),
                 Some("off") => {
                     self.node.set_volunteer(None)?;
-                    println!("* no longer volunteering");
+                    say!("* no longer volunteering");
                 }
                 Some(a) => {
                     let addrs: Vec<String> = a.split_whitespace().map(str::to_owned).collect();
                     self.node.set_volunteer(Some(addrs.clone()))?;
-                    println!("* volunteering as a relay at {}", addrs.join(", "));
+                    say!("* volunteering as a relay at {}", addrs.join(", "));
                 }
             },
             "vonion" => {
@@ -1781,11 +1932,11 @@ impl Ui {
                         .and_then(|c| c.last_addr.clone())
                 });
                 let addr = addr.ok_or_else(|| anyhow!("no address known for {dest}"))?;
-                println!("* building a circuit to {dest} through volunteer relays");
+                say!("* building a circuit to {dest} through volunteer relays");
                 let node = self.node.clone();
                 tokio::spawn(async move {
                     if let Err(e) = node.connect_volunteer(dest, &addr).await {
-                        println!("! volunteer circuit to {dest}: {e:#}");
+                        say!("! volunteer circuit to {dest}: {e:#}");
                     }
                 });
             }
@@ -1836,9 +1987,9 @@ impl Ui {
                 }
                 let shared = self.node.shared_with(&peer);
                 if shared.is_empty() {
-                    println!("* {} sees none of your profile", self.name(&peer));
+                    say!("* {} sees none of your profile", self.name(&peer));
                 } else {
-                    println!("* {} sees your {}", self.name(&peer), shared.join(", "));
+                    say!("* {} sees your {}", self.name(&peer), shared.join(", "));
                 }
             }
             "reveal" => {
@@ -1856,7 +2007,7 @@ impl Ui {
                 let invite =
                     addr.map(|a| crate::target::invite_link(&main.public().fingerprint(), a));
                 self.node.reveal(&peer, proof, invite)?;
-                println!(
+                say!(
                     "* revealed to {} that you are {}. This can't be taken back.",
                     self.name(&peer),
                     main.public().fingerprint()
@@ -1865,7 +2016,7 @@ impl Ui {
             "clear" => {
                 let p = self.resolve_peer(arg)?;
                 self.node.clear_conversation(&p);
-                println!(
+                say!(
                     "* cleared your messages with {}; they're still a contact",
                     self.name(&p)
                 );
@@ -1878,7 +2029,7 @@ impl Ui {
                 if self.current == Some(p) {
                     self.current = None;
                 }
-                println!(
+                say!(
                     "* deleted {name} and your conversation; they can write again as a new request"
                 );
             }
@@ -1893,12 +2044,12 @@ impl Ui {
                 };
                 self.node.set_timer(&p, secs)?;
                 match secs {
-                    Some(t) => println!(
+                    Some(t) => say!(
                         "* new messages with {} disappear after {}",
                         self.name(&p),
                         human_secs(t)
                     ),
-                    None => println!("* disappearing messages off for {}", self.name(&p)),
+                    None => say!("* disappearing messages off for {}", self.name(&p)),
                 }
             }
             "device" => {
@@ -1916,16 +2067,16 @@ impl Ui {
                             given.to_owned()
                         };
                         let code = self.node.create_link_code(addr);
-                        println!("  On the new device run:\n\n    threnody link '{code}'\n");
+                        say!("  On the new device run:\n\n    threnody link '{code}'\n");
                         if let Ok(qr) = qrcode::QrCode::new(code.to_string().as_bytes()) {
                             let art = qr
                                 .render::<qrcode::render::unicode::Dense1x2>()
                                 .dark_color(qrcode::render::unicode::Dense1x2::Light)
                                 .light_color(qrcode::render::unicode::Dense1x2::Dark)
                                 .build();
-                            println!("{art}");
+                            say!("{art}");
                         }
-                        println!(
+                        say!(
                             "  The code works once, for 10 minutes. Never share it with anyone else."
                         );
                     }
@@ -1948,7 +2099,7 @@ impl Ui {
                                 anyhow!("no device {who:?} in your account; see /devices")
                             })?;
                         self.node.rename_device(&target, name)?;
-                        println!("* renamed {who} to {:?}", name.trim());
+                        say!("* renamed {who} to {:?}", name.trim());
                     }
                     ("remove", who) if !who.is_empty() => {
                         let own = self.node.account();
@@ -1968,7 +2119,7 @@ impl Ui {
                                 anyhow!("no device {who:?} in your account; see /devices")
                             })?;
                         self.node.remove_device(&target)?;
-                        println!("* removed {} from your account", target.fingerprint());
+                        say!("* removed {} from your account", target.fingerprint());
                     }
                     _ => {
                         bail!("usage: /device add [host:port] | /device remove <name|fingerprint>")
@@ -1984,21 +2135,21 @@ impl Ui {
                     _ => (a, 2),
                 };
                 let dest = self.parse_destination(q)?;
-                println!("* building an onion circuit to {dest} ({min}+ relays)");
+                say!("* building an onion circuit to {dest} ({min}+ relays)");
                 if min < 2 {
-                    println!("  note: with one relay, that relay sees both ends");
+                    say!("  note: with one relay, that relay sees both ends");
                 }
                 let node = self.node.clone();
                 tokio::spawn(async move {
                     if let Err(e) = node.connect_onion(dest, min).await {
-                        println!("! onion to {dest}: {e:#}");
+                        say!("! onion to {dest}: {e:#}");
                     }
                 });
             }
             "relay" => {
                 let q = arg.ok_or_else(|| anyhow!("usage: /relay <contact|fingerprint|invite>"))?;
                 let dest = self.parse_destination(q)?;
-                println!("* looking for a relay path to {dest}");
+                say!("* looking for a relay path to {dest}");
                 self.relay(dest);
             }
             "group" => {
@@ -2050,7 +2201,7 @@ impl Ui {
                         })?,
                     )
                     .await?;
-                println!("* sent {n} file(s), {len} bytes, to the group");
+                say!("* sent {n} file(s), {len} bytes, to the group");
             }
             other => bail!("unknown command /{other}; try /help"),
         }
@@ -2064,15 +2215,15 @@ impl Ui {
         match (it.next(), it.next()) {
             (Some("scan") | None, secs) => {
                 let secs = secs.and_then(|s| s.parse().ok()).unwrap_or(8);
-                println!("* scanning Bluetooth LE for {secs}s…");
+                say!("* scanning Bluetooth LE for {secs}s…");
                 tokio::spawn(async move {
                     match crate::ble::scan(secs).await {
                         Ok(found) => {
                             if found.is_empty() {
-                                println!("* no Threnody devices nearby");
+                                say!("* no Threnody devices nearby");
                             }
                             for (i, f) in found.iter().enumerate() {
-                                println!(
+                                say!(
                                     "  {}: {} {} psm {} rssi {}",
                                     i + 1,
                                     f.addr,
@@ -2082,13 +2233,13 @@ impl Ui {
                                 );
                             }
                             if !found.is_empty() {
-                                println!("  /ble connect <n> to open a session");
+                                say!("  /ble connect <n> to open a session");
                             }
                             *seen
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = found;
                         }
-                        Err(e) => println!("! Bluetooth scan: {e:#}"),
+                        Err(e) => say!("! Bluetooth scan: {e:#}"),
                     }
                 });
             }
@@ -2107,28 +2258,29 @@ impl Ui {
                             .cloned()
                     });
                 let Some(f) = f else {
-                    println!("! no such device; /ble scan first");
+                    say!("! no such device; /ble scan first");
                     return;
                 };
                 let node = self.node.clone();
-                println!(
+                say!(
                     "* connecting to {} over Bluetooth LE (psm {})…",
-                    f.addr, f.psm
+                    f.addr,
+                    f.psm
                 );
                 tokio::spawn(async move {
                     if let Err(e) = crate::ble::connect(&node, &f, None).await {
-                        println!("! Bluetooth connect: {e:#}");
+                        say!("! Bluetooth connect: {e:#}");
                     }
                 });
             }
-            _ => println!("! usage: /ble scan [secs] | /ble connect <n|address>"),
+            _ => say!("! usage: /ble scan [secs] | /ble connect <n|address>"),
         }
     }
 
     fn devices(&self) {
         let account = self.node.account();
         let me = self.node.identity();
-        println!("  account {}", account.id().fingerprint());
+        say!("  account {}", account.id().fingerprint());
         for (d, name) in &account.state().devices {
             let tag = if *d == me { " (this device)" } else { "" };
             let live = if self.node.sessions().iter().any(|s| s.peer == *d) {
@@ -2136,10 +2288,10 @@ impl Ui {
             } else {
                 ""
             };
-            println!("    {name:<16} {}{tag}{live}", d.fingerprint());
+            say!("    {name:<16} {}{tag}{live}", d.fingerprint());
         }
         for d in &account.state().removed {
-            println!("    removed          {}", d.fingerprint());
+            say!("    removed          {}", d.fingerprint());
         }
     }
 
@@ -2147,21 +2299,21 @@ impl Ui {
     fn status(&self) {
         let sessions = self.node.sessions();
         let account = self.node.account();
-        println!(
+        say!(
             "  account      {} ({} device(s))",
             account.id().fingerprint(),
             account.state().devices.len()
         );
-        println!("  this device  {}", self.node.identity().fingerprint());
+        say!("  this device  {}", self.node.identity().fingerprint());
         match (self.listen_addr, self.node.quic_addr()) {
-            (Some(a), Some(q)) => println!("  listening    tcp {a}, quic {q}"),
-            (Some(a), None) => println!("  listening    tcp {a}"),
-            _ => println!("  listening    no"),
+            (Some(a), Some(q)) => say!("  listening    tcp {a}, quic {q}"),
+            (Some(a), None) => say!("  listening    tcp {a}"),
+            _ => say!("  listening    no"),
         }
         let r = self.node.reachability();
         if r.enabled {
             let cands: Vec<String> = r.candidates.iter().map(|c| c.addr.to_string()).collect();
-            println!(
+            say!(
                 "  internet     {}; addresses {}{}{}",
                 if r.online {
                     "in the DHT"
@@ -2185,10 +2337,10 @@ impl Ui {
                 }
             );
         } else {
-            println!("  internet     off (--no-rendezvous, or an anonymous identity)");
+            say!("  internet     off (--no-rendezvous, or an anonymous identity)");
         }
-        println!("  policy       {:?}", self.node.policy());
-        println!(
+        say!("  policy       {:?}", self.node.policy());
+        say!(
             "  transports   {}",
             if sessions.is_empty() {
                 "none active".into()
@@ -2200,17 +2352,17 @@ impl Ui {
             }
         );
         let held = self.node.held_messages();
-        println!("  mailbox      holding {held} sealed message(s) for others");
+        say!("  mailbox      holding {held} sealed message(s) for others");
         match self.discovery {
-            Some(a) => println!(
+            Some(a) => say!(
                 "  discovery    lan beacons on udp/{} (approved peers only)",
                 a.port()
             ),
-            None => println!("  discovery    off"),
+            None => say!("  discovery    off"),
         }
         match &self.tunnels {
-            Some(t) => println!("  tunnel       {}", t.summary()),
-            None => println!("  tunnel       off (run with --tunnel)"),
+            Some(t) => say!("  tunnel       {}", t.summary()),
+            None => say!("  tunnel       off (run with --tunnel)"),
         }
         let rate = match self.node.constant_rate() {
             Some(d) => format!("cover traffic every {} ms", d.as_millis()),
@@ -2222,17 +2374,17 @@ impl Ui {
             "direct first (--no-onion)"
         };
         match self.node.default_timer() {
-            Some(t) => println!(
+            Some(t) => say!(
                 "  disappear    after {} unless a chat says otherwise (/disappear)",
                 human_secs(t)
             ),
-            None => println!("  disappear    off by default (--disappear-default)"),
+            None => say!("  disappear    off by default (--disappear-default)"),
         }
-        println!(
+        say!(
             "  metadata     padding: on; timing: {rate}; routing: {onion}; carrying {} circuit(s) for others",
             self.node.onion_hops()
         );
-        println!(
+        say!(
             "  images       {}",
             if self.node.strip_metadata() {
                 "metadata stripped before sending"
@@ -2474,7 +2626,7 @@ async fn listen_quic(node: &Node, tcp: std::net::SocketAddr) -> Option<std::net:
             return Some(q);
         }
     }
-    println!("! QUIC unavailable on udp/{}", tcp.port());
+    say!("! QUIC unavailable on udp/{}", tcp.port());
     None
 }
 
