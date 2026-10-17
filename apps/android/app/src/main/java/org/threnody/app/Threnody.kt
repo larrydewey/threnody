@@ -418,11 +418,31 @@ object Threnody {
         })
     }
 
+    /** Where the main identity's node keeps its files. */
+    fun home(ctx: Context): String = ctx.filesDir.resolve("threnody").path
+
     /** Opens the node, its identity sealed under the Android Keystore. */
     private fun open(ctx: Context): ThrenodyNode {
         Calls.prepare(ctx)
-        val home = ctx.filesDir.resolve("threnody").path
+        val home = home(ctx)
+        // A restore staged from a backup (BackupUi) finishes before the node opens.
+        if (uniffi.threnody_ffi.applyStagedRestore(home)) {
+            // Its anonymous identities are gone, and their photos with them.
+            prefs(ctx).edit().clear().apply()
+            ctx.filesDir.listFiles { f -> f.name.startsWith("media-p-") }?.forEach { it.deleteRecursively() }
+            say("* restored from a backup")
+        }
         return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home), null)
+    }
+
+    /** Starts the app afresh in a new process (after staging a restore). */
+    fun restartApp(a: android.app.Activity) {
+        a.stopService(android.content.Intent(a, ThrenodyService::class.java))
+        val launch = a.packageManager.getLaunchIntentForPackage(a.packageName)
+            ?: return
+        launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        a.startActivity(launch)
+        Runtime.getRuntime().exit(0)
     }
 
     /** Subscribes to node events (called on the event thread); returns an unsubscriber. */

@@ -952,6 +952,14 @@ class MainActivity : Activity() {
         }
         accountSection.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
         accountSection.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
+        accountSection.add("Back up…").setOnMenuItemClickListener {
+            node?.let { BackupUi.backUp(this@MainActivity, it) }
+            true
+        }
+        accountSection.add("Restore from a backup…").setOnMenuItemClickListener {
+            node?.let { BackupUi.restore(this@MainActivity, it) }
+            true
+        }
 
         // Privacy & Security
         val privacySection = menu.addSubMenu("Privacy & Security")

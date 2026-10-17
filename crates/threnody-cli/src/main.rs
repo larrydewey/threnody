@@ -83,6 +83,31 @@ enum Cmd {
     },
     /// Show this device's fingerprint and its account.
     Id,
+    /// Save an encrypted backup of this identity, its contacts and history
+    /// to FILE, sealed under a passphrase you choose. Restore it with
+    /// `threnody restore` after losing this device.
+    Backup {
+        file: PathBuf,
+        /// Replace FILE if it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Replace this device's identity, contacts and history with a backup
+    /// from `threnody backup`. Only for a device that replaces a lost one:
+    /// to use two devices as one, link them (`threnody link`).
+    Restore {
+        file: PathBuf,
+        /// Replace the identity already here, and its anonymous identities.
+        #[arg(long)]
+        force: bool,
+        /// Protect the restored identity key with a passphrase instead of
+        /// the system keyring.
+        #[arg(long, conflicts_with = "no_keyring")]
+        passphrase: bool,
+        /// Store the restored identity key unprotected.
+        #[arg(long)]
+        no_keyring: bool,
+    },
     /// Join an existing account using a link code from one of its devices.
     Link {
         /// The `threnody-link://…` code shown by `/device add`.
@@ -405,6 +430,78 @@ fn passphrase_file() -> Option<PathBuf> {
     Some(creds.join("threnody-passphrase")).filter(|p| p.exists())
 }
 
+/// How a new or restored identity is sealed: by default with a key in
+/// the system keyring; without one, it is stored unprotected.
+fn identity_seal(
+    home: &Home,
+    passphrase: bool,
+    no_keyring: bool,
+) -> Result<Option<zeroize_string::Secret>> {
+    if passphrase {
+        return Ok(Some(new_passphrase()?));
+    }
+    if no_keyring {
+        return Ok(None);
+    }
+    match keyring::create(home) {
+        Ok(pw) => {
+            println!("The identity key is sealed with a key kept in the system keyring.");
+            Ok(Some(pw))
+        }
+        Err(e) => {
+            eprintln!("No system keyring ({e:#}); the identity key is stored unprotected.");
+            eprintln!("Use `threnody passphrase` to protect it with a passphrase.");
+            Ok(None)
+        }
+    }
+}
+
+/// A backup's passphrase: `$THRENODY_BACKUP_PASSPHRASE`, else asked for
+/// (twice for a new backup).
+fn backup_passphrase(new: bool) -> Result<zeroize_string::Secret> {
+    if let Ok(p) = std::env::var("THRENODY_BACKUP_PASSPHRASE") {
+        return Ok(zeroize_string::Secret(p));
+    }
+    if new {
+        let min = threnody_core::backup::MIN_PASSPHRASE_CHARS;
+        let a = zeroize_string::Secret(rpassword::prompt_password(format!(
+            "Backup passphrase (at least {min} characters): "
+        ))?);
+        if a.0.chars().count() < min {
+            bail!("a backup passphrase needs at least {min} characters");
+        }
+        let b = zeroize_string::Secret(rpassword::prompt_password("Repeat passphrase: ")?);
+        if a.as_bytes() != b.as_bytes() {
+            bail!("passphrases do not match");
+        }
+        return Ok(a);
+    }
+    Ok(zeroize_string::Secret(rpassword::prompt_password(
+        "Backup passphrase: ",
+    )?))
+}
+
+/// Fails if a node has `home` open: the desktop app (its lock) or
+/// `run --daemon` (its control socket). Holds the app's lock until dropped.
+fn no_node_running(home: &Home) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        let path = chat::control_path(home);
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            bail!("a node is running here ({}); stop it first", path.display());
+        }
+    }
+    std::fs::create_dir_all(home.dir())?;
+    let f = std::fs::File::create(home.dir().join("desktop.lock"))?;
+    if f.try_lock().is_err() {
+        bail!(
+            "Threnody is running with {}; quit it first",
+            home.dir().display()
+        );
+    }
+    Ok(f)
+}
+
 /// Asks for a new passphrase twice.
 fn new_passphrase() -> Result<zeroize_string::Secret> {
     let a = read_passphrase("New passphrase: ")?;
@@ -467,6 +564,13 @@ pub fn describe_contact(c: &Contact) -> String {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let main_home = Home::new(cli.home.unwrap_or_else(default_home));
+    // The desktop app stages a restore and quits; finish it if it hasn't.
+    if threnody_core::backup::staging_dir(main_home.dir()).is_ok_and(|d| d.exists())
+        && let Ok(_lock) = no_node_running(&main_home)
+        && threnody_core::backup::apply_staged_restore(&main_home)?
+    {
+        eprintln!("Finished restoring a backup.");
+    }
     if let Cmd::Persona { action } = cli.cmd {
         return persona_command(&main_home, action);
     }
@@ -495,36 +599,80 @@ fn main() -> Result<()> {
                     home.dir().display()
                 );
             }
-            // By default the identity is sealed with a key in the system
-            // keyring; without one, it is stored unprotected as before.
-            let pw = if passphrase {
-                Some(new_passphrase()?)
-            } else if no_keyring {
-                None
-            } else {
-                match keyring::create(&home) {
-                    Ok(pw) => {
-                        println!(
-                            "The identity key is sealed with a key kept in the system keyring."
-                        );
-                        Some(pw)
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "No system keyring ({e:#}); the identity key is stored unprotected."
-                        );
-                        eprintln!(
-                            "Use `threnody init --passphrase` to protect it with a passphrase."
-                        );
-                        None
-                    }
-                }
-            };
+            let pw = identity_seal(&home, passphrase, no_keyring)?;
             let id = home.create_identity(pw.as_ref().map(|p| p.as_bytes()))?;
             println!("Created identity in {}", home.dir().display());
             println!("Fingerprint: {}", id.public().fingerprint());
         }
         Cmd::Keyring { action } => keyring_command(&home, action)?,
+        Cmd::Backup { .. } if main_identity.is_some() => {
+            bail!("anonymous identities aren't backed up: a backup would link them to you")
+        }
+        Cmd::Backup { file, force } => {
+            let id = load_identity(&home)?;
+            let pw = backup_passphrase(true)?;
+            let backup = home.export_backup(&id, &pw.0)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true);
+            if force {
+                opts.create(true).truncate(true);
+            } else {
+                opts.create_new(true);
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            let mut f = opts.open(&file).with_context(|| {
+                format!(
+                    "creating {}{}",
+                    file.display(),
+                    if force { "" } else { " (--force replaces it)" }
+                )
+            })?;
+            std::io::Write::write_all(&mut f, &backup)?;
+            f.sync_all()?;
+            println!("Backup saved to {}.", file.display());
+            println!("It holds your identity: keep it and its passphrase safe.");
+        }
+        Cmd::Restore { .. } if main_identity.is_some() => {
+            bail!("restore into your main identity (without --persona)")
+        }
+        Cmd::Restore {
+            file,
+            force,
+            passphrase,
+            no_keyring,
+        } => {
+            if home.has_identity() && !force {
+                bail!(
+                    "{} already has an identity; --force replaces it, its contacts, history and anonymous identities",
+                    home.dir().display()
+                );
+            }
+            let _lock = no_node_running(&home)?;
+            let backup =
+                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            let pw = backup_passphrase(false)?;
+            // Check the passphrase before making a keyring key.
+            match threnody_core::backup::inspect_backup(&backup, &pw.0) {
+                Err(threnody_core::Error::Decrypt) => {
+                    bail!("wrong passphrase, or the backup is damaged")
+                }
+                r => r?,
+            };
+            let seal = identity_seal(&home, passphrase, no_keyring)?;
+            let restored =
+                match home.restore_backup(&backup, &pw.0, seal.as_ref().map(|p| p.as_bytes())) {
+                    Err(threnody_core::Error::Decrypt) => {
+                        bail!("wrong passphrase, or the backup is damaged")
+                    }
+                    r => r?,
+                };
+            println!(
+                "Restored {} from a backup made {}.",
+                restored.identity.public().fingerprint(),
+                about(restored.created_ms)
+            );
+        }
         Cmd::Passphrase { remove } => {
             let current = current_passphrase(&home)?;
             let new = if remove {

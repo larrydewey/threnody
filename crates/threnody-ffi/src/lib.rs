@@ -372,6 +372,67 @@ pub fn change_passphrase(home: String, current: Option<String>, new: Option<Stri
         .map_err(fail)
 }
 
+/// The shortest passphrase [`ThrenodyNode::export_backup`] accepts.
+#[uniffi::export]
+pub fn backup_passphrase_min_chars() -> u32 {
+    threnody_core::backup::MIN_PASSPHRASE_CHARS as u32
+}
+
+/// Whose a backup is and when it was made.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BackupInfo {
+    pub fingerprint: String,
+    pub created_ms: u64,
+}
+
+fn backup_error(e: threnody_core::Error) -> ThrenodyError {
+    match e {
+        threnody_core::Error::Decrypt => fail("wrong passphrase, or the backup is damaged"),
+        e => fail(e),
+    }
+}
+
+fn backup_info(r: threnody_core::backup::Restored) -> BackupInfo {
+    BackupInfo {
+        fingerprint: r.identity.public().fingerprint().to_string(),
+        created_ms: r.created_ms,
+    }
+}
+
+/// Opens a backup made by [`ThrenodyNode::export_backup`] without
+/// restoring it, to show the user whose it is before replacing anything.
+#[uniffi::export]
+pub fn inspect_backup(backup: Vec<u8>, passphrase: String) -> Result<BackupInfo> {
+    threnody_core::backup::inspect_backup(&backup, &passphrase)
+        .map(backup_info)
+        .map_err(backup_error)
+}
+
+/// Prepares replacing everything in `home` with a backup: identity,
+/// contacts, history and other state; any personas are removed. Nothing
+/// changes until [`apply_staged_restore`] runs, before the next `open`,
+/// so the app should restart once this returns. The identity is sealed
+/// under `seal`, as `open` would create it.
+#[uniffi::export]
+pub fn stage_restore(
+    home: String,
+    backup: Vec<u8>,
+    passphrase: String,
+    seal: Option<String>,
+) -> Result<BackupInfo> {
+    Home::new(home)
+        .stage_restore(&backup, &passphrase, seal.as_deref().map(str::as_bytes))
+        .map(backup_info)
+        .map_err(backup_error)
+}
+
+/// Carries out a restore staged by [`stage_restore`], if any. Call it
+/// before `open`, with no node open on `home`. Returns whether it did.
+#[uniffi::export]
+pub fn apply_staged_restore(home: String) -> Result<bool> {
+    threnody_core::backup::apply_staged_restore(&Home::new(home)).map_err(fail)
+}
+
 /// An approved contact heard over Bluetooth that this device should dial.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct BleDial {
@@ -1381,19 +1442,12 @@ PersistentKeepalive = 25\n",
         self.node.apply_wireguard(&iface).map_err(fail)
     }
 
-    /// Exports all node state as an encrypted backup (identity, contacts,
-    /// history, groups, prekeys, etc.). The backup is encrypted with a key
-    /// derived from the identity seed.
-    pub fn export_backup(&self) -> Result<Vec<u8>> {
-        let _guard = self.rt.enter();
-        self.node.export_backup().map_err(fail)
-    }
-
-    /// Imports a backup, replacing all node state. The backup must have been
-    /// created by the same identity.
-    pub fn import_backup(&self, backup_data: Vec<u8>) -> Result<()> {
-        let _guard = self.rt.enter();
-        self.node.import_backup(&backup_data).map_err(fail)
+    /// Seals this node's identity, contacts, history and other state into
+    /// a backup under `passphrase`, at least
+    /// [`backup_passphrase_min_chars`] long. Restore it with
+    /// [`restore_backup`].
+    pub fn export_backup(&self, passphrase: String) -> Result<Vec<u8>> {
+        self.node.export_backup(&passphrase).map_err(fail)
     }
 
     /// Fetches a URL preview (Open Graph meta tags: title, description,
