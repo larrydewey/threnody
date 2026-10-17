@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-boringtun = ["dep:boringtun"]
+boringtun = ["dep:boringtun", "dep:threnody-tun"]
 
 [dependencies]
 threnody-core.workspace = true
@@ -19,6 +19,7 @@ socket2.workspace = true
 const-cbor.workspace = true
 anyhow.workspace = true
 boringtun = { workspace = true, optional = true }
+threnody-tun = { workspace = true, optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "log"] }
 rcgen = "0.14"

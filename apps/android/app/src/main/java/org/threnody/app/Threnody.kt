@@ -27,6 +27,9 @@ import uniffi.threnody_ffi.ThrenodyNode
  */
 object Threnody {
     @Volatile private var instance: ThrenodyNode? = null
+
+    /** The main node, if it has started. */
+    fun running(): ThrenodyNode? = instance
     var listenAddr: String = ""
         private set
     private val log = StringBuilder()
@@ -61,6 +64,7 @@ object Threnody {
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
         openPersonas(ctx.applicationContext, it)
         applyPrivacy(ctx)
+        Tunnels.resume(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)
         keepStandby(ctx.applicationContext, it)
         nameThisDevice(it)

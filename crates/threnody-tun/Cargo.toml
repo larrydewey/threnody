@@ -1,0 +1,22 @@
+[package]
+name = "threnody-tun"
+description = "A TUN interface from a file descriptor, for Threnody's userspace WireGuard."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The one crate that may use `unsafe`: adopting a file descriptor handed
+# over by the platform (Android's VpnService) has no safe API. Every
+# block says why it holds.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+tokio = { workspace = true, features = ["net"] }

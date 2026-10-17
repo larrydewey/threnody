@@ -449,9 +449,6 @@ pub(crate) struct Shared {
     tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
     tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
-    /// Userspace WireGuard (boringtun) state.
-    #[cfg(feature = "boringtun")]
-    wg_userspace: Mutex<Option<crate::wg_userspace::WgUserspace>>,
     pub(crate) relay: Mutex<RelayState>,
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
@@ -656,8 +653,6 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
-            #[cfg(feature = "boringtun")]
-            wg_userspace: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
@@ -769,6 +764,15 @@ impl Node {
         *lock(&self.shared.tunnel) = new_tunnel;
         // Clear existing tunnel peers since port changed
         lock(&self.shared.tunnel_peers).clear();
+        // Offer at once on direct sessions with approved contacts, rather
+        // than when each session next wakes; they answer with theirs.
+        if let Some((port, wg_public)) = new_tunnel {
+            for s in self.sessions() {
+                if s.via.is_none() && self.shared.mutual(&s.peer) {
+                    let _ = self.send(&s.peer, AppMessage::TunnelOffer { wg_public, port });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -866,75 +870,6 @@ impl Node {
             .home
             .import_backup(&self.shared.identity, backup_data)
             .map_err(|e| NetError::External(anyhow::anyhow!(e)))
-    }
-
-    /// Starts the userspace WireGuard implementation (boringtun).
-    /// Returns the local UDP port being listened on.
-    #[cfg(feature = "boringtun")]
-    pub fn start_wg_userspace(&self) -> Result<u16> {
-        let mut wg = self.shared.wg_userspace.lock().unwrap();
-        if wg.is_some() {
-            return Ok(wg.as_ref().unwrap().listen_port());
-        }
-
-        let identity =
-            Identity::from_seed(self.shared.identity.seed().as_ref().try_into().unwrap());
-        let port = self
-            .tunnel_port()
-            .unwrap_or(threnody_core::tunnel::DEFAULT_PORT);
-        let mut wg_userspace = crate::wg_userspace::WgUserspace::new(&identity, port)?;
-
-        // Add existing tunnel peers
-        for (peer_id, peer) in self.tunnel_peer_entries() {
-            let config = crate::wg_userspace::WgPeerConfig {
-                peer_identity: peer_id,
-                peer_wg_public: peer.wg_public,
-                endpoint: peer.endpoint,
-                overlay: peer.overlay,
-                psk: peer.psk,
-            };
-            wg_userspace.add_peer(config)?;
-        }
-
-        wg_userspace.start()?;
-        let listen_port = wg_userspace.listen_port();
-        *wg = Some(wg_userspace);
-        Ok(listen_port)
-    }
-
-    /// Stops the userspace WireGuard implementation.
-    #[cfg(feature = "boringtun")]
-    pub fn stop_wg_userspace(&self) {
-        let mut wg = self.shared.wg_userspace.lock().unwrap();
-        if let Some(mut wg_userspace) = wg.take() {
-            wg_userspace.stop();
-        }
-    }
-
-    /// Sends a packet through the userspace WireGuard tunnel to a peer.
-    #[cfg(feature = "boringtun")]
-    pub fn wg_userspace_send(&self, peer: &PublicIdentity, data: &[u8]) -> Result<()> {
-        let mut wg = self.shared.wg_userspace.lock().unwrap();
-        if let Some(wg_userspace) = wg.as_mut() {
-            let mut out_buf = [0u8; 65536];
-            let len = wg_userspace.encapsulate(peer, data, &mut out_buf)?;
-            if len > 0
-                && let (Some(socket), Some(config)) =
-                    (wg_userspace.udp_socket(), wg_userspace.peer_config(peer))
-            {
-                let socket = socket.clone();
-                let data = out_buf[..len].to_vec();
-                let endpoint = config.endpoint;
-                tokio::spawn(async move {
-                    let _ = socket.send_to(&data, endpoint).await;
-                });
-            }
-            Ok(())
-        } else {
-            Err(crate::error::NetError::External(anyhow::anyhow!(
-                "userspace WireGuard not started"
-            )))
-        }
     }
 
     /// Binds a TCP listener and accepts sessions in the background.
@@ -1521,6 +1456,8 @@ where
     let mut ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
 
     let mut offered = false;
+    // Whether we took an offer of theirs this session (see TunnelOffer).
+    let mut took_offer = false;
     let mut paths_sent = false;
     // Silence longer than this ends the session (see `recover`): known once
     // the peer's `Paths` says how often it sends.
@@ -1715,6 +1652,7 @@ where
                                 if !mutual {
                                     shared.tunnel_down(&peer);
                                     offered = false;
+                                    took_offer = false;
                                     discovery_keyed = false;
                                     prekeys_sent = false;
                                     let mut contacts = lock(&shared.contacts);
@@ -1735,6 +1673,13 @@ where
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 };
                                 lock(&shared.tunnel_peers).insert(peer, tp.clone());
+                                // They may have offered while our tunnels
+                                // were off, and so ignored ours: answer
+                                // their first offer with ours.
+                                if !took_offer {
+                                    took_offer = true;
+                                    offered = false;
+                                }
                                 shared.emit(Event::TunnelUp {
                                     peer,
                                     wg_public: tp.wg_public,
