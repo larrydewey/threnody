@@ -129,7 +129,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 ## Roadmap
 
 0. **Internet reachability (remaining).** 0.3.0 reaches contacts across the internet with no server: sessions over QUIC, rendezvous in the public BitTorrent DHT under keys only the two contacts share, hole punching, and fast recovery that reconnects in under a second when a phone changes network (see [Appendix N](docs/appendix-n-internet-reachability.md)). Still to do: router port mapping, a persistent relay circuit to an always-on contact (instant notice of moves, and reaching phones in the background), and tests between two phones.
-1. **Hardening (remaining).** An iOS keystore, ratchet persistence across reconnects, and an external audit.
+1. **Hardening (remaining).** An iOS keystore and an external audit.
 2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** A `boringtun` data plane for mobile and unprivileged use.
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
