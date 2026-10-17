@@ -306,15 +306,22 @@ impl Node {
         }
         let paths = Paths::decode(payload).ok()?;
         let lease = lease_for(paths.beat_ms);
-        let new_standby = {
+        let (new_standby, new_main) = {
             let mut peers = lock(&self.rec().peers);
             let p = peers.entry(peer).or_default();
             let changed = p.theirs.standby != paths.standby;
+            let main = p.theirs.main != paths.main;
             p.theirs = paths;
             p.updated_ms = now_ms();
-            changed && !p.theirs.standby.is_empty()
+            (changed && !p.theirs.standby.is_empty(), main)
         };
         self.save_recovery();
+        if new_main {
+            // Open our standby socket's hole toward its new addresses now:
+            // the next round may come after the network has changed.
+            self.rec().force.store(true, Ordering::Relaxed);
+            self.rec().kick.notify_one();
+        }
         if new_standby {
             let addrs: Vec<String> = lock(&self.rec().peers)
                 .get(&peer)
@@ -760,6 +767,8 @@ impl Node {
             note: format!("standby path addresses: {}", addrs.join(", ")),
         });
         self.broadcast_paths();
+        // A new standby socket (or mapping) has no holes yet: open them now.
+        self.rec().force.store(true, Ordering::Relaxed);
         self.rec().kick.notify_one();
     }
 
