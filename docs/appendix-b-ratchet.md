@@ -58,6 +58,10 @@ The plaintext is a padded `AppMessage` (Appendix C).
 - **Cost.** Every header carries a full public key and ciphertext (about 2.3 KB). That is fine on IP links. On Bluetooth LE a future minor version should send the KEM material only in the first messages of a chain, or move to a sparse post-quantum ratchet.
 - **Opaque headers.** Path observers and relays see only random-looking bytes of a fixed size per chain. Ratchet public keys, KEM ciphertexts and message counters stay hidden, so frames cannot be linked to chains or ordered by counter.
 
-## Not yet done
+## Ratchets live only as long as a session
 
-- Persisting ratchet state across reconnects. Today every connection runs a new handshake, which is safe but costs an extra round trip.
+Every connection runs a new handshake, and its ratchet is kept only in memory. When a session ends, its keys are gone. Resuming a ratchet across reconnects would save about one round trip, but it was decided against:
+
+- **Keys on disk.** A resumable ratchet has to be stored. Someone who seizes the device (spec §16) could then read traffic recorded since the last ratchet step, which today's sessions don't allow.
+- **Little gain.** Fast recovery (Appendix N) already reconnects in under a second after a network change, and the handshake is a small part of that.
+- **New protocol surface.** Resuming needs a resume message, replay protection, tokens that don't link reconnects to each other, and a Tamarin model of all of it.
