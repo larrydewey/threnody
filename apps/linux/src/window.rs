@@ -1605,6 +1605,8 @@ impl App {
             return;
         };
         let (device, title) = (conv.device.clone(), conv.title.clone());
+        // Without a session, reaching them first can take up to 45 s.
+        self.toast(&format!("Calling {title}…"));
         let weak = Rc::downgrade(self);
         bg(
             move || node.start_call(device, video),

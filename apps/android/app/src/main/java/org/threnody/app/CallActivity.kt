@@ -322,6 +322,7 @@ class CallActivity : Activity() {
         }
         who.text = c.title
         status.text = when (c.state) {
+            "reaching" -> "Reaching ${c.title}…"
             "calling" -> if (c.video) "Video calling…" else "Calling…"
             "ringing" -> "Ringing…"
             "incoming" -> if (c.peerVideo) "Incoming video call" else "Incoming voice call"

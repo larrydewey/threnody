@@ -283,3 +283,34 @@ async fn calls_over_tcp_move_to_quic() {
         }
     }
 }
+
+/// Calling a contact without a session reaches it first (here at its last
+/// known address), instead of failing at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calling_reaches_a_contact_without_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let ((alice, mut arx), (bob, mut brx), _) = pair(&dir, false).await;
+    let b_id = bob.identity();
+    assert!(alice.disconnect(&b_id));
+    next(&mut arx, 10, |e| matches!(e, Event::Disconnected { .. })).await;
+    assert!(alice.start_call(&b_id, false).is_err(), "no session yet");
+
+    timeout(Duration::from_secs(20), alice.reach_for_call(&b_id))
+        .await
+        .expect("reached in time")
+        .expect("reached");
+    timeout(Duration::from_secs(10), async {
+        while !alice.supports(&b_id, FEATURE_CALLS) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("hellos exchanged");
+    let id = alice.start_call(&b_id, false).unwrap();
+    let Event::CallIncoming { call, .. } =
+        next(&mut brx, 10, |e| matches!(e, Event::CallIncoming { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(call, id);
+}
