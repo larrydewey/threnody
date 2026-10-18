@@ -685,3 +685,47 @@ async fn turning_tunnels_on_mid_session_still_pairs_both_sides() {
     assert_eq!(alice.tunnel_peers(), vec![bob_id]);
     assert_eq!(bob.tunnel_peers(), vec![alice.identity()]);
 }
+
+#[tokio::test]
+async fn read_receipts_reach_the_sender() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+
+    alice.send_text(&bob_id, "read me").unwrap();
+    let Event::Message {
+        msg: AppMessage::Text { id, .. },
+        ..
+    } = next(&mut brx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: AppMessage::Text { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    bob.report_read(&alice.identity(), &[id]).unwrap();
+    next(&mut arx, |e| matches!(e, Event::Read { .. })).await;
+    let conv = alice.conversation_for(&bob_id);
+    let read = alice
+        .history(conv)
+        .unwrap()
+        .entries()
+        .iter()
+        .any(|e| e.outgoing && e.local_id == id && e.read_ms != 0);
+    assert!(read, "Alice's message shows as read");
+}
