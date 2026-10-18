@@ -352,6 +352,7 @@ impl Node {
             self.rdv().regather.notify_one();
             self.rdv().republish.notify_one();
             self.rdv().poll.notify_one();
+            self.rdv().handles.kick.notify_one();
         }
     }
 
@@ -360,6 +361,8 @@ impl Node {
     pub fn set_foreground(&self, on: bool) {
         if !self.rdv().foreground.swap(on, Ordering::Relaxed) && on {
             self.rdv().poll.notify_one();
+            // Knocks on our handle waiting since we went to the background.
+            self.rdv().handles.kick.notify_one();
         }
     }
 
@@ -822,6 +825,8 @@ impl Node {
             });
             self.broadcast_paths();
             self.rdv().republish.notify_one();
+            // Our handle's record says where we are too (Appendix S).
+            self.rdv().handles.kick.notify_one();
         }
     }
 

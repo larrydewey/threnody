@@ -42,7 +42,7 @@ pub(crate) struct HandleState {
     /// Probe keys for peers we punch toward through a handle: finders
     /// knocking on ours, and owners of handles we looked up.
     pub(crate) probe_keys: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
-    kick: Notify,
+    pub(crate) kick: Notify,
 }
 
 /// What a published record said: epoch, addresses, flags.
