@@ -31,6 +31,8 @@ const KNOCK_FRESH_MS: u64 = 5 * 60 * 1000;
 const FIND_FOR: Duration = Duration::from_secs(120);
 /// How long a finder tries the owner's addresses directly first.
 const DIRECT_FOR: Duration = Duration::from_secs(5);
+/// How often a finder re-reads the owner's record while punching.
+const REREAD_EVERY: Duration = Duration::from_secs(10);
 /// Most peers kept with handle probe keys.
 const MAX_PROBE_KEYS: usize = 64;
 
@@ -96,14 +98,15 @@ impl Node {
         })?;
         let now = epoch(now_ms() / 1000);
         let mut best: Option<HandleRecord> = None;
-        for e in [now, now.saturating_sub(1)] {
-            let rk = handle.record_keys(e);
-            let Some(v) = fetch(&dht, &rk).await else {
-                continue;
-            };
-            let Ok(r) = HandleRecord::open(&rk, &v) else {
-                continue;
-            };
+        let read = |e: u64| {
+            let (dht, rk) = (dht.clone(), handle.record_keys(e));
+            async move {
+                let v = fetch(&dht, &rk).await?;
+                HandleRecord::open(&rk, &v).ok()
+            }
+        };
+        let (a, b) = tokio::join!(read(now), read(now.saturating_sub(1)));
+        for r in [a, b].into_iter().flatten() {
             if best
                 .as_ref()
                 .is_none_or(|b| r.candidates.issued_ms > b.candidates.issued_ms)
@@ -167,9 +170,28 @@ impl Node {
         let symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
         self.punch(peer, &rec.candidates.list, symmetric, Urge::Start);
         let deadline = Instant::now() + FIND_FOR;
+        let mut issued = rec.candidates.issued_ms;
+        let mut reread = Instant::now() + REREAD_EVERY;
         while Instant::now() < deadline {
             if self.connected(&peer) {
                 return Ok(peer);
+            }
+            // The owner may have moved since (a phone off Wi-Fi): aim at
+            // its new addresses too, or our side of the NAT stays shut.
+            if Instant::now() >= reread {
+                reread = Instant::now() + REREAD_EVERY;
+                if let Ok(r) = self.resolve_handle(&handle).await
+                    && r.id == peer
+                    && r.candidates.issued_ms > issued
+                {
+                    issued = r.candidates.issued_ms;
+                    self.emit(Event::ReachNote {
+                        note: format!("{handle} moved: {} address(es)", r.candidates.list.len()),
+                    });
+                    let symmetric = r.candidates.flags & FLAG_SYMMETRIC != 0;
+                    self.punch(peer, &r.candidates.list, symmetric, Urge::Start);
+                }
+                continue;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -282,32 +304,36 @@ impl Node {
         let Some(handle) = self.handle() else { return };
         let now = now_ms();
         let ep = epoch(now / 1000);
+        // All slots at once: one at a time, a knock waited up to a minute.
+        let mut gets = tokio::task::JoinSet::new();
         for e in [ep, ep.saturating_sub(1)] {
             for slot in 0..KNOCK_SLOTS {
-                let rk = handle.knock_keys(e, slot);
-                let Some(v) = fetch(dht, &rk).await else {
-                    continue;
-                };
-                let Ok(k) = Knock::open(&rk, &v) else {
-                    continue;
-                };
-                let fresh = now.saturating_sub(k.candidates.issued_ms) < KNOCK_FRESH_MS;
-                if k.id == self.identity() || !fresh || self.connected(&k.id) {
-                    continue;
-                }
-                let new = lock(&self.handles().own)
-                    .as_mut()
-                    .is_some_and(|o| o.seen.insert((k.id, k.candidates.issued_ms)));
-                if !new {
-                    continue;
-                }
-                self.emit(Event::ReachNote {
-                    note: format!("{} knocked on {handle}", k.id.fingerprint()),
+                let (dht, handle) = (dht.clone(), handle.clone());
+                gets.spawn(async move {
+                    let rk = handle.knock_keys(e, slot);
+                    let v = fetch(&dht, &rk).await?;
+                    Knock::open(&rk, &v).ok()
                 });
-                self.add_probe_key(k.id, handle.probe_key());
-                let symmetric = k.candidates.flags & FLAG_SYMMETRIC != 0;
-                self.punch(k.id, &k.candidates.list, symmetric, Urge::Start);
             }
+        }
+        while let Some(r) = gets.join_next().await {
+            let Ok(Some(k)) = r else { continue };
+            let fresh = now.saturating_sub(k.candidates.issued_ms) < KNOCK_FRESH_MS;
+            if k.id == self.identity() || !fresh || self.connected(&k.id) {
+                continue;
+            }
+            let new = lock(&self.handles().own)
+                .as_mut()
+                .is_some_and(|o| o.seen.insert((k.id, k.candidates.issued_ms)));
+            if !new {
+                continue;
+            }
+            self.emit(Event::ReachNote {
+                note: format!("{} knocked on {handle}", k.id.fingerprint()),
+            });
+            self.add_probe_key(k.id, handle.probe_key());
+            let symmetric = k.candidates.flags & FLAG_SYMMETRIC != 0;
+            self.punch(k.id, &k.candidates.list, symmetric, Urge::Start);
         }
     }
 }
