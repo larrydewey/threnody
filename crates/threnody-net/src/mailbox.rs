@@ -447,9 +447,17 @@ impl Node {
                 return DepositStatus::Delivered;
             }
         }
-        let mut mb = lock(&self.shared.mailbox);
-        if mb.hold(to, sealed, now_ms()) {
-            self.shared.persist_mailbox(&mb);
+        let held = {
+            let mut mb = lock(&self.shared.mailbox);
+            let held = mb.hold(to, sealed, now_ms());
+            if held {
+                self.shared.persist_mailbox(&mb);
+            }
+            held
+        };
+        if held {
+            // Wake it, if it sleeps and gave us where (Appendix R).
+            self.push_wake(&dest);
             DepositStatus::Held
         } else {
             DepositStatus::Declined

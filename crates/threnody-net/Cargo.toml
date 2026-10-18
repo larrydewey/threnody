@@ -29,6 +29,10 @@ port-control-client = "0.2"
 blake3.workspace = true
 chacha20poly1305.workspace = true
 rand_core.workspace = true
+# Wake-ups to UnifiedPush endpoints (Appendix R): both already in the tree
+# (reqwest via threnody-core's link previews, ring via rustls).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+ring = "0.17"
 
 [dev-dependencies]
 mainline = "8"

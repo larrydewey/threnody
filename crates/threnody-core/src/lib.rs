@@ -25,6 +25,7 @@ pub mod onion;
 pub mod persona;
 pub mod prekey;
 pub mod preview;
+pub mod push;
 pub mod ratchet;
 pub mod rendezvous;
 #[cfg(test)]

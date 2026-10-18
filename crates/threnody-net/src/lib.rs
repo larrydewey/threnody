@@ -23,6 +23,7 @@ pub mod mailbox;
 pub mod node;
 pub mod onion;
 pub(crate) mod portmap;
+pub mod push;
 mod quic;
 pub mod reach;
 mod recover;
@@ -39,6 +40,7 @@ pub use direct::DirectOffer;
 pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};
 pub use node::{AcceptPolicy, Event, Node, NodeConfig, SessionInfo};
+pub use push::WakeReport;
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};
 #[cfg(feature = "boringtun")]
 pub use wg_userspace::{TunIo, WgDevice};
