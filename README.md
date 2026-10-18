@@ -125,18 +125,18 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard on desktops, userspace WireGuard (boringtun) through a VPN interface on Android; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), onion-routed mailbox deposits, each only off when switched off; volunteer relays from subscribed directories (k-of-n listing, Ed25519 + ML-DSA signed), paid with unlinkable rate-limited tokens, entered without revealing who you are ([Appendix P](docs/appendix-p-volunteer-relays.md)) |
 | §10 Status indicators | ✅ `/status` |
-| §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: sealed with a key in the system keyring by default, or a passphrase; 0600 files without either |
+| §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). iOS: under a Secure Enclave key (a this-device-only Keychain item without one). Desktop: sealed with a key in the system keyring by default, or a passphrase; 0600 files without either |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
 
 ## Roadmap
 
 0. **Internet reachability (remaining).** 0.3.0 reaches contacts across the internet with no server: sessions over QUIC, rendezvous in the public BitTorrent DHT under keys only the two contacts share, hole punching, and fast recovery that reconnects in under a second when a phone changes network (see [Appendix N](docs/appendix-n-internet-reachability.md)). Still to do: router port mapping, a persistent relay circuit to an always-on contact (instant notice of moves, and reaching phones in the background), and tests between two phones.
-1. **Hardening (remaining).** An iOS keystore and an external audit.
+1. **Hardening (remaining).** An external audit.
 2. **Groups (remaining).** More admin roles.
 3. **Tunnels (remaining).** The userspace data plane on iOS and unprivileged desktops (Android has it).
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Relays that hold a connection for a device behind NAT, as onion services do (Appendix N, "Later"), and cover traffic inside circuits.
-6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
+6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. A first iOS app is in [`apps/ios`](apps/ios) (SwiftUI): 1:1 chat with receipts and typing, invites by QR code and link, approval and safety numbers; not yet groups, files out or calls. Still to do: the rest of Android's features on iOS, and push-style wake-ups for when the process is gone (an iOS app receives only while open).
 
 ## Development
 
