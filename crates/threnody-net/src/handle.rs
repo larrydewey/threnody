@@ -111,7 +111,7 @@ impl Node {
                 best = Some(r);
             }
         }
-        let r = best.ok_or_else(|| NetError::NoRoute(format!("no one publishes {handle} now")))?;
+        let r = best.ok_or_else(|| NetError::NotFound(format!("no one publishes {handle} now")))?;
         let (h, id, v) = (handle.clone(), r.id, r.version);
         let ok = tokio::task::spawn_blocking(move || h.belongs_to(&id, v))
             .await
@@ -173,7 +173,7 @@ impl Node {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        Err(NetError::NoRoute(format!(
+        Err(NetError::NotFound(format!(
             "{handle} didn't answer; they may need to open the app"
         )))
     }
