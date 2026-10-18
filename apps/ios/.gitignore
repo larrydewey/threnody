@@ -1,0 +1,6 @@
+Generated/
+Threnody/Generated/
+Threnody/Info.plist
+*.xcodeproj/
+build/
+DerivedData/
