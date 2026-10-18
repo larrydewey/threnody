@@ -1515,7 +1515,7 @@ PersistentKeepalive = 25\n",
         Ok(())
     }
 
-    /// Connects to an invite link, `host:port`, contact or fingerprint;
+    /// Connects to an invite link, handle, `host:port`, contact or fingerprint;
     /// returns the peer's fingerprint. When the direct path fails (or
     /// there is none), it goes through approved relays, whatever links
     /// they are on (spec §7.3).
@@ -1538,6 +1538,9 @@ PersistentKeepalive = 25\n",
             (addr, Some(f))
         } else if let Lookup::Found(c) = self.node.contacts().find(&target) {
             (c.last_addr.clone(), Some(c.key.fingerprint()))
+        } else if target.parse::<threnody_core::handle::Handle>().is_ok() {
+            // Someone's handle (Appendix S).
+            return self.find_handle(target);
         } else {
             (Some(target), None)
         };
