@@ -198,7 +198,7 @@ struct Published {
 #[derive(Default)]
 pub(crate) struct Inner {
     pub(crate) candidates: Vec<Candidate>,
-    symmetric: bool,
+    pub(crate) symmetric: bool,
     /// Our address as each session peer sees it.
     observed: HashMap<PublicIdentity, SocketAddr>,
     /// DHT pings in flight: transaction id → node.
@@ -228,7 +228,7 @@ pub(crate) struct Inner {
 
 pub(crate) struct ReachState {
     enabled: AtomicBool,
-    foreground: AtomicBool,
+    pub(crate) foreground: AtomicBool,
     started: AtomicBool,
     dht: Mutex<Option<AsyncDht>>,
     pub(crate) inner: Mutex<Inner>,
@@ -240,6 +240,8 @@ pub(crate) struct ReachState {
     anchor: Mutex<Option<PublicIdentity>>,
     /// The anchor changed, or the network did: dial it now.
     anchor_kick: Notify,
+    /// Our handle and handle lookups (Appendix S).
+    pub(crate) handles: crate::handle::HandleState,
 }
 
 impl ReachState {
@@ -256,6 +258,7 @@ impl ReachState {
             cfg: Mutex::new(None),
             anchor: Mutex::new(None),
             anchor_kick: Notify::new(),
+            handles: Default::default(),
         }
     }
 }
@@ -511,6 +514,8 @@ impl Node {
         tokio::spawn(async move { node.gather_loop(&c).await });
         let (node, c) = (self.clone(), cfg.clone());
         tokio::spawn(async move { node.publish_loop(&c).await });
+        let (node, c) = (self.clone(), cfg.clone());
+        tokio::spawn(async move { node.handle_loop(&c).await });
         let node = self.clone();
         tokio::spawn(async move { node.poll_loop(&cfg).await });
         Ok(())
@@ -1230,7 +1235,14 @@ impl Node {
                 }
                 () = &mut closed => break false,
             }
-            let Some(d) = self.contacts().get(&peer).and_then(|c| c.discovery_key) else {
+            // A contact's discovery key, or for someone found through a
+            // handle (Appendix S), the handle's probe key.
+            let Some(d) = self
+                .contacts()
+                .get(&peer)
+                .and_then(|c| c.discovery_key)
+                .or_else(|| lock(&self.rdv().handles.probe_keys).get(&peer).copied())
+            else {
                 break false;
             };
             let brisk = start.elapsed() < punch.brisk || lively.elapsed() < LIVELY_FOR;
@@ -1270,7 +1282,7 @@ impl Node {
     }
 
     /// Dials every target at once; the first QUIC connection wins.
-    async fn race(&self, targets: &[SocketAddr]) -> Result<quinn::Connection> {
+    pub(crate) async fn race(&self, targets: &[SocketAddr]) -> Result<quinn::Connection> {
         let mut set = JoinSet::new();
         for t in targets {
             let (node, t) = (self.clone(), *t);
@@ -1313,6 +1325,11 @@ impl Node {
             .iter()
             .filter(|c| c.mutually_approved())
             .flat_map(|c| c.recognition_keys().map(move |k| (&c.key, k)));
+        let handle_keys: Vec<(PublicIdentity, [u8; 32])> = lock(&self.rdv().handles.probe_keys)
+            .iter()
+            .map(|(p, k)| (*p, *k))
+            .collect();
+        let keys = keys.chain(handle_keys.iter().map(|(p, k)| (p, k)));
         let Some(peer) = rendezvous::recognise_probe(data, keys) else {
             return;
         };

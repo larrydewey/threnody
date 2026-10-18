@@ -1313,6 +1313,34 @@ impl ThrenodyNode {
         self.node.anchor_connected()
     }
 
+    /// Publishes a handle others can type to find this device
+    /// (`name-XXXX-XXXX`, Appendix S) and returns it, or stops (`None`).
+    /// A new `version` gives a new code; the old handle stops working
+    /// within the hour. Slow (an Argon2id run): call it off the UI thread.
+    /// Needs internet reachability. Apps set it on the main identity only.
+    pub fn set_handle(&self, name: Option<String>, version: u64) -> Result<Option<String>> {
+        let _guard = self.rt.enter();
+        self.node
+            .set_handle(name.as_deref(), version)
+            .map(|h| h.map(|h| h.to_string()))
+            .map_err(fail)
+    }
+
+    /// The handle this device publishes, if any.
+    pub fn handle(&self) -> Option<String> {
+        self.node.handle().map(|h| h.to_string())
+    }
+
+    /// Finds whoever owns `handle` and opens a session with them; returns
+    /// their fingerprint. Their first messages are a message request, as
+    /// with any stranger. Blocks for up to two minutes while they answer.
+    pub fn find_handle(&self, handle: String) -> Result<String> {
+        self.rt
+            .block_on(self.node.find_handle(&handle))
+            .map(|p| fp(&p))
+            .map_err(fail)
+    }
+
     pub fn reachability(&self) -> ReachInfo {
         let r = self.node.reachability();
         ReachInfo {
