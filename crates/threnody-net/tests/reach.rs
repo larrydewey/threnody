@@ -333,9 +333,11 @@ async fn strangers_find_each_other_by_handle() {
     }
     let handle = bob.set_handle(Some("Bob"), 0).unwrap().unwrap();
     assert_eq!(bob.handle(), Some(handle.clone()));
-    next(&mut brx, 60, |e| {
-        matches!(e, Event::ReachNote { note } if note.starts_with("published handle"))
-    })
+    next(
+        &mut brx,
+        60,
+        |e| matches!(e, Event::ReachNote { note } if note.starts_with("published handle")),
+    )
     .await;
 
     // A handle nobody publishes isn't found.
