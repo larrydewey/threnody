@@ -40,7 +40,7 @@ object Handles {
 
     /** Shows our handle, or offers to make one. */
     fun show(a: Activity, node: ThrenodyNode) {
-        val current = node.handle()
+        val current = node.ownHandle()
         if (current == null) choose(a, node, null) else showHandle(a, node, current)
     }
 

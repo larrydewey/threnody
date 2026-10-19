@@ -75,4 +75,4 @@ Raising `version` gives a new code. Removing the handle, or changing it, stops p
 
 ## Implementation
 
-`threnody-core::handle` (format, code, records, knocks), `threnody-net::handle` (publishing, polling knocks, `Node::set_handle`, `Node::find_handle`), the FFI's `set_handle`, `handle` and `find_handle`, and `connect`, which takes handles too. The CLI publishes one with `/handle <name>`; `/connect` takes handles. The Android and Linux apps have "Your handle" in their settings, and their "Add a contact" boxes take handles.
+`threnody-core::handle` (format, code, records, knocks), `threnody-net::handle` (publishing, polling knocks, `Node::set_handle`, `Node::find_handle`), the FFI's `set_handle`, `own_handle` and `find_handle` (not `handle`, which UniFFI's Swift objects already use), and `connect`, which takes handles too. The CLI publishes one with `/handle <name>`; `/connect` takes handles. The Android and Linux apps have "Your handle" in their settings, and their "Add a contact" boxes take handles.

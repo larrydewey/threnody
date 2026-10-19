@@ -1329,7 +1329,7 @@ impl ThrenodyNode {
     }
 
     /// The handle this device publishes, if any.
-    pub fn handle(&self) -> Option<String> {
+    pub fn own_handle(&self) -> Option<String> {
         self.node.handle().map(|h| h.to_string())
     }
 

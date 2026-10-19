@@ -2497,7 +2497,7 @@ impl App {
                  this computer's IP address. Needs internet reachability.",
             )
             .build();
-        let current = self.core.main.handle();
+        let current = self.core.main.own_handle();
         let handle_row = adw::ActionRow::builder()
             .title(current.as_deref().unwrap_or("No handle"))
             .subtitle(if current.is_some() {
