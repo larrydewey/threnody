@@ -1,0 +1,4 @@
+- Calls and sessions survive moving from Wi-Fi to mobile data, also under a VPN.
+- Call audio follows Bluetooth headsets.
+- WireGuard tunnels to approved contacts run in userspace on Android.
+- Passphrase-sealed backups that restore onto a new device.
