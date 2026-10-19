@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threnody FAQ</title>
+<meta name="description" content="Common questions about Threnody: safety, phone numbers, data use, offline messaging, devices, calls and downloads.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="icon.svg" alt="" width="36" height="36">Threnody</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="./">Home</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="faq.html" aria-current="page">FAQ</a>
+      <a href="./#download">Download</a>
+      <a href="https://github.com/larrydewey/threnody">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="page-head">
+  <div class="wrap prose">
+    <h1>Questions and answers</h1>
+    <p class="lead">Short answers to common questions. <a href="how-it-works.html">How it works</a> goes into more depth.</p>
+  </div>
+</div>
+
+<section>
+  <div class="wrap prose">
+
+    <h2>The basics</h2>
+
+    <details>
+      <summary>Is Threnody safe to use?</summary>
+      <p>It's designed to be, and its core protocols have machine-checked proofs, but it is early software and <strong>has not had an independent security audit</strong>. Try it, use it with friends, and report problems. Don't rely on it yet where your safety depends on it.</p>
+    </details>
+
+    <details>
+      <summary>Who runs the servers?</summary>
+      <p>Nobody, because there aren't any. Your devices connect to your contacts' devices directly, or through other Threnody users: your approved contacts, or volunteer relays you choose to use. There's no company that holds your account or could be asked to hand over records of who you talk to.</p>
+    </details>
+
+    <details>
+      <summary>Do I need a phone number or email?</summary>
+      <p>No. Your identity is a key that your device makes. You add contacts with a QR code or a link.</p>
+    </details>
+
+    <details>
+      <summary>How do I add a contact?</summary>
+      <p>Show them your invite as a QR code, or send them the link. Once you're connected, compare your safety number with theirs, in person or on a call, to be sure no one is in between. Approving each other lets your devices find each other automatically, relay for each other and hold messages while the other is away.</p>
+    </details>
+
+    <details>
+      <summary>Is it free? Who makes it?</summary>
+      <p>It's free and open source, under Apache-2.0 or MIT. All the code and the protocol specification are <a href="https://github.com/larrydewey/threnody">on GitHub</a>. <a href="https://github.com/larrydewey/threnody/blob/master/WhyThrenody.md">Why Threnody</a> tells the story of why it exists.</p>
+    </details>
+
+    <h2>Privacy</h2>
+
+    <details>
+      <summary>Signal is end-to-end encrypted. Why isn't that enough?</summary>
+      <p>End-to-end encryption hides what you say. It doesn't hide who you talk to, when, or how often, and a service that relays every message is in a position to see that. Signal works hard to keep as little as possible, and it's a good choice for many people. Threnody takes a different route: there's no service in the middle at all, and it pads and paces traffic so even someone watching the network learns little.</p>
+    </details>
+
+    <details>
+      <summary>What can someone watching my network see?</summary>
+      <p>That you use Threnody, and the addresses your device connects to. With the default protections, they can't see what you send, how big each message is, or when you send it. Connections go through onion circuits whenever enough relays are available, so the address you connect to is often a relay rather than your contact. Calls and WireGuard tunnel traffic are exceptions: they can't wait for the steady rhythm, so they're visible as what they are.</p>
+    </details>
+
+    <details>
+      <summary>Why does Threnody use so much data?</summary>
+      <p>To hide when you send, each connection sends a small padded frame at a steady rate, whether you have something to say or not. That costs about 230 MB a day per connected contact on Wi-Fi, and about 46 MB a day on mobile data, counting both directions. You can turn cover traffic off in the settings if data matters more to you than hiding your timing.</p>
+    </details>
+
+    <details>
+      <summary>Can I talk to someone without them knowing who I am?</summary>
+      <p>Yes. An anonymous identity is a separate identity with its own keys, contacts and history, and nothing links it to you. Make one, share its invite, and talk. It can delete itself after a day, a week or four weeks. If you later want that person to know it was you, you can prove it.</p>
+    </details>
+
+    <details>
+      <summary>What does my contact see about me?</summary>
+      <p>Your fingerprint and whatever you send them. Your profile, such as your name, is shared only when you choose, contact by contact. Photos have their location and camera details removed before they're sent, unless you turn that off.</p>
+    </details>
+
+    <details>
+      <summary>Does Threnody contact any outside services?</summary>
+      <p>To find contacts across the internet, devices leave encrypted notes for each other in the public BitTorrent DHT, which means DHT nodes see your IP address. You can turn internet reachability off. Optional features, like GIF search through GIPHY, contact their service only after you agree to it. There are no ads, no analytics and no push notification service.</p>
+    </details>
+
+    <h2>Using it</h2>
+
+    <details>
+      <summary>Does it really work without the internet?</summary>
+      <p>Yes, between nearby devices. On Android, phones connect to approved contacts over Bluetooth on their own, and can switch to Wi-Fi Direct for speed. Devices on the same Wi-Fi network find each other too, even if that network has no internet. Messages can also hop through a nearby contact who does have a connection. On Linux, the command-line tool does Bluetooth and Wi-Fi Direct; the desktop app doesn't yet.</p>
+    </details>
+
+    <details>
+      <summary>What happens if my contact is offline?</summary>
+      <p>Your message is sealed so only they can open it and left with a mutual contact, who delivers it when they come back.</p>
+    </details>
+
+    <details>
+      <summary>Can I make calls?</summary>
+      <p>Yes, voice and video calls between two people, in the Android and Linux apps. Group calls aren't available yet.</p>
+    </details>
+
+    <details>
+      <summary>Can I use it on my phone and my computer?</summary>
+      <p>Yes. Link a new device with a one-time code from a device you already have. All your devices share your contacts and history, and any of them can remove a lost one.</p>
+    </details>
+
+    <details>
+      <summary>What if I lose my phone?</summary>
+      <p>If you have another linked device, remove the lost one from there. You can also make a backup file, sealed with a passphrase you choose, and restore it on a new device. Backups don't include anonymous identities or the contents of received files.</p>
+    </details>
+
+    <details>
+      <summary>Do messages disappear?</summary>
+      <p>Only if you want them to. Each chat can set a timer, from 30 seconds to four weeks, and it applies on both sides.</p>
+    </details>
+
+    <h2>Getting it</h2>
+
+    <details>
+      <summary>Which platforms are supported?</summary>
+      <p>Android 10 or newer, and Linux with GTK 4. There are also command-line builds for Linux, macOS and Windows. There's no iOS app yet.</p>
+    </details>
+
+    <details>
+      <summary>Why isn't it in the Play Store or F-Droid?</summary>
+      <p>It's early. For now, the Android app is published as an APK on <a href="https://github.com/larrydewey/threnody/releases/latest">GitHub Releases</a>.</p>
+    </details>
+
+    <details>
+      <summary>How can I check that a download is genuine?</summary>
+      <p>Each release has a <code>SHA256SUMS</code> file with the checksum of every file. Each file also has signed build provenance, which shows it was built by the project's own release workflow from the published source. With the GitHub command-line tool, run <code>gh attestation verify &lt;file&gt; -R larrydewey/threnody</code>.</p>
+    </details>
+
+    <details>
+      <summary>How can I help?</summary>
+      <p>Use it and report what breaks. If you have a small server, you can <a href="https://github.com/larrydewey/threnody/blob/master/docs/relay-node.md">run an always-on relay</a> for yourself and your friends. If you know cryptography or security, reviewing the <a href="https://github.com/larrydewey/threnody/blob/master/Threnody-Specification.md">specification</a> and its <a href="https://github.com/larrydewey/threnody/tree/master/docs">appendices</a> is very welcome.</p>
+    </details>
+
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>Threnody is open source under Apache-2.0 or MIT.</span>
+    <span><a href="https://github.com/larrydewey/threnody">GitHub</a> · <a href="https://github.com/larrydewey/threnody/blob/master/Threnody-Specification.md">Specification</a> · <a href="https://github.com/larrydewey/threnody/blob/master/WhyThrenody.md">Why Threnody</a></span>
+  </div>
+</footer>
+</body>
+</html>

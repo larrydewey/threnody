@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Threnody works</title>
+<meta name="description" content="How Threnody hides who talks to whom, works over Bluetooth and Wi-Fi Direct without the internet, and protects messages with post-quantum encryption, in plain words.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="icon.svg" alt="" width="36" height="36">Threnody</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="./">Home</a>
+      <a href="how-it-works.html" aria-current="page">How it works</a>
+      <a href="faq.html">FAQ</a>
+      <a href="./#download">Download</a>
+      <a href="https://github.com/larrydewey/threnody">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="page-head">
+  <div class="wrap prose">
+    <h1>How it works</h1>
+    <p class="lead">A plain-language tour of what Threnody does to keep your conversations, and the fact that you're having them, private. Each part links to the technical write-up on GitHub if you want the details.</p>
+  </div>
+</div>
+
+<section>
+  <div class="wrap prose">
+    <nav class="toc" aria-label="On this page">
+      <strong>On this page</strong>
+      <ol>
+        <li><a href="#identity">You are a key, not a phone number</a></li>
+        <li><a href="#no-servers">No servers in the middle</a></li>
+        <li><a href="#metadata">Hiding when and how much</a></li>
+        <li><a href="#mesh">Bluetooth, Wi-Fi Direct and the local network</a></li>
+        <li><a href="#crypto">The cryptography</a></li>
+        <li><a href="#anonymity">Anonymous identities and proofs</a></li>
+        <li><a href="#devices">Several devices</a></li>
+        <li><a href="#calls">Calls and tunnels</a></li>
+        <li><a href="#limits">What it doesn't protect against</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="identity">You are a key, not a phone number</h2>
+    <p>When you start Threnody, your device makes a pair of cryptographic keys. That key is your identity. Its short form, a 32-character fingerprint, is what your contacts know you by. There's no sign-up, no phone number and no email.</p>
+    <p>To add someone, you share an invite: a QR code or a link that holds your fingerprint and where to reach you. Once you're connected, you can compare a safety number in person or over a call. If it matches, nobody is sitting in between.</p>
+    <p>Contacts can be <em>approved</em>, and approval is mutual. Approved contacts can find each other automatically, relay for each other and hold messages for each other. Messages from people you haven't accepted wait in a separate list of requests, and their calls never ring.</p>
+
+    <h2 id="no-servers">No servers in the middle</h2>
+    <p>Most messengers, even encrypted ones, send everything through a company's servers. Those servers can't read your messages, but they do see which accounts talk, when and how often. Threnody has no server of its own, so there's nothing in the middle to keep those records.</p>
+    <figure class="diagram" aria-hidden="true">
+      <svg viewBox="0 0 640 170">
+        <rect class="art-soft" x="0" y="0" width="300" height="170" rx="14"/>
+        <rect class="art-soft" x="340" y="0" width="300" height="170" rx="14"/>
+        <text class="art-text" x="150" y="24" text-anchor="middle">a typical messenger</text>
+        <text class="art-text" x="490" y="24" text-anchor="middle">Threnody</text>
+        <circle class="art-device" cx="50" cy="80" r="16"/>
+        <circle class="art-device" cx="50" cy="135" r="16"/>
+        <circle class="art-device" cx="250" cy="80" r="16"/>
+        <circle class="art-device" cx="250" cy="135" r="16"/>
+        <rect class="art-fill" x="128" y="88" width="44" height="40" rx="6"/>
+        <path class="art-line" d="M66 82 L128 100 M66 133 L128 118 M172 100 L234 82 M172 118 L234 133"/>
+        <text class="art-text" x="150" y="152" text-anchor="middle">sees every connection</text>
+        <circle class="art-device" cx="390" cy="80" r="16"/>
+        <circle class="art-device" cx="390" cy="135" r="16"/>
+        <circle class="art-device" cx="590" cy="80" r="16"/>
+        <circle class="art-device" cx="590" cy="135" r="16"/>
+        <circle class="art-device" cx="490" cy="108" r="12"/>
+        <path class="art-line" d="M406 80 L574 80"/>
+        <path class="art-dash" d="M406 135 L478 112 M502 112 L574 135"/>
+        <text class="art-text" x="490" y="152" text-anchor="middle">direct, or through a contact</text>
+      </svg>
+    </figure>
+    <p>Instead, devices connect to each other in whichever way works:</p>
+    <ul>
+      <li><strong>Directly.</strong> On the same network, approved contacts find each other through private beacons that only they can recognise. Across the internet, two devices meet using the public BitTorrent DHT, a large shared lookup table that nobody owns. What each device leaves there is encrypted so only that one contact can read it, under a key that keeps changing. Then they open a direct path through their home routers or phone networks. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-e-discovery.md">Appendix E</a>, <a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-n-internet-reachability.md">Appendix N</a>)</li>
+      <li><strong>Through contacts.</strong> When there's no direct path, approved contacts can relay for each other, up to three hops. Every hop adds another layer of encryption. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-g-relay.md">Appendix G</a>)</li>
+      <li><strong>Through onion circuits.</strong> Whenever enough relays are available, Threnody reaches contacts through at least two of them, wrapped like an onion, so the first relay knows you but not your contact, and the last knows your contact but not you. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-i-onion.md">Appendix I</a>)</li>
+      <li><strong>Through volunteer relays.</strong> New users, or anonymous identities, may not have contacts to relay through. They can subscribe to relay directories that list volunteers. Each circuit is paid for with an anonymous token that the relay can't link to you or to your other circuits, and you connect to it with a throwaway identity. Nothing is subscribed by default. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-p-volunteer-relays.md">Appendix P</a>)</li>
+      <li><strong>Later, through a friend.</strong> If your contact is offline, your message is sealed with keys they handed out in advance, so only they can open it. A mutual contact holds it until they come back. It travels there by onion circuit when possible, so the friend holding it doesn't learn who sent it. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-h-offline.md">Appendix H</a>)</li>
+    </ul>
+    <p>If you want a relay that is always reachable, for example for phones on mobile data, you can <a href="https://github.com/larrydewey/threnody/blob/master/docs/relay-node.md">run one yourself</a> on a small server. It can't read anything, but it does see which of its contacts talk to which, so it's best run by you.</p>
+
+    <h2 id="metadata">Hiding when and how much</h2>
+    <p>Encryption hides what you say. It doesn't hide that a message was sent, how big it was, or when. Someone watching the network can learn a lot from that alone. Threnody does three things about it, all on unless you turn them off:</p>
+    <ul>
+      <li><strong>Padding.</strong> Every message is padded, so short and long messages look the same size on the wire.</li>
+      <li><strong>Cover traffic.</strong> Each connection sends one padded frame at a steady rate, every 2 seconds on Wi-Fi or every 10 seconds on mobile data. When you have nothing to send, the frame is filler. An observer sees the same even rhythm whether you're chatting or not.</li>
+      <li><strong>Onion routing first</strong>, as described above, so even the relays don't learn both ends.</li>
+    </ul>
+    <p>This costs data, and we'd rather say so: about 230 MB a day per connected contact on Wi-Fi, or about 46 MB a day on mobile data, counting both directions. Photos also lose their location and camera details before they're sent, and notifications say only "New message", without the sender or text. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-c-wire-format.md">Appendix C</a>)</p>
+
+    <h2 id="mesh">Bluetooth, Wi-Fi Direct and the local network</h2>
+    <p>Threnody doesn't care how bytes get from one device to another. The same encrypted session runs over the internet, the local network, Bluetooth or Wi-Fi Direct.</p>
+    <ul>
+      <li><strong>Bluetooth LE.</strong> Phones send private beacons that only approved contacts can recognise. When an Android phone hears one, it connects on its own, with no taps. To anyone else, a beacon shows only that some Threnody device is nearby, and beacons can't be linked from one to the next. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-k-bluetooth.md">Appendix K</a>)</li>
+      <li><strong>Wi-Fi Direct.</strong> Bluetooth is slow, so a chat can move to a Wi-Fi Direct link for photos and video, with the session carried over unchanged. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-l-wifi-direct.md">Appendix L</a>)</li>
+      <li><strong>Across links.</strong> Relaying works across transports. A phone with only Bluetooth can reach a contact who is across the internet, through a nearby approved contact who has a connection.</li>
+    </ul>
+    <p>Today, Bluetooth and Wi-Fi Direct work in the Android app and in the Linux command-line tool. The Linux desktop app doesn't do them yet.</p>
+
+    <h2 id="crypto">The cryptography</h2>
+    <p>Large quantum computers don't exist yet, but traffic recorded today could be decrypted once they do. So Threnody uses <em>hybrid</em> encryption everywhere: a well-tested classical method and a newer post-quantum one together. An attacker would have to break both.</p>
+    <ul>
+      <li><strong>Connecting.</strong> Each session starts with a handshake using X-Wing, which combines X25519 with ML-KEM-768, the post-quantum standard published by NIST. Its output matches the official test vectors. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-a-handshake.md">Appendix A</a>)</li>
+      <li><strong>Messaging.</strong> Messages use a double ratchet: keys change constantly, so stealing today's keys doesn't reveal past messages, and the conversation heals itself after a compromise. Threnody's ratchet uses the post-quantum key exchange at each step, and even the message headers are encrypted. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-b-ratchet.md">Appendix B</a>)</li>
+      <li><strong>Groups.</strong> Groups use MLS, the IETF standard for group encryption, with the same X-Wing hybrid. The group's owner manages membership, and no server is needed. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-f-groups.md">Appendix F</a>)</li>
+      <li><strong>Symmetric encryption</strong> is ChaCha20-Poly1305 or AES-256-GCM, with keys derived through BLAKE3.</li>
+      <li><strong>On your device.</strong> On Android your identity is sealed under a key in the Android Keystore (in StrongBox where the phone has it). On desktops it's sealed with a key in your system keyring, or a passphrase. Your history and contacts are encrypted too.</li>
+    </ul>
+    <p>The handshake, the ratchet, sealed offline messages, onion hops, device linking, credentials and relay tokens have machine-checked proofs in the Tamarin prover. Parsers are fuzzed and mutation-tested. These checks catch many kinds of mistake, but they're not a substitute for an independent audit, which hasn't happened yet. (<a href="https://github.com/larrydewey/threnody/blob/master/proofs/README.md">The proofs</a>)</p>
+
+    <h2 id="anonymity">Anonymous identities and proofs</h2>
+    <p>Sometimes you want to talk to someone without them knowing who you are. An <em>anonymous identity</em> is a completely separate Threnody identity, with its own keys, contacts and history. Nothing it sends is derived from your main identity. It doesn't use Bluetooth, local discovery or tunnels, which could give away the device. It can delete itself after a set time, and you can later prove to one contact that it was you, if you choose. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-m-anonymity.md">Appendix M</a>)</p>
+    <p>Your profile works the same way: nothing is shared until you pick, contact by contact, what each one sees.</p>
+    <p>Threnody also supports <em>zero-knowledge credentials</em>. Someone who knows you can vouch for something about you, say, that you're a member of a group. Later you can prove just that one fact to someone else, without revealing anything more, and without those proofs being linkable to each other. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-o-credentials.md">Appendix O</a>)</p>
+
+    <h2 id="devices">Several devices</h2>
+    <p>You can use Threnody on your phone and your computers as one account. A device you already have shows a one-time code, and the new device uses it to join. All devices are equal: any of them can add, rename or remove the others, and your contacts are told when a device is added or removed. Messages reach all of a contact's devices, and your own devices share your history. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-j-devices.md">Appendix J</a>)</p>
+    <p>If you lose your only device, a backup file sealed with a passphrase you choose restores your identity, contacts and history onto a new one.</p>
+
+    <h2 id="calls">Calls and tunnels</h2>
+    <p><strong>Voice and video calls</strong> run between two people, in the Android and Linux apps. The audio and video use WebRTC, the same technology video-call websites use, but it never touches the network itself. Everything is sealed with the call's own keys and carried through the existing encrypted session, by whatever path that session uses. If your Wi-Fi drops mid-call, the call moves to another path. Group calls aren't done yet. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-q-calls.md">Appendix Q</a>)</p>
+    <p><strong>WireGuard tunnels</strong> give approved contacts a private network between their devices. The tunnel keys come from the post-quantum session, so the tunnels are post-quantum too. On Android this runs as a VPN inside the app; on Linux it uses the system's WireGuard. (<a href="https://github.com/larrydewey/threnody/blob/master/docs/appendix-d-tunnels.md">Appendix D</a>)</p>
+
+    <h2 id="limits">What it doesn't protect against</h2>
+    <ul>
+      <li><strong>An unaudited codebase.</strong> Bugs happen. No outside expert has reviewed Threnody yet.</li>
+      <li><strong>A compromised phone or computer.</strong> If malware controls your device, it can read what you read.</li>
+      <li><strong>The internet meeting point.</strong> When devices meet through the public BitTorrent DHT, the DHT nodes see your IP address, though not who you're looking for.</li>
+      <li><strong>Calls and tunnels reveal themselves.</strong> Call media and tunnel traffic go out at once rather than at the steady rate, so an observer can tell that they're happening. Calls take a direct path when they can, and don't use onion circuits yet.</li>
+      <li><strong>Protections you switch off.</strong> Turning off cover traffic or onion routing saves data but gives up what they protect.</li>
+      <li><strong>Your contacts.</strong> The people you talk to see what you send them, and relays you use see some metadata, which is why onion circuits use at least two.</li>
+      <li><strong>An adversary who sees everything</strong> and also controls most of your devices, or who can break the underlying mathematics. The <a href="https://github.com/larrydewey/threnody/blob/master/Threnody-Specification.md">specification</a> spells out its threat model.</li>
+    </ul>
+    <p>For every detail, read the <a href="https://github.com/larrydewey/threnody/blob/master/Threnody-Specification.md">protocol specification</a> and its <a href="https://github.com/larrydewey/threnody/tree/master/docs">appendices</a>.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>Threnody is open source under Apache-2.0 or MIT.</span>
+    <span><a href="https://github.com/larrydewey/threnody">GitHub</a> · <a href="https://github.com/larrydewey/threnody/blob/master/Threnody-Specification.md">Specification</a> · <a href="https://github.com/larrydewey/threnody/blob/master/WhyThrenody.md">Why Threnody</a></span>
+  </div>
+</footer>
+</body>
+</html>

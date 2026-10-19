@@ -2,22 +2,68 @@
 
 # Threnody
 
-Threnody is an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography. This repository holds the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md).
+Threnody is a private messenger that works without a company in the middle. There is no server that holds your account, sees your contact list, or logs who talks to whom and when. Your phone and computers talk to your contacts' devices directly, over the internet, the local network, Bluetooth or Wi-Fi Direct, and through your own contacts when no direct path exists.
+
+**Website:** <https://larrydewey.github.io/threnody/>
+
+> **Status: early and not audited.** Threnody works day to day on Android and Linux, but nobody outside the project has reviewed its security yet. Don't rely on it where your safety depends on it.
+
+## Why it's different
+
+- **No servers that see who talks to whom.** There is no Threnody server at all. Messages go straight to your contact, or through relays that are your own approved contacts or volunteers. Whenever enough relays are available, they take onion circuits through two of them by default, so no single relay sees both ends.
+- **Works with no internet nearby.** Phones find approved contacts over Bluetooth LE and connect without any taps, and a chat can move to Wi-Fi Direct for speed. Devices on the same network find each other on their own. A phone with only a Bluetooth link can reach contacts that its contacts reach over the internet.
+- **Hides when you talk, not just what you say.** Every message is padded to the same size, and each connection sends a steady stream of padded frames with filler in the gaps, so an observer can't tell when you send. Photos lose their location and camera details before they're sent. All of this is on unless you switch it off.
+- **Post-quantum encryption.** Connections, messages and groups use hybrid encryption (X25519 with ML-KEM-768), designed to resist attacks by future quantum computers as well as today's. The core protocols have machine-checked proofs (Tamarin).
+- **No phone number, no email.** Your identity is a key on your device. You add contacts with a QR code or link, or, if you choose to make one, a short handle like `larry-7K3M-QX9P` that people can type. You can compare safety numbers to be sure it's them.
+- **Anonymous identities.** Make a separate identity for one conversation, with its own keys, contacts and history. Nothing links it to you unless you choose to reveal it, and it can delete itself after a day, a week or four weeks.
+- **Voice and video calls** between two people, carried inside the same encrypted connection.
+- **Groups** using MLS, with no server. Members who can't reach each other directly pass messages through a member who can.
+- **Several devices, one account.** Link a laptop to your phone with a one-time code. Devices are equal: any of them can add or remove the others, and they share your contacts and history.
+- **WireGuard tunnels.** Approved contacts can get private network tunnels between their devices, with keys from the post-quantum session.
+- **Messages for offline contacts** are sealed so only the recipient can open them, and held by mutual contacts until the recipient comes back.
+- **Open source**, under Apache-2.0 or MIT.
+
+## Get it
+
+All downloads are on the [latest release](https://github.com/larrydewey/threnody/releases/latest).
+
+- **Android** (10 or newer): download `threnody-<version>-android.apk` and open it on your phone. It isn't in an app store yet.
+- **Linux desktop**: clone this repository and run `apps/linux/install.sh`. It builds the app (you need Rust, GTK 4 and libadwaita; see [the Linux app's README](apps/linux/README.md)) and adds it to your app menu.
+- **Command line** for Linux, macOS and Windows: `threnody-<version>-<platform>.tar.gz` (or `.zip`). See [Quick start](#quick-start).
+
+Every release has a `SHA256SUMS` file, and every file carries signed build provenance: `gh attestation verify <file> -R larrydewey/threnody` checks that this repository's release workflow built it. There's no iOS app yet.
+
+## How it compares
+
+A short comparison by threat, as fairly as we can put it. The other apps change too; corrections are welcome.
+
+| | Threnody | Signal | Briar | SimpleX Chat |
+|---|---|---|---|---|
+| A central service carries your messages and can see who talks to whom | No servers; direct, or onion-routed through contacts and volunteer relays | Yes; Signal's servers relay all messages (sealed sender hides the sender of most messages from them) | No; peer to peer over Tor | Relays carry messages but see no user IDs; you can choose or run your own |
+| Needs a phone number | No | Yes, to register (usernames can hide it from contacts) | No | No |
+| Works offline over Bluetooth or Wi-Fi | Yes: Bluetooth LE, Wi-Fi Direct, local network | No | Yes: Bluetooth, Wi-Fi | No |
+| Post-quantum encryption | Yes: handshake, messages and groups | Yes, for key agreement | No | Yes, in direct chats |
+| Several devices on one account | Yes, all equal | Yes: one phone plus linked devices | No | Limited: a desktop can use a phone's profile |
+| Groups | Yes (MLS) | Yes | Yes | Yes |
+| Independent security audit | Not yet | Widely reviewed | Yes | Yes |
+
+## The trade-offs
+
+- **It costs data.** Hiding when you send means sending all the time. Each connected contact costs about 230 MB a day on Wi-Fi and about 46 MB a day on mobile data, both ways. You can turn cover traffic off.
+- **Your contacts need Threnody too**, and a relay is only as available as the contact or volunteer running it.
+- **Finding a contact across the internet** uses the public BitTorrent DHT as a meeting point. What's stored there is encrypted so only the two of you can read it, under keys that change, but DHT nodes see your IP address.
+- **Optional extras can reach outside services.** GIF search, for example, contacts GIPHY, and only after you agree to it.
+- **The apps are young.** Android and Linux only, with rough edges. The Linux app doesn't do Bluetooth or Wi-Fi Direct yet (the command line does).
+
+For the longer story of why this exists, see [Why Threnody](WhyThrenody.md). To see how it works in more depth, read [How it works](https://larrydewey.github.io/threnody/how-it-works.html) on the website, or the [protocol specification](Threnody-Specification.md) and its appendices below.
+
+## For developers
+
+Threnody is the Rust reference implementation of the [Threnody Protocol Specification](Threnody-Specification.md), an encrypted, metadata-resistant messaging protocol with post-quantum hybrid cryptography.
 
 **Status: milestone 6.** Two devices can connect over IP and authenticate with an X-Wing (X25519 + ML-KEM-768) handshake. They can then chat and send files over a post-quantum double ratchet with encrypted headers, and mutually approve each other. Mutually approved devices find each other automatically on the local network through private beacons, and they get post-quantum-hybrid WireGuard tunnels. MLS groups use an X-Wing ciphersuite and need no server. Approved nodes relay end-to-end sessions over up to three hops. Messages to offline contacts are sealed to their prekeys and held by mutual contacts until the recipient returns. Onion circuits through two or more relays keep any single relay from seeing both ends, through approved contacts or through volunteer relays listed by directories you subscribe to, each paid with an anonymous token. Zero-knowledge credentials (BBS, with post-quantum-signed issuance) let someone prove chosen attributes another person vouched for, and nothing else. Several devices can share one account, linked with a one-time code; any device can add or remove others. The KEM matches the official X-Wing test vectors, the handshake, ratchet, credentials and relay tokens are machine-checked in Tamarin, every parser is mutation-tested, and identity keys can be protected with a passphrase. Apps can embed a node through generated Kotlin, Swift and Python bindings. Over Bluetooth LE, approved contacts recognise each other's private beacons and connect without any taps. A Pixel 8a and a laptop have chatted this way, and the phone keeps its sessions while in the background. Relays work across transports, so a phone with only a Bluetooth link can reach peers that its contacts reach over IP. Sessions over Bluetooth can be upgraded to Wi-Fi Direct for bandwidth.
 
-> ⚠️ Not audited. Do not rely on it for real-world safety yet.
-
-## Why Threnody?
-
-Threnody exists because content encryption alone is not enough.
-
-Most messengers—including Signal, WhatsApp, Threema, and SimpleX Chat—still rely on central servers or relay infrastructure that can observe connection patterns, and none combine local-first mesh networking, aggressive default metadata protection, post-quantum hybrid cryptography, and true multi-device operation without a central identity provider.
-
-For a clear, concise explanation of the design goals, threat model, and how Threnody differs from existing options, see **[Why Threnody](WhyThrenody.md)**.
-
-
-## Quick start
+### Quick start
 
 For a graphical messenger on Linux, run `apps/linux/install.sh` and start Threnody from your app menu ([details](apps/linux/README.md)). It shares its identity with the CLI. The rest of this section uses the CLI.
 
@@ -50,7 +96,7 @@ Inside `run`, any line you type goes to the current peer. The available commands
 To add a device to your account, run `/device add [host:port]` on a device you already have. It prints a one-time code (and a QR code) with this machine's LAN address, or the one given. Then run `threnody link '<code>'` on the new device. `/devices` lists your devices, `/device rename <name> <new name>` renames one, and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices. Your devices share your message history, and a new device gets it all when linked.
 
 ```
-/connect <invite|contact|host:port>   /to <peer>   /peers   /contacts
+/connect <invite|handle|contact|host:port>   /handle [name|off]   /to <peer>   /peers   /contacts
 /name <peer> <name>   /approve [peer]   /revoke [peer]
 /safety [peer]   /verify [peer]   /file [-s] <path>... [| caption]   /drop [peer]
 /policy anyone|contacts|approved   /status   /quit
@@ -72,7 +118,7 @@ While listening, nodes send private UDP beacons that only mutually approved peer
 
 `--tunnel [PORT]` builds WireGuard tunnels to mutually approved peers. Each pair's preshared key comes from its Threnody session, which makes the tunnels post-quantum hybrid. The node keeps `<home>/wireguard/thr0.conf` current: bring the interface up with `sudo wg-quick up …`, then add `--wg-apply` to push changes live. See [Appendix D](docs/appendix-d-tunnels.md).
 
-## Layout
+### Layout
 
 | Crate | Contents |
 |---|---|
@@ -101,12 +147,12 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix N: reaching contacts across the internet](docs/appendix-n-internet-reachability.md) (0.3.0)
 - [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md) (0.4.0)
 - [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md) (0.4.0)
-- [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (in progress: audio between apps)
+- [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (voice and video between two people; group calls not yet)
 - [Appendix S: handles](docs/appendix-s-handles.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
-## Spec coverage
+### Spec coverage
 
 | Spec | Status |
 |---|---|
@@ -129,7 +175,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.1 Platform keystore | ✅ Android: the identity is sealed under an Android Keystore key (StrongBox or TEE). Desktop: sealed with a key in the system keyring by default, or a passphrase; 0600 files without either |
 | §15 Test vectors | ✅ `docs/test-vectors/v1.txt` |
 
-## Roadmap
+### Roadmap
 
 0. **Internet reachability (remaining).** 0.3.0 reaches contacts across the internet with no server: sessions over QUIC, rendezvous in the public BitTorrent DHT under keys only the two contacts share, hole punching, and fast recovery that reconnects in under a second when a phone changes network (see [Appendix N](docs/appendix-n-internet-reachability.md)). Still to do: router port mapping, a persistent relay circuit to an always-on contact (instant notice of moves, and reaching phones in the background), and tests between two phones.
 1. **Hardening (remaining).** An iOS keystore and an external audit.
@@ -139,7 +185,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 5. **Metadata (remaining).** Relays that hold a connection for a device behind NAT, as onion services do (Appendix N, "Later"), and cover traffic inside circuits.
 6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
 
-## Development
+### Development
 
 ```sh
 cargo test                    # unit, vector, mutation and TCP integration tests
@@ -148,7 +194,7 @@ cargo +nightly fuzz run envelope   # see fuzz/README.md
 crates/threnody-ffi/bindings.sh    # generate bindings, run the Python binding test
 ```
 
-## CI and releases
+### CI and releases
 
 Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, an Android build and a dependency advisory check (`.github/workflows/ci.yml`). It also builds and tests on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
 

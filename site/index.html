@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threnody: private messaging with no one in the middle</title>
+<meta name="description" content="Threnody is an open-source messenger with no servers in the middle. It hides who talks to whom, works over Bluetooth and Wi-Fi Direct with no internet, and uses post-quantum encryption.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="icon.svg" alt="" width="36" height="36">Threnody</a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="./" aria-current="page">Home</a>
+      <a href="how-it-works.html">How it works</a>
+      <a href="faq.html">FAQ</a>
+      <a href="#download">Download</a>
+      <a href="https://github.com/larrydewey/threnody">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <h1>Private messaging with no one in the middle.</h1>
+      <p class="lead">Threnody is a messenger with no company server. Your devices talk to your contacts' devices directly: over the internet, the local network, Bluetooth or Wi-Fi Direct. There's no company in the middle keeping a record of who you talk to, or when.</p>
+      <div class="buttons">
+        <a class="button primary" href="#download">Download</a>
+        <a class="button secondary" href="how-it-works.html">How it works</a>
+      </div>
+      <p class="notice"><strong>Early and not audited.</strong> Threnody works day to day on Android and Linux, but no one outside the project has reviewed its security yet. Don't rely on it where your safety depends on it.</p>
+    </div>
+    <div class="hero-art" aria-hidden="true">
+      <svg viewBox="0 0 400 320" role="img">
+        <!-- crossed-out server -->
+        <rect class="art-soft" x="160" y="18" width="80" height="58" rx="10"/>
+        <line class="art-line" x1="176" y1="38" x2="224" y2="38"/>
+        <line class="art-line" x1="176" y1="56" x2="224" y2="56"/>
+        <line class="art-no" x1="150" y1="10" x2="250" y2="86"/>
+        <line class="art-no" x1="250" y1="10" x2="150" y2="86"/>
+        <text class="art-text" x="200" y="106" text-anchor="middle">no server</text>
+        <!-- links -->
+        <path class="art-line" d="M92 214 C 150 150, 250 150, 308 214"/>
+        <path class="art-dash" d="M92 240 C 140 290, 170 290, 200 276"/>
+        <path class="art-dash" d="M200 276 C 230 290, 260 290, 308 240"/>
+        <!-- phone left -->
+        <rect class="art-device" x="56" y="170" width="70" height="120" rx="14"/>
+        <rect class="art-screen" x="64" y="186" width="54" height="88" rx="4"/>
+        <rect class="art-fill" x="70" y="196" width="34" height="10" rx="5"/>
+        <rect class="art-fill-2" x="80" y="214" width="32" height="10" rx="5"/>
+        <rect class="art-fill" x="70" y="232" width="26" height="10" rx="5"/>
+        <!-- laptop right -->
+        <rect class="art-device" x="262" y="182" width="96" height="66" rx="8"/>
+        <rect class="art-screen" x="272" y="192" width="76" height="46" rx="3"/>
+        <path class="art-device" d="M248 252 H372 L362 266 H258 Z"/>
+        <rect class="art-fill" x="280" y="200" width="36" height="9" rx="4.5"/>
+        <rect class="art-fill-2" x="300" y="216" width="40" height="9" rx="4.5"/>
+        <!-- relay contact middle -->
+        <circle class="art-device" cx="200" cy="276" r="18"/>
+        <circle class="art-fill-2" cx="200" cy="276" r="6"/>
+        <!-- lock -->
+        <rect class="art-fill" x="186" y="150" width="28" height="22" rx="4"/>
+        <path class="art-line" d="M192 150 v-7 a8 8 0 0 1 16 0 v7"/>
+        <text class="art-text" x="200" y="196" text-anchor="middle">internet</text>
+        <text class="art-text" x="200" y="314" text-anchor="middle">Bluetooth, via a contact</text>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What makes it different</h2>
+    <p class="lead">Most encrypted messengers protect what you say. Threnody also protects who you talk to, when, and how often, and keeps working when the internet doesn't.</p>
+
+    <div class="feature">
+      <div>
+        <h3>No servers that see who talks to whom</h3>
+        <p>There is no Threnody server at all. Messages go straight to your contact. When that isn't possible, they pass through relays run by your own approved contacts, or by volunteers you choose to trust. Whenever enough relays are available, Threnody uses onion circuits through two of them, so no single relay sees both ends.</p>
+        <p>If a contact is offline, the message is sealed so only they can open it and left with a mutual contact, who hands it over when they come back.</p>
+      </div>
+      <figure aria-hidden="true">
+        <svg viewBox="0 0 400 180">
+          <circle class="art-device" cx="40" cy="90" r="24"/>
+          <circle class="art-fill" cx="40" cy="90" r="8"/>
+          <circle class="art-device" cx="150" cy="60" r="20"/>
+          <circle class="art-device" cx="250" cy="120" r="20"/>
+          <circle class="art-device" cx="360" cy="90" r="24"/>
+          <circle class="art-fill-2" cx="360" cy="90" r="8"/>
+          <path class="art-line" d="M64 84 L130 64"/>
+          <path class="art-line" d="M170 66 L230 112"/>
+          <path class="art-line" d="M270 116 L336 96"/>
+          <text class="art-text" x="40" y="138" text-anchor="middle">you</text>
+          <text class="art-text" x="150" y="30" text-anchor="middle">relay 1</text>
+          <text class="art-text" x="250" y="160" text-anchor="middle">relay 2</text>
+          <text class="art-text" x="360" y="138" text-anchor="middle">contact</text>
+        </svg>
+        <figcaption>Relay 1 knows you but not your contact. Relay 2 knows your contact but not you.</figcaption>
+      </figure>
+    </div>
+
+    <div class="feature flip">
+      <div>
+        <h3>Works with no internet nearby</h3>
+        <p>On Android, phones find approved contacts over Bluetooth and connect on their own, without any taps. A chat can then move to Wi-Fi Direct for speed. Devices on the same Wi-Fi find each other automatically.</p>
+        <p>Relays work across links, so a phone that only has Bluetooth can still reach contacts that a nearby contact reaches over the internet.</p>
+      </div>
+      <figure aria-hidden="true">
+        <svg viewBox="0 0 400 180">
+          <rect class="art-device" x="30" y="40" width="56" height="96" rx="12"/>
+          <rect class="art-device" x="172" y="40" width="56" height="96" rx="12"/>
+          <rect class="art-device" x="314" y="40" width="56" height="96" rx="12"/>
+          <path class="art-dash" d="M92 88 H166"/>
+          <path class="art-line" d="M234 88 H308"/>
+          <path class="art-line" d="M118 70 a14 14 0 0 1 0 36 M110 78 a6 6 0 0 1 0 20" stroke-linecap="round"/>
+          <text class="art-text" x="129" y="160" text-anchor="middle">Bluetooth</text>
+          <text class="art-text" x="271" y="160" text-anchor="middle">internet</text>
+          <circle class="art-fill" cx="58" cy="88" r="7"/>
+          <circle class="art-fill-2" cx="342" cy="88" r="7"/>
+        </svg>
+        <figcaption>A phone with only Bluetooth reaches a contact across the internet through a friend in the room.</figcaption>
+      </figure>
+    </div>
+
+    <div class="feature">
+      <div>
+        <h3>Hides when you talk, not just what you say</h3>
+        <p>Every message is padded to the same size. Each connection sends a steady beat of padded frames, with filler in the gaps, so someone watching the network can't tell when you're typing or sending. Photos lose their location and camera details before they leave your device.</p>
+        <p>All of this is on unless you turn it off. It costs data: about 230 MB a day per connected contact on Wi-Fi, and about 46 MB on mobile data.</p>
+      </div>
+      <figure aria-hidden="true">
+        <svg viewBox="0 0 400 140">
+          <g class="art-fill">
+            <rect x="20" y="50" width="24" height="40" rx="4"/>
+            <rect x="64" y="50" width="24" height="40" rx="4"/>
+            <rect x="108" y="50" width="24" height="40" rx="4"/>
+            <rect x="196" y="50" width="24" height="40" rx="4"/>
+            <rect x="284" y="50" width="24" height="40" rx="4"/>
+            <rect x="328" y="50" width="24" height="40" rx="4"/>
+          </g>
+          <g class="art-fill-2">
+            <rect x="152" y="50" width="24" height="40" rx="4"/>
+            <rect x="240" y="50" width="24" height="40" rx="4"/>
+            <rect x="372" y="50" width="24" height="40" rx="4"/>
+          </g>
+          <text class="art-text" x="200" y="125" text-anchor="middle">same size, same rhythm: real messages and filler look alike</text>
+        </svg>
+        <figcaption>An observer sees an even stream either way.</figcaption>
+      </figure>
+    </div>
+
+    <div class="grid" style="margin-top:56px">
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><rect x="8" y="18" width="24" height="18" rx="4" fill="currentColor"/><path d="M13 18v-5a7 7 0 0 1 14 0v5" stroke="currentColor" stroke-width="3" fill="none"/></svg>
+        <h3>Post-quantum encryption</h3>
+        <p>Connections, messages and groups combine a classic key exchange (X25519) with a post-quantum one (ML-KEM-768), so recorded traffic stays safe even against future quantum computers. The core protocols have machine-checked proofs.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="14" r="7" fill="currentColor"/><path d="M6 36c2-8 8-11 14-11s12 3 14 11" fill="currentColor"/></svg>
+        <h3>No phone number</h3>
+        <p>Your identity is a key on your device, not a phone number or email. You add people with a QR code or a link, and compare safety numbers to know it's really them.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><path d="M6 14c0-4 6-6 14-6s14 2 14 6c0 9-6 16-14 16S6 23 6 14z" fill="currentColor"/><circle cx="14" cy="16" r="3" fill="var(--surface)"/><circle cx="26" cy="16" r="3" fill="var(--surface)"/></svg>
+        <h3>Anonymous identities</h3>
+        <p>Make a separate identity for one conversation, with its own keys and history. Nothing links it to you unless you choose to reveal it, and it can delete itself after a day, a week or four weeks.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><rect x="4" y="11" width="22" height="18" rx="4" fill="currentColor"/><path d="M27 17l9-5v16l-9-5z" fill="currentColor"/></svg>
+        <h3>Voice and video calls</h3>
+        <p>Call a contact by voice or video, inside the same encrypted connection as your messages. Calls keep going when you switch from Wi-Fi to mobile data. Group calls are not done yet.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><circle cx="12" cy="14" r="5" fill="currentColor"/><circle cx="28" cy="14" r="5" fill="currentColor"/><circle cx="20" cy="27" r="5" fill="currentColor"/><path d="M12 14L28 14L20 27Z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
+        <h3>Groups without a server</h3>
+        <p>Groups use MLS, the IETF standard for group encryption. Members who can't reach each other directly pass messages through a member who can.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><rect x="3" y="9" width="22" height="16" rx="3" fill="currentColor"/><rect x="1" y="27" width="26" height="3" rx="1.5" fill="currentColor"/><rect x="28" y="12" width="10" height="20" rx="3" fill="currentColor"/></svg>
+        <h3>All your devices</h3>
+        <p>Link a laptop to your phone with a one-time code. Every device is equal: any of them can add or remove the others, and they share your contacts and history.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><path d="M20 4l13 5v10c0 9-6 15-13 17C13 34 7 28 7 19V9z" fill="currentColor"/></svg>
+        <h3>Private network tunnels</h3>
+        <p>Approved contacts can get WireGuard tunnels between their devices, with keys from the post-quantum session. Their devices can then reach each other as if they shared one network.</p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 40 40" aria-hidden="true"><path d="M14 10l-9 10 9 10M26 10l9 10-9 10" stroke="currentColor" stroke-width="3.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h3>Open source</h3>
+        <p>All the code and the protocol specification are public, under Apache-2.0 or MIT. Releases carry signed build provenance, so you can check where a download came from.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="compare">
+  <div class="wrap">
+    <h2>How it compares</h2>
+    <p class="lead">A short comparison by threat, as fairly as we can put it. Each of these apps makes different trade-offs, and they all change over time. Corrections are welcome.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th scope="col">Threat or need</th><th scope="col">Threnody</th><th scope="col">Signal</th><th scope="col">Briar</th><th scope="col">SimpleX Chat</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">A central service carries your messages and can see who talks to whom</th>
+            <td class="us"><span class="yes">No servers.</span> <span class="small">Direct, or onion-routed through contacts and volunteer relays.</span></td>
+            <td><span class="no">Yes.</span> <span class="small">Signal's servers relay all messages. Sealed sender hides the sender of most messages from them.</span></td>
+            <td><span class="yes">No.</span> <span class="small">Peer to peer over Tor.</span></td>
+            <td><span class="part">Relays.</span> <span class="small">They carry messages but see no user IDs; you can choose or run your own.</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Needs a phone number</th>
+            <td class="us"><span class="yes">No</span></td>
+            <td><span class="no">Yes,</span> <span class="small">to register. Usernames can hide it from contacts.</span></td>
+            <td><span class="yes">No</span></td>
+            <td><span class="yes">No</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Works offline over Bluetooth or Wi-Fi</th>
+            <td class="us"><span class="yes">Yes.</span> <span class="small">Bluetooth LE, Wi-Fi Direct, local network.</span></td>
+            <td><span class="no">No</span></td>
+            <td><span class="yes">Yes.</span> <span class="small">Bluetooth, Wi-Fi.</span></td>
+            <td><span class="no">No</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Post-quantum encryption</th>
+            <td class="us"><span class="yes">Yes.</span> <span class="small">Handshake, messages and groups.</span></td>
+            <td><span class="yes">Yes,</span> <span class="small">for key agreement.</span></td>
+            <td><span class="no">No</span></td>
+            <td><span class="yes">Yes,</span> <span class="small">in direct chats.</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Several devices on one account</th>
+            <td class="us"><span class="yes">Yes,</span> <span class="small">all equal.</span></td>
+            <td><span class="yes">Yes:</span> <span class="small">one phone plus linked devices.</span></td>
+            <td><span class="no">No</span></td>
+            <td><span class="part">Limited:</span> <span class="small">a desktop can use a phone's profile.</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Groups</th>
+            <td class="us"><span class="yes">Yes</span> <span class="small">(MLS)</span></td>
+            <td><span class="yes">Yes</span></td>
+            <td><span class="yes">Yes</span></td>
+            <td><span class="yes">Yes</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Independent security audit</th>
+            <td class="us"><span class="no">Not yet</span></td>
+            <td><span class="yes">Widely reviewed</span></td>
+            <td><span class="yes">Yes</span></td>
+            <td><span class="yes">Yes</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="muted small">Signal is the most polished and widely used of these, and a fine choice when you trust its servers not to keep records. Briar is the closest to Threnody in spirit, and is built for activists and crises. SimpleX avoids user identifiers altogether. Threnody's aim is to combine no servers, offline mesh, post-quantum encryption and multiple devices in one app.</p>
+  </div>
+</section>
+
+<section id="download" class="downloads">
+  <div class="wrap">
+    <h2>Download</h2>
+    <p class="lead">Threnody is free and open source. All downloads are on the latest GitHub release.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>Android</h3>
+        <p>Android 10 or newer. Download <code>threnody-&lt;version&gt;-android.apk</code> from the release and open it on your phone. It isn't in an app store yet, so your phone will ask you to allow the install.</p>
+        <a class="button primary" href="https://github.com/larrydewey/threnody/releases/latest">Get the APK</a>
+      </div>
+      <div class="card">
+        <h3>Linux desktop</h3>
+        <p>Clone the repository and run <code>apps/linux/install.sh</code>. It builds the app and adds it to your app menu. You need Rust, GTK 4 and libadwaita.</p>
+        <a class="button secondary" href="https://github.com/larrydewey/threnody/blob/master/apps/linux/README.md">Linux instructions</a>
+      </div>
+      <div class="card">
+        <h3>Command line</h3>
+        <p>Ready-built <code>threnody</code> binaries for Linux (x86_64, ARM), macOS (Apple silicon, Intel) and Windows. Good for servers, relays and people who live in a terminal.</p>
+        <a class="button secondary" href="https://github.com/larrydewey/threnody/releases/latest">Get the binaries</a>
+      </div>
+    </div>
+    <p class="muted small" style="margin-top:20px">Every release has a <code>SHA256SUMS</code> file, and every file has signed build provenance. <code>gh attestation verify &lt;file&gt; -R larrydewey/threnody</code> checks that this project's release workflow built it. There is no iOS app yet.</p>
+  </div>
+</section>
+
+<section id="status">
+  <div class="wrap prose">
+    <h2>Where things stand</h2>
+    <p>Threnody is young. It runs day to day on Android phones and Linux computers, and it has been tested between a Pixel phone and a laptop over Wi-Fi, Bluetooth, Wi-Fi Direct and mobile data. Its core protocols are checked with formal proofs and its parsers are fuzzed, but <strong>no independent security audit has been done</strong>. Until one has, treat it as a promising tool to try, not one to bet your safety on.</p>
+    <p>Things still missing include an iOS app, group calls, and an app store listing. The <a href="https://github.com/larrydewey/threnody#roadmap">roadmap</a> has the details, and the <a href="faq.html">FAQ</a> answers common questions.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <span>Threnody is open source under Apache-2.0 or MIT.</span>
+    <span><a href="https://github.com/larrydewey/threnody">GitHub</a> · <a href="https://github.com/larrydewey/threnody/blob/master/Threnody-Specification.md">Specification</a> · <a href="https://github.com/larrydewey/threnody/blob/master/WhyThrenody.md">Why Threnody</a></span>
+  </div>
+</footer>
+</body>
+</html>
