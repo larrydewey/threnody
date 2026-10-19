@@ -30,6 +30,6 @@ Build the library for each ABI with [cargo-ndk](https://github.com/bbqsrc/cargo-
 
 ## iOS
 
-Build `libthrenody_ffi.a` for `aarch64-apple-ios` and `aarch64-apple-ios-sim`, then combine them into an XCFramework with `xcodebuild -create-xcframework`. Add `threnody_ffi.swift`, `threnody_ffiFFI.h` and `threnody_ffiFFI.modulemap` from `target/bindings/swift`.
+[`apps/ios/build-xcframework.sh`](../../apps/ios/build-xcframework.sh) builds `libthrenody_ffi.a` for `aarch64-apple-ios`, `aarch64-apple-ios-sim` and `x86_64-apple-ios`, generates the Swift bindings and packages them as an XCFramework, without the `calls` and `boringtun` features.
 
-The Kotlin and Swift bindings are generated from the same library as the Python ones, which are exercised by `tests/python/test_chat.py`. The Kotlin bindings are used by the Android app in [`apps/android`](../../apps/android). The Swift ones have not been compiled into an app yet.
+The Kotlin and Swift bindings are generated from the same library as the Python ones, which are exercised by `tests/python/test_chat.py`. The Kotlin bindings are used by the Android app in [`apps/android`](../../apps/android), the Swift ones by the iOS app in [`apps/ios`](../../apps/ios).

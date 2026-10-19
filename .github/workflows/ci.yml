@@ -107,6 +107,29 @@ jobs:
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
 
+  ios:
+    name: iOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: brew install xcodegen
+      - name: Build the XCFramework and Swift bindings
+        run: apps/ios/build-xcframework.sh
+      - name: Generate the Xcode project
+        working-directory: apps/ios
+        run: xcodegen generate
+      - name: Build for the simulator
+        working-directory: apps/ios
+        run: |
+          xcodebuild build -project Threnody.xcodeproj -scheme Threnody -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO
+
   portability:
     name: Build on ${{ matrix.os }}
     strategy:
