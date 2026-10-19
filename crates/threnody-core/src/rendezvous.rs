@@ -61,7 +61,7 @@ pub struct RecordKeys {
     /// Seed of the Ed25519 key pair the record is stored (and signed) under.
     pub signing_seed: [u8; 32],
     pub salt: [u8; 16],
-    enc_key: [u8; 32],
+    pub(crate) enc_key: [u8; 32],
 }
 
 impl Drop for RecordKeys {
@@ -232,7 +232,7 @@ impl Paths {
 }
 
 impl Candidates {
-    fn encode(&self) -> Result<Vec<u8>> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         cbor::to_vec(PADDED_LEN, |e| {
             e.map_len(3 + usize::from(self.seeking_until_ms.is_some()))?;
             e.u8(0)?;
@@ -246,7 +246,7 @@ impl Candidates {
         })
     }
 
-    fn decode(b: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut list, mut issued, mut flags, mut seeking) = (None, None, 0, None);
         read_map(&mut dec, |key, d| {

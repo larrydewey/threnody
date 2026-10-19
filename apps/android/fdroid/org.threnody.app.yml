@@ -1,0 +1,75 @@
+# DRAFT fdroiddata recipe for Threnody (metadata/org.threnody.app.yml).
+#
+# Not ready to submit as it stands: the build below still fetches LiveKit's
+# prebuilt libwebrtc (native library and libwebrtc.jar) for calls, which
+# F-Droid does not accept. See "Blockers" in apps/android/README.md and the
+# comments on the build entry.
+#
+# The license is "Apache-2.0 OR MIT" (dual); fdroiddata takes one SPDX id
+# here, so this uses Apache-2.0, as other dual-licensed Rust apps do.
+
+AntiFeatures:
+  NonFreeNet:
+    en-US: >-
+      Optional GIF search uses the GIPHY API (a proprietary service). It is
+      off until the user agrees to it, and F-Droid builds carry no API key,
+      so the user must also supply their own.
+Categories:
+  - Internet
+  - Security
+License: Apache-2.0
+AuthorName: Larry Dewey
+WebSite: https://github.com/larrydewey/threnody
+SourceCode: https://github.com/larrydewey/threnody
+IssueTracker: https://github.com/larrydewey/threnody/issues
+Changelog: https://github.com/larrydewey/threnody/releases
+
+AutoName: Threnody
+
+RepoType: git
+Repo: https://github.com/larrydewey/threnody.git
+
+Builds:
+  - versionName: 0.16.0
+    versionCode: 16000
+    commit: v0.16.0
+    subdir: apps/android/app
+    sudo:
+      - apt-get update
+      - apt-get install -y --no-install-recommends build-essential pkg-config
+    srclibs:
+      - rustup@1.28.2
+    # The wrapper jar is a binary; F-Droid uses its own Gradle anyway.
+    rm:
+      - apps/android/gradle/wrapper/gradle-wrapper.jar
+    prebuild:
+      - $$rustup$$/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 --target aarch64-linux-android
+    # Same steps as apps/android/build.sh, minus Gradle: cross-compile
+    # libthrenody_ffi.so into jniLibs, copy libwebrtc.jar into app/libs and
+    # generate the UniFFI Kotlin bindings.
+    #
+    # BLOCKER: the `calls` feature pulls in webrtc-sys, whose build script
+    # downloads a prebuilt libwebrtc from
+    # github.com/livekit/rust-sdks/releases (tag webrtc-89d790b) unless
+    # LK_CUSTOM_WEBRTC points at a local build. Either build it from source
+    # first (webrtc-sys's libwebrtc/build_android.sh: a full Chromium WebRTC
+    # checkout through depot_tools, tens of GB, and depot_tools itself fetches
+    # prebuilt gn/ninja/clang), then set LK_CUSTOM_WEBRTC; or ship an F-Droid
+    # build without calls, which needs the app to build without
+    # libwebrtc.jar (Calls.kt calls livekit.org.webrtc.ContextUtils
+    # directly, and app/build.gradle.kts depends on libs/libwebrtc.jar).
+    build:
+      - source $HOME/.cargo/env
+      - ANDROID_NDK_HOME=$$NDK$$ ../build.sh --native-only
+    ndk: 28.2.13676358
+    gradle:
+      - yes
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags ^v[0-9.]+$
+# The versionCode is computed in app/build.gradle.kts from the workspace
+# version in Cargo.toml (major * 1000000 + minor * 1000 + patch), which
+# checkupdates can't evaluate. Until there's a literal to match, new builds
+# need their versionCode filled in by hand.
+CurrentVersion: 0.16.0
+CurrentVersionCode: 16000

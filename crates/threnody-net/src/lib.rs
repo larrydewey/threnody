@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod error;
 pub mod folders;
 pub mod frame;
+mod handle;
 pub mod handshake;
 pub mod history;
 pub mod identity;

@@ -1013,6 +1013,7 @@ class MainActivity : Activity() {
             if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
             else "Only your own contacts relay for you"
         }
+        networkSection.add("Your handle").setOnMenuItemClickListener { node?.let { Handles.show(this@MainActivity, it) }; true }
         networkSection.add("Always-on relay").setOnMenuItemClickListener { alwaysOnRelay(); true }
         networkSection.add("WireGuard tunnels").apply {
             isCheckable = true
@@ -1469,7 +1470,7 @@ class MainActivity : Activity() {
     /** `scanned`: the invite came from a QR code, so naming them comes next. */
     private fun addContact(prefill: String?, scanned: Boolean = false) {
         // A copied invite (say, from the camera app) fills itself in.
-        val field = input("threnody://… or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
+        val field = input("Invite link, handle or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
         val name = input("Name (optional; only you see it)", null,
             InputType.TYPE_TEXT_FLAG_CAP_WORDS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
         val fields = LinearLayout(this).apply {
@@ -1482,7 +1483,7 @@ class MainActivity : Activity() {
             .setTitle(if (scanned) "Add the scanned contact" else "Add a contact")
             .setMessage(
                 if (scanned) "Give them a name you'll recognise, if you like. You'll check their safety number together later."
-                else "Scan or paste their invite. You'll check their safety number together later."
+                else "Scan or paste their invite, or type their handle (name-XXXX-XXXX). You'll check their safety number together later."
             )
             .setView(fields)
             .setPositiveButton("Connect") { _, _ -> connect(field.text.toString().trim(), name.text.toString().trim()) }
@@ -1563,7 +1564,9 @@ class MainActivity : Activity() {
     private fun connect(target: String, name: String = "") {
         if (target.isEmpty()) return
         val n = node ?: return
-        Toast.makeText(this, "Connecting…", Toast.LENGTH_SHORT).show()
+        val handle = !target.contains("://") && Regex("^@?[A-Za-z0-9_.]+[- ]").containsMatchIn(target) &&
+            target.count { it.isLetterOrDigit() } >= 9 && !target.contains(':')
+        Toast.makeText(this, if (handle) "Looking for $target… (up to two minutes)" else "Connecting…", Toast.LENGTH_SHORT).show()
         Threading.background {
             try {
                 val peer = n.connect(target)

@@ -71,6 +71,7 @@ object Threnody {
         applyPrivacy(ctx)
         Push.apply(ctx.applicationContext, it)
         Tunnels.resume(ctx.applicationContext, it)
+        Handles.resume(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)
         keepStandby(ctx.applicationContext, it)
         nameThisDevice(it)
