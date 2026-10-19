@@ -178,7 +178,13 @@ final class NodeStore: ObservableObject {
         values.isExcludedFromBackup = true
         try home.setResourceValues(values)
         let n = try ThrenodyNode.open(home: home.path, passphrase: KeyVault.passphrase(home: home), tunnelPort: nil)
-        let addr = (try? n.listen(addr: "0.0.0.0:7450")) ?? (try n.listen(addr: "0.0.0.0:0"))
+        // The usual port, or any free one if it's taken.
+        let addr: String
+        if let a = try? n.listen(addr: "0.0.0.0:7450") {
+            addr = a
+        } else {
+            addr = try n.listen(addr: "0.0.0.0:0")
+        }
         if let deviceName, !deviceName.isEmpty, let me = n.devices().first(where: \.thisDevice) {
             try? n.renameDevice(device: me.fingerprint, name: deviceName)
         }
