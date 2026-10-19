@@ -1,0 +1,4 @@
+- Handles: a short name like larry-7K3M-QX9P that people can type to find you, without an invite. Off unless you make one.
+- Optional UnifiedPush wake-ups: no permanent notification, and contacts holding a message wake the phone.
+- Read receipts work again, shown as an eye; double ticks mean delivered.
+- The time and ticks show under every message.
