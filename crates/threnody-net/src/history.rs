@@ -625,23 +625,19 @@ impl Node {
 
     /// Handles a `Read` from `from`: it displayed our outgoing messages
     /// `ids` in our conversation with it; their "seen" ticks update.
-    pub(crate) fn on_read(&self, from: &PublicIdentity, conversation: &[u8], ids: &[u64]) {
+    /// `conversation` is ours as the reader names it (after our account,
+    /// not theirs), so like an edit's it says nothing here: the
+    /// conversation is the one with `from`.
+    pub(crate) fn on_read(&self, from: &PublicIdentity, _conversation: &[u8], ids: &[u64]) {
         if self.is_own_device(from) {
             return;
         }
-        let expected = self.conversation_for(from);
-        let ok = match ConversationId::from_bytes(conversation) {
-            Some(c) => c == expected,
-            None => false,
-        };
-        if !ok {
-            return;
-        }
+        let conv = self.conversation_for(from);
         let now = now_ms();
         let n = self
             .shared
             .home
-            .mark_read_entries(self.identity_ref(), expected, now, |e| {
+            .mark_read_entries(self.identity_ref(), conv, now, |e| {
                 e.outgoing && e.local_id != 0 && ids.contains(&e.local_id)
             })
             .unwrap_or(0);

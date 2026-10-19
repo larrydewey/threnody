@@ -10,13 +10,10 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
 import android.text.Editable
-import android.text.SpannableString
-import android.text.Spanned
 import android.text.InputType
 import android.text.TextWatcher
 import android.text.format.DateFormat
 import android.text.format.Formatter
-import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -1373,11 +1370,13 @@ class ChatActivity : Activity() {
         }
         // One tick once sent, two once delivered: to a device of the
         // contact, or to every member of a group (with a count until then).
+        // An eye once the contact has read it.
         // Sent from another of our devices: that device sees its ticks.
         val elsewhere = outgoing && !item.sending && e.device != myDevice
         val tick = when {
             !outgoing || item.sending -> ""
             elsewhere -> " · from your other device"
+            run.all { it.entry.delivered } && e.read -> " 👁️"
             run.all { it.entry.delivered } -> " ✓✓"
             group != null && e.deliveredTo > 0u -> " ✓ ${e.deliveredTo}/${e.recipients}"
             else -> " ✓"
@@ -1385,20 +1384,12 @@ class ChatActivity : Activity() {
         reactionChips(e, fg)?.let { body.addView(it, matchWrap) }
         body.addView(TextView(this).apply {
             val metaText = meta + (if (e.edited) " · edited" else "") + (if (e.disappearing) " · ⏱" else "") + tick
-            contentDescription = metaText.replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
+            contentDescription = metaText.replace("👁️", "read").replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
             textSize = 11f
             setTextColor(fg)
             alpha = 0.7f
             gravity = Gravity.END
-            // Color the ticks blue when message is read (Signal-style).
-            if (e.read && e.outgoing && e.delivered) {
-                val spannable = SpannableString(metaText)
-                val idx = metaText.lastIndexOf("✓")
-                if (idx >= 0) {
-                    spannable.setSpan(ForegroundColorSpan(color(R.color.accent)), idx, metaText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                text = spannable
-            }
+            text = metaText
         }, matchWrap)
         if (!item.sending) {
             val longPress = View.OnLongClickListener { deleteMessage(run.map { it.entry }); true }

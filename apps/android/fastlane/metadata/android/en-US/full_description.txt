@@ -1,0 +1,29 @@
+Threnody is an end-to-end encrypted messenger with no server of its own. Your phone talks to your contacts' devices directly, or through other contacts who relay for you. There is no account, phone number or email address: you add people by sharing an invite link or QR code.
+
+WARNING: Threnody has not been independently audited. It is an early, actively developed reference implementation. Do not rely on it where your safety depends on it.
+
+What it does
+
+* Encryption: sessions start with a post-quantum hybrid handshake (X-Wing: X25519 + ML-KEM-768) and use a double ratchet with encrypted headers. Groups use MLS with the same hybrid ciphersuite and need no server. You compare safety numbers to verify contacts, and you are warned when a verified contact adds a device.
+* Many ways to connect: the local network, Bluetooth LE and Wi-Fi Direct between nearby phones, and the internet. Across the internet, contacts find each other through the public BitTorrent DHT and connect directly where the networks allow it, asking the router to forward a port (UPnP, PCP, NAT-PMP) when it can.
+* Relays and onion routing: when a contact can't be reached directly, approved contacts relay the encrypted session. Onion circuits through two relays keep any single relay from seeing both ends. You can also subscribe to directories of volunteer relays.
+* Offline delivery: messages for a contact who is offline are sealed to them and held by mutual contacts until they return.
+* Metadata protection, on by default: padded cover traffic hides when you send. This uses data (about 46 MB a day per connected contact on mobile data) and can be switched off.
+* Chats and groups with photos, files, voice and video messages, reactions, editing and deleting, read ticks, disappearing messages and message requests from people you haven't accepted.
+* Voice and video calls, carried inside the encrypted session.
+* Photo metadata (location, camera, time) is removed before sending, and photos can be marked sensitive so they arrive covered.
+* Several devices can share one account, with shared contacts and history.
+* Anonymous identities with their own keys, which can burn themselves after a set time.
+* Anonymous credentials: vouch for a contact's attributes, or prove attributes someone vouched for without revealing anything else.
+* Passphrase-sealed backups that restore onto a new device.
+* Keys are sealed with a passphrase kept in the Android Keystore (StrongBox where available). Screen security (no screenshots, blank recent-apps thumbnail) and content-free lock-screen notifications are on by default.
+
+Network services
+
+Threnody runs no servers. To reach contacts across the internet it uses the public BitTorrent DHT, including its well-known bootstrap nodes. Optional GIF search uses GIPHY, a third-party service: it is off until you agree to it, GIPHY then sees your searches and your IP address, and builds without a GIPHY API key ask you for your own key.
+
+Background use
+
+A foreground service with an ongoing notification keeps the node running so that contacts can reach you, which uses battery and data.
+
+Threnody is free software under the Apache-2.0 or MIT license. The protocol specification, design documents and formal proofs are in the source repository.

@@ -112,6 +112,8 @@ Volunteer relays and directories (Appendix P):
   /dir [list]   /dir add <link>   /dir remove <id>   /dir refresh   /dir relays
   /vonion <peer|invite>                 reach a peer through two volunteer relays
   /volunteer <host:port>...|off         volunteer as a relay for strangers' circuits
+  /handle [name [version]|off]          publish a handle others can type to find you
+                                        (/connect <name-XXXX-XXXX> finds someone by theirs)
   /directory [relays|link]   /directory list|unlist <relay>   (when serving a directory)
 Credentials (Appendix O, zero-knowledge selective disclosure):
   /cred [list]                          credentials you hold
@@ -535,6 +537,22 @@ impl Ui {
             threnody_core::store::Lookup::Found(c) => Some(c.key),
             _ => None,
         };
+        // Someone's handle (Appendix S): look it up, then connect.
+        if known.is_none() && t.parse::<threnody_core::handle::Handle>().is_ok() {
+            let (node, t) = (self.node.clone(), t.to_owned());
+            say!("* looking for {t}");
+            tokio::spawn(async move {
+                match node.find_handle(&t).await {
+                    Ok(p) => say!(
+                        "* {t} is {}; /to {} to write to them",
+                        p.fingerprint(),
+                        p.fingerprint()
+                    ),
+                    Err(e) => say!("! connect {t}: {e:#}"),
+                }
+            });
+            return;
+        }
         let resolved = target::resolve(t, &contacts);
         let node = self.node.clone();
         let t = t.to_owned();
@@ -1897,6 +1915,27 @@ impl Ui {
                 }
                 "leave" => self.leave_wifi_direct().await,
                 _ => bail!("usage: /wifi-direct [request|leave]"),
+            },
+            "handle" => match arg.map(str::trim) {
+                None | Some("") => match self.node.handle() {
+                    Some(h) => say!("* your handle: {h}"),
+                    None => say!("* no handle; /handle <name> publishes one"),
+                },
+                Some("off") => {
+                    self.node.set_handle(None, 0)?;
+                    say!("* handle off; it stops working within the hour");
+                }
+                Some(a) => {
+                    let (name, version) =
+                        a.split_once(' ').map_or((a, "0"), |(n, v)| (n, v.trim()));
+                    let version: u64 = version
+                        .parse()
+                        .map_err(|_| anyhow!("usage: /handle [name [version]|off]"))?;
+                    let h = self.node.set_handle(Some(name), version)?;
+                    if let Some(h) = h {
+                        say!("* your handle: {h} (give it to people you want to find you)");
+                    }
+                }
             },
             "status" => self.status(),
             "dir" => self.dir_command(arg).await?,
