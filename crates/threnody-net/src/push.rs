@@ -22,7 +22,7 @@ use threnody_core::push::{MAX_KEEP_MS, PushReg, PushTarget, WebPushKeys};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::error::{NetError, Result};
-use crate::node::{Node, lock};
+use crate::node::{Event, Node, lock};
 
 /// At least this long between two wake-ups of one device.
 pub const MIN_GAP_MS: u64 = 60_000;
@@ -441,9 +441,26 @@ impl Node {
         if self.is_persona() || !self.shared.mutual(&from) {
             return;
         }
-        let Ok(PushReg(reg)) = PushReg::decode(payload) else {
-            return;
+        let reg = match PushReg::decode(payload) {
+            Ok(PushReg(reg)) => reg,
+            Err(e) => {
+                self.emit(Event::ReachNote {
+                    note: format!("push endpoint from {} refused: {e}", from.fingerprint()),
+                });
+                return;
+            }
         };
+        self.emit(Event::ReachNote {
+            note: format!(
+                "{} {}",
+                from.fingerprint(),
+                if reg.is_some() {
+                    "can be woken through its push server"
+                } else {
+                    "withdrew its push endpoint"
+                }
+            ),
+        });
         let now = now_ms();
         let mut s = self.push();
         match reg {
@@ -500,7 +517,16 @@ impl Node {
             let mut s = self.push();
             match s.held.get(dest.as_bytes()) {
                 Some(h) if h.until_ms > now => {}
-                _ => return false,
+                _ => {
+                    drop(s);
+                    self.emit(Event::ReachNote {
+                        note: format!(
+                            "can't wake {}: no push endpoint from it",
+                            dest.fingerprint()
+                        ),
+                    });
+                    return false;
+                }
             }
             match s
                 .pace
@@ -536,6 +562,19 @@ impl Node {
             (Some(t), false, Some(c)) => Some(post(&c, &t).await),
             _ => None,
         };
+        if let Some(o) = &outcome {
+            self.emit(Event::ReachNote {
+                note: format!(
+                    "waking {}: {}",
+                    dest.fingerprint(),
+                    match o {
+                        Outcome::Sent => "sent",
+                        Outcome::Gone => "endpoint gone",
+                        Outcome::Later => "push server busy or unreachable; backing off",
+                    }
+                ),
+            });
+        }
         let now = now_ms();
         let mut s = self.push();
         let pace = s.pace.entry(*dest.as_bytes()).or_default();
