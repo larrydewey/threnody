@@ -1319,6 +1319,8 @@ impl ChatView {
         if e.outgoing {
             bits.push(if e.recipients > 0 && !e.delivered {
                 format!("✓ {}/{}", e.delivered_to, e.recipients)
+            } else if e.delivered && e.read {
+                "👁️".into()
             } else if e.delivered {
                 "✓✓".into()
             } else {
@@ -1328,9 +1330,6 @@ impl ChatView {
         let m = gtk::Label::new(Some(&bits.join(" ")));
         m.add_css_class("caption");
         m.add_css_class("bubble-meta");
-        if e.outgoing && e.delivered && e.read {
-            m.add_css_class("read");
-        }
         meta.append(&m);
         if let Some(id) = &e.list {
             let open = gtk::Button::with_label("Open list");

@@ -14,7 +14,7 @@ Threnody is a private messenger that works without a company in the middle. Ther
 - **Works with no internet nearby.** Phones find approved contacts over Bluetooth LE and connect without any taps, and a chat can move to Wi-Fi Direct for speed. Devices on the same network find each other on their own. A phone with only a Bluetooth link can reach contacts that its contacts reach over the internet.
 - **Hides when you talk, not just what you say.** Every message is padded to the same size, and each connection sends a steady stream of padded frames with filler in the gaps, so an observer can't tell when you send. Photos lose their location and camera details before they're sent. All of this is on unless you switch it off.
 - **Post-quantum encryption.** Connections, messages and groups use hybrid encryption (X25519 with ML-KEM-768), designed to resist attacks by future quantum computers as well as today's. The core protocols have machine-checked proofs (Tamarin).
-- **No phone number, no email.** Your identity is a key on your device. You add contacts with a QR code or link, and you can compare safety numbers to be sure it's them.
+- **No phone number, no email.** Your identity is a key on your device. You add contacts with a QR code or link, or, if you choose to make one, a short handle like `larry-7K3M-QX9P` that people can type. You can compare safety numbers to be sure it's them.
 - **Anonymous identities.** Make a separate identity for one conversation, with its own keys, contacts and history. Nothing links it to you unless you choose to reveal it, and it can delete itself after a day, a week or four weeks.
 - **Voice and video calls** between two people, carried inside the same encrypted connection.
 - **Groups** using MLS, with no server. Members who can't reach each other directly pass messages through a member who can.
@@ -96,7 +96,7 @@ Inside `run`, any line you type goes to the current peer. The available commands
 To add a device to your account, run `/device add [host:port]` on a device you already have. It prints a one-time code (and a QR code) with this machine's LAN address, or the one given. Then run `threnody link '<code>'` on the new device. `/devices` lists your devices, `/device rename <name> <new name>` renames one, and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices. Your devices share your message history, and a new device gets it all when linked.
 
 ```
-/connect <invite|contact|host:port>   /to <peer>   /peers   /contacts
+/connect <invite|handle|contact|host:port>   /handle [name|off]   /to <peer>   /peers   /contacts
 /name <peer> <name>   /approve [peer]   /revoke [peer]
 /safety [peer]   /verify [peer]   /file [-s] <path>... [| caption]   /drop [peer]
 /policy anyone|contacts|approved   /status   /quit
@@ -148,6 +148,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md) (0.4.0)
 - [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md) (0.4.0)
 - [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (voice and video between two people; group calls not yet)
+- [Appendix S: handles](docs/appendix-s-handles.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
