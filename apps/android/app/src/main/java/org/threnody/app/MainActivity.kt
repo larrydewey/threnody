@@ -120,7 +120,8 @@ class MainActivity : Activity() {
         setContentView(root)
         fitSystemBars(root, bar, scroll)
 
-        ThrenodyService.start(this)
+        // Woken by pushes: no permanent connection (and notification).
+        if (!Push.active(this)) ThrenodyService.start(this)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 3)
         }
@@ -993,6 +994,11 @@ class MainActivity : Activity() {
             { Privacy.setScreenSecurity(this@MainActivity, it) }) {
             if (it) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed"
         }
+        privacySection.add("Wake up with UnifiedPush (no permanent notification)").apply {
+            isCheckable = true
+            isChecked = Push.enabled(this@MainActivity)
+            setOnMenuItemClickListener { togglePush(); true }
+        }
 
         // Network & Connectivity
         val networkSection = menu.addSubMenu("Network & Connectivity")
@@ -1228,6 +1234,54 @@ class MainActivity : Activity() {
                 d.dismiss()
                 Privacy.setDefaultTimer(this, choices[i].second)
                 Toast.makeText(this, "New chats: ${choices[i].first.lowercase()}", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
+     * UnifiedPush wake-ups (Appendix R): off unless chosen, after saying
+     * what the push server learns.
+     */
+    private fun togglePush() {
+        if (Push.enabled(this)) {
+            Push.disable(this)
+            Toast.makeText(this, "Staying connected in the background again", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!Push.available(this)) {
+            SecureBuilder(this)
+                .setTitle("No UnifiedPush distributor")
+                .setMessage("Install a UnifiedPush distributor app (ntfy, for example), ideally with a push " +
+                    "server you run or trust, then turn this on.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        SecureBuilder(this)
+            .setTitle("Wake up with UnifiedPush?")
+            .setMessage(
+                "Threnody stops running in the background, so there is no permanent notification and less " +
+                    "battery use. Contacts holding a message for you wake this phone through your push server " +
+                    "instead.\n\n" +
+                    "Wake-ups carry nothing: no content, no sender. But the push server sees when this phone is " +
+                    "woken and the IP addresses of the contacts that wake it, and while it sleeps the phone sends " +
+                    "no cover traffic, so sessions start when wake-ups come. Random cover wake-ups make real " +
+                    "ones less telling. Messages wait while their holder is offline. Anonymous identities are " +
+                    "never woken this way; their messages arrive whenever the app wakes. With WireGuard " +
+                    "tunnels on, the app stays connected.",
+            )
+            .setPositiveButton("Turn on") { _, _ ->
+                Push.enable(this) { ok ->
+                    runOnUiThread {
+                        Toast.makeText(
+                            this,
+                            if (ok) "Wake-ups on: Threnody sleeps a minute after you leave it"
+                            else "No UnifiedPush distributor chosen; staying connected",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()

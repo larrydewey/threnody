@@ -90,6 +90,12 @@
         <receiver android:name=".Calls$Decline" android:exported="false" />
         <service android:name=".ThrenodyService" android:exported="false"
             android:foregroundServiceType="remoteMessaging|microphone" />
+        <!-- UnifiedPush wake-ups (Appendix R), when the user turns them on. -->
+        <service android:name=".ThrenodyPushService" android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
         <!-- WireGuard tunnels to approved contacts, over the overlay network only. -->
         <service android:name=".ThrenodyVpn" android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE">

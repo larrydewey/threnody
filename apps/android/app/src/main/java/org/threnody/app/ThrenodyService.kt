@@ -15,16 +15,56 @@ import android.os.IBinder
 /**
  * Keeps the process, and so the node, alive while the app is in the
  * background: sessions stay up and incoming messages raise notifications.
+ *
+ * With UnifiedPush wake-ups on ([Push]), it runs only briefly instead: in
+ * wake mode, to sync after a push, or during a call.
  */
 class ThrenodyService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         running = this
+        if (intent?.action == ACTION_WAKE) {
+            wake()
+            return START_NOT_STICKY
+        }
         foreground(intent?.action == ACTION_CALL || Calls.current != null)
         // Restarted by the system without the Activity: bring the node up here.
         Thread { Threnody.start(applicationContext) }.start()
-        return START_STICKY
+        // Woken by pushes: never restarted by the system just to stay connected.
+        return if (Push.active(this)) START_NOT_STICKY else START_STICKY
+    }
+
+    /** Woken by a push: sync, then sleep again unless the app came up meanwhile. */
+    private fun wake() {
+        channels(this)
+        val n = Notification.Builder(this, CHANNEL_WAKE)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Checking for messages")
+            .setContentIntent(openApp(this))
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(ID_SERVICE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+            } else {
+                startForeground(ID_SERVICE, n)
+            }
+        } catch (e: Exception) {
+            Threnody.say("! wake: foreground refused (${e.message})")
+        }
+        Thread {
+            Push.sync(applicationContext)
+            if (Threnody.visible > 0 || Calls.current != null) {
+                // In use now: in front no service is needed; in a call, the call's.
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    if (Calls.current != null) foreground(true) else stopSelf()
+                }
+            } else {
+                Push.sleepIfIdle(applicationContext)
+                // Not allowed to sleep (tunnels, say): at least drop the notification.
+                android.os.Handler(android.os.Looper.getMainLooper()).post { stopSelf() }
+            }
+        }.start()
     }
 
     override fun onDestroy() {
@@ -63,6 +103,7 @@ class ThrenodyService : Service() {
     companion object {
         private const val CHANNEL_SERVICE = "service2" // showBadge=false requires a fresh channel
         private const val CHANNEL_MESSAGES = "messages"
+        private const val CHANNEL_WAKE = "wake"
         private const val ID_SERVICE = 1
         private const val ID_MESSAGE = 2
 
@@ -71,6 +112,8 @@ class ThrenodyService : Service() {
         }
 
         private const val ACTION_CALL = "org.threnody.app.IN_CALL"
+        /** Started by a UnifiedPush wake-up ([Push]). */
+        const val ACTION_WAKE = "org.threnody.app.WAKE"
         @Volatile private var running: ThrenodyService? = null
 
         /**
@@ -172,6 +215,10 @@ class ThrenodyService : Service() {
             )
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_MESSAGES, "Messages", NotificationManager.IMPORTANCE_HIGH)
+            )
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_WAKE, "Checking for messages", NotificationManager.IMPORTANCE_MIN)
+                    .apply { setShowBadge(false) }
             )
         }
 

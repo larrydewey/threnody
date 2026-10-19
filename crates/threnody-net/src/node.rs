@@ -12,7 +12,7 @@ use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::message::{
-    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURES, MAX_ACK_IDS,
+    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURES, MAX_ACK_IDS,
 };
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
@@ -493,6 +493,8 @@ pub(crate) struct Shared {
     pub(crate) creds: Mutex<crate::cred::CredState>,
     /// The current voice or video call (see `call`).
     pub(crate) calls: Mutex<crate::call::CallState>,
+    /// Wake-up endpoints, ours and contacts' (see `push`).
+    pub(crate) push: Mutex<crate::push::PushState>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -685,6 +687,7 @@ impl Node {
             volunteer: crate::volunteer::VolunteerState::new(),
             creds: Mutex::default(),
             calls: Mutex::default(),
+            push: Mutex::default(),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -694,6 +697,7 @@ impl Node {
         node.load_volunteer();
         node.load_credentials();
         node.start_directory_upkeep();
+        node.load_push();
         Ok((node, rx))
     }
 
@@ -1144,6 +1148,8 @@ impl Node {
         self.shared.delivery(|d| {
             d.track(peer, msg, tag);
         });
+        // It waits for a session: wake the peer if it sleeps (Appendix R).
+        self.push_wake(peer);
     }
 
     /// The QUIC connection under the session with `peer`, if it has one.
@@ -1523,6 +1529,7 @@ where
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
+    let mut push_sent = false;
     // Our account chain (and, for own devices, our contacts), then anything
     // mailboxes held for this peer.
     pending.extend(node.account_hello(&peer));
@@ -1582,6 +1589,15 @@ where
             if !prekeys_sent && shared.mutual(&peer) {
                 pending.extend(node.prekeys_for(&peer));
                 prekeys_sent = true;
+            }
+            // Where to wake us, once per session (Appendix R).
+            if !push_sent
+                && peer_acks.is_some()
+                && shared.mutual(&peer)
+                && node.supports(&peer, FEATURE_PUSH)
+            {
+                pending.extend(node.push_message());
+                push_sent = true;
             }
             // Offer a tunnel once per session, as soon as approval is mutual.
             // Tunnels need a direct UDP path, so never over relayed sessions.
@@ -1724,6 +1740,8 @@ where
                                     took_offer = false;
                                     discovery_keyed = false;
                                     prekeys_sent = false;
+                                    push_sent = false;
+                                    node.forget_push(&peer);
                                     let mut contacts = lock(&shared.contacts);
                                     if let Some(c) = contacts.get_mut(&peer) {
                                         c.clear_discovery_keys();
@@ -1771,6 +1789,7 @@ where
                             }
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
+                        AppMessage::Push(payload) => node.on_push(peer, &payload),
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}
