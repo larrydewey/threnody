@@ -21,6 +21,9 @@ pub enum NetError {
     NotAllowed(String),
     #[error("no relay path to {0} (relays need mutual approval with both ends)")]
     NoRoute(String),
+    /// A handle (Appendix S) nobody publishes, or whose owner didn't answer.
+    #[error("{0}")]
+    NotFound(String),
     #[error("node has shut down")]
     Shutdown,
     #[error("external: {0}")]

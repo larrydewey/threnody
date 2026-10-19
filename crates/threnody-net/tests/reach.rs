@@ -310,3 +310,53 @@ async fn a_silently_dead_path_is_repaired_within_seconds() {
         "recovery took {back_after:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strangers_find_each_other_by_handle() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        poll_foreground: Duration::from_secs(1),
+        poll_seeking: Duration::from_secs(1),
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    for n in [&alice, &bob] {
+        n.listen_quic("127.0.0.1:0").await.unwrap();
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    let handle = bob.set_handle(Some("Bob"), 0).unwrap().unwrap();
+    assert_eq!(bob.handle(), Some(handle.clone()));
+    next(
+        &mut brx,
+        60,
+        |e| matches!(e, Event::ReachNote { note } if note.starts_with("published handle")),
+    )
+    .await;
+
+    // A handle nobody publishes isn't found.
+    let nobody = threnody_core::handle::Handle::new(&alice.identity(), "nobody", 0).unwrap();
+    assert!(alice.find_handle(&nobody.to_string()).await.is_err());
+
+    let typed = handle.to_string().to_uppercase();
+    let peer = alice.find_handle(&typed).await.unwrap();
+    assert_eq!(peer, bob.identity());
+    alice.send(&peer, text("found you by handle")).unwrap();
+    let Event::MessageRequest { msg, .. } =
+        next(&mut brx, 10, |e| matches!(e, Event::MessageRequest { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(msg, text("found you by handle"));
+
+    // Turned off, it stops answering once the record ages out; the
+    // node no longer claims one.
+    bob.set_handle(None, 0).unwrap();
+    assert_eq!(bob.handle(), None);
+}

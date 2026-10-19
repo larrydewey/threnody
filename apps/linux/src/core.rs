@@ -249,6 +249,7 @@ impl Core {
             ));
         }
         core.apply_privacy_to(&core.main, false);
+        core.apply_handle();
         core.name_this_device();
         core.pump(core.main.clone(), None, Arc::new(AtomicBool::new(true)));
         core.open_personas();
@@ -370,6 +371,24 @@ impl Core {
         if let Err(e) = r {
             self.say(format!("! writing {}: {e}", path.display()));
         }
+    }
+
+    /// Publishes the chosen handle (main identity only), off the calling
+    /// thread: computing it takes an Argon2id run.
+    pub fn apply_handle(&self) {
+        let (name, version) = {
+            let s = self.settings();
+            (
+                s.text(settings::HANDLE_NAME).map(str::to_owned),
+                s.number(settings::HANDLE_VERSION).unwrap_or(0),
+            )
+        };
+        let (node, ui) = (self.main.clone(), self.ui.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = node.set_handle(name, u64::from(version)) {
+                let _ = ui.send_blocking(UiEvent::Log(format!("! handle: {e}")));
+            }
+        });
     }
 
     /// The always-on relay, on the main identity only: a persona's

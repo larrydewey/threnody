@@ -19,6 +19,10 @@ pub const ANCHOR: &str = "always_on_relay";
 /// WireGuard tunnels to mutually approved contacts: off unless chosen,
 /// since bringing the interface up needs root.
 pub const TUNNELS: &str = "wireguard_tunnels";
+/// A handle others can type to find us (Appendix S): its name and
+/// version. None unless chosen.
+pub const HANDLE_NAME: &str = "handle_name";
+pub const HANDLE_VERSION: &str = "handle_version";
 pub const SEND_READ: &str = "send_read_receipts";
 pub const SEND_TYPING: &str = "send_typing";
 /// GIF search through GIPHY: off until the user agrees to GIPHY seeing

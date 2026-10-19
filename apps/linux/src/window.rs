@@ -1842,13 +1842,13 @@ impl App {
     pub fn add_contact(self: &Rc<Self>, initial: &str) {
         let d = ui::alert(
             "Add a contact",
-            "Paste their invite link, and give them a name you'll recognise if you like. \
-             You'll compare safety numbers together later.",
+            "Paste their invite link or type their handle (name-XXXX-XXXX), and give them \
+             a name you'll recognise if you like. You'll compare safety numbers together later.",
             &[("cancel", "Cancel"), ("ok", "Connect")],
         );
         d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
         let link = gtk::Entry::builder()
-            .placeholder_text("threnody://…")
+            .placeholder_text("threnody://… or name-XXXX-XXXX")
             .text(initial)
             .activates_default(true)
             .build();
@@ -2377,6 +2377,36 @@ impl App {
         );
     }
 
+    /// Publishes our handle for `name` at `version` (an empty name
+    /// removes it), then shows the preferences again with it.
+    fn set_handle(self: &Rc<Self>, prefs: &adw::PreferencesDialog, name: String, version: u32) {
+        let core = self.core.clone();
+        let weak = Rc::downgrade(self);
+        let prefs = prefs.clone();
+        ui::bg(
+            move || {
+                let n = (!name.is_empty()).then(|| name.clone());
+                let r = core.main.set_handle(n, u64::from(version));
+                if r.is_ok() {
+                    let mut s = core.settings();
+                    s.set_text(settings::HANDLE_NAME, &name);
+                    s.set_number(settings::HANDLE_VERSION, Some(version));
+                }
+                r.map_err(|e| e.to_string())
+            },
+            move |r| {
+                let Some(t) = weak.upgrade() else { return };
+                match r {
+                    Ok(Some(h)) => t.toast(&format!("Your handle: {h}")),
+                    Ok(None) => t.toast("Handle removed; it stops working within the hour"),
+                    Err(e) => t.toast(&format!("Couldn't make that handle: {e}")),
+                }
+                prefs.close();
+                t.preferences();
+            },
+        );
+    }
+
     fn preferences(self: &Rc<Self>) {
         let d = adw::PreferencesDialog::new();
         d.set_title("Preferences");
@@ -2456,6 +2486,93 @@ impl App {
         });
         relays.add(&dirs);
         page.add(&relays);
+
+        // A handle people can type to find us (Appendix S).
+        let handle_group = adw::PreferencesGroup::builder()
+            .title("Your handle")
+            .description(
+                "People who have your handle can find you by typing it into “Add a contact”, \
+                 without an invite. A code made from your key follows the name, so no one else \
+                 can take it. Anyone with it can write to you (as a message request) and learn \
+                 this computer's IP address. Needs internet reachability.",
+            )
+            .build();
+        let current = self.core.main.handle();
+        let handle_row = adw::ActionRow::builder()
+            .title(current.as_deref().unwrap_or("No handle"))
+            .subtitle(if current.is_some() {
+                "Give it to people you want to find you"
+            } else {
+                "Off"
+            })
+            .build();
+        if let Some(h) = current.clone() {
+            let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+            copy.set_valign(gtk::Align::Center);
+            copy.set_tooltip_text(Some("Copy"));
+            let weak = Rc::downgrade(self);
+            copy.connect_clicked(move |b| {
+                b.clipboard().set_text(&h);
+                if let Some(t) = weak.upgrade() {
+                    t.toast("Handle copied");
+                }
+            });
+            handle_row.add_suffix(&copy);
+        }
+        handle_group.add(&handle_row);
+        let name_row = adw::EntryRow::builder()
+            .title("Name")
+            .text(
+                self.core
+                    .settings()
+                    .text(settings::HANDLE_NAME)
+                    .unwrap_or(""),
+            )
+            .show_apply_button(true)
+            .build();
+        let (weak, dd) = (Rc::downgrade(self), d.clone());
+        name_row.connect_apply(move |r| {
+            if let Some(t) = weak.upgrade() {
+                let v = t
+                    .core
+                    .settings()
+                    .number(settings::HANDLE_VERSION)
+                    .unwrap_or(0);
+                t.set_handle(&dd, r.text().trim().to_owned(), v);
+            }
+        });
+        handle_group.add(&name_row);
+        if current.is_some() {
+            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            buttons.set_margin_top(8);
+            let renew = gtk::Button::with_label("New code");
+            renew.set_tooltip_text(Some("The old handle stops working within the hour"));
+            let (weak, dd) = (Rc::downgrade(self), d.clone());
+            renew.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    let (name, v) = {
+                        let s = t.core.settings();
+                        (
+                            s.text(settings::HANDLE_NAME).unwrap_or("").to_owned(),
+                            s.number(settings::HANDLE_VERSION).unwrap_or(0),
+                        )
+                    };
+                    t.set_handle(&dd, name, v + 1);
+                }
+            });
+            let remove = gtk::Button::with_label("Remove");
+            remove.add_css_class("destructive-action");
+            let (weak, dd) = (Rc::downgrade(self), d.clone());
+            remove.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.set_handle(&dd, String::new(), 0);
+                }
+            });
+            buttons.append(&renew);
+            buttons.append(&remove);
+            handle_group.add(&buttons);
+        }
+        page.add(&handle_group);
 
         // A relay node of your own (docs/relay-node.md), kept connected.
         let always = adw::PreferencesGroup::builder()
