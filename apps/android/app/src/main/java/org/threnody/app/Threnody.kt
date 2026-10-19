@@ -50,11 +50,16 @@ object Threnody {
             if ((v > 0) != was) {
                 instance?.setForeground(v > 0)
                 updateStandby()
+                // Woken by pushes: sleep once the app has been gone a while.
+                if (v == 0) app?.let(Push::backgrounded)
             }
         }
+    /** The application context, once the node has started. */
+    @Volatile private var app: Context? = null
 
     @Synchronized
     fun start(ctx: Context): ThrenodyNode = instance ?: open(ctx).also {
+        app = ctx.applicationContext
         debuggable = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (debuggable) debugHooks(ctx.applicationContext, it)
         listenAddr = it.listen("0.0.0.0:7450")
@@ -64,6 +69,7 @@ object Threnody {
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
         openPersonas(ctx.applicationContext, it)
         applyPrivacy(ctx)
+        Push.apply(ctx.applicationContext, it)
         Tunnels.resume(ctx.applicationContext, it)
         Handles.resume(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)

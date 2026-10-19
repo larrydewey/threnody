@@ -26,6 +26,8 @@ pub use folders::{ChatUnread, FolderInfo, QuietSlotInfo};
 pub use lists::{ListInfo, ListItemInfo};
 mod groups;
 mod persona;
+mod push;
+pub use push::{PushEndpoint, WakeReport};
 mod volunteer;
 pub use persona::{PersonaRecord, ProfileAttr};
 pub use volunteer::{

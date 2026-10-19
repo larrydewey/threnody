@@ -5908,6 +5908,8 @@ dependencies = [
  "quinn",
  "rand_core 0.10.1",
  "rcgen",
+ "reqwest",
+ "ring",
  "rustls",
  "socket2",
  "tempfile",

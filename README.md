@@ -148,6 +148,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md) (0.4.0)
 - [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md) (0.4.0)
 - [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (voice and video between two people; group calls not yet)
+- [Appendix R: waking a sleeping device with UnifiedPush](docs/appendix-r-push.md) (opt-in)
 - [Appendix S: handles](docs/appendix-s-handles.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
@@ -168,7 +169,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §6.2 MLS groups | ✅ openmls with the X-Wing ciphersuite; text, files, photos, voice and video messages; owner-administered; encrypted persistence; members forward and hold messages for members who can't be reached directly |
 | §6.3 / §11 CBOR, versioning, unknown-field tolerance | ✅ |
 | §6.4 Local-first store | ✅ encrypted identity, contacts, groups and message history, including file transfers, synced across an account's devices; passphrase-sealed backups that restore onto a new device ([Appendix C](docs/appendix-c-wire-format.md#backups)) |
-| §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins) |
+| §7 Transports | ✅ TCP/IP, Bluetooth LE (L2CAP, tested phone ↔ laptop), private LAN discovery with auto-connect, multi-hop relay circuits (≤ 3 relays), store-and-forward mailboxes, Wi-Fi Direct upgrade (Android hosts or joins; Linux joins); opt-in UnifiedPush wake-ups instead of an always-on connection on Android: content-free, paced, padded with cover wake-ups, sent by the contacts holding messages ([Appendix R](docs/appendix-r-push.md)) |
 | §8 WireGuard full-mesh tunnels | ✅ kernel WireGuard on desktops, userspace WireGuard (boringtun) through a VPN interface on Android; PQ PSK from the session; gated on mutual approval |
 | §9 Metadata layers | ✅ on by default: padding, constant-rate cover traffic, onion-first routing (≥ 2 relays, fixed-size cells), onion-routed mailbox deposits, each only off when switched off; volunteer relays from subscribed directories (k-of-n listing, Ed25519 + ML-DSA signed), paid with unlinkable rate-limited tokens, entered without revealing who you are ([Appendix P](docs/appendix-p-volunteer-relays.md)) |
 | §10 Status indicators | ✅ `/status` |
@@ -183,7 +184,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 3. **Tunnels (remaining).** The userspace data plane on iOS and unprivileged desktops (Android has it).
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Relays that hold a connection for a device behind NAT, as onion services do (Appendix N, "Later"), and cover traffic inside circuits.
-6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service. Still to do: an iOS sample, and push-style wake-ups for when the process is gone.
+6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service, or, if the user chooses, sleeps and is woken through UnifiedPush by the contacts holding its messages ([Appendix R](docs/appendix-r-push.md)). Still to do: an iOS sample, a field test of push wake-ups between two phones, and sending wake-ups through circuits so the push server doesn't see contacts' addresses.
 
 ### Development
 
