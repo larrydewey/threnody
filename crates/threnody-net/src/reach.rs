@@ -796,6 +796,15 @@ impl Node {
             // Many NATs keep the port: the DHT's view of our IP, our port.
             reflexive.push(SocketAddr::new(IpAddr::V4(*g.ip()), port));
         }
+        // Global IPv6 addresses peers see us at: the one the OS sends from
+        // can differ from the route's preferred one (a temporary address),
+        // and with no NAT in the way each is worth offering.
+        for a in seen.iter().filter(|a| is_global_v6(&a.ip())).take(2) {
+            list.push(Candidate {
+                kind: CandidateKind::Ipv6,
+                addr: SocketAddr::new(a.ip(), port),
+            });
+        }
         list.extend(
             reflexive
                 .into_iter()

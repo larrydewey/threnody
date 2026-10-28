@@ -316,8 +316,11 @@ final class NodeStore: ObservableObject {
     func invite() -> String? {
         guard let n = node else { return nil }
         let port = listenAddr.split(separator: ":").last.map(String.init) ?? "7450"
-        if let ip = LocalAddress.ipv4() { return n.inviteLink(addr: "\(ip):\(port)") }
-        return n.reachability().addresses.first.map { n.inviteLink(addr: $0) }
+        // The node adds its IPv6 and public addresses, and the key that
+        // finds this device on mobile data; with neither, there's no invite.
+        let addr = LocalAddress.ipv4().map { "\($0):\(port)" } ?? ""
+        if addr.isEmpty && !n.reachInternet() && n.reachability().addresses.isEmpty { return nil }
+        return n.inviteLink(addr: addr)
     }
 
     // MARK: Lifecycle

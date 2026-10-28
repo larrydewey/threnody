@@ -56,6 +56,23 @@ Knock      = { 0: id bstr(32), 1: Candidates bstr }                    aad "thre
 
 The session that results is an ordinary session with a stranger: its messages are a message request until the owner accepts.
 
+## Invite links
+
+An invite link made on mobile data used to carry an address nobody could dial: the phone's address behind carrier-grade NAT, or none at all on an IPv6-only network. Invites now meet the same way handles do, with a random key instead of a handle:
+
+```
+link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ]
+addr  = host ":" port                -- IPv6 in brackets: [2001:db8::1]:7450
+key   = Crockford Base32 of 16 random bytes
+base  = KDF("… invite", key)         -- then records, knock slots and probe key as above
+```
+
+- **Addresses.** A link carries up to four: global IPv6 addresses first (no NAT to cross, often reachable directly), then the address the app suggests, then local and public IPv4 ones. The finder dials them all, 300 ms apart and each for at most 6 s, over TCP and, half a second later, QUIC, since mobile IPv6 firewalls often drop TCP silently. A dead address no longer holds up the rest.
+- **The key.** Each device makes one the first time it shows an invite and keeps it (state `invite-key`). From then on it publishes its record under the key and answers knocks there, as for a handle. When none of the addresses answers, the finder reads the record, checks that it names the fingerprint in the link (that check replaces a handle's code), dials, then knocks and punches. Relays come last, as before.
+- **Off with reachability.** Without internet reachability (and so for anonymous identities) a link has no key and only its addresses work.
+- **Cost.** One more record to keep, and knock slots to read at the handle rates. Last hour's slots are read only in the first five minutes of an hour, when a knock there can still be fresh; this halves the reads for handles too.
+- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. Links without `?r=` and links with one address still parse.
+
 ## Changing or removing a handle
 
 Raising `version` gives a new code. Removing the handle, or changing it, stops publishing; the old record expires from the DHT within about two hours and is ignored after its epoch passes. People who already added you keep you as a contact.

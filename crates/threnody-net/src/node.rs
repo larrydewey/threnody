@@ -926,7 +926,7 @@ impl Node {
     /// invite); otherwise the outbound connection is itself the user's
     /// decision to trust on first use.
     pub async fn connect(&self, addr: &str, expect: Option<Fingerprint>) -> Result<PublicIdentity> {
-        let mut stream = match TcpStream::connect(addr).await {
+        let stream = match TcpStream::connect(addr).await {
             Ok(s) => s,
             Err(e) => {
                 // The same address may still answer over QUIC (UDP).
@@ -942,6 +942,25 @@ impl Node {
                 return Err(e.into());
             }
         };
+        self.connect_over(stream, addr, expect).await
+    }
+
+    /// [`Node::connect`] over TCP only.
+    pub(crate) async fn connect_tcp(
+        &self,
+        addr: &str,
+        expect: Option<Fingerprint>,
+    ) -> Result<PublicIdentity> {
+        let stream = TcpStream::connect(addr).await?;
+        self.connect_over(stream, addr, expect).await
+    }
+
+    async fn connect_over(
+        &self,
+        mut stream: TcpStream,
+        addr: &str,
+        expect: Option<Fingerprint>,
+    ) -> Result<PublicIdentity> {
         tune_tcp(&stream);
         let peer_addr = stream.peer_addr()?;
         let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;

@@ -442,18 +442,26 @@ impl Core {
         }
     }
 
-    /// This machine's address on its default network, for invites.
+    /// This machine's address on its default network, for invites: IPv4,
+    /// else a global IPv6 address on an IPv6-only network.
     pub fn lan_ip() -> Option<std::net::IpAddr> {
         // Connecting a UDP socket picks a route without sending anything.
-        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-        s.connect("192.0.2.1:9").ok()?;
-        let ip = s.local_addr().ok()?.ip();
-        (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+        let route = |bind: &str, to: &str| {
+            let s = std::net::UdpSocket::bind(bind).ok()?;
+            s.connect(to).ok()?;
+            let ip = s.local_addr().ok()?.ip();
+            (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+        };
+        route("0.0.0.0:0", "192.0.2.1:9").or_else(|| {
+            route("[::]:0", "[2001:db8::1]:9").filter(
+                |ip| matches!(ip, std::net::IpAddr::V6(v6) if v6.segments()[0] & 0xe000 == 0x2000),
+            )
+        })
     }
 
     /// The invite link for the main identity or a persona.
     pub fn invite(&self, persona: Option<&str>) -> Result<String, String> {
-        let ip = Self::lan_ip().ok_or("No network: connect to a network to make an invite.")?;
+        let ip = Self::lan_ip();
         let (node, port) = match persona {
             None => (self.main.clone(), self.port),
             Some(id) => (
@@ -462,13 +470,22 @@ impl Core {
                     .ok_or("that anonymous identity isn't running")?,
             ),
         };
-        Ok(node.invite_link(format!("{ip}:{port}")))
+        // With internet reachability on, the link's key finds us anyway.
+        if ip.is_none() && !node.reach_internet() {
+            return Err("No network: connect to a network to make an invite.".into());
+        }
+        let addr = ip
+            .map(|ip| std::net::SocketAddr::new(ip, port).to_string())
+            .unwrap_or_default();
+        Ok(node.invite_link(addr))
     }
 
     pub fn link_code(&self) -> Result<String, String> {
         let ip =
             Self::lan_ip().ok_or("No network: both devices need to be on the same network.")?;
-        Ok(self.main.create_link_code(format!("{ip}:{}", self.port)))
+        Ok(self
+            .main
+            .create_link_code(std::net::SocketAddr::new(ip, self.port).to_string()))
     }
 
     /// The network changed: tell every node, and redial.

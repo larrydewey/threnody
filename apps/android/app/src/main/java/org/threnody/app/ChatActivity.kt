@@ -2232,10 +2232,9 @@ class ChatActivity : Activity() {
 
     /** Our main identity's invite, on this device's current address. */
     private fun mainInvite(main: ThrenodyNode): String? {
-        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return null
-        val props = cm.getLinkProperties(cm.activeNetwork) ?: return null
-        val ip = props.linkAddresses.map { it.address }.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: return null
-        return main.inviteLink("$ip:${Threnody.listenAddr.substringAfterLast(':')}")
+        val addr = Threnody.inviteAddr(this, Threnody.listenAddr.substringAfterLast(':'))
+        if (addr.isEmpty() && !main.reachInternet()) return null
+        return main.inviteLink(addr)
     }
 
     /** Adds the identity they revealed, as a contact of our main identity. */

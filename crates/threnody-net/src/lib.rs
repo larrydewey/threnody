@@ -40,6 +40,7 @@ pub use delivery::Tag;
 pub use direct::DirectOffer;
 pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};
+pub use handle::INVITE_KEY_STATE;
 pub use node::{AcceptPolicy, Event, Node, NodeConfig, SessionInfo};
 pub use push::WakeReport;
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};

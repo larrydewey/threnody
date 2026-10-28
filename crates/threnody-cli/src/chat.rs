@@ -553,6 +553,24 @@ impl Ui {
             });
             return;
         }
+        // An invite link: its addresses, then the meeting place its key
+        // names (a phone on mobile data), then relays.
+        if known.is_none() && t.starts_with(threnody_core::invite::SCHEME) {
+            let link: threnody_core::invite::InviteLink = match t.parse() {
+                Ok(l) => l,
+                Err(e) => return say!("! connect: {e}"),
+            };
+            let node = self.node.clone();
+            if link.key.is_some() {
+                say!("* looking for {}", link.fingerprint);
+            }
+            tokio::spawn(async move {
+                if let Err(e) = node.reach_invite(&link).await {
+                    say!("! connect {}: {e:#}", link.fingerprint);
+                }
+            });
+            return;
+        }
         let resolved = target::resolve(t, &contacts);
         let node = self.node.clone();
         let t = t.to_owned();

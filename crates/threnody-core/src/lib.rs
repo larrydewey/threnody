@@ -19,6 +19,7 @@ pub mod handle;
 pub mod handshake;
 pub mod history;
 pub mod identity;
+pub mod invite;
 pub mod lists;
 pub mod media;
 pub mod message;

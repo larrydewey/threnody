@@ -1238,12 +1238,22 @@ impl ThrenodyNode {
         self.node.account().id().fingerprint().to_string()
     }
 
-    /// `threnody://…` link others can connect with.
+    /// `threnody://…` link others can connect with. `addr` (`host:port`,
+    /// IPv6 in brackets) is the address the app suggests, or empty when it
+    /// has none; the link adds this device's global IPv6 and public
+    /// addresses, and, with internet reachability on, a key that finds
+    /// this device wherever it is, mobile data included.
     pub fn invite_link(&self, addr: String) -> String {
-        format!(
-            "threnody://{}@{addr}",
-            self.node.identity().fingerprint().compact()
-        )
+        let addr = Some(addr.trim()).filter(|a| !a.is_empty());
+        let _guard = self.rt.enter();
+        self.node.invite_link(addr).to_string()
+    }
+
+    /// Makes invite links made so far stop finding this device once it
+    /// moves (they keep only the addresses they carry).
+    pub fn reset_invites(&self) {
+        let _guard = self.rt.enter();
+        self.node.reset_invite_key();
     }
 
     /// Starts listening; returns the bound address. QUIC (UDP) listens on
@@ -1522,14 +1532,13 @@ PersistentKeepalive = 25\n",
     /// there is none), it goes through approved relays, whatever links
     /// they are on (spec §7.3).
     pub fn connect(&self, target: String) -> Result<String> {
-        let (addr, pin) = if let Some(rest) = target.strip_prefix("threnody://") {
-            let (f, a) = rest
-                .split_once('@')
-                .ok_or_else(|| fail("bad invite link"))?;
-            (
-                Some(a.to_owned()),
-                Some(f.parse::<Fingerprint>().map_err(fail)?),
-            )
+        let (addr, pin) = if target.starts_with(threnody_core::invite::SCHEME) {
+            let link: threnody_core::invite::InviteLink = target.parse().map_err(fail)?;
+            return self
+                .rt
+                .block_on(self.node.reach_invite(&link))
+                .map(|p| fp(&p))
+                .map_err(fail);
         } else if let Ok(f) = target.parse::<Fingerprint>() {
             let addr = self
                 .node
