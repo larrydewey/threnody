@@ -12,4 +12,14 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # crypto-bigint 0.5.5: timing variability in operations meant to be
+    # constant time. It comes in through zkryptium -> bls12_381_plus 0.8 ->
+    # elliptic-curve 0.13, and no release of either moves off it yet
+    # (zkryptium 0.8 still uses bls12_381_plus 0.8). bls12_381_plus does its
+    # field and scalar arithmetic itself and uses crypto-bigint only for the
+    # group order constant and word/byte conversions; zkryptium uses
+    # elliptic-curve only for hash-to-curve message expansion and group
+    # traits. No secret arithmetic runs through crypto-bigint. Drop this
+    # once zkryptium moves to a fixed crypto-bigint (>= 0.7.6).
+    "RUSTSEC-2026-0387",
 ]
