@@ -381,6 +381,26 @@ object Threnody {
     }
 
     /**
+     * The address to put in an invite (`host:port`, IPv6 in brackets): this
+     * phone's IPv4 address on the physical network, else its global IPv6
+     * one (IPv6-only mobile networks), else "". The node adds the rest of
+     * its addresses and the key that finds it on mobile data.
+     */
+    fun inviteAddr(ctx: Context, port: String): String {
+        val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return ""
+        val net = defaultNet ?: cm.activeNetwork ?: return ""
+        val addrs = cm.getLinkProperties(net)?.linkAddresses.orEmpty().map { it.address }
+        // 192.0.0.0/29 is 464XLAT's own address: nobody else can reach it.
+        val v4 = addrs.filterIsInstance<java.net.Inet4Address>()
+            .firstOrNull { !it.isLoopbackAddress && !it.isLinkLocalAddress && !it.hostAddress.orEmpty().startsWith("192.0.0.") }
+        if (v4 != null) return "${v4.hostAddress}:$port"
+        val v6 = addrs.filterIsInstance<java.net.Inet6Address>()
+            .firstOrNull { !it.isLinkLocalAddress && !it.isSiteLocalAddress && !it.isLoopbackAddress && !it.isAnyLocalAddress }
+            ?.hostAddress?.substringBefore('%')
+        return v6?.let { "[$it]:$port" } ?: ""
+    }
+
+    /**
      * The physical network traffic leaves on: the default network, or under
      * a VPN the one Android would pick, a validated Wi-Fi before mobile data.
      */

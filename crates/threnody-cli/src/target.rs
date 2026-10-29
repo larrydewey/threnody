@@ -4,28 +4,30 @@ use anyhow::{Result, bail};
 use threnody_core::Fingerprint;
 use threnody_core::store::{Contacts, Lookup};
 
-const SCHEME: &str = "threnody://";
+use threnody_core::invite::{InviteLink, SCHEME};
 
-/// `threnody://<fingerprint>@<host:port>`
+/// `threnody://<fingerprint>@<host:port>`, with no key: for links that
+/// must not lead anywhere but that address (an anonymous identity's).
 pub fn invite_link(fp: &Fingerprint, addr: &str) -> String {
     format!("{SCHEME}{}@{addr}", fp.compact())
 }
 
-/// The address in an invite link, if `target` is one.
+/// The first address in an invite link, if `target` is one.
 pub fn invite_addr(target: &str) -> Option<String> {
     target
-        .strip_prefix(SCHEME)
-        .and_then(|r| r.split_once('@'))
-        .map(|(_, a)| a.to_owned())
+        .parse::<InviteLink>()
+        .ok()
+        .and_then(|l| l.addrs.into_iter().next())
 }
 
 /// Resolves to `(address, pinned fingerprint)`.
 pub fn resolve(target: &str, contacts: &Contacts) -> Result<(String, Option<Fingerprint>)> {
-    if let Some(rest) = target.strip_prefix(SCHEME) {
-        let Some((fp, addr)) = rest.split_once('@') else {
-            bail!("invite link must look like {SCHEME}<fingerprint>@<host:port>");
+    if target.starts_with(SCHEME) {
+        let link: InviteLink = target.parse()?;
+        let Some(addr) = link.addrs.into_iter().next() else {
+            bail!("this invite has no address; /connect looks its maker up instead");
         };
-        return Ok((addr.to_owned(), Some(fp.parse()?)));
+        return Ok((addr, Some(link.fingerprint)));
     }
     match contacts.find(target) {
         Lookup::Found(c) => match &c.last_addr {

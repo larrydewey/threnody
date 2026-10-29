@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use threnody_core::invite::{InviteKey, InviteLink};
 use threnody_core::store::{Contact, Home, Lookup};
 use threnody_core::{Identity, safety_number};
 use threnody_net::AcceptPolicy;
@@ -115,7 +116,8 @@ enum Cmd {
     },
     /// Print an invite link (and QR code) others can connect with.
     Invite {
-        /// Address peers should dial, e.g. 192.0.2.7:7450.
+        /// Addresses peers should dial, comma-separated, e.g.
+        /// `192.0.2.7:7450` or `[2001:db8::7]:7450,192.0.2.7:7450`.
         addr: String,
         /// Skip the QR code.
         #[arg(long)]
@@ -760,7 +762,30 @@ fn main() -> Result<()> {
         }
         Cmd::Invite { addr, no_qr } => {
             let id = load_identity(&home)?;
-            let link = target::invite_link(&id.public().fingerprint(), &addr);
+            // The key that finds this device across the internet; `run`
+            // keeps its addresses there (unless --no-rendezvous).
+            let key = home
+                .load_state(&id, threnody_net::INVITE_KEY_STATE)?
+                .and_then(|b| InviteKey::from_bytes(&b).ok());
+            let key = match key {
+                Some(k) => k,
+                None => {
+                    let k = InviteKey::generate();
+                    home.save_state(&id, threnody_net::INVITE_KEY_STATE, k.as_bytes())?;
+                    k
+                }
+            };
+            let link = InviteLink {
+                fingerprint: id.public().fingerprint(),
+                addrs: addr
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                key: Some(key),
+            }
+            .to_string();
             println!("{link}");
             if !no_qr {
                 let code = qrcode::QrCode::new(link.as_bytes())?;

@@ -78,27 +78,37 @@ impl Handle {
     pub fn belongs_to(&self, id: &PublicIdentity, version: u64) -> bool {
         code(id, &self.name, version).is_ok_and(|c| c == self.code)
     }
+}
 
-    fn base(&self) -> [u8; 32] {
-        derive(BASE, &[self.to_string().as_bytes()])
-    }
+/// A place in the DHT where an owner can be found: a handle, or the secret
+/// an invite link carries (`invite::InviteKey`). Everything there is keyed
+/// from its base: the owner's record, the knock slots and the probe key.
+pub trait Meeting {
+    /// The secret every key below comes from.
+    fn base(&self) -> [u8; 32];
 
     /// Keys for the owner's record in `epoch`.
-    pub fn record_keys(&self, epoch: u64) -> RecordKeys {
+    fn record_keys(&self, epoch: u64) -> RecordKeys {
         let base = self.base();
         keys(&[&base, &epoch.to_le_bytes()])
     }
 
     /// Keys for knock slot `slot` in `epoch`.
-    pub fn knock_keys(&self, epoch: u64, slot: u8) -> RecordKeys {
+    fn knock_keys(&self, epoch: u64, slot: u8) -> RecordKeys {
         let base = self.base();
         keys(&[&base, &epoch.to_le_bytes(), b"knock", &[slot]])
     }
 
     /// The key hole-punching probes between the owner and a finder use, in
     /// place of a contact's discovery key.
-    pub fn probe_key(&self) -> [u8; 32] {
+    fn probe_key(&self) -> [u8; 32] {
         derive(PROBE_KEY, &[&self.base()])
+    }
+}
+
+impl Meeting for Handle {
+    fn base(&self) -> [u8; 32] {
+        derive(BASE, &[self.to_string().as_bytes()])
     }
 }
 

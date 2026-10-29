@@ -6,7 +6,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
 import android.os.Bundle
 import android.text.InputType
 import android.text.format.DateUtils
@@ -25,7 +24,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.graphics.drawable.ColorDrawable
-import java.net.Inet4Address
 import uniffi.threnody_ffi.DeviceInfo
 import uniffi.threnody_ffi.FolderInfo
 import uniffi.threnody_ffi.HistoryEntry
@@ -1118,8 +1116,10 @@ class MainActivity : Activity() {
     /** An anonymous identity's invite, on its own port. */
     private fun personaInvite(id: String) {
         val p = Threnody.personaNode(id) ?: return
-        val ip = ourAddr()?.substringBeforeLast(':') ?: return failed("No network: connect to Wi-Fi to make an invite.")
-        val link = p.inviteLink("$ip:${Threnody.personaPort(this, id)}")
+        val addr = Threnody.inviteAddr(this, Threnody.personaPort(this, id).toString())
+        // Anonymous identities never use the DHT: an address is all there is.
+        if (addr.isEmpty()) return failed("No network: connect to Wi-Fi to make an invite.")
+        val link = p.inviteLink(addr)
         showCode(
             "Anonymous invite · ${Threnody.personaLabels[id] ?: ""}",
             "Whoever uses this reaches your anonymous identity, not you. It works while this phone is on this network.",
@@ -1203,17 +1203,11 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** The address others should dial: our Wi-Fi (or other) IPv4 address. */
-    private fun ourAddr(): String? {
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return null
-        val props = cm.getLinkProperties(cm.activeNetwork) ?: return null
-        val ip = props.linkAddresses.map { it.address }.firstOrNull { it is Inet4Address }?.hostAddress ?: return null
-        return "$ip:${Threnody.listenAddr.substringAfterLast(':')}"
-    }
-
     private fun showInvite() {
         val n = node ?: return
-        val addr = ourAddr() ?: return failed("No network: connect to Wi-Fi to make an invite.")
+        val addr = Threnody.inviteAddr(this, Threnody.listenAddr.substringAfterLast(':'))
+        // With internet reachability on, the link finds us without one.
+        if (addr.isEmpty() && !n.reachInternet()) return failed("No network: connect to a network to make an invite.")
         val link = n.inviteLink(addr)
         showCode(
             "Your invite",
@@ -1406,7 +1400,8 @@ class MainActivity : Activity() {
 
     private fun linkDevice() {
         val n = node ?: return
-        val addr = ourAddr() ?: return failed("No network: both devices need to be on the same network.")
+        val addr = Threnody.inviteAddr(this, Threnody.listenAddr.substringAfterLast(':')).ifEmpty { null }
+            ?: return failed("No network: both devices need to be on the same network.")
         showCode(
             "Link a new device",
             "On the new device, choose “Join another device's account” and scan or paste this. " +

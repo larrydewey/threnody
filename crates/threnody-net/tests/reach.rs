@@ -360,3 +360,92 @@ async fn strangers_find_each_other_by_handle() {
     bob.set_handle(None, 0).unwrap();
     assert_eq!(bob.handle(), None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invites_find_their_maker_when_its_address_is_dead() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        poll_foreground: Duration::from_secs(1),
+        poll_seeking: Duration::from_secs(1),
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    for n in [&alice, &bob] {
+        n.listen_quic("127.0.0.1:0").await.unwrap();
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    // The address a phone on mobile data would offer: nobody can dial it.
+    let link = bob.invite_link(Some("192.0.2.1:7450"));
+    assert_eq!(link.addrs, ["192.0.2.1:7450"]);
+    let key = link.key.expect("reachability is on: the link has a key");
+    assert_eq!(bob.invite_key(), key, "the key is kept");
+    next(
+        &mut brx,
+        60,
+        |e| matches!(e, Event::ReachNote { note } if note == "published invite"),
+    )
+    .await;
+
+    // Through the printed link, as a scanned QR code would give it.
+    let scanned: threnody_core::invite::InviteLink = link.to_string().parse().unwrap();
+    let peer = timeout(Duration::from_secs(60), alice.reach_invite(&scanned))
+        .await
+        .expect("found in time")
+        .unwrap();
+    assert_eq!(peer, bob.identity());
+    alice.send(&peer, text("found you by invite")).unwrap();
+    let Event::MessageRequest { msg, .. } =
+        next(&mut brx, 10, |e| matches!(e, Event::MessageRequest { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(msg, text("found you by invite"));
+
+    // A link naming someone else under that key is refused, not dialed.
+    let (carol, _crx) = node(&dir, "carol");
+    let forged = threnody_core::invite::InviteLink {
+        fingerprint: carol.identity().fingerprint(),
+        addrs: vec![],
+        key: Some(key),
+    };
+    let (dave, _drx) = node(&dir, "dave");
+    dave.listen_quic("127.0.0.1:0").await.unwrap();
+    dave.start_reach(cfg.clone()).unwrap();
+    assert!(dave.reach_invite(&forged).await.is_err());
+    assert!(dave.sessions().iter().all(|s| s.peer != bob.identity()));
+
+    // A new key: old links no longer lead here.
+    assert_ne!(bob.reset_invite_key(), key);
+}
+
+#[tokio::test]
+async fn invites_try_every_address_ipv6_included() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let (bob, _brx) = node(&dir, "bob");
+    let Ok(addr) = bob.listen("[::1]:0").await else {
+        eprintln!("no IPv6 loopback here; skipping");
+        return;
+    };
+    // A dead address first (one that hangs, as a carrier's private one
+    // does from outside), then IPv6: the link still works, and soon.
+    let link: threnody_core::invite::InviteLink = format!(
+        "threnody://{}@192.0.2.1:7450,{addr}",
+        bob.identity().fingerprint().compact()
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(link.addrs[1], format!("[::1]:{}", addr.port()));
+    let peer = timeout(Duration::from_secs(5), alice.reach_invite(&link))
+        .await
+        .expect("didn't wait for the dead address")
+        .unwrap();
+    assert_eq!(peer, bob.identity());
+}

@@ -465,25 +465,8 @@ impl Node {
         addr: Option<&str>,
         pin: Option<Fingerprint>,
     ) -> Result<PublicIdentity> {
-        // Metadata first (spec §9 layer 2): with two approved relays, an
-        // onion circuit keeps any single relay, and anyone watching our
-        // network, from seeing who we talk to.
         if let Some(fp) = pin
-            && self.prefer_onion()
-            && self.onion_possible(fp)
-            && let Ok(Ok(p)) =
-                tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
-        {
-            return Ok(p);
-        }
-        // Without enough approved contacts, through volunteer relays from
-        // our directories (Appendix P): the destination then sees a relay's
-        // address, not ours.
-        if let (Some(fp), Some(a)) = (pin, addr)
-            && self.prefer_onion()
-            && !self.volunteer_routes(fp, a, &[]).is_empty()
-            && let Ok(Ok(p)) =
-                tokio::time::timeout(VOLUNTEER_DIAL_TIMEOUT, self.connect_volunteer(fp, a)).await
+            && let Some(p) = self.reach_hidden(addr, fp).await
         {
             return Ok(p);
         }
@@ -499,6 +482,39 @@ impl Node {
             (Err(_), Some(fp)) => self.connect_relayed(fp).await,
             (Err(e), None) => Err(e),
         }
+    }
+
+    /// Reaches `fp` without showing either side's address to the other,
+    /// when we can: an onion circuit through approved contacts, else
+    /// through volunteer relays toward `addr`.
+    pub(crate) async fn reach_hidden(
+        &self,
+        addr: Option<&str>,
+        fp: Fingerprint,
+    ) -> Option<PublicIdentity> {
+        if !self.prefer_onion() {
+            return None;
+        }
+        // Metadata first (spec §9 layer 2): with two approved relays, an
+        // onion circuit keeps any single relay, and anyone watching our
+        // network, from seeing who we talk to.
+        if self.onion_possible(fp)
+            && let Ok(Ok(p)) =
+                tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
+        {
+            return Some(p);
+        }
+        // Without enough approved contacts, through volunteer relays from
+        // our directories (Appendix P): the destination then sees a relay's
+        // address, not ours.
+        if let Some(a) = addr
+            && !self.volunteer_routes(fp, a, &[]).is_empty()
+            && let Ok(Ok(p)) =
+                tokio::time::timeout(VOLUNTEER_DIAL_TIMEOUT, self.connect_volunteer(fp, a)).await
+        {
+            return Some(p);
+        }
+        None
     }
 
     /// Whether a two-relay onion path to `dest` could exist: a live,
