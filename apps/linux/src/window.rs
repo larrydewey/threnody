@@ -2574,6 +2574,43 @@ impl App {
         }
         page.add(&handle_group);
 
+        // A new invite key (Appendix S): old links stop finding us via the DHT.
+        let invites = adw::PreferencesGroup::builder()
+            .title("Invite links")
+            .description(
+                "Invite links carry a key that finds this computer across the internet. \
+                 Resetting it makes the links you've shared stop finding it there. They still \
+                 work at the addresses they carry while this computer is there. Contacts you've \
+                 already added aren't affected.",
+            )
+            .build();
+        let reset = adw::ActionRow::builder()
+            .title("Reset invite links")
+            .subtitle("Then make a new invite to share")
+            .activatable(true)
+            .build();
+        reset.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let (weak, dd) = (Rc::downgrade(self), d.clone());
+        reset.connect_activated(move |_| {
+            let weak = weak.clone();
+            ui::confirm(
+                &dd,
+                "Reset invite links?",
+                "Invite links you've shared stop finding this computer across the internet. \
+                 Someone on the same network could still use one.",
+                "Reset",
+                true,
+                move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.core.main.reset_invites();
+                        t.toast("Invite links reset: make a new invite to share");
+                    }
+                },
+            );
+        });
+        invites.add(&reset);
+        page.add(&invites);
+
         // A relay node of your own (docs/relay-node.md), kept connected.
         let always = adw::PreferencesGroup::builder()
             .title("Always-on relay")
