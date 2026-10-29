@@ -51,12 +51,13 @@
 
     <details>
       <summary>Do I need a phone number or email?</summary>
-      <p>No. Your identity is a key that your device makes. You add contacts with a QR code or a link.</p>
+      <p>No. Your identity is a key that your device makes. You add contacts with a QR code or a link, or with a short handle you can choose to make.</p>
     </details>
 
     <details>
       <summary>How do I add a contact?</summary>
-      <p>Show them your invite as a QR code, or send them the link. Once you're connected, compare your safety number with theirs, in person or on a call, to be sure no one is in between. Approving each other lets your devices find each other automatically, relay for each other and hold messages while the other is away.</p>
+      <p>Show them your invite as a QR code, or send them the link. The link lists your device's addresses and, with internet reachability on, a key that finds your device wherever it is, mobile data included; you both need version 0.17.1 or later for that. If you made a handle, they can type that into <em>Add a contact</em> instead. Once you're connected, compare your safety number with theirs, in person or on a call, to be sure no one is in between. Approving each other lets your devices find each other automatically, relay for each other and hold messages while the other is away.</p>
+      <p>One known gap: if you're both behind a VPN, the direct connection often can't be made, and a relay only works through a contact you already share. A brand-new contact may then not connect until one of you turns the VPN off or you're on the same network.</p>
     </details>
 
     <details>
@@ -93,7 +94,7 @@
 
     <details>
       <summary>Does Threnody contact any outside services?</summary>
-      <p>To find contacts across the internet, devices leave encrypted notes for each other in the public BitTorrent DHT, which means DHT nodes see your IP address. You can turn internet reachability off. Optional features, like GIF search through GIPHY, contact their service only after you agree to it. There are no ads, no analytics and no push notification service.</p>
+      <p>To find contacts across the internet, devices leave encrypted notes for each other in the public BitTorrent DHT (invite links and handles use it too), which means DHT nodes see your IP address. You can turn internet reachability off. Optional features, like GIF search through GIPHY, contact their service only after you agree to it. There are no ads and no analytics. The Android app can sleep and be woken through UnifiedPush instead of staying connected, but only if you turn that on; the push server you chose then sees when your phone is woken.</p>
     </details>
 
     <h2>Using it</h2>
@@ -132,7 +133,7 @@
 
     <details>
       <summary>Which platforms are supported?</summary>
-      <p>Android 10 or newer, and Linux with GTK 4. There are also command-line builds for Linux, macOS and Windows. There's no iOS app yet.</p>
+      <p>Android 10 or newer, and Linux with GTK 4. There are also command-line builds for Linux, macOS and Windows. There's no iOS release yet; a first iOS app, with the core chat features, builds from source.</p>
     </details>
 
     <details>
