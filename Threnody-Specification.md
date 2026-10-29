@@ -141,7 +141,7 @@ Threnody supports three complementary identity modes. A single device MAY presen
 
 - Primary identity is the long-term public verification key (Ed25519).
 - Short fingerprint (e.g., 32-character Crockford Base32 or similar) for human verification.
-- Optional human-memorable handles resolved only through user-controlled or optional public directories.
+- Optional human-memorable handles, never required. The reference implementation needs no directory for them: a handle carries a code bound to its owner's key and is found through encrypted, rotating records in the public Mainline DHT, which only someone holding the handle can locate ([Appendix S](docs/appendix-s-handles.md)).
 
 ### 4.5 Multi-Device
 
@@ -157,7 +157,7 @@ The strongest practical multi-device model compatible with MLS and the identity 
 
 ### 5.1 Discovery Methods (all complementary)
 
-1. Out-of-band: QR codes, NFC, safety numbers, shared secrets, physical exchange.
+1. Out-of-band: QR codes, invite links, NFC, safety numbers, shared secrets, physical exchange. In the reference implementation an invite link (`threnody://FP[@addr,…][?r=KEY]`) pins the inviter's fingerprint, lists up to four of its addresses, and, when internet reachability is on, carries a key naming a DHT meeting place where the inviter keeps its current addresses ([Appendix S](docs/appendix-s-handles.md#invite-links)). Handles (Section 4.4) serve the same purpose for someone who can only type or say a short name.
 2. Optional public directories / introducers (rate-limited, anti-scraping).
 3. Social / web-of-trust encrypted introductions.
 
@@ -330,16 +330,16 @@ The following are goals, not hard requirements:
 
 ## 15. Document Structure and Future Work
 
-This document is the top-level formal specification. Detailed appendices (to be produced in subsequent revisions) will cover:
+This document is the top-level formal specification. The detailed appendices are in [`docs/`](docs/), and the README lists them all. They cover:
 
-- Exact Noise-hybrid handshake patterns
-- MLS integration profile
-- Mesh routing algorithm
-- CBOR schema definitions
-- Multi-device protocol
-- WireGuard key derivation
-- Formal verification claims
-- Test vectors
+- Exact Noise-hybrid handshake patterns ([Appendix A](docs/appendix-a-handshake.md))
+- MLS integration profile ([Appendix F](docs/appendix-f-groups.md))
+- Mesh routing algorithm (relays, onion circuits, offline delivery, internet reachability: [Appendices G, I, H and N](docs/))
+- CBOR schema definitions ([Appendix C](docs/appendix-c-wire-format.md))
+- Multi-device protocol ([Appendix J](docs/appendix-j-devices.md))
+- WireGuard key derivation ([Appendix D](docs/appendix-d-tunnels.md))
+- Formal verification claims ([`proofs/`](proofs/README.md))
+- Test vectors ([`docs/test-vectors/v1.txt`](docs/test-vectors/v1.txt))
 
 ---
 
