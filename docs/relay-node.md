@@ -117,8 +117,9 @@ alias tctl='sudo -u threnody env THRENODY_HOME=/var/lib/threnody threnody ctl'
 For each phone that should use the relay (yours, your partner's, any other device):
 
 1. Let new devices in while you add them: `tctl /policy anyone`.
-2. Print the relay's invite, with the server's public address:
-   `sudo -u threnody env THRENODY_HOME=/var/lib/threnody threnody invite <public-ip>:7450`
+2. Print the relay's invite, with the server's public addresses (comma-separated, an IPv6 address in brackets and first):
+   `sudo -u threnody env THRENODY_HOME=/var/lib/threnody threnody invite '[<public-ipv6>]:7450,<public-ip>:7450'`
+   The link also carries a key (`?r=…`) naming a meeting place in the DHT, where the running node keeps its current addresses (Appendix S, *Invite links*), so the invite still works if the server's address changes. The running node reads a new key only when it starts, so after the first `threnody invite`, run `sudo systemctl restart threnody` once.
 3. On the phone, scan the QR code (or open the `threnody://…` link). The relay shows up as a new contact.
 4. On the server, find the phone and approve it:
    `tctl /contacts`, then `tctl /approve <fingerprint>`.

@@ -49,7 +49,7 @@ The Bluetooth channel itself is **insecure** at the Bluetooth layer (no pairing,
 - **SDU size.** Android hands an L2CAP SDU (Service Data Unit) to the app only once the whole SDU has arrived, and stalls on large ones. On a Pixel 8a a 10 KB SDU arrived and a 33 KB one never did. Both ends therefore cut writes to **4096 bytes**. Linux also offers a 4096-byte receive MTU, up from the default 672.
 - **Android writes.** `BluetoothSocket.write` on an L2CAP channel silently truncates a write larger than one packet, so the app writes packet-sized pieces.
 - **Lingering links.** When a peer's app dies, its LE link can stay up. While it does, the laptop's controller stops advertising. Every 10 s, Linux therefore disconnects LE links to devices it has run Threnody channels with that no longer carry a session, after a 30 s grace period for handshakes. Other Bluetooth devices are never touched. In testing, a link left by force-stopping the app was gone within 8 s, and the app reconnected 9 s after it restarted.
-- **Android background.** A foreground service of type `remoteMessaging` keeps the process, and so the node and its Bluetooth sessions, alive while the app is in the background. Messages that arrive while no Activity is visible raise a notification.
+- **Android background.** A foreground service of type `remoteMessaging` (and `microphone` during calls) keeps the process, and so the node and its Bluetooth sessions, alive while the app is in the background. Messages that arrive while no Activity is visible raise a notification.
 
 ## Tested
 
@@ -66,6 +66,4 @@ A Pixel 8a (Android API 37) and a Linux laptop (BlueZ 5.87), in both directions:
 
 To anyone without a discovery key, the advert shows only that *a* Threnody device is nearby, plus its PSM. Beacons are unlinkable to each other, and the phone's Bluetooth address rotates. Only mutually approved contacts can recognise the device. Its presence is still visible: hiding that would mean dropping the fixed service UUID, so that scanners have to test every extended advert they hear.
 
-## Not yet done
-
-- Android listening that survives the Activity being destroyed by the user (the listener is process-wide, but starting it needs the Activity).
+Android starts listening, advertising and scanning whenever the node starts, once the Bluetooth permissions have been granted, so the foreground service brings Bluetooth back without the Activity.

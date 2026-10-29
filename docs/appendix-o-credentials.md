@@ -52,9 +52,11 @@ The receipt makes issuance post-quantum authenticated: a holder never accepts a 
 
 ```
 Presentation = { 0: issuer_id, 1: header, 2: total (attribute count), 3: [* [index, key, value]],
-                 4: proof, 5: pseudonym (48) }
+                 4: proof, 5: pseudonym (48), ? 6: ML-DSA signature }
 proof = ProofGenWithNym(pk, signature, header, ph = binding, context, disclosed indexes)
 ```
+
+Field 6 is reserved for an ML-DSA signature over the presentation (context `threnody presentation pq sig`). Threnody never sends one; a verifier that receives one checks it against the issuer key's ML-DSA key and refuses the presentation if it fails.
 
 The verifier checks the following:
 

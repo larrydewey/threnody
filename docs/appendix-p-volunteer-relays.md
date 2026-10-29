@@ -1,6 +1,6 @@
 # Appendix P: Volunteer Relays and Directories (v1)
 
-Status: specified here, modelled in [`proofs/relay_tokens.spthy`](../proofs/README.md), implemented in `threnody-core::directory`, `threnody-net::anon`, `threnody-net::volunteer` and `threnody-net::onion`. Fulfils spec §5.1 (optional directories) and §9 layer 2 ("onion / multi-hop routing through volunteer or user-run nodes"). It closes the gaps Appendix I ("contacts-only relays"), Appendix M (a persona's network address) and Appendix N (symmetric NATs on both ends) left open.
+Status: specified here, modelled in [`proofs/relay_tokens.spthy`](../proofs/README.md), implemented in `threnody-core::directory`, `threnody-net::anon`, `threnody-net::volunteer` and `threnody-net::onion`. Fulfils spec §5.1 (optional directories) and §9 layer 2 ("onion / multi-hop routing through volunteer or user-run nodes"). It closes the gaps Appendix I ("contacts-only relays") and Appendix M (a persona's network address) left open. It doesn't yet close Appendix N's (symmetric NATs on both ends): the last relay still dials the destination's address, so a destination behind NAT is reached only if that address takes a dial (see *Reachability* below).
 
 Onion circuits (Appendix I) can only use relays that are your own approved contacts, and a new user or a new persona has few or none. Volunteer relays carry circuits for strangers. Directories tell users which volunteers exist. Anonymous tokens (Appendix O) pay for each circuit, so relays can limit abuse without learning who is asking.
 
