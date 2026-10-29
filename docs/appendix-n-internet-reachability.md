@@ -22,12 +22,12 @@ So two contacts meet only on the same network (LAN discovery, Appendix E), over 
 
 ## Non-goals
 
-- **Getting through symmetric NAT on both ends.** When both devices' NATs assign a new outside port for every destination, port prediction is unreliable. That case still needs a relay through a reachable contact; volunteer relay directories (spec §9 layer 2) would help later.
-- **Reaching strangers.** First contact still uses an invite with an address, a QR code, Bluetooth or the LAN.
+- **Getting through symmetric NAT on both ends.** When both devices' NATs assign a new outside port for every destination, port prediction is unreliable. That case still needs a relay through a reachable contact. Volunteer relays (Appendix P) don't solve it yet, since a circuit through them still ends by dialing the destination's address ("Later", below).
+- **Reaching strangers through contact records.** The records here exist only for mutually approved contacts. First contact uses an invite or a handle, which meet in the DHT the same way but under a key of their own (Appendix S), or a QR code, Bluetooth or the LAN.
 
 ## Overview
 
-0. **Asking the router first.** Before anything else, the node asks its router to forward its port (section 0). When that works and the public address is known, contacts simply dial it, with no DHT at all.
+0. **Asking the router first.** The node asks its router to forward its port (section 0). When that works, the forwarded address is a candidate contacts can dial without punching a hole.
 1. **UDP transport.** Sessions also run over QUIC on the same port number as TCP (UDP 7450). NAT hole punching works with UDP. QUIC only carries bytes: the Threnody handshake (Appendix A) and ratchet (B) run inside one QUIC stream, unchanged.
 2. **Learning your own addresses** (candidates): your public address and port as seen from outside, your LAN addresses, and global IPv6 addresses.
 3. **Rendezvous through the public BitTorrent DHT** (Mainline, BEP 5 and BEP 44). Each node stores its current candidates for each mutually approved contact, encrypted under a key only the two of them share. The record is stored under a storage key that rotates.
@@ -37,10 +37,10 @@ So two contacts meet only on the same network (LAN discovery, Appendix E), over 
 
 Most home routers let a device on the network request a port forward, using UPnP IGD, NAT-PMP or its successor PCP (RFC 6887).
 
-- **Requesting the mapping.** A node asks its router to forward TCP and UDP 7450 to itself, renewing before the lease ends. It removes the mapping on shutdown, and makes no request when the setting is off.
-- **Learning the public address.** The router reports the public address in its answer. Session peers confirm it with `Observed` messages (section 2).
-- **Remembering it.** A contact who was told the address while connected (in the session, so never in the clear) remembers it as that contact's *home address*. A phone that left home Wi-Fi then dials the remembered address first.
-- **When the DHT is still needed:** only when the remembered address fails, for example because the address changed or the router refused the mapping.
+- **Requesting the mapping.** A node asks its router to forward its TCP and UDP port (7450 by default) to itself, trying UPnP first, then PCP, then NAT-PMP, with a two-hour lease that renews on its own. It removes the mapping on shutdown, and makes no request when internet reachability is off. Only IPv4 is mapped; IPv6 needs no mapping.
+- **Learning the public address.** The router reports the public address in its answer, and it becomes a reflexive candidate (section 2). When the mapping is lost or changes, candidates are gathered again.
+- **Passing it on.** Like any candidate, it goes to contacts in `Paths` during a session (section 5) and in DHT records (section 3), so a phone that left home Wi-Fi can dial it at once.
+- **When the DHT is still needed:** when the mapping is refused, or the address changed and the contact hasn't seen the new one yet.
 
 This covers the common case of a phone reaching a home computer cheaply, with nothing published anywhere. It doesn't help two phones on mobile data, whose carriers do the NAT and offer no mapping. That case is what sections 1 to 4 are for.
 
@@ -62,7 +62,9 @@ A node gathers its candidates as follows:
   - DHT nodes report the address they see a query come from (the `ip` field of BEP 42). The node pings a few DHT nodes *from its QUIC socket* (a few well-known ones plus some from its routing table), so the answer is the outside address and port of that very socket. No STUN server is needed. Libtorrent-based nodes answer with `ip`; some others don't. If none answers, the DHT client's own view of our IP, with our port, is used as a guess (many NATs keep the port).
   - A candidate that two independent observers agree on is trusted. One that changes for each destination marks this NAT as symmetric.
 - **Local:** the LAN interfaces' addresses, for two devices behind the same NAT that can't see each other's discovery beacons.
-- **IPv6:** global unicast addresses. With IPv6 there's no NAT to cross, only a firewall, and probing usually opens it. Many mobile carriers are IPv6-first, so this alone covers a large share of mobile cases.
+- **IPv6:** the global unicast address the system would send from, plus up to two global IPv6 addresses peers or DHT nodes report seeing us at (a temporary address can differ from the preferred one). With IPv6 there's no NAT to cross, only a firewall, and probing usually opens it. Many mobile carriers are IPv6-first, so this alone covers a large share of mobile cases.
+
+Only mutually approved contacts' `Observed` reports count: anyone else could steer our probes toward an address of its choosing.
 
 Candidates are re-gathered whenever the network changes (Android's network callback) and every 10 minutes, or every 30 seconds while the outside address is still unknown.
 
@@ -114,9 +116,11 @@ Once either side sees the other's fresh candidates:
 2. **Overlapping in time.** Both sides must punch at once, but each only learns of the other through polling. So the side that starts (it found a new record, or it seeks the contact) marks its own record as seeking the contact and punches for two minutes. While it still seeks the contact after that, it keeps probing every 5 seconds without dialing, which keeps its NAT open toward the contact. The contact, seeing a record that seeks it, joins in for 60 seconds, even while backing off, and marks its own record as seeking in return, so a seeker that slowed down sees the answer at its next 15-second poll and punches at full rate again. A probe from the contact also makes a node join in.
 3. **One side dials.** When a probe arrives, or after 3 seconds, the device with the smaller identity key dials every candidate at once over QUIC, retrying every 5 seconds; the first connection wins. As LAN discovery does, it pins the expected fingerprint.
 4. **The handshake decides.** The Threnody handshake inside the QUIC stream authenticates both sides. A probe from anyone else can at most cause a connection attempt that then fails.
-5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. A message none of these can take is held (with the unacknowledged ones, so it survives a restart when small) and goes first in the next session with the contact, instead of failing. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
+5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. A node relays only between its own mutually approved contacts (Appendix G), so this works only through a contact both people already share. A message none of these can take is held (with the unacknowledged ones, so it survives a restart when small) and goes first in the next session with the contact, instead of failing. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
 
 **Symmetric NAT.** With `flags & 1` set on exactly one side, the other side (which has a stable port) dials, and the symmetric side's probes open its own mapping toward that port. That usually works. When both sides are symmetric, the relay fallback applies.
+
+**Where this fails in practice.** Hole punching often fails behind symmetric NAT, which many VPNs use, especially when both people are on one. Relaying then needs a contact the two already share, so a brand-new contact (met through an invite or a handle) with both sides behind VPNs may not connect at all until one of them turns the VPN off, or both are on the same network.
 
 ## 5. Fast recovery
 
@@ -179,7 +183,7 @@ An app starting after a long time away is found at the contact's next read of it
 
 ## Settings
 
-The feature has a toggle: *Reach contacts over the internet* in the app's menu, and `--no-rendezvous` in the CLI. It covers DHT rendezvous and hole punching (and, later, router port mapping). With it off, the node never joins the DHT. QUIC itself stays on: it carries sessions to addresses the user dials.
+The feature has a toggle: *Reach contacts over the internet* in the app's menu, and `--no-rendezvous` in the CLI. It covers DHT rendezvous, hole punching, router port mapping, and the meeting places of handles and invite links (Appendix S). With it off, the node never joins the DHT, and invite links carry no key. QUIC itself stays on: it carries sessions to addresses the user dials.
 
 The CLI's `/status` and the app's Diagnostics screen show whether the node is in the DHT, its addresses, and whether its NAT looks symmetric. Events (`Addresses`, `Punching`, `PunchFailed`, and diagnostic `ReachNote`s for records published and found) go to the CLI output and the app's diagnostic log.
 
@@ -197,7 +201,7 @@ So DHT rendezvous is the bridge to a relay network, and afterwards a fallback. T
 
 ## Work plan
 
-0. **Router port mapping:** UPnP IGD, NAT-PMP and PCP, lease renewal, removal on shutdown, and remembered home addresses. *Not built yet.*
+0. **Router port mapping:** done (`threnody-net` `portmap`): UPnP IGD, PCP and NAT-PMP, lease renewal, removal on shutdown; the mapped address is a candidate.
 1. **QUIC transport:** done (`threnody-net` `quic`): the endpoint on the TCP port's number, dual-stack, dialing and accepting into the existing session code, keepalives, TCP-to-QUIC fallback. Tests over loopback.
 2. **Observed addresses:** done: the `Observed` session message (feature bit 32), candidate gathering, DHT pings for the outside address, symmetric-NAT detection.
 3. **DHT records:** done (`threnody-core` `rendezvous`, `threnody-net` `reach`): key derivation, record format, padding, publishing and polling with the `mainline` crate. Unit tests for keys and records; an end-to-end test against a local DHT testnet.
@@ -209,6 +213,6 @@ So DHT rendezvous is the bridge to a relay network, and afterwards a fallback. T
 - `quinn` (QUIC), with `rustls` on the `ring` backend.
 - `rcgen`, for the throwaway certificate.
 - `mainline`, for the DHT client and BEP 44 storage.
-- Later, for section 0: a small UPnP IGD / NAT-PMP / PCP client, written here or from a crate (to be chosen).
+- `port-control-client`, for section 0 (UPnP IGD, PCP, NAT-PMP).
 
 All are Rust, pure or with `ring`, and build for Android.
