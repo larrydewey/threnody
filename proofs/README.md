@@ -9,6 +9,7 @@ This directory has these Tamarin models:
 - `devices.spthy` models device linking and account chains ([Appendix J](../docs/appendix-j-devices.md)).
 - `credentials.spthy` models zero-knowledge credentials: blind issuance, receipts and selective disclosure ([Appendix O](../docs/appendix-o-credentials.md)).
 - `relay_tokens.spthy` models relay directories and relay tokens ([Appendix P](../docs/appendix-p-volunteer-relays.md)).
+- `meeting.spthy` models meeting places in the DHT for invite links and handles ([Appendix S](../docs/appendix-s-handles.md)).
 
 Every lemma verifies automatically, in a few minutes in total:
 
@@ -131,6 +132,23 @@ Abstractions specific to this model:
 | `sanity_*` | A BBS break mints tokens; leaked client secrets spend them; both directory keys forge a listing. |
 
 Anyone may hold relay credentials: directories limit them per network, not per identity. So the token lemmas bound what a credential can do, not who holds one.
+
+## Meeting places
+
+| Lemma | Property |
+|---|---|
+| `invite_executable`, `handle_executable` | A finder can reach an invite's or a handle's owner through its meeting place. |
+| `invite_finder_authentication` | A finder that follows an invite link ends up in a session with the device whose fingerprint the link carries, unless that device's long-term key leaked earlier. This holds even when the link has leaked and anyone can forge records at its meeting place. |
+| `handle_finder_authentication` | The same for a handle, which is public by design: a record counts only if its key matches the handle's code. |
+| `invite_record_secrecy` | The owner's addresses at an invite's meeting place stay secret from everyone without the link, unless the link leaked. |
+| `knock_secrecy` | A finder's addresses in a knock likewise. |
+| `sanity_*` | A leaked link really does expose the owner's addresses and lets an attacker send finders to an address of its own (where they fail authentication), and a leaked long-term key really does allow impersonation. |
+
+Abstractions specific to this model:
+
+- The session handshake is abstracted to a signed challenge. Its real guarantees are proved in `handshake.spthy`.
+- `code/1` is an ideal one-way function. Brute-forcing a handle's Argon2 code is not modelled.
+- Epochs and knock slots only partition the DHT and are not modelled. Neither is unlinkability of records across epochs, which is an equivalence property.
 
 ## Abstractions and limits
 
