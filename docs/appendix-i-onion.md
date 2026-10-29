@@ -61,27 +61,29 @@ The end-to-end Threnody handshake and session (Appendices A and B) run over the 
 These are carried as `AppMessage::Onion` (Appendix C, kind 10):
 
 ```
-OnionMsg = { 0: op, 1: circ u64, ? 2: e_pub, ? 3: id, ? 4: ct, ? 5: sig, ? 6: cell (2048) }
+OnionMsg = { 0: op, 1: circ u64, ? 2: e_pub, ? 3: id, ? 4: ct, ? 5: sig, ? 6: cell (2048), ? 7: token }
 op: 1 create, 2 created, 3 cell, 4 destroy
 ```
+
+`token` appears only on `create`, paying a volunteer relay (Appendix P).
 
 ## Relay rules
 
 - **Who may create.** A node answers `CREATE` from any neighbour, with at most 64 circuits per neighbour. Only a hop created by a mutually approved neighbour, or paid with a relay token (Appendix P), may `EXTEND`; any other hop may only end there (`BEGIN` or `DEPOSIT`).
-- **Who to extend to.** On `EXTEND`, a node checks for a live direct session with a mutually approved contact whose fingerprint is `to`. If there is one, it sends that contact `CREATE` on a new link circuit and returns its `CREATED` fields as `EXTENDED`. Otherwise it returns `EXTEND_FAILED`.
+- **Who to extend to.** On `EXTEND`, a node checks for a live direct session with a mutually approved contact whose fingerprint is `to`. If there is one, it sends that contact `CREATE` on a new link circuit and returns its `CREATED` fields as `EXTENDED`. A volunteer relay may instead dial the address the `EXTEND` carries (Appendix P). Otherwise it returns `EXTEND_FAILED`.
 - **Passing cells on.** Cells that aren't recognized are forwarded on the paired link circuit. Cells from the next hop get this hop's backward layer and are forwarded upstream.
 - **Teardown.** `DESTROY`, or losing either link, tears the circuit down in both directions.
 
 ## When circuits are used
 
-Nodes reach contacts through onion circuits first, by default (`Node::reach`, the CLI and the apps). That happens whenever a two-relay path could exist: a live, mutually approved neighbour, plus another approved contact. If building a circuit fails or takes over 10 s, the node falls back to a direct dial, then to a relay circuit (Appendix G). `--no-onion`, or the app's toggle, turns this off. `/onion` still builds a circuit on demand.
+Nodes reach contacts through onion circuits first, by default (`Node::reach`, the CLI and the apps). That happens whenever a two-relay path could exist: a live, mutually approved neighbour, plus another approved contact. If building a circuit fails or takes over 10 s, the node tries volunteer relays when its subscribed directories offer a route and an address is known (Appendix P, for up to 60 s), then falls back to a direct dial, then to a relay circuit (Appendix G). `--no-onion`, or the app's toggle, turns this off. `/onion` still builds a circuit on demand.
 
 ## Path selection
 
 A tries paths in this order:
 
 - **Two relays:** each live, mutually approved neighbour `R1` paired with each other mutually approved contact `R2`, ending at the destination.
-- **One relay**, but only if allowed (`--min-relays 1`): an `R1` that can extend straight to the destination.
+- **One relay**, but only if allowed (`/onion <peer> 1`): an `R1` that can extend straight to the destination.
 
 If any extension fails, A destroys the circuit and tries the next path.
 

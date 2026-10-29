@@ -33,15 +33,17 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
-           / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory / Push
+           / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
+           / Typing / Read / Call / Media / Pin / List / Tunnel / Push
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
                                                            ; 8192 tunnel, 16384 push); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
+             ? 6 => uint,                                              ; flags (8 forwarded)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
-             ? 6 => uint, ? 7 => tstr, ? 8 => uint, ? 9 => uint }      ; flags (1 sensitive, 2 voice, 4 video), caption,
+             ? 6 => uint, ? 7 => tstr, ? 8 => uint, ? 9 => uint }      ; flags (1 sensitive, 2 voice, 4 video, 8 forwarded), caption,
                                                                        ; album id, clip duration (ms)
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
@@ -63,6 +65,13 @@ Observed = { 0 => 19, 2 => bstr, 3 => uint }               ; address (4 or 16 by
 Paths    = { 0 => 20, 2 => bstr .cbor Paths }             ; recovery paths and heartbeat, Appendix N
 Credential = { 0 => 21, 2 => bstr .cbor CredMsg }         ; credential issuance and presentation, Appendix O
 Directory  = { 0 => 22, 2 => bstr .cbor DirMsg }          ; relay directory requests, anonymous links only, Appendix P
+Typing     = { 0 => 23, 2 => bool }                        ; typing now or not; never tracked, sealed or stored
+Read       = { 0 => 24, 2 => bstr, 3 => bstr }             ; ids displayed (8 bytes each, ≤ 512), conversation id
+Call       = { 0 => 25, 2 => bstr .cbor CallMsg }          ; call signalling, Appendix Q
+Media      = { 0 => 26, 2 => bstr }                        ; one sealed call media packet on links without datagrams, Appendix Q
+Pin        = { 0 => 27, 3 => bstr, 5 => uint, ? 6 => uint }  ; conversation id, message id, flags (1 = unpin)
+List       = { 0 => 28, 2 => bstr }                        ; a shared list's state, see *Lists*
+Tunnel     = { 0 => 29, 2 => bstr }                        ; one WireGuard packet, Appendix D
 Push       = { 0 => 30, 2 => bstr .cbor PushReg }         ; wake-up endpoint or its withdrawal, mutual contacts only, Appendix R
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
@@ -87,6 +96,12 @@ When both sides set bit 1, text, files, group messages and mailbox messages trav
 An outgoing text or file in history carries a random local id (history key 7), and its tracked copies carry the same id as a tag. When any device of the recipient's account acknowledges one, the history entry is marked delivered (key 8), and the node emits `Delivered`. Apps show this as a second tick. A group message's entry records how many members it went to (key 9) and the devices that acknowledged their copy (key 10), and it is delivered once all have. Only a member's own acknowledgement counts, not a mailbox's or a forwarder's. A forwarder that delivers a copy reports the member's acknowledgement back with a group `Receipt` (Appendix F).
 
 Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The exception is messages over 64 KiB (files), which are resent only within one run.
+
+### Typing and read receipts
+
+`Typing` (feature bit 256) tells the devices of the peer's account whether we are typing in our chat with them. It is a transient hint: never tracked, never sealed for a mailbox, never stored.
+
+`Read` (feature bit 512) tells the peer's devices that the messages with these ids, the ids it sent them with, were displayed. It goes only over live sessions, never tracked or sealed. The sender marks those outgoing entries read (history key 14, the time it learned) and emits `Read`; apps show an eye. A `Read` from one of our own devices is ignored.
 
 ## Deleting and editing messages
 
@@ -153,7 +168,8 @@ Both files are written with mode 0600 inside a directory with mode 0700.
 
 ```cddl
 IdentityFile = { 0 => 1, 1 => bstr .size 32 }               ; Ed25519 seed
-ContactsFile = { 0 => 1, 1 => [* Contact] }
+             / { 0 => 1, 2 => bstr }                         ; or the seed sealed (Argon2id + ChaCha20-Poly1305) under a passphrase, or a random secret the platform keystore keeps
+ContactsFile = { 0 => 1, 1 => [* Contact], ? 2 => [* [bstr .size 32, uint]] }  ; contacts, forgotten keys and when (ms)
 Contact = {
   0 => bstr .size 32,    ; identity key
   ? 1 => tstr,           ; petname
@@ -168,6 +184,11 @@ Contact = {
   ? 11 => [* bstr .size 32], ; previous discovery keys
   ? 12 => bool,          ; accepted: we want their messages (absent = true, for contacts from before requests)
   ? 13 => bool,          ; blocked
+  ? 14 => [* [tstr, tstr]], ; their profile as they shared it (Appendix M)
+  ? 15 => [* tstr],      ; our profile attributes shared with them
+  ? 16 => bstr .size 32, ; the identity a persona revealed to us (Appendix M)
+  ? 17 => tstr,          ; the invite link that came with the reveal
+  ? 18 => uint,          ; conversation cleared at (ms)
 }
 ```
 
