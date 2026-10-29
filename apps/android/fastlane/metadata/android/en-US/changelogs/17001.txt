@@ -1,0 +1,3 @@
+- Invites work on mobile data and IPv6-only networks: a link finds you wherever you are, not only on the network you made it on.
+- Invite links carry IPv6 addresses, and a link whose first address is dead no longer hangs.
+- Security updates to certificate checking libraries.
