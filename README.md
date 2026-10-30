@@ -165,7 +165,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 | §3.2 Hybrid KEM X25519 + ML-KEM-768 | ✅ X-Wing (draft-11), passes the official vectors |
 | §3.2 Ed25519, ChaCha20-Poly1305 + AES-256-GCM, domain-separated KDF | ✅ BLAKE3 KDF; both AEADs negotiated |
 | §3.3 FS / PCS ratchet with hybrid PQ updates | ✅ KEM double ratchet with header encryption |
-| §3.4 Formal verification | ✅ Tamarin, 52 lemmas: handshake, ratchet, sealed messages, onion hops, device linking and account chains, credentials and relay tokens; `proofs/check.sh` |
+| §3.4 Formal verification | ✅ Tamarin, 61 lemmas: handshake, ratchet, sealed messages, onion hops, device linking and account chains, credentials, relay tokens, and meeting places for invites and handles; `proofs/check.sh` |
 | §4.2 Pseudonymous identity, §4.4 fingerprint | ✅ 32-character Crockford Base32 |
 | §4.1 Anonymous mode, §4.3 selective disclosure | ✅ anonymous identities (personas) with their own keys, contacts and history, unlinkable to the main identity, optionally burning themselves, revealed only by a signed proof; profiles shared per contact, nothing by default ([Appendix M](docs/appendix-m-anonymity.md)); zero-knowledge credentials: BBS selective disclosure with per-verifier pseudonyms, blind issuance, ML-DSA-signed issuer keys and receipts ([Appendix O](docs/appendix-o-credentials.md)) |
 | §4.5 Multi-device | ✅ signed device chains (equal peers, threshold-ready), link codes, revocation, own-device contact sync and history sync (with a backfill for newly linked devices), account-wide offline keys and group invites |
