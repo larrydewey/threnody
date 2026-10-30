@@ -9,14 +9,14 @@ Every device keeps its own Ed25519 key. Sessions, ratchets, tunnels, prekeys and
 An account is a hash-linked list of signed changes to its device set:
 
 ```
-Link   = { 0: seq u64, 1: prev (32), 2: threshold u8, 3: action, 4: [ Sig ] }
+Link   = { 0: body bstr, 1: [ * Sig ] }
+body   = { 0: version 1, 1: seq u64, 2: prev (32), 3: threshold u8, 4: action }
 action = { 0: 1 add,    1: device key (32), 2: name tstr }
        / { 0: 2 remove, 1: device key (32) }
        / { 0: 3 rename, 1: device key (32), 2: name tstr }
-Sig    = { 0: device key (32), 1: signature (64) }
-body   = Link without field 4
+Sig    = [ device key (32), signature (64) ]
 sig    = Sign(device, L("account link") || L(body))
-prev   = H(previous link body)     -- 32 zero bytes for the genesis link
+prev   = BLAKE3(previous link body)     -- 32 zero bytes for the genesis link
 AccountId = KDF("account id", body of link 0)
 ```
 
@@ -36,7 +36,7 @@ v1 always writes threshold 1, so every current device is an equal peer. Verifier
 
 ### Account fingerprint
 
-The account fingerprint is computed the same way as a device fingerprint (Appendix A), with `AccountId` in place of the identity key. Invite links and safety numbers use account fingerprints. A single-device account is just a chain with one link.
+The account fingerprint is computed like a device fingerprint (Appendix A), as `KDF("account fingerprint", AccountId)`. Invite links and safety numbers still name devices: a link carries the inviting device's fingerprint, and a safety number is computed from the two devices' keys. A single-device account is just a chain with one link.
 
 ### Updates and forks
 
@@ -51,10 +51,15 @@ The account fingerprint is computed the same way as a device fingerprint (Append
 existing device E                                  new device N
   code = threnody-link://<fp(E)>@<addr>#<s>   ──(out of band: QR / typed)──▶
                                               ◀──  session (handshake; N pins fp(E))
-                                              ◀──  LinkRequest { proof = KDF("link proof", s, session_id, N), name, sig_N(body) }
-  check proof; build link Add(N, name), signed by E (and N's sig over the same body)
-                                              ──▶ LinkAccepted { chain, contacts }
+                                              ◀──  LinkRequest { proof = KDF("link proof", s, session_id, N), name }
+  check proof; build link Add(N, name), signed by E
+                                              ──▶ LinkOffer { chain, link }
+                                                   N checks the link and countersigns it
+                                              ◀──  LinkConsent { link }
+  append the link; broadcast the new chain
 ```
+
+`s` travels in the code as 32 hex digits after `#`. Account messages (`AppMessage::Account`) are numbered: 1 chain, 2 `LinkRequest`, 3 `LinkOffer`, 4 `LinkConsent`, 5 `ContactSync`, 6 `LinkRefused`, 7 shared bundle, 8 `Transcript`, 9 `Folders`, 10 `List`.
 
 - **The secret.** `s` is 16 random bytes, good for one use and 10 minutes.
 - **Authenticating each side.** The code pins `fp(E)`, which authenticates E to N. The proof binds `s` to *this* session and *this* device, which authenticates N to E. An attacker without the code can't be added, and can't replay a proof into another session.
@@ -123,5 +128,4 @@ MLS leaves stay per device. `/group invite` sends a key-package request to every
 ## Not yet done
 
 - Gathering co-signatures for thresholds above 1, so removals need several devices.
-- Devices added to an account after a group was created must be invited to it separately.
-- Syncing group history from before a device joined (MLS can't), file contents, and delivery ticks between devices.
+- Syncing file contents and delivery ticks between devices.

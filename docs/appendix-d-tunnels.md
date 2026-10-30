@@ -38,9 +38,10 @@ Offers travel inside the authenticated ratchet, so only the genuine peer can set
 
 ## Operation
 
-- `threnody run --tunnel [PORT]` keeps `<home>/wireguard/thr0.conf` (mode 0600) up to date. Bring the interface up with `sudo wg-quick up <file>`.
+- `threnody run --tunnel [PORT]` (port 51820 by default) keeps `<home>/wireguard/<iface>.conf` (mode 0600) up to date, the interface being `thr0` unless `--wg-iface` names another. Bring the interface up with `sudo wg-quick up <file>`.
 - Adding `--wg-apply` also pushes every change to the running interface with `wg set`, with the PSK passed on stdin. This needs CAP_NET_ADMIN.
 - `threnody tunnel` shows this device's WireGuard public key, overlay address and overlay network.
+- The Linux app has the same as a *WireGuard tunnels* setting (off by default, main identity only). It keeps `<data dir>/wireguard/thr0.conf` current on port 51820, for `wg-quick` as above.
 
 ### Userspace WireGuard (Android)
 

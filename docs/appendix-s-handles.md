@@ -63,15 +63,19 @@ An invite link made on mobile data used to carry an address nobody could dial: t
 ```
 link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ]
 addr  = host ":" port                -- IPv6 in brackets: [2001:db8::1]:7450
-key   = Crockford Base32 of 16 random bytes
+key   = Crockford Base32 of 16 random bytes (26 symbols)
 base  = KDF("… invite", key)         -- then records, knock slots and probe key as above
 ```
 
+A finder tries, in order: an onion circuit through approved contacts or volunteer relays when one can be had (Appendices I and P), as for any dial; every address in the link; the meeting place the key names; and last, relay circuits through approved contacts (Appendix G), which work only through a contact both people already share.
+
 - **Addresses.** A link carries up to four: global IPv6 addresses first (no NAT to cross, often reachable directly), then the address the app suggests, then local and public IPv4 ones. The finder dials them all, 300 ms apart and each for at most 6 s, over TCP and, half a second later, QUIC, since mobile IPv6 firewalls often drop TCP silently. A dead address no longer holds up the rest.
 - **The key.** Each device makes one the first time it shows an invite and keeps it (state `invite-key`). From then on it publishes its record under the key and answers knocks there, as for a handle. When none of the addresses answers, the finder reads the record, checks that it names the fingerprint in the link (that check replaces a handle's code), dials, then knocks and punches. Relays come last, as before.
-- **Off with reachability.** Without internet reachability (and so for anonymous identities) a link has no key and only its addresses work.
+- **Off with reachability.** Without internet reachability (and so for anonymous identities) a link the apps make has no key and only its addresses work. The CLI's `threnody invite <addr>[,<addr>…]` always adds the key; a `run` started after that keeps the record under it, unless started with `--no-rendezvous`.
+- **Versions.** Both sides need 0.17.1 or later: older versions can't read a link with several addresses or a key, and never publish under one.
+- **Limits.** The meeting place ends in a hole punch (Appendix N, section 4), which often fails behind symmetric NAT, as many VPNs are, especially when both people use one. Relays need a contact the two already share, so a brand-new contact with both sides behind VPNs may not connect.
 - **Cost.** One more record to keep, and knock slots to read at the handle rates. Last hour's slots are read only in the first five minutes of an hour, when a knock there can still be fresh; this halves the reads for handles too.
-- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. Links without `?r=` and links with one address still parse.
+- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. The apps don't offer this yet. Links without `?r=` and links with one address still parse.
 
 ## Changing or removing a handle
 
@@ -92,4 +96,4 @@ Raising `version` gives a new code. Removing the handle, or changing it, stops p
 
 ## Implementation
 
-`threnody-core::handle` (format, code, records, knocks), `threnody-net::handle` (publishing, polling knocks, `Node::set_handle`, `Node::find_handle`), the FFI's `set_handle`, `own_handle` and `find_handle` (not `handle`, which UniFFI's Swift objects already use), and `connect`, which takes handles too. The CLI publishes one with `/handle <name>`; `/connect` takes handles. The Android and Linux apps have "Your handle" in their settings, and their "Add a contact" boxes take handles.
+`threnody-core::handle` (format, code, records, knocks), `threnody-core::invite` (invite links and keys), `threnody-net::handle` (publishing, polling knocks, `Node::set_handle`, `Node::find_handle`, `Node::invite_link`, `Node::reach_invite`), the FFI's `set_handle`, `own_handle`, `find_handle` (not `handle`, which UniFFI's Swift objects already use), `invite_link` and `reset_invites`, and `connect`, which takes handles and invite links too. The CLI publishes one with `/handle <name>`; `/connect` takes handles. The Android and Linux apps have "Your handle" in their settings, and their "Add a contact" boxes take handles.

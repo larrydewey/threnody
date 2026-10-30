@@ -18,7 +18,7 @@ Every leaf uses a `BasicCredential` whose identity is exactly the leaf's 32-byte
 There is no delivery service. Group traffic is carried as `AppMessage::Group(GroupWire)` (Appendix C, kind 6) inside the authenticated 1:1 ratchets:
 
 ```
-GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (32) }
+GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (32), ? 5: reference }
   1 KeyPackageRequest  owner -> invitee           (name)
   2 KeyPackage         invitee -> owner           (MlsMessage(KeyPackage))
   3 Welcome            owner -> new member        (MlsMessage(Welcome), ratchet tree in extension)
@@ -109,5 +109,5 @@ The key is derived from the identity seed, so group secrets are only as accessib
 ## Not yet done
 
 - **Secure deletion.** Each save rewrites the whole state file atomically. Old epoch secrets are gone from the file system's view, but not necessarily from the storage medium (spec §16 secure deletion).
-- **More committers.** Admin roles beyond a single owner.
+- **More committers.** Admin roles beyond a single owner. The owner can already mark members as admins (`promote_in_group` and `demote_in_group` in the FFI), but the role is kept only on the owner's devices: it isn't sent to members, and members still accept commits only from the owner.
 - **Ciphersuite version.** openmls's X-Wing HPKE implements X-Wing draft-06, while the 1:1 protocol uses draft-11. Both are hybrid; they will converge once the MLS PQ ciphersuite draft settles.

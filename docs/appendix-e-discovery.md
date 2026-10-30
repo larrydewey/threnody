@@ -12,6 +12,8 @@ The discovery key is stored in each side's contact entry (Appendix C, contact ke
 
 The previous two keys are kept as well (contact key 11) and are accepted when recognising beacons. When both sides dial at once, two sessions complete and each side may keep a different one as "latest". Without the older keys, the two sides would then stop recognising each other. Revocation deletes all of them.
 
+Internet rendezvous (Appendix N) derives its DHT keys and hole-punching probes from `D` as well, so only mutually approved contacts find each other that way. Invite links and handles, which reach people who aren't contacts yet, use a meeting place of their own (Appendix S).
+
 ## Beacon
 
 ```

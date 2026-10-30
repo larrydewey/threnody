@@ -27,7 +27,7 @@ This is X-Wing exactly as specified in draft-connolly-cfrg-xwing-kem-11: a priva
 KDF(label, p0, p1, ...) = BLAKE3-derive_key(label, le64(|p0|) || p0 || le64(|p1|) || p1 || ...)
 ```
 
-Labels have the form `threnody v1 2026-10-03 <purpose>`. The full list is in `crypto/kdf.rs`.
+Labels have the form `threnody v1 <date> <purpose>`, where the date is when the label was introduced (`2026-10-03` for every label in this appendix). Most are listed in `crypto/kdf.rs`; a few live beside the protocol that uses them (`rendezvous.rs`, `handle.rs`, `invite.rs`).
 
 ## Messages
 
@@ -62,9 +62,13 @@ session_id = T
 (ss, ct)       = Encap(e_I)                       -- responder
 k_R || k_I     = KDF("handshake traffic keys", ss, h2)   (64 bytes)
 root           = KDF("session root", ss, session_id)
+exporter       = KDF("exporter secret", ss, session_id)
+export(ctx)    = KDF("exported key", exporter, ctx)
 ```
 
 Each handshake AEAD key encrypts exactly one message, so the nonce is fixed at zero.
+
+`export(ctx)` gives both ends the same session-bound secret for a context, in the spirit of the TLS exporter (RFC 8446 §7.5). It keys LAN discovery (Appendix E), rendezvous recovery slots (Appendix N) and WireGuard preshared keys (Appendix D).
 
 ### Payloads
 
