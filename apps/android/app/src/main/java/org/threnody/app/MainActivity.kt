@@ -1012,6 +1012,7 @@ class MainActivity : Activity() {
             else "Only your own contacts relay for you"
         }
         networkSection.add("Your handle").setOnMenuItemClickListener { node?.let { Handles.show(this@MainActivity, it) }; true }
+        networkSection.add("Reset invite links").setOnMenuItemClickListener { resetInvites(); true }
         networkSection.add("Always-on relay").setOnMenuItemClickListener { alwaysOnRelay(); true }
         networkSection.add("WireGuard tunnels").apply {
             isCheckable = true
@@ -1216,6 +1217,27 @@ class MainActivity : Activity() {
             link,
             "Device ${n.deviceFingerprint()}",
         )
+    }
+
+    /**
+     * New invite key (Appendix S): links made so far stop finding this
+     * device through the DHT, and keep only the addresses they carry.
+     */
+    private fun resetInvites() {
+        val n = node ?: return
+        SecureBuilder(this)
+            .setTitle("Reset invite links?")
+            .setMessage(
+                "Invite links you've shared stop finding this device across the internet. They still " +
+                    "work at the addresses they carry while this device is there, so someone on the same " +
+                    "network could still use one. Contacts you've already added aren't affected.",
+            )
+            .setPositiveButton("Reset") { _, _ ->
+                n.resetInvites()
+                Toast.makeText(this, "Invite links reset: make a new invite to share", Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /** The disappearing timer for chats that haven't chosen their own. */
