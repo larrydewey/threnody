@@ -5782,7 +5782,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "bluer",
@@ -5802,7 +5802,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-core"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5830,7 +5830,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-desktop"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "async-channel",
  "gstreamer",
@@ -5847,7 +5847,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-ffi"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "qrcode",
  "rqrr",
@@ -5864,7 +5864,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-groups"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "const-cbor",
  "openmls",
@@ -5879,7 +5879,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-media"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "futures-lite",
@@ -5895,7 +5895,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-net"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5922,7 +5922,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-tun"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "libc",
  "tokio",

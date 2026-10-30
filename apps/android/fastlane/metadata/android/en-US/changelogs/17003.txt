@@ -1,0 +1,1 @@
+- No Android changes: this release brings Reset invite links to the iOS app.
