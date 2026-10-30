@@ -1,0 +1,173 @@
+theory Threnody_Meeting
+begin
+
+/*
+ * Symbolic model of meeting places in the DHT: invite links and handles
+ * (docs/appendix-s-handles.md).
+ *
+ * - A meeting place has a base: h(<'invite', k>) for an invite key k, and
+ *   h(<'handle', name, code>) for a handle, whose name and code are public.
+ *   Records and knocks are encrypted under a key derived from the base. The
+ *   DHT is the network: anyone with the base can read and write there, and
+ *   anyone can drop or replay what is written.
+ * - The owner's record carries its long-term public key and its addresses.
+ *   A knock carries the finder's addresses.
+ * - The session handshake (Appendix A, proved in handshake.spthy) is
+ *   abstracted to a signed challenge: the finder accepts a peer only after
+ *   checking a signature by the key it expected. For an invite that key is
+ *   the link's fingerprint; for a handle it is a record's key whose code
+ *   matches the handle's. code/1 is an ideal one-way function, so brute
+ *   forcing Argon2 is not modelled.
+ * - An invite link reaches the finder out of band; it can also leak.
+ *   Epochs and knock slots only partition the DHT and are not modelled;
+ *   neither is unlinkability of records across epochs (an equivalence
+ *   property).
+ */
+
+builtins: hashing, signing, symmetric-encryption
+
+functions: code/1
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+// ----- Keys -----
+
+rule Ltk:
+  [ Fr(~ltk) ] --[ Device($A) ]-> [ !Ltk($A, ~ltk), !Pk($A, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Reveal_Ltk:
+  [ !Ltk(A, ltk) ] --[ LtkRevealed(A) ]-> [ Out(ltk) ]
+
+// The session handshake, abstracted: the device signs the challenge it is
+// dialed with, under its long-term key.
+rule Respond:
+  [ !Ltk(A, ltk), In(n) ]
+  --[ Respond(A, n) ]->
+  [ Out(sign(<'resp', n, pk(ltk)>, ltk)) ]
+
+// ----- Invites -----
+
+rule Make_Invite:
+  [ Fr(~k), !Pk(A, pkA) ] --[ InviteMade(A, ~k) ]-> [ !Invite(A, pkA, ~k) ]
+
+// A link shared out of band, or leaked.
+rule Share_Link:
+  [ !Invite(A, pkA, k) ] --[ Shared($F, A, k) ]-> [ !Link($F, A, pkA, k) ]
+
+rule Leak_Link:
+  [ !Invite(A, pkA, k) ] --[ LinkLeaked(k) ]-> [ Out(k) ]
+
+// The owner keeps its record (its key and addresses) at the meeting place.
+rule Invite_Publish:
+  let ek = h(<'enc', h(<'invite', k>)>)
+  in
+  [ !Invite(A, pkA, k), Fr(~addr) ]
+  --[ Published(A, k, ~addr) ]->
+  [ Out(senc(<'rec', pkA, ~addr>, ek)) ]
+
+// A finder reads a record, which must name the link's fingerprint, knocks
+// with its own addresses and dials with a fresh challenge.
+rule Invite_Find:
+  let ek = h(<'enc', h(<'invite', k>)>)
+  in
+  [ !Link(F, A, pkA, k), In(senc(<'rec', id, addr>, ek)), Fr(~faddr), Fr(~n) ]
+  --[ Eq(id, pkA), Knocked(F, k, ~faddr), Dialed(F, addr) ]->
+  [ Out(senc(<'knock', ~faddr>, ek)), Out(~n), InviteWait(F, A, pkA, ~n) ]
+
+// The owner reads a knock and punches toward it; nothing is sent back
+// except through the handshake.
+rule Invite_Answer:
+  let ek = h(<'enc', h(<'invite', k>)>)
+  in
+  [ !Invite(A, pkA, k), In(senc(<'knock', faddr>, ek)) ]
+  --[ Answered(A, faddr) ]->
+  [ ]
+
+rule Invite_Accept:
+  [ InviteWait(F, A, pkA, n), In(s) ]
+  --[ Eq(verify(s, <'resp', n, pkA>, pkA), true), InviteAccept(F, A, n) ]->
+  [ ]
+
+// ----- Handles -----
+
+// A handle is public: its name and code, from the owner's key.
+rule Make_Handle:
+  [ !Pk(A, pkA) ] --[ HandleMade(A, $name, code(pkA)) ]-> [ !Handle(A, $name, code(pkA)), Out(<$name, code(pkA)>) ]
+
+rule Handle_Publish:
+  let ek = h(<'enc', h(<'handle', name, c>)>)
+  in
+  [ !Handle(A, name, c), !Pk(A, pkA), Fr(~addr) ]
+  --[ HandlePublished(A, ~addr) ]->
+  [ Out(senc(<'rec', pkA, ~addr>, ek)) ]
+
+// A finder who typed the handle accepts a record only if its key matches
+// the code, then dials and expects that key.
+rule Handle_Find:
+  let ek = h(<'enc', h(<'handle', name, c>)>)
+  in
+  [ !Handle(A, name, c), In(senc(<'rec', id, addr>, ek)), Fr(~n) ]
+  --[ Eq(code(id), c), HandleDialed($F, addr) ]->
+  [ Out(~n), HandleWait($F, A, id, ~n) ]
+
+rule Handle_Accept:
+  [ HandleWait(F, A, id, n), In(s) ]
+  --[ Eq(verify(s, <'resp', n, id>, id), true), HandleAccept(F, A, n) ]->
+  [ ]
+
+// ----- Lemmas -----
+
+lemma invite_executable:
+  exists-trace
+  "Ex F A n #i. InviteAccept(F, A, n) @ #i
+     & not (Ex #r. LtkRevealed(A) @ #r)
+     & not (Ex k #r. LinkLeaked(k) @ #r)"
+
+lemma handle_executable:
+  exists-trace
+  "Ex F A n #i. HandleAccept(F, A, n) @ #i
+     & not (Ex #r. LtkRevealed(A) @ #r)"
+
+// A finder ends up talking to the device the link names, even when the
+// link has leaked and anyone can forge records at its meeting place:
+// a record only says where to dial.
+lemma invite_finder_authentication:
+  "All F A n #i. InviteAccept(F, A, n) @ #i ==>
+     (Ex #j. Respond(A, n) @ #j & #j < #i)
+     | (Ex #r. LtkRevealed(A) @ #r & #r < #i)"
+
+// The same for a handle, which is public by design.
+lemma handle_finder_authentication:
+  "All F A n #i. HandleAccept(F, A, n) @ #i ==>
+     (Ex #j. Respond(A, n) @ #j & #j < #i)
+     | (Ex #r. LtkRevealed(A) @ #r & #r < #i)"
+
+// The owner's addresses at an invite's meeting place are known only to
+// those holding the link, unless it leaked.
+lemma invite_record_secrecy:
+  "All A k addr #i #j. Published(A, k, addr) @ #i & K(addr) @ #j ==>
+     Ex #r. LinkLeaked(k) @ #r"
+
+// A finder's addresses in a knock likewise.
+lemma knock_secrecy:
+  "All F k faddr #i #j. Knocked(F, k, faddr) @ #i & K(faddr) @ #j ==>
+     Ex #r. LinkLeaked(k) @ #r"
+
+// Sanity: a leaked link exposes the owner's addresses and lets an attacker
+// send a finder to its own address (which then fails authentication).
+lemma sanity_leaked_link_exposes_record:
+  exists-trace
+  "Ex A k addr #i #j. Published(A, k, addr) @ #i & K(addr) @ #j"
+
+lemma sanity_leaked_link_forges_record:
+  exists-trace
+  "Ex F addr #i. Dialed(F, addr) @ #i
+     & not (Ex A k #j. Published(A, k, addr) @ #j)"
+
+// Sanity: a leaked long-term key does let an attacker answer as the owner.
+lemma sanity_ltk_leak_impersonates:
+  exists-trace
+  "Ex F A n #i. InviteAccept(F, A, n) @ #i & not (Ex #j. Respond(A, n) @ #j)"
+
+end
