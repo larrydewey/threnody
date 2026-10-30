@@ -75,7 +75,7 @@ A finder tries, in order: an onion circuit through approved contacts or voluntee
 - **Versions.** Both sides need 0.17.1 or later: older versions can't read a link with several addresses or a key, and never publish under one.
 - **Limits.** The meeting place ends in a hole punch (Appendix N, section 4), which often fails behind symmetric NAT, as many VPNs are, especially when both people use one. Relays need a contact the two already share, so a brand-new contact with both sides behind VPNs may not connect.
 - **Cost.** One more record to keep, and knock slots to read at the handle rates. Last hour's slots are read only in the first five minutes of an hour, when a knock there can still be fresh; this halves the reads for handles too.
-- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. The Android app offers it under Network & Connectivity → Reset invite links, and the Linux app under Preferences → Invite links; the iOS app does not yet. Links without `?r=` and links with one address still parse.
+- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. The Android app offers it under Network & Connectivity → Reset invite links, the Linux app under Preferences → Invite links, and the iOS app under Add contact → Your invite. Links without `?r=` and links with one address still parse.
 
 ## Changing or removing a handle
 

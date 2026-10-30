@@ -23,7 +23,7 @@ CI (`.github/workflows/ci.yml`, job `ios`) runs the same steps and builds for th
 - **Identity.** Created on first launch and sealed with a random passphrase (Argon2id, as on Android). The passphrase is encrypted to a P-256 key in the Secure Enclave, or kept as a Keychain item where there is no Secure Enclave (the simulator). Both are `AfterFirstUnlockThisDeviceOnly`: bound to this device and out of backups, and the node's directory is excluded from backups too. A restored backup on another phone can't open the identity, by design.
 - **Chats.** The chat list (with previews, unread counts and who is connected), 1:1 text chat, drafts, and received files and photos (saved privately; tap to share).
 - **Receipts and typing.** ✓ sent, ✓✓ delivered, 👁️ read. Read receipts go out for messages shown on screen; typing indicators both ways.
-- **Contacts.** Add by pasting an invite link or scanning its QR code (AVFoundation); show your own invite as a QR code (Core Image) or share the link. Accept or block message requests.
+- **Contacts.** Add by pasting an invite link or scanning its QR code (AVFoundation); show your own invite as a QR code (Core Image) or share the link, and reset invite links so ones shared so far stop finding this device across the internet. Accept or block message requests.
 - **Trust.** Approve and revoke, compare safety numbers device by device and mark them verified, with the same banners as Android (approval, unverified, new unverified device). Per-chat disappearing timers.
 - **Network changes.** `NWPathMonitor` tells the node when the path moves between Wi-Fi and cellular, and it redials approved contacts.
 - **Notifications.** Local notifications for messages that arrive while the app runs, except for the chat on screen.
