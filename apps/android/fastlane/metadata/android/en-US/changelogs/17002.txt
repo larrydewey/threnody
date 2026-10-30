@@ -1,0 +1,2 @@
+- Reset invite links: ⋮ → Network & Connectivity → Reset invite links makes links you've shared stop finding this phone across the internet.
+- Documentation brought up to date with the app.
