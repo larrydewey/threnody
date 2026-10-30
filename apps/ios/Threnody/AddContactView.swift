@@ -13,6 +13,7 @@ struct AddContactView: View {
     @State private var scanning = false
     @State private var busy = false
     @State private var failure: String?
+    @State private var confirmReset = false
 
     var body: some View {
         NavigationStack {
@@ -45,6 +46,7 @@ struct AddContactView: View {
                             .frame(maxWidth: .infinity)
                         Text(invite).font(.caption.monospaced()).textSelection(.enabled)
                         ShareLink("Share invite", item: invite)
+                        Button("Reset invite links", role: .destructive) { confirmReset = true }
                     } else {
                         Text("No network: connect to Wi-Fi to make an invite.")
                     }
@@ -70,6 +72,15 @@ struct AddContactView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(failure ?? "")
+            }
+            .confirmationDialog("Reset invite links?", isPresented: $confirmReset, titleVisibility: .visible) {
+                Button("Reset", role: .destructive) {
+                    // A new key (Appendix S): old links stop finding this device in the DHT.
+                    store.node?.resetInvites()
+                    invite = store.invite()
+                }
+            } message: {
+                Text("Invite links you've shared stop finding this device across the internet. They still work at the addresses they carry while this device is there, so someone on the same network could still use one. Contacts you've already added aren't affected.")
             }
             .onAppear { invite = store.invite() }
         }
