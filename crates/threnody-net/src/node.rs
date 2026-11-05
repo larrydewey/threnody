@@ -1282,7 +1282,10 @@ impl Node {
             }
             self.shared.save_contacts(&contacts);
         }
-        if !approved {
+        if approved {
+            // A stranger until now may not have our account yet.
+            self.send_chain(&[*peer]);
+        } else {
             self.shared.tunnel_down(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });

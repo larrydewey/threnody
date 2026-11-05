@@ -290,8 +290,15 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     let (bob, mut brx) = node(&dir, "bob");
     let b = bob.identity();
     let (cut_a, _) = lossy_link(&alice, &bob).await;
-    let conv = alice.conversation_for(&b);
-    let last = |a: &Node| a.history(conv).unwrap().entries().last().cloned().unwrap();
+    // Looked up each time: it moves to Bob's account once his chain arrives.
+    let last = |a: &Node| {
+        a.history(a.conversation_for(&b))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
 
     alice.send_text(&b, "tick").unwrap();
     let e = next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;

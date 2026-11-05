@@ -40,7 +40,7 @@ The account fingerprint is computed like a device fingerprint (Appendix A), as `
 
 ### Updates and forks
 
-- **Exchange.** Peers send their chain as `AppMessage::Account` (kind 11) at the start of every session, and again whenever it changes.
+- **Exchange.** Peers send their chain as `AppMessage::Account` (kind 11) at the start of every session, and again whenever it changes, but only to their own devices and to peers they accepted (or approved). The chain names every device of the account, often after its owner, so a stranger gets it only once accepted, when it is sent at once. Older peers send it to everyone; nothing depends on receiving it sooner.
 - **Accepting a chain.** A receiver accepts a chain only if it is valid, its id matches what the receiver has stored for that account (pinned at first sight), and the session's device is in its current set.
 - **Updates.** A newer chain must *extend* the stored one. A different chain at or below the stored height is a **fork**: the receiver rejects it and warns, because forking requires a compromised device.
 - **Removal.** When a chain removes a device, every peer drops its sessions with that device, revokes its approvals, deletes its discovery key and prekeys, and refuses it from then on. Nothing more is sealed to it, and no group message goes to it by any path. Owners of groups it is in remove it from them (Appendix F, *Removal*), so later epochs are unreadable to it. Nothing more is sealed to it, and group messages are no longer delivered to it by any path. The owner of each group it is in removes it, as for any member (Appendix F), so later epochs are unreadable to it; the device that removed it does the same in groups it owns.
@@ -65,9 +65,9 @@ existing device E                                  new device N
 - **Authenticating each side.** The code pins `fp(E)`, which authenticates E to N. The proof binds `s` to *this* session and *this* device, which authenticates N to E. An attacker without the code can't be added, and can't replay a proof into another session.
 - **Signing.** E sends the current chain and a proposed `Add(N)` link that E has already signed (`LinkOffer`). N checks that the proposal is exactly the next link adding N on top of that chain, then countersigns it (`LinkConsent`).
 - **Refusal.** A wrong or expired code gets an explicit `LinkRefused`, so N fails at once instead of waiting.
-- **Aftermath.** E then broadcasts the new chain to every session.
+- **Aftermath.** E then broadcasts the new chain to every session with a peer that may see it (see *Exchange*).
 
-Apps name a device on creation: the CLI uses the host name, and the Android app uses the phone's model (it renames a device still called "device"). `/device rename <device> <name>` and the app's *Devices* screen rename any device of the account.
+Apps name a device on creation: the CLI uses the host name, and the Android app uses the phone's model (it renames a device still called "device"). Only our own devices and accepted contacts see these names. `/device rename <device> <name>` and the app's *Devices* screen rename any device of the account.
 
 ## Own devices
 

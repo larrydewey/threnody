@@ -634,3 +634,29 @@ async fn deleting_and_editing_reach_a_sibling_that_was_away() {
     wait_for(|| texts(&phone2, &bid) == want(&["edited"])).await;
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+#[tokio::test]
+async fn strangers_learn_our_devices_only_once_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut stranger = spawn(&dir, "stranger").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = laptop.node.identity();
+
+    // A stranger dials us: our chain, with our devices' names, isn't sent.
+    let sid = stranger.node.identity();
+    stranger.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::Connected { .. })).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        stranger.node.account_of(&lid).is_none(),
+        "a stranger saw our account"
+    );
+
+    // Once we accept them, they learn it (on the session they have).
+    laptop.node.accept_contact(&sid);
+    wait_for(|| stranger.node.account_of(&lid).is_some()).await;
+    let _ = &mut stranger.rx;
+}

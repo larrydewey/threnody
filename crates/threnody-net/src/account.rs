@@ -218,10 +218,20 @@ impl Node {
             || lock(&self.shared.accounts).is_revoked(device)
     }
 
+    /// Whether `peer` may see our account chain: the devices of our
+    /// account and their names (a host name or phone model, often the
+    /// owner's name). Our own devices and contacts we accepted may; a
+    /// stranger only once accepted.
+    pub(crate) fn shows_account_to(&self, peer: &PublicIdentity) -> bool {
+        self.is_accepted(peer)
+    }
+
     /// Messages to send when a session with `peer` starts.
     pub(crate) fn account_hello(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
         let mut out = Vec::new();
-        if let Ok(b) = self.account().encode() {
+        if self.shows_account_to(peer)
+            && let Ok(b) = self.account().encode()
+        {
             out.extend(AccountMsg::Chain(b).encode().ok().map(AppMessage::Account));
         }
         if self.is_own_device(peer) {
@@ -287,14 +297,21 @@ impl Node {
     }
 
     fn broadcast_chain(&self) {
+        let peers: Vec<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        self.send_chain(&peers);
+    }
+
+    /// Sends our account chain to those of `peers` with a session that may
+    /// see it.
+    pub(crate) fn send_chain(&self, peers: &[PublicIdentity]) {
         let Ok(b) = self.account().encode() else {
             return;
         };
         let Ok(m) = AccountMsg::Chain(b).encode() else {
             return;
         };
-        for s in self.sessions() {
-            let _ = self.send(&s.peer, AppMessage::Account(m.clone()));
+        for p in peers.iter().filter(|p| self.shows_account_to(p)) {
+            let _ = self.send(p, AppMessage::Account(m.clone()));
         }
     }
 

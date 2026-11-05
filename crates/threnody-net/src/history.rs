@@ -671,7 +671,9 @@ impl Node {
     pub fn accept_contact(&self, peer: &PublicIdentity) {
         // Accepting in advance (before they've connected) works too.
         self.update_contacts(|c| c.observe(*peer, None, now_ms()));
-        self.mark_contacts(peer, |c| c.accepted = true);
+        let devices = self.mark_contacts(peer, |c| c.accepted = true);
+        // Now they may see our account (withheld from strangers).
+        self.send_chain(&devices);
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
