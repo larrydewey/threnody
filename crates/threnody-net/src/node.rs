@@ -963,16 +963,8 @@ impl Node {
     ) -> Result<PublicIdentity> {
         tune_tcp(&stream);
         let peer_addr = stream.peer_addr()?;
-        let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;
+        let chan = handshake::initiate(&mut stream, &self.shared.identity, expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         self.spawn_session(
             stream,
             chan,
@@ -996,16 +988,8 @@ impl Node {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;
+        let chan = handshake::initiate(&mut stream, &self.shared.identity, expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         self.spawn_session(
             stream,
             chan,

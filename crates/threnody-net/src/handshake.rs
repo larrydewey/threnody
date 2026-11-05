@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use threnody_core::handshake::{Initiator, Responder};
-use threnody_core::{Identity, SecureChannel};
+use threnody_core::{Fingerprint, Identity, SecureChannel};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{NetError, Result};
@@ -15,8 +15,14 @@ async fn next<S: AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>> {
     read_frame(s).await?.ok_or(NetError::Closed)
 }
 
-/// Runs the initiator side to completion.
-pub async fn initiate<S>(s: &mut S, identity: &Identity) -> Result<SecureChannel>
+/// Runs the initiator side to completion. With `expect`, the responder must
+/// present that fingerprint; anyone else is refused before HS3, so they
+/// never learn who was dialing.
+pub async fn initiate<S>(
+    s: &mut S,
+    identity: &Identity,
+    expect: Option<Fingerprint>,
+) -> Result<SecureChannel>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -24,7 +30,17 @@ where
         let (ini, hs1) = Initiator::start(identity)?;
         write_frame(s, &hs1).await?;
         let hs2 = next(s).await?;
-        let (hs3, est) = ini.finish(&hs2)?;
+        let auth = ini.authenticate(&hs2)?;
+        let got = auth.peer().fingerprint();
+        if let Some(want) = expect
+            && got != want
+        {
+            return Err(NetError::IdentityMismatch {
+                expected: want.to_string(),
+                got: got.to_string(),
+            });
+        }
+        let (hs3, est) = auth.finish()?;
         write_frame(s, &hs3).await?;
         Ok(SecureChannel::from(est))
     })

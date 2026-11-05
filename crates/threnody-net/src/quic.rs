@@ -418,16 +418,8 @@ impl Node {
         let addr = canonical(conn.remote_address());
         let (send, recv) = conn.open_bi().await.map_err(quic_error)?;
         let mut stream = tokio::io::join(recv, send);
-        let chan = handshake::initiate(&mut stream, self.identity_ref()).await?;
+        let chan = handshake::initiate(&mut stream, self.identity_ref(), expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         let route = if standby {
             Route::QuicStandby(conn)
         } else {

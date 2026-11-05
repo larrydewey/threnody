@@ -78,16 +78,8 @@ impl Node {
         } else {
             Identity::from_seed(&self.identity_ref().seed())
         };
-        let chan = handshake::initiate(&mut stream, &me).await?;
+        let chan = handshake::initiate(&mut stream, &me, expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         self.spawn_anon(stream, chan, remote, true);
         Ok(peer)
     }

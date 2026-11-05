@@ -149,6 +149,29 @@ async fn pinned_fingerprint_mismatch_is_refused() {
 }
 
 #[tokio::test]
+async fn pinned_mismatch_never_reveals_the_dialer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (impostor, mut irx) = node(&dir, "impostor", AcceptPolicy::Anyone, None);
+    let addr = impostor.listen("127.0.0.1:0").await.unwrap();
+    let wanted = Identity::generate().public().fingerprint();
+    let r = alice.connect(&addr.to_string(), Some(wanted)).await;
+    assert!(matches!(r, Err(NetError::IdentityMismatch { .. })));
+    // Alice gave up before sending her identity, so whoever answered never
+    // learns who was dialing.
+    let connected = timeout(Duration::from_secs(1), async {
+        while let Some(e) = irx.recv().await {
+            if matches!(e, Event::Connected { .. }) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(connected.is_err(), "the impostor saw a session");
+    assert!(impostor.contacts().get(&alice.identity()).is_none());
+}
+
+#[tokio::test]
 async fn approved_only_policy_rejects_strangers() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
