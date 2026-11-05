@@ -1175,6 +1175,7 @@ impl Node {
     /// drops what we kept for it.
     pub(crate) fn forget_peer(&self, peer: &PublicIdentity) {
         self.shared.delivery(|d| d.forget_peer(peer));
+        self.forget_push(peer);
     }
 
     /// The QUIC connection under the session with `peer`, if it has one.
@@ -1281,6 +1282,8 @@ impl Node {
         }
         if !approved {
             self.shared.tunnel_down(peer);
+            // No longer mutual: its wake-up endpoint goes (Appendix R).
+            self.forget_push(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });
         self.push_contact_sync();
