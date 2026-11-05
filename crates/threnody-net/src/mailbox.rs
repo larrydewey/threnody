@@ -491,7 +491,12 @@ impl Node {
         if let Ok((from, body)) = opened
             && let Ok(msg) = AppMessage::decode(&body)
         {
-            // Changes to a conversation are sealed too (see `send_change`).
+            // Changes to a conversation are sealed too (see `send_change`),
+            // and also held for our next session: a copy that came that way
+            // first is dropped, so it can't undo a newer change.
+            if self.shared.delivery(|d| d.seen_change(&from, &msg)) {
+                return;
+            }
             match &msg {
                 AppMessage::Delete { conversation, ids } => {
                     return self.on_delete(&from, conversation, ids);

@@ -428,7 +428,8 @@ impl Node {
     /// sent again if lost. For a device that isn't connected it waits for
     /// its next session, and is also sealed for its mailboxes when we can,
     /// so it arrives even if we don't meet first; taking a change twice
-    /// does nothing more. A device that told us it can't read such changes
+    /// does nothing more, and a mailbox copy of one already taken is
+    /// dropped (see `Delivery::seen_change`). A device that told us it can't read such changes
     /// is skipped; one we haven't heard from since starting gets it held,
     /// dropped then if it can't (see `needs`).
     pub(crate) fn send_change(&self, d: &PublicIdentity, msg: &AppMessage) {

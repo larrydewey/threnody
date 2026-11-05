@@ -1738,6 +1738,9 @@ where
                         m => Some(m),
                     };
                     let Some(msg) = msg else { continue };
+                    // Remembered so a mailbox copy of it opened later is
+                    // dropped (see `Delivery::seen_change`).
+                    shared.delivery(|d| d.seen_change(&peer, &msg));
                     match msg {
                         AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),

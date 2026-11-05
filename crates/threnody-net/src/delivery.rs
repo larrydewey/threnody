@@ -260,6 +260,31 @@ impl Delivery {
         self.unacked.get(peer).map_or(0, VecDeque::len)
     }
 
+    /// Notes that change `m` (a deletion, edit, reaction or pin) came from
+    /// `peer`, and returns true if this exact change came before. A change
+    /// for a device that is away is both held for its next session and
+    /// sealed for its mailboxes, and carries no version, so a mailbox copy
+    /// opened after the held one (and after newer changes) must be dropped
+    /// rather than undo them. The change's digest is kept with the
+    /// delivered ids. Anything else is never "seen".
+    pub fn seen_change(&mut self, peer: &PublicIdentity, m: &AppMessage) -> bool {
+        if !matches!(
+            m,
+            AppMessage::Delete { .. }
+                | AppMessage::Edit { .. }
+                | AppMessage::React { .. }
+                | AppMessage::Pin { .. }
+        ) {
+            return false;
+        }
+        let Ok(b) = m.encode() else {
+            return false;
+        };
+        let h = blake3::hash(&b);
+        let digest = u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap_or_default());
+        !self.first_delivery(peer, digest)
+    }
+
     /// True the first time `id` arrives from `peer`.
     pub fn first_delivery(&mut self, peer: &PublicIdentity, id: u64) -> bool {
         let r = self.delivered.entry(*peer).or_default();
@@ -326,6 +351,22 @@ mod tests {
             d.first_delivery(&p, 100 + i);
         }
         assert!(d.first_delivery(&p, 9), "old ids are forgotten");
+    }
+
+    #[test]
+    fn changes_are_seen_once_per_peer() {
+        let (p, q) = (Identity::generate().public(), Identity::generate().public());
+        let mut d = Delivery::default();
+        let pin = |pin| AppMessage::Pin {
+            conversation: vec![1; 16],
+            id: 7,
+            pin,
+        };
+        assert!(!d.seen_change(&p, &pin(true)));
+        assert!(d.seen_change(&p, &pin(true)), "the same change again");
+        assert!(!d.seen_change(&p, &pin(false)), "a different change");
+        assert!(!d.seen_change(&q, &pin(true)), "from another peer");
+        assert!(!d.seen_change(&p, &text("a")) && !d.seen_change(&p, &text("a")));
     }
 
     #[test]
