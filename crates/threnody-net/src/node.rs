@@ -716,6 +716,7 @@ impl Node {
         node.load_credentials();
         node.start_directory_upkeep();
         node.load_push();
+        node.resume_placements();
         Ok((node, rx))
     }
 
@@ -1875,11 +1876,13 @@ where
                             }
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
-                            node.record_incoming(&peer, &msg, false);
-                            if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
-                                shared.emit(Event::Message { peer, msg });
-                            } else {
-                                shared.emit(Event::MessageRequest { peer, msg });
+                            // A text already here (through a mailbox too) doesn't show again.
+                            if node.record_incoming(&peer, &msg, false) {
+                                if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
+                                    shared.emit(Event::Message { peer, msg });
+                                } else {
+                                    shared.emit(Event::MessageRequest { peer, msg });
+                                }
                             }
                         }
                     }

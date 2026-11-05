@@ -1277,7 +1277,15 @@ impl Node {
     }
 
     /// Records an incoming text, adopting the sender's timer setting.
-    pub(crate) fn record_incoming(&self, from: &PublicIdentity, msg: &AppMessage, offline: bool) {
+    /// False for a copy of a text already recorded, which shouldn't show
+    /// again: one may come both from its sender and from a mailbox, when
+    /// the sender stopped waiting for the mailbox's receipt.
+    pub(crate) fn record_incoming(
+        &self,
+        from: &PublicIdentity,
+        msg: &AppMessage,
+        offline: bool,
+    ) -> bool {
         let AppMessage::Text {
             body,
             expires_in_s,
@@ -1287,10 +1295,20 @@ impl Node {
             ..
         } = msg
         else {
-            return;
+            return true;
         };
         let conv = self.conversation_for(from);
+        // Held until it is recorded, so two copies can't both pass.
         let lock = threnody_core::history::history_lock();
+        if *id != 0
+            && self.history(conv).is_ok_and(|h| {
+                h.entries()
+                    .iter()
+                    .any(|e| !e.outgoing && e.device == *from.as_bytes() && e.remote_id == *id)
+            })
+        {
+            return false;
+        }
         if self.effective_timer(conv) != *expires_in_s
             && let Ok(mut h) = self.history(conv)
         {
@@ -1301,7 +1319,6 @@ impl Node {
                 secs: *expires_in_s,
             });
         }
-        drop(lock);
         self.record_with_id(
             conv,
             *from.as_bytes(),
@@ -1316,6 +1333,8 @@ impl Node {
                 ..Extras::default()
             },
         );
+        drop(lock);
+        true
     }
 
     /// Starts the background sweep of expired history (and of what is

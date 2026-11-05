@@ -9,7 +9,7 @@
 //! A deposit may carry a `ref`, which its receipt repeats.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
@@ -311,15 +311,23 @@ impl MailboxStore {
 
 /// Our sealed messages waiting to hear whether any mailbox took them: one
 /// that every mailbox declines (or none answers for) waits for a session
-/// with its recipient instead, as if it had never been sealed.
+/// with its recipient instead, as if it had never been sealed. Saved, so
+/// one still waiting at a restart does so too.
 #[derive(Default)]
 pub(crate) struct Placements {
-    next: u64,
     open: HashMap<u64, Placement>,
     /// Direct deposits waiting for a receipt, per mailbox and recipient,
     /// oldest first (a mailbox that doesn't repeat `ref` answers in order).
-    waiting: HashMap<(PublicIdentity, [u8; 32]), VecDeque<u64>>,
+    /// Every direct deposit is here, placed or not, so that order holds.
+    waiting: HashMap<(PublicIdentity, [u8; 32]), VecDeque<Sent>>,
+    /// `open` changed since last saved.
+    dirty: bool,
+    /// Overrides [`RECEIPT_WAIT`].
+    receipt_wait: Option<Duration>,
 }
+
+/// A direct deposit's `ref`, and when it went.
+type Sent = (u64, Instant);
 
 struct Placement {
     dest: PublicIdentity,
@@ -330,11 +338,17 @@ struct Placement {
     declined: usize,
 }
 
+/// A fresh `ref`: random, so a mailbox learns nothing from the gaps
+/// between ours.
+fn fresh_ref() -> u64 {
+    u64::from_le_bytes(threnody_core::crypto::random_bytes())
+}
+
 impl Placements {
     fn open(&mut self, dest: PublicIdentity, msg: AppMessage, tag: Tag, asked: usize) -> u64 {
-        self.next += 1;
+        let r = fresh_ref();
         self.open.insert(
-            self.next,
+            r,
             Placement {
                 dest,
                 msg,
@@ -343,29 +357,42 @@ impl Placements {
                 declined: 0,
             },
         );
-        self.next
+        self.dirty = true;
+        r
     }
 
     /// Takes `r` out entirely.
     fn close(&mut self, r: u64) -> Option<Placement> {
         self.waiting.retain(|_, q| {
-            q.retain(|x| *x != r);
+            q.retain(|(x, _)| *x != r);
             !q.is_empty()
         });
-        self.open.remove(&r)
+        let p = self.open.remove(&r);
+        self.dirty |= p.is_some();
+        p
+    }
+
+    /// A deposit with `ref` `r` went to `mailbox` for `to`. Unplaced ones
+    /// unanswered for [`RECEIPT_WAIT`] are forgotten; placed ones are
+    /// declined then ([`Node::await_receipt`]).
+    fn wait(&mut self, mailbox: PublicIdentity, to: [u8; 32], r: u64, now: Instant) {
+        let open = &self.open;
+        let q = self.waiting.entry((mailbox, to)).or_default();
+        q.retain(|(x, at)| open.contains_key(x) || now.duration_since(*at) < RECEIPT_WAIT);
+        q.push_back((r, now));
     }
 
     /// `mailbox` answered for `to`: which deposit that was.
     fn receipt(&mut self, mailbox: PublicIdentity, to: [u8; 32], r: Option<u64>) -> Option<u64> {
         let q = self.waiting.get_mut(&(mailbox, to))?;
         let r = match r {
-            Some(r) => q.remove(q.iter().position(|x| *x == r)?),
+            Some(r) => q.remove(q.iter().position(|(x, _)| *x == r)?),
             None => q.pop_front(),
         };
         if q.is_empty() {
             self.waiting.remove(&(mailbox, to));
         }
-        r
+        r.map(|(r, _)| r)
     }
 
     /// One more mailbox answered `status` for `r`. Returns the message to
@@ -396,6 +423,78 @@ impl Placements {
             n if p.declined >= n => self.close(r),
             _ => None,
         }
+    }
+
+    /// `{ 0: version, 1: [* [ref, dest (32), tag, AppMessage]] }`, tag as
+    /// [`Tag::encode`] writes it.
+    fn encode(&self) -> threnody_core::Result<Vec<u8>> {
+        let msgs = self
+            .open
+            .iter()
+            .map(|(r, p)| Ok((*r, p, p.msg.encode()?)))
+            .collect::<threnody_core::Result<Vec<_>>>()?;
+        let size = msgs.iter().map(|(_, _, m)| m.len() + 128).sum::<usize>() + 16;
+        cbor::to_vec(size, |e| {
+            e.map_len(2)?;
+            e.u8(0)?.u64(STATE_VERSION)?;
+            e.u8(1)?.array_len(msgs.len())?;
+            for (r, p, m) in &msgs {
+                let mut tag = Vec::with_capacity(Tag::LEN);
+                p.tag.encode(&mut tag);
+                e.array_len(4)?
+                    .u64(*r)?
+                    .bytes(p.dest.as_bytes())?
+                    .bytes(&tag)?
+                    .bytes(m)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// What [`Placements::encode`] saved: (ref, dest, message, tag).
+    fn decode(b: &[u8]) -> threnody_core::Result<Vec<(u64, PublicIdentity, AppMessage, Tag)>> {
+        let mut dec = Decoder::new(b);
+        let (mut ver, mut out) = (None, Vec::new());
+        read_map(&mut dec, |k, d| {
+            match k {
+                0 => ver = Some(d.u64()?),
+                1 => {
+                    for _ in 0..d.array_len()? {
+                        if d.array_len()? != 4 {
+                            return Err(threnody_core::Error::Malformed("placement"));
+                        }
+                        let r = d.u64()?;
+                        let dest = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?)?;
+                        let tag = d.bytes()?;
+                        if tag.len() != Tag::LEN {
+                            return Err(threnody_core::Error::Malformed("placement tag"));
+                        }
+                        let tag = Tag::decode(tag);
+                        out.push((r, dest, AppMessage::decode(d.bytes()?)?, tag));
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        if ver != Some(STATE_VERSION) {
+            return Err(threnody_core::Error::Malformed("placements version"));
+        }
+        Ok(out)
+    }
+}
+
+/// The `ref` of `m`, if it is a deposit for `to`.
+fn deposit_ref(m: &AppMessage, to: &[u8; 32]) -> Option<u64> {
+    let AppMessage::Mailbox(b) = m else {
+        return None;
+    };
+    match MailboxMsg::decode(b) {
+        Ok(MailboxMsg::Deposit {
+            to: t, reference, ..
+        }) if t == *to => reference,
+        _ => None,
     }
 }
 
@@ -467,7 +566,9 @@ impl Node {
         };
         let placement = match keep {
             Some(tag) if asked > 0 => {
-                Some(lock(&self.shared.placements).open(*dest, msg.clone(), tag, asked))
+                let r = lock(&self.shared.placements).open(*dest, msg.clone(), tag, asked);
+                self.save_placements();
+                Some(r)
             }
             _ => None,
         };
@@ -508,6 +609,7 @@ impl Node {
             } else if let Some(r) = placement {
                 let p = lock(&self.shared.placements).unask(r);
                 self.keep_for_session(p);
+                self.save_placements();
             }
         }
         if n == 0 {
@@ -520,52 +622,75 @@ impl Node {
     }
 
     /// Deposits `sealed` for `dest` with `mailbox` directly. With a
-    /// placement `r`, waits for the receipt (at most [`RECEIPT_WAIT`]).
+    /// placement `r`, waits for the receipt (see [`Node::await_receipt`]).
     fn deposit_direct(
         &self,
         mailbox: &PublicIdentity,
         dest: &PublicIdentity,
         sealed: &[u8],
-        r: Option<u64>,
+        placement: Option<u64>,
     ) -> bool {
         let key = (*mailbox, *dest.as_bytes());
-        if let Some(r) = r {
-            lock(&self.shared.placements)
-                .waiting
-                .entry(key)
-                .or_default()
-                .push_back(r);
-        }
+        // Every direct deposit carries a `ref`, so that no receipt can be
+        // taken for another deposit's.
+        let r = placement.unwrap_or_else(fresh_ref);
+        lock(&self.shared.placements).wait(key.0, key.1, r, Instant::now());
         let sent = self.mailbox_send(
             mailbox,
             &MailboxMsg::Deposit {
-                to: *dest.as_bytes(),
+                to: key.1,
                 sealed: sealed.to_vec(),
-                reference: r,
+                reference: Some(r),
             },
         );
-        let Some(r) = r else { return sent };
         if !sent {
             lock(&self.shared.placements).receipt(key.0, key.1, Some(r));
             return false;
         }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let node = self.clone();
-            handle.spawn(async move {
-                tokio::time::sleep(RECEIPT_WAIT).await;
-                // Still unanswered: as good as declined.
-                let late = lock(&node.shared.placements).receipt(key.0, key.1, Some(r));
-                if late.is_some() {
-                    node.placement_answer(r, DepositStatus::Declined);
-                }
-            });
+        if placement.is_some() {
+            self.await_receipt(*mailbox, *dest, r);
         }
         true
     }
 
+    /// Counts placement `r`'s deposit with `mailbox` declined if its
+    /// receipt doesn't come within [`RECEIPT_WAIT`], and withdraws it, so
+    /// that the mailbox doesn't get it later as well, when the message may
+    /// already have gone to `dest` another way.
+    fn await_receipt(&self, mailbox: PublicIdentity, dest: PublicIdentity, r: u64) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let wait = lock(&self.shared.placements)
+            .receipt_wait
+            .unwrap_or(RECEIPT_WAIT);
+        let node = self.clone();
+        handle.spawn(async move {
+            // Shut down first: the placement stays saved for the next start.
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = node.closed() => return,
+            }
+            let to = *dest.as_bytes();
+            let late = lock(&node.shared.placements).receipt(mailbox, to, Some(r));
+            if late.is_none() || node.is_closed() {
+                return;
+            }
+            node.shared.delivery(|d| {
+                d.drop_where(|p, m| *p == mailbox && deposit_ref(m, &to) == Some(r));
+            });
+            node.placement_answer(r, DepositStatus::Declined);
+        });
+    }
+
     fn placement_answer(&self, r: u64, status: DepositStatus) {
+        // After a shutdown, it stays saved for the next start.
+        if self.is_closed() {
+            return;
+        }
         let p = lock(&self.shared.placements).answer(r, status);
         self.keep_for_session(p);
+        self.save_placements();
     }
 
     /// No mailbox took it: send it now if a session came up meanwhile,
@@ -575,6 +700,51 @@ impl Node {
         if self.send_tagged(&p.dest, p.msg.clone(), p.tag).is_err() {
             self.hold(&p.dest, p.msg, p.tag);
         }
+    }
+
+    /// Saves the open placements if they changed. After the message is
+    /// kept elsewhere, so a crash in between can't lose it.
+    fn save_placements(&self) {
+        let mut ps = lock(&self.shared.placements);
+        if std::mem::take(&mut ps.dirty) {
+            self.shared.save_state("placements", ps.encode());
+        }
+    }
+
+    /// Placements a restart left open: nothing waits for their receipts
+    /// any more, so each message waits for a session with its recipient,
+    /// and its deposits still queued for mailboxes are withdrawn. (One a
+    /// mailbox already took then reaches the recipient twice; it keeps
+    /// the first.)
+    pub(crate) fn resume_placements(&self) {
+        let Ok(Some(b)) = self
+            .shared
+            .home
+            .load_state(self.identity_ref(), "placements")
+        else {
+            return;
+        };
+        let placed = Placements::decode(&b).unwrap_or_default();
+        if !placed.is_empty() {
+            self.shared.delivery(|d| {
+                d.drop_where(|_, m| {
+                    placed
+                        .iter()
+                        .any(|(r, dest, ..)| deposit_ref(m, dest.as_bytes()) == Some(*r))
+                });
+            });
+        }
+        for (_, dest, msg, tag) in placed {
+            self.hold(&dest, msg, tag);
+        }
+        let ps = lock(&self.shared.placements);
+        self.shared.save_state("placements", ps.encode());
+    }
+
+    /// How long a direct deposit from [`Node::send_offline_or_hold`] waits
+    /// for its receipt ([`RECEIPT_WAIT`] unless set).
+    pub fn set_receipt_wait(&self, wait: Duration) {
+        lock(&self.shared.placements).receipt_wait = Some(wait);
     }
 
     /// Disappearing texts still waiting for their recipient once their
@@ -854,7 +1024,9 @@ impl Node {
                 self.on_edit(&from, conversation, *id, body);
                 return;
             }
-            self.record_incoming(&from, &msg, true);
+            if !self.record_incoming(&from, &msg, true) {
+                return;
+            }
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {
                 self.emit(Event::OfflineMessage { from, via, msg });
             } else {
@@ -994,11 +1166,12 @@ mod tests {
         let id = |i| threnody_core::Identity::from_seed(&[i; 32]).public();
         let (m1, m2, dest) = (id(1), id(2), id(3));
         let to = *dest.as_bytes();
+        let now = Instant::now();
         let mut p = Placements::default();
         let open = |p: &mut Placements, asked| {
             let r = p.open(dest, AppMessage::Cover, Tag::NONE, asked);
             for m in [m1, m2] {
-                p.waiting.entry((m, to)).or_default().push_back(r);
+                p.wait(m, to, r, now);
             }
             r
         };
@@ -1021,6 +1194,79 @@ mod tests {
         let r = open(&mut p, 1);
         assert!(p.unask(r).is_none());
         assert!(p.open.is_empty() && p.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_receipt_answers_only_its_own_deposit() {
+        let id = |i| threnody_core::Identity::from_seed(&[i; 32]).public();
+        let (m, dest) = (id(1), id(3));
+        let to = *dest.as_bytes();
+        let now = Instant::now();
+        let mut p = Placements::default();
+        // An edit (not placed) goes first, then a text (placed).
+        let (edit, text) = (fresh_ref(), p.open(dest, AppMessage::Cover, Tag::NONE, 1));
+        p.wait(m, to, edit, now);
+        p.wait(m, to, text, now);
+        // The edit's receipt says nothing about the text.
+        assert_eq!(p.receipt(m, to, Some(edit)), Some(edit));
+        assert!(p.answer(edit, DepositStatus::Declined).is_none());
+        assert!(p.open.contains_key(&text));
+        assert_eq!(p.receipt(m, to, Some(text)), Some(text));
+        assert!(p.answer(text, DepositStatus::Declined).is_some());
+
+        // A mailbox that doesn't repeat refs answers in order.
+        let text = p.open(dest, AppMessage::Cover, Tag::NONE, 1);
+        p.wait(m, to, edit, now);
+        p.wait(m, to, text, now);
+        assert_eq!(p.receipt(m, to, None), Some(edit));
+        assert_eq!(p.receipt(m, to, None), Some(text));
+
+        // Unplaced deposits never answered are forgotten in time; placed
+        // ones wait for their own timer.
+        let text = p.open(dest, AppMessage::Cover, Tag::NONE, 1);
+        p.wait(m, to, edit, now);
+        p.wait(m, to, text, now);
+        p.wait(m, to, fresh_ref(), now + RECEIPT_WAIT);
+        let left: Vec<u64> = p.waiting[&(m, to)].iter().map(|(r, _)| *r).collect();
+        assert_eq!(left[0], text);
+        assert_eq!(left.len(), 2);
+    }
+
+    #[test]
+    fn refs_say_nothing_about_other_placements() {
+        let dest = threnody_core::Identity::from_seed(&[3; 32]).public();
+        let mut p = Placements::default();
+        let refs: Vec<u64> = (0..4)
+            .map(|_| p.open(dest, AppMessage::Cover, Tag::NONE, 1))
+            .collect();
+        assert!(refs.windows(2).all(|w| w[1] != w[0].wrapping_add(1)));
+        assert!(refs.iter().all(|r| *r > 4));
+    }
+
+    #[test]
+    fn placements_are_saved() {
+        let dest = threnody_core::Identity::from_seed(&[3; 32]).public();
+        let mut p = Placements::default();
+        let tag = Tag {
+            local_id: 9,
+            group: Some([1; 16]),
+            relay_for: None,
+        };
+        let msg = AppMessage::Text {
+            sent_ms: 5,
+            body: "kept".into(),
+            expires_in_s: None,
+            id: 7,
+            quote: None,
+            forwarded: false,
+        };
+        let r = p.open(dest, msg.clone(), tag, 2);
+        assert!(p.dirty);
+        let saved = Placements::decode(&p.encode().unwrap()).unwrap();
+        assert_eq!(saved, vec![(r, dest, msg, tag)]);
+        p.close(r);
+        assert!(Placements::decode(&p.encode().unwrap()).unwrap().is_empty());
+        assert!(Placements::decode(&[0xa0]).is_err());
     }
 
     #[tokio::test]
@@ -1108,6 +1354,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got, (aid, secret));
+    }
+
+    #[tokio::test]
+    async fn a_receipt_timer_does_nothing_after_shutdown() {
+        use crate::{AcceptPolicy, NodeConfig};
+        use threnody_core::store::Home;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("a"));
+        let identity = home.create_identity(None).unwrap();
+        let (a, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let id = |i| threnody_core::Identity::from_seed(&[i; 32]).public();
+        let (m, dest) = (id(1), id(3));
+        a.set_receipt_wait(Duration::from_millis(50));
+        let place = || {
+            let mut p = lock(&a.shared.placements);
+            let r = p.open(dest, AppMessage::Cover, Tag::NONE, 1);
+            p.wait(m, *dest.as_bytes(), r, Instant::now());
+            r
+        };
+        // Running, an unanswered deposit counts as declined in time.
+        let r = place();
+        a.await_receipt(m, dest, r);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!lock(&a.shared.placements).open.contains_key(&r));
+        assert_eq!(a.shared.delivery(|d| d.unacked(&dest)), 1);
+
+        // Shut down first: the old node leaves it for the next start.
+        let r = place();
+        a.await_receipt(m, dest, r);
+        a.shutdown();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(lock(&a.shared.placements).open.contains_key(&r));
+        assert_eq!(a.shared.delivery(|d| d.unacked(&dest)), 1);
     }
 
     #[test]
