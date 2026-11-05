@@ -496,6 +496,11 @@ impl Node {
             return;
         };
         let Some(hop) = st.hops.get_mut(&up) else {
+            // The circuit went while the next hop was being made: that hop
+            // goes too, or it would sit there taking up a circuit slot.
+            drop(st);
+            self.onion_send(&from, &OnionMsg::Destroy { circ });
+            lock(&self.shared.onion).anon.remove(&(from, circ));
             return;
         };
         hop.next = Some((from, circ));
@@ -611,10 +616,14 @@ impl Node {
         let Ok(req) = ExtendReq::decode(data) else {
             return fail(self);
         };
-        let (allowed, from_contact) = lock(&self.shared.onion)
-            .hops
-            .get(&up)
-            .map_or((false, false), |h| (h.full && h.next.is_none(), h.contact));
+        let (allowed, from_contact) = {
+            let st = lock(&self.shared.onion);
+            // One extension at a time: a second would orphan the first.
+            let extending = st.extending.values().any(|u| *u == up);
+            st.hops.get(&up).map_or((false, false), |h| {
+                (h.full && h.next.is_none() && !extending, h.contact)
+            })
+        };
         if !allowed {
             return fail(self);
         }
@@ -652,6 +661,9 @@ impl Node {
             };
             {
                 let mut st = lock(&node.shared.onion);
+                if !st.hops.contains_key(&up) {
+                    return;
+                }
                 st.anon.insert((next, c));
                 st.extending.insert((next, c), up);
             }
@@ -801,6 +813,17 @@ impl Node {
                 if let Some(next) = hop.next {
                     st.down.remove(&next);
                     notify.push(next);
+                }
+                // A next hop still being made goes too.
+                let making: Vec<Link> = st
+                    .extending
+                    .iter()
+                    .filter(|(_, up)| **up == link)
+                    .map(|(down, _)| *down)
+                    .collect();
+                for down in making {
+                    st.extending.remove(&down);
+                    notify.push(down);
                 }
             } else if let Some(up) = st.down.remove(&link) {
                 if let Some(hop) = st.hops.remove(&up) {
@@ -1400,6 +1423,46 @@ mod tests {
         let up = fake_hop(&v, friend, 2, true, false);
         v.onion_extend(up, &extend_to(xfp));
         assert_eq!(lock(&v.shared.onion).extending.len(), 1);
+    }
+
+    async fn eventually(what: &str, f: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    #[tokio::test]
+    async fn no_hop_is_left_behind_downstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v, mut vrx, _) = listening(&dir, "v").await;
+        let (x, mut xrx, xaddr) = listening(&dir, "x").await;
+        mutual(&v, &mut vrx, &x, &mut xrx, &xaddr).await;
+        let xfp = x.identity().fingerprint();
+        let friend = threnody_core::Identity::generate().public();
+        // EXTEND, then DESTROY before X's CREATED is back.
+        let up = fake_hop(&v, friend, 1, true, false);
+        v.onion_extend(up, &extend_to(xfp));
+        v.onion_destroy(up, true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eventually("X drops the hop", || x.onion_hops() == 0).await;
+        // One EXTEND at a time: a second one would orphan the first.
+        let up = fake_hop(&v, friend, 2, true, false);
+        v.onion_extend(up, &extend_to(xfp));
+        v.onion_extend(up, &extend_to(xfp));
+        assert_eq!(lock(&v.shared.onion).extending.len(), 1);
+        eventually("the circuit reaches X", || {
+            lock(&v.shared.onion)
+                .hops
+                .get(&up)
+                .is_some_and(|h| h.next.is_some())
+        })
+        .await;
+        v.onion_destroy(up, true);
+        eventually("X drops it with the circuit", || x.onion_hops() == 0).await;
     }
 
     fn create(circ: u64, e_pub: Vec<u8>) -> Vec<u8> {
