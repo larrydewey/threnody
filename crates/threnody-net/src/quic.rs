@@ -29,7 +29,7 @@ use threnody_core::{Fingerprint, PublicIdentity};
 use tokio::sync::mpsc;
 
 use crate::error::{NetError, Result};
-use crate::gate::Source;
+use crate::gate::{Gate, Pass, Source};
 use crate::handshake;
 use crate::node::{Event, Node, Route, lock};
 
@@ -48,6 +48,25 @@ pub(crate) const MAX_HANDSHAKING_PER_SOURCE: usize = 16;
 /// packets at its address (a Retry round trip, which costs us nothing to
 /// send): a spoofed source can't pin memory with one packet.
 const RETRY_ABOVE: usize = 16;
+
+/// What becomes of a new inbound connection.
+enum Admit {
+    /// Ask it to show it gets packets at its address first.
+    Retry,
+    Refuse,
+    Enter(Pass),
+}
+
+/// Whether a new connection from `source` gets a place. One whose address
+/// isn't shown yet (`validated`) takes a place only as its source's first,
+/// and only while few are in progress: anyone can claim an address, and
+/// Initials claiming someone else's mustn't use up that one's places.
+fn admit(gate: &Gate, source: Source, validated: bool) -> Admit {
+    if !validated && (gate.len() >= RETRY_ABOVE || gate.held(source) > 0) {
+        return Admit::Retry;
+    }
+    gate.enter(source).map_or(Admit::Refuse, Admit::Enter)
+}
 
 /// A datagram that isn't QUIC: a probe or a DHT reply.
 pub(crate) type Foreign = (SocketAddr, Vec<u8>);
@@ -350,17 +369,19 @@ impl Node {
                     () = &mut closed => break,
                 };
                 let Some(incoming) = incoming else { break };
-                let gate = &node.shared.quic_inbound;
-                if gate.len() >= RETRY_ABOVE
-                    && !incoming.remote_address_validated()
-                    && incoming.may_retry()
-                {
-                    let _ = incoming.retry();
-                    continue;
-                }
-                let Some(pass) = gate.enter(Source::ip(incoming.remote_address().ip())) else {
-                    incoming.refuse();
-                    continue;
+                let source = Source::ip(incoming.remote_address().ip());
+                // One that already answered a Retry is never asked again.
+                let validated = incoming.remote_address_validated() || !incoming.may_retry();
+                let pass = match admit(&node.shared.quic_inbound, source, validated) {
+                    Admit::Retry => {
+                        let _ = incoming.retry();
+                        continue;
+                    }
+                    Admit::Refuse => {
+                        incoming.refuse();
+                        continue;
+                    }
+                    Admit::Enter(pass) => pass,
                 };
                 let node = node.clone();
                 tokio::spawn(async move {
@@ -538,6 +559,37 @@ mod tests {
         .expect("places given back");
         assert!(dial().await.is_ok());
         node.shutdown();
+    }
+
+    /// Initials that claim someone's address, but never answer what is
+    /// sent there, hold at most one of its places: that one still gets in.
+    #[test]
+    fn spoofed_initials_do_not_use_up_a_sources_places() {
+        let gate = Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE);
+        let victim = Source::ip("192.0.2.7".parse().unwrap());
+        let mut held = Vec::new();
+        for _ in 0..MAX_HANDSHAKING_PER_SOURCE {
+            match admit(&gate, victim, false) {
+                Admit::Enter(pass) => held.push(pass),
+                Admit::Retry => {}
+                Admit::Refuse => panic!("refused below the limit"),
+            }
+        }
+        assert_eq!(held.len(), 1, "the rest were asked to retry");
+        // The real owner answers the Retry and comes back validated.
+        for _ in 1..MAX_HANDSHAKING_PER_SOURCE {
+            match admit(&gate, victim, true) {
+                Admit::Enter(pass) => held.push(pass),
+                _ => panic!("the source's own connections get in"),
+            }
+        }
+        assert!(matches!(admit(&gate, victim, true), Admit::Refuse));
+        // Other sources: unvalidated ones take a first place while few are
+        // in progress, then must retry too.
+        let other = Source::ip("198.51.100.1".parse().unwrap());
+        assert!(matches!(admit(&gate, other, false), Admit::Retry));
+        let gate = Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE);
+        assert!(matches!(admit(&gate, other, false), Admit::Enter(_)));
     }
 
     /// A flood of datagrams shaped like DHT replies fills the queue to its

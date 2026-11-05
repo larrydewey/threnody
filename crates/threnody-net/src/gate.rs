@@ -80,6 +80,11 @@ impl Gate {
     pub(crate) fn len(&self) -> usize {
         lock(&self.counts).all
     }
+
+    /// Places taken by `source`.
+    pub(crate) fn held(&self, source: Source) -> usize {
+        lock(&self.counts).by.get(&source).copied().unwrap_or(0)
+    }
 }
 
 impl Drop for Pass {
@@ -109,8 +114,10 @@ mod tests {
         assert!(gate.enter(a).is_none(), "per source");
         let _b1 = gate.enter(b).unwrap();
         assert!(gate.enter(Source::Link).is_none(), "in all");
+        assert_eq!(gate.held(a), 2);
         drop(a1);
         assert_eq!(gate.len(), 2);
+        assert_eq!(gate.held(a), 1);
         assert!(gate.enter(a).is_some());
     }
 
