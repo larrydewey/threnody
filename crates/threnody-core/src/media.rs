@@ -42,6 +42,22 @@ pub fn kind(data: &[u8]) -> Option<Kind> {
     }
 }
 
+/// Whether `data` is a photo in a format that carries metadata (location,
+/// camera details) which [`strip`] can't remove: HEIC/HEIF and AVIF, and
+/// TIFF, which camera raw files such as DNG are built on. Apps re-encode
+/// such photos as JPEG before sending; the node won't send them as they
+/// are while stripping is on. Recognised by their first bytes, whatever
+/// the file is called.
+pub fn needs_converting(data: &[u8]) -> bool {
+    /// HEIF and AVIF brands; videos in the same container have others.
+    const BRANDS: [&[u8; 4]; 10] = [
+        b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1", b"avif", b"avis",
+    ];
+    let heif =
+        data.len() >= 12 && &data[4..8] == b"ftyp" && BRANDS.iter().any(|b| &data[8..12] == *b);
+    heif || data.starts_with(b"II*\0") || data.starts_with(b"MM\0*")
+}
+
 /// Removes metadata from `data` if it is an image we understand. A
 /// damaged image of a supported kind is an error rather than being sent
 /// with its metadata.
@@ -477,5 +493,28 @@ mod tests {
         }
         assert!(strip(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec()).is_err());
         assert!(strip(b"RIFF\xff\xff\xff\x7fWEBP".to_vec()).is_err());
+    }
+
+    #[test]
+    fn photo_formats_with_metadata_we_cant_strip_are_recognised() {
+        for photo in [
+            &b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"[..],
+            b"\0\0\0\x1cftypmif1\0\0\0\0mif1heic",
+            b"\0\0\0\x20ftypavif\0\0\0\0avifmif1",
+            b"II*\0\x08\0\0\0",
+            b"MM\0*\0\0\0\x08",
+        ] {
+            assert!(needs_converting(photo), "{photo:?}");
+        }
+        // Videos share the container, and the node strips these itself.
+        for other in [
+            &b"\0\0\0\x18ftypisom\0\0\0\0isommp42"[..],
+            b"\0\0\0\x14ftypqt  \0\0\0\0qt  ",
+            b"\xff\xd8\xff\xe0",
+            b"hello",
+            b"",
+        ] {
+            assert!(!needs_converting(other), "{other:?}");
+        }
     }
 }

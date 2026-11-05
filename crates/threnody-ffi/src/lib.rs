@@ -315,6 +315,15 @@ pub fn album_id() -> u64 {
     threnody_net::history::album_id()
 }
 
+/// Whether a file is a photo whose location and camera details the node
+/// can't remove (HEIC, AVIF, TIFF and camera raw), going by its first bytes
+/// (32 are enough) rather than its name. The app sends such a photo as
+/// JPEG; the node refuses it as it is while metadata removal is on.
+#[uniffi::export]
+pub fn needs_converting(head: Vec<u8>) -> bool {
+    threnody_core::media::needs_converting(&head)
+}
+
 /// A QR code as a square of modules, row by row (`true` = dark).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct QrMatrix {

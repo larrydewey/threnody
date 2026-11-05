@@ -7,6 +7,7 @@ import android.net.Uri
 import android.util.LruCache
 import java.io.ByteArrayOutputStream
 import java.io.File
+import uniffi.threnody_ffi.needsConverting
 
 /**
  * Pictures: which files are images, where received ones are kept, and
@@ -32,12 +33,15 @@ object Media {
 
     /**
      * Makes a picked file ready to send: an image the node can't strip
-     * metadata from (HEIC, AVIF, …) is re-encoded as JPEG, which carries
-     * none. Returns the name and bytes to send.
+     * metadata from (HEIC, AVIF, DNG, …) is re-encoded as JPEG, which
+     * carries none. Its content decides as well as its name, so a HEIC
+     * called "file" or "photo.jpg" is converted too. Returns the name and
+     * bytes to send.
      */
     fun prepare(ctx: Context, name: String, data: ByteArray): Pair<String, ByteArray> {
         val ext = name.substringAfterLast('.', "").lowercase()
-        if (!isImage(name) || ext in STRIPPABLE || ext == "gif") return name to data
+        val byName = isImage(name) && ext !in STRIPPABLE && ext != "gif"
+        if (!byName && !needsConverting(data.copyOf(minOf(data.size, 32)))) return name to data
         val bitmap = decode(ImageDecoder.createSource(java.nio.ByteBuffer.wrap(data)), 4096)
             ?: throw IllegalArgumentException("couldn't read $name")
         val out = ByteArrayOutputStream()
