@@ -140,13 +140,13 @@ A pair without a session sends its packets to a participant R that it reaches an
   - *The audio device across calls.* WebRTC terminates its media engine when the last peer connection closes, and initialises it again for the next one. LiveKit's audio-device proxy terminates the Android audio device then, but never re-initialises it, so the second call crashed. An idle peer connection, held for the life of the process, keeps the engine up (`rtc::factory`).
   - *Ringing.* An incoming call posts a `CallStyle` notification with a full-screen intent, insistent, on a channel that plays the phone's ringtone as a ringtone. Silent mode and Do Not Disturb therefore apply, and Answer and Decline work from the lock screen.
   - *Audio routing.* While a call runs, the app uses `MODE_IN_COMMUNICATION`. Audio goes to the speaker if chosen, else to a connected headset (LE Audio, Bluetooth SCO or a hearing aid), else to the speaker for video or to the earpiece (or a wired headset). The app watches audio devices during the call: when a headset drops, audio moves to the earpiece (the speaker for video) at once, and back when it reconnects. On Android 10 and 11 it starts Bluetooth SCO itself.
+  - *Telecom.* Each call is also a self-managed `ConnectionService` call, so car audio and headset buttons answer and hang up, the audio follows Bluetooth hands-free, and a phone call that comes in puts ours on hold (our microphone goes quiet). Telecom then sets the audio mode and routes the audio, and the app's speaker switch goes through it. The system learns nothing about who the call is with: the address is a fixed `threnody:call`, the name shown is "Threnody call", and self-managed calls stay out of the system call log. Where Telecom refuses a call, it rings and routes as before.
   - *Size.* The APK grows by about 20 MB (WebRTC).
 - **macOS, iOS, Windows.** These need their apps, which reach calls through the FFI (`start_call`, `answer_call`, `hangup_call`, `set_call_muted`, `current_call` and the `Call*` events).
 
 ## Not yet
 
 - Video: screen sharing, hardware-texture rendering (frames are copied as RGBA), and a frame size limited to the path's QUIC datagrams before path MTU discovery.
-- Android: Telecom integration (`ConnectionService`: car audio, other calls, headset buttons).
 - Group calls: mixing or forwarding one upload for everyone (an SFU with frame encryption), which needs RTP forwarding below WebRTC; and calls bigger than eight. Group calls on iOS, which has no calls yet.
 - Media over onion circuits.
 - A Tamarin model of the call key derivation.

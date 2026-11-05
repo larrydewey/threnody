@@ -26,7 +26,9 @@ import uniffi.threnody_ffi.ThrenodyNode
  * Calls (Appendix Q). The node runs the call and its audio (WebRTC on the
  * microphone and earpiece or speaker); this keeps track of the one call,
  * routes its audio, rings for incoming ones and opens [CallActivity], which
- * runs the camera ([CallCamera]) and shows the video. A group call (up to
+ * runs the camera ([CallCamera]) and shows the video. The system knows of
+ * each call through [Telecom] (car audio, headset buttons, phone calls
+ * putting ours on hold), where it allows that. A group call (up to
  * eight people in a group) is a call too, with [Call.group] set: it rings
  * as an invitation to join, and its screen shows everyone's video.
  */
@@ -130,6 +132,7 @@ object Calls {
         current = Call(node, persona, REACHING, device, title, outgoing = true, state = "reaching", video = video,
             speaker = video && headset(a) == null)
         inCall(a, true)
+        Telecom.outgoing(a, video)
         changed()
         a.startActivity(Intent(a, CallActivity::class.java))
         Threading.background {
@@ -138,6 +141,7 @@ object Calls {
                 if (attempt == mine && current?.id == REACHING) {
                     current = null
                     ended = "Couldn't reach $title"
+                    Telecom.ended(android.telecom.DisconnectCause.ERROR)
                     inCall(a, false)
                     ongoing(a)
                     changed()
@@ -175,6 +179,7 @@ object Calls {
         current = Call(node, persona, id, group, title, outgoing = true, state = "calling", video = video,
             speaker = video && headset(a) == null, group = group)
         inCall(a, true)
+        Telecom.outgoing(a, video)
         changed()
         a.startActivity(Intent(a, CallActivity::class.java))
     }
@@ -199,23 +204,73 @@ object Calls {
 
     /** Answers the incoming call, with our camera on if `video`. */
     fun answer(a: Activity, video: Boolean = false) {
-        val c = current?.takeIf { it.state == "incoming" } ?: return
+        current?.takeIf { it.state == "incoming" } ?: return
         val need = missing(a, video)
         if (need.isNotEmpty()) {
             pendingCall = { answer(a, video) }
             return a.requestPermissions(need.toTypedArray(), MICROPHONE)
         }
-        cancelRinging(a)
+        answerNow(a, video)
+    }
+
+    /**
+     * Answered from a headset, a car or a watch (through [Telecom]): with
+     * the microphone already allowed, at once, without the camera if it
+     * isn't; else the call screen opens to ask.
+     */
+    fun answerFromSystem(ctx: Context, video: Boolean) {
+        current?.takeIf { it.state == "incoming" } ?: return
+        if (missing(ctx, false).isNotEmpty()) {
+            ctx.startActivity(Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return
+        }
+        answerNow(ctx, video && missing(ctx, true).isEmpty())
+    }
+
+    private fun answerNow(ctx: Context, video: Boolean) {
+        val c = current?.takeIf { it.state == "incoming" } ?: return
+        cancelRinging(ctx)
         Threading.background {
             try {
                 if (c.group != null) c.node.joinGroupCall(c.id, video) else c.node.answerCall(c.id, video)
-                current = c.copy(state = "connecting", video = video, speaker = video && headset(a) == null)
-                inCall(a, true)
+                current = c.copy(state = "connecting", video = video, speaker = video && headset(ctx) == null)
+                inCall(ctx, true)
+                Telecom.answered()
             } catch (e: Exception) {
                 Threnody.say("! answer: ${e.message}")
             }
             changed()
         }
+    }
+
+    /** The system rang an incoming call through [Telecom]: our ringing shows it. */
+    fun showRinging(ctx: Context) = ring(ctx)
+
+    /** A phone call took over (or gave the call back): ours goes quiet meanwhile. */
+    @Volatile private var held = false
+
+    fun hold(on: Boolean) {
+        val c = current ?: return
+        held = on
+        Threading.background { c.node.setCallMuted(on || c.muted) }
+    }
+
+    /** Telecom changed the route or mute (a car, a headset button): show it. */
+    fun systemRoute(speaker: Boolean, muted: Boolean) {
+        val c = current ?: return
+        if (c.speaker == speaker && c.muted == muted) return
+        current = c.copy(speaker = speaker, muted = muted)
+        if (muted != c.muted) Threading.background { c.node.setCallMuted(muted || held) }
+        changed()
+    }
+
+    /** Telecom holds the call now: it routes the audio, not us. */
+    fun handOverAudio(ctx: Context) {
+        val am = ctx.getSystemService(AudioManager::class.java) ?: return
+        deviceWatch?.let { am.unregisterAudioDeviceCallback(it) }
+        deviceWatch = null
+        unroute(am)
+        route(ctx)
     }
 
     /** Hangs up, declines or cancels the current call. */
@@ -225,6 +280,7 @@ object Calls {
             // No call in the node yet: `start` hangs it up if it gets one.
             current = null
             ended = "Call ended"
+            Telecom.ended(android.telecom.DisconnectCause.LOCAL)
             inCall(ctx, false)
             ongoing(ctx)
             return changed()
@@ -236,7 +292,7 @@ object Calls {
     fun setMuted(muted: Boolean) {
         val c = current ?: return
         current = c.copy(muted = muted)
-        Threading.background { c.node.setCallMuted(muted) }
+        Threading.background { c.node.setCallMuted(muted || held) }
         changed()
     }
 
@@ -248,6 +304,7 @@ object Calls {
             return a.requestPermissions(missing(a, true).toTypedArray(), MICROPHONE)
         }
         current = c.copy(video = on)
+        Telecom.video(on)
         Threading.background {
             try {
                 if (c.group != null) c.node.setGroupCallVideo(on) else c.node.setCallVideo(on)
@@ -293,7 +350,8 @@ object Calls {
                 ended = null
                 current = Call(node, persona, e.call, e.peer, Threnody.nameOf(node, e.peer), outgoing = false,
                     state = "incoming", peerVideo = e.video)
-                ring(ctx)
+                // Telecom asks us to ring (onShowIncomingCallUi) when it takes the call.
+                if (!Telecom.incoming(ctx, e.video)) ring(ctx)
             }
             is NodeEvent.GroupCallRinging -> {
                 if (current != null) return
@@ -301,7 +359,7 @@ object Calls {
                 val name = try { node.groups().firstOrNull { it.id == e.group }?.name } catch (_: Exception) { null }
                 current = Call(node, persona, e.call, e.group, name ?: "Group", outgoing = false,
                     state = "incoming", group = e.group, members = mapOf(e.from to false))
-                ring(ctx)
+                if (!Telecom.incoming(ctx, false)) ring(ctx)
             }
             is NodeEvent.GroupCallMember -> update(e.call) {
                 // Whether a newcomer sends video is the node's to say.
@@ -312,6 +370,7 @@ object Calls {
                     else it.members - e.device
                 // Someone joined the call we started: it's under way.
                 val state = if (e.joined && it.state == "calling") "connecting" else it.state
+                if (state != it.state) Telecom.answered()
                 it.copy(members = members, state = state)
             }
             is NodeEvent.GroupCallVideo -> update(e.call) { it.copy(members = it.members + (e.device to e.video)) }
@@ -319,13 +378,18 @@ object Calls {
                 val c = current?.takeIf { it.id == e.call } ?: return
                 current = null
                 cancelRinging(ctx)
+                Telecom.ended(if (c.state == "incoming") android.telecom.DisconnectCause.MISSED
+                    else android.telecom.DisconnectCause.LOCAL)
                 ongoing(ctx)
                 inCall(ctx, false)
                 ended = if (c.state == "incoming") "Missed group call" else "Call ended"
                 if (c.state == "incoming") missed(ctx, c)
             }
             is NodeEvent.CallRinging -> update(e.call) { it.copy(state = "ringing") }
-            is NodeEvent.CallStarted -> update(e.call) { it.copy(state = "connecting", peerVideo = e.peerVideo) }
+            is NodeEvent.CallStarted -> update(e.call) {
+                Telecom.answered()
+                it.copy(state = "connecting", peerVideo = e.peerVideo)
+            }
             is NodeEvent.CallVideo -> update(e.call) { it.copy(peerVideo = e.video) }
             is NodeEvent.CallReaction -> if (current?.id == e.call) reactionListeners.forEach { it(e.emoji) }
             is NodeEvent.CallMedia -> update(e.call) {
@@ -339,6 +403,16 @@ object Calls {
                 val c = current?.takeIf { it.id == e.call } ?: return
                 current = null
                 cancelRinging(ctx)
+                Telecom.ended(when {
+                    e.reason == "busy" -> android.telecom.DisconnectCause.BUSY
+                    e.reason == "declined" && !e.byUs -> android.telecom.DisconnectCause.REMOTE
+                    e.reason == "declined" -> android.telecom.DisconnectCause.REJECTED
+                    e.reason == "failed" -> android.telecom.DisconnectCause.ERROR
+                    e.reason.endsWith("elsewhere") -> android.telecom.DisconnectCause.ANSWERED_ELSEWHERE
+                    c.since == 0L && !c.outgoing && !e.byUs -> android.telecom.DisconnectCause.MISSED
+                    e.byUs -> android.telecom.DisconnectCause.LOCAL
+                    else -> android.telecom.DisconnectCause.REMOTE
+                })
                 ongoing(ctx)
                 inCall(ctx, false)
                 ended = when {
@@ -407,8 +481,11 @@ object Calls {
             Threnody.say("! call service: ${e.javaClass.simpleName}")
         }
         val am = ctx.getSystemService(AudioManager::class.java) ?: return
-        am.mode = if (on) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL
-        if (on) {
+        // While Telecom holds the call, it sets the audio mode and routes.
+        if (!Telecom.active()) am.mode = if (on) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL
+        if (on && Telecom.active()) {
+            route(ctx)
+        } else if (on) {
             route(ctx)
             if (deviceWatch == null) {
                 val app = ctx.applicationContext
@@ -454,6 +531,10 @@ object Calls {
      */
     private fun route(ctx: Context) {
         val c = current ?: return
+        if (Telecom.active()) {
+            Telecom.speaker(c.speaker || (c.video && headset(ctx) == null))
+            return
+        }
         val am = ctx.getSystemService(AudioManager::class.java) ?: return
         val headset = if (c.speaker) null else headset(ctx)
         val speaker = c.speaker || (headset == null && c.video)
