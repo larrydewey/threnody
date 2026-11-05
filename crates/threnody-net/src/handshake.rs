@@ -7,12 +7,15 @@ use threnody_core::{Fingerprint, Identity, SecureChannel};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{NetError, Result};
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{MAX_HANDSHAKE_FRAME, read_frame_max, write_frame};
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-async fn next<S: AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>> {
-    read_frame(s).await?.ok_or(NetError::Closed)
+/// Reads one handshake frame.
+pub(crate) async fn next<S: AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>> {
+    read_frame_max(s, MAX_HANDSHAKE_FRAME)
+        .await?
+        .ok_or(NetError::Closed)
 }
 
 /// Runs the initiator side to completion. With `expect`, the responder must
@@ -73,4 +76,24 @@ where
     })
     .await
     .map_err(|_| NetError::Timeout)?
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_handshake_frames_are_refused_unread() {
+        let me = Identity::generate();
+        let (mut ours, mut theirs) = tokio::io::duplex(1 << 16);
+        // A stranger announces a 16 MiB first frame and then stalls.
+        theirs
+            .write_all(&(crate::frame::MAX_FRAME as u32).to_be_bytes())
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(1), accept(&mut ours, &me)).await;
+        assert!(matches!(r, Ok(Err(NetError::FrameTooLarge))));
+    }
 }

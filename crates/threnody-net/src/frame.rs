@@ -8,6 +8,10 @@ use crate::error::{NetError, Result};
 
 /// Largest accepted frame: one maximal core message plus envelope headroom.
 pub const MAX_FRAME: usize = threnody_core::cbor::MAX_ENCODED + 4096;
+/// Largest frame accepted before the peer is authenticated. Handshake
+/// messages are under 3 KB, and nobody should get a stranger to hold
+/// megabytes.
+pub const MAX_HANDSHAKE_FRAME: usize = 16 * 1024;
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &[u8]) -> Result<()> {
     let len = u32::try_from(frame.len()).map_err(|_| NetError::FrameTooLarge)?;
@@ -22,6 +26,14 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &[u8]) -> Resu
 
 /// Reads one frame; `Ok(None)` on clean end of stream.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
+    read_frame_max(r, MAX_FRAME).await
+}
+
+/// [`read_frame`] refusing anything longer than `max` before reading it.
+pub async fn read_frame_max<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -29,7 +41,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
+    if len > max {
         return Err(NetError::FrameTooLarge);
     }
     let mut buf = vec![0u8; len];

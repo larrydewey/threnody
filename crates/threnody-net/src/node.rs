@@ -907,10 +907,11 @@ impl Node {
 
     async fn run_inbound(&self, mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
         tune_tcp(&stream);
-        let first = tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, read_frame(&mut stream))
-            .await
-            .map_err(|_| NetError::Timeout)??
-            .ok_or(NetError::Closed)?;
+        // Either the anonymous-link marker or HS1, both small.
+        let first =
+            tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::next(&mut stream))
+                .await
+                .map_err(|_| NetError::Timeout)??;
         // An anonymous link (Appendix P) announces itself before the handshake.
         if first == crate::anon::MAGIC {
             return self.accept_anon(stream, addr).await;

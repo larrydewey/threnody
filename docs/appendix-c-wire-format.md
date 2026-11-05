@@ -158,7 +158,7 @@ Before encryption, an `AppMessage` is padded ISO/IEC 7816-4 style: a `0x80` byte
 
 ## Stream framing (transport)
 
-On stream transports, each frame is prefixed with its length as a `u32` in big-endian byte order. The maximum is 16 MiB plus 4 KiB.
+On stream transports, each frame is prefixed with its length as a `u32` in big-endian byte order. The maximum is 16 MiB plus 4 KiB. Until the handshake has authenticated the peer, the maximum is 16 KiB: handshake messages and the anonymous-link marker are far smaller, and a receiver refuses a longer length prefix without reading the frame.
 
 ## Local storage
 
