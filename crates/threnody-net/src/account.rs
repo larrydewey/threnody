@@ -308,12 +308,18 @@ impl Node {
         self.shared.save_state("accounts", book);
     }
 
-    pub(crate) fn on_account(&self, from: PublicIdentity, payload: &[u8]) {
+    /// Handles an account message from `from`. False for a chain that
+    /// waits until `from` is accepted (see [`Node::chain_wanted`]): the
+    /// session offers it again then.
+    pub(crate) fn on_account(&self, from: PublicIdentity, payload: &[u8]) -> bool {
         let Ok(msg) = AccountMsg::decode(payload) else {
-            return;
+            return true;
         };
         match msg {
             AccountMsg::Chain(b) => {
+                if !self.chain_wanted(&from, &b) {
+                    return false;
+                }
                 if let Ok(chain) = AccountChain::decode(&b) {
                     self.on_chain(from, chain);
                 }
@@ -388,6 +394,24 @@ impl Node {
                 }
             }
         }
+        true
+    }
+
+    /// Whether to take `from`'s chain `b` now. Anyone can present a chain,
+    /// and a stored one stays (with every device in it a contact), so only
+    /// chains from devices the user accepted, or about our own account or
+    /// one we already know (a contact's new device), are checked and kept.
+    /// A stranger's waits until the user accepts it; until then it costs
+    /// neither checking nor storage.
+    fn chain_wanted(&self, from: &PublicIdentity, b: &[u8]) -> bool {
+        if self.is_accepted(from) {
+            return true;
+        }
+        // Malformed: decoding will fail at once anyway.
+        let Ok(id) = AccountChain::claimed_id(b) else {
+            return true;
+        };
+        id == lock(&self.shared.account).id() || lock(&self.shared.accounts).get(&id).is_some()
     }
 
     fn on_chain(&self, from: PublicIdentity, chain: AccountChain) {
@@ -823,5 +847,70 @@ impl Node {
     /// Known peer accounts.
     pub fn known_accounts(&self) -> AccountBook {
         lock(&self.shared.accounts).clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{AcceptPolicy, NodeConfig};
+    use threnody_core::Identity;
+    use threnody_core::account::Action;
+    use threnody_core::store::Home;
+
+    fn add(chain: &mut AccountChain, by: &Identity, new: &Identity) {
+        let mut link = chain.propose(Action::Add {
+            device: new.public(),
+            name: "device".into(),
+        });
+        link.sign(by).unwrap();
+        link.sign(new).unwrap();
+        chain.append(link).unwrap();
+    }
+
+    /// A stranger's chain is neither stored nor turned into contacts until
+    /// the user accepts the stranger; a known account's new device is
+    /// recognised at once.
+    #[tokio::test]
+    async fn a_strangers_chain_waits_until_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let stranger = Identity::generate();
+        let genesis = Identity::generate();
+        let mut chain = AccountChain::genesis(&genesis, "genesis").unwrap();
+        add(&mut chain, &genesis, &stranger);
+        let fakes: Vec<Identity> = (0..20).map(|_| Identity::generate()).collect();
+        for f in &fakes {
+            add(&mut chain, &stranger, f);
+        }
+        let msg = AccountMsg::Chain(chain.encode().unwrap()).encode().unwrap();
+        let contacts = || node.contacts().iter().count();
+        let before = contacts();
+
+        assert!(!node.on_account(stranger.public(), &msg), "set aside");
+        assert!(node.known_accounts().get(&chain.id()).is_none());
+        assert_eq!(contacts(), before, "no contacts from a stranger's chain");
+
+        node.accept_contact(&stranger.public());
+        assert!(node.on_account(stranger.public(), &msg));
+        assert!(node.known_accounts().get(&chain.id()).is_some());
+        assert!(node.contacts().get(&fakes[0].public()).is_some());
+
+        // Another device of that account, not accepted itself, is taken.
+        let other = Identity::generate();
+        add(&mut chain, &stranger, &other);
+        let msg = AccountMsg::Chain(chain.encode().unwrap()).encode().unwrap();
+        assert!(node.on_account(other.public(), &msg));
+        assert!(node.account_of(&other.public()).is_some());
+        node.shutdown();
     }
 }

@@ -42,6 +42,7 @@ The account fingerprint is computed like a device fingerprint (Appendix A), as `
 
 - **Exchange.** Peers send their chain as `AppMessage::Account` (kind 11) at the start of every session, and again whenever it changes.
 - **Accepting a chain.** A receiver accepts a chain only if it is valid, its id matches what the receiver has stored for that account (pinned at first sight), and the session's device is in its current set.
+- **Strangers' chains wait.** Anyone can open a session and present a chain, and a kept chain stays, with every device in it added as a contact. So a receiver checks and keeps a chain only if the user accepted the presenting device, or the chain claims to be the receiver's own account or one it already holds (which is how a contact's new device is recognised). It reads the claimed id from the genesis link without verifying anything. Any other chain waits, unchecked, until the user accepts that device in the same session, and is dropped when the session ends; the next session presents it again. Until then a stranger's devices aren't grouped into one account.
 - **Updates.** A newer chain must *extend* the stored one. A different chain at or below the stored height is a **fork**: the receiver rejects it and warns, because forking requires a compromised device.
 - **Removal.** When a chain removes a device, every peer drops its sessions with that device, revokes its approvals, deletes its discovery key and prekeys, and refuses it from then on.
 

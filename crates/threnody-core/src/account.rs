@@ -323,6 +323,19 @@ impl AccountChain {
         finish(&dec)?;
         Self::from_links(links)
     }
+
+    /// The account an encoded chain says it is, read from its genesis link
+    /// alone. Nothing is verified: this only tells, cheaply, which account
+    /// a chain is about before deciding whether to check it.
+    pub fn claimed_id(b: &[u8]) -> Result<AccountId> {
+        let mut dec = Decoder::new(b);
+        let n = dec.array_len()?;
+        if n == 0 || n > MAX_LINKS {
+            return Err(Error::Malformed("account chain length"));
+        }
+        let g = Link::decode(dec.bytes()?)?;
+        Ok(AccountId(kdf::derive(label::ACCOUNT_ID, &[&g.body()?])))
+    }
 }
 
 fn decode_link(dec: &mut Decoder<'_>) -> Result<Link> {
@@ -704,6 +717,11 @@ mod tests {
         let again = AccountChain::decode(&chain.encode().unwrap()).unwrap();
         assert_eq!(again, chain);
         assert_ne!(id.fingerprint(), a.public().fingerprint());
+        assert_eq!(
+            AccountChain::claimed_id(&chain.encode().unwrap()).unwrap(),
+            id
+        );
+        assert!(AccountChain::claimed_id(&[0x80]).is_err(), "no links");
     }
 
     #[test]

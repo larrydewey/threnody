@@ -1569,6 +1569,9 @@ where
     // `Paths` that arrived before approval was mutual (the peer's
     // `Approval` can trail them), kept until it is.
     let mut early_paths: Option<Vec<u8>> = None;
+    // The peer's account chain, kept until the user accepts the peer (see
+    // `Node::chain_wanted`).
+    let mut early_chain: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
     let mut heartbeat = tokio::time::interval(node.beat());
@@ -1607,6 +1610,12 @@ where
                 && let Some(payload) = early_paths.take()
             {
                 lease = node.on_paths(peer, &payload).or(lease);
+            }
+            if early_chain.is_some()
+                && node.is_accepted(&peer)
+                && let Some(payload) = early_chain.take()
+            {
+                node.on_account(peer, &payload);
             }
             // Tell an approved peer how to find us if this session breaks.
             // Over relay and onion circuits too: the endpoints are mutual
@@ -1843,7 +1852,11 @@ where
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}
-                        AppMessage::Account(payload) => node.on_account(peer, &payload),
+                        AppMessage::Account(payload) => {
+                            if !node.on_account(peer, &payload) {
+                                early_chain = Some(payload);
+                            }
+                        }
                         AppMessage::Mailbox(payload) => node.on_mailbox(peer, &payload),
                         AppMessage::Onion(payload) => {
                             if via.is_none() {
