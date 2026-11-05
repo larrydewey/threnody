@@ -25,7 +25,8 @@ pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
 /// Delivered ids remembered per peer to drop resent copies.
 pub const RECENT_IDS: usize = 4096;
 /// And at most this many across all peers (strangers each add theirs):
-/// the peers heard from longest ago are forgotten first.
+/// the peers heard from longest ago are forgotten first, strangers before
+/// accepted contacts.
 pub const MAX_DELIVERED_IDS: usize = 64 * 1024;
 /// Messages larger than this (files) are resent only within one run.
 pub const MAX_PERSISTED: usize = 64 * 1024;
@@ -89,6 +90,9 @@ struct Recent {
     set: HashSet<u64>,
     /// When we last delivered from this peer, in [`Delivery::clock`] ticks.
     last: u64,
+    /// An accepted contact's: kept over strangers' when trimming. Not
+    /// saved; [`Delivery::mark_contacts`] sets it again after a restart.
+    contact: bool,
 }
 
 #[derive(Default)]
@@ -311,6 +315,18 @@ impl Delivery {
         self.acked(peer, &[id]);
     }
 
+    /// Stops sending what `gone` picks out, to whichever peer.
+    pub fn drop_where(&mut self, mut gone: impl FnMut(&PublicIdentity, &AppMessage) -> bool) {
+        self.unacked.retain(|p, q| {
+            q.retain(|(_, m, len, _)| {
+                let drop = gone(p, m);
+                self.unacked_dirty |= drop && *len <= MAX_PERSISTED;
+                !drop
+            });
+            !q.is_empty()
+        });
+    }
+
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
         self.unacked.get(peer).map_or(0, VecDeque::len)
     }
@@ -328,12 +344,13 @@ impl Delivery {
     }
 
     /// The message `id` from `peer`, which [`Delivery::first_delivery`]
-    /// let through, has been handled.
-    pub fn delivered(&mut self, peer: &PublicIdentity, id: u64) {
+    /// let through, has been handled. `contact`: `peer` is one we accepted.
+    pub fn delivered(&mut self, peer: &PublicIdentity, id: u64, contact: bool) {
         self.opening.remove(&(*peer, id));
         self.clock += 1;
         let r = self.delivered.entry(*peer).or_default();
         r.last = self.clock;
+        r.contact = contact;
         if !r.set.insert(id) {
             return;
         }
@@ -349,15 +366,28 @@ impl Delivery {
         self.trim_delivered(Some(peer));
     }
 
-    /// Forgets the peers delivered from longest ago (never `keep`) while
-    /// there are more than [`MAX_DELIVERED_IDS`] ids.
+    /// Which of the peers we remember ids from are accepted contacts.
+    pub fn mark_contacts(&mut self, contacts: &HashSet<PublicIdentity>) {
+        for (p, r) in &mut self.delivered {
+            r.contact = contacts.contains(p);
+        }
+    }
+
+    /// Peers we remember delivered ids from.
+    pub fn delivered_from(&self) -> Vec<PublicIdentity> {
+        self.delivered.keys().copied().collect()
+    }
+
+    /// Forgets the peers delivered from longest ago (never `keep`), strangers
+    /// first, while there are more than [`MAX_DELIVERED_IDS`] ids: a flood
+    /// from throwaway identities can't wipe what contacts' resends need.
     fn trim_delivered(&mut self, keep: Option<&PublicIdentity>) {
         while self.delivered_ids > MAX_DELIVERED_IDS {
             let Some(oldest) = self
                 .delivered
                 .iter()
                 .filter(|(p, _)| Some(*p) != keep)
-                .min_by_key(|(_, r)| r.last)
+                .min_by_key(|(_, r)| (r.contact, r.last))
                 .map(|(p, _)| *p)
             else {
                 return;
@@ -433,11 +463,11 @@ mod tests {
         assert_eq!(d.acked(&p, &[id]), (vec![], vec![vec![4]]));
         assert_eq!(d.unacked(&p), 1);
         assert!(d.first_delivery(&p, 9) && !d.first_delivery(&p, 9));
-        d.delivered(&p, 9);
+        d.delivered(&p, 9, true);
         assert!(!d.first_delivery(&p, 9));
         for i in 0..RECENT_IDS as u64 {
             d.first_delivery(&p, 100 + i);
-            d.delivered(&p, 100 + i);
+            d.delivered(&p, 100 + i, true);
         }
         assert!(d.first_delivery(&p, 9), "old ids are forgotten");
     }
@@ -464,7 +494,7 @@ mod tests {
             Tag::NONE,
         );
         d.first_delivery(&p, 42);
-        d.delivered(&p, 42);
+        d.delivered(&p, 42, true);
         assert!(d.unacked_dirty && d.delivered_dirty);
         let (u, del) = (d.encode_unacked(), d.encode_delivered());
         let mut again = Delivery::load(&u, &del);
@@ -497,7 +527,7 @@ mod tests {
         // sender's resend is taken after the restart.
         assert!(!d.delivered_dirty);
         assert!(Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
-        d.delivered(&p, 7);
+        d.delivered(&p, 7, true);
         assert!(!Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
     }
 
@@ -511,7 +541,7 @@ mod tests {
             for i in 0..RECENT_IDS as u64 {
                 let id = (n as u64) << 32 | i;
                 assert!(d.first_delivery(p, id));
-                d.delivered(p, id);
+                d.delivered(p, id, false);
             }
         }
         // The first peer, heard from longest ago, made room for the last.
@@ -538,6 +568,60 @@ mod tests {
         assert!(d.unacked_dirty && d.delivered_dirty);
         assert_eq!(d.unacked(last), 0);
         assert!(d.first_delivery(last, (peers.len() as u64 - 1) << 32));
+    }
+
+    #[test]
+    fn strangers_ids_go_before_a_contacts() {
+        let mut d = Delivery::default();
+        let contact = Identity::generate().public();
+        for i in 0..RECENT_IDS as u64 {
+            d.first_delivery(&contact, i);
+            d.delivered(&contact, i, true);
+        }
+        // Throwaway identities send more than the cap between them, all
+        // after the contact last did.
+        let strangers: Vec<PublicIdentity> = (0..MAX_DELIVERED_IDS / RECENT_IDS)
+            .map(|_| Identity::generate().public())
+            .collect();
+        for (n, p) in strangers.iter().enumerate() {
+            for i in 0..RECENT_IDS as u64 {
+                let id = (n as u64 + 1) << 32 | i;
+                d.first_delivery(p, id);
+                d.delivered(p, id, false);
+            }
+        }
+        assert!(!d.first_delivery(&contact, 0), "the contact's ids stay");
+        assert!(d.first_delivery(&strangers[0], 1 << 32));
+        assert_eq!(d.delivered_ids, MAX_DELIVERED_IDS);
+
+        // After a restart the node says again who the contacts are.
+        let mut again = Delivery::load(&[], &d.encode_delivered());
+        assert!(again.delivered_from().contains(&contact));
+        again.mark_contacts(&HashSet::from([contact]));
+        let p = Identity::generate().public();
+        again.first_delivery(&p, 1);
+        again.delivered(&p, 1, false);
+        assert!(!again.first_delivery(&contact, 0));
+    }
+
+    #[test]
+    fn chosen_unacked_messages_can_be_dropped() {
+        let (p, q) = (Identity::generate().public(), Identity::generate().public());
+        let mut d = Delivery::default();
+        d.track(&p, text("keep"), Tag::NONE);
+        d.track(&p, text("drop"), Tag::NONE);
+        d.track(&q, text("drop"), Tag::NONE);
+        d.unacked_dirty = false;
+        d.drop_where(|peer, m| *peer == p && *m == text("drop"));
+        assert!(d.unacked_dirty);
+        assert_eq!((d.unacked(&p), d.unacked(&q)), (1, 1));
+        assert_eq!(
+            d.resend(&p),
+            vec![AppMessage::Tracked {
+                id: d.unacked[&p][0].0,
+                inner: Box::new(text("keep"))
+            }]
+        );
     }
 
     #[test]

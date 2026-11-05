@@ -1,7 +1,7 @@
 //! A running Threnody node: listens, dials, runs one task per session,
 //! enforces the trust policy and keeps the contact book current.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -702,6 +702,14 @@ impl Node {
         let node = Self {
             shared: Arc::new(shared),
         };
+        // Which peers' delivered ids to keep longest: not saved with them.
+        let contacts: HashSet<PublicIdentity> = node
+            .shared
+            .delivery(|d| d.delivered_from())
+            .into_iter()
+            .filter(|p| node.is_accepted(p))
+            .collect();
+        node.shared.delivery(|d| d.mark_contacts(&contacts));
         node.start_history_sweep();
         node.load_recovery();
         node.load_volunteer();
@@ -1876,7 +1884,8 @@ where
                         }
                     }
                     if let Some(id) = handling {
-                        shared.delivery(|d| d.delivered(&peer, id));
+                        let contact = node.is_accepted(&peer);
+                        shared.delivery(|d| d.delivered(&peer, id, contact));
                     }
                 }
                 out = outbox.recv() => match out {
