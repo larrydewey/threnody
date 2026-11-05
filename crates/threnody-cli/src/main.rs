@@ -33,8 +33,8 @@ enum KeyringAction {
     Status,
 }
 
-/// Cover-traffic interval unless told otherwise: one ~2.7 kB frame each
-/// way every 2 s per session, about 230 MB a day per connected contact.
+/// Cover-traffic interval unless told otherwise: one ~6.5 kB frame each
+/// way every 2 s per session, about 560 MB a day per connected contact.
 const DEFAULT_COVER_MS: u64 = 2000;
 
 #[derive(Parser)]
@@ -151,7 +151,7 @@ enum Cmd {
         policy: Policy,
         /// Send one padded frame per interval per session, with cover traffic
         /// when idle: hides when messages are sent, at a bandwidth cost
-        /// (each frame is about 2.7 kB). On by default.
+        /// (each frame is about 6.5 kB). On by default.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_COVER_MS, conflicts_with = "no_cover")]
         constant_rate_ms: u64,
         /// Turn cover traffic off (messages go out as soon as they're sent).

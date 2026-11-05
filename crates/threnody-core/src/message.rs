@@ -15,6 +15,11 @@ pub const PAD_MIN: usize = 256;
 /// Above this, padding rounds up to a multiple of this size instead of the
 /// next power of two.
 pub const PAD_STEP_MAX: usize = 64 * 1024;
+/// Smallest padded plaintext on a constant-rate link: the bucket an onion
+/// cell (`Onion`, a 2048-byte cell and its circuit header) pads to. Cover,
+/// cells and short messages on such a link are then one size, so an
+/// observer can't tell ticks that carry circuit traffic from idle ones.
+pub const PAD_LINK: usize = 4096;
 /// Largest file a single message may carry.
 pub const MAX_FILE: usize = 8 * 1024 * 1024;
 /// `File` flag (key 6): the sender marked it sensitive.
@@ -908,6 +913,15 @@ pub fn pad(mut msg: Vec<u8>) -> Vec<u8> {
     msg
 }
 
+/// [`pad`], to at least `min` bytes (e.g. [`PAD_LINK`]). Receivers unpad
+/// any length, so this needs nothing from the peer.
+pub fn pad_at_least(mut msg: Vec<u8>, min: usize) -> Vec<u8> {
+    let target = padded_len(msg.len() + 1).max(min);
+    msg.push(0x80);
+    msg.resize(target, 0);
+    msg
+}
+
 pub fn padded_len(n: usize) -> usize {
     if n <= PAD_MIN {
         PAD_MIN
@@ -1232,5 +1246,23 @@ mod tests {
         assert_eq!(padded_len(PAD_STEP_MAX + 1), 2 * PAD_STEP_MAX);
         assert!(unpad(vec![0; 10]).is_err());
         assert_eq!(unpad(pad(vec![0x80, 0])).unwrap(), vec![0x80, 0]);
+    }
+
+    #[test]
+    fn link_padding_makes_cover_and_cells_one_size() {
+        let cover = AppMessage::Cover.encode().unwrap();
+        let cell = AppMessage::Onion(vec![0; crate::onion::CELL_LEN + 16])
+            .encode()
+            .unwrap();
+        assert_eq!(pad_at_least(cover.clone(), PAD_LINK).len(), PAD_LINK);
+        assert_eq!(pad_at_least(cell.clone(), PAD_LINK).len(), PAD_LINK);
+        assert_eq!(pad(cell).len(), PAD_LINK, "a cell fills the link bucket");
+        assert_eq!(
+            unpad(pad_at_least(cover.clone(), PAD_LINK)).unwrap(),
+            cover,
+            "plain unpadding reads it"
+        );
+        // Bigger messages keep their own bucket.
+        assert_eq!(pad_at_least(vec![1; 5000], PAD_LINK).len(), 8192);
     }
 }

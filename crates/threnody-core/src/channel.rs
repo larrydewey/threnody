@@ -7,7 +7,7 @@ use crate::crypto::kdf::{self, label};
 use crate::error::Result;
 use crate::handshake::Established;
 use crate::identity::PublicIdentity;
-use crate::message::{AppMessage, pad, unpad};
+use crate::message::{AppMessage, pad, pad_at_least, unpad};
 use crate::ratchet::Ratchet;
 
 pub struct SecureChannel {
@@ -57,6 +57,13 @@ impl SecureChannel {
     /// Encodes, pads and encrypts one message into a wire frame.
     pub fn seal(&mut self, msg: &AppMessage) -> Result<Vec<u8>> {
         self.ratchet.encrypt(&pad(msg.encode()?))
+    }
+
+    /// [`SecureChannel::seal`], padding to at least `min` bytes (spec §9
+    /// layer 1: every frame of a constant-rate link pads to
+    /// [`crate::message::PAD_LINK`]).
+    pub fn seal_padded(&mut self, msg: &AppMessage, min: usize) -> Result<Vec<u8>> {
+        self.ratchet.encrypt(&pad_at_least(msg.encode()?, min))
     }
 
     /// Decrypts, unpads and decodes one wire frame.

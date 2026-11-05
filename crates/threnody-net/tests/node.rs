@@ -1076,3 +1076,104 @@ async fn read_receipts_reach_the_sender() {
         .any(|e| e.outgoing && e.local_id == id && e.read_ms != 0);
     assert!(read, "Alice's message shows as read");
 }
+
+/// Copies `from` to `to` frame by frame, recording the length of every
+/// ratchet frame (everything after the handshake) in `seen`.
+async fn tap_frames(
+    mut from: tokio::io::DuplexStream,
+    mut to: tokio::io::DuplexStream,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let mut len = [0u8; 4];
+        if from.read_exact(&mut len).await.is_err() {
+            return;
+        }
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        if from.read_exact(&mut buf).await.is_err() {
+            return;
+        }
+        if let Ok((threnody_core::wire::MsgType::Ratchet, _)) =
+            threnody_core::wire::decode_envelope(&buf)
+        {
+            seen.lock().unwrap().push(4 + buf.len());
+        }
+        if to.write_all(&len).await.is_err() || to.write_all(&buf).await.is_err() {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn constant_rate_frames_are_all_one_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let rate = Some(Duration::from_millis(20));
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, rate);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, rate);
+    let (a_end, a_tap) = tokio::io::duplex(1 << 20);
+    let (b_tap, b_end) = tokio::io::duplex(1 << 20);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (a_rd, a_wr) = tokio::io::split(a_tap);
+    let (b_rd, b_wr) = tokio::io::split(b_tap);
+    // Alice to Bob through the tap; Bob to Alice as is.
+    let (up_in, up_out) = tokio::io::duplex(1 << 20);
+    let (down_in, down_out) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let (mut r, mut w) = (a_rd, up_in);
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+    });
+    tokio::spawn(tap_frames(up_out, down_in, seen.clone()));
+    tokio::spawn(async move {
+        let (mut r, mut w) = (down_out, b_wr);
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+    });
+    tokio::spawn(async move {
+        let (mut r, mut w) = (b_rd, a_wr);
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+    });
+    let bob2 = bob.clone();
+    let accept = tokio::spawn(async move { bob2.accept_stream(b_end, "ble", "AA".into()).await });
+    let bid = alice
+        .connect_stream(
+            a_end,
+            "ble",
+            "BB".into(),
+            Some(bob.identity().fingerprint()),
+        )
+        .await
+        .unwrap();
+    accept.await.unwrap().unwrap();
+    // Setup done, the link idles on cover.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    seen.lock().unwrap().clear();
+    alice
+        .send(
+            &bid,
+            AppMessage::Text {
+                sent_ms: 0,
+                body: "between cover frames".into(),
+                expires_in_s: None,
+                id: 0,
+                quote: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    // What an onion cell looks like on a link: a 2048-byte cell and its
+    // circuit header.
+    alice
+        .send(
+            &bid,
+            AppMessage::Onion(vec![7; threnody_core::onion::CELL_LEN + 16]),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.len() > 5, "frames went by: {seen:?}");
+    assert!(
+        seen.iter().all(|n| *n == seen[0]),
+        "cover, message and cell frames differ in size: {seen:?}"
+    );
+    eprintln!("constant-rate frame on the wire: {} bytes", seen[0]);
+}

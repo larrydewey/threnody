@@ -2088,7 +2088,7 @@ PersistentKeepalive = 25\n",
 
     /// Cover traffic (spec §9 layer 1): each session sends one padded frame
     /// every `interval_ms`, filler when idle, so timing shows nothing.
-    /// `None` turns it off. Each frame is about 2.7 kB. On by default.
+    /// `None` turns it off. Each frame is about 6.5 kB. On by default.
     pub fn set_cover_traffic(&self, interval_ms: Option<u32>) {
         self.node
             .set_constant_rate(interval_ms.map(|ms| Duration::from_millis(u64::from(ms.max(10)))));

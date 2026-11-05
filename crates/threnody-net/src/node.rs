@@ -13,7 +13,7 @@ use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::message::{
     FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURE_TIMED_PROBES, FEATURES,
-    MAX_ACK_IDS,
+    MAX_ACK_IDS, PAD_LINK,
 };
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
@@ -1748,7 +1748,7 @@ where
                     )
                 ) {
                     if let Some(m) = pending.pop_front() {
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
             }
@@ -2015,7 +2015,7 @@ where
                         let revoked = !lock(&shared.contacts).get(&peer).is_some_and(|c| c.local_approved);
                         if revoked && chan.can_send() {
                             for m in pending.iter().filter(|m| matches!(m, AppMessage::Approval { approved: false })) {
-                                let sealed = chan.seal(m)?;
+                                let sealed = seal_link(&mut chan, m, ticker.is_some())?;
                                 let _ = tokio::time::timeout(LAST_WORDS, write_frame(&mut wr, &sealed)).await;
                             }
                             // Close gently, reading until the peer closes too:
@@ -2040,7 +2040,9 @@ where
                     if paths_sent && shared.mutual(&peer) && node.supports(&peer, FEATURE_PATHS) {
                         if chan.can_send() {
                             if let Some(m) = node.paths_message(inner) {
-                                write_frame(&mut wr, &chan.seal(&m)?).await?;
+                                // Padded if either rate paces the link.
+                                let paced = ticker.is_some() || rate.borrow().is_some_and(|_| !inner);
+                                write_frame(&mut wr, &seal_link(&mut chan, &m, paced)?).await?;
                             }
                         } else {
                             paths_sent = false;
@@ -2063,7 +2065,7 @@ where
                                 Err(w) => pending.push_back(w),
                             }
                         }
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
             }
@@ -2080,6 +2082,19 @@ where
 /// packet.
 fn is_wireguard(d: &[u8]) -> bool {
     d.len() >= 32 && (1..=4).contains(&d[0]) && d[1..4] == [0, 0, 0]
+}
+
+/// Seals `m` for a session or anonymous link. On a constant-rate link
+/// (`paced`) every frame pads to at least [`PAD_LINK`], the size of an
+/// onion cell's, so ticks carrying cells, messages or cover look the same
+/// (Appendix C, *Padding*). Urgent messages (calls, tunnel packets) are
+/// sealed plainly: they skip the ticks, so their size hides nothing.
+pub(crate) fn seal_link(chan: &mut SecureChannel, m: &AppMessage, paced: bool) -> Result<Vec<u8>> {
+    Ok(if paced {
+        chan.seal_padded(m, PAD_LINK)?
+    } else {
+        chan.seal(m)?
+    })
 }
 
 /// Call signalling and media, and tunnel packets: sent at once even under
