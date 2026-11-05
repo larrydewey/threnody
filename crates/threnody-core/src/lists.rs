@@ -16,6 +16,11 @@ use crate::error::{Error, Result};
 /// room), and characters in a title or an item.
 pub const MAX_LISTS: usize = 200;
 pub const MAX_ITEMS: usize = 1000;
+/// Most items not deleted that we add ourselves. The rest of
+/// [`MAX_ITEMS`] is kept for deletions, so a full copy taking in another
+/// copy's new items forgets old deletions rather than recent ones, or
+/// rather than refusing the items.
+pub const MAX_LIVE: usize = 900;
 pub const MAX_TITLE: usize = 80;
 pub const MAX_ITEM_TEXT: usize = 500;
 /// Deepest nesting of an item.
@@ -92,7 +97,7 @@ impl List {
     }
 
     /// Adds an item after `after`; returns its id, or None if the list is
-    /// full.
+    /// full ([`MAX_LIVE`] items).
     pub fn add(
         &mut self,
         after: Option<u64>,
@@ -100,7 +105,7 @@ impl List {
         heading: bool,
         stamp: Stamp,
     ) -> Option<u64> {
-        if !self.make_room() {
+        if self.items.iter().filter(|i| !i.deleted).count() >= MAX_LIVE || !self.make_room() {
             return None;
         }
         let id = u64::from_le_bytes(crate::crypto::random_bytes()).max(1);
@@ -122,11 +127,14 @@ impl List {
     }
 
     /// Makes room for one more item, if the list is full, by forgetting
-    /// the oldest deleted one; false if every item is still there.
+    /// the oldest deleted one (the smallest stamp, then id, so every copy
+    /// picks the same); false if every item is still there.
     ///
     /// A forgotten deletion no longer spreads, so a copy that never heard
     /// of it could bring that item back; but without this a list that has
-    /// seen [`MAX_ITEMS`] items could never take another.
+    /// seen [`MAX_ITEMS`] items could never take another. Since we add at
+    /// most [`MAX_LIVE`] ourselves, a full list keeps some deletions, and
+    /// the ones forgotten are the oldest of those.
     fn make_room(&mut self) -> bool {
         if self.items.len() < MAX_ITEMS {
             return true;
@@ -136,7 +144,7 @@ impl List {
             .iter()
             .enumerate()
             .filter(|(_, i)| i.deleted)
-            .min_by_key(|(_, i)| i.stamp)
+            .min_by_key(|(_, i)| (i.stamp, i.id))
             .map(|(k, _)| k);
         match oldest {
             Some(k) => {
@@ -163,8 +171,8 @@ impl List {
                     changed = true;
                 }
                 Some(_) => {}
-                // A deletion we never saw the item of changes nothing to
-                // make room for.
+                // A deletion of an item we never had doesn't push out a
+                // deletion we keep.
                 None if self.items.len() >= MAX_ITEMS && o.deleted => {}
                 None if self.make_room() => {
                     self.items.push(o.clone());
@@ -414,15 +422,94 @@ mod tests {
         assert!(a.items().iter().any(|i| i.id == milk));
         assert!(a.items.len() <= MAX_ITEMS);
 
-        // A list full of live items takes no more, rather than keeping one
-        // it can't save or send.
+        // A list of MAX_LIVE items takes no more from us, even with
+        // deletions it could forget: those are kept for merging.
         let mut full = List::default();
-        for n in 0..MAX_ITEMS as u64 {
+        for n in 0..MAX_LIVE as u64 {
             full.add(None, "x", false, st(n + 1, 1)).unwrap();
         }
+        let gone = full.add(None, "gone", false, st(9998, 1)).is_none();
+        assert!(gone, "full");
+        let x = full.items[0].id;
+        full.change(x, st(9998, 1), |i| i.deleted = true);
+        full.add(None, "y", false, st(9999, 1)).unwrap();
         assert_eq!(full.add(None, "one more", false, st(9999, 1)), None);
         assert_eq!(full.add_markdown("- [ ] more", st(9999, 1)), 0);
-        assert_eq!(full.items.len(), MAX_ITEMS);
+        assert_eq!(full.items().len(), MAX_LIVE);
+    }
+
+    /// A list of `live` items and `dead` deletions, all deleted at once (as
+    /// clearing ticked items does), so their stamps tie.
+    fn worn(live: usize, dead: usize) -> List {
+        let mut l = List {
+            id: [6; 16],
+            ..List::default()
+        };
+        for n in 0..(live + dead) as u64 {
+            l.items.push(Item {
+                id: n + 1,
+                text: "x".into(),
+                pos: n as f64,
+                deleted: n < dead as u64,
+                stamp: st(if n < dead as u64 { 7 } else { n + 10 }, 1),
+                ..Item::default()
+            });
+        }
+        l
+    }
+
+    fn ids(l: &List) -> Vec<u64> {
+        let mut v: Vec<u64> = l.items.iter().map(|i| i.id).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn full_copies_adding_at_once_end_the_same() {
+        // Two copies of a full list, its items in a different order on each
+        // (as merging leaves them); each adds an item at once.
+        let base = worn(MAX_LIVE - 1, MAX_ITEMS - MAX_LIVE + 1);
+        let mut a = base.clone();
+        let mut b = base.clone();
+        b.items.reverse();
+        let x = a.add(None, "from a", false, st(5000, 1)).unwrap();
+        let y = b.add(None, "from b", false, st(5000, 2)).unwrap();
+        assert_eq!(ids(&a).len(), MAX_ITEMS);
+        assert!(a.merge(&b) && b.merge(&a));
+        // Both have both, and forgot the same deletions to make room.
+        for l in [&a, &b] {
+            assert!(l.items().iter().any(|i| i.id == x));
+            assert!(l.items().iter().any(|i| i.id == y));
+        }
+        assert_eq!(ids(&a), ids(&b));
+        assert!(!a.merge(&b) && !b.merge(&a));
+    }
+
+    #[test]
+    fn a_full_list_takes_no_unknown_deletion() {
+        // Deletions of items we never had don't push out the deletions we
+        // keep (which would let those items come back from older copies).
+        let mut l = worn(MAX_LIVE, MAX_ITEMS - MAX_LIVE);
+        let before = ids(&l);
+        let mut other = List {
+            id: l.id,
+            ..List::default()
+        };
+        for n in 0..200 {
+            other.items.push(Item {
+                id: 50_000 + n,
+                deleted: true,
+                stamp: st(5000, 2),
+                ..Item::default()
+            });
+        }
+        assert!(!l.merge(&other));
+        assert_eq!(ids(&l), before);
+        // Every item live: a new one can't come in, as nothing may go.
+        let mut l = worn(MAX_ITEMS, 0);
+        other.items[0].deleted = false;
+        assert!(!l.merge(&other));
+        assert_eq!(l.items().len(), MAX_ITEMS);
     }
 
     #[test]
