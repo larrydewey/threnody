@@ -730,6 +730,12 @@ object Threnody {
                     ThrenodyService.notifyAccount(ctx, "This device was removed from your account. " +
                         "Your contacts no longer accept it as you.")
                 }
+                is NodeEvent.DeviceLinked -> {
+                    say("* a new device joined your account")
+                    // A leaked link code adds a device without asking: say so.
+                    ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
+                        "If you didn't link it, remove it in Devices.")
+                }
                 is NodeEvent.AccountChanged -> {
                     say("· $e")
                     // A verified contact gained a device we haven't verified.
