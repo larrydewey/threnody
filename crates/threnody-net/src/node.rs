@@ -1035,6 +1035,8 @@ impl Node {
     pub fn shutdown(&self) {
         self.shared.shutdown.send_replace(true);
         lock(&self.shared.sessions).clear();
+        // Relay tokens spent a moment ago, not saved yet.
+        self.save_seen();
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -1519,7 +1521,8 @@ where
     // Inside a relay or onion circuit the links' cover traffic hides the
     // timing (Appendix I); cover from this session too would send more
     // cells than a constant-rate link carries, and the backlog would grow
-    // without end.
+    // without end. For the same reason its heartbeat is slow (see
+    // `inner_beat_for`).
     let inner = via.is_some();
     let mut ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
 
@@ -1535,7 +1538,7 @@ where
     let mut early_paths: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
-    let mut heartbeat = tokio::time::interval(node.beat());
+    let mut heartbeat = tokio::time::interval(node.beat_for(inner));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
@@ -1586,7 +1589,7 @@ where
                 // get its lease and recovery paths across.
                 // Behind `Hello` and our `Approval`, though: the peer only
                 // takes paths from a peer it knows approves it.
-                if let Some(m) = node.paths_message() {
+                if let Some(m) = node.paths_message(inner) {
                     let at = pending
                         .iter()
                         .rposition(|m| matches!(m, AppMessage::Hello { .. } | AppMessage::Approval { .. }))
@@ -1866,6 +1869,26 @@ where
                 },
                 Ok(()) = rate.changed() => {
                     ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
+                    // The beat follows the rate, and the peer hears of it
+                    // first: from now on our `Paths` (`broadcast_paths`)
+                    // advertise the new beat, and a peer told of a faster
+                    // beat than we keep would end the session as silent.
+                    let beat = node.beat_for(inner);
+                    if beat != heartbeat.period() {
+                        let now = tokio::time::Instant::now();
+                        heartbeat = tokio::time::interval_at(now + beat, beat);
+                        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        if paths_sent
+                            && shared.mutual(&peer)
+                            && let Some(m) = node.paths_message(inner)
+                        {
+                            let at = pending
+                                .iter()
+                                .rposition(|m| matches!(m, AppMessage::Hello { .. } | AppMessage::Approval { .. }))
+                                .map_or(0, |i| i + 1);
+                            pending.insert(at, m);
+                        }
+                    }
                 }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {

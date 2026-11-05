@@ -238,6 +238,45 @@ async fn mailboxes_decline_unapproved_recipients_and_say_so() {
 }
 
 #[tokio::test]
+async fn anonymous_deposits_do_not_tell_whether_the_recipient_is_online() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut b = spawn(&dir, "b").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut r2 = spawn(&dir, "r2").await;
+    let mut m = spawn(&dir, "m").await;
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r1).await;
+    link(&mut a, &mut r2).await;
+    link(&mut a, &mut m).await;
+    link(&mut r1, &mut r2).await;
+    link(&mut r2, &mut m).await;
+    link(&mut b, &mut m).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    // B is away from A, but still connected to M.
+    a.node.disconnect(&bid);
+    wait_for(|| a.node.sessions().iter().all(|s| s.peer != bid)).await;
+
+    a.node.send_offline(&bid, &text("are you there")).unwrap();
+    let mid = m.node.identity();
+    let Event::DepositReceipt { status, .. } = next(
+        &mut a.rx,
+        |e| matches!(e, Event::DepositReceipt { mailbox, anonymous: true, .. } if *mailbox == mid),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    // Whoever deposits anonymously could be anyone: M doesn't say B is
+    // online, though it passed the message straight on.
+    assert_eq!(status, DepositStatus::Held);
+    next(&mut b.rx, |e| matches!(e, Event::OfflineMessage { .. })).await;
+    assert_eq!(m.node.held_messages(), 0);
+    let _ = (&mut r1.rx, &mut r2.rx);
+}
+
+#[tokio::test]
 async fn deposits_go_through_onion_circuits_and_hide_the_sender() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = spawn(&dir, "a").await;

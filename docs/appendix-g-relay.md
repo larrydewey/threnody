@@ -32,7 +32,7 @@ Destinations are fingerprints, so anyone whose fingerprint you know (for example
 2. **A relay** receiving `Open` from `P` first checks four things, and replies `Refused` if any fails:
    - `P` is mutually approved with it.
    - `ttl ≤ 3`.
-   - `P` has fewer than 64 circuits open through it.
+   - `P` has fewer than 64 circuits open through it, counting `Open`s from `P` still looking for a path.
    - It has never seen this `nonce` before. Nonces are remembered for 10 minutes, which breaks loops.
 
    It then extends the circuit:

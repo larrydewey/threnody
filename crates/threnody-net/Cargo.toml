@@ -37,6 +37,8 @@ ring = "0.17"
 [dev-dependencies]
 mainline = "8"
 tempfile.workspace = true
+# Paused clocks for timeouts in unit tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map};
@@ -54,6 +54,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(40);
 const STATE_SUBS: &str = "directories";
 const STATE_WALLET: &str = "relay-wallet";
 const STATE_SERVER: &str = "directory-server";
+const STATE_SEEN: &str = "relay-seen";
+/// Pseudonyms seen since `STATE_SEEN` was last written.
+const STATE_SEEN_RECENT: &str = "relay-seen-recent";
+/// Spent pseudonyms are saved this long after the first new one, together.
+const SEEN_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// Once this many wait in `STATE_SEEN_RECENT`, they are folded into
+/// `STATE_SEEN`: each save writes only the recent ones, and the whole set
+/// (up to a few MB on a busy relay) is rewritten only now and then.
+const SEEN_FOLD: usize = 256;
 
 struct Subscription {
     link: DirectoryLink,
@@ -92,6 +101,25 @@ struct Wallet {
     used: HashMap<(Fingerprint, u32), u64>,
 }
 
+type Seen = HashMap<u32, HashSet<[u8; credential::PSEUDONYM_LEN]>>;
+
+/// Token pseudonyms seen today and yesterday.
+#[derive(Default)]
+struct Spent {
+    all: Seen,
+    /// Those not yet in the saved `STATE_SEEN`.
+    recent: Seen,
+    /// A save is due.
+    dirty: bool,
+}
+
+impl Spent {
+    fn prune(&mut self, today: u32) {
+        self.all.retain(|e, _| *e + 1 >= today);
+        self.recent.retain(|e, _| *e + 1 >= today);
+    }
+}
+
 struct DirServer {
     issuer: Issuer,
     review: bool,
@@ -107,10 +135,16 @@ pub(crate) struct VolunteerState {
     subs: Mutex<Vec<Subscription>>,
     wallet: Mutex<Wallet>,
     pending: Mutex<HashMap<u64, (PublicIdentity, oneshot::Sender<DirMsg>)>>,
+    /// Per anonymous link: start of the current minute and directory
+    /// requests in it.
+    requests: Mutex<HashMap<PublicIdentity, (Instant, u32)>>,
     /// Our relay descriptor's addresses while volunteering.
     relay: Mutex<Option<Vec<String>>>,
-    /// Token pseudonyms seen, by epoch (each opens one circuit).
-    seen: Mutex<HashMap<u32, HashSet<[u8; credential::PSEUDONYM_LEN]>>>,
+    /// Token pseudonyms seen, by epoch (each opens one circuit). Saved, so
+    /// a restart doesn't let spent slots pay again.
+    seen: Mutex<Spent>,
+    /// Held while spent pseudonyms are written, so saves land in order.
+    seen_save: Mutex<()>,
     server: Mutex<Option<DirServer>>,
     /// Route through volunteer relays when contacts can't (on by default).
     use_volunteers: AtomicBool,
@@ -137,8 +171,10 @@ impl VolunteerState {
             subs: Mutex::new(Vec::new()),
             wallet: Mutex::new(Wallet::default()),
             pending: Mutex::new(HashMap::new()),
+            requests: Mutex::new(HashMap::new()),
             relay: Mutex::new(None),
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::default(),
+            seen_save: Mutex::new(()),
             server: Mutex::new(None),
             use_volunteers: AtomicBool::new(true),
             threshold: AtomicUsize::new(0),
@@ -148,8 +184,12 @@ impl VolunteerState {
     }
 }
 
+/// Directory requests answered per anonymous link per minute: every
+/// answer queues for the link's cover ticks, so more would pile up.
+const MAX_DIRECTORY_REQUESTS_PER_MINUTE: u32 = 12;
+
 /// The part of an address that limits issuance: a /24 or a /56.
-fn network(ip: IpAddr) -> [u8; 16] {
+pub(crate) fn network(ip: IpAddr) -> [u8; 16] {
     let mut out = [0u8; 16];
     match ip {
         IpAddr::V4(v4) => out[..3].copy_from_slice(&v4.octets()[..3]),
@@ -184,6 +224,24 @@ impl Node {
         }
         if let Ok(Some(b)) = home.load_state(id, STATE_WALLET) {
             *lock(&self.vol().wallet) = decode_wallet(&b).unwrap_or_default();
+        }
+        {
+            let load = |name| {
+                home.load_state(id, name)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| decode_seen(&b).ok())
+                    .unwrap_or_default()
+            };
+            let (mut all, recent) = (load(STATE_SEEN), load(STATE_SEEN_RECENT));
+            for (epoch, nyms) in &recent {
+                all.entry(*epoch).or_default().extend(nyms);
+            }
+            *lock(&self.vol().seen) = Spent {
+                all,
+                recent,
+                dirty: false,
+            };
         }
         if let Ok(Some(b)) = home.load_state(id, STATE_SERVER)
             && let Ok(issuer) = Issuer::new(id, 0)
@@ -424,7 +482,12 @@ impl Node {
                 DirMsg::Token { issued, .. } => {
                     let issued = Issued::decode(&issued)?;
                     let cred = req.finish(&key, &issued)?;
-                    if cred.header.schema != RELAY_SCHEMA || cred.header.expires_day != epoch {
+                    // No attributes: their count shows on every token, so
+                    // one would mark this client's circuits.
+                    if cred.header.schema != RELAY_SCHEMA
+                        || cred.header.expires_day != epoch
+                        || !cred.attributes.is_empty()
+                    {
                         return Err(NetError::Protocol(threnody_core::Error::Malformed(
                             "directory issued the wrong credential",
                         )));
@@ -700,10 +763,62 @@ impl Node {
         let Ok(nym) = token.verify(&keys, &self.identity(), e_pub, now) else {
             return false;
         };
-        let mut seen = lock(&self.vol().seen);
-        let today = credential::day(now);
-        seen.retain(|e, _| *e + 1 >= today);
-        seen.entry(token.epoch).or_default().insert(nym)
+        self.spend_pseudonym(token.epoch, nym)
+    }
+
+    /// Records a token pseudonym as spent in `epoch`; false if it was
+    /// already.
+    /// It is saved a moment later, with any others spent meanwhile: the
+    /// circuit doesn't wait for the disk.
+    fn spend_pseudonym(&self, epoch: u32, nym: [u8; credential::PSEUDONYM_LEN]) -> bool {
+        let schedule = {
+            let mut seen = lock(&self.vol().seen);
+            seen.prune(credential::day(now_ms()));
+            if !seen.all.entry(epoch).or_default().insert(nym) {
+                return false;
+            }
+            seen.recent.entry(epoch).or_default().insert(nym);
+            !std::mem::replace(&mut seen.dirty, true)
+        };
+        if schedule {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    let node = self.clone();
+                    rt.spawn(async move {
+                        tokio::time::sleep(SEEN_SAVE_DELAY).await;
+                        let _ = tokio::task::spawn_blocking(move || node.save_seen()).await;
+                    });
+                }
+                Err(_) => self.save_seen(),
+            }
+        }
+        true
+    }
+
+    /// Saves the pseudonyms spent since the last save, if any: on their
+    /// own, or, once there are enough of them, folded into the whole set.
+    pub(crate) fn save_seen(&self) {
+        let _order = lock(&self.vol().seen_save);
+        let (all, recent) = {
+            let mut seen = lock(&self.vol().seen);
+            if !std::mem::take(&mut seen.dirty) {
+                return;
+            }
+            seen.prune(credential::day(now_ms()));
+            let count: usize = seen.recent.values().map(HashSet::len).sum();
+            if count >= SEEN_FOLD {
+                seen.recent.clear();
+                (Some(encode_seen(&seen.all)), encode_seen(&seen.recent))
+            } else {
+                (None, encode_seen(&seen.recent))
+            }
+        };
+        // The whole set first: until the recent ones are cleared on disk
+        // too, loading takes both.
+        if let Some(all) = all {
+            self.shared.save_state(STATE_SEEN, all);
+        }
+        self.shared.save_state(STATE_SEEN_RECENT, recent);
     }
 
     // ----- Directory server -----
@@ -957,7 +1072,9 @@ impl Node {
             | DirMsg::GetDocument { .. }
             | DirMsg::TokenRequest { .. }
             | DirMsg::Register { .. } => {
-                self.serve_request(peer, msg);
+                if self.directory_request_allowed(peer) {
+                    self.serve_request(peer, msg);
+                }
             }
             answer => {
                 let mut pending = lock(&self.vol().pending);
@@ -970,12 +1087,27 @@ impl Node {
         }
     }
 
+    /// Whether another request from the link to `peer` is answered this
+    /// minute. Beyond that they are dropped: each answer would wait for
+    /// the link's cover ticks, and the queue would grow without end.
+    fn directory_request_allowed(&self, peer: PublicIdentity) -> bool {
+        let now = Instant::now();
+        let mut rate = lock(&self.vol().requests);
+        let (start, n) = rate.entry(peer).or_insert((now, 0));
+        if now.duration_since(*start) >= Duration::from_secs(60) {
+            (*start, *n) = (now, 0);
+        }
+        *n += 1;
+        *n <= MAX_DIRECTORY_REQUESTS_PER_MINUTE
+    }
+
     pub(crate) fn dir_busy(&self, peer: &PublicIdentity) -> bool {
         lock(&self.vol().pending).values().any(|(p, _)| p == peer)
     }
 
     pub(crate) fn dir_link_closed(&self, peer: &PublicIdentity) {
         lock(&self.vol().pending).retain(|_, (p, _)| p != peer);
+        lock(&self.vol().requests).remove(peer);
     }
 }
 
@@ -1029,6 +1161,35 @@ fn decode_subs(b: &[u8]) -> threnody_core::Result<Vec<Subscription>> {
     }
     finish(&d)?;
     Ok(out)
+}
+
+fn encode_seen(seen: &Seen) -> threnody_core::Result<Vec<u8>> {
+    let size = 64 + seen.values().map(|n| 16 + n.len() * 52).sum::<usize>();
+    cbor::to_vec(size, |e| {
+        e.array_len(seen.len())?;
+        for (epoch, nyms) in seen {
+            e.array_len(2)?.u32(*epoch)?.array_len(nyms.len())?;
+            for n in nyms {
+                e.bytes(n)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn decode_seen(b: &[u8]) -> threnody_core::Result<Seen> {
+    let mut d = Decoder::new(b);
+    let mut seen = Seen::new();
+    for _ in 0..d.array_len()? {
+        d.array_len()?;
+        let epoch = d.u32()?;
+        let nyms = seen.entry(epoch).or_default();
+        for _ in 0..d.array_len()? {
+            nyms.insert(fixed_bytes::<{ credential::PSEUDONYM_LEN }>(&mut d)?);
+        }
+    }
+    finish(&d)?;
+    Ok(seen)
 }
 
 fn encode_wallet(w: &Wallet) -> threnody_core::Result<Vec<u8>> {
@@ -1145,6 +1306,130 @@ mod tests {
         let v6a: IpAddr = "2001:db8:1:2:3::1".parse().unwrap();
         let v6b: IpAddr = "2001:db8:1:2:4::1".parse().unwrap();
         assert_eq!(network(v6a), network(v6b));
+    }
+
+    #[tokio::test]
+    async fn one_link_gets_only_so_many_directory_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = threnody_core::store::Home::new(dir.path().join("d"));
+        let identity = home.create_identity(None).unwrap();
+        let (d, _rx) = Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        d.serve_directory("127.0.0.1:7450", false).unwrap();
+        let ask = |id| DirMsg::GetKey { id }.encode().unwrap();
+        let stranger = threnody_core::Identity::generate().public();
+        let mut out = d.fake_anon_link(stranger, "192.0.2.1:1".parse().unwrap());
+        // Each answer is kilobytes and waits for a cover tick: a stream of
+        // tiny requests must not pile them up without end.
+        for id in 0..200 {
+            d.on_directory(stranger, &ask(id));
+        }
+        let mut answers = 0;
+        while out.try_recv().is_ok() {
+            answers += 1;
+        }
+        assert_eq!(answers, MAX_DIRECTORY_REQUESTS_PER_MINUTE as usize);
+        // Another link has its own allowance.
+        let other = threnody_core::Identity::generate().public();
+        let mut out = d.fake_anon_link(other, "198.51.100.1:1".parse().unwrap());
+        d.on_directory(other, &ask(1000));
+        assert!(out.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn spent_token_pseudonyms_survive_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |create: bool| {
+            let home = threnody_core::store::Home::new(dir.path().join("v"));
+            let identity = if create {
+                home.create_identity(None).unwrap()
+            } else {
+                home.load_identity(None).unwrap()
+            };
+            Node::new(crate::NodeConfig {
+                home,
+                identity,
+                policy: crate::AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+            .0
+        };
+        let today = credential::day(now_ms());
+        let nym = [7u8; credential::PSEUDONYM_LEN];
+        let v = open(true);
+        assert!(v.spend_pseudonym(today, nym));
+        assert!(!v.spend_pseudonym(today, nym));
+        v.shutdown();
+        // A relay that restarts must not take the same slot again.
+        let v = open(false);
+        assert!(!v.spend_pseudonym(today, nym));
+        assert!(v.spend_pseudonym(today, [8u8; credential::PSEUDONYM_LEN]));
+    }
+
+    #[tokio::test]
+    async fn spent_pseudonyms_are_saved_in_batches_off_the_circuit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |create: bool| {
+            let home = threnody_core::store::Home::new(dir.path().join("v"));
+            let identity = if create {
+                home.create_identity(None).unwrap()
+            } else {
+                home.load_identity(None).unwrap()
+            };
+            Node::new(crate::NodeConfig {
+                home,
+                identity,
+                policy: crate::AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+            .0
+        };
+        let saved = |v: &Node, name: &str| {
+            let b = v.shared.home.load_state(v.identity_ref(), name).unwrap();
+            b.map_or(0, |b| {
+                decode_seen(&b).unwrap().values().map(HashSet::len).sum()
+            })
+        };
+        let today = credential::day(now_ms());
+        let nym = |i: usize| {
+            let mut n = [0u8; credential::PSEUDONYM_LEN];
+            n[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            n
+        };
+        let v = open(true);
+        // A CREATE paying with a token doesn't wait for a disk write.
+        assert!(v.spend_pseudonym(today, nym(0)));
+        assert_eq!(saved(&v, STATE_SEEN) + saved(&v, STATE_SEEN_RECENT), 0);
+        tokio::time::sleep(SEEN_SAVE_DELAY * 2).await;
+        assert_eq!(saved(&v, STATE_SEEN_RECENT), 1);
+        // New ones are saved apart until there are enough to fold in, so
+        // the whole set is rewritten only now and then.
+        for i in 1..SEEN_FOLD + 10 {
+            assert!(v.spend_pseudonym(today, nym(i)));
+            if i % 64 == 0 {
+                tokio::time::sleep(SEEN_SAVE_DELAY * 2).await;
+            }
+        }
+        tokio::time::sleep(SEEN_SAVE_DELAY * 2).await;
+        assert!(saved(&v, STATE_SEEN) >= SEEN_FOLD);
+        assert!(saved(&v, STATE_SEEN_RECENT) < SEEN_FOLD);
+        // A relay that stops without shutting down keeps all but the last
+        // moment's.
+        drop(v);
+        let v = open(false);
+        for i in 0..SEEN_FOLD + 10 {
+            assert!(!v.spend_pseudonym(today, nym(i)), "{i} paid again");
+        }
     }
 
     #[test]

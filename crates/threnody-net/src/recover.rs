@@ -189,6 +189,22 @@ impl RecoverState {
     }
 }
 
+/// Link ticks between heartbeats inside a relay or onion circuit: a
+/// heartbeat frame there (its ratchet header alone is over 2 KB) takes
+/// two cells, and a constant-rate link carries one per tick, so beating
+/// at the link's rate would queue cells on it without end.
+const INNER_BEAT_TICKS: u32 = 16;
+/// The slowest heartbeat a peer's lease allows for (see [`lease_for`]).
+const MAX_BEAT: Duration = Duration::from_secs(120);
+
+/// The heartbeat of a session inside a relay or onion circuit, over links
+/// sending one frame per `rate` (or, with no cover, as fast as they like).
+pub(crate) fn inner_beat_for(rate: Option<Duration>) -> Duration {
+    rate.map_or(HEARTBEAT, |r| {
+        (r * INNER_BEAT_TICKS).clamp(HEARTBEAT, MAX_BEAT)
+    })
+}
+
 /// The lease for a peer whose heartbeat is `beat_ms`.
 pub(crate) fn lease_for(beat_ms: u64) -> Duration {
     Duration::from_millis(beat_ms.clamp(500, 120_000)) * LEASE_BEATS + Duration::from_secs(2)
@@ -230,7 +246,17 @@ impl Node {
         self.constant_rate().unwrap_or(HEARTBEAT).min(HEARTBEAT)
     }
 
-    fn our_paths(&self) -> Paths {
+    /// Our heartbeat in a session inside a relay or onion circuit
+    /// (`inner`), else on a link.
+    pub(crate) fn beat_for(&self, inner: bool) -> Duration {
+        if inner {
+            inner_beat_for(self.constant_rate())
+        } else {
+            self.beat()
+        }
+    }
+
+    fn our_paths(&self, inner: bool) -> Paths {
         let main = lock(&self.rdv().inner).candidates.clone();
         let standby = if self.rec().warm.load(Ordering::Relaxed) {
             lock(&self.rec().standby)
@@ -243,26 +269,28 @@ impl Node {
         Paths {
             main,
             standby,
-            beat_ms: self.beat().as_millis() as u64,
+            beat_ms: self.beat_for(inner).as_millis() as u64,
         }
     }
 
-    /// The `Paths` message for a peer, when rendezvous is on.
-    pub(crate) fn paths_message(&self) -> Option<AppMessage> {
+    /// The `Paths` message for a peer, when rendezvous is on: for a
+    /// session inside a relay or onion circuit when `inner`, which beats
+    /// more slowly.
+    pub(crate) fn paths_message(&self, inner: bool) -> Option<AppMessage> {
         if !self.reach_enabled() {
             return None;
         }
-        self.our_paths().encode().ok().map(AppMessage::Paths)
+        self.our_paths(inner).encode().ok().map(AppMessage::Paths)
     }
 
     /// Tells every approved peer on a direct session our current paths.
     pub(crate) fn broadcast_paths(&self) {
-        let Some(msg) = self.paths_message() else {
-            return;
-        };
         for s in self.sessions() {
-            if self.supports(&s.peer, FEATURE_PATHS) && self.shared.mutual(&s.peer) {
-                let _ = self.send(&s.peer, msg.clone());
+            if self.supports(&s.peer, FEATURE_PATHS)
+                && self.shared.mutual(&s.peer)
+                && let Some(msg) = self.paths_message(s.via.is_some())
+            {
+                let _ = self.send(&s.peer, msg);
             }
         }
     }
@@ -864,6 +892,100 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeats_inside_circuits_leave_room_on_constant_rate_links() {
+        for rate in [500, 2000, 5000, 10_000, 30_000].map(Duration::from_millis) {
+            let beat = inner_beat_for(Some(rate));
+            // A heartbeat frame inside a circuit (its ratchet header is
+            // over 2 KB) takes two cells, and a link carries one per tick:
+            // heartbeats use at most an eighth of a link, or, with very
+            // slow cover, as little as the peer's lease allows.
+            assert!(
+                beat >= rate * 16 || beat == MAX_BEAT,
+                "{beat:?} at {rate:?}"
+            );
+            assert!(beat >= rate * 4, "{beat:?} at {rate:?}");
+            // And the peer's lease, from the beat we tell it, still holds.
+            assert!(lease_for(beat.as_millis() as u64) > beat * 2);
+        }
+        assert_eq!(inner_beat_for(None), HEARTBEAT);
+    }
+
+    type Events = tokio::sync::mpsc::UnboundedReceiver<Event>;
+
+    fn test_node(dir: &tempfile::TempDir, name: &str) -> (Node, Events) {
+        let home = threnody_core::store::Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_heartbeats_follow_the_cover_rate_they_advertise() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, mut arx) = test_node(&dir, "a");
+        let (c, mut crx) = test_node(&dir, "c");
+        // A phone on mobile data: slow cover, so a slow beat in circuits.
+        a.set_constant_rate(Some(Duration::from_secs(10)));
+        // A session inside a relay circuit (the relay itself plays no part).
+        let relay = threnody_core::Identity::generate().public();
+        let (x, y) = tokio::io::duplex(1 << 20);
+        let ((x, ax), (y, cy)) = tokio::join!(
+            async {
+                let mut x = x;
+                let ch = crate::handshake::initiate(&mut x, a.identity_ref()).await;
+                (x, ch.unwrap())
+            },
+            async {
+                let mut y = y;
+                let ch = crate::handshake::accept(&mut y, c.identity_ref()).await;
+                (y, ch.unwrap())
+            },
+        );
+        a.spawn_relayed_session(x, ax, relay, true);
+        c.spawn_relayed_session(y, cy, relay, false);
+        a.set_approval(&c.identity(), true).unwrap();
+        c.set_approval(&a.identity(), true).unwrap();
+        for rx in [&mut arx, &mut crx] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !matches!(
+                    rx.recv().await,
+                    Some(Event::ApprovalChanged { mutual: true, .. }) | None
+                ) {}
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // It joins Wi-Fi: faster cover, and new addresses to tell contacts.
+        // Then back to mobile data, with nothing else to tell, and then
+        // cover goes off. The lease `c` gives `a` must hold through each.
+        for rate in [Some(2), Some(10), None] {
+            a.set_constant_rate(rate.map(Duration::from_secs));
+            if rate == Some(2) {
+                a.broadcast_paths();
+            }
+            let ended = tokio::time::timeout(Duration::from_secs(600), async {
+                loop {
+                    match crx.recv().await {
+                        Some(Event::Disconnected { reason, .. }) => return reason,
+                        None => return "closed".into(),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            assert!(ended.is_err(), "ended at {rate:?} s: {ended:?}");
+            assert!(c.sessions().iter().any(|s| s.peer == a.identity()));
+        }
+    }
 
     #[test]
     fn saved_peers_round_trip() {

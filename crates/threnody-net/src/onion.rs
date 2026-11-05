@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{NetError, Result};
 use crate::handshake;
+use crate::mailbox::DepositStatus;
 use crate::node::{Node, lock};
 
 /// Most circuits one neighbour may hold through us.
@@ -33,6 +34,13 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const VOLUNTEER_STEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Circuits this node carries for others through anonymous links, at most.
 pub const MAX_STRANGER_HOPS: usize = 4096;
+/// Of those, at most this many from one network (a /24 or a /56), so a
+/// few addresses can't take them all.
+pub const MAX_STRANGER_HOPS_PER_NETWORK: usize = 256;
+/// A hop that hasn't extended, begun a stream or finished a deposit this
+/// long after its CREATE is torn down. Building a circuit through
+/// volunteers takes at most a minute.
+const HOP_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long an anonymous deposit may take once its circuit is up.
 const DEPOSIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Anonymous deposits we accept per neighbour per minute: the depositor is
@@ -156,6 +164,28 @@ impl OnionMsg {
 
 type Link = (PublicIdentity, u64);
 
+/// The circuit an encoded onion message is for, read without copying its
+/// cell.
+pub(crate) fn circ_of(b: &[u8]) -> Option<u64> {
+    let mut dec = Decoder::new(b);
+    let mut circ = None;
+    read_map(&mut dec, |k, d| {
+        if k == 1 {
+            circ = Some(d.u64()?);
+            return Ok(true);
+        }
+        Ok(false)
+    })
+    .ok()?;
+    circ
+}
+
+/// Tests only: an encoded DESTROY for `circ`.
+#[cfg(test)]
+pub(crate) fn test_destroy(circ: u64) -> Vec<u8> {
+    OnionMsg::Destroy { circ }.encode().unwrap()
+}
+
 /// One hop of a circuit we build.
 #[derive(Clone, Debug)]
 pub(crate) struct Hop {
@@ -206,10 +236,40 @@ struct RelayHop {
     /// May extend: the circuit came from a mutually approved neighbour, or
     /// paid with a token. Others may only end here (BEGIN or DEPOSIT).
     full: bool,
+    /// Came from a mutually approved neighbour's session: only such a
+    /// circuit may go on to our contacts. A paid one goes on only to the
+    /// address its EXTEND names, or a stranger could reach, and probe for,
+    /// people who relay for their contacts alone.
+    contact: bool,
     next: Option<Link>,
     endpoint: Option<mpsc::UnboundedSender<Vec<u8>>>,
     /// An anonymous mailbox deposit being received.
     deposit: Option<PendingDeposit>,
+    /// Where an anonymous link's far end is (for per-network limits).
+    net: Option<[u8; 16]>,
+    /// When the CREATE came: tells this hop from a later one on the same
+    /// link circuit.
+    born: Instant,
+}
+
+impl RelayHop {
+    fn new(keys: HopKeys, contact: bool, paid: bool, net: Option<[u8; 16]>) -> Self {
+        Self {
+            keys,
+            full: contact || paid,
+            contact,
+            next: None,
+            endpoint: None,
+            deposit: None,
+            net,
+            born: Instant::now(),
+        }
+    }
+
+    /// Carries a circuit on, or is its end.
+    fn in_use(&self) -> bool {
+        self.next.is_some() || self.endpoint.is_some()
+    }
 }
 
 struct PendingDeposit {
@@ -228,65 +288,46 @@ pub(crate) struct OnionState {
     extending: HashMap<Link, Link>,
     /// Our own circuits: first-hop link circuit -> backward cells.
     origins: HashMap<Link, mpsc::UnboundedSender<Cell>>,
-    /// Cover traffic state for our own circuits.
-    cover_traffic: HashMap<Link, CoverTrafficState>,
     /// Our first-hop CREATEs awaiting CREATED.
     creating: HashMap<Link, oneshot::Sender<CreatedFields>>,
-    /// Per neighbour: start of the current minute and deposits in it.
-    deposit_rate: HashMap<PublicIdentity, (Instant, u32)>,
+    /// Per carrier: start of the current minute and deposits in it.
+    deposit_rate: HashMap<Carrier, (Instant, u32)>,
     /// Link circuits that run over anonymous links rather than sessions.
     anon: HashSet<Link>,
-    /// Per neighbour: start of the current minute and tokens checked in it.
-    token_rate: HashMap<PublicIdentity, (Instant, u32)>,
-}
-
-/// State for cover traffic on a circuit we initiated.
-struct CoverTrafficState {
-    /// Interval for cover cells (None = disabled).
-    interval: Option<Duration>,
-    /// Timer handle for periodic dummy cell sending.
-    timer: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl CoverTrafficState {
-    fn new(interval: Duration, _link: Link, node: Node) -> Self {
-        let mut state = Self {
-            interval: Some(interval),
-            timer: None,
-        };
-        state.start(node);
-        state
-    }
-
-    fn start(&mut self, node: Node) {
-        if self.interval.is_none() || self.timer.is_some() {
-            return;
-        }
-        let interval = self.interval.unwrap();
-        let timer = tokio::spawn(async move {
-            let mut interval_timer = tokio::time::interval(interval);
-            interval_timer.tick().await; // skip immediate tick
-            loop {
-                interval_timer.tick().await;
-                node.send_onion_cover_cell();
-            }
-        });
-        self.timer = Some(timer);
-    }
-
-    fn stop(&mut self) {
-        if let Some(timer) = self.timer.take() {
-            timer.abort();
-        }
-        self.interval = None;
-    }
+    /// Per carrier: start of the current minute and tokens checked in it.
+    token_rate: HashMap<Carrier, (Instant, u32)>,
 }
 
 /// Relay tokens checked per neighbour per minute: each costs pairings.
 pub const MAX_TOKEN_CHECKS_PER_MINUTE: u32 = 120;
+/// Anonymous deposits still arriving may hold this many bytes in all.
+const MAX_PENDING_DEPOSIT_BYTES: usize = 4 * crate::mailbox::MAX_HELD_BYTES;
+
+/// Who answers for a circuit: the neighbour that carried it to us or,
+/// over an anonymous link, where any identity costs nothing, its network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Carrier {
+    Peer(PublicIdentity),
+    Network([u8; 16]),
+}
+
+impl Carrier {
+    fn of(link: &Link, net: Option<[u8; 16]>) -> Self {
+        net.map_or(Self::Peer(link.0), Self::Network)
+    }
+}
 
 impl OnionState {
-    fn token_check_allowed(&mut self, from: PublicIdentity) -> bool {
+    /// Whether another stranger's hop fits, from network `net`.
+    fn stranger_room(&self, net: Option<[u8; 16]>) -> bool {
+        let strangers = self.hops.iter().filter(|(l, _)| self.anon.contains(l));
+        let (all, here) = strangers.fold((0, 0), |(a, n), (_, h)| {
+            (a + 1, n + usize::from(net.is_some() && h.net == net))
+        });
+        all < MAX_STRANGER_HOPS && here < MAX_STRANGER_HOPS_PER_NETWORK
+    }
+
+    fn token_check_allowed(&mut self, from: Carrier) -> bool {
         let now = Instant::now();
         if self.token_rate.len() > 4 * MAX_STRANGER_HOPS {
             self.token_rate
@@ -300,8 +341,12 @@ impl OnionState {
         *n <= MAX_TOKEN_CHECKS_PER_MINUTE
     }
 
-    fn deposit_allowed(&mut self, from: PublicIdentity) -> bool {
+    fn deposit_allowed(&mut self, from: Carrier) -> bool {
         let now = Instant::now();
+        if self.deposit_rate.len() > 4 * MAX_STRANGER_HOPS {
+            self.deposit_rate
+                .retain(|_, (s, _)| now.duration_since(*s) < Duration::from_secs(60));
+        }
         let (start, n) = self.deposit_rate.entry(from).or_insert((now, 0));
         if now.duration_since(*start) >= Duration::from_secs(60) {
             (*start, *n) = (now, 0);
@@ -309,12 +354,43 @@ impl OnionState {
         *n += 1;
         *n <= MAX_DEPOSITS_PER_MINUTE
     }
+
+    /// Whether `more` bytes of the deposit arriving over hop `up` may be
+    /// kept: while they arrive, deposits are held in memory. What has
+    /// arrived counts, not what a deposit's head claims, so holding room
+    /// costs sending the bytes. Our contacts' circuits and everyone else's
+    /// have room of their own, and within each one carrier (a contact, a
+    /// stranger's network) may hold only one deposit's worth.
+    fn deposit_room(&self, up: &Link, more: usize) -> bool {
+        let Some(hop) = self.hops.get(up) else {
+            return false;
+        };
+        let carrier = Carrier::of(up, hop.net);
+        let (all, here) = self
+            .hops
+            .iter()
+            .filter(|(_, h)| h.contact == hop.contact)
+            .filter_map(|(l, h)| {
+                h.deposit
+                    .as_ref()
+                    .map(|d| (Carrier::of(l, h.net), d.sealed.len()))
+            })
+            .fold((0, 0), |(a, n), (c, len)| {
+                (a + len, n + if c == carrier { len } else { 0 })
+            });
+        all + more <= MAX_PENDING_DEPOSIT_BYTES && here + more <= crate::mailbox::MAX_HELD_BYTES
+    }
 }
 
 impl Node {
     fn onion_send(&self, to: &PublicIdentity, m: &OnionMsg) -> bool {
-        let Ok(b) = m.encode() else { return false };
         let anon = lock(&self.shared.onion).anon.contains(&(*to, m.circ()));
+        self.onion_send_via(to, m, anon)
+    }
+
+    /// Sends over the anonymous link to `to` when `anon`, else its session.
+    fn onion_send_via(&self, to: &PublicIdentity, m: &OnionMsg, anon: bool) -> bool {
+        let Ok(b) = m.encode() else { return false };
         if anon {
             return self.anon_send(to, AppMessage::Onion(b));
         }
@@ -344,10 +420,6 @@ impl Node {
         }
     }
 
-    /// Cover traffic interval for onion circuits (default 2s, same as link layer).
-    #[allow(dead_code)]
-    const ONION_COVER_INTERVAL: Duration = Duration::from_secs(2);
-
     fn onion_create(
         &self,
         from: PublicIdentity,
@@ -357,43 +429,68 @@ impl Node {
         anon: bool,
     ) {
         let contact = !anon && self.shared.mutual(&from);
+        let net = self
+            .anon_addr(&from)
+            .filter(|_| anon)
+            .map(|a| crate::volunteer::network(a.ip()));
         let admitted = {
-            let mut st = lock(&self.shared.onion);
-            let strangers = st.hops.keys().filter(|l| st.anon.contains(l)).count();
-            let ok = !st.hops.contains_key(&(from, circ))
+            let st = lock(&self.shared.onion);
+            !st.hops.contains_key(&(from, circ))
                 && st.hops.keys().filter(|(p, _)| *p == from).count() < MAX_CIRCUITS_PER_PEER
-                && (contact || strangers < MAX_STRANGER_HOPS);
-            if ok && anon {
-                st.anon.insert((from, circ));
-            }
-            ok
+                && (contact || st.stranger_room(net))
         };
         // A stranger's circuit may end here; it goes further only if paid.
-        let full = contact
-            || token.is_some_and(|t| {
+        let paid = !contact
+            && token.is_some_and(|t| {
                 admitted
-                    && lock(&self.shared.onion).token_check_allowed(from)
+                    && lock(&self.shared.onion).token_check_allowed(Carrier::of(&(from, circ), net))
                     && self.accept_token(t, e_pub)
             });
         let responded = admitted
             .then(|| onion::respond(self.identity_ref(), e_pub).ok())
             .flatten();
         let Some((keys, ct, sig)) = responded else {
-            self.onion_send(&from, &OnionMsg::Destroy { circ });
+            // Back the way it came; nothing of it is kept.
+            self.onion_send_via(&from, &OnionMsg::Destroy { circ }, anon);
             return;
         };
-        lock(&self.shared.onion).hops.insert(
-            (from, circ),
-            RelayHop {
-                keys,
-                full,
-                next: None,
-                endpoint: None,
-                deposit: None,
-            },
-        );
+        {
+            let mut st = lock(&self.shared.onion);
+            if anon {
+                st.anon.insert((from, circ));
+            }
+            let hop = RelayHop::new(keys, contact, paid, net);
+            self.watch_hop((from, circ), hop.born);
+            st.hops.insert((from, circ), hop);
+        }
         let id = *self.identity().as_bytes();
         self.onion_send(&from, &OnionMsg::Created { circ, id, ct, sig });
+    }
+
+    /// Tears hop `up` down if it still goes nowhere after
+    /// [`HOP_SETUP_TIMEOUT`]: a stranger could otherwise hold it, and its
+    /// share of the hops, for as long as its link stays up.
+    fn watch_hop(&self, up: Link, born: Instant) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let node = self.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(HOP_SETUP_TIMEOUT).await;
+            let (stalled, depositing) = lock(&node.shared.onion)
+                .hops
+                .get(&up)
+                .filter(|h| h.born == born && !h.in_use())
+                .map_or((false, false), |h| (true, h.deposit.is_some()));
+            if depositing {
+                let declined = DepositStatus::Declined as u8;
+                node.onion_reply(up, &Payload::new(Cmd::Deposited, vec![declined]));
+            }
+            if stalled {
+                node.onion_send(&up.0, &OnionMsg::Destroy { circ: up.1 });
+                node.onion_destroy(up, true);
+            }
+        });
     }
 
     fn onion_created(
@@ -407,19 +504,17 @@ impl Node {
         let mut st = lock(&self.shared.onion);
         if let Some(tx) = st.creating.remove(&(from, circ)) {
             let _ = tx.send((id, ct, sig));
-            // Circuit is fully established; start cover traffic if enabled.
-            let interval = *self.shared.constant_rate.borrow();
-            if let Some(interval) = interval {
-                let link = (from, circ);
-                let cover_state = CoverTrafficState::new(interval, link, self.clone());
-                st.cover_traffic.insert(link, cover_state);
-            }
             return;
         }
         let Some(up) = st.extending.remove(&(from, circ)) else {
             return;
         };
         let Some(hop) = st.hops.get_mut(&up) else {
+            // The circuit went while the next hop was being made: that hop
+            // goes too, or it would sit there taking up a circuit slot.
+            drop(st);
+            self.onion_send(&from, &OnionMsg::Destroy { circ });
+            lock(&self.shared.onion).anon.remove(&(from, circ));
             return;
         };
         hop.next = Some((from, circ));
@@ -513,8 +608,19 @@ impl Node {
                 let Some(hop) = st.hops.get_mut(&up) else {
                     return;
                 };
-                if let Some(d) = &mut hop.deposit {
-                    d.sealed.extend_from_slice(&p.data);
+                if hop.deposit.is_some() {
+                    let fits = st.deposit_room(&up, p.data.len());
+                    let Some(hop) = st.hops.get_mut(&up) else {
+                        return;
+                    };
+                    if fits && let Some(d) = &mut hop.deposit {
+                        d.sealed.extend_from_slice(&p.data);
+                    } else {
+                        // No room for the rest: none of it is kept.
+                        hop.deposit = None;
+                        drop(st);
+                        return self.onion_deposited(up, DepositStatus::Declined);
+                    }
                     drop(st);
                     self.onion_deposit_check(up);
                 } else if let Some(tx) = hop.endpoint.clone() {
@@ -535,19 +641,26 @@ impl Node {
         let Ok(req) = ExtendReq::decode(data) else {
             return fail(self);
         };
-        let allowed = lock(&self.shared.onion)
-            .hops
-            .get(&up)
-            .is_some_and(|h| h.full && h.next.is_none());
+        let (allowed, from_contact) = {
+            let st = lock(&self.shared.onion);
+            // One extension at a time: a second would orphan the first.
+            let extending = st.extending.values().any(|u| *u == up);
+            st.hops.get(&up).map_or((false, false), |h| {
+                (h.full && h.next.is_none() && !extending, h.contact)
+            })
+        };
         if !allowed {
             return fail(self);
         }
-        let contact = self
-            .sessions()
-            .into_iter()
-            .find(|s| s.via.is_none() && s.peer.fingerprint() == req.to && s.peer != up.0)
-            .map(|s| s.peer)
-            .filter(|p| self.shared.mutual(p));
+        let contact = from_contact
+            .then(|| {
+                self.sessions()
+                    .into_iter()
+                    .find(|s| s.via.is_none() && s.peer.fingerprint() == req.to && s.peer != up.0)
+                    .map(|s| s.peer)
+                    .filter(|p| self.shared.mutual(p))
+            })
+            .flatten();
         let c = u64::from_le_bytes(random_bytes());
         if let Some(next) = contact {
             lock(&self.shared.onion).extending.insert((next, c), up);
@@ -573,6 +686,9 @@ impl Node {
             };
             {
                 let mut st = lock(&node.shared.onion);
+                if !st.hops.contains_key(&up) {
+                    return;
+                }
                 st.anon.insert((next, c));
                 st.extending.insert((next, c), up);
             }
@@ -595,19 +711,28 @@ impl Node {
     /// We are the circuit's last hop and a mailbox: someone, hidden from us,
     /// leaves a sealed message for one of our contacts.
     fn onion_deposit_start(&self, up: Link, data: &[u8]) {
+        let head = data.get(..DEPOSIT_HEAD).and_then(|h| {
+            let to: [u8; 32] = h[..32].try_into().ok()?;
+            let total = u32::from_be_bytes(h[32..].try_into().ok()?) as usize;
+            (total <= crate::mailbox::MAX_HELD_BYTES).then_some((to, total))
+        });
+        // Only for our own mutually approved contacts: anything else would
+        // be declined once complete, so it is declined before it is kept.
+        let head = head
+            .filter(|(to, _)| PublicIdentity::from_bytes(to).is_ok_and(|d| self.shared.mutual(&d)));
         let started = {
             let mut st = lock(&self.shared.onion);
-            let free = st
-                .hops
-                .get(&up)
+            let hop = st.hops.get(&up);
+            let free = hop
                 .is_some_and(|h| h.next.is_none() && h.endpoint.is_none() && h.deposit.is_none());
-            let head = data.get(..DEPOSIT_HEAD).and_then(|h| {
-                let to: [u8; 32] = h[..32].try_into().ok()?;
-                let total = u32::from_be_bytes(h[32..].try_into().ok()?) as usize;
-                (total <= crate::mailbox::MAX_HELD_BYTES).then_some((to, total))
-            });
+            let net = hop.and_then(|h| h.net);
+            let first = data.len().saturating_sub(DEPOSIT_HEAD);
             match head {
-                Some((to, total)) if free && st.deposit_allowed(up.0) => {
+                Some((to, total))
+                    if free
+                        && st.deposit_room(&up, first)
+                        && st.deposit_allowed(Carrier::of(&up, net)) =>
+                {
                     if let Some(h) = st.hops.get_mut(&up) {
                         h.deposit = Some(PendingDeposit {
                             to,
@@ -623,7 +748,7 @@ impl Node {
         if started {
             self.onion_deposit_check(up);
         } else {
-            self.onion_deposited(up, crate::mailbox::DepositStatus::Declined);
+            self.onion_deposited(up, DepositStatus::Declined);
         }
     }
 
@@ -641,14 +766,19 @@ impl Node {
         };
         let Some(d) = done else { return };
         let status = if d.sealed.len() == d.total {
-            self.store_deposit(d.to, d.sealed)
+            // The depositor could be anyone: "delivered now" would tell
+            // them the recipient is online. Held says all they need.
+            match self.store_deposit(d.to, d.sealed) {
+                DepositStatus::Delivered => DepositStatus::Held,
+                s => s,
+            }
         } else {
-            crate::mailbox::DepositStatus::Declined
+            DepositStatus::Declined
         };
         self.onion_deposited(up, status);
     }
 
-    fn onion_deposited(&self, up: Link, status: crate::mailbox::DepositStatus) {
+    fn onion_deposited(&self, up: Link, status: DepositStatus) {
         self.onion_reply(up, &Payload::new(Cmd::Deposited, vec![status as u8]));
         self.onion_destroy(up, true);
     }
@@ -711,10 +841,6 @@ impl Node {
         let mut notify = Vec::new();
         {
             let mut st = lock(&self.shared.onion);
-            // Stop cover traffic for this circuit if we initiated it
-            if let Some(mut ct) = st.cover_traffic.remove(&link) {
-                ct.stop();
-            }
             st.origins.remove(&link);
             st.creating.remove(&link);
             st.extending.remove(&link);
@@ -722,6 +848,17 @@ impl Node {
                 if let Some(next) = hop.next {
                     st.down.remove(&next);
                     notify.push(next);
+                }
+                // A next hop still being made goes too.
+                let making: Vec<Link> = st
+                    .extending
+                    .iter()
+                    .filter(|(_, up)| **up == link)
+                    .map(|(down, _)| *down)
+                    .collect();
+                for down in making {
+                    st.extending.remove(&down);
+                    notify.push(down);
                 }
             } else if let Some(up) = st.down.remove(&link) {
                 if let Some(hop) = st.hops.remove(&up) {
@@ -757,6 +894,14 @@ impl Node {
         for l in links {
             self.onion_destroy(l, true);
         }
+    }
+
+    /// Circuit `link` has more cells waiting on its anonymous link than the
+    /// link can carry: it ends in both directions (its waiting cells are
+    /// gone), and the link carries on for its other circuits.
+    pub(crate) fn onion_overflowed(&self, link: Link) {
+        self.onion_send_via(&link.0, &OnionMsg::Destroy { circ: link.1 }, true);
+        self.onion_destroy(link, true);
     }
 
     /// Whether any circuit uses a link to `peer` (keeps anonymous links open).
@@ -951,7 +1096,7 @@ impl Node {
         route: &OnionRoute,
         to: &PublicIdentity,
         sealed: &[u8],
-    ) -> Result<crate::mailbox::DepositStatus> {
+    ) -> Result<DepositStatus> {
         let first = route.first;
         let (circ, mut onion, mut rx) = self.build_circuit(route).await?;
         let result = async {
@@ -986,10 +1131,8 @@ impl Node {
                     if let Ok((h, p)) = onion.unwrap(back)
                         && h == last
                         && p.cmd == Cmd::Deposited
-                        && let Some(status) = p
-                            .data
-                            .first()
-                            .and_then(|b| crate::mailbox::DepositStatus::from_wire(*b))
+                        && let Some(status) =
+                            p.data.first().and_then(|b| DepositStatus::from_wire(*b))
                     {
                         return Ok(status);
                     }
@@ -1012,7 +1155,7 @@ impl Node {
         mailbox: &PublicIdentity,
         to: &PublicIdentity,
         sealed: &[u8],
-    ) -> Result<crate::mailbox::DepositStatus> {
+    ) -> Result<DepositStatus> {
         let mut routes: Vec<OnionRoute> = self
             .onion_paths(mailbox.fingerprint(), &[to.fingerprint()], 2)
             .into_iter()
@@ -1184,58 +1327,307 @@ impl Node {
             "{dest} (no volunteer relays with tokens; subscribe to a directory)"
         )))
     }
-
-    /// Sends a dummy cover cell through all circuits we initiated.
-    /// This is called periodically to maintain constant-rate cover traffic
-    /// through onion circuits, so observers cannot distinguish real traffic
-    /// from padding.
-    fn send_onion_cover_cell(&self) {
-        let links: Vec<Link> = {
-            let st = lock(&self.shared.onion);
-            st.cover_traffic.keys().copied().collect()
-        };
-        for link in links {
-            self.send_onion_cover_cell_for_link(link);
-        }
-    }
-
-    /// Sends a single dummy cover cell through a specific circuit.
-    fn send_onion_cover_cell_for_link(&self, link: Link) {
-        // Build a cell that the first hop will forward
-        let mut st = lock(&self.shared.onion);
-        if let Some(hop) = st.hops.get_mut(&link) {
-            let dummy_payload =
-                Payload::new(Cmd::Data, threnody_core::crypto::random_bytes_vec(MAX_DATA));
-            if let Ok(cell) = hop.keys.relay_originate(&dummy_payload) {
-                drop(st);
-                self.onion_send(
-                    &link.0,
-                    &OnionMsg::Cell {
-                        circ: link.1,
-                        cell: cell.to_vec(),
-                    },
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AcceptPolicy, NodeConfig};
+    use threnody_core::store::Home;
+
+    fn test_node(dir: &tempfile::TempDir, name: &str) -> Node {
+        let home = Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+        .0
+    }
+
+    async fn listening(dir: &tempfile::TempDir, name: &str) -> (Node, Events, String) {
+        let home = Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        let (node, rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
+        (node, rx, addr)
+    }
+
+    type Events = mpsc::UnboundedReceiver<crate::Event>;
+
+    async fn mutual(x: &Node, xrx: &mut Events, y: &Node, yrx: &mut Events, yaddr: &str) {
+        let yid = x.connect(yaddr, None).await.unwrap();
+        x.set_approval(&yid, true).unwrap();
+        y.set_approval(&x.identity(), true).unwrap();
+        for rx in [xrx, yrx] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !matches!(
+                    rx.recv().await,
+                    Some(crate::Event::ApprovalChanged { mutual: true, .. }) | None
+                ) {}
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A hop on `node` for a circuit from `from`, as if it had been created.
+    fn fake_hop(node: &Node, from: PublicIdentity, circ: u64, contact: bool, paid: bool) -> Link {
+        let (_, e_pub) = CreateState::new(node.identity().fingerprint());
+        let (keys, _, _) = onion::respond(node.identity_ref(), &e_pub).unwrap();
+        let mut st = lock(&node.shared.onion);
+        if !contact {
+            st.anon.insert((from, circ));
+        }
+        st.hops
+            .insert((from, circ), RelayHop::new(keys, contact, paid, None));
+        (from, circ)
+    }
+
+    fn extend_to(to: Fingerprint) -> Vec<u8> {
+        ExtendReq {
+            to,
+            e_pub: CreateState::new(to).1,
+            addr: None,
+            token: None,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn paid_strangers_never_reach_the_relays_contacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v, mut vrx, _) = listening(&dir, "v").await;
+        let (x, mut xrx, xaddr) = listening(&dir, "x").await;
+        mutual(&v, &mut vrx, &x, &mut xrx, &xaddr).await;
+        let xfp = x.identity().fingerprint();
+        // A stranger's hop, paid with a token: an EXTEND naming the
+        // relay's contact, with no address, gets nowhere.
+        let stranger = threnody_core::Identity::generate().public();
+        let up = fake_hop(&v, stranger, 1, false, true);
+        v.onion_extend(up, &extend_to(xfp));
+        assert!(lock(&v.shared.onion).extending.is_empty());
+        // A contact's circuit still goes on to the relay's contacts.
+        let friend = threnody_core::Identity::generate().public();
+        let up = fake_hop(&v, friend, 2, true, false);
+        v.onion_extend(up, &extend_to(xfp));
+        assert_eq!(lock(&v.shared.onion).extending.len(), 1);
+    }
+
+    async fn eventually(what: &str, f: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    #[tokio::test]
+    async fn no_hop_is_left_behind_downstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v, mut vrx, _) = listening(&dir, "v").await;
+        let (x, mut xrx, xaddr) = listening(&dir, "x").await;
+        mutual(&v, &mut vrx, &x, &mut xrx, &xaddr).await;
+        let xfp = x.identity().fingerprint();
+        let friend = threnody_core::Identity::generate().public();
+        // EXTEND, then DESTROY before X's CREATED is back.
+        let up = fake_hop(&v, friend, 1, true, false);
+        v.onion_extend(up, &extend_to(xfp));
+        v.onion_destroy(up, true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eventually("X drops the hop", || x.onion_hops() == 0).await;
+        // One EXTEND at a time: a second one would orphan the first.
+        let up = fake_hop(&v, friend, 2, true, false);
+        v.onion_extend(up, &extend_to(xfp));
+        v.onion_extend(up, &extend_to(xfp));
+        assert_eq!(lock(&v.shared.onion).extending.len(), 1);
+        eventually("the circuit reaches X", || {
+            lock(&v.shared.onion)
+                .hops
+                .get(&up)
+                .is_some_and(|h| h.next.is_some())
+        })
+        .await;
+        v.onion_destroy(up, true);
+        eventually("X drops it with the circuit", || x.onion_hops() == 0).await;
+    }
+
+    fn create(circ: u64, e_pub: Vec<u8>) -> Vec<u8> {
+        OnionMsg::Create {
+            circ,
+            e_pub,
+            token: None,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refused_stranger_create_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "n");
+        let stranger = threnody_core::Identity::generate().public();
+        // Admitted, but the key is junk, so the hop is never made.
+        for circ in 0..8 {
+            node.on_onion_from(stranger, &create(circ, vec![1; 8]), true);
+        }
+        let st = lock(&node.shared.onion);
+        assert!(st.hops.is_empty());
+        assert!(st.anon.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hops_that_go_nowhere_are_torn_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "n");
+        let stranger = threnody_core::Identity::generate().public();
+        let (_, e_pub) = CreateState::new(node.identity().fingerprint());
+        node.on_onion_from(stranger, &create(1, e_pub), true);
+        assert_eq!(node.onion_hops(), 1);
+        tokio::time::sleep(HOP_SETUP_TIMEOUT - Duration::from_secs(1)).await;
+        assert_eq!(node.onion_hops(), 1);
+        // Never extended, began a stream or finished a deposit.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(node.onion_hops(), 0);
+        assert!(lock(&node.shared.onion).anon.is_empty());
+    }
+
+    #[test]
+    fn one_network_holds_only_part_of_the_stranger_hops() {
+        let me = threnody_core::Identity::generate();
+        let hop = || {
+            let (_, e_pub) = CreateState::new(me.public().fingerprint());
+            let (keys, _, _) = onion::respond(&me, &e_pub).unwrap();
+            keys
+        };
+        let mut st = OnionState::default();
+        let (here, there) = ([1; 16], [2; 16]);
+        for i in 0..MAX_STRANGER_HOPS_PER_NETWORK {
+            assert!(st.stranger_room(Some(here)));
+            let link = (threnody_core::Identity::generate().public(), i as u64);
+            st.anon.insert(link);
+            st.hops
+                .insert(link, RelayHop::new(hop(), false, false, Some(here)));
+        }
+        assert!(!st.stranger_room(Some(here)));
+        assert!(st.stranger_room(Some(there)));
+    }
 
     #[test]
     fn anonymous_deposits_are_rate_limited_per_neighbour() {
         let mut st = OnionState::default();
         let (x, y) = (
-            threnody_core::Identity::generate().public(),
-            threnody_core::Identity::generate().public(),
+            Carrier::Peer(threnody_core::Identity::generate().public()),
+            Carrier::Peer(threnody_core::Identity::generate().public()),
         );
         for _ in 0..MAX_DEPOSITS_PER_MINUTE {
             assert!(st.deposit_allowed(x));
         }
         assert!(!st.deposit_allowed(x));
         assert!(st.deposit_allowed(y));
+        // Over anonymous links identities are free: the network counts.
+        let stranger = |n| {
+            let link = (threnody_core::Identity::generate().public(), 1);
+            Carrier::of(&link, Some([n; 16]))
+        };
+        for _ in 0..MAX_DEPOSITS_PER_MINUTE {
+            assert!(st.deposit_allowed(stranger(1)));
+        }
+        assert!(!st.deposit_allowed(stranger(1)));
+        assert!(st.deposit_allowed(stranger(2)));
+    }
+
+    #[tokio::test]
+    async fn deposits_still_arriving_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "m");
+        let contact = threnody_core::Identity::generate().public();
+        node.set_approval(&contact, true).unwrap();
+        lock(&node.shared.contacts)
+            .get_mut(&contact)
+            .unwrap()
+            .remote_approved = true;
+        let deposit = |to: &PublicIdentity, total: usize| {
+            let mut d = to.as_bytes().to_vec();
+            d.extend_from_slice(&u32::try_from(total).unwrap().to_be_bytes());
+            d.extend_from_slice(&[0; 100]);
+            d
+        };
+        let pending = |node: &Node| {
+            lock(&node.shared.onion)
+                .hops
+                .values()
+                .filter(|h| h.deposit.is_some())
+                .count()
+        };
+        // Not our contact: declined at once, nothing buffered.
+        let stranger = threnody_core::Identity::generate().public();
+        let up = fake_hop(&node, stranger, 1, false, false);
+        let nobody = threnody_core::Identity::generate().public();
+        node.onion_deposit_start(up, &deposit(&nobody, 4096));
+        assert_eq!(pending(&node), 0);
+        // What counts is what has arrived, not what a head claims: one
+        // network may start several deposits.
+        let max = crate::mailbox::MAX_HELD_BYTES;
+        let hop_from = |n: u8, circ| {
+            let from = threnody_core::Identity::generate().public();
+            let up = fake_hop(&node, from, circ, false, false);
+            lock(&node.shared.onion).hops.get_mut(&up).unwrap().net = Some([n; 16]);
+            up
+        };
+        let data = |up: Link, len: usize| {
+            node.onion_recognized(up, Payload::new(Cmd::Data, vec![0; len]));
+        };
+        let a = hop_from(1, 2);
+        node.onion_deposit_start(a, &deposit(&contact, max));
+        let b = hop_from(1, 3);
+        node.onion_deposit_start(b, &deposit(&contact, max));
+        assert_eq!(pending(&node), 2);
+        // But together they may hold only so much from that network.
+        data(a, max / 2);
+        data(b, max / 2 - 200);
+        assert_eq!(pending(&node), 2);
+        data(b, 1);
+        assert_eq!(pending(&node), 1, "the deposit that went over is declined");
+        // And all strangers' deposits together only so much.
+        let nets = MAX_PENDING_DEPOSIT_BYTES / max;
+        for n in 2..=nets as u8 {
+            let up = hop_from(n, 10 + u64::from(n));
+            node.onion_deposit_start(up, &deposit(&contact, max));
+            data(up, max - 200);
+        }
+        assert_eq!(pending(&node), nets);
+        let late = hop_from(100, 200);
+        node.onion_deposit_start(late, &deposit(&contact, max));
+        assert_eq!(pending(&node), nets + 1);
+        // Its network has room, but all of them together do not.
+        data(late, max - 200);
+        assert_eq!(pending(&node), nets);
+        // Deposits over our contacts' circuits have their own room.
+        let up = fake_hop(
+            &node,
+            threnody_core::Identity::generate().public(),
+            300,
+            true,
+            false,
+        );
+        node.onion_deposit_start(up, &deposit(&contact, max));
+        data(up, max - 200);
+        assert_eq!(pending(&node), nets + 1);
     }
 
     #[test]

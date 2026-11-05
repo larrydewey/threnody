@@ -78,12 +78,12 @@ binding    = KDF("… relay token binding", e_pub)        the hop's ephemeral X-
 - **Issuing.** A client asks each directory for credentials for today and tomorrow, over a fresh anonymous link. A directory issues at most 8 per day to one network (an IPv4 /24 or an IPv6 /56). It learns an address, which says nothing about the circuits the credential later pays for.
 - **Spending.** For each circuit through a volunteer relay, the client picks an unused slot for that relay and day. The resulting pseudonym is the same whenever that slot is reused, and unrelated across slots, relays and days. A relay accepts a token if all of these hold:
   - it is for this relay;
-  - it is for today or yesterday;
+  - it is for today or yesterday, and its credential is for that same day (`expires_day` = epoch) and has no attributes. A credential valid on other days too would pay for their slots as well, and an attribute count, which every presentation shows, could mark one client's circuits; clients refuse such credentials from a directory too;
   - it is bound to the CREATE's `e_pub`;
   - a directory this relay is registered with issued it;
-  - its pseudonym hasn't been seen this epoch.
+  - its pseudonym hasn't been seen this epoch. Relays keep the pseudonyms of today and yesterday in encrypted state, so restarting doesn't let a spent slot pay again. New pseudonyms are saved together a second after the first of them (`relay-seen-recent`), and folded into the whole set (`relay-seen`) every 256, so a circuit never waits for the disk and a busy relay doesn't rewrite the whole set for each one. Shutting down saves at once; a relay that crashes may forget the last second's.
 
-  So one credential opens at most 64 circuits per relay per day, and the relay learns nothing else about it. A relay checks at most 120 tokens per neighbour per minute, since each check costs pairings.
+  So one credential opens at most 64 circuits per relay per day, and the relay learns nothing else about it. A relay checks at most 120 tokens per neighbour per minute, since each check costs pairings; over anonymous links, where identities are free, per neighbour network (a /24 or a /56).
 - **Clients** keep the credentials and used slots in encrypted state (`relay-wallet`). Used slots are never reused, and credentials older than yesterday are dropped.
 
 ## Circuits
@@ -98,8 +98,8 @@ EXTEND data          = to (20) || e_pub (1216) [ || flags (1) [|| u16 len || add
 
 Without the optional part, EXTEND is exactly Appendix I's.
 
-- **Who may create.** Any neighbour may CREATE a hop, but a hop may EXTEND only if it is *full*: the CREATE came from a mutually approved contact's session (as before), or carried a valid token. Other hops may only end there, with BEGIN (a session to that node, subject to its accept policy) or DEPOSIT (Appendix H, rate-limited). This is how a destination accepts the last relay's circuit without being a relay itself.
-- **Extending.** A full hop extends as before to a live, mutually approved contact. A volunteer relay may also dial the EXTEND's address over an anonymous link, pinned to `to`, and send CREATE with the EXTEND's token. Non-volunteers never dial addresses for others.
+- **Who may create.** Any neighbour may CREATE a hop, but a hop may EXTEND only if it is *full*: the CREATE came from a mutually approved contact's session (as before), or carried a valid token. Other hops may only end there, with BEGIN (a session to that node, subject to its accept policy) or DEPOSIT (Appendix H, rate-limited). This is how a destination accepts the last relay's circuit without being a relay itself. A node carries at most 4096 hops over anonymous links, at most 256 of them from one network (a /24 or a /56), and tears down any hop that hasn't extended or begun a stream within 120 s (Appendix I), so idle hops can't fill the space.
+- **Extending.** A hop a mutually approved contact created extends as before to a live, mutually approved contact. A volunteer relay may also dial the EXTEND's address over an anonymous link, pinned to `to`, and send CREATE with the EXTEND's token. A hop that is full only because it was paid extends only that way: a stranger's circuit never goes on to the relay's contacts, who relay for their own contacts alone, and an EXTEND naming one can't be used to ask whether someone is the operator's contact and online. Non-volunteers never dial addresses for others.
 - **Paths.** A client tries circuits in this order: two contact relays (Appendix I), then two volunteer relays. Then it dials directly, then uses relay circuits (Appendix G). A volunteer path is entered over an anonymous link with a fresh identity: `V1` (paid), then `V2` (paid, by address), then the destination (by its last known address). The two volunteers are picked from different networks when possible. Anonymous mailbox deposits (Appendix H) use the same fallback. Circuits over volunteers allow 20 s for the first hop and 40 s for each extension (60 s overall when reached automatically), since cover traffic on every link spaces messages.
 
 ## Registering
@@ -110,6 +110,8 @@ DirMsg = { 0: op, 1: id u64, ? 2: IssuerKey, ? 3: Document, ? 4: epoch, ? 5: com
 op: 1 get key, 2 key, 3 get document, 4 document, 5 token request, 6 token,
     7 register, 8 registered (status 1 listed, 2 pending review), 9 refused
 ```
+
+A node answers at most 12 requests per anonymous link per minute and ignores the rest: every answer, a document or key of several kilobytes, waits for the link's cover ticks, so a stream of tiny requests would otherwise pile answers up without end. An anonymous link holds at most 1024 waiting cells of one circuit and 4096 waiting messages in all. A volunteer's links carry many people's circuits, so when a link is that far behind, the circuit with the most cells waiting is torn down (in both directions, its waiting cells dropped) and the link carries on; only a link filled by directory messages alone is closed.
 
 A volunteer registers with every subscribed directory over an anonymous link, as itself. The directory checks that the descriptor verifies and is current, and accepts at most 8 registrations per network per day. It then dials one of the descriptor's addresses over a fresh anonymous link, expecting the relay's identity. Only a relay that answers is listed, at once or after the operator's review (`--review-relays`, then `/directory list <relay>`).
 
