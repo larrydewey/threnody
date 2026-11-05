@@ -343,3 +343,38 @@ async fn deposits_are_direct_when_onion_routing_is_off() {
     .await;
     let _ = (&mut r1.rx, &mut r2.rx);
 }
+
+#[tokio::test]
+async fn changes_to_a_chat_are_opened_from_a_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    a.node.send_text(&bid, "pin me").unwrap();
+    next(&mut b.rx, |e| matches!(e, Event::Message { .. })).await;
+    let conv = a.node.conversation_for(&bid);
+    let id = a.node.history(conv).unwrap().entries()[0].message_id();
+
+    // B goes away; A pins the message, sealed for R to hold, then A goes
+    // too, so only the mailbox can tell B.
+    a.node.disconnect(&bid);
+    r.node.disconnect(&bid);
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    assert!(a.node.pin(&bid, id, true));
+    wait_for(|| r.node.held_messages() == 1).await;
+    a.node.shutdown();
+
+    b.node.connect(&r.addr, None).await.unwrap();
+    wait_for(|| b.node.pinned(b.node.conversation_for(&aid)).len() == 1).await;
+}

@@ -16,6 +16,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use threnody_core::crypto::random_bytes;
+use threnody_core::message::{
+    FEATURE_DELETE, FEATURE_EDIT, FEATURE_LISTS, FEATURE_PIN, FEATURE_REACT,
+};
 use threnody_core::{AppMessage, PublicIdentity};
 
 /// Unacknowledged messages kept per peer; the oldest are dropped first.
@@ -37,6 +40,20 @@ pub fn trackable(m: &AppMessage) -> bool {
             | AppMessage::Group(_)
             | AppMessage::Mailbox(_)
     )
+}
+
+/// The `Hello` feature bit a peer needs to read `m`, or 0. A change held
+/// for a peer we haven't heard from since starting is dropped, not sent,
+/// once its `Hello` shows it lacks this.
+pub fn needs(m: &AppMessage) -> u64 {
+    match m {
+        AppMessage::Delete { .. } => FEATURE_DELETE,
+        AppMessage::Edit { .. } => FEATURE_EDIT,
+        AppMessage::React { .. } => FEATURE_REACT,
+        AppMessage::Pin { .. } => FEATURE_PIN,
+        AppMessage::List(_) => FEATURE_LISTS,
+        _ => 0,
+    }
 }
 
 /// What an acknowledgement means: our outgoing history entry `local_id`

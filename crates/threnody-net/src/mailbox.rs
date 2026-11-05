@@ -485,18 +485,29 @@ impl Node {
         if let Ok((from, body)) = opened
             && let Ok(msg) = AppMessage::decode(&body)
         {
-            if let AppMessage::Delete { conversation, ids } = &msg {
-                self.on_delete(&from, conversation, ids);
-                return;
-            }
-            if let AppMessage::Edit {
-                conversation,
-                id,
-                body,
-            } = &msg
-            {
-                self.on_edit(&from, conversation, *id, body);
-                return;
+            // Changes to a conversation are sealed too (see `send_change`).
+            match &msg {
+                AppMessage::Delete { conversation, ids } => {
+                    return self.on_delete(&from, conversation, ids);
+                }
+                AppMessage::Edit {
+                    conversation,
+                    id,
+                    body,
+                } => return self.on_edit(&from, conversation, *id, body),
+                AppMessage::React {
+                    conversation,
+                    id,
+                    emoji,
+                    add,
+                } => return self.on_react(&from, conversation, *id, emoji, *add),
+                AppMessage::Pin {
+                    conversation,
+                    id,
+                    pin,
+                } => return self.on_pin(&from, conversation, *id, *pin),
+                AppMessage::List(bytes) => return self.on_list_message(from, bytes),
+                _ => {}
             }
             self.record_incoming(&from, &msg, true);
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {

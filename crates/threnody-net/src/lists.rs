@@ -16,7 +16,6 @@ use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
 use threnody_core::history::{ConversationId, Entry};
 use threnody_core::lists::{List, ListId, MAX_LISTS, MAX_TITLE, Stamp};
-use threnody_core::message::FEATURE_LISTS;
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::node::{Event, Node, lock};
@@ -315,12 +314,8 @@ impl Node {
                 ConversationId::Peer(_) if *c == self.notes() => {}
                 ConversationId::Peer(_) => {
                     for d in self.conversation_devices(*c) {
-                        if d == self.identity() || !self.supports(&d, FEATURE_LISTS) {
-                            continue;
-                        }
-                        if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d)
-                        {
-                            let _ = self.send_offline(&d, &msg);
+                        if d != self.identity() {
+                            self.send_change(&d, &msg);
                         }
                     }
                 }

@@ -554,3 +554,64 @@ async fn blocking_and_unblocking_follow_us_across_our_devices() {
     assert!(!blocked(&phone.node), "unblocking stuck on the phone");
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+#[tokio::test]
+async fn deleting_and_editing_reach_a_sibling_that_was_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    for t in ["to delete", "to edit"] {
+        laptop.node.send_text(&bid, t).unwrap();
+    }
+    let want = |v: &[&str]| {
+        v.iter()
+            .map(|t| (true, (*t).to_owned()))
+            .collect::<Vec<_>>()
+    };
+    wait_for(|| texts(&phone.node, &bid) == want(&["to delete", "to edit"])).await;
+    let id_of = |t: &str| {
+        let conv = laptop.node.conversation_for(&bid);
+        laptop
+            .node
+            .history(conv)
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| e.text == t)
+            .unwrap()
+            .message_id()
+    };
+
+    // The phone goes away; the laptop deletes one message (only for us)
+    // and edits the other.
+    let pid = phone.node.identity();
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    assert_eq!(
+        laptop
+            .node
+            .delete_messages(&bid, &[id_of("to delete")], false),
+        1
+    );
+    assert!(laptop.node.edit_message(&bid, id_of("to edit"), "edited"));
+
+    // The phone comes back and follows.
+    let home = Home::new(dir.path().join("phone"));
+    let identity = home.load_identity(None).unwrap();
+    let (phone2, _prx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    phone2.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| texts(&phone2, &bid) == want(&["edited"])).await;
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}

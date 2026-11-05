@@ -5,12 +5,9 @@ use std::time::Duration;
 use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Query};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
-use threnody_core::message::{
-    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_PIN, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
-    Mention, Quote,
-};
+use threnody_core::message::{Clip, FEATURE_READ, FEATURE_TYPING, Mention, Quote};
 
-use crate::delivery::Tag;
+use crate::delivery::{Tag, needs};
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 
@@ -110,11 +107,10 @@ impl Node {
             conversation: conv.to_bytes(),
             ids,
         };
-        // Our other devices delete the same, whatever they are.
-        for s in self.sessions() {
-            if self.is_own_device(&s.peer) && self.supports(&s.peer, FEATURE_DELETE) {
-                let _ = self.send_tracked(&s.peer, msg(ids.to_vec()));
-            }
+        // Our other devices delete the same, whatever they are, and those
+        // away now when they come back.
+        for d in self.own_devices() {
+            self.send_change(&d, &msg(ids.to_vec()));
         }
         if everyone && !ours.is_empty() {
             let devices: Vec<PublicIdentity> = match self.account_of(peer) {
@@ -122,11 +118,8 @@ impl Node {
                 None => vec![*peer],
             };
             for d in devices {
-                if !self.supports(&d, FEATURE_DELETE) {
-                    continue;
-                }
-                if self.send_tracked(&d, msg(ours.clone())).is_err() && self.can_send_offline(&d) {
-                    let _ = self.send_offline(&d, &msg(ours.clone()));
+                if d != self.identity() {
+                    self.send_change(&d, &msg(ours.clone()));
                 }
             }
         }
@@ -218,25 +211,8 @@ impl Node {
             id,
             body: body.to_owned(),
         };
-        let mut targets: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .map(|s| s.peer)
-            .filter(|p| self.is_own_device(p))
-            .collect();
-        match self.account_of(peer) {
-            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
-            None => targets.push(*peer),
-        }
-        targets.sort_unstable_by_key(|p| *p.as_bytes());
-        targets.dedup();
-        for d in targets {
-            if d == self.identity() || !self.supports(&d, FEATURE_EDIT) {
-                continue;
-            }
-            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
-                let _ = self.send_offline(&d, &msg);
-            }
+        for d in self.account_targets(peer) {
+            self.send_change(&d, &msg);
         }
         true
     }
@@ -383,12 +359,7 @@ impl Node {
             pin,
         };
         for d in self.account_targets(peer) {
-            if !self.supports(&d, FEATURE_PIN) {
-                continue;
-            }
-            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
-                let _ = self.send_offline(&d, &msg);
-            }
+            self.send_change(&d, &msg);
         }
         true
     }
@@ -426,15 +397,10 @@ impl Node {
         }
     }
 
-    /// Every device of `peer`'s account and our other connected devices,
-    /// except this one: where a change to our chat with `peer` goes.
+    /// Every device of `peer`'s account and our other devices, connected
+    /// or not, except this one: where a change to our chat with `peer` goes.
     fn account_targets(&self, peer: &PublicIdentity) -> Vec<PublicIdentity> {
-        let mut targets: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .map(|s| s.peer)
-            .filter(|p| self.is_own_device(p))
-            .collect();
+        let mut targets = self.own_devices();
         match self.account_of(peer) {
             Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
             None => targets.push(*peer),
@@ -443,6 +409,36 @@ impl Node {
         targets.dedup();
         targets.retain(|d| *d != self.identity());
         targets
+    }
+
+    /// Our account's other devices, connected or not.
+    pub(crate) fn own_devices(&self) -> Vec<PublicIdentity> {
+        let me = self.identity();
+        self.account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, _)| *d)
+            .filter(|d| *d != me)
+            .collect()
+    }
+
+    /// Sends `msg`, a change to a conversation (a deletion, an edit, a
+    /// reaction, a pin or a list), to device `d`. It is tracked, so it is
+    /// sent again if lost. For a device that isn't connected it waits for
+    /// its next session, and is also sealed for its mailboxes when we can,
+    /// so it arrives even if we don't meet first; taking a change twice
+    /// does nothing more. A device that told us it can't read such changes
+    /// is skipped; one we haven't heard from since starting gets it held,
+    /// dropped then if it can't (see `needs`).
+    pub(crate) fn send_change(&self, d: &PublicIdentity, msg: &AppMessage) {
+        if self.lacks(d, needs(msg)) || self.send_tracked(d, msg.clone()).is_ok() {
+            return;
+        }
+        self.hold(d, msg.clone(), Tag::NONE);
+        if self.can_send_offline(d) {
+            let _ = self.send_offline(d, msg);
+        }
     }
 
     /// Adds (or with `add` false, takes away) our `emoji` on message `id`
@@ -477,25 +473,8 @@ impl Node {
             emoji: emoji.to_owned(),
             add,
         };
-        let mut targets: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .map(|s| s.peer)
-            .filter(|p| self.is_own_device(p))
-            .collect();
-        match self.account_of(peer) {
-            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
-            None => targets.push(*peer),
-        }
-        targets.sort_unstable_by_key(|p| *p.as_bytes());
-        targets.dedup();
-        for d in targets {
-            if d == self.identity() || !self.supports(&d, FEATURE_REACT) {
-                continue;
-            }
-            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
-                let _ = self.send_offline(&d, &msg);
-            }
+        for d in self.account_targets(peer) {
+            self.send_change(&d, &msg);
         }
         true
     }

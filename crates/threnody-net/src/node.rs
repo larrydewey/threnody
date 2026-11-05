@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::account::LinkState;
-use crate::delivery::{Delivery, Tag, trackable};
+use crate::delivery::{Delivery, Tag, needs, trackable};
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
@@ -1249,6 +1249,15 @@ impl Node {
             .is_some_and(|f| f & feature != 0)
     }
 
+    /// Whether `peer` said (in a session since we started) it doesn't
+    /// support `feature`. Unlike `!supports`, false for a peer we haven't
+    /// heard from yet.
+    pub(crate) fn lacks(&self, peer: &PublicIdentity, feature: u64) -> bool {
+        lock(&self.shared.peer_features)
+            .get(peer)
+            .is_some_and(|f| f & feature == 0)
+    }
+
     /// How many messages to `peer` are waiting for an acknowledgement.
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
         lock(&self.shared.delivery).unacked(peer)
@@ -1663,7 +1672,8 @@ where
                 let mut waiting = VecDeque::new();
                 while let Some(m) = pending.pop_front() {
                     match ready(shared, &peer, m, peer_acks) {
-                        Ok(m) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                        Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                        Ok(None) => {}
                         Err(m) => waiting.push_back(m),
                     }
                 }
@@ -1853,7 +1863,8 @@ where
                     // shows anyway), and a call can't wait for ticks.
                     Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
                         match ready(shared, &peer, m, peer_acks) {
-                            Ok(m) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                            Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                            Ok(None) => {}
                             Err(m) => pending.push_back(m),
                         }
                     }
@@ -1870,10 +1881,11 @@ where
                         for _ in 0..pending.len() {
                             let Some(next) = pending.pop_front() else { break };
                             match ready(shared, &peer, next, peer_acks) {
-                                Ok(r) => {
+                                Ok(Some(r)) => {
                                     m = r;
                                     break;
                                 }
+                                Ok(None) => {}
                                 Err(w) => pending.push_back(w),
                             }
                         }
@@ -1908,19 +1920,34 @@ fn urgent(m: &AppMessage) -> bool {
 
 /// What to send for `m` now: tracked messages wait until we know whether
 /// the peer acknowledges them, and go out plain (untracked) if it doesn't.
+/// One the peer can't read (a change held before we knew its features) is
+/// dropped: `Ok(None)`.
 fn ready(
     shared: &Shared,
     peer: &PublicIdentity,
     m: AppMessage,
     peer_acks: Option<bool>,
-) -> std::result::Result<AppMessage, AppMessage> {
+) -> std::result::Result<Option<AppMessage>, AppMessage> {
     match (m, peer_acks) {
         (m @ AppMessage::Tracked { .. }, None) => Err(m),
-        (AppMessage::Tracked { id, inner }, Some(false)) => {
-            shared.delivery(|d| d.forget(peer, id));
-            Ok(*inner)
+        (AppMessage::Tracked { id, inner }, Some(acks)) => {
+            let feature = needs(&inner);
+            let readable = feature == 0
+                || lock(&shared.peer_features)
+                    .get(peer)
+                    .is_some_and(|f| f & feature != 0);
+            if !readable {
+                shared.delivery(|d| d.forget(peer, id));
+                return Ok(None);
+            }
+            if acks {
+                Ok(Some(AppMessage::Tracked { id, inner }))
+            } else {
+                shared.delivery(|d| d.forget(peer, id));
+                Ok(Some(*inner))
+            }
         }
-        (m, _) => Ok(m),
+        (m, _) => Ok(Some(m)),
     }
 }
 
