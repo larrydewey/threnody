@@ -12,7 +12,8 @@ use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::message::{
-    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURES, MAX_ACK_IDS,
+    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURE_TIMED_PROBES, FEATURES,
+    MAX_ACK_IDS,
 };
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
@@ -1684,6 +1685,18 @@ where
                         };
                         lock(&shared.peer_features).insert(peer, features);
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        // Remembered across restarts: probes matter most
+                        // when there is no session to ask in.
+                        let timed = features & FEATURE_TIMED_PROBES != 0;
+                        {
+                            let mut contacts = lock(&shared.contacts);
+                            if let Some(c) = contacts.get_mut(&peer)
+                                && c.timed_probes != timed
+                            {
+                                c.timed_probes = timed;
+                                shared.save_contacts(&contacts);
+                            }
+                        }
                         node.send_profile(&peer);
                         if let Some(addr) = observed
                             && features & FEATURE_OBSERVED != 0

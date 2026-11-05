@@ -38,7 +38,7 @@ AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Rela
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
-                                                           ; 8192 tunnel, 16384 push); absent = 0
+                                                           ; 8192 tunnel, 16384 push, 32768 timed probes); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)

@@ -356,6 +356,10 @@ pub struct Contact {
     /// leave each side with a different "latest" key; keeping recent ones
     /// means both still recognise each other. Cleared on revocation.
     pub discovery_older: Vec<[u8; 32]>,
+    /// The peer's latest `Hello` had `FEATURE_TIMED_PROBES`: probes to and
+    /// from it under these discovery keys are timed (Appendix N), and an
+    /// untimed one claiming to be from it is ignored. Cleared with the keys.
+    pub timed_probes: bool,
     /// Account this device belongs to (Appendix J), once its chain is known.
     pub account: Option<AccountId>,
     /// When the approval or verification flags last changed (own-device
@@ -393,6 +397,7 @@ impl Contact {
             last_seen_ms: now_ms,
             discovery_key: None,
             discovery_older: Vec::new(),
+            timed_probes: false,
             account: None,
             approval_changed_ms: 0,
             accepted: false,
@@ -420,6 +425,7 @@ impl Contact {
     pub fn clear_discovery_keys(&mut self) {
         self.discovery_key = None;
         self.discovery_older.clear();
+        self.timed_probes = false;
     }
 
     /// Keys to recognise this peer's beacons with: current first.
@@ -678,6 +684,7 @@ impl Contacts {
                         + usize::from(c.revealed.is_some())
                         + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
                         + usize::from(c.cleared_ms != 0)
+                        + usize::from(c.timed_probes)
                         + 2;
                     e.map_len(n)?;
                     e.u8(0)?.bytes(c.key.as_bytes())?;
@@ -729,6 +736,9 @@ impl Contacts {
                     }
                     if c.cleared_ms != 0 {
                         e.u8(18)?.u64(c.cleared_ms)?;
+                    }
+                    if c.timed_probes {
+                        e.u8(19)?.bool(true)?;
                     }
                 }
                 if !self.forgotten.is_empty() {
@@ -788,6 +798,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         last_seen_ms: 0,
         discovery_key: None,
         discovery_older: Vec::new(),
+        timed_probes: false,
         account: None,
         approval_changed_ms: 0,
         // Contacts saved before message requests existed were wanted.
@@ -836,6 +847,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             16 => revealed = Some(fixed_bytes::<32>(d)?),
             17 => invite = Some(d.str()?.to_owned()),
             18 => c.cleared_ms = d.u64()?,
+            19 => c.timed_probes = d.bool()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -1018,6 +1030,7 @@ mod passphrase_tests {
             c.set_discovery_key([k; 32]);
         }
         c.set_discovery_key([4; 32]);
+        c.timed_probes = true;
         assert_eq!(c.discovery_key, Some([4; 32]));
         assert_eq!(c.discovery_older, vec![[3; 32], [2; 32]]);
         assert_eq!(c.recognition_keys().count(), 3);
@@ -1027,6 +1040,7 @@ mod passphrase_tests {
         assert_eq!(back.list[0], c);
         c.clear_discovery_keys();
         assert_eq!(c.recognition_keys().count(), 0);
+        assert!(!c.timed_probes);
     }
 
     #[test]

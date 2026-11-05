@@ -1251,11 +1251,14 @@ impl Node {
             }
             // A contact's discovery key, or for someone found through a
             // handle (Appendix S), the handle's probe key.
-            let Some(d) = self
+            let Some((d, timed)) = self
                 .contacts()
                 .get(&peer)
-                .and_then(|c| c.discovery_key)
-                .or_else(|| lock(&self.rdv().handles.probe_keys).get(&peer).copied())
+                .and_then(|c| c.discovery_key.map(|d| (d, c.timed_probes)))
+                .or_else(|| {
+                    let keys = lock(&self.rdv().handles.probe_keys);
+                    keys.get(&peer).map(|d| (*d, false))
+                })
             else {
                 break false;
             };
@@ -1266,7 +1269,7 @@ impl Node {
             probed = Some(Instant::now());
             let targets = lock(&punch.targets).clone();
             for t in &targets {
-                let _ = quic.send_raw(*t, &rendezvous::probe(&d, &me));
+                let _ = quic.send_raw(*t, &probe_for(&d, &me, timed));
             }
             let idle = dialing.as_ref().is_none_or(|h| h.is_finished());
             let quiet = heard.is_none_or(|h| h.elapsed() > Duration::from_secs(5));
@@ -1335,16 +1338,22 @@ impl Node {
             return;
         }
         let contacts = self.contacts();
-        let keys = contacts
-            .iter()
-            .filter(|c| c.mutually_approved())
-            .flat_map(|c| c.recognition_keys().map(move |k| (&c.key, k)));
+        let keys = |timed: bool| {
+            contacts
+                .iter()
+                .filter(move |c| c.mutually_approved() && c.timed_probes == timed)
+                .flat_map(|c| c.recognition_keys().map(move |k| (&c.key, k)))
+        };
         let handle_keys: Vec<(PublicIdentity, [u8; 32])> = lock(&self.rdv().handles.probe_keys)
             .iter()
             .map(|(p, k)| (*p, *k))
             .collect();
-        let keys = keys.chain(handle_keys.iter().map(|(p, k)| (p, k)));
-        let Some(peer) = rendezvous::recognise_probe(data, keys) else {
+        // A contact that times its probes is never recognised by an untimed
+        // one, which anyone who once saw it could replay.
+        let untimed = keys(false).chain(handle_keys.iter().map(|(p, k)| (p, k)));
+        let Some(peer) = rendezvous::recognise_timed_probe(data, now_ms() / 1000, keys(true))
+            .or_else(|| rendezvous::recognise_probe(data, untimed))
+        else {
             return;
         };
         let punch = lock(&self.rdv().inner).punches.get(&peer).cloned();
@@ -1389,6 +1398,20 @@ impl Node {
         if changed && self.shared.mutual(&peer) && self.reach_enabled() {
             self.rdv().regather.notify_one();
         }
+    }
+}
+
+/// A probe from `me` under discovery key `d`: timed for a contact whose
+/// `Hello` said it understands that.
+pub(crate) fn probe_for(
+    d: &[u8; 32],
+    me: &PublicIdentity,
+    timed: bool,
+) -> [u8; rendezvous::PROBE_LEN] {
+    if timed {
+        rendezvous::timed_probe(d, me, now_ms() / 1000)
+    } else {
+        rendezvous::probe(d, me)
     }
 }
 
