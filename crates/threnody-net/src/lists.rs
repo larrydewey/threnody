@@ -74,9 +74,11 @@ pub(crate) struct Lists {
     pub lists: Vec<SharedList>,
     /// The lists we deleted, oldest first (at most [`MAX_DELETED`]).
     pub deleted: Vec<ListId>,
-    /// Changes from contacts that groups the list is shared with should
-    /// hear of; the app sends them (see [`Node::take_list_forwards`]).
-    pub to_groups: Vec<(Vec<u8>, [u8; 16])>,
+    /// Lists changed by contacts, and the groups they're also shared with
+    /// that should hear of it; the app sends them (see
+    /// [`Node::take_list_forwards`]). Each pair once, whatever the number
+    /// of changes in between.
+    pub to_groups: Vec<(ListId, [u8; 16])>,
 }
 
 impl Lists {
@@ -103,6 +105,13 @@ impl Lists {
             }
         }
         all <= MAX_FROM_OTHERS && chat <= MAX_CHAT_BYTES
+    }
+
+    /// Notes that group `g` should hear of list `id`'s latest state.
+    fn forward(&mut self, id: ListId, g: [u8; 16]) {
+        if !self.to_groups.contains(&(id, g)) {
+            self.to_groups.push((id, g));
+        }
     }
 
     /// Remembers that list `id` was deleted.
@@ -539,7 +548,19 @@ impl Node {
 
     /// Lists to send to groups, for the app (after `Event::ListChanged`).
     pub fn take_list_forwards(&self) -> Vec<(Vec<u8>, [u8; 16])> {
-        std::mem::take(&mut lock(&self.shared.lists).to_groups)
+        let mut ls = lock(&self.shared.lists);
+        let pending = std::mem::take(&mut ls.to_groups);
+        pending
+            .into_iter()
+            .filter_map(|(id, g)| {
+                // Still there, and still shared with it.
+                let l = ls
+                    .lists
+                    .iter()
+                    .find(|l| l.list.id == id && l.shared.contains(&ConversationId::Group(g)))?;
+                Some((l.list.encode().ok()?, g))
+            })
+            .collect()
     }
 
     /// A list from our own device `from`: merged, or deleted.
@@ -695,10 +716,13 @@ impl Node {
         let conv = self.conversation_for(&from);
         // Groups it's also shared with hear of it from the app, which has
         // the group state.
-        if let Some((b, groups)) = self.on_shared_list(conv, from, bytes) {
+        let Ok(id) = List::decode(bytes).map(|l| l.id) else {
+            return;
+        };
+        if let Some((_, groups)) = self.on_shared_list(conv, from, bytes) {
             let mut ls = lock(&self.shared.lists);
             for g in groups {
-                ls.to_groups.push((b.clone(), g));
+                ls.forward(id, g);
             }
         }
     }
@@ -710,19 +734,24 @@ mod tests {
     use threnody_core::Identity;
     use threnody_core::store::Home;
 
-    #[tokio::test]
-    async fn nothing_goes_to_a_blocked_contact() {
-        let dir = tempfile::tempdir().unwrap();
+    fn node(dir: &tempfile::TempDir) -> Node {
         let home = Home::new(dir.path().join("alice"));
         let identity = home.create_identity(None).unwrap();
-        let (node, _rx) = Node::new(crate::NodeConfig {
+        Node::new(crate::NodeConfig {
             home,
             identity,
             policy: crate::AcceptPolicy::Anyone,
             constant_rate: None,
             tunnel_port: None,
         })
-        .unwrap();
+        .unwrap()
+        .0
+    }
+
+    #[tokio::test]
+    async fn nothing_goes_to_a_blocked_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = node(&dir);
         let bob = Identity::generate().public();
         node.accept_contact(&bob);
         let conv = node.conversation_for(&bob);
@@ -733,6 +762,36 @@ mod tests {
         node.block_contact(&bob);
         assert!(node.conversation_devices(conv).is_empty());
         assert!(node.list(&id).unwrap().shared.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_contacts_changes_wait_for_a_group_once() {
+        // However often a contact changes a list also shared with a group,
+        // and nothing sends it on, the group waits for it once, and then
+        // gets its latest state.
+        let dir = tempfile::tempdir().unwrap();
+        let node = node(&dir);
+        let bob = Identity::generate().public();
+        node.accept_contact(&bob);
+        let id = node.create_list("Trip").unwrap();
+        node.share_list(&id, node.conversation_for(&bob));
+        node.share_list(&id, ConversationId::Group([3; 16]));
+        let mut l = node.list(&id).unwrap().list;
+        for n in 0..50 {
+            l.rename(
+                &format!("Trip {n}"),
+                Stamp {
+                    ms: now_ms(),
+                    by: [9; 32],
+                },
+            );
+            node.on_list_message(bob, &l.encode().unwrap());
+        }
+        assert_eq!(lock(&node.shared.lists).to_groups.len(), 1);
+        let out = node.take_list_forwards();
+        assert_eq!(out.len(), 1);
+        assert_eq!(List::decode(&out[0].0).unwrap().title, "Trip 49");
+        assert!(node.take_list_forwards().is_empty());
     }
 
     #[test]
@@ -754,6 +813,7 @@ mod tests {
             to_groups: Vec::new(),
         };
         let back = Lists::decode(&l.encode().unwrap());
+        assert!(back.to_groups.is_empty());
         assert_eq!(back.lists, l.lists);
         assert_eq!(back.deleted, l.deleted);
         assert!(Lists::decode(&[0xff]).lists.is_empty());

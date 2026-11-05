@@ -237,6 +237,14 @@ impl GroupUi {
         self.groups.linked(node, device);
     }
 
+    /// Sends lists a contact changed on to the groups they're also shared
+    /// with (see `Node::take_list_forwards`).
+    pub fn forward_lists(&mut self, node: &Node) {
+        for (bytes, g) in node.take_list_forwards() {
+            let _ = self.groups.send_list(node, &g, bytes);
+        }
+    }
+
     /// Sends group messages held for `peer`, who just connected.
     pub fn connected(
         &mut self,
