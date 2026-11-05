@@ -29,6 +29,7 @@ use threnody_core::{Fingerprint, PublicIdentity};
 use tokio::sync::mpsc;
 
 use crate::error::{NetError, Result};
+use crate::gate::Source;
 use crate::handshake;
 use crate::node::{Event, Node, Route, lock};
 
@@ -39,6 +40,14 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a QUIC dial may take before it counts as failed.
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Inbound connections from the first packet until their Threnody
+/// handshake is done, at once and from one source. Each holds some 40 KB.
+pub(crate) const MAX_HANDSHAKING: usize = 256;
+pub(crate) const MAX_HANDSHAKING_PER_SOURCE: usize = 16;
+/// With this many in progress, a new one must first show that it gets
+/// packets at its address (a Retry round trip, which costs us nothing to
+/// send): a spoofed source can't pin memory with one packet.
+const RETRY_ABOVE: usize = 16;
 
 /// A datagram that isn't QUIC: a probe or a DHT reply.
 pub(crate) type Foreign = (SocketAddr, Vec<u8>);
@@ -341,8 +350,21 @@ impl Node {
                     () = &mut closed => break,
                 };
                 let Some(incoming) = incoming else { break };
+                let gate = &node.shared.quic_inbound;
+                if gate.len() >= RETRY_ABOVE
+                    && !incoming.remote_address_validated()
+                    && incoming.may_retry()
+                {
+                    let _ = incoming.retry();
+                    continue;
+                }
+                let Some(pass) = gate.enter(Source::ip(incoming.remote_address().ip())) else {
+                    incoming.refuse();
+                    continue;
+                };
                 let node = node.clone();
                 tokio::spawn(async move {
+                    let _pass = pass;
                     let addr = canonical(incoming.remote_address());
                     if let Err(e) = node.run_quic_inbound(incoming).await {
                         node.emit(Event::Rejected {
@@ -372,7 +394,12 @@ impl Node {
     }
 
     async fn run_quic_inbound(&self, incoming: quinn::Incoming) -> Result<()> {
-        let conn = incoming.await.map_err(quic_error)?;
+        // The idle timeout (60 s) would otherwise bound a handshake that
+        // never finishes.
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, incoming)
+            .await
+            .map_err(|_| NetError::Io(io::ErrorKind::TimedOut.into()))?
+            .map_err(quic_error)?;
         let addr = canonical(conn.remote_address());
         let (send, recv) = tokio::time::timeout(DIAL_TIMEOUT, conn.accept_bi())
             .await
@@ -461,6 +488,57 @@ fn quic_error(e: impl std::fmt::Display) -> NetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::{AcceptPolicy, NodeConfig};
+    use threnody_core::store::Home;
+
+    /// QUIC handshakes that never get to the Threnody one each hold a
+    /// place; past the limit from one address, new ones are refused (after
+    /// a Retry: the limit for all has load enough by then).
+    #[tokio::test]
+    async fn quic_handshakes_past_the_limit_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let addr = node.listen_quic("127.0.0.1:0").await.unwrap();
+        let (_, client) = configs().unwrap();
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(client);
+        let dial = || async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ep.connect(addr, "threnody").unwrap(),
+            )
+            .await
+            .expect("answered")
+        };
+        let mut held = Vec::new();
+        for _ in 0..MAX_HANDSHAKING_PER_SOURCE {
+            held.push(dial().await.unwrap());
+        }
+        assert!(dial().await.is_err(), "past the limit: refused");
+        assert_eq!(node.shared.quic_inbound.len(), MAX_HANDSHAKING_PER_SOURCE);
+        // Closing them gives the places back.
+        for c in held {
+            c.close(0u8.into(), b"");
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.shared.quic_inbound.len() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("places given back");
+        assert!(dial().await.is_ok());
+        node.shutdown();
+    }
 
     /// A flood of datagrams shaped like DHT replies fills the queue to its
     /// bound and no further, and QUIC behind it still gets through.

@@ -179,7 +179,7 @@ An app starting after a long time away is found at the contact's next read of it
 - **Records are encrypted and authenticated** under keys only the two contacts hold. BEP 44 signatures (from keys derived per direction and per epoch) stop DHT nodes from altering them.
 - **Revocation** deletes `D(A,B)`. From then on the node neither publishes records for that contact nor reads theirs.
 - **Resource limits:** at most 32 probes in flight, punching at most 4 contacts at once, and backoff per contact. Datagrams on the QUIC socket that aren't QUIC (probes, DHT ping replies) wait in a queue of at most 256; a flood beyond that is dropped, as a full socket buffer would drop it. A DHT reply longer than 512 bytes is not taken for one: a ping's reply is under 200.
-- **The QUIC endpoint** accepts connections only to run the Threnody handshake. `check_policy` applies as for TCP.
+- **The QUIC endpoint** accepts connections only to run the Threnody handshake. `check_policy` applies as for TCP. A connection's QUIC handshake must finish within 8 s, and the stream must open within 8 s after that. At most 256 inbound connections are in progress at once (from the first packet until the Threnody handshake is done), 16 from one source (an IPv6 source by its /64); more are refused. Once 16 are in progress, a new one first gets a QUIC Retry (RFC 9000 §8.1), which costs the node no state, so a spoofed source can't hold memory with one packet. Every QUIC client follows a Retry, older Threnody nodes included.
 
 ## Settings
 
