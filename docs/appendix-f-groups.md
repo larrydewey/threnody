@@ -112,5 +112,6 @@ The key is derived from the identity seed, so group secrets are only as accessib
 ## Not yet done
 
 - **Secure deletion.** Each save rewrites the whole state file atomically. Old epoch secrets are gone from the file system's view, but not necessarily from the storage medium (spec §16 secure deletion).
+- **Member key updates.** Only the owner commits, so only the owner's leaf key changes, with each add or removal. Members never send updates, so a member's leaf key stays the same for as long as it is in the group. Until they do, groups give members forward secrecy but not post-compromise security (spec §3.3): someone who once copied a member's group state and identity seed can read every later epoch until that member is removed. Members would need to send update proposals for the owner to commit. Older members reject proposals, so this needs a feature bit.
 - **More committers.** Admin roles beyond a single owner. The owner can already mark members as admins (`promote_in_group` and `demote_in_group` in the FFI), but the role is kept only on the owner's devices: it isn't sent to members, and members still accept commits only from the owner.
 - **Ciphersuite version.** openmls's X-Wing HPKE implements X-Wing draft-06, while the 1:1 protocol uses draft-11. Both are hybrid; they will converge once the MLS PQ ciphersuite draft settles.
