@@ -1,18 +1,22 @@
 //! Group calls (Appendix Q, *Group calls*): the roster, a leg of sealed
-//! media between every two participants, and the hub that passes legs on
-//! for pairs without a session of their own.
+//! media between every two participants, and relaying for pairs without a
+//! session of their own.
 //!
 //! The group layer above owns the signalling: it reads and writes
-//! [`threnody_core::call::GroupCallMsg`] in group messages, takes the
-//! call's base secret from the group's MLS exporter, and tells the node
-//! what happened ([`Node::group_call_rang`], [`Node::group_call_joined`],
-//! …). The media layer gets each leg's payloads from
-//! [`Node::group_leg_media`] and sends with [`Node::send_leg_media`]; its
-//! leg signalling (session descriptions) also goes through the group
-//! layer, so the hub never sees it and can't stand in the middle.
+//! [`threnody_core::call::GroupCallMsg`] in group messages, carries the
+//! call's secret, and tells the node what happened
+//! ([`Node::group_call_rang`], [`Node::group_call_joined`], …). The media
+//! layer gets each leg's payloads from [`Node::group_leg_media`] and sends
+//! with [`Node::send_leg_media`]; its leg signalling (session
+//! descriptions) goes over the pair's own session or in a group message,
+//! never through a relay, so no relay can stand in the middle.
 //!
-//! The hub only forwards packets between two current participants, sealed
-//! with a leg's keys; DTLS-SRTP inside each leg keeps the media from it.
+//! Each participant says which other participants it has sessions with
+//! (its links). A pair without a session sends its leg through any
+//! participant linked to both, which passes on only packets of the leg
+//! between two current participants, sealed with that leg's keys;
+//! DTLS-SRTP inside each leg keeps the media from it. The best-linked
+//! participant is the call's hub, for the record.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -39,7 +43,7 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 pub struct GroupCallInfo {
     pub call: u64,
     pub group: [u8; 16],
-    /// The device that relays for pairs without a session.
+    /// The participant linked to the most others (it relays the most).
     pub hub: PublicIdentity,
     /// Devices in the call other than us, with whether each sends video.
     pub participants: Vec<(PublicIdentity, bool)>,
@@ -60,6 +64,10 @@ struct GroupCall {
     info: GroupCallInfo,
     base: Zeroizing<[u8; 32]>,
     legs: HashMap<PublicIdentity, Leg>,
+    /// Who each participant says it has sessions with.
+    links: HashMap<PublicIdentity, Vec<PublicIdentity>>,
+    /// Our own links as we last told the others.
+    told: Vec<PublicIdentity>,
     /// When it started ringing here.
     rang_ms: u64,
 }
@@ -73,15 +81,81 @@ impl GroupCall {
     fn is_participant(&self, d: &PublicIdentity) -> bool {
         self.info.participants.iter().any(|(p, _)| p == d)
     }
+
+    /// Whether `a` and `b` have a session, as either says.
+    fn linked(&self, a: &PublicIdentity, b: &PublicIdentity) -> bool {
+        self.links.get(a).is_some_and(|l| l.contains(b))
+            || self.links.get(b).is_some_and(|l| l.contains(a))
+    }
+
+    /// The participant linked to the most others (ties: the smaller key),
+    /// with `mine` being our own links.
+    fn hub(&self, me: &PublicIdentity, mine: &[PublicIdentity]) -> PublicIdentity {
+        let all: Vec<PublicIdentity> = self
+            .info
+            .participants
+            .iter()
+            .map(|(p, _)| *p)
+            .chain(self.info.joined.then_some(*me))
+            .collect();
+        let score = |d: &PublicIdentity| {
+            all.iter()
+                .filter(|o| *o != d)
+                .filter(|o| {
+                    if d == me {
+                        mine.contains(o)
+                    } else if *o == me {
+                        mine.contains(d) || self.linked(d, o)
+                    } else {
+                        self.linked(d, o)
+                    }
+                })
+                .count()
+        };
+        all.iter()
+            .copied()
+            .max_by(|a, b| {
+                score(a)
+                    .cmp(&score(b))
+                    .then_with(|| b.as_bytes().cmp(a.as_bytes()))
+            })
+            .unwrap_or(*me)
+    }
 }
 
 impl Node {
     /// The group call we're in or that rings here, if any.
     pub fn group_call(&self) -> Option<GroupCallInfo> {
-        lock(&self.shared.group_calls)
-            .current
-            .as_ref()
-            .map(|c| c.info.clone())
+        let me = self.identity();
+        let gc = lock(&self.shared.group_calls);
+        let c = gc.current.as_ref()?;
+        let mine = self.links_of(c);
+        let mut info = c.info.clone();
+        info.hub = c.hub(&me, &mine);
+        Some(info)
+    }
+
+    /// The participants of `c` we have a session with.
+    fn links_of(&self, c: &GroupCall) -> Vec<PublicIdentity> {
+        c.info
+            .participants
+            .iter()
+            .map(|(p, _)| *p)
+            .filter(|p| self.connected(p))
+            .collect()
+    }
+
+    /// Our links in call `call` (the participants we have a session
+    /// with), for the group layer to send with `Join` or `Update`; noted
+    /// as told.
+    pub fn group_call_links(&self, call: u64) -> Vec<PublicIdentity> {
+        let mut gc = lock(&self.shared.group_calls);
+        let Some(c) = gc.current.as_mut().filter(|c| c.info.call == call) else {
+            return Vec::new();
+        };
+        let mine = self.links_of(c);
+        c.told = mine.clone();
+        mine
     }
 
     /// Whether any call, one-to-one or group, rings or runs here.
@@ -92,9 +166,8 @@ impl Node {
             .is_some_and(|c| c.info.joined)
     }
 
-    /// We start group call `call` in `group`, relaying for everyone, with
-    /// `base` from the group's exporter. The group layer then sends
-    /// `GroupCallMsg::Start`.
+    /// We start group call `call` in `group`, keyed by `base` (the call's
+    /// secret). The group layer then sends `GroupCallMsg::Start`.
     pub fn start_group_call(
         &self,
         group: [u8; 16],
@@ -121,6 +194,8 @@ impl Node {
             },
             base: Zeroizing::new(base),
             legs: HashMap::new(),
+            links: HashMap::new(),
+            told: Vec::new(),
             rang_ms: 0,
         });
         drop(gc);
@@ -128,14 +203,13 @@ impl Node {
         Ok(())
     }
 
-    /// `from` started (or, `joined`, is in) group call `call` in `group`:
-    /// it rings here unless we're in a call. Returns whether it rings.
+    /// `from` started group call `call` in `group`, keyed by `base`: it
+    /// rings here unless we're in a call. Returns whether it rings.
     pub fn group_call_rang(
         &self,
         group: [u8; 16],
         call: u64,
         from: PublicIdentity,
-        hub: PublicIdentity,
         base: [u8; 32],
         video: bool,
     ) -> bool {
@@ -152,7 +226,7 @@ impl Node {
             info: GroupCallInfo {
                 call,
                 group,
-                hub,
+                hub: from,
                 participants: vec![(from, video)],
                 joined: false,
                 video: false,
@@ -160,6 +234,8 @@ impl Node {
             },
             base: Zeroizing::new(base),
             legs: HashMap::new(),
+            links: HashMap::new(),
+            told: Vec::new(),
             rang_ms: now_ms(),
         });
         drop(gc);
@@ -194,21 +270,32 @@ impl Node {
         Ok(())
     }
 
-    /// `device` joined call `call` (or is in it, as the starter is).
-    pub fn group_call_joined(&self, call: u64, device: PublicIdentity, video: bool) {
+    /// `device` is in call `call` (it joined, or answered our join), with
+    /// sessions to `links`. Returns whether it's new to us: then, if
+    /// we're in the call, the group layer answers it with our own `Join`,
+    /// so it learns of us even if our join reached it before the call did.
+    pub fn group_call_joined(
+        &self,
+        call: u64,
+        device: PublicIdentity,
+        video: bool,
+        links: Vec<PublicIdentity>,
+    ) -> bool {
         let me = self.identity();
         if device == me {
-            return;
+            return false;
         }
         let mut gc = lock(&self.shared.group_calls);
         let Some(c) = gc.current.as_mut().filter(|c| c.info.call == call) else {
-            return;
+            return false;
         };
-        if c.is_participant(&device) {
-            return;
+        c.links.insert(device, links);
+        if let Some(p) = c.info.participants.iter_mut().find(|(p, _)| *p == device) {
+            p.1 = video;
+            return false;
         }
         if c.info.participants.len() + usize::from(c.info.joined) >= MAX_GROUP_CALL {
-            return;
+            return false;
         }
         c.info.participants.push((device, video));
         let joined = c.info.joined;
@@ -217,47 +304,32 @@ impl Node {
         }
         let group = c.info.group;
         drop(gc);
+        // Try for a session of our own with it, where we can.
+        self.seek(&device);
         self.emit(Event::GroupCallMember {
             group,
             call,
             device,
             joined: true,
         });
+        true
     }
 
-    /// `device` left call `call`. Returns the new hub when the hub left
-    /// and we take its place (the group layer then sends
-    /// `GroupCallMsg::Hub`).
-    pub fn group_call_left(&self, call: u64, device: PublicIdentity) -> Option<PublicIdentity> {
-        let me = self.identity();
+    /// `device` left call `call`.
+    pub fn group_call_left(&self, call: u64, device: PublicIdentity) {
         let mut gc = lock(&self.shared.group_calls);
-        let c = gc.current.as_mut().filter(|c| c.info.call == call)?;
+        let Some(c) = gc.current.as_mut().filter(|c| c.info.call == call) else {
+            return;
+        };
         if !c.is_participant(&device) {
-            return None;
+            return;
         }
         c.info.participants.retain(|(p, _)| *p != device);
         c.legs.remove(&device);
+        c.links.remove(&device);
         let group = c.info.group;
         // Nobody left to ring with: it stops ringing here.
         let over = !c.info.joined && c.info.participants.is_empty();
-        let mut new_hub = None;
-        if c.info.hub == device {
-            // The remaining participant with the smallest key takes over;
-            // everyone picks the same one.
-            let next = c
-                .info
-                .participants
-                .iter()
-                .map(|(p, _)| *p)
-                .chain(c.info.joined.then_some(me))
-                .min_by_key(|p| *p.as_bytes());
-            if let Some(h) = next {
-                c.info.hub = h;
-                if h == me {
-                    new_hub = Some(h);
-                }
-            }
-        }
         if over {
             gc.current = None;
         }
@@ -271,22 +343,16 @@ impl Node {
         if over {
             self.emit(Event::GroupCallEnded { group, call });
         }
-        new_hub
     }
 
-    /// The group layer heard `GroupCallMsg::Hub`.
-    pub fn set_group_call_hub(&self, call: u64, hub: PublicIdentity) {
-        if let Some(c) = lock(&self.shared.group_calls)
-            .current
-            .as_mut()
-            .filter(|c| c.info.call == call)
-        {
-            c.info.hub = hub;
-        }
-    }
-
-    /// `device` turned its video on or off.
-    pub fn group_call_video(&self, call: u64, device: PublicIdentity, video: bool) {
+    /// `device` sent an update: its video, and its links.
+    pub fn group_call_update(
+        &self,
+        call: u64,
+        device: PublicIdentity,
+        video: bool,
+        links: Vec<PublicIdentity>,
+    ) {
         let mut gc = lock(&self.shared.group_calls);
         let Some(c) = gc.current.as_mut().filter(|c| c.info.call == call) else {
             return;
@@ -294,7 +360,12 @@ impl Node {
         let Some(p) = c.info.participants.iter_mut().find(|(p, _)| *p == device) else {
             return;
         };
+        let changed = p.1 != video;
         p.1 = video;
+        c.links.insert(device, links);
+        if !changed {
+            return;
+        }
         let group = c.info.group;
         drop(gc);
         self.emit(Event::GroupCallVideo {
@@ -394,8 +465,9 @@ impl Node {
     }
 
     /// Seals and sends one media payload on our leg with `peer`: over our
-    /// own session with it, else through the hub. False when it couldn't
-    /// go (dropped, not queued).
+    /// own session with it, else through a participant linked to both of
+    /// us (the best-linked first). False when it couldn't go (dropped, not
+    /// queued).
     pub fn send_leg_media(
         &self,
         call: u64,
@@ -403,28 +475,37 @@ impl Node {
         stream: u8,
         payload: &[u8],
     ) -> Result<bool> {
-        let (packet, hub) = {
+        let me = self.identity();
+        let (packet, relays) = {
             let mut gc = lock(&self.shared.group_calls);
             let c = gc
                 .current
                 .as_mut()
                 .filter(|c| c.info.call == call && c.info.joined)
                 .ok_or_else(|| NetError::NotAllowed("no such call".into()))?;
-            let hub = c.info.hub;
+            let mine = self.links_of(c);
+            let hub = c.hub(&me, &mine);
+            // Participants we reach that say they reach `peer`.
+            let mut relays: Vec<PublicIdentity> = mine
+                .iter()
+                .filter(|r| *r != peer && c.linked(r, peer))
+                .copied()
+                .collect();
+            relays.sort_by_key(|r| (*r != hub, *r.as_bytes()));
             let leg = c
                 .legs
                 .get_mut(peer)
                 .ok_or_else(|| NetError::NotAllowed("not in the call".into()))?;
-            (leg.keys.seal(stream, payload)?, hub)
+            (leg.keys.seal(stream, payload)?, relays)
         };
         if self.connected(peer) {
             return Ok(self.send_packet(peer, packet));
         }
-        if hub != self.identity() && hub != *peer && self.connected(&hub) {
-            let wrapped = call::wrap_relayed(peer.as_bytes(), &packet);
-            return Ok(self.send_packet(&hub, wrapped));
-        }
-        Ok(false)
+        let Some(relay) = relays.first() else {
+            return Ok(false);
+        };
+        let wrapped = call::wrap_relayed(peer.as_bytes(), &packet);
+        Ok(self.send_packet(relay, wrapped))
     }
 
     /// A packet to `to`: as a datagram when the link has them and it
@@ -439,32 +520,33 @@ impl Node {
     }
 
     /// A media packet from `from` that may be a group call's: relayed
-    /// (we pass it on as the hub, or the hub passes it to us) or one of
-    /// our legs. Returns false when it isn't, for the one-to-one call.
+    /// (for us to pass on, or passed on to us) or one of our legs.
+    /// Returns false when it isn't, for the one-to-one call.
     pub(crate) fn on_group_media(&self, from: PublicIdentity, packet: &[u8]) -> bool {
         let me = self.identity();
         if let Some((device, inner)) = call::unwrap_relayed(packet) {
-            let other = PublicIdentity::from_bytes(&device);
             let mut gc = lock(&self.shared.group_calls);
             let Some(c) = gc.current.as_mut().filter(|c| c.info.joined) else {
                 return true;
             };
-            let Ok(other) = other else { return true };
-            if c.info.hub == me {
-                // Pass it on, only between two participants, and only a
-                // packet of the leg between them.
-                if c.is_participant(&from)
-                    && c.is_participant(&other)
-                    && call::call_of(inner)
-                        == Some(call::leg_id(c.info.call, from.as_bytes(), other.as_bytes()))
-                {
-                    drop(gc);
-                    self.send_packet(&other, call::wrap_relayed(from.as_bytes(), inner));
-                }
+            let Ok(other) = PublicIdentity::from_bytes(&device) else {
+                return true;
+            };
+            let id = call::call_of(inner);
+            if !c.is_participant(&from) || !c.is_participant(&other) {
                 return true;
             }
-            if from == c.info.hub {
+            // `other`'s packet on our leg with it, passed on by `from`.
+            if id == Some(call::leg_id(c.info.call, me.as_bytes(), other.as_bytes())) {
                 open_leg(c, &other, inner);
+                return true;
+            }
+            // For us to pass on: only a packet of the leg between the two.
+            if other != me
+                && id == Some(call::leg_id(c.info.call, from.as_bytes(), other.as_bytes()))
+            {
+                drop(gc);
+                self.send_packet(&other, call::wrap_relayed(from.as_bytes(), inner));
             }
             return true;
         }
@@ -482,19 +564,25 @@ impl Node {
         true
     }
 
-    /// Stops a group call ringing after a minute, and drops participants
-    /// whose legs went silent.
+    /// Stops a group call ringing after a minute, drops participants whose
+    /// legs went silent, and reports when our links change
+    /// ([`Event::GroupCallLinks`], for the group layer to send an update).
     fn watch_group_call(&self, call: u64) {
         let node = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(WATCH_EVERY).await;
                 let now = now_ms();
-                let (ring_over, silent) = {
+                let (ring_over, silent, relinked) = {
                     let gc = lock(&node.shared.group_calls);
                     let Some(c) = gc.current.as_ref().filter(|c| c.info.call == call) else {
                         return;
                     };
+                    let mut mine = node.links_of(c);
+                    mine.sort_by_key(|p| *p.as_bytes());
+                    let mut told = c.told.clone();
+                    told.sort_by_key(|p| *p.as_bytes());
+                    let relinked = c.info.joined && mine != told;
                     let ring_over = !c.info.joined
                         && now.saturating_sub(c.rang_ms) > GROUP_RING_TIMEOUT.as_millis() as u64;
                     let silent: Vec<_> = c
@@ -505,11 +593,14 @@ impl Node {
                         })
                         .map(|(p, _)| *p)
                         .collect();
-                    (ring_over, silent)
+                    (ring_over, silent, relinked)
                 };
                 if ring_over {
                     node.leave_group_call(call);
                     return;
+                }
+                if relinked {
+                    node.emit(Event::GroupCallLinks { call });
                 }
                 for p in silent {
                     node.group_call_left(call, p);

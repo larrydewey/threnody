@@ -69,6 +69,9 @@ impl N {
                 Event::Connected { peer, .. } => self.groups.connected(&self.node, &peer),
                 Event::DeviceLinked { device } => self.groups.linked(&self.node, &device),
                 Event::GroupLegSignal { from, data, .. } => self.legs.push((from, data)),
+                Event::GroupCallLinks { call } => {
+                    let _ = self.groups.announce_call_links(&self.node, call);
+                }
                 _ => {}
             }
         }

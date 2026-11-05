@@ -2542,6 +2542,11 @@ impl ThrenodyNode {
                 Event::GroupLegSignal { call, from, data } => {
                     self.group_leg_signal(call, from, data)
                 }
+                // Our sessions with the call's participants changed: tell them.
+                Event::GroupCallLinks { call } => {
+                    let _guard = self.rt.enter();
+                    let _ = self.group_node().announce_call_links(&self.node, call);
+                }
                 other => {
                     match &other {
                         Event::Connected { peer, .. } => self.group_connected(peer),

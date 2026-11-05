@@ -62,6 +62,8 @@ class ChatActivity : Activity() {
     /** The device to address; any of the account's devices reaches them all. */
     private var device = ""
     private var convo: Conversation? = null
+    /** The voice and video call buttons, hidden in a group we're only invited to. */
+    private var callButtons: List<View> = emptyList()
     private lateinit var bar: TopBar
     private lateinit var banner: LinearLayout
     /** The pinned messages, newest pin shown; tapping steps through them. */
@@ -174,6 +176,7 @@ class ChatActivity : Activity() {
             title.text = if (group != null) "Group" else Threnody.short(device)
             action(R.drawable.ic_videocam, if (group != null) "Group video call" else "Video call") { call(video = true) }
             action(R.drawable.ic_call, if (group != null) "Group call" else "Call") { call() }
+            callButtons = (childCount - 2 until childCount).map { getChildAt(it) }
             action(R.drawable.ic_search, "Search this chat") { search.open() }
             action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
         }
@@ -957,6 +960,7 @@ class ChatActivity : Activity() {
     private fun groupHeader(g: GroupInfo?) {
         clearBanner()
         bar.subtitle.visibility = View.VISIBLE
+        callButtons.forEach { it.visibility = if (g == null) View.GONE else View.VISIBLE }
         if (g == null) {
             val invites = try { node.groupInvites().filter { it.group == group } } catch (_: Exception) { emptyList() }
             val invite = invites.firstOrNull { it.from == inviter } ?: invites.firstOrNull()

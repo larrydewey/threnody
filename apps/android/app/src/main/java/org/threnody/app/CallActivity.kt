@@ -35,6 +35,7 @@ class CallActivity : Activity() {
     private lateinit var who: TextView
     private lateinit var ringingRow: LinearLayout
     private lateinit var activeRow: LinearLayout
+    private lateinit var answer: ImageButton
     private lateinit var answerVideo: ImageButton
     private lateinit var mute: ImageButton
     private lateinit var camera: ImageButton
@@ -108,9 +109,10 @@ class CallActivity : Activity() {
             })
         }
         answerVideo = round(R.drawable.ic_videocam, "Answer with video", green, white) { Calls.answer(this, video = true) }
+        answer = round(R.drawable.ic_call, "Answer", green, white) { Calls.answer(this) }
         ringingRow = row(
             round(R.drawable.ic_call_end, "Decline", red, white) { Calls.hangUp(this) },
-            round(R.drawable.ic_call, "Answer", green, white) { Calls.answer(this) },
+            answer,
             answerVideo,
         )
         val idle = getColor(R.color.surface_container)
@@ -360,6 +362,7 @@ class CallActivity : Activity() {
         // Joining a group call, either way is fine.
         answerVideo.visibility = if (c.peerVideo || group) View.VISIBLE else View.GONE
         answerVideo.contentDescription = if (group) "Join with video" else "Answer with video"
+        answer.contentDescription = if (group) "Join" else "Answer"
         activeRow.visibility = if (ringing) View.GONE else View.VISIBLE
         val talking = c.state == "connected" || c.state == "interrupted"
         // Reactions are for calls with one contact.

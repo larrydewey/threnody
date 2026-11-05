@@ -316,6 +316,11 @@ pub enum Event {
         from: PublicIdentity,
         data: Vec<u8>,
     },
+    /// Our sessions with group call `call`'s participants changed: the
+    /// group layer tells them ([`Node::group_call_links`]).
+    GroupCallLinks {
+        call: u64,
+    },
     /// We left group call `call`, or it stopped ringing here.
     GroupCallEnded {
         group: [u8; 16],

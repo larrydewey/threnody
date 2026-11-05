@@ -1,7 +1,7 @@
 //! Group calls (Appendix Q, *Group calls*): legs between every two
-//! participants, relayed by the hub when a pair has no session, and a new
-//! hub when the hub leaves. The group layer's signalling is played here
-//! by calling the node directly.
+//! participants, relayed by a participant linked to both when a pair has
+//! no session. The group layer's signalling is played here by calling the
+//! node directly.
 
 use std::time::Duration;
 
@@ -54,11 +54,10 @@ const GROUP: [u8; 16] = [7; 16];
 const CALL: u64 = 42;
 const BASE: [u8; 32] = [9; 32];
 
-/// `n` hears that `joined` are in the call (as the group layer would tell it).
-fn roster(n: &Node, joined: &[PublicIdentity]) {
-    for d in joined {
-        n.group_call_joined(CALL, *d, false);
-    }
+/// `n` hears that `who` is in the call, linked to `links` (as the group
+/// layer would tell it).
+fn joined(n: &Node, who: PublicIdentity, links: &[PublicIdentity]) {
+    n.group_call_joined(CALL, who, false, links.to_vec());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -75,7 +74,7 @@ async fn group_call_legs_go_direct_or_through_the_hub() {
     let (ai, bi, ci) = (a.identity(), b.identity(), c.identity());
 
     a.start_group_call(GROUP, CALL, BASE, false).unwrap();
-    assert!(b.group_call_rang(GROUP, CALL, ai, ai, BASE, false));
+    assert!(b.group_call_rang(GROUP, CALL, ai, BASE, false));
     let Event::GroupCallRinging { from, .. } = timeout(Duration::from_secs(5), async {
         loop {
             let e = brx.recv().await.unwrap();
@@ -89,13 +88,16 @@ async fn group_call_legs_go_direct_or_through_the_hub() {
         unreachable!()
     };
     assert_eq!(from, ai);
-    assert!(c.group_call_rang(GROUP, CALL, ai, ai, BASE, false));
+    assert!(c.group_call_rang(GROUP, CALL, ai, BASE, false));
     b.join_group_call(CALL, false).unwrap();
-    roster(&a, &[bi]);
-    roster(&c, &[bi]);
+    joined(&a, bi, &[ai]);
+    joined(&c, bi, &[ai]);
     c.join_group_call(CALL, false).unwrap();
-    roster(&a, &[ci]);
-    roster(&b, &[ci]);
+    joined(&a, ci, &[ai]);
+    joined(&b, ci, &[ai]);
+    // A says it reaches both (its answer to their joins).
+    joined(&b, ai, &[bi, ci]);
+    joined(&c, ai, &[bi, ci]);
     assert_eq!(b.group_call().unwrap().participants.len(), 2);
 
     let mut a_from_b = a.group_leg_media(CALL, &bi).unwrap();
@@ -112,14 +114,14 @@ async fn group_call_legs_go_direct_or_through_the_hub() {
     assert_eq!(recv(&mut a_from_b).await, Some((1, b"to a".to_vec())));
     assert!(a.send_leg_media(CALL, &bi, 1, b"to b").unwrap());
     assert_eq!(recv(&mut b_from_a).await, Some((1, b"to b".to_vec())));
-    // B and C through the hub, both ways.
+    // B and C through A, both ways.
     assert!(b.send_leg_media(CALL, &ci, 2, b"b to c").unwrap());
     assert_eq!(recv(&mut c_from_b).await, Some((2, b"b to c".to_vec())));
     assert!(c.send_leg_media(CALL, &bi, 2, b"c to b").unwrap());
     assert_eq!(recv(&mut b_from_c).await, Some((2, b"c to b".to_vec())));
 
-    // The hub passes on only packets between two participants: D, not in
-    // the call, can't use it to reach C.
+    // A passes on only packets between two participants: D, not in the
+    // call, can't use it to reach C.
     let junk = wrap_relayed(ci.as_bytes(), &[1; 64]);
     d.send(&ai, AppMessage::Media(junk)).unwrap();
     // Nor can a participant pass off another leg's packet.
@@ -129,19 +131,18 @@ async fn group_call_legs_go_direct_or_through_the_hub() {
         .unwrap();
     assert_eq!(recv(&mut c_from_b).await, None);
 
-    // The hub leaves: the participant with the smaller key takes over.
+    // A is the best linked: the hub. When it leaves, B and C are linked
+    // to nobody, and tie.
+    assert_eq!(b.group_call().unwrap().hub, ai);
     a.leave_group_call(CALL);
-    let next_b = b.group_call_left(CALL, ai);
-    let next_c = c.group_call_left(CALL, ai);
-    let expect = if bi.as_bytes() < ci.as_bytes() {
+    b.group_call_left(CALL, ai);
+    c.group_call_left(CALL, ai);
+    let smaller = if bi.as_bytes() < ci.as_bytes() {
         bi
     } else {
         ci
     };
-    assert_eq!(b.group_call().unwrap().hub, expect);
-    assert_eq!(c.group_call().unwrap().hub, expect);
-    assert_eq!(next_b.or(next_c), Some(expect));
-    assert!(next_b.is_none() || next_c.is_none(), "one new hub");
+    assert_eq!(b.group_call().unwrap().hub, smaller);
     // B and C now need a path of their own.
     assert!(!b.send_leg_media(CALL, &ci, 1, b"nowhere").unwrap());
     connect(&b, &c).await;
@@ -188,5 +189,46 @@ async fn group_calls_and_one_to_one_calls_exclude_each_other() {
     })
     .await
     .unwrap();
-    assert!(!a.group_call_rang(GROUP, 99, b.identity(), b.identity(), BASE, false));
+    assert!(!a.group_call_rang(GROUP, 99, b.identity(), BASE, false));
+}
+
+/// The starter (S) reaches only A, and B reaches only A: S and B's leg goes
+/// through A, a participant linked to both, though A didn't start the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leg_goes_through_whoever_is_linked_to_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s, _srx) = node(&dir, "s");
+    let (a, _arx) = node(&dir, "a");
+    let (b, _brx) = node(&dir, "b");
+    connect(&s, &a).await;
+    connect(&b, &a).await;
+    let (si, ai, bi) = (s.identity(), a.identity(), b.identity());
+
+    s.start_group_call(GROUP, CALL, BASE, false).unwrap();
+    for n in [&a, &b] {
+        assert!(n.group_call_rang(GROUP, CALL, si, BASE, false));
+        n.join_group_call(CALL, false).unwrap();
+    }
+    assert_eq!(a.group_call_links(CALL), vec![si]);
+    // Everyone hears everyone's join and links.
+    joined(&s, ai, &[si, bi]);
+    joined(&s, bi, &[ai]);
+    joined(&a, bi, &[ai]);
+    joined(&a, si, &[ai]);
+    joined(&b, ai, &[si, bi]);
+    joined(&b, si, &[ai]);
+    // A's links grew when B joined: the node says so.
+    let mut a_links = a.group_call_links(CALL);
+    a_links.sort_by_key(|p| *p.as_bytes());
+    let mut want = vec![si, bi];
+    want.sort_by_key(|p| *p.as_bytes());
+    assert_eq!(a_links, want);
+    assert_eq!(s.group_call().unwrap().hub, ai, "A is linked to both");
+
+    let mut s_from_b = s.group_leg_media(CALL, &bi).unwrap();
+    let mut b_from_s = b.group_leg_media(CALL, &si).unwrap();
+    assert!(b.send_leg_media(CALL, &si, 3, b"b to s").unwrap());
+    assert_eq!(recv(&mut s_from_b).await, Some((3, b"b to s".to_vec())));
+    assert!(s.send_leg_media(CALL, &bi, 3, b"s to b").unwrap());
+    assert_eq!(recv(&mut b_from_s).await, Some((3, b"s to b".to_vec())));
 }

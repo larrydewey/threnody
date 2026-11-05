@@ -1425,6 +1425,7 @@ impl Ui {
             | Event::GroupCallMember { .. }
             | Event::GroupCallVideo { .. }
             | Event::GroupLegSignal { .. }
+            | Event::GroupCallLinks { .. }
             | Event::GroupCallEnded { .. } => {}
             Event::Typing { peer, active } => {
                 if active {

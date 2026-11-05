@@ -63,14 +63,18 @@ async fn three_people_see_each_other_through_the_hub() {
     // The roster, as the group layer would build it.
     a.start_group_call(GROUP, CALL, SECRET, true).unwrap();
     for n in [&b, &c] {
-        assert!(n.group_call_rang(GROUP, CALL, ids[0], ids[0], SECRET, true));
+        assert!(n.group_call_rang(GROUP, CALL, ids[0], SECRET, true));
     }
     b.join_group_call(CALL, true).unwrap();
-    a.group_call_joined(CALL, ids[1], true);
-    c.group_call_joined(CALL, ids[1], true);
+    a.group_call_joined(CALL, ids[1], true, vec![ids[0]]);
+    c.group_call_joined(CALL, ids[1], true, vec![ids[0]]);
     c.join_group_call(CALL, true).unwrap();
-    a.group_call_joined(CALL, ids[2], true);
-    b.group_call_joined(CALL, ids[2], true);
+    a.group_call_joined(CALL, ids[2], true, vec![ids[0]]);
+    b.group_call_joined(CALL, ids[2], true, vec![ids[0]]);
+    // Alice reaches both.
+    for n in [&b, &c] {
+        n.group_call_joined(CALL, ids[0], true, vec![ids[1], ids[2]]);
+    }
 
     // Leg signalling goes straight to the other side's media (the group
     // layer's job in the apps).
