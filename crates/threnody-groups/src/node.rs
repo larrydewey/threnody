@@ -1089,10 +1089,13 @@ impl GroupNode {
                     .is_some_and(|c| c.mutually_approved())
                     || node.is_own_device(&peer)
                     || self.expected.contains(&(group, Some(peer)));
-                if trusted && let Ok(out) = self.groups.accept_invite(&group, peer) {
-                    if let Ok(u) = self.apply(node, out, true) {
-                        updates.extend(u);
-                    }
+                // If our key package can't be kept and sent, the
+                // invitation waits for consent like any other.
+                if trusted
+                    && let Ok(out) = self.groups.accept_invite(&group, peer)
+                    && let Ok(u) = self.apply(node, out, true)
+                {
+                    updates.extend(u);
                     return;
                 }
                 let inv = Invite {

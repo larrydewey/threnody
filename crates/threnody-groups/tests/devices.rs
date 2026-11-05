@@ -359,6 +359,32 @@ async fn a_crowd_of_strangers_neither_hides_invitations_nor_floods_notifications
 }
 
 #[tokio::test]
+async fn a_trusted_invitation_that_could_not_be_saved_waits_for_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    // Alice's group state can't be written, so her key package for Bob's
+    // invitation can't be kept or sent: the invitation is kept instead.
+    let blocker = dir.path().join("alice").join("groups.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let request = GroupWire::KeyPackageRequest {
+        group: [5; 16],
+        name: "team".into(),
+    };
+    let updates = alice
+        .groups
+        .incoming(&alice.node, bid, &request.encode().unwrap())
+        .unwrap();
+    assert!(
+        updates
+            .iter()
+            .any(|u| matches!(u, Update::Invited { invite, quiet: false } if invite.from == bid))
+    );
+    assert_eq!(alice.groups.invites().len(), 1);
+}
+
+#[tokio::test]
 async fn nothing_leaves_that_could_not_be_saved() {
     let dir = tempfile::tempdir().unwrap();
     let mut alice = spawn(&dir, "alice").await;
