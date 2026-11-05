@@ -1588,7 +1588,8 @@ where
 
     let make_ticker = |rate: Option<Duration>| {
         rate.map(|d| {
-            let mut t = tokio::time::interval(d);
+            // No slower than the longest heartbeat a lease allows.
+            let mut t = tokio::time::interval(d.min(crate::recover::MAX_BEAT));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             t
         })
@@ -1613,8 +1614,12 @@ where
     let mut early_paths: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
-    let mut heartbeat = tokio::time::interval(node.beat());
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let make_heartbeat = || {
+        let mut t = tokio::time::interval(node.beat());
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    };
+    let mut heartbeat = make_heartbeat();
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
     let mut push_sent = false;
@@ -1967,7 +1972,21 @@ where
                     }
                 }
                 Ok(()) = rate.changed() => {
+                    // The peer's lease follows the heartbeat our `Paths`
+                    // announced: announce the new one at once, before
+                    // sending less often, or a slower rate would outlast
+                    // the old lease and the peer would end the session.
+                    if paths_sent && shared.mutual(&peer) && node.supports(&peer, FEATURE_PATHS) {
+                        if chan.can_send() {
+                            if let Some(m) = node.paths_message() {
+                                write_frame(&mut wr, &chan.seal(&m)?).await?;
+                            }
+                        } else {
+                            paths_sent = false;
+                        }
+                    }
                     ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
+                    heartbeat = make_heartbeat();
                 }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {

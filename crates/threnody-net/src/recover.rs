@@ -46,6 +46,9 @@ const SLOT_POLL: Duration = Duration::from_millis(1500);
 /// The longest silence on a session when cover traffic is off: an empty
 /// frame goes out at least this often, so the lease means something.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
+/// The longest heartbeat a peer may announce: cover traffic slower than
+/// this still sends a frame this often.
+pub(crate) const MAX_BEAT: Duration = Duration::from_secs(120);
 /// Missed heartbeats before a session counts as lost. QUIC and TCP
 /// retransmit, so a frame arrives late rather than not at all.
 const LEASE_BEATS: u32 = 2;
@@ -191,7 +194,8 @@ impl RecoverState {
 
 /// The lease for a peer whose heartbeat is `beat_ms`.
 pub(crate) fn lease_for(beat_ms: u64) -> Duration {
-    Duration::from_millis(beat_ms.clamp(500, 120_000)) * LEASE_BEATS + Duration::from_secs(2)
+    Duration::from_millis(beat_ms.clamp(500, MAX_BEAT.as_millis() as u64)) * LEASE_BEATS
+        + Duration::from_secs(2)
 }
 
 fn slot_key(slot: &[u8; 32], writer: &PublicIdentity) -> rendezvous::RecordKeys {
@@ -225,9 +229,11 @@ impl Node {
         self.emit(Event::ReachNote { note });
     }
 
-    /// Our heartbeat: the cover-traffic interval, else [`HEARTBEAT`].
+    /// Our heartbeat: the cover-traffic interval, else [`HEARTBEAT`]; at
+    /// most [`MAX_BEAT`]. Sessions send at least this often, and the
+    /// `Paths` we send say so.
     pub(crate) fn beat(&self) -> Duration {
-        self.constant_rate().unwrap_or(HEARTBEAT).min(HEARTBEAT)
+        self.constant_rate().unwrap_or(HEARTBEAT).min(MAX_BEAT)
     }
 
     fn our_paths(&self) -> Paths {

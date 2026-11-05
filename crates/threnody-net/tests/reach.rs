@@ -311,6 +311,66 @@ async fn a_silently_dead_path_is_repaired_within_seconds() {
     );
 }
 
+/// Slowing cover traffic mid-session (as a phone does when its network
+/// turns metered) tells the peer the new heartbeat first: its lease,
+/// sized for the old one, must not end the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slowing_cover_traffic_mid_session_keeps_the_session() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    // Every 200 ms: Bob's lease for Alice is then 3 s.
+    for n in [&alice, &bob] {
+        n.set_constant_rate(Some(Duration::from_millis(200)));
+    }
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    let b_quic = bob.listen_quic("127.0.0.1:0").await.unwrap();
+    for n in [&alice, &bob] {
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    // Wait until both know their own addresses, so `Paths` carry them.
+    timeout(Duration::from_secs(10), async {
+        while alice.reachability().candidates.is_empty() || bob.reachability().candidates.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let bob_id = alice.connect_quic(b_quic, None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Let the `Paths` messages cross.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    alice.set_constant_rate(Some(Duration::from_secs(4)));
+    let dropped = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Event::Disconnected { reason, .. }) = brx.recv().await {
+                return reason;
+            }
+        }
+    })
+    .await;
+    assert!(dropped.is_err(), "session dropped: {dropped:?}");
+    assert!(alice.sessions().iter().any(|s| s.peer == bob_id));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strangers_find_each_other_by_handle() {
     let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
