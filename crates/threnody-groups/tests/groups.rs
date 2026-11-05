@@ -544,3 +544,22 @@ fn a_welcome_must_come_from_whom_we_gave_a_key_package() {
     assert!(net.node(&pb).handle(pc, w).is_err());
     assert!(!net.node(&pb).list().iter().any(|(id, ..)| *id == g));
 }
+
+#[test]
+fn names_lose_characters_that_reorder_text() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let mut gb = Groups::new(&b);
+    let out = gb
+        .handle(
+            a.public(),
+            GroupWire::KeyPackageRequest {
+                group: [1; 16],
+                name: "Your\u{202E}knab\u{2066} \u{200B}club\u{FEFF}\n".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        &out.events[..],
+        [GroupEvent::InviteRequested { name, .. }] if name == "Yourknab club"
+    ));
+}

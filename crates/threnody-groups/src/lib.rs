@@ -1215,9 +1215,24 @@ impl Groups {
     }
 }
 
+/// A name as we show it: at most [`MAX_NAME`] characters, without
+/// control characters or the invisible ones that reorder or hide text
+/// (bidirectional overrides and isolates, zero-width characters).
 fn truncate(name: &str) -> String {
     name.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .take(MAX_NAME)
         .collect()
+}
+
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }

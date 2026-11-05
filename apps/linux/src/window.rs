@@ -1319,16 +1319,29 @@ impl App {
                     )
                 }),
             ),
-            NodeEvent::GroupInvited { group, name, from } => (
-                Some(group.clone()),
-                Some((
-                    name.clone(),
-                    format!(
-                        "{} invites you to join",
-                        self.name(persona.as_deref(), from)
-                    ),
-                )),
-            ),
+            NodeEvent::GroupInvited { group, name, from } => {
+                let known = self.core.node(persona.as_deref()).is_ok_and(|n| {
+                    n.contacts()
+                        .iter()
+                        .any(|c| c.fingerprint == *from && c.accepted)
+                });
+                (
+                    Some(group.clone()),
+                    Some(if known {
+                        (
+                            name.clone(),
+                            format!(
+                                "{} invites you to join",
+                                self.name(persona.as_deref(), from)
+                            ),
+                        )
+                    } else {
+                        // Not even the group's name: a stranger's can be a
+                        // message in itself.
+                        ("Threnody".into(), "New group invitation".into())
+                    }),
+                )
+            }
             // Not even who: a stranger's name can be a message in itself.
             NodeEvent::MessageRequest { peer, .. } => (
                 Some(peer.clone()),

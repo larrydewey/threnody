@@ -42,6 +42,10 @@ pub const MAX_HELD_PER_MEMBER: usize = 200;
 /// forwards, so this bounds what one can make us keep and rewrite.
 pub const MAX_HELD_BYTES_PER_MEMBER: usize = 32 << 20;
 pub const MAX_HELD_BYTES: usize = 128 << 20;
+/// Invitations waiting for consent from one inviter, and in all; the
+/// oldest are dropped first.
+pub const MAX_INVITES_PER_PEER: usize = 3;
+pub const MAX_INVITES: usize = 32;
 
 /// An invitation waiting for the user's consent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1002,6 +1006,11 @@ impl GroupNode {
                 Update::Joined { group, name, owner }
             }
             GroupEvent::InviteRequested { group, name, peer } => {
+                // Group traffic skips message requests, and can still come
+                // from someone blocked (through a mailbox).
+                if node.contacts().get(&peer).is_some_and(|c| c.blocked) {
+                    return;
+                }
                 // Mutually approved contacts are trusted to add us, and so
                 // is the owner of a group our own device says to join;
                 // anyone else needs explicit consent.
@@ -1023,6 +1032,16 @@ impl GroupNode {
                 self.invites
                     .retain(|i| !(i.group == group && i.from == peer));
                 self.invites.push(inv.clone());
+                // Anyone can ask: keep only the latest few of each.
+                let theirs = self.invites.iter().filter(|i| i.from == peer).count();
+                let mut extra = theirs.saturating_sub(MAX_INVITES_PER_PEER);
+                self.invites.retain(|i| {
+                    let drop = extra > 0 && i.from == peer;
+                    extra -= usize::from(drop);
+                    !drop
+                });
+                let extra = self.invites.len().saturating_sub(MAX_INVITES);
+                self.invites.drain(..extra);
                 self.save_invites();
                 Update::Invited(inv)
             }

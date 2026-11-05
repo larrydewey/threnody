@@ -279,6 +279,45 @@ async fn a_linked_device_takes_only_the_owners_invitation() {
 }
 
 #[tokio::test]
+async fn invitations_from_strangers_are_few_and_from_the_blocked_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut mallory = spawn(&dir, "mallory").await;
+    let aid = mallory.node.connect(&alice.addr, None).await.unwrap();
+    let mid = mallory.node.identity();
+    let request = |i: u8| {
+        let r = GroupWire::KeyPackageRequest {
+            group: [i; 16],
+            name: format!("Free money {i}"),
+        };
+        r.encode().unwrap()
+    };
+    for i in 0..10 {
+        mallory
+            .node
+            .send(&aid, AppMessage::Group(request(i)))
+            .unwrap();
+    }
+    // The newest few stay.
+    until(&mut [&mut alice, &mut mallory], |ns| {
+        ns[0].groups.invites().iter().any(|i| i.group == [9; 16])
+    })
+    .await;
+    let groups: Vec<_> = alice.groups.invites().iter().map(|i| i.group[0]).collect();
+    assert_eq!(groups, [7, 8, 9]);
+
+    // Once blocked, whatever still reaches us (from a mailbox, say) asks
+    // nothing.
+    alice.node.block_contact(&mid);
+    let updates = alice
+        .groups
+        .incoming(&alice.node, mid, &request(20))
+        .unwrap();
+    assert!(updates.is_empty());
+    assert_eq!(alice.groups.invites().len(), 3);
+}
+
+#[tokio::test]
 async fn an_owner_adds_its_own_linked_device() {
     let dir = tempfile::tempdir().unwrap();
     let mut laptop = spawn(&dir, "laptop").await;
