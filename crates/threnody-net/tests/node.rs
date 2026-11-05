@@ -903,6 +903,68 @@ async fn turning_tunnels_on_mid_session_still_pairs_both_sides() {
     assert_eq!(bob.tunnel_peers(), vec![alice.identity()]);
 }
 
+/// A TCP proxy to `to` that holds back what the dialer sends by `delay`.
+async fn late_requests(to: std::net::SocketAddr, delay: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(to).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = cr.read(&mut buf).await {
+            tokio::time::sleep(delay).await;
+            if n == 0 || sw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
+/// Both sides dialing at once keep one session, and neither reports a
+/// disconnection for the duplicate the other dropped, even when that
+/// duplicate was, for a moment, the only session on one side.
+#[tokio::test]
+async fn simultaneous_dials_report_no_disconnection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let a_addr = alice.listen("127.0.0.1:0").await.unwrap();
+    let b_addr = bob.listen("127.0.0.1:0").await.unwrap();
+    // Both keep the session the smaller key (x) dialed. x dials first,
+    // over a slow path; y dials a moment later. x has its own session
+    // first, so drops y's at once, while y still holds that as its only
+    // one: x's session completes on y's side only later.
+    let alice_smaller = alice.identity().as_bytes() < bob.identity().as_bytes();
+    let (x, y, yrx, y_addr) = if alice_smaller {
+        (&alice, &bob, &mut brx, b_addr)
+    } else {
+        (&bob, &alice, &mut arx, a_addr)
+    };
+    let x_addr = if alice_smaller { a_addr } else { b_addr };
+    let slow = late_requests(y_addr, Duration::from_millis(200)).await;
+    let x2 = x.clone();
+    let dial = tokio::spawn(async move { x2.connect(&slow, None).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    y.connect(&x_addr.to_string(), None).await.unwrap();
+    dial.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(y.sessions().len(), 1);
+    assert_eq!(x.sessions().len(), 1);
+    while let Ok(e) = yrx.try_recv() {
+        assert!(
+            !matches!(e, Event::Disconnected { .. }),
+            "spurious disconnection: {e:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn read_receipts_reach_the_sender() {
     let dir = tempfile::tempdir().unwrap();

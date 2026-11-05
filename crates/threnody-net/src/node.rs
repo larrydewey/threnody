@@ -1497,6 +1497,7 @@ impl Node {
         });
 
         let node = self.clone();
+        let started = tokio::time::Instant::now();
         tokio::spawn(async move {
             let result = run_session(&node, stream, chan, addr, via, over, rx).await;
             // Closed on purpose (either side) is not a loss to repair.
@@ -1513,6 +1514,17 @@ impl Node {
                 if sessions.get(&peer).is_some_and(|h| h.id == id) {
                     sessions.remove(&peer);
                 }
+                current
+            };
+            // When both sides dial at once, the other side may drop this
+            // session (see `loses_duplicate`) before its twin reaches us:
+            // a young one gets a moment for the twin before counting as
+            // a disconnection.
+            let young = started.elapsed() < Duration::from_millis(DUPLICATE_WINDOW_MS);
+            let current = if current && via.is_none() && young {
+                tokio::time::sleep(TWIN_GRACE).await;
+                !node.connected(&peer)
+            } else {
                 current
             };
             // Circuits relayed over this link die with it (unless a newer
@@ -2064,6 +2076,10 @@ const SETUP_BURST: Duration = Duration::from_secs(5);
 
 /// How long a session ended locally may take to send its last revocation.
 const LAST_WORDS: Duration = Duration::from_secs(1);
+
+/// How long a young session that ended waits for a twin (see
+/// `spawn_session`) before it counts as a disconnection.
+const TWIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;
