@@ -70,6 +70,13 @@ impl std::fmt::Debug for Secret {
 /// the userspace device.
 pub(crate) type TunnelInbound = mpsc::Sender<(PublicIdentity, Vec<u8>)>;
 
+/// Whether a tunnel endpoint says where to send: one learned only over a
+/// link with no IP address (Bluetooth) doesn't, and WireGuard then waits
+/// for the peer's own packets to show it.
+pub fn has_endpoint(endpoint: &SocketAddr) -> bool {
+    !endpoint.ip().is_unspecified()
+}
+
 /// A peer's WireGuard tunnel info.
 #[derive(Clone)]
 pub struct TunnelPeer {
@@ -523,6 +530,21 @@ impl Shared {
         }
     }
 
+    /// Where `peer`'s tunnel endpoint is, offered `port` on a session from
+    /// `addr`. A link with no IP address (Bluetooth) has an unspecified
+    /// one: the endpoint an earlier session gave stays, else it is left
+    /// unspecified (see [`has_endpoint`]) until the peer's packets show it.
+    fn tunnel_endpoint(&self, peer: &PublicIdentity, addr: SocketAddr, port: u16) -> SocketAddr {
+        let ip = if addr.ip().is_unspecified() {
+            lock(&self.tunnel_peers)
+                .get(peer)
+                .map_or(addr.ip(), |tp| tp.endpoint.ip())
+        } else {
+            addr.ip()
+        };
+        SocketAddr::new(ip, port)
+    }
+
     /// Records `peer`'s tunnel, unless its WireGuard key is ours or
     /// already another peer's. WireGuard knows peers by key, so a contact
     /// offering someone else's key would take over that peer's entry (and,
@@ -866,21 +888,16 @@ impl Node {
         // Then add/update each peer
         for peer in self.tunnel_peers_full() {
             let psk = zeroize::Zeroizing::new(threnody_core::tunnel::base64(&peer.psk.0[..]));
+            let key = threnody_core::tunnel::base64(&peer.wg_public);
+            let endpoint = peer.endpoint.to_string();
+            let allowed = format!("{}/128", peer.overlay);
+            let mut args = vec!["set", iface, "peer", &key, "preshared-key", "/dev/stdin"];
+            if has_endpoint(&peer.endpoint) {
+                args.extend(["endpoint", &endpoint]);
+            }
+            args.extend(["allowed-ips", &allowed, "persistent-keepalive", "25"]);
             let mut child = Command::new("wg")
-                .args([
-                    "set",
-                    iface,
-                    "peer",
-                    &threnody_core::tunnel::base64(&peer.wg_public),
-                    "preshared-key",
-                    "/dev/stdin",
-                    "endpoint",
-                    &peer.endpoint.to_string(),
-                    "allowed-ips",
-                    &format!("{}/128", peer.overlay),
-                    "persistent-keepalive",
-                    "25",
-                ])
+                .args(args)
                 .stdin(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -1822,11 +1839,13 @@ where
                             }
                         }
                         AppMessage::TunnelOffer { wg_public, port } => {
-                            // Spec §8: tunnels only between mutually approved devices.
-                            if lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
+                            // Spec §8: tunnels only between mutually approved
+                            // devices, offered on direct sessions only: the
+                            // address of a relayed one is the relay's.
+                            if via.is_none() && lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
                                 let tp = TunnelPeer {
                                     wg_public,
-                                    endpoint: SocketAddr::new(addr.ip(), port),
+                                    endpoint: shared.tunnel_endpoint(&peer, addr, port),
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 };

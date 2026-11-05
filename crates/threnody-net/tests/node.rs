@@ -451,6 +451,58 @@ async fn a_tunnel_offer_cannot_claim_anothers_key() {
     assert_eq!(alice.tunnel_peers().len(), 2);
 }
 
+/// A session over Bluetooth has no IP address: a tunnel offer on it
+/// keeps the endpoint an earlier session gave, rather than pointing
+/// WireGuard at 0.0.0.0.
+#[tokio::test]
+async fn a_bluetooth_session_keeps_the_tunnel_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+    let entry = || {
+        alice
+            .tunnel_peer_entries()
+            .into_iter()
+            .find(|(k, _)| *k == bob_id)
+            .map(|(_, tp)| (tp.endpoint, *tp.psk.0))
+            .unwrap()
+    };
+    let (direct, psk) = entry();
+    assert!(!direct.ip().is_unspecified());
+
+    // The same pair over a Bluetooth link replaces the TCP session.
+    let (a_end, b_end) = tokio::io::duplex(1 << 16);
+    let bob2 = bob.clone();
+    let accept =
+        tokio::spawn(async move { bob2.accept_stream(b_end, "ble", "AA:BB".into()).await });
+    alice
+        .connect_stream(a_end, "ble", "CC:DD".into(), None)
+        .await
+        .unwrap();
+    accept.await.unwrap().unwrap();
+    // Its offer arrives with the new session's PSK.
+    let (e, _) = timeout(Duration::from_secs(10), async {
+        loop {
+            let now = entry();
+            if now.1 != psk {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("offered over the link");
+    assert_eq!(e, direct);
+}
+
 #[tokio::test]
 async fn no_tunnel_without_mutual_approval() {
     let dir = tempfile::tempdir().unwrap();

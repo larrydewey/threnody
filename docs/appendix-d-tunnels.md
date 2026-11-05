@@ -27,11 +27,11 @@ Addresses are unique ULAs derived from identity keys, so no allocator or coordin
 1. A session starts. Once the contact is **mutually approved** (spec §5.2) and tunnels are enabled, each side sends `TunnelOffer { wg_public, port }` once per session (Appendix C, kind 5).
 2. When a node receives an offer, it checks mutual approval again. If approval holds, it configures the peer with:
    - public key `wg_public`,
-   - endpoint `(session source IP, port)`,
+   - endpoint `(session source IP, port)`. A Bluetooth link has no source IP: an offer over one keeps the IP an earlier session gave, or else leaves the endpoint out, and WireGuard learns it from the peer's authenticated packets (on Android, packets meanwhile go over the session),
    - `AllowedIPs = addr(peer)/128`,
    - PSK `psk(pair)`,
    - keepalive 25 s.
-   An offer from a peer that is not approved is ignored.
+   An offer from a peer that is not approved is ignored, as is one over a relayed or onion session, whose source address is the relay's.
 3. When either side revokes, the approval exchange makes mutual approval false. Both sides then remove the peer (`TunnelDown`). Blocking a contact, or deleting its conversation, withdraws approval the same way: the peer goes from our side at once, and the session sends `Approval { approved: false }` as its last message, so the peer removes ours.
 
 Offers travel inside the authenticated ratchet, so only the genuine peer can set its tunnel key and endpoint. Each new session refreshes the PSK. A peer's WireGuard key is not secret, though: every mutual contact of its owner has it. WireGuard knows peers by key, so a node refuses an offer whose key is its own or already belongs to another peer. Otherwise one contact could offer another's key, take over that contact's peer entry, and remove it entirely once revoked. The first peer to hold a key keeps it.

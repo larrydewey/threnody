@@ -1467,16 +1467,22 @@ Address = {}/128\n",
         for peer in self.node.tunnel_peers_full() {
             let psk = threnody_core::tunnel::base64(&peer.psk.0[..]);
             let peer_overlay = peer.overlay;
+            // Learned over Bluetooth only: WireGuard finds it from its packets.
+            let endpoint = if threnody_net::node::has_endpoint(&peer.endpoint) {
+                format!("Endpoint = {}\n", peer.endpoint)
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
                 "\n[Peer]\n\
 PublicKey = {}\n\
 PresharedKey = {}\n\
-Endpoint = {}\n\
+{}\
 AllowedIPs = {}/128\n\
 PersistentKeepalive = 25\n",
                 threnody_core::tunnel::base64(&peer.wg_public),
                 psk,
-                peer.endpoint,
+                endpoint,
                 peer_overlay
             ));
         }
