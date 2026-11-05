@@ -66,8 +66,8 @@ pub(crate) struct CredState {
     offered: HashMap<u64, (PublicIdentity, String, Profile, u32)>,
     /// Offers made to us, waiting for the user.
     offers: HashMap<u64, (CredentialOffer, IssuerKey)>,
-    /// Offers we accepted: id -> (issuer peer, our secrets, its key).
-    requested: HashMap<u64, (PublicIdentity, Request, IssuerKey)>,
+    /// Offers we accepted: id -> (the offer, our secrets, its key).
+    requested: HashMap<u64, (CredentialOffer, Request, IssuerKey)>,
     /// Presentations we asked for: id -> (peer, schema, keys, nonce).
     asked: HashMap<u64, (PublicIdentity, String, Vec<String>, [u8; 32])>,
     /// Requests for our presentations, waiting for the user.
@@ -190,7 +190,7 @@ impl Node {
         )?;
         lock(&self.shared.creds)
             .requested
-            .insert(id, (offer.peer, req, key));
+            .insert(id, (offer, req, key));
         Ok(())
     }
 
@@ -382,12 +382,25 @@ impl Node {
                 let pending = {
                     let mut st = lock(&self.shared.creds);
                     match st.requested.get(&id) {
-                        Some((p, ..)) if *p == peer => st.requested.remove(&id),
+                        Some((o, ..)) if o.peer == peer => st.requested.remove(&id),
                         _ => None,
                     }
                 };
-                let Some((_, req, key)) = pending else { return };
+                let Some((offer, req, key)) = pending else {
+                    return;
+                };
                 let cred = Issued::decode(&issued).and_then(|i| req.finish(&key, &i));
+                // Exactly what the user accepted: another expiry, schema or
+                // a hidden extra attribute shows in every presentation, so
+                // the issuer could tell this holder's apart.
+                let cred = cred.and_then(|c| {
+                    let same = c.header.schema == offer.schema
+                        && c.header.expires_day == offer.expires_day
+                        && c.attributes == offer.attributes;
+                    same.then_some(c).ok_or(threnody_core::Error::Malformed(
+                        "the issuer signed something other than its offer",
+                    ))
+                });
                 match cred {
                     Ok(cred) => {
                         let schema = cred.header.schema.clone();
@@ -550,6 +563,79 @@ mod tests {
         }
         .encode()
         .unwrap()
+    }
+
+    async fn next(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+        pred: impl Fn(&Event) -> bool,
+    ) -> Event {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let e = rx.recv().await.expect("event stream open");
+                if pred(&e) {
+                    return e;
+                }
+            }
+        })
+        .await
+        .expect("expected event did not arrive")
+    }
+
+    #[tokio::test]
+    async fn holders_take_only_what_was_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let home = threnody_core::store::Home::new(dir.path().join(name));
+            let identity = home.create_identity(None).unwrap();
+            Node::new(crate::NodeConfig {
+                home,
+                identity,
+                policy: crate::AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+        };
+        let (issuer, mut irx) = open("issuer");
+        let (holder, mut hrx) = open("holder");
+        let addr = holder.listen("127.0.0.1:0").await.unwrap().to_string();
+        let hid = issuer.connect(&addr, None).await.unwrap();
+        holder.accept_contact(&issuer.identity());
+        // Features are exchanged in the first messages.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let attrs = vec![("member".to_owned(), "yes".to_owned())];
+        let today = credential::day(now_ms());
+        for tamper in [
+            |o: &mut (PublicIdentity, String, Profile, u32)| o.3 += 1,
+            |o: &mut (PublicIdentity, String, Profile, u32)| o.1.push('2'),
+            |o: &mut (PublicIdentity, String, Profile, u32)| o.2.push(("x".into(), "1".into())),
+        ] {
+            let id = issuer
+                .offer_credential(&hid, "example/member/1", attrs.clone(), today + 30)
+                .unwrap();
+            // The issuer signs something other than what it offered: a
+            // different expiry or a hidden attribute could mark this
+            // holder's presentations.
+            tamper(lock(&issuer.shared.creds).offered.get_mut(&id).unwrap());
+            next(&mut hrx, |e| matches!(e, Event::CredentialOffered { .. })).await;
+            holder.accept_credential_offer(id).unwrap();
+            next(&mut hrx, |e| {
+                matches!(
+                    e,
+                    Event::CredentialFailed { .. } | Event::CredentialReceived { .. }
+                )
+            })
+            .await;
+            assert!(holder.credentials().is_empty());
+        }
+        let id = issuer
+            .offer_credential(&hid, "example/member/1", attrs.clone(), today + 30)
+            .unwrap();
+        next(&mut hrx, |e| matches!(e, Event::CredentialOffered { .. })).await;
+        holder.accept_credential_offer(id).unwrap();
+        next(&mut hrx, |e| matches!(e, Event::CredentialReceived { .. })).await;
+        assert_eq!(holder.credentials().len(), 1);
+        let _ = &mut irx;
     }
 
     #[tokio::test]

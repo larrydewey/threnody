@@ -87,7 +87,7 @@ CredMsg = { 0: op, 1: id u64, ? 2: issuer key, ? 3: schema, ? 4: [* attribute], 
 op: 1 offer, 2 request, 3 issued, 4 decline, 5 ask, 6 proof
 ```
 
-- **Issuing.** The issuer offers (1), naming itself. An offer whose key isn't the sender's own is ignored. The holder's user accepts, and the holder sends a request with its commitment (2). The issuer issues (3) only for an offer it made to that peer.
+- **Issuing.** The issuer offers (1), naming itself. An offer whose key isn't the sender's own is ignored. The holder's user accepts, and the holder sends a request with its commitment (2). The issuer issues (3) only for an offer it made to that peer. The holder keeps the credential only if its schema, attributes and expiry are exactly those of the offer its user accepted: every presentation shows the expiry and the number of attributes, so an issuer that signed something else could tell that holder's presentations apart.
 - **Proving.** A verifier asks (5) for keys of a schema, with a nonce. The holder's user chooses a credential, and the holder shows the asked-for keys among those the user allows (6). Keys nobody asked for are never shown. The verifier refuses a proof showing more, or of another schema.
 - Either side may decline (4). Every step that gives something away waits for the user. Apps show who issued a credential and when it expires.
 - **Who may ask.** Offers and asks wait for the user only from a peer whose messages the user has accepted (a stranger's land among message requests, Appendix C), at most 8 of each from one peer and 64 of each in all. Anything else is declined (4) at once, so the sender learns of it rather than waiting.
