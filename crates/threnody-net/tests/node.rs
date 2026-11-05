@@ -286,6 +286,46 @@ async fn tunnels_follow_mutual_approval() {
     assert!(alice.tunnel_peers().is_empty());
 }
 
+/// Blocking or forgetting an approved contact takes its tunnel down on
+/// both sides, as revoking does, even under cover traffic.
+#[tokio::test]
+async fn blocking_or_forgetting_takes_the_tunnel_down() {
+    for forget in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let rate = Some(Duration::from_millis(200));
+        let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, rate);
+        let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, rate);
+        let addr = bob.listen("127.0.0.1:0").await.unwrap();
+        let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+        bob.accept_contact(&alice.identity());
+        alice.set_approval(&bob_id, true).unwrap();
+        bob.set_approval(&alice.identity(), true).unwrap();
+        let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+        next(&mut arx, up).await;
+        next(&mut brx, up).await;
+
+        if forget {
+            alice.delete_conversation(&bob_id);
+        } else {
+            alice.block_contact(&bob_id);
+        }
+        assert!(alice.tunnel_peers().is_empty(), "forget: {forget}");
+        next(&mut arx, |e| {
+            matches!(
+                e,
+                Event::TunnelDown {
+                    wg_public: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        // Bob hears of it before the session ends, and drops his side.
+        next(&mut brx, |e| matches!(e, Event::TunnelDown { .. })).await;
+        assert!(bob.tunnel_peers().is_empty(), "forget: {forget}");
+    }
+}
+
 #[tokio::test]
 async fn no_tunnel_without_mutual_approval() {
     let dir = tempfile::tempdir().unwrap();

@@ -370,6 +370,7 @@ impl Node {
                             .collect()
                     };
                     for (k, conv) in left {
+                        self.withdraw_approval(&k);
                         self.disconnect(&k);
                         let _ = self.shared.home.delete_history(conv);
                     }

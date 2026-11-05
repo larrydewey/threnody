@@ -1281,6 +1281,15 @@ impl Node {
         Ok(())
     }
 
+    /// Takes back what mutual approval gave `peer`, when it is blocked or
+    /// forgotten rather than revoked: its tunnel peer goes at once, and it
+    /// is told we no longer approve it, so its side removes ours too. The
+    /// session may end right after; its last act is to send that.
+    pub(crate) fn withdraw_approval(&self, peer: &PublicIdentity) {
+        self.shared.tunnel_down(peer);
+        let _ = self.send(peer, AppMessage::Approval { approved: false });
+    }
+
     /// Ends the session with `peer`, if any.
     pub fn disconnect(&self, peer: &PublicIdentity) -> bool {
         lock(&self.shared.sessions).remove(peer).is_some()
@@ -1858,7 +1867,21 @@ where
                         }
                     }
                     Some(m) => pending.push_back(m),
-                    None => return Ok(()), // replaced or disconnected locally
+                    None => {
+                        // Replaced or disconnected locally. A revocation
+                        // queued just before (a block, say) still goes, even
+                        // under cover traffic, so the peer drops its side.
+                        // Only while it still holds: a replaced session's
+                        // stale one must not undo a later approval.
+                        let revoked = !lock(&shared.contacts).get(&peer).is_some_and(|c| c.local_approved);
+                        if revoked && chan.can_send() {
+                            for m in pending.iter().filter(|m| matches!(m, AppMessage::Approval { approved: false })) {
+                                let sealed = chan.seal(m)?;
+                                let _ = tokio::time::timeout(LAST_WORDS, write_frame(&mut wr, &sealed)).await;
+                            }
+                        }
+                        return Ok(());
+                    }
                 },
                 Ok(()) = rate.changed() => {
                     ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
@@ -1927,6 +1950,9 @@ fn ready(
 /// How long after a session starts its setup messages skip the cover-traffic
 /// schedule.
 const SETUP_BURST: Duration = Duration::from_secs(5);
+
+/// How long a session ended locally may take to send its last revocation.
+const LAST_WORDS: Duration = Duration::from_secs(1);
 
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;

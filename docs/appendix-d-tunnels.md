@@ -32,7 +32,7 @@ Addresses are unique ULAs derived from identity keys, so no allocator or coordin
    - PSK `psk(pair)`,
    - keepalive 25 s.
    An offer from a peer that is not approved is ignored.
-3. When either side revokes, the approval exchange makes mutual approval false. Both sides then remove the peer (`TunnelDown`).
+3. When either side revokes, the approval exchange makes mutual approval false. Both sides then remove the peer (`TunnelDown`). Blocking a contact, or deleting its conversation, withdraws approval the same way: the peer goes from our side at once, and the session sends `Approval { approved: false }` as its last message, so the peer removes ours.
 
 Offers travel inside the authenticated ratchet, so only the genuine peer can set its tunnel key and endpoint. Each new session refreshes the PSK.
 

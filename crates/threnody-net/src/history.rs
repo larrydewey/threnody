@@ -696,7 +696,8 @@ impl Node {
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
-    /// and are refused, and our conversation with them is deleted.
+    /// and are refused, their tunnels go, and our conversation with them
+    /// is deleted.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
         let devices = self.mark_contacts(peer, |c| {
@@ -705,6 +706,7 @@ impl Node {
             c.local_approved = false;
         });
         for d in devices {
+            self.withdraw_approval(&d);
             self.disconnect(&d);
         }
         let _ = self.shared.home.delete_history(conv);
@@ -741,6 +743,7 @@ impl Node {
             }
         });
         for d in &devices {
+            self.withdraw_approval(d);
             self.disconnect(d);
         }
         let _ = self.shared.home.delete_history(conv);
