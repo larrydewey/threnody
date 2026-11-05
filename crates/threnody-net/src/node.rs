@@ -1528,7 +1528,8 @@ where
     // Inside a relay or onion circuit the links' cover traffic hides the
     // timing (Appendix I); cover from this session too would send more
     // cells than a constant-rate link carries, and the backlog would grow
-    // without end.
+    // without end. For the same reason its heartbeat is slow (see
+    // `inner_beat_for`).
     let inner = via.is_some();
     let mut ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
 
@@ -1544,7 +1545,7 @@ where
     let mut early_paths: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
-    let mut heartbeat = tokio::time::interval(node.beat());
+    let mut heartbeat = tokio::time::interval(node.beat_for(inner));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
@@ -1595,7 +1596,7 @@ where
                 // get its lease and recovery paths across.
                 // Behind `Hello` and our `Approval`, though: the peer only
                 // takes paths from a peer it knows approves it.
-                if let Some(m) = node.paths_message() {
+                if let Some(m) = node.paths_message(inner) {
                     let at = pending
                         .iter()
                         .rposition(|m| matches!(m, AppMessage::Hello { .. } | AppMessage::Approval { .. }))
