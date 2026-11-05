@@ -456,3 +456,42 @@ fn removed_members_can_be_invited_again() {
         forwarded: false,
     }));
 }
+
+#[test]
+fn key_packages_for_unanswered_invitations_are_bounded() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let size = |net: &mut Net| net.node(&pb).export().unwrap().len();
+    let base = size(&mut net);
+    net.node(&pb).accept_invite(&[0; 16], pa).unwrap();
+    let one = size(&mut net) - base;
+
+    // Asking again for the same group replaces the key package.
+    for _ in 0..10 {
+        net.node(&pb).accept_invite(&[0; 16], pa).unwrap();
+    }
+    assert!(size(&mut net) < base + 2 * one);
+    // A flood of requests keeps only the latest few.
+    for i in 0..100u8 {
+        net.node(&pb).accept_invite(&[i; 16], pa).unwrap();
+    }
+    let flooded = size(&mut net);
+    assert!(
+        flooded < base + (threnody_groups::MAX_KEY_PACKAGES + 1) * one,
+        "{flooded} bytes"
+    );
+    // They survive a restart.
+    let restored = Groups::restore(&b, &net.node(&pb).export().unwrap()).unwrap();
+    assert_eq!(restored.export().unwrap().len(), flooded);
+
+    // An invitation still works, and takes its key packages with it.
+    let g = net.node(&pa).create("x").unwrap();
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    assert!(
+        net.take(&pb)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Joined { .. }))
+    );
+}

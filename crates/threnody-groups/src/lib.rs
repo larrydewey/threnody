@@ -37,6 +37,9 @@ const STATE_VERSION: u8 = 1;
 const MAX_PAST_EPOCHS: usize = 5;
 /// Group names are display labels; keep them short.
 pub const MAX_NAME: usize = 64;
+/// Key packages kept for invitations we accepted that no Welcome has
+/// answered yet; past this the oldest are deleted.
+pub const MAX_KEY_PACKAGES: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GroupError {
@@ -282,6 +285,9 @@ pub struct Groups {
     groups: HashMap<GroupId, Group>,
     /// Invitations we sent and are waiting on a key package for.
     pending_adds: Vec<(GroupId, PublicIdentity)>,
+    /// Key packages we gave out and are waiting on a Welcome for, oldest
+    /// first: the group, who asked, and where the key package is stored.
+    key_packages: Vec<(GroupId, PublicIdentity, KeyPackageRef)>,
 }
 
 fn credential_for(id: &PublicIdentity) -> CredentialWithKey {
@@ -314,6 +320,7 @@ impl Groups {
             me: identity.public(),
             groups: HashMap::new(),
             pending_adds: Vec::new(),
+            key_packages: Vec::new(),
         }
     }
 
@@ -332,8 +339,14 @@ impl Groups {
             .map(|(k, v)| k.len() + v.len() + 16)
             .sum::<usize>()
             + 256;
+        let key_packages = self
+            .key_packages
+            .iter()
+            .map(|(g, p, kp)| Ok((g, p, kp.tls_serialize_detached().map_err(mls)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let size = size + key_packages.len() * 128;
         Ok(threnody_core::cbor::to_vec(size, |e| {
-            e.map_len(3)?;
+            e.map_len(4)?;
             e.u8(0)?.u8(STATE_VERSION)?;
             e.u8(1)?.array_len(values.len())?;
             for (k, v) in values.iter() {
@@ -349,6 +362,13 @@ impl Groups {
                 for (member, role) in &g.roles {
                     e.bytes(member.as_bytes())?.u8(*role as u8)?;
                 }
+            }
+            e.u8(3)?.array_len(key_packages.len())?;
+            for (group, peer, kp) in &key_packages {
+                e.array_len(3)?
+                    .bytes(*group)?
+                    .bytes(peer.as_bytes())?
+                    .bytes(kp)?;
             }
             Ok(())
         })?)
@@ -367,6 +387,7 @@ impl Groups {
             HashMap<PublicIdentity, MemberRole>,
         )> = Vec::new();
         let mut version = None;
+        let mut key_packages = Vec::new();
         {
             let mut values = me
                 .provider
@@ -407,6 +428,18 @@ impl Groups {
                             meta.push((id, name, owner, roles));
                         }
                     }
+                    3 => {
+                        for _ in 0..d.array_len()? {
+                            if d.array_len()? != 3 {
+                                return Err(threnody_core::Error::Malformed("key package entry"));
+                            }
+                            let group = fixed_bytes::<16>(d)?;
+                            let peer = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?)?;
+                            let kp = KeyPackageRef::tls_deserialize_exact(d.bytes()?)
+                                .map_err(|_| threnody_core::Error::Malformed("key package ref"))?;
+                            key_packages.push((group, peer, kp));
+                        }
+                    }
                     _ => return Ok(false),
                 }
                 Ok(true)
@@ -428,6 +461,7 @@ impl Groups {
             group.roles = roles;
             me.groups.insert(id, group);
         }
+        me.key_packages = key_packages;
         Ok(me)
     }
 
@@ -529,6 +563,21 @@ impl Groups {
                 credential_for(&self.me),
             )
             .map_err(mls)?;
+        // Each stays stored, private keys and all, until a Welcome uses
+        // it: keep one per invitation, and only the latest few.
+        let kp = bundle
+            .key_package()
+            .hash_ref(self.provider.crypto())
+            .map_err(mls)?;
+        self.drop_key_packages(|(g, p, _)| g == group && *p == peer)?;
+        self.key_packages.push((*group, peer, kp));
+        let extra = self.key_packages.len().saturating_sub(MAX_KEY_PACKAGES);
+        for (.., kp) in self.key_packages.drain(..extra).collect::<Vec<_>>() {
+            self.provider
+                .storage()
+                .delete_key_package(&kp)
+                .map_err(mls)?;
+        }
         let key_package = MlsMessageOut::from(bundle.key_package().clone())
             .tls_serialize_detached()
             .map_err(mls)?;
@@ -542,6 +591,24 @@ impl Groups {
             }],
             events: vec![],
         })
+    }
+
+    /// Deletes the key packages `which` picks, which no Welcome will need.
+    fn drop_key_packages(
+        &mut self,
+        which: impl Fn(&(GroupId, PublicIdentity, KeyPackageRef)) -> bool,
+    ) -> Result<()> {
+        let (gone, kept) = std::mem::take(&mut self.key_packages)
+            .into_iter()
+            .partition(which);
+        self.key_packages = kept;
+        for (.., kp) in gone {
+            self.provider
+                .storage()
+                .delete_key_package(&kp)
+                .map_err(mls)?;
+        }
+        Ok(())
     }
 
     /// Checks if the current user can commit (owner or admin).
@@ -944,6 +1011,8 @@ impl Groups {
         if !members.contains(&from) || !members.contains(&self.me) {
             return Err(GroupError::Unexpected("welcome from non-member"));
         }
+        // The Welcome used one; any others for this group are spare.
+        self.drop_key_packages(|(g, ..)| *g == group)?;
         let name = truncate(name);
         let mut roles = HashMap::new();
         roles.insert(from, MemberRole::Owner);

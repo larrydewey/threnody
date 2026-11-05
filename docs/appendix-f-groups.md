@@ -77,7 +77,7 @@ Spec §6.2 leaves admin semantics to the application layer.
 - **Owner.** The creator owns the group and is its only committer. Adds and removals are owner commits, and members reject commits from anyone else. Without a delivery service to order commits, this rules out epoch forks.
 - **Joining.**
   1. The owner sends a `KeyPackageRequest` to the invitee.
-  2. The invitee consents by returning a fresh key package. Requests from mutually approved contacts are accepted automatically; anyone else needs `/group accept`.
+  2. The invitee consents by returning a fresh key package. Requests from mutually approved contacts are accepted automatically; anyone else needs `/group accept`. The invitee keeps the key package's private keys (in its group state) only until a Welcome uses them. Another request for the same group from the same peer replaces it, and at most 16 are kept, the oldest deleted first.
   3. The owner completes adds only for key packages it asked for, and only when the key package comes from the identity it invited.
   4. The owner commits the add, sends the Welcome to the new member, and sends the commit to the existing members.
 - **Joining checks.** On a Welcome, the joiner checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members.
