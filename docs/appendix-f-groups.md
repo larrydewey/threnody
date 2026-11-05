@@ -83,7 +83,7 @@ Spec §6.2 leaves admin semantics to the application layer.
 - **Joining checks.** On a Welcome, the joiner checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members.
 - **Leaving.** A member leaves by sending the owner `Leave` and forgetting the group at once. The owner commits its removal for the remaining members. An owner can't leave, but deleting the group removes every other member in one commit and then forgets it.
 - **Linked devices.** When a device is linked into an account (or first connects to a sibling after this was introduced), each sibling has it join every group the sibling is in, once per group: it invites the device itself if it may commit, and otherwise sends the owner `AddDevice`. The owner invites the device only if the sender is a member and both are devices of the same account, according to the sender's account chain. The sibling also sends `AddDevice` to the device itself, which then accepts the owner's invitation to that group automatically, as it does an invitation from its own sibling.
-- **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it.
+- **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it. The removed member then deletes the group and its secrets, as on leaving, so the owner can invite it again.
 - **Past epochs.** Application messages from up to five past epochs are still accepted, to tolerate reordering around commits.
 
 ## Persistence

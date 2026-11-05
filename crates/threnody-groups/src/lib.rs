@@ -24,6 +24,7 @@ use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::signatures::{Signer, SignerError};
+use openmls_traits::storage::StorageProvider as _;
 use threnody_core::crypto::random_bytes;
 use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::{Identity, PublicIdentity};
@@ -702,7 +703,20 @@ impl Groups {
     /// Drops a group and its MLS secrets from our state.
     fn forget(&mut self, group: &GroupId) -> Result<()> {
         if let Some(mut g) = self.groups.remove(group) {
-            g.mls.delete(self.provider.storage()).map_err(mls)?;
+            let storage = self.provider.storage();
+            // A commit that removed us moved the group on an epoch without
+            // us, so our leaf keys are still filed under the one before,
+            // which `delete` doesn't look at.
+            if let Some(prev) = g.mls.epoch().as_u64().checked_sub(1) {
+                storage
+                    .delete_encryption_epoch_key_pairs(
+                        g.mls.group_id(),
+                        &GroupEpoch::from(prev),
+                        g.mls.own_leaf_index().u32(),
+                    )
+                    .map_err(mls)?;
+            }
+            g.mls.delete(storage).map_err(mls)?;
         }
         self.pending_adds.retain(|(g, _)| g != group);
         Ok(())
@@ -900,6 +914,12 @@ impl Groups {
         let MlsMessageBodyIn::Welcome(welcome) = msg.extract() else {
             return Err(GroupError::Unexpected("not a welcome"));
         };
+        // A group we were removed from before its secrets were dropped
+        // on removal would block joining it again.
+        let stale = openmls::group::GroupId::from_slice(&group);
+        if let Some(mut old) = MlsGroup::load(self.provider.storage(), &stale).map_err(mls)? {
+            old.delete(self.provider.storage()).map_err(mls)?;
+        }
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(MAX_PAST_EPOCHS)
@@ -1070,7 +1090,10 @@ impl Groups {
                     .merge_staged_commit(&self.provider, *staged)
                     .map_err(mls)?;
                 if !g.mls.is_active() {
-                    self.groups.remove(&group);
+                    // We were removed: drop the group's secrets too, or
+                    // they'd stay in our state, and a later Welcome to the
+                    // same group would find it there and fail.
+                    self.forget(&group)?;
                     return Ok(Output {
                         send: vec![],
                         events: vec![GroupEvent::Left { group }],

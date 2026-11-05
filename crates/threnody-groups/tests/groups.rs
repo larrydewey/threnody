@@ -420,3 +420,39 @@ fn members_leave_and_owners_delete() {
     let saved = net.node(&pa).export().unwrap();
     assert!(Groups::restore(&a, &saved).unwrap().list().is_empty());
 }
+
+#[test]
+fn removed_members_can_be_invited_again() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let g = net.node(&pa).create("club").unwrap();
+    let before = net.node(&pb).export().unwrap().len();
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    let out = net.node(&pa).remove(&g, &pb).unwrap();
+    net.deliver(pa, out);
+    assert!(net.take(&pb).contains(&GroupEvent::Left { group: g }));
+    // Nothing of the group is left behind: no old epoch secrets on disk.
+    let after = net.node(&pb).export().unwrap().len();
+    assert!(after <= before + 64, "{before} -> {after} bytes");
+
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    assert!(
+        net.take(&pb)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Joined { .. }))
+    );
+    let out = net.node(&pa).send_text(&g, "welcome back").unwrap();
+    net.deliver(pa, out);
+    assert!(net.take(&pb).contains(&GroupEvent::Text {
+        group: g,
+        from: pa,
+        text: "welcome back".into(),
+        id: 0,
+        quote: None,
+        mentions: Vec::new(),
+        forwarded: false,
+    }));
+}
