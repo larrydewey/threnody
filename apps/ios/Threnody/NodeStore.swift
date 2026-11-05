@@ -14,6 +14,8 @@ func offMain<T>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
 enum Paths {
     static let support = URL.applicationSupportDirectory
     static let home = support.appendingPathComponent("threnody", isDirectory: true)
+    /// Received files, kept out of backups like the node's directory.
+    static let media = support.appendingPathComponent("media", isDirectory: true)
     static let refreshTask = "org.threnody.app.refresh"
 
     static var hasIdentity: Bool {
@@ -27,11 +29,43 @@ enum Paths {
         let rel = "media/\(UUID().uuidString)-\(base.isEmpty ? "file" : base)"
         let url = support.appendingPathComponent(rel)
         do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+            try excludeFromBackup(media)
             try data.write(to: url, options: .completeFileProtectionUntilFirstUserAuthentication)
             return rel
         } catch {
             return nil
+        }
+    }
+
+    /// Keeps `dir` and everything in it out of iCloud and computer backups.
+    static func excludeFromBackup(_ dir: URL) throws {
+        var dir = dir
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try dir.setResourceValues(values)
+    }
+
+    /// Deletes kept files no message refers to any more: ones whose
+    /// messages disappeared or were deleted, as on Android. Recent files
+    /// are left, as their message may not be recorded yet.
+    static func sweep(_ n: ThrenodyNode) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: media, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        var entries: [HistoryEntry] = []
+        do {
+            for c in n.contacts() { entries += try n.history(peer: c.fingerprint, limit: 10_000) }
+            for g in n.groups() { entries += try n.groupHistory(group: g.id, limit: 10_000) }
+            entries += try n.noteHistory(limit: 10_000)
+        } catch {
+            return
+        }
+        let used = Set(entries.compactMap { $0.file?.location })
+        let old = Date().addingTimeInterval(-10 * 60)
+        for f in files {
+            let modified = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date()
+            if modified < old && !used.contains("media/" + f.lastPathComponent) { try? fm.removeItem(at: f) }
         }
     }
 
@@ -177,6 +211,8 @@ final class NodeStore: ObservableObject {
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try home.setResourceValues(values)
+        // Received files too; ones kept before this was done included.
+        if FileManager.default.fileExists(atPath: Paths.media.path) { try? Paths.excludeFromBackup(Paths.media) }
         let n = try ThrenodyNode.open(home: home.path, passphrase: KeyVault.passphrase(home: home), tunnelPort: nil)
         // The usual port, or any free one if it's taken.
         let addr: String
@@ -199,6 +235,14 @@ final class NodeStore: ObservableObject {
         n.reconnect()
         // The store lives as long as the process.
         Self.pump(n) { e in Task { @MainActor in self.handle(e) } }
+        // Files of messages that are gone: a minute after start, then every five.
+        Task.detached(priority: .background) {
+            try? await Task.sleep(for: .seconds(60))
+            while true {
+                Paths.sweep(n)
+                try? await Task.sleep(for: .seconds(300))
+            }
+        }
         path.start { cellular in
             n.networkChanged(toStandby: false, mobile: cellular)
             n.reconnect()
