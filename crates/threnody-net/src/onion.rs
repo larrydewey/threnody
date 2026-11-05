@@ -333,18 +333,30 @@ impl OnionState {
         *n <= MAX_DEPOSITS_PER_MINUTE
     }
 
-    /// Whether a deposit of `total` bytes may start arriving over a hop
-    /// from network `net`: while they arrive, deposits are held in memory,
-    /// so all of them together, and those from any one network, are capped.
-    fn deposit_room(&self, net: Option<[u8; 16]>, total: usize) -> bool {
+    /// Whether `more` bytes of the deposit arriving over hop `up` may be
+    /// kept: while they arrive, deposits are held in memory. What has
+    /// arrived counts, not what a deposit's head claims, so holding room
+    /// costs sending the bytes. Our contacts' circuits and everyone else's
+    /// have room of their own, and within each one carrier (a contact, a
+    /// stranger's network) may hold only one deposit's worth.
+    fn deposit_room(&self, up: &Link, more: usize) -> bool {
+        let Some(hop) = self.hops.get(up) else {
+            return false;
+        };
+        let carrier = Carrier::of(up, hop.net);
         let (all, here) = self
             .hops
-            .values()
-            .filter_map(|h| h.deposit.as_ref().map(|d| (h.net, d.total)))
-            .fold((0, 0), |(a, n), (from, t)| {
-                (a + t, n + if net.is_some() && from == net { t } else { 0 })
+            .iter()
+            .filter(|(_, h)| h.contact == hop.contact)
+            .filter_map(|(l, h)| {
+                h.deposit
+                    .as_ref()
+                    .map(|d| (Carrier::of(l, h.net), d.sealed.len()))
+            })
+            .fold((0, 0), |(a, n), (c, len)| {
+                (a + len, n + if c == carrier { len } else { 0 })
             });
-        all + total <= MAX_PENDING_DEPOSIT_BYTES && here + total <= crate::mailbox::MAX_HELD_BYTES
+        all + more <= MAX_PENDING_DEPOSIT_BYTES && here + more <= crate::mailbox::MAX_HELD_BYTES
     }
 }
 
@@ -574,8 +586,19 @@ impl Node {
                 let Some(hop) = st.hops.get_mut(&up) else {
                     return;
                 };
-                if let Some(d) = &mut hop.deposit {
-                    d.sealed.extend_from_slice(&p.data);
+                if hop.deposit.is_some() {
+                    let fits = st.deposit_room(&up, p.data.len());
+                    let Some(hop) = st.hops.get_mut(&up) else {
+                        return;
+                    };
+                    if fits && let Some(d) = &mut hop.deposit {
+                        d.sealed.extend_from_slice(&p.data);
+                    } else {
+                        // No room for the rest: none of it is kept.
+                        hop.deposit = None;
+                        drop(st);
+                        return self.onion_deposited(up, DepositStatus::Declined);
+                    }
                     drop(st);
                     self.onion_deposit_check(up);
                 } else if let Some(tx) = hop.endpoint.clone() {
@@ -681,10 +704,11 @@ impl Node {
             let free = hop
                 .is_some_and(|h| h.next.is_none() && h.endpoint.is_none() && h.deposit.is_none());
             let net = hop.and_then(|h| h.net);
+            let first = data.len().saturating_sub(DEPOSIT_HEAD);
             match head {
                 Some((to, total))
                     if free
-                        && st.deposit_room(net, total)
+                        && st.deposit_room(&up, first)
                         && st.deposit_allowed(Carrier::of(&up, net)) =>
                 {
                     if let Some(h) = st.hops.get_mut(&up) {
@@ -1532,7 +1556,8 @@ mod tests {
         let nobody = threnody_core::Identity::generate().public();
         node.onion_deposit_start(up, &deposit(&nobody, 4096));
         assert_eq!(pending(&node), 0);
-        // One network may have one large deposit arriving at a time.
+        // What counts is what has arrived, not what a head claims: one
+        // network may start several deposits.
         let max = crate::mailbox::MAX_HELD_BYTES;
         let hop_from = |n: u8, circ| {
             let from = threnody_core::Identity::generate().public();
@@ -1540,18 +1565,45 @@ mod tests {
             lock(&node.shared.onion).hops.get_mut(&up).unwrap().net = Some([n; 16]);
             up
         };
+        let data = |up: Link, len: usize| {
+            node.onion_recognized(up, Payload::new(Cmd::Data, vec![0; len]));
+        };
         let a = hop_from(1, 2);
         node.onion_deposit_start(a, &deposit(&contact, max));
-        assert_eq!(pending(&node), 1);
         let b = hop_from(1, 3);
         node.onion_deposit_start(b, &deposit(&contact, max));
-        assert_eq!(pending(&node), 1);
-        // And all of them together only so much.
-        for n in 2..=MAX_PENDING_DEPOSIT_BYTES.div_ceil(max) as u8 + 1 {
+        assert_eq!(pending(&node), 2);
+        // But together they may hold only so much from that network.
+        data(a, max / 2);
+        data(b, max / 2 - 200);
+        assert_eq!(pending(&node), 2);
+        data(b, 1);
+        assert_eq!(pending(&node), 1, "the deposit that went over is declined");
+        // And all strangers' deposits together only so much.
+        let nets = MAX_PENDING_DEPOSIT_BYTES / max;
+        for n in 2..=nets as u8 {
             let up = hop_from(n, 10 + u64::from(n));
             node.onion_deposit_start(up, &deposit(&contact, max));
+            data(up, max - 200);
         }
-        assert_eq!(pending(&node), MAX_PENDING_DEPOSIT_BYTES / max);
+        assert_eq!(pending(&node), nets);
+        let late = hop_from(100, 200);
+        node.onion_deposit_start(late, &deposit(&contact, max));
+        assert_eq!(pending(&node), nets + 1);
+        // Its network has room, but all of them together do not.
+        data(late, max - 200);
+        assert_eq!(pending(&node), nets);
+        // Deposits over our contacts' circuits have their own room.
+        let up = fake_hop(
+            &node,
+            threnody_core::Identity::generate().public(),
+            300,
+            true,
+            false,
+        );
+        node.onion_deposit_start(up, &deposit(&contact, max));
+        data(up, max - 200);
+        assert_eq!(pending(&node), nets + 1);
     }
 
     #[test]
