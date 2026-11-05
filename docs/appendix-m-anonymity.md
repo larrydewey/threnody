@@ -19,7 +19,7 @@ LinkProof = Ed25519_sign(main, "threnody persona link v1" || persona_public_key)
 IdentityMsg (kind 2) = { 0: 2, 2: main_public_key (32), 3: signature (64), ? 4: invite tstr }
 ```
 
-The receiver verifies the signature against the main key it names, and checks it is for the persona that sent it. A proof for another persona, or one claiming someone else's identity, fails. The receiver keeps the result with the contact (`Contact::revealed`) and tells the app, which can offer to add the main identity using the invite. Nothing is added automatically.
+The receiver verifies the signature against the main key it names, and checks it is for the persona that sent it. A proof for another persona, or one claiming someone else's identity, fails. The receiver keeps the result with the contact (`Contact::revealed`) and tells the app, which can offer to add the main identity using the invite. The invite is the sender's word, not part of the proof, so it is kept only if it is an invite link pinned to the proven main key; any other (someone else's link, a bare address) is dropped, and the app then has nothing to dial. Nothing is added automatically.
 
 A reveal can't be taken back: the peer now holds a signature linking the two identities, and could show it to others. Apps say so before sending one.
 
