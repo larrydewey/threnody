@@ -704,8 +704,11 @@ object Threnody {
                     }
                 }
                 is NodeEvent.VolunteerNote -> say("* ${e.note}")
-                is NodeEvent.WifiDirectOffer -> WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
-                is NodeEvent.WifiDirectRequested -> {
+                // An anonymous identity's node never passes these on; were
+                // one to, it still mustn't host or join (Appendix M).
+                is NodeEvent.WifiDirectOffer ->
+                    if (persona == null) WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
+                is NodeEvent.WifiDirectRequested -> if (persona == null) {
                     say("* ${short(e.peer)} asks for a Wi-Fi Direct link")
                     WifiDirect.host(ctx, node, e.peer)
                 }

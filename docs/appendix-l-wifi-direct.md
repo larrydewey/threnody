@@ -28,7 +28,7 @@ op: 1 offer (ssid ≤ 32 bytes, passphrase 8–63, addr = ip:port literal)
     2 request (asks the peer to host and offer)
 ```
 
-Both messages are only sent to, and only honoured from, **mutually approved peers on direct sessions**. A peer reached through relays isn't nearby, and isn't trusted with link credentials just because it is reachable. Malformed offers are refused on both ends.
+Both messages are only sent to, and only honoured from, **mutually approved peers on direct sessions**. A peer reached through relays isn't nearby, and isn't trusted with link credentials just because it is reachable. Malformed offers are refused on both ends. An anonymous identity's node (Appendix M) neither sends nor honours them: a group would show a nearby contact the phone, and the main identity listening on it.
 
 ## Platforms
 
