@@ -46,9 +46,12 @@ pub const MAX_HELD_PER_MEMBER: usize = 200;
 pub const MAX_HELD_BYTES_PER_MEMBER: usize = 32 << 20;
 pub const MAX_HELD_BYTES: usize = 128 << 20;
 /// Invitations waiting for consent from one inviter, and in all; the
-/// oldest are dropped first.
+/// oldest are dropped first, those from strangers before the rest.
 pub const MAX_INVITES_PER_PEER: usize = 3;
 pub const MAX_INVITES: usize = 32;
+/// After a stranger's invitation, others from strangers in this long
+/// come quietly: new identities cost nothing.
+pub const STRANGER_INVITE_QUIET: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// An invitation waiting for the user's consent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,8 +103,9 @@ pub enum Update {
         name: String,
         owner: PublicIdentity,
     },
-    /// Someone who isn't a mutually approved contact invites us.
-    Invited(Invite),
+    /// Someone who isn't a mutually approved contact invites us. A quiet
+    /// one shouldn't notify ([`STRANGER_INVITE_QUIET`]).
+    Invited { invite: Invite, quiet: bool },
     MemberAdded {
         group: GroupId,
         member: PublicIdentity,
@@ -172,6 +176,8 @@ pub struct GroupNode {
     /// Groups we have had our own other devices added to, once each, so
     /// one that leaves a group isn't put back.
     offered: Vec<(PublicIdentity, GroupId)>,
+    /// When a stranger's invitation last notified.
+    stranger_invited: Option<std::time::Instant>,
     home: Home,
     identity: Identity,
 }
@@ -196,6 +202,7 @@ impl GroupNode {
             held: decode_held(&load(HELD)),
             expected: decode_expected(&load(EXPECTED)),
             offered: decode_offered(&load(OFFERED)),
+            stranger_invited: None,
             home: Home::new(home.dir()),
             identity: Identity::from_seed(&identity.seed()),
         })
@@ -1096,7 +1103,9 @@ impl GroupNode {
                 self.invites
                     .retain(|i| !(i.group == group && i.from == peer));
                 self.invites.push(inv.clone());
-                // Anyone can ask: keep only the latest few of each.
+                // Anyone can ask: keep only the latest few of each, and
+                // past the limit drop strangers' first, so a crowd of new
+                // identities can't push out what someone we know sent.
                 let theirs = self.invites.iter().filter(|i| i.from == peer).count();
                 let mut extra = theirs.saturating_sub(MAX_INVITES_PER_PEER);
                 self.invites.retain(|i| {
@@ -1104,10 +1113,25 @@ impl GroupNode {
                     extra -= usize::from(drop);
                     !drop
                 });
-                let extra = self.invites.len().saturating_sub(MAX_INVITES);
-                self.invites.drain(..extra);
+                while self.invites.len() > MAX_INVITES {
+                    let i = self
+                        .invites
+                        .iter()
+                        .position(|i| !vouched(node, &self.expected, i))
+                        .unwrap_or(0);
+                    self.invites.remove(i);
+                }
                 self.save_invites();
-                Update::Invited(inv)
+                // Nor notify for each of them.
+                let stranger = !vouched(node, &self.expected, &inv);
+                let quiet = stranger
+                    && self
+                        .stranger_invited
+                        .is_some_and(|t| t.elapsed() < STRANGER_INVITE_QUIET);
+                if stranger && !quiet {
+                    self.stranger_invited = Some(std::time::Instant::now());
+                }
+                Update::Invited { invite: inv, quiet }
             }
             GroupEvent::MemberAdded { group, member } => Update::MemberAdded { group, member },
             GroupEvent::MemberRemoved { group, member } => Update::MemberRemoved { group, member },
@@ -1351,6 +1375,17 @@ fn victim(
     held.iter()
         .position(|h| theirs(&h) && !h.handshake)
         .or_else(|| held.iter().position(|h| theirs(&h)))
+}
+
+/// Whether `invite` comes from someone we accepted, or for a group our own
+/// device is in from its owner (or anyone, if the device didn't say).
+fn vouched(node: &Node, expected: &[(GroupId, Option<PublicIdentity>)], invite: &Invite) -> bool {
+    node.contacts()
+        .get(&invite.from)
+        .is_some_and(|c| c.accepted)
+        || expected
+            .iter()
+            .any(|(g, o)| *g == invite.group && o.is_none_or(|o| o == invite.from))
 }
 
 /// The tag for our own message, history entry `local_id` in `group`.

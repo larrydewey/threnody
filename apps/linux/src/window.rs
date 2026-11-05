@@ -1319,7 +1319,9 @@ impl App {
                     )
                 }),
             ),
-            NodeEvent::GroupInvited { group, name, from } => {
+            NodeEvent::GroupInvited {
+                group, name, from, ..
+            } => {
                 let known = self.core.node(persona.as_deref()).is_ok_and(|n| {
                     n.contacts()
                         .iter()
@@ -1581,6 +1583,7 @@ impl App {
                         | NodeEvent::File { quiet: true, .. }
                         | NodeEvent::GroupMessage { quiet: true, .. }
                         | NodeEvent::GroupFile { quiet: true, .. }
+                        | NodeEvent::GroupInvited { quiet: true, .. }
                 );
                 if !quiet {
                     self.notify(&chat, &title, &body);

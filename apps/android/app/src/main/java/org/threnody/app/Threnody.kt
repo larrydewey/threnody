@@ -685,7 +685,9 @@ object Threnody {
                 }
                 is NodeEvent.GroupInvited -> {
                     say("* ${short(e.from)} invites us to a group")
-                    if (node.contacts().any { it.fingerprint == e.from && it.accepted }) {
+                    if (e.quiet) {
+                        // One of many from strangers: it waits in the list.
+                    } else if (node.contacts().any { it.fingerprint == e.from && it.accepted }) {
                         ThrenodyService.notifyGroup(ctx, e.group, e.name, "${nameOf(node, e.from)} invites you to join", persona)
                     } else {
                         // Not even the group's name: a stranger's can be a message in itself.

@@ -318,6 +318,47 @@ async fn invitations_from_strangers_are_few_and_from_the_blocked_none() {
 }
 
 #[tokio::test]
+async fn a_crowd_of_strangers_neither_hides_invitations_nor_floods_notifications() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    // `from` invites Alice to group `i`: whether that is quiet.
+    let invite = |alice: &mut N, from: PublicIdentity, i: u8| {
+        let r = GroupWire::KeyPackageRequest {
+            group: [i; 16],
+            name: format!("Group {i}"),
+        };
+        let r = r.encode().unwrap();
+        let mut updates = alice.groups.incoming(&alice.node, from, &r).unwrap();
+        let Some(Update::Invited { invite, quiet }) = updates.pop() else {
+            panic!("no invitation");
+        };
+        assert_eq!((invite.from, invite.group), (from, [i; 16]));
+        quiet
+    };
+    // Carol, whom Alice accepted but who hasn't approved her back.
+    let carol = threnody_core::Identity::generate().public();
+    alice.node.set_approval(&carol, true).unwrap();
+    assert!(!invite(&mut alice, carol, 1));
+    // Then fresh identities, more than are kept: only the first notifies.
+    let quiet: Vec<bool> = (0..40)
+        .map(|i| {
+            invite(
+                &mut alice,
+                threnody_core::Identity::generate().public(),
+                100 + i,
+            )
+        })
+        .collect();
+    assert!(!quiet[0] && quiet[1..].iter().all(|q| *q));
+    let invites = alice.groups.invites();
+    assert_eq!(invites.len(), threnody_groups::node::MAX_INVITES);
+    assert!(invites.iter().any(|i| i.from == carol), "Carol's stays");
+    assert_eq!(invites.last().unwrap().group, [139; 16], "the newest stay");
+    // Someone we know still notifies.
+    assert!(!invite(&mut alice, carol, 2));
+}
+
+#[tokio::test]
 async fn nothing_leaves_that_could_not_be_saved() {
     let dir = tempfile::tempdir().unwrap();
     let mut alice = spawn(&dir, "alice").await;

@@ -65,12 +65,13 @@ fn event(u: Update) -> NodeEvent {
             name,
             owner: fp(&owner),
         },
-        Update::Invited(i) => {
+        Update::Invited { invite: i, quiet } => {
             let i = invite(&i);
             NodeEvent::GroupInvited {
                 group: i.group,
                 name: i.name,
                 from: i.from,
+                quiet,
             }
         }
         Update::MemberAdded { group, member } => NodeEvent::GroupMembersChanged {

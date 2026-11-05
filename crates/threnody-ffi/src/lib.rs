@@ -581,6 +581,8 @@ pub enum NodeEvent {
         group: String,
         name: String,
         from: String,
+        /// One of many from strangers: list it, but don't notify.
+        quiet: bool,
     },
     GroupMembersChanged {
         group: String,

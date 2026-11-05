@@ -103,7 +103,7 @@ impl GroupUi {
                         name(&owner)
                     );
                 }
-                Update::Invited(i) => say!(
+                Update::Invited { invite: i, .. } => say!(
                     "* {} invites you to group {:?}. /group accept {} to join",
                     name(&i.from),
                     i.name,
