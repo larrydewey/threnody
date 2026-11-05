@@ -81,7 +81,7 @@ binding    = KDF("… relay token binding", e_pub)        the hop's ephemeral X-
   - it is for today or yesterday, and its credential is for that same day (`expires_day` = epoch) and has no attributes. A credential valid on other days too would pay for their slots as well, and an attribute count, which every presentation shows, could mark one client's circuits; clients refuse such credentials from a directory too;
   - it is bound to the CREATE's `e_pub`;
   - a directory this relay is registered with issued it;
-  - its pseudonym hasn't been seen this epoch.
+  - its pseudonym hasn't been seen this epoch. Relays keep the pseudonyms of today and yesterday in encrypted state (`relay-seen`), so restarting doesn't let a spent slot pay again.
 
   So one credential opens at most 64 circuits per relay per day, and the relay learns nothing else about it. A relay checks at most 120 tokens per neighbour per minute, since each check costs pairings; over anonymous links, where identities are free, per neighbour network (a /24 or a /56).
 - **Clients** keep the credentials and used slots in encrypted state (`relay-wallet`). Used slots are never reused, and credentials older than yesterday are dropped.

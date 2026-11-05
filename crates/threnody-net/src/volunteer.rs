@@ -54,6 +54,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(40);
 const STATE_SUBS: &str = "directories";
 const STATE_WALLET: &str = "relay-wallet";
 const STATE_SERVER: &str = "directory-server";
+const STATE_SEEN: &str = "relay-seen";
 
 struct Subscription {
     link: DirectoryLink,
@@ -92,6 +93,8 @@ struct Wallet {
     used: HashMap<(Fingerprint, u32), u64>,
 }
 
+type Seen = HashMap<u32, HashSet<[u8; credential::PSEUDONYM_LEN]>>;
+
 struct DirServer {
     issuer: Issuer,
     review: bool,
@@ -109,8 +112,9 @@ pub(crate) struct VolunteerState {
     pending: Mutex<HashMap<u64, (PublicIdentity, oneshot::Sender<DirMsg>)>>,
     /// Our relay descriptor's addresses while volunteering.
     relay: Mutex<Option<Vec<String>>>,
-    /// Token pseudonyms seen, by epoch (each opens one circuit).
-    seen: Mutex<HashMap<u32, HashSet<[u8; credential::PSEUDONYM_LEN]>>>,
+    /// Token pseudonyms seen, by epoch (each opens one circuit). Saved, so
+    /// a restart doesn't let spent slots pay again.
+    seen: Mutex<Seen>,
     server: Mutex<Option<DirServer>>,
     /// Route through volunteer relays when contacts can't (on by default).
     use_volunteers: AtomicBool,
@@ -184,6 +188,9 @@ impl Node {
         }
         if let Ok(Some(b)) = home.load_state(id, STATE_WALLET) {
             *lock(&self.vol().wallet) = decode_wallet(&b).unwrap_or_default();
+        }
+        if let Ok(Some(b)) = home.load_state(id, STATE_SEEN) {
+            *lock(&self.vol().seen) = decode_seen(&b).unwrap_or_default();
         }
         if let Ok(Some(b)) = home.load_state(id, STATE_SERVER)
             && let Ok(issuer) = Issuer::new(id, 0)
@@ -705,10 +712,20 @@ impl Node {
         let Ok(nym) = token.verify(&keys, &self.identity(), e_pub, now) else {
             return false;
         };
+        self.spend_pseudonym(token.epoch, nym)
+    }
+
+    /// Records a token pseudonym as spent in `epoch`; false if it was
+    /// already.
+    fn spend_pseudonym(&self, epoch: u32, nym: [u8; credential::PSEUDONYM_LEN]) -> bool {
         let mut seen = lock(&self.vol().seen);
-        let today = credential::day(now);
+        let today = credential::day(now_ms());
         seen.retain(|e, _| *e + 1 >= today);
-        seen.entry(token.epoch).or_default().insert(nym)
+        let fresh = seen.entry(epoch).or_default().insert(nym);
+        if fresh {
+            self.shared.save_state(STATE_SEEN, encode_seen(&seen));
+        }
+        fresh
     }
 
     // ----- Directory server -----
@@ -1036,6 +1053,35 @@ fn decode_subs(b: &[u8]) -> threnody_core::Result<Vec<Subscription>> {
     Ok(out)
 }
 
+fn encode_seen(seen: &Seen) -> threnody_core::Result<Vec<u8>> {
+    let size = 64 + seen.values().map(|n| 16 + n.len() * 52).sum::<usize>();
+    cbor::to_vec(size, |e| {
+        e.array_len(seen.len())?;
+        for (epoch, nyms) in seen {
+            e.array_len(2)?.u32(*epoch)?.array_len(nyms.len())?;
+            for n in nyms {
+                e.bytes(n)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn decode_seen(b: &[u8]) -> threnody_core::Result<Seen> {
+    let mut d = Decoder::new(b);
+    let mut seen = Seen::new();
+    for _ in 0..d.array_len()? {
+        d.array_len()?;
+        let epoch = d.u32()?;
+        let nyms = seen.entry(epoch).or_default();
+        for _ in 0..d.array_len()? {
+            nyms.insert(fixed_bytes::<{ credential::PSEUDONYM_LEN }>(&mut d)?);
+        }
+    }
+    finish(&d)?;
+    Ok(seen)
+}
+
 fn encode_wallet(w: &Wallet) -> threnody_core::Result<Vec<u8>> {
     let creds: Vec<([u8; 32], u32, Vec<u8>)> = w
         .creds
@@ -1150,6 +1196,38 @@ mod tests {
         let v6a: IpAddr = "2001:db8:1:2:3::1".parse().unwrap();
         let v6b: IpAddr = "2001:db8:1:2:4::1".parse().unwrap();
         assert_eq!(network(v6a), network(v6b));
+    }
+
+    #[tokio::test]
+    async fn spent_token_pseudonyms_survive_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |create: bool| {
+            let home = threnody_core::store::Home::new(dir.path().join("v"));
+            let identity = if create {
+                home.create_identity(None).unwrap()
+            } else {
+                home.load_identity(None).unwrap()
+            };
+            Node::new(crate::NodeConfig {
+                home,
+                identity,
+                policy: crate::AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+            .0
+        };
+        let today = credential::day(now_ms());
+        let nym = [7u8; credential::PSEUDONYM_LEN];
+        let v = open(true);
+        assert!(v.spend_pseudonym(today, nym));
+        assert!(!v.spend_pseudonym(today, nym));
+        v.shutdown();
+        // A relay that restarts must not take the same slot again.
+        let v = open(false);
+        assert!(!v.spend_pseudonym(today, nym));
+        assert!(v.spend_pseudonym(today, [8u8; credential::PSEUDONYM_LEN]));
     }
 
     #[test]
