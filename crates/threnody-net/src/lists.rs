@@ -389,15 +389,52 @@ impl Node {
         Some((bytes, groups))
     }
 
-    /// The devices of the contact a 1:1 conversation is with.
+    /// The devices of the contact a 1:1 conversation is with; none if
+    /// we blocked them.
     fn conversation_devices(&self, conv: ConversationId) -> Vec<PublicIdentity> {
-        let keys: Vec<PublicIdentity> = self.contacts().iter().map(|c| c.key).collect();
-        let Some(k) = keys.into_iter().find(|k| self.conversation_for(k) == conv) else {
+        let contacts = self.contacts();
+        let blocked = |k: &PublicIdentity| contacts.get(k).is_some_and(|c| c.blocked);
+        let Some(k) = contacts
+            .iter()
+            .map(|c| c.key)
+            .find(|k| self.conversation_for(k) == conv)
+        else {
             return Vec::new();
         };
+        if blocked(&k) {
+            return Vec::new();
+        }
         match self.account_of(&k) {
-            Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
+            Some(a) => a
+                .state()
+                .devices
+                .iter()
+                .map(|(d, _)| *d)
+                .filter(|d| !blocked(d))
+                .collect(),
             None => vec![k],
+        }
+    }
+
+    /// Stops sharing every list with `conv`, a contact we blocked, on all
+    /// our devices.
+    pub(crate) fn unshare_lists_with(&self, conv: ConversationId) {
+        let changed: Vec<SharedList> = {
+            let mut ls = lock(&self.shared.lists);
+            let mut changed = Vec::new();
+            for l in &mut ls.lists {
+                if l.shared.contains(&conv) {
+                    l.shared.retain(|c| *c != conv);
+                    changed.push(l.clone());
+                }
+            }
+            if !changed.is_empty() {
+                self.save_lists(&ls);
+            }
+            changed
+        };
+        for sl in &changed {
+            self.push_list(sl, false);
         }
     }
 
@@ -555,6 +592,33 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use threnody_core::Identity;
+    use threnody_core::store::Home;
+
+    #[tokio::test]
+    async fn nothing_goes_to_a_blocked_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("alice"));
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let bob = Identity::generate().public();
+        node.accept_contact(&bob);
+        let conv = node.conversation_for(&bob);
+        assert_eq!(node.conversation_devices(conv), [bob]);
+        let id = node.create_list("Gift ideas").unwrap();
+        node.share_list(&id, conv);
+
+        node.block_contact(&bob);
+        assert!(node.conversation_devices(conv).is_empty());
+        assert!(node.list(&id).unwrap().shared.is_empty());
+    }
 
     #[test]
     fn stored_lists_round_trip() {

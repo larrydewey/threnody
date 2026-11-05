@@ -696,7 +696,8 @@ impl Node {
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
-    /// and are refused, and our conversation with them is deleted.
+    /// and are refused, our conversation with them is deleted, and lists
+    /// are no longer shared with them.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
         let devices = self.mark_contacts(peer, |c| {
@@ -708,6 +709,7 @@ impl Node {
             self.disconnect(&d);
         }
         let _ = self.shared.home.delete_history(conv);
+        self.unshare_lists_with(conv);
     }
 
     /// Deletes a message request: the contact and the conversation go, and
