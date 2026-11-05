@@ -358,13 +358,18 @@ impl Node {
                     // Conversations of contacts the sync deletes go too.
                     // (The contacts lock must be released before
                     // conversation_for, which takes it again.)
-                    let keys: Vec<(PublicIdentity, u64)> = lock(&self.shared.contacts)
+                    let keys: Vec<(PublicIdentity, u64, bool)> = lock(&self.shared.contacts)
                         .iter()
-                        .map(|c| (c.key, c.cleared_ms))
+                        .map(|c| (c.key, c.cleared_ms, c.blocked))
                         .collect();
                     let cleared_before: std::collections::HashMap<PublicIdentity, u64> =
-                        keys.iter().copied().collect();
-                    let keys: Vec<PublicIdentity> = keys.into_iter().map(|(k, _)| k).collect();
+                        keys.iter().map(|(k, t, _)| (*k, *t)).collect();
+                    let blocked_before: std::collections::HashSet<PublicIdentity> = keys
+                        .iter()
+                        .filter(|(_, _, b)| *b)
+                        .map(|(k, _, _)| *k)
+                        .collect();
+                    let keys: Vec<PublicIdentity> = keys.into_iter().map(|(k, _, _)| k).collect();
                     let before: Vec<(PublicIdentity, ConversationId)> = keys
                         .into_iter()
                         .map(|k| (k, self.conversation_for(&k)))
@@ -382,11 +387,27 @@ impl Node {
                     let left: Vec<(PublicIdentity, ConversationId)> = {
                         let c = lock(&self.shared.contacts);
                         before
-                            .into_iter()
+                            .iter()
                             .filter(|(k, _)| c.get(k).is_none() && c.forgotten_at(k).is_some())
+                            .copied()
                             .collect()
                     };
                     for (k, conv) in left {
+                        self.disconnect(&k);
+                        let _ = self.shared.home.delete_history(conv);
+                    }
+                    // Contacts blocked on our other device: their sessions
+                    // end and their conversation goes, as on that device.
+                    let blocked: Vec<PublicIdentity> = lock(&self.shared.contacts)
+                        .iter()
+                        .filter(|c| c.blocked && !blocked_before.contains(&c.key))
+                        .map(|c| c.key)
+                        .collect();
+                    for k in blocked {
+                        let conv = before
+                            .iter()
+                            .find(|(b, _)| *b == k)
+                            .map_or_else(|| self.conversation_for(&k), |(_, c)| *c);
                         self.disconnect(&k);
                         let _ = self.shared.home.delete_history(conv);
                     }

@@ -548,10 +548,20 @@ async fn blocking_and_unblocking_follow_us_across_our_devices() {
     let bid = bob.node.identity();
     let blocked = |n: &Node| n.contacts().get(&bid).is_some_and(|c| c.blocked);
     wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    bob.node
+        .send_text(&laptop.node.identity(), "hello")
+        .unwrap();
+    wait_for(|| !texts(&laptop.node, &bid).is_empty()).await;
 
-    // Blocking on the phone reaches the connected laptop at once.
+    // Blocking on the phone reaches the connected laptop at once, and the
+    // laptop drops Bob's session and the conversation as the phone did.
     phone.node.block_contact(&bid);
     wait_for(|| blocked(&laptop.node)).await;
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    assert!(
+        texts(&laptop.node, &bid).is_empty(),
+        "the laptop kept the blocked conversation"
+    );
 
     // Approving again on the laptop unblocks on the phone, and the phone's
     // older block doesn't come back when the two next meet.
