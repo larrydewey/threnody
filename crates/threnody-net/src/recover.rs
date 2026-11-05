@@ -197,8 +197,6 @@ impl RecoverState {
 /// two cells, and a constant-rate link carries one per tick, so beating
 /// at the link's rate would queue cells on it without end.
 const INNER_BEAT_TICKS: u32 = 16;
-/// The slowest heartbeat a peer's lease allows for (see [`lease_for`]).
-const MAX_BEAT: Duration = Duration::from_secs(120);
 
 /// The heartbeat of a session inside a relay or onion circuit, over links
 /// sending one frame per `rate` (or, with no cover, as fast as they like).
@@ -946,7 +944,7 @@ mod tests {
         let ((x, ax), (y, cy)) = tokio::join!(
             async {
                 let mut x = x;
-                let ch = crate::handshake::initiate(&mut x, a.identity_ref()).await;
+                let ch = crate::handshake::initiate(&mut x, a.identity_ref(), None).await;
                 (x, ch.unwrap())
             },
             async {
