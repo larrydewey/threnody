@@ -1552,7 +1552,11 @@ where
     let on_standby = matches!(over, Over::Standby);
     let shared: &Shared = &node.shared;
     let peer = *chan.peer();
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, mut wr) = tokio::io::split(stream);
+    // Bytes of a frame still arriving (a large file) count as the peer
+    // talking, for the lease: a whole frame may take longer than it.
+    let heard = Heard::new();
+    let mut rd = heard.reader(rd);
 
     // Frame reads are not cancellation-safe, so they get their own task.
     let (in_tx, mut inbox) = mpsc::channel::<Result<Vec<u8>>>(16);
@@ -1744,7 +1748,12 @@ where
                 pending = waiting;
             }
             tokio::select! {
-                () = lease_expired(lease, last_rx) => {
+                () = lease_expired(lease, last_rx.max(heard.last())) => {
+                    if heard.last() > last_rx || !inbox.is_empty() {
+                        // Bytes came in meanwhile, or frames wait unread
+                        // after a long write of ours: not silent.
+                        continue;
+                    }
                     return Err(NetError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "lease expired (peer silent)",
@@ -2069,6 +2078,58 @@ enum Over {
     /// network's address, not ours.
     Standby,
     Other,
+}
+
+/// When bytes from the peer last arrived on a session, partial frames
+/// included, shared with the session's reader task.
+#[derive(Clone)]
+struct Heard {
+    t0: tokio::time::Instant,
+    /// Milliseconds after `t0`.
+    at_ms: Arc<AtomicU64>,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Self {
+            t0: tokio::time::Instant::now(),
+            at_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        self.t0 + Duration::from_millis(self.at_ms.load(Ordering::Relaxed))
+    }
+
+    /// `inner`, noting here whenever bytes arrive on it.
+    fn reader<R>(&self, inner: R) -> HeardReader<R> {
+        HeardReader {
+            inner,
+            heard: self.clone(),
+        }
+    }
+}
+
+struct HeardReader<R> {
+    inner: R,
+    heard: Heard,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for HeardReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            let ms = this.heard.t0.elapsed().as_millis() as u64;
+            this.heard.at_ms.store(ms, Ordering::Relaxed);
+        }
+        r
+    }
 }
 
 /// Resolves when `lease` has passed since `last_rx`; never without a lease.

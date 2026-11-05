@@ -371,6 +371,111 @@ async fn slowing_cover_traffic_mid_session_keeps_the_session() {
     assert!(alice.sessions().iter().any(|s| s.peer == bob_id));
 }
 
+/// A TCP proxy to `to` passing at most `per_s` bytes a second from the
+/// dialer, as a slow uplink would; the other way at full speed.
+async fn slow_proxy(to: std::net::SocketAddr, per_s: usize) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(to).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut buf = vec![0u8; per_s / 10];
+        while let Ok(n) = cr.read(&mut buf).await {
+            if n == 0 || sw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    addr
+}
+
+/// A file that takes longer to arrive than the lease still gets through:
+/// its bytes arriving count as the peer talking, not just whole frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_slower_than_the_lease_still_arrives() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    // Every 200 ms: the lease is then 3 s.
+    for n in [&alice, &bob] {
+        n.set_constant_rate(Some(Duration::from_millis(200)));
+    }
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    bob.listen_quic("127.0.0.1:0").await.unwrap();
+    for n in [&alice, &bob] {
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    timeout(Duration::from_secs(10), async {
+        while alice.reachability().candidates.is_empty() || bob.reachability().candidates.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+    // 1.5 MB at 300 kB/s: about 5 s for the one frame.
+    let proxy = slow_proxy(b_tcp, 300_000).await;
+    let bob_id = alice.connect(&proxy.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Let the `Paths` messages cross.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    alice
+        .send_file(
+            &bob_id,
+            threnody_net::history::OutgoingFile {
+                name: "big.bin".into(),
+                data: vec![7u8; 1_500_000],
+                location: None,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+                clip: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    let got = next(&mut brx, 30, |e| {
+        matches!(
+            e,
+            Event::Disconnected { .. }
+                | Event::Message {
+                    msg: AppMessage::File { .. },
+                    ..
+                }
+        )
+    })
+    .await;
+    assert!(
+        matches!(got, Event::Message { .. }),
+        "the session ended first: {got:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strangers_find_each_other_by_handle() {
     let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
