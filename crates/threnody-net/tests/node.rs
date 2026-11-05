@@ -161,6 +161,35 @@ async fn approved_only_policy_rejects_strangers() {
     assert!(bob.sessions().is_empty());
 }
 
+/// Tightening the policy, or revoking under `ApprovedOnly`, ends the
+/// sessions it would now refuse instead of letting them run on.
+#[tokio::test]
+async fn tightening_the_policy_ends_sessions_it_now_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let (carol, mut crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
+    let addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    // Bob is a stranger; Carol becomes a mutually approved contact.
+    bob.connect(&addr, None).await.unwrap();
+    let alice_id = carol.connect(&addr, None).await.unwrap();
+    carol.set_approval(&alice_id, true).unwrap();
+    alice.set_approval(&carol.identity(), true).unwrap();
+    next(&mut crx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+
+    alice.set_policy(AcceptPolicy::ApprovedOnly);
+    next(&mut brx, |e| matches!(e, Event::Disconnected { .. })).await;
+    let peers = |n: &Node| n.sessions().into_iter().map(|s| s.peer).collect::<Vec<_>>();
+    assert_eq!(peers(&alice), vec![carol.identity()]);
+
+    alice.set_approval(&carol.identity(), false).unwrap();
+    next(&mut crx, |e| matches!(e, Event::Disconnected { .. })).await;
+    assert!(alice.sessions().is_empty());
+}
+
 #[tokio::test]
 async fn constant_rate_mode_delivers_and_hides_idle() {
     let dir = tempfile::tempdir().unwrap();

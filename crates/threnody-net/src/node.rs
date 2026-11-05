@@ -713,8 +713,26 @@ impl Node {
         *lock(&self.shared.policy)
     }
 
+    /// Sets who may hold a session with us. Sessions the new policy would
+    /// refuse end at once rather than when they next reconnect.
     pub fn set_policy(&self, p: AcceptPolicy) {
         *lock(&self.shared.policy) = p;
+        self.enforce_policy();
+    }
+
+    /// Ends sessions the accept policy refuses now, as it would have at
+    /// accept: after it tightens, or an approval it relied on is revoked.
+    /// Sessions we dialed ourselves stay, as the policy never covered them.
+    pub(crate) fn enforce_policy(&self) {
+        let refused: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .filter(|s| !s.outbound && self.check_policy(&s.peer).is_err())
+            .map(|s| s.peer)
+            .collect();
+        for peer in refused {
+            self.disconnect(&peer);
+        }
     }
 
     pub fn constant_rate(&self) -> Option<Duration> {
@@ -1277,6 +1295,11 @@ impl Node {
             self.shared.tunnel_down(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });
+        if !approved {
+            // Under `ApprovedOnly` the peer has no business holding a
+            // session any more (the revocation above still goes first).
+            self.enforce_policy();
+        }
         self.push_contact_sync();
         Ok(())
     }

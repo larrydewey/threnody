@@ -125,7 +125,7 @@ For each phone that should use the relay (yours, your partner's, any other devic
    `tctl /contacts`, then `tctl /approve <fingerprint>`.
 5. On the phone, open the relay's chat and tap **Approve**. Approval has to be mutual for relaying.
 6. Compare safety numbers (`tctl /safety <fingerprint>` against the phone's) and mark it verified on both sides (`tctl /verify <fingerprint>`).
-7. When every phone is in: `tctl /policy approved`.
+7. When every phone is in: `tctl /policy approved`. Sessions the new policy refuses, from anyone who connected while it was open, end at once. Revoking a contact under this policy ends its session too.
 
 `tctl /peers` lists live sessions; each phone should be there. `tctl /help` lists every command.
 

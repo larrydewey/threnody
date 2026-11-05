@@ -391,11 +391,14 @@ impl Node {
                                 .then_some((c.key, newly_blocked))
                         })
                         .collect();
-                    for (k, newly_blocked) in withdrawn {
-                        self.withdraw_approval(&k);
-                        if newly_blocked {
-                            self.disconnect(&k);
+                    if !withdrawn.is_empty() {
+                        for (k, newly_blocked) in withdrawn {
+                            self.withdraw_approval(&k);
+                            if newly_blocked {
+                                self.disconnect(&k);
+                            }
                         }
+                        self.enforce_policy();
                     }
                     // Chats cleared on our other device.
                     let cleared: Vec<(PublicIdentity, u64)> = lock(&self.shared.contacts)
