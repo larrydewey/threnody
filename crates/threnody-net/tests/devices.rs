@@ -516,3 +516,58 @@ async fn clearing_a_chat_keeps_the_contact_on_every_device() {
     assert_eq!(h.entries()[0].text, "new news", "old messages stay cleared");
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+#[tokio::test]
+async fn a_device_that_was_away_cant_undo_deleting_or_unsharing_a_list() {
+    use threnody_core::history::ConversationId;
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::DeviceLinked { .. })).await;
+    let pid = phone.node.identity();
+
+    // Two lists, one shared with a group, on both devices.
+    let group = ConversationId::Group([5; 16]);
+    let gifts = laptop.node.create_list("Gifts").unwrap();
+    let old = laptop.node.create_list("Old").unwrap();
+    laptop.node.share_list(&gifts, group);
+    wait_for(|| {
+        phone.node.list(&old).is_some()
+            && phone.node.list(&gifts).is_some_and(|l| l.shared == [group])
+    })
+    .await;
+
+    // With the phone away, the laptop unshares one and deletes the other.
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    laptop.node.unshare_list(&gifts, group);
+    laptop.node.delete_list(&old);
+
+    // The phone comes back with its old copies: both changes stand, on
+    // both devices.
+    let home = threnody_core::store::Home::new(dir.path().join("phone"));
+    let identity = home.load_identity(None).unwrap();
+    let (phone2, _prx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    phone2.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| {
+        phone2.list(&old).is_none() && phone2.list(&gifts).is_some_and(|l| l.shared.is_empty())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        laptop.node.list(&old).is_none(),
+        "the deleted list stays gone"
+    );
+    assert!(laptop.node.list(&gifts).unwrap().shared.is_empty());
+    assert!(phone2.list(&old).is_none());
+    assert!(phone2.list(&gifts).unwrap().shared.is_empty());
+}

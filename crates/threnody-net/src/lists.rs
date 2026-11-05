@@ -13,7 +13,7 @@
 //! Changes never echo: a device only sends what it changed itself.
 
 use const_cbor::Decoder;
-use threnody_core::cbor::{self, finish, read_map, required};
+use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
 use threnody_core::history::{ConversationId, Entry};
 use threnody_core::lists::{List, ListId, MAX_LISTS, MAX_TITLE, Stamp};
 use threnody_core::message::FEATURE_LISTS;
@@ -34,17 +34,46 @@ const MAX_CHAT_BYTES: usize = 3 << 20;
 const MAX_CHAT_LISTS: usize = 50;
 /// List slots only lists we start may fill.
 const OWN_LISTS: usize = 50;
+/// How many lists we deleted we remember, so that a device that was away
+/// can't bring them back.
+const MAX_DELETED: usize = 200;
 
 /// A list with the conversations it's shared with.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SharedList {
     pub list: List,
     pub shared: Vec<ConversationId>,
+    /// When our devices last changed whom it's shared with (0: not known),
+    /// so the latest change wins among them.
+    pub shared_ms: u64,
+}
+
+impl SharedList {
+    /// Whether our devices should take `shared`, set at `ms` (None: by a
+    /// device that doesn't say when), over what we have: the later wins,
+    /// and on a tie the larger, so every device picks the same.
+    fn takes_sharing(&self, shared: &[ConversationId], ms: Option<u64>) -> bool {
+        let key = |s: &[ConversationId]| s.iter().map(|c| c.to_bytes()).collect::<Vec<_>>();
+        match ms {
+            _ if shared == self.shared.as_slice() => false,
+            None => true,
+            Some(ms) => {
+                ms > self.shared_ms || (ms == self.shared_ms && key(shared) > key(&self.shared))
+            }
+        }
+    }
+
+    /// Notes that whom it's shared with changed here, now.
+    fn shared_now(&mut self) {
+        self.shared_ms = now_ms().max(self.shared_ms.saturating_add(1));
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct Lists {
     pub lists: Vec<SharedList>,
+    /// The lists we deleted, oldest first (at most [`MAX_DELETED`]).
+    pub deleted: Vec<ListId>,
     /// Changes from contacts that groups the list is shared with should
     /// hear of; the app sends them (see [`Node::take_list_forwards`]).
     pub to_groups: Vec<(Vec<u8>, [u8; 16])>,
@@ -76,25 +105,47 @@ impl Lists {
         all <= MAX_FROM_OTHERS && chat <= MAX_CHAT_BYTES
     }
 
+    /// Remembers that list `id` was deleted.
+    fn forget(&mut self, id: ListId) {
+        self.lists.retain(|l| l.list.id != id);
+        if !self.deleted.contains(&id) {
+            if self.deleted.len() >= MAX_DELETED {
+                self.deleted.remove(0);
+            }
+            self.deleted.push(id);
+        }
+    }
+
+    /// Stored: `{ 0: 1, 1: [* [list, [* conversation]]], 2: [* deleted
+    /// id], 3: [* [id, shared_ms]] }`.
     pub fn encode(&self) -> threnody_core::Result<Vec<u8>> {
-        let parts: Vec<(Vec<u8>, &[ConversationId])> = self
+        let parts: Vec<(Vec<u8>, &SharedList)> = self
             .lists
             .iter()
-            .filter_map(|l| Some((l.list.encode().ok()?, l.shared.as_slice())))
+            .filter_map(|l| Some((l.list.encode().ok()?, l)))
             .collect();
         let hint = 64
+            + self.deleted.len() * 20
             + parts
                 .iter()
-                .map(|(b, s)| b.len() + s.len() * 40 + 8)
+                .map(|(b, l)| b.len() + l.shared.len() * 40 + 40)
                 .sum::<usize>();
         cbor::to_vec(hint, |e| {
-            e.map_len(2)?.u8(0)?.u8(1)?;
+            e.map_len(4)?.u8(0)?.u8(1)?;
             e.u8(1)?.array_len(parts.len())?;
-            for (b, shared) in &parts {
-                e.array_len(2)?.bytes(b)?.array_len(shared.len())?;
-                for c in *shared {
+            for (b, l) in &parts {
+                e.array_len(2)?.bytes(b)?.array_len(l.shared.len())?;
+                for c in &l.shared {
                     e.bytes(&c.to_bytes())?;
                 }
+            }
+            e.u8(2)?.array_len(self.deleted.len())?;
+            for id in &self.deleted {
+                e.bytes(id)?;
+            }
+            e.u8(3)?.array_len(parts.len())?;
+            for (_, l) in &parts {
+                e.array_len(2)?.bytes(&l.list.id)?.u64(l.shared_ms)?;
             }
             Ok(())
         })
@@ -102,6 +153,7 @@ impl Lists {
 
     pub fn decode(b: &[u8]) -> Self {
         let mut out = Self::default();
+        let mut stamps = Vec::new();
         let mut dec = Decoder::new(b);
         let _ = read_map(&mut dec, |k, d| {
             match k {
@@ -114,7 +166,30 @@ impl Lists {
                         if let Ok(list) = List::decode(&l)
                             && out.lists.len() < MAX_LISTS
                         {
-                            out.lists.push(SharedList { list, shared });
+                            out.lists.push(SharedList {
+                                list,
+                                shared,
+                                shared_ms: 0,
+                            });
+                        }
+                    }
+                }
+                2 => {
+                    for _ in 0..d.array_len()? {
+                        let id = fixed_bytes::<16>(d)?;
+                        if out.deleted.len() < MAX_DELETED {
+                            out.deleted.push(id);
+                        }
+                    }
+                }
+                3 => {
+                    for _ in 0..d.array_len()? {
+                        if d.array_len()? != 2 {
+                            return Err(threnody_core::Error::Malformed("list stamp"));
+                        }
+                        let stamp = (fixed_bytes::<16>(d)?, d.u64()?);
+                        if stamps.len() < MAX_LISTS {
+                            stamps.push(stamp);
                         }
                     }
                 }
@@ -122,6 +197,11 @@ impl Lists {
             }
             Ok(true)
         });
+        for (id, ms) in stamps {
+            if let Some(l) = out.lists.iter_mut().find(|l| l.list.id == id) {
+                l.shared_ms = ms;
+            }
+        }
         out
     }
 }
@@ -143,11 +223,11 @@ fn decode_shared(d: &mut Decoder<'_>) -> threnody_core::Result<(Vec<u8>, Vec<Con
 }
 
 /// Account message `List`: `{ 0: list, 1: [* conversation], ? 2: true
-/// (deleted) }`.
+/// (deleted), 3: when the sharing last changed }`.
 fn sync_payload(l: &SharedList, deleted: bool) -> Option<Vec<u8>> {
     let b = l.list.encode().ok()?;
-    cbor::to_vec(b.len() + l.shared.len() * 40 + 32, |e| {
-        e.map_len(2 + usize::from(deleted))?;
+    cbor::to_vec(b.len() + l.shared.len() * 40 + 48, |e| {
+        e.map_len(3 + usize::from(deleted))?;
         e.u8(0)?.bytes(&b)?;
         e.u8(1)?.array_len(l.shared.len())?;
         for c in &l.shared {
@@ -156,9 +236,22 @@ fn sync_payload(l: &SharedList, deleted: bool) -> Option<Vec<u8>> {
         if deleted {
             e.u8(2)?.bool(true)?;
         }
+        e.u8(3)?.u64(l.shared_ms)?;
         Ok(())
     })
     .ok()
+}
+
+/// The account message saying list `id` was deleted.
+fn deletion(id: ListId) -> Option<AppMessage> {
+    let gone = SharedList {
+        list: List {
+            id,
+            ..List::default()
+        },
+        ..SharedList::default()
+    };
+    sync_payload(&gone, true).and_then(crate::account::list_message)
 }
 
 impl Node {
@@ -211,6 +304,7 @@ impl Node {
                 items: Vec::new(),
             },
             shared: Vec::new(),
+            shared_ms: 0,
         };
         {
             let mut ls = lock(&self.shared.lists);
@@ -266,9 +360,11 @@ impl Node {
             let mut ls = lock(&self.shared.lists);
             let k = ls.lists.iter().position(|l| l.list.id == *id)?;
             if !ls.lists[k].shared.contains(&conv) {
+                let before = ls.lists[k].clone();
                 ls.lists[k].shared.push(conv);
+                ls.lists[k].shared_now();
                 if !self.save_lists(&ls) {
-                    ls.lists[k].shared.pop();
+                    ls.lists[k] = before;
                     return None;
                 }
             }
@@ -287,6 +383,7 @@ impl Node {
                 return;
             };
             sl.shared.retain(|c| *c != conv);
+            sl.shared_now();
             let sl = sl.clone();
             self.save_lists(&ls);
             sl
@@ -294,14 +391,15 @@ impl Node {
         self.push_list(&sl, false);
     }
 
-    /// Deletes list `id` on all our devices (others keep theirs).
+    /// Deletes list `id` on all our devices (others keep theirs). We
+    /// remember it, so a device that was away can't bring it back.
     pub fn delete_list(&self, id: &ListId) {
         let gone = {
             let mut ls = lock(&self.shared.lists);
-            let Some(k) = ls.lists.iter().position(|l| l.list.id == *id) else {
+            let Some(gone) = ls.lists.iter().find(|l| l.list.id == *id).cloned() else {
                 return;
             };
-            let gone = ls.lists.remove(k);
+            ls.forget(*id);
             self.save_lists(&ls);
             gone
         };
@@ -425,6 +523,7 @@ impl Node {
             for l in &mut ls.lists {
                 if l.shared.contains(&conv) {
                     l.shared.retain(|c| *c != conv);
+                    l.shared_now();
                     changed.push(l.clone());
                 }
             }
@@ -449,7 +548,7 @@ impl Node {
             return;
         }
         let mut dec = Decoder::new(payload);
-        let (mut l, mut shared, mut deleted) = (None, Vec::new(), false);
+        let (mut l, mut shared, mut deleted, mut shared_ms) = (None, Vec::new(), false, None);
         let ok = read_map(&mut dec, |k, d| {
             match k {
                 0 => l = Some(d.bytes()?.to_vec()),
@@ -461,6 +560,7 @@ impl Node {
                     }
                 }
                 2 => deleted = d.bool()?,
+                3 => shared_ms = Some(d.u64()?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -475,47 +575,57 @@ impl Node {
         };
         list.drop_future(now_ms());
         let id = list.id;
-        let changed = {
-            let mut ls = lock(&self.shared.lists);
-            let k = ls.lists.iter().position(|x| x.list.id == id);
-            let changed = match (k, deleted) {
-                (Some(k), true) => {
-                    ls.lists.remove(k);
-                    true
-                }
-                (None, true) => false,
-                (Some(k), false) => {
-                    let before = ls.lists[k].clone();
-                    let x = &mut ls.lists[k];
-                    let mut c = x.list.merge(&list);
-                    if x.shared != shared {
-                        x.shared = shared;
-                        c = true;
-                    }
-                    if c && !self.save_lists(&ls) {
-                        ls.lists[k] = before;
-                        return;
-                    }
-                    c
-                }
-                (None, false) if ls.lists.len() < MAX_LISTS => {
-                    ls.lists.push(SharedList { list, shared });
-                    if !self.save_lists(&ls) {
-                        ls.lists.pop();
-                        return;
-                    }
-                    true
-                }
-                (None, false) => false,
-            };
-            if changed && deleted {
+        let mut ls = lock(&self.shared.lists);
+        let k = ls.lists.iter().position(|x| x.list.id == id);
+        match (k, deleted) {
+            (_, true) => {
+                ls.forget(id);
                 self.save_lists(&ls);
+                if k.is_none() {
+                    return;
+                }
             }
-            changed
-        };
-        if changed {
-            self.emit(Event::ListChanged { id });
+            // One we deleted, from a device that was away: it goes there
+            // too.
+            (None, false) if ls.deleted.contains(&id) => {
+                drop(ls);
+                if let Some(m) = deletion(id) {
+                    let _ = self.send_tracked(&from, m);
+                }
+                return;
+            }
+            (Some(k), false) => {
+                let before = ls.lists[k].clone();
+                let x = &mut ls.lists[k];
+                let mut changed = x.list.merge(&list);
+                if x.takes_sharing(&shared, shared_ms) {
+                    x.shared = shared;
+                    x.shared_ms = shared_ms.unwrap_or(x.shared_ms);
+                    changed = true;
+                }
+                if !changed {
+                    return;
+                }
+                if !self.save_lists(&ls) {
+                    ls.lists[k] = before;
+                    return;
+                }
+            }
+            (None, false) if ls.lists.len() < MAX_LISTS => {
+                ls.lists.push(SharedList {
+                    list,
+                    shared,
+                    shared_ms: shared_ms.unwrap_or(0),
+                });
+                if !self.save_lists(&ls) {
+                    ls.lists.pop();
+                    return;
+                }
+            }
+            (None, false) => return,
         }
+        drop(ls);
+        self.emit(Event::ListChanged { id });
     }
 
     /// A list shared in `conv` (by `from`, a contact or a group member):
@@ -551,14 +661,19 @@ impl Node {
                 }
                 Some(_) => return None,
                 None if ls.room_for(conv) => {
-                    ls.lists.push(SharedList {
+                    let mut sl = SharedList {
                         list: list.clone(),
                         shared: vec![conv],
-                    });
+                        shared_ms: 0,
+                    };
+                    sl.shared_now();
+                    ls.lists.push(sl);
                     if !ls.fits_from(conv) || !self.save_lists(&ls) {
                         ls.lists.pop();
                         return None;
                     }
+                    // Shared with us again since we deleted it.
+                    ls.deleted.retain(|d| *d != id);
                     true
                 }
                 None => return None,
@@ -633,10 +748,14 @@ mod tests {
                     ConversationId::Group([1; 16]),
                     ConversationId::Peer([2; 32]),
                 ],
+                shared_ms: 12,
             }],
+            deleted: vec![[8; 16]],
             to_groups: Vec::new(),
         };
-        assert_eq!(Lists::decode(&l.encode().unwrap()).lists, l.lists);
+        let back = Lists::decode(&l.encode().unwrap());
+        assert_eq!(back.lists, l.lists);
+        assert_eq!(back.deleted, l.deleted);
         assert!(Lists::decode(&[0xff]).lists.is_empty());
     }
 }
