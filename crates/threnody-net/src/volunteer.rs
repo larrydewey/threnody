@@ -149,7 +149,7 @@ impl VolunteerState {
 }
 
 /// The part of an address that limits issuance: a /24 or a /56.
-fn network(ip: IpAddr) -> [u8; 16] {
+pub(crate) fn network(ip: IpAddr) -> [u8; 16] {
     let mut out = [0u8; 16];
     match ip {
         IpAddr::V4(v4) => out[..3].copy_from_slice(&v4.octets()[..3]),
