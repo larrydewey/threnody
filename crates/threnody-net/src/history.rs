@@ -696,20 +696,27 @@ impl Node {
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
-    /// and are refused, their tunnels go, and our conversation with them
-    /// is deleted.
+    /// and are refused, their tunnels and discovery keys go, and our
+    /// conversation with them is deleted, here and (through contact sync)
+    /// on our other devices.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        let now = now_ms();
         let devices = self.mark_contacts(peer, |c| {
             c.blocked = true;
             c.accepted = false;
+            // A revocation like any other: dated, so an older approval
+            // synced from our other devices can't bring it back.
             c.local_approved = false;
+            c.approval_changed_ms = now;
+            c.clear_discovery_keys();
         });
         for d in devices {
             self.withdraw_approval(&d);
             self.disconnect(&d);
         }
         let _ = self.shared.home.delete_history(conv);
+        self.push_contact_sync();
     }
 
     /// Deletes a message request: the contact and the conversation go, and

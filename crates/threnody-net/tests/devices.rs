@@ -480,6 +480,60 @@ async fn deleting_a_chat_deletes_it_on_our_other_devices() {
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
 
+/// Blocking on one device is a revocation on all of them: our other
+/// devices stop approving the contact, drop its discovery keys and end
+/// their sessions with it.
+#[tokio::test]
+async fn blocking_revokes_on_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let bid = bob.node.identity();
+    wait_for(|| {
+        laptop
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.discovery_key.is_some())
+    })
+    .await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    wait_for(|| {
+        phone
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.local_approved)
+    })
+    .await;
+
+    phone.node.block_contact(&bid);
+    let c = phone.node.contacts().get(&bid).cloned().unwrap();
+    assert!(c.blocked && !c.local_approved && c.discovery_key.is_none());
+    wait_for(|| {
+        laptop
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.blocked && !c.local_approved && c.discovery_key.is_none())
+    })
+    .await;
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    // Bob hears that the laptop no longer approves him.
+    let lid = laptop.node.identity();
+    wait_for(|| {
+        bob.node
+            .contacts()
+            .get(&lid)
+            .is_some_and(|c| !c.mutually_approved())
+    })
+    .await;
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}
+
 #[tokio::test]
 async fn clearing_a_chat_keeps_the_contact_on_every_device() {
     let dir = tempfile::tempdir().unwrap();
