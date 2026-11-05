@@ -106,6 +106,8 @@ extension Date {
 struct SettingsView: View {
     @EnvironmentObject private var store: NodeStore
     @Environment(\.dismiss) private var dismiss
+    /// Read by NodeStore.privateNotifications.
+    @AppStorage("privateNotifications") private var privateNotifications = true
 
     var body: some View {
         NavigationStack {
@@ -117,6 +119,15 @@ struct SettingsView: View {
                         LabeledContent("Listening on", value: store.listenAddr)
                         Text("Identity \(KeyVault.describe).").font(.footnote).foregroundStyle(.secondary)
                     }
+                }
+                Section {
+                    Toggle("Private notifications", isOn: $privateNotifications)
+                } header: {
+                    Text("Privacy")
+                } footer: {
+                    Text(privateNotifications
+                        ? "Notifications say only “New message”, without sender or text."
+                        : "Notifications show who wrote and what they said, except for disappearing messages.")
                 }
                 Section("Background") {
                     Text("iOS suspends Threnody shortly after you leave it. Messages sent to you meanwhile wait with mutually approved contacts (mailboxes) and arrive when you open the app again, or during the occasional background refresh iOS allows.")

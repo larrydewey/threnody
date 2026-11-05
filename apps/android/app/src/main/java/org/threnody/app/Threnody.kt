@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.ContactInfo
 import uniffi.threnody_ffi.FileOptions
+import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.PersonaRecord
 import uniffi.threnody_ffi.ThrenodyNode
@@ -586,6 +587,16 @@ object Threnody {
         }
     }
 
+    /**
+     * Whether the newest message in a history disappears, so its text stays
+     * out of notifications. If it can't be told, it is taken to.
+     */
+    private fun disappearing(history: () -> List<HistoryEntry>): Boolean = try {
+        history().lastOrNull()?.disappearing != false
+    } catch (_: Exception) {
+        true
+    }
+
     fun say(line: String) {
         if (debuggable) android.util.Log.d("Threnody", line)
         val l = synchronized(log) {
@@ -641,7 +652,8 @@ object Threnody {
                     val k = key(contacts, e.peer)
                     if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
                         val name = contacts.firstOrNull { it.fingerprint == e.peer }?.name ?: short(e.peer)
-                        ThrenodyService.notifyMessage(ctx, k, e.peer, name, e.text, persona)
+                        ThrenodyService.notifyMessage(ctx, k, e.peer, name, e.text, persona,
+                            disappearing { node.history(e.peer, 1u) })
                     }
                 }
                 is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
@@ -657,7 +669,8 @@ object Threnody {
                     if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
                         val contacts = node.contacts()
                         ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer),
-                            fileLabel(e.name, e.sensitive, e.caption, e.clip), persona)
+                            fileLabel(e.name, e.sensitive, e.caption, e.clip), persona,
+                            disappearing { node.history(e.peer, 1u) })
                     }
                 }
                 is NodeEvent.GroupMessage -> {
@@ -665,7 +678,8 @@ object Threnody {
                     // Our own other device's messages aren't news.
                     if (!e.ours && !e.quiet && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
-                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}", persona)
+                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}", persona,
+                            disappearing { node.groupHistory(e.group, 1u) })
                     }
                 }
                 is NodeEvent.GroupFile -> {
@@ -680,7 +694,8 @@ object Threnody {
                     if (!e.ours && !e.quiet && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group",
-                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption, e.clip)}", persona)
+                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption, e.clip)}", persona,
+                            disappearing { node.groupHistory(e.group, 1u) })
                     }
                 }
                 is NodeEvent.GroupInvited -> {

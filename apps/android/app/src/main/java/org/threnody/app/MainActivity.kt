@@ -988,6 +988,11 @@ class MainActivity : Activity() {
             if (it) "Photos are sent without location, camera or time details"
             else "Photos are sent with their metadata, which can include where they were taken"
         }
+        toggle("Private notifications", Privacy.privateNotifications(this@MainActivity),
+            { Privacy.setPrivateNotifications(this@MainActivity, it) }) {
+            if (it) "Notifications say only \u201cNew message\u201d, without sender or text"
+            else "Notifications show who wrote and what they said, where other apps and watches can read them"
+        }
         toggle("Screen security", Privacy.screenSecurity(this@MainActivity),
             { Privacy.setScreenSecurity(this@MainActivity, it) }) {
             if (it) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed"

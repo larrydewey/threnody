@@ -26,7 +26,7 @@ CI (`.github/workflows/ci.yml`, job `ios`) runs the same steps and builds for th
 - **Contacts.** Add by pasting an invite link or scanning its QR code (AVFoundation); show your own invite as a QR code (Core Image) or share the link, and reset invite links so ones shared so far stop finding this device across the internet. Accept or block message requests.
 - **Trust.** Approve and revoke, compare safety numbers device by device and mark them verified, with the same banners as Android (approval, unverified, new unverified device). Per-chat disappearing timers.
 - **Network changes.** `NWPathMonitor` tells the node when the path moves between Wi-Fi and cellular, and it redials approved contacts.
-- **Notifications.** Local notifications for messages that arrive while the app runs, except for the chat on screen.
+- **Notifications.** Local notifications for messages that arrive while the app runs, except for the chat on screen. They say only "New message", without sender or text, unless *Settings* → *Private notifications* is turned off; even then a disappearing message's text is left out, as it would outlive the message.
 
 ## Receiving in the background
 

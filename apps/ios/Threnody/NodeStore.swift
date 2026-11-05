@@ -264,12 +264,22 @@ final class NodeStore: ObservableObject {
         }
     }
 
+    /// Private notifications, on unless turned off in Settings: a
+    /// notification says only "New message", not who wrote or what.
+    static var privateNotifications: Bool {
+        UserDefaults.standard.object(forKey: "privateNotifications") as? Bool ?? true
+    }
+
     private func notify(_ peer: String, _ body: String, quiet: Bool, anonymous: Bool = false) {
         guard !quiet, !(active && visibleChat.contains(peer)) else { return }
         let c = conversation(peer)
+        let hidden = Self.privateNotifications
+        // A disappearing message's text would outlive it in the notification.
+        // If it can't be told, it is taken to disappear.
+        let disappears = (try? node?.history(peer: peer, limit: 1))?.last?.disappearing ?? true
         let content = UNMutableNotificationContent()
-        content.title = anonymous ? "Threnody" : (c?.title ?? Self.short(peer))
-        content.body = body
+        content.title = (anonymous || hidden) ? "Threnody" : (c?.title ?? Self.short(peer))
+        content.body = anonymous ? body : ((hidden || disappears) ? "New message" : body)
         content.sound = .default
         content.threadIdentifier = c?.key ?? peer
         content.userInfo = ["chat": c?.key ?? peer]
