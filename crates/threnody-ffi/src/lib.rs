@@ -1115,10 +1115,53 @@ fn convert(e: Event) -> NodeEvent {
             reason: calls::reason(reason),
             by_us,
         },
+        // Other messages (pins, reactions, lists, a file a contact sealed)
+        // are applied by the node; the log gets their kind, never what
+        // they carry.
+        Event::Message { msg, .. } | Event::OfflineMessage { msg, .. } => NodeEvent::Other {
+            description: format!("{} message", kind_of(&msg)),
+        },
         other => NodeEvent::Other {
-            description: format!("{other:?}"),
+            description: describe(&other, MAX_DESCRIPTION),
         },
     }
+}
+
+/// Longest description an `Other` event carries.
+const MAX_DESCRIPTION: usize = 512;
+
+/// The name of a message's kind ("File", "Pin"), without its content.
+fn kind_of(msg: &AppMessage) -> String {
+    describe(msg, 32)
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+/// `value`'s debug text, cut to at most `max` bytes. Formatting stops at
+/// the limit, so a large value is never written out whole.
+fn describe(value: &impl std::fmt::Debug, max: usize) -> String {
+    struct Bounded(String, usize);
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let room = self.1 - self.0.len();
+            if s.len() <= room {
+                self.0.push_str(s);
+                return Ok(());
+            }
+            let mut cut = room;
+            while !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.0.push_str(&s[..cut]);
+            Err(std::fmt::Error)
+        }
+    }
+    let mut out = Bounded(String::new(), max);
+    if std::fmt::write(&mut out, format_args!("{value:?}")).is_err() {
+        out.0.push('…');
+    }
+    out.0
 }
 
 impl ThrenodyNode {
@@ -2516,6 +2559,36 @@ mod tests {
             None
         );
         assert_eq!(decode_qr(0, 0, 0, vec![]), None);
+    }
+
+    /// A message the app has no event for is logged by kind only: a sealed
+    /// file's bytes, or a pin's text, never reach the log.
+    #[test]
+    fn other_messages_are_described_without_their_content() {
+        let from = threnody_core::Identity::generate().public();
+        let file = AppMessage::File {
+            sent_ms: 1,
+            name: "secret.bin".into(),
+            data: vec![7; 1 << 20],
+            id: 1,
+            sensitive: false,
+            caption: "a caption".into(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        };
+        let e = Event::OfflineMessage {
+            from,
+            via: from,
+            msg: file,
+        };
+        let NodeEvent::Other { description } = convert(e) else {
+            panic!("expected Other");
+        };
+        assert_eq!(description, "File message");
+        // Anything else is cut short.
+        let long = describe(&vec![7u8; 1 << 20], MAX_DESCRIPTION);
+        assert!(long.len() <= MAX_DESCRIPTION + '…'.len_utf8());
     }
 
     #[test]
