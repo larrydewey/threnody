@@ -92,6 +92,9 @@ pub(crate) struct Delivery {
     /// local id to mark delivered on acknowledgement (0 = none).
     unacked: HashMap<PublicIdentity, VecDeque<(u64, AppMessage, usize, Tag)>>,
     delivered: HashMap<PublicIdentity, Recent>,
+    /// Ids whose message is being handled: neither delivered again nor
+    /// saved as delivered until it has been (see [`Delivery::delivered`]).
+    opening: HashSet<(PublicIdentity, u64)>,
     /// Changed since last saved.
     pub unacked_dirty: bool,
     pub delivered_dirty: bool,
@@ -243,11 +246,25 @@ impl Delivery {
         self.unacked.get(peer).map_or(0, VecDeque::len)
     }
 
-    /// True the first time `id` arrives from `peer`.
+    /// True the first time `id` arrives from `peer`. It only counts as
+    /// delivered across a restart once [`Delivery::delivered`] says the
+    /// message was handled (saved to history, say): a crash in between
+    /// must take the sender's resend, not drop it as a duplicate.
     pub fn first_delivery(&mut self, peer: &PublicIdentity, id: u64) -> bool {
+        let seen = self
+            .delivered
+            .get(peer)
+            .is_some_and(|r| r.set.contains(&id));
+        !seen && self.opening.insert((*peer, id))
+    }
+
+    /// The message `id` from `peer`, which [`Delivery::first_delivery`]
+    /// let through, has been handled.
+    pub fn delivered(&mut self, peer: &PublicIdentity, id: u64) {
+        self.opening.remove(&(*peer, id));
         let r = self.delivered.entry(*peer).or_default();
         if !r.set.insert(id) {
-            return false;
+            return;
         }
         r.order.push_back(id);
         self.delivered_dirty = true;
@@ -256,7 +273,6 @@ impl Delivery {
         {
             r.set.remove(&old);
         }
-        true
     }
 }
 
@@ -305,8 +321,11 @@ mod tests {
         assert!(d.acked(&p, &[id]).is_empty(), "only once");
         assert_eq!(d.unacked(&p), 1);
         assert!(d.first_delivery(&p, 9) && !d.first_delivery(&p, 9));
+        d.delivered(&p, 9);
+        assert!(!d.first_delivery(&p, 9));
         for i in 0..RECENT_IDS as u64 {
             d.first_delivery(&p, 100 + i);
+            d.delivered(&p, 100 + i);
         }
         assert!(d.first_delivery(&p, 9), "old ids are forgotten");
     }
@@ -333,6 +352,7 @@ mod tests {
             Tag::NONE,
         );
         d.first_delivery(&p, 42);
+        d.delivered(&p, 42);
         assert!(d.unacked_dirty && d.delivered_dirty);
         let (u, del) = (d.encode_unacked(), d.encode_delivered());
         let mut again = Delivery::load(&u, &del);
@@ -353,6 +373,20 @@ mod tests {
         let cut = Delivery::load(&u[..u.len() - 1], &del[..del.len() - 1]);
         assert_eq!(cut.unacked(&p), 1);
         assert_eq!(Delivery::load(&[9], &[]).unacked(&p), 0);
+    }
+
+    #[test]
+    fn an_id_is_saved_as_delivered_only_once_handled() {
+        let p = Identity::generate().public();
+        let mut d = Delivery::default();
+        assert!(d.first_delivery(&p, 7));
+        assert!(!d.first_delivery(&p, 7), "a second copy while handling");
+        // A crash now: the saved state hasn't got the id, so the
+        // sender's resend is taken after the restart.
+        assert!(!d.delivered_dirty);
+        assert!(Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
+        d.delivered(&p, 7);
+        assert!(!Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
     }
 
     #[test]

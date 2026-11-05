@@ -1706,6 +1706,8 @@ where
                             pending.push_back(AppMessage::Observed { addr });
                         }
                     }
+                    // Saved as delivered only once handled below.
+                    let mut handling = None;
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
                             // Acknowledge every copy (the last ack may have
@@ -1714,7 +1716,9 @@ where
                                 Some(AppMessage::Ack(ids)) if ids.len() < MAX_ACK_IDS => ids.push(id),
                                 _ => pending.push_back(AppMessage::Ack(vec![id])),
                             }
-                            shared.delivery(|d| d.first_delivery(&peer, id)).then_some(*inner)
+                            let first = shared.delivery(|d| d.first_delivery(&peer, id));
+                            handling = first.then_some(id);
+                            first.then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
                             for tag in shared.delivery(|d| d.acked(&peer, &ids)) {
@@ -1846,6 +1850,9 @@ where
                                 shared.emit(Event::MessageRequest { peer, msg });
                             }
                         }
+                    }
+                    if let Some(id) = handling {
+                        shared.delivery(|d| d.delivered(&peer, id));
                     }
                 }
                 out = outbox.recv() => match out {

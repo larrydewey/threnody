@@ -95,7 +95,7 @@ When both sides set bit 1, text, files, group messages and mailbox messages trav
 
 An outgoing text or file in history carries a random local id (history key 7), and its tracked copies carry the same id as a tag. When any device of the recipient's account acknowledges one, the history entry is marked delivered (key 8), and the node emits `Delivered`. Apps show this as a second tick. A group message's entry records how many members it went to (key 9) and the devices that acknowledged their copy (key 10), and it is delivered once all have. Only a member's own acknowledgement counts, not a mailbox's or a forwarder's. A forwarder that delivers a copy reports the member's acknowledgement back with a group `Receipt` (Appendix F).
 
-Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The exception is messages over 64 KiB (files), which are resent only within one run.
+Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restart neither loses nor repeats messages. The receiver saves an id as delivered only after it has handled the message (a text is in history by then), so a crash in between takes the resent copy rather than dropping it as a duplicate. The exception is messages over 64 KiB (files), which are resent only within one run.
 
 ### Typing and read receipts
 
