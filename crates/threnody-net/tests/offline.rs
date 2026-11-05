@@ -730,3 +730,45 @@ async fn a_text_that_comes_twice_shows_once() {
     assert_eq!(shown, 0, "the mailbox's copy showed again");
     let _ = &mut r.rx;
 }
+
+#[tokio::test]
+async fn a_large_message_survives_a_mailbox_restart_before_the_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| r.node.sessions().iter().all(|s| s.peer != bid)).await;
+    a.node.set_prefer_onion(false);
+    let big = text(&"x".repeat(90_000));
+    a.node.send_offline(&bid, &big).unwrap();
+    wait_for(|| r.node.held_messages() == 1).await;
+
+    // B gets it, but its acknowledgement never reaches R: the link goes
+    // quiet once most of the message is in.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    connect_cut(&b2, &r.addr, 60_000).await;
+    next(
+        &mut b2rx,
+        |e| matches!(e, Event::OfflineMessage { msg, .. } if *msg == big),
+    )
+    .await;
+    // R restarts: it still has the message, and B's next session takes
+    // it (as a copy B drops) and acknowledges it.
+    r.node.shutdown();
+    let (r2, _r2rx) = open(&dir, "r", false);
+    assert_eq!(r2.held_messages(), 1);
+    let raddr = r2.listen("127.0.0.1:0").await.unwrap().to_string();
+    wait_for(|| b2.sessions().iter().all(|s| s.peer != r.node.identity())).await;
+    b2.connect(&raddr, None).await.unwrap();
+    wait_for(|| r2.held_messages() == 0).await;
+    assert!(quiet(&mut b2rx, |e| matches!(e, Event::OfflineMessage { .. })).await);
+    let _ = (&mut a.rx, &mut r.rx);
+}
