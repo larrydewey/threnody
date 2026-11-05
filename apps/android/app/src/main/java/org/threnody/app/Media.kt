@@ -125,8 +125,9 @@ object Media {
 
     /**
      * Deletes privately kept images no message refers to any more: deleted
-     * ones, and ones whose messages disappeared. Recent files are left, as
-     * their message may not be recorded yet.
+     * ones, and ones whose messages disappeared. Notes to self count as
+     * messages. Recent files are left, as their message may not be recorded
+     * yet.
      */
     fun sweep(ctx: Context, node: uniffi.threnody_ffi.ThrenodyNode, persona: String? = null) {
         val dir = dir(ctx, persona)
@@ -134,7 +135,8 @@ object Media {
         val used = try {
             val chats = Threnody.conversations(node, persona).flatMap { node.history(it.device, 10_000u) }
             val groups = node.groups().flatMap { node.groupHistory(it.id, 10_000u) }
-            (chats + groups).mapNotNull { it.file?.location }.toSet()
+            val notes = node.noteHistory(10_000u)
+            (chats + groups + notes).mapNotNull { it.file?.location }.toSet()
         } catch (_: Exception) {
             return
         }

@@ -852,30 +852,8 @@ impl Core {
 
     fn sweep(&self, persona: Option<&str>) {
         let Ok(node) = self.node(persona) else { return };
-        let dir = self.media_dir(persona);
-        let Ok(files) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        let mut kept: HashSet<String> = HashSet::new();
-        let mut all = Vec::new();
-        for c in node.contacts() {
-            match node.history(c.fingerprint, u32::MAX) {
-                Ok(h) => all.extend(h),
-                Err(_) => return,
-            }
-        }
-        for g in node.groups() {
-            match node.group_history(g.id, u32::MAX) {
-                Ok(h) => all.extend(h),
-                Err(_) => return,
-            }
-        }
-        kept.extend(all.into_iter().filter_map(|e| e.file?.location));
-        for f in files.flatten() {
-            let path = f.path().display().to_string();
-            if !kept.contains(&path) {
-                let _ = std::fs::remove_file(f.path());
-            }
+        if let Some(kept) = media_in_use(&node) {
+            sweep_media(&self.media_dir(persona), &kept);
         }
     }
 
@@ -1318,6 +1296,46 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(candidate)
 }
 
+/// How long a kept file is safe from the sweep without a message referring
+/// to it: a clip being recorded, or a photo or GIF waiting to be sent, has
+/// no message yet.
+const MEDIA_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Every file location a node's messages refer to: its chats, its groups
+/// and its notes to self. `None` if some history can't be read, so nothing
+/// is swept on a guess.
+fn media_in_use(node: &ThrenodyNode) -> Option<HashSet<String>> {
+    let mut all = Vec::new();
+    for c in node.contacts() {
+        all.extend(node.history(c.fingerprint, u32::MAX).ok()?);
+    }
+    for g in node.groups() {
+        all.extend(node.group_history(g.id, u32::MAX).ok()?);
+    }
+    all.extend(node.note_history(u32::MAX).ok()?);
+    Some(all.into_iter().filter_map(|e| e.file?.location).collect())
+}
+
+/// Deletes the files in `dir` that nothing in `kept` refers to, once they
+/// are older than [`MEDIA_GRACE`].
+fn sweep_media(dir: &Path, kept: &HashSet<String>) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for f in files.flatten() {
+        let path = f.path();
+        let recent = f
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age < MEDIA_GRACE);
+        if !recent && !kept.contains(&path.display().to_string()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// What the list or a notification says for a file.
 pub fn file_label(name: &str, sensitive: bool, caption: &str, clip: Option<Clip>) -> String {
     if let Some(c) = clip {
@@ -1366,4 +1384,53 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     f.write_all(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sweep_keeps_notes_and_recent_files() {
+        let dir = std::env::temp_dir().join(format!("threnody-sweep-{}", std::process::id()));
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let node = ThrenodyNode::open(dir.join("node").display().to_string(), None, None).unwrap();
+
+        // A photo kept only in notes to self is in use.
+        let note = media.join("note.jpg");
+        std::fs::write(&note, b"photo").unwrap();
+        let options = FileOptions {
+            sensitive: false,
+            caption: String::new(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        };
+        let location = note.display().to_string();
+        node.add_note_file("note.jpg".into(), 5, Some(location.clone()), options)
+            .unwrap();
+        let kept = media_in_use(&node).unwrap();
+        assert!(kept.contains(&location));
+
+        // A clip still being recorded has no message yet; an old file
+        // nothing refers to goes.
+        let recording = media.join("voice-1.ogg");
+        let stale = media.join("stale.jpg");
+        std::fs::write(&recording, b"ogg").unwrap();
+        std::fs::write(&stale, b"old").unwrap();
+        let long_ago = std::time::SystemTime::now() - 2 * MEDIA_GRACE;
+        for f in [&note, &stale] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        sweep_media(&media, &kept);
+        assert!(note.exists() && recording.exists());
+        assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
