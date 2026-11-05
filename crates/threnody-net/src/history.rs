@@ -1318,8 +1318,9 @@ impl Node {
         );
     }
 
-    /// Starts the background sweep of expired history, and of sealed
-    /// messages we have held too long for others.
+    /// Starts the background sweep of expired history (and of what is
+    /// left of it waiting for a peer), and of sealed messages we have held
+    /// too long for others.
     pub(crate) fn start_history_sweep(&self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -1333,6 +1334,7 @@ impl Node {
                 tokio::select! {
                     _ = tick.tick() => {
                         node.shared.home.sweep_history(node.identity_ref(), now_ms());
+                        node.seal_expired_unacked(now_ms());
                         node.sweep_mailbox(now_ms());
                     }
                     () = &mut closed => break,

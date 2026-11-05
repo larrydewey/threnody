@@ -577,6 +577,23 @@ impl Node {
         }
     }
 
+    /// Disappearing texts still waiting for their recipient once their
+    /// timer has run out here: the plain copy goes, replaced by one sealed
+    /// to the recipient, which we can't read back. It goes out as a
+    /// mailbox delivery from us. With no prekeys to seal to, it is dropped.
+    pub(crate) fn seal_expired_unacked(&self, now: u64) {
+        for (peer, id, msg) in self.shared.delivery(|d| d.expired(now)) {
+            let sealed = msg.encode().ok().and_then(|body| {
+                let mut book = lock(&self.shared.bundles);
+                let sealed = book.seal(self.identity_ref(), &peer, &body, now).ok()?;
+                self.shared.persist_bundles(&book);
+                MailboxMsg::Deliver { sealed }.encode().ok()
+            });
+            self.shared
+                .delivery(|d| d.replace(&peer, id, sealed.map(AppMessage::Mailbox)));
+        }
+    }
+
     /// Messages held for `peer`, to deliver now that it is connected.
     /// Only to a mutually approved peer, as we only hold for one.
     pub(crate) fn mailbox_for(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
@@ -1004,6 +1021,93 @@ mod tests {
         let r = open(&mut p, 1);
         assert!(p.unask(r).is_none());
         assert!(p.open.is_empty() && p.waiting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expired_disappearing_text_waits_sealed_not_plain() {
+        use crate::{AcceptPolicy, NodeConfig};
+        use threnody_core::store::Home;
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str, create: bool| {
+            let home = Home::new(dir.path().join(name));
+            let identity = if create {
+                home.create_identity(None).unwrap()
+            } else {
+                home.load_identity(None).unwrap()
+            };
+            Node::new(NodeConfig {
+                home,
+                identity,
+                policy: AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+        };
+        let wait = |cond: &dyn Fn() -> bool| {
+            let ok = (0..500).any(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                cond()
+            });
+            assert!(ok, "condition not reached");
+        };
+        let (a, _arx) = open("a", true);
+        let (b, _brx) = open("b", true);
+        let addr = a.listen("127.0.0.1:0").await.unwrap().to_string();
+        let aid = b.connect(&addr, None).await.unwrap();
+        let bid = b.identity();
+        b.set_approval(&aid, true).unwrap();
+        a.set_approval(&bid, true).unwrap();
+        tokio::task::spawn_blocking({
+            let a = a.clone();
+            move || wait(&|| a.can_send_offline(&bid))
+        })
+        .await
+        .unwrap();
+        b.shutdown();
+        let a2 = a.clone();
+        tokio::task::spawn_blocking(move || wait(&|| a2.sessions().is_empty()))
+            .await
+            .unwrap();
+
+        let secret = AppMessage::Text {
+            sent_ms: now_ms(),
+            body: "gone in 30 s".into(),
+            expires_in_s: Some(30),
+            id: 1,
+            quote: None,
+            forwarded: false,
+        };
+        a.hold(&bid, secret.clone(), Tag::NONE);
+        a.seal_expired_unacked(now_ms() + 31_000);
+        let waiting = a.shared.delivery(|d| d.resend(&bid));
+        assert!(
+            matches!(&waiting[..], [AppMessage::Tracked { inner, .. }] if matches!(**inner, AppMessage::Mailbox(_))),
+            "{waiting:?}"
+        );
+        let saved = a
+            .shared
+            .home
+            .load_state(a.identity_ref(), "unacked")
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&saved.unwrap()).contains("gone in 30 s"),
+            "plain text left in the saved state"
+        );
+
+        // B still gets it, from A, as a sealed message.
+        let (b2, mut b2rx) = open("b", false);
+        b2.connect(&addr, None).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(Event::OfflineMessage { from, msg, .. }) = b2rx.recv().await {
+                    return (from, msg);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, (aid, secret));
     }
 
     #[test]

@@ -259,6 +259,53 @@ impl Delivery {
         (tags, mail)
     }
 
+    /// Disappearing texts still waiting for their peer whose timer has run
+    /// out at our end (`now`): (peer, id, message).
+    pub fn expired(&self, now: u64) -> Vec<(PublicIdentity, u64, AppMessage)> {
+        let mut out = Vec::new();
+        for (p, q) in &self.unacked {
+            for (id, m, ..) in q {
+                if let AppMessage::Text {
+                    sent_ms,
+                    expires_in_s: Some(s),
+                    ..
+                } = m
+                    && sent_ms.saturating_add(u64::from(*s) * 1000) <= now
+                {
+                    out.push((*p, *id, m.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Swaps the message `id` waiting for `peer` for `m` (same id and tag),
+    /// or drops it with `None`.
+    pub fn replace(&mut self, peer: &PublicIdentity, id: u64, m: Option<AppMessage>) {
+        let Some(q) = self.unacked.get_mut(peer) else {
+            return;
+        };
+        let Some(i) = q.iter().position(|(x, ..)| *x == id) else {
+            return;
+        };
+        let old = q[i].2;
+        match m {
+            Some(m) => {
+                let len = m.encoded_len_hint();
+                q[i].1 = m;
+                q[i].2 = len;
+                self.unacked_dirty |= len <= MAX_PERSISTED || old <= MAX_PERSISTED;
+            }
+            None => {
+                q.remove(i);
+                self.unacked_dirty |= old <= MAX_PERSISTED;
+                if q.is_empty() {
+                    self.unacked.remove(peer);
+                }
+            }
+        }
+    }
+
     /// The peer doesn't acknowledge: what was sent plain can't be tracked.
     pub fn forget(&mut self, peer: &PublicIdentity, id: u64) {
         self.acked(peer, &[id]);
@@ -491,6 +538,44 @@ mod tests {
         assert!(d.unacked_dirty && d.delivered_dirty);
         assert_eq!(d.unacked(last), 0);
         assert!(d.first_delivery(last, (peers.len() as u64 - 1) << 32));
+    }
+
+    #[test]
+    fn expired_disappearing_texts_are_found_and_replaced() {
+        let p = Identity::generate().public();
+        let mut d = Delivery::default();
+        let gone = AppMessage::Text {
+            sent_ms: 1_000,
+            body: "secret".into(),
+            expires_in_s: Some(30),
+            id: 1,
+            quote: None,
+            forwarded: false,
+        };
+        let AppMessage::Tracked { id, .. } = d.track(&p, gone.clone(), Tag::NONE) else {
+            panic!()
+        };
+        d.track(&p, text("kept"), Tag::NONE);
+        assert!(d.expired(30_999).is_empty());
+        assert_eq!(d.expired(31_000), [(p, id, gone)]);
+        d.unacked_dirty = false;
+        d.replace(&p, id, Some(AppMessage::Mailbox(vec![9])));
+        assert!(d.unacked_dirty);
+        assert!(d.expired(u64::MAX).is_empty());
+        let saved = Delivery::load(&d.encode_unacked(), &[]);
+        assert!(!String::from_utf8_lossy(&d.encode_unacked()).contains("secret"));
+        assert_eq!(
+            saved.resend(&p),
+            [
+                AppMessage::Tracked {
+                    id,
+                    inner: Box::new(AppMessage::Mailbox(vec![9]))
+                },
+                d.resend(&p)[1].clone()
+            ]
+        );
+        d.replace(&p, id, None);
+        assert_eq!(d.unacked(&p), 1);
     }
 
     #[test]
