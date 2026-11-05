@@ -1759,11 +1759,16 @@ where
                 }
                 pending = waiting;
             }
+            // The lease runs from whatever came in last, a whole frame or
+            // just some bytes of one.
+            let since = last_rx.max(heard.last());
             tokio::select! {
-                () = lease_expired(lease, last_rx.max(heard.last())) => {
-                    if heard.last() > last_rx || !inbox.is_empty() {
-                        // Bytes came in meanwhile, or frames wait unread
-                        // after a long write of ours: not silent.
+                () = lease_expired(lease, since) => {
+                    // Bytes came in after `since`, or frames wait unread
+                    // after a long write of ours: not silent. Only bytes
+                    // newer than `since` count: a frame cut off midway
+                    // would otherwise hold the session open for good.
+                    if heard.last() > since || !inbox.is_empty() {
                         continue;
                     }
                     return Err(NetError::Io(std::io::Error::new(
