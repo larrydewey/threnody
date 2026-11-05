@@ -37,6 +37,7 @@ pub const MAX_TTL: u8 = 3;
 pub const MAX_CIRCUITS_PER_PEER: usize = 64;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const NONCE_MEMORY: Duration = Duration::from_secs(600);
+const NONCE_PRUNE_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelayMsg {
@@ -156,6 +157,11 @@ pub(crate) struct RelayState {
     hops: HashMap<(PublicIdentity, u64), Hop>,
     pending: HashMap<(PublicIdentity, u64), oneshot::Sender<bool>>,
     seen: HashMap<[u8; 16], Instant>,
+    /// When `seen` was last pruned.
+    pruned: Option<Instant>,
+    /// Per neighbour: OPENs still looking for a path. They count against
+    /// its circuits, or it could start any number of searches at once.
+    opening: HashMap<PublicIdentity, usize>,
 }
 
 impl RelayState {
@@ -165,8 +171,42 @@ impl RelayState {
 
     /// Records an open nonce; false if it was already seen (a loop).
     fn first_sighting(&mut self, nonce: [u8; 16]) -> bool {
-        self.seen.retain(|_, t| t.elapsed() < NONCE_MEMORY);
-        self.seen.insert(nonce, Instant::now()).is_none()
+        let now = Instant::now();
+        // Forgotten nonces are swept now and then, not on every OPEN.
+        if self
+            .pruned
+            .is_none_or(|t| now.duration_since(t) > NONCE_PRUNE_EVERY)
+        {
+            self.seen
+                .retain(|_, t| now.duration_since(*t) < NONCE_MEMORY);
+            self.pruned = Some(now);
+        }
+        match self.seen.insert(nonce, now) {
+            None => true,
+            Some(t) => now.duration_since(t) >= NONCE_MEMORY,
+        }
+    }
+
+    /// Takes an OPEN from `from` on its circuit `circ`, if there is room;
+    /// [`Self::open_done`] once it has a hop or has failed.
+    fn admit_open(&mut self, from: PublicIdentity, circ: u64, nonce: [u8; 16]) -> bool {
+        let searching = self.opening.get(&from).copied().unwrap_or(0);
+        let ok = self.circuits_with(&from) + searching < MAX_CIRCUITS_PER_PEER
+            && !self.hops.contains_key(&(from, circ))
+            && self.first_sighting(nonce);
+        if ok {
+            *self.opening.entry(from).or_default() += 1;
+        }
+        ok
+    }
+
+    fn open_done(&mut self, from: &PublicIdentity) {
+        if let Some(n) = self.opening.get_mut(from) {
+            *n -= 1;
+            if *n == 0 {
+                self.opening.remove(from);
+            }
+        }
     }
 }
 
@@ -196,20 +236,18 @@ impl Node {
                 ttl,
                 nonce,
             } => {
-                let admitted = {
-                    let mut st = lock(&self.shared.relay);
-                    self.shared.mutual(&from)
-                        && ttl <= MAX_TTL
-                        && st.circuits_with(&from) < MAX_CIRCUITS_PER_PEER
-                        && !st.hops.contains_key(&(from, circ))
-                        && st.first_sighting(nonce)
-                };
+                let admitted = self.shared.mutual(&from)
+                    && ttl <= MAX_TTL
+                    && lock(&self.shared.relay).admit_open(from, circ, nonce);
                 if !admitted {
                     self.relay_send(&from, &RelayMsg::Refused { circ });
                     return;
                 }
                 let node = self.clone();
-                tokio::spawn(async move { node.handle_open(from, circ, dest, ttl, nonce).await });
+                tokio::spawn(async move {
+                    node.handle_open(from, circ, dest, ttl, nonce).await;
+                    lock(&node.shared.relay).open_done(&from);
+                });
             }
             RelayMsg::Opened { circ } | RelayMsg::Refused { circ } => {
                 let ok = matches!(msg, RelayMsg::Opened { .. });
@@ -607,6 +645,25 @@ async fn pump_frames<S>(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn opens_still_searching_count_against_the_cap() {
+        let mut st = RelayState::default();
+        let peer = threnody_core::Identity::generate().public();
+        let other = threnody_core::Identity::generate().public();
+        for c in 0..MAX_CIRCUITS_PER_PEER as u64 {
+            assert!(st.admit_open(peer, c, random_bytes()));
+        }
+        // None has a hop yet: each is still searching for a path.
+        assert!(!st.admit_open(peer, 1000, random_bytes()));
+        assert!(st.admit_open(other, 1000, random_bytes()));
+        st.open_done(&peer);
+        assert!(st.admit_open(peer, 1001, random_bytes()));
+        // A nonce is taken once.
+        let nonce = random_bytes();
+        assert!(st.admit_open(other, 1, nonce));
+        assert!(!st.admit_open(other, 2, nonce));
+    }
 
     #[tokio::test]
     async fn a_frame_read_in_pieces_survives_frames_the_other_way() {
