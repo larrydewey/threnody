@@ -210,7 +210,7 @@ impl GroupNode {
             match self.groups.invite(group, d) {
                 Ok(out) => {
                     invited += 1;
-                    self.apply(node, out, true);
+                    self.apply(node, out, true)?;
                 }
                 Err(GroupError::AlreadyMember(_)) => {}
                 Err(e) => return Err(e),
@@ -250,7 +250,7 @@ impl GroupNode {
         let inv = self.invites.remove(i);
         self.save_invites();
         let out = self.groups.accept_invite(&inv.group, inv.from)?;
-        Ok(self.apply(node, out, true))
+        self.apply(node, out, true)
     }
 
     pub fn decline(&mut self, group: &GroupId) {
@@ -277,7 +277,7 @@ impl GroupNode {
         let mut updates = Vec::new();
         for d in devices {
             let out = self.groups.remove(group, &d)?;
-            updates.extend(self.apply(node, out, true));
+            updates.extend(self.apply(node, out, true)?);
         }
         Ok(updates)
     }
@@ -294,7 +294,7 @@ impl GroupNode {
             return Err(GroupError::NotMember(peer.fingerprint().to_string()));
         }
         let out = self.groups.promote(group, peer)?;
-        Ok(self.apply(node, out, true))
+        self.apply(node, out, true)
     }
 
     /// Demotes `peer` from Admin to Member (only the group owner can do this).
@@ -309,7 +309,7 @@ impl GroupNode {
             return Err(GroupError::NotMember(peer.fingerprint().to_string()));
         }
         let out = self.groups.demote(group, peer)?;
-        Ok(self.apply(node, out, true))
+        self.apply(node, out, true)
     }
 
     /// Leaves a group: a member asks the owner to remove it, the owner
@@ -330,7 +330,7 @@ impl GroupNode {
         self.held
             .retain(|(_, b, _)| GroupWire::decode(b).map_or(true, |w| w.group() != group));
         self.save_held();
-        Ok(self.apply(node, out, true))
+        self.apply(node, out, true)
     }
 
     /// Sends text to every other member and records it in the group's
@@ -412,7 +412,7 @@ impl GroupNode {
             add,
         };
         let out = self.groups.send(group, &content)?;
-        self.apply(node, out, true);
+        self.apply(node, out, true)?;
         Ok(true)
     }
 
@@ -454,7 +454,7 @@ impl GroupNode {
             choices: choices.to_vec(),
         };
         let out = self.groups.send(group, &content)?;
-        self.apply(node, out, true);
+        self.apply(node, out, true)?;
         Ok(true)
     }
 
@@ -468,14 +468,14 @@ impl GroupNode {
             return Ok(false);
         }
         let out = self.groups.send(group, &Content::ClosePoll { id })?;
-        self.apply(node, out, true);
+        self.apply(node, out, true)?;
         Ok(true)
     }
 
     /// Sends a list to every member (see `Node::edit_list`).
     pub fn send_list(&mut self, node: &Node, group: &GroupId, list: Vec<u8>) -> Result<()> {
         let out = self.groups.send(group, &Content::List(list))?;
-        self.apply(node, out, true);
+        self.apply(node, out, true)?;
         Ok(())
     }
 
@@ -494,7 +494,7 @@ impl GroupNode {
         }
         node.pin_in(conv, id, pin);
         let out = self.groups.send(group, &Content::Pin { id, pin })?;
-        self.apply(node, out, true);
+        self.apply(node, out, true)?;
         Ok(true)
     }
 
@@ -554,7 +554,7 @@ impl GroupNode {
     ) -> Result<()> {
         let recipients = self.members(group)?.len().saturating_sub(1);
         let out = self.groups.send(group, content)?;
-        self.apply_tagged(node, out, true, tag(local_id, group));
+        self.apply_tagged(node, out, true, tag(local_id, group))?;
         let now = threnody_core::now_ms();
         node.append(
             ConversationId::Group(*group),
@@ -686,7 +686,7 @@ impl GroupNode {
                         relay_for: Some(*from.as_bytes()),
                     }
                 };
-                Ok(self.apply_tagged(node, out, false, t))
+                self.apply_tagged(node, out, false, t)
             }
             GroupWire::AddDevice {
                 group,
@@ -695,7 +695,7 @@ impl GroupNode {
             } => self.add_device(node, from, group, device, owner),
             wire => {
                 let out = self.groups.handle(from, wire)?;
-                Ok(self.apply(node, out, true))
+                self.apply(node, out, true)
             }
         }
     }
@@ -742,7 +742,7 @@ impl GroupNode {
             return Ok(Vec::new());
         }
         let out = self.groups.invite(&group, device)?;
-        Ok(self.apply(node, out, true))
+        self.apply(node, out, true)
     }
 
     /// Our own device `sibling` is connected (or just linked): it joins
@@ -782,7 +782,7 @@ impl GroupNode {
                 .is_some_and(|r| r.can_commit());
             if can_commit {
                 if let Ok(out) = self.groups.invite(&group, *sibling) {
-                    self.apply(node, out, true);
+                    let _ = self.apply(node, out, true);
                 }
             } else {
                 self.deliver(node, owner, hint(None), true, Tag::NONE);
@@ -888,15 +888,27 @@ impl GroupNode {
     }
 
     /// Persists, delivers `out`, and turns its events into updates.
-    fn apply(&mut self, node: &Node, out: Output, may_forward: bool) -> Vec<Update> {
+    fn apply(&mut self, node: &Node, out: Output, may_forward: bool) -> Result<Vec<Update>> {
         self.apply_tagged(node, out, may_forward, Tag::NONE)
     }
 
     /// [`Self::apply`], sending the copies with delivery tag `t`.
-    fn apply_tagged(&mut self, node: &Node, out: Output, may_forward: bool, t: Tag) -> Vec<Update> {
+    fn apply_tagged(
+        &mut self,
+        node: &Node,
+        out: Output,
+        may_forward: bool,
+        t: Tag,
+    ) -> Result<Vec<Update>> {
         // Persist before anything leaves: a crash must not lose an epoch
-        // that peers have already moved to.
-        let _ = self.save();
+        // that peers have already moved to. If it can't be saved, nothing
+        // leaves, and we go back to what was saved, where peers still are.
+        if let Err(e) = self.save()
+            && !out.send.is_empty()
+        {
+            self.reload();
+            return Err(e);
+        }
         let held = self.held.len();
         // Whoever this welcomes doesn't know the group until the Welcome
         // is in: asked to forward anything before then, it would drop it.
@@ -916,7 +928,19 @@ impl GroupNode {
         for e in out.events {
             self.event(node, e, &mut updates);
         }
-        updates
+        Ok(updates)
+    }
+
+    /// Goes back to the groups as last saved.
+    fn reload(&mut self) {
+        let saved = match self.home.load_state(&self.identity, STATE) {
+            Ok(Some(b)) => Groups::restore(&self.identity, &b),
+            Ok(None) => Ok(Groups::new(&self.identity)),
+            Err(e) => Err(e.into()),
+        };
+        if let Ok(groups) = saved {
+            self.groups = groups;
+        }
     }
 
     /// Only a copy the member acknowledges itself counts towards the
@@ -1021,7 +1045,9 @@ impl GroupNode {
                     || node.is_own_device(&peer)
                     || self.expected.contains(&(group, Some(peer)));
                 if trusted && let Ok(out) = self.groups.accept_invite(&group, peer) {
-                    updates.extend(self.apply(node, out, true));
+                    if let Ok(u) = self.apply(node, out, true) {
+                        updates.extend(u);
+                    }
                     return;
                 }
                 let inv = Invite {

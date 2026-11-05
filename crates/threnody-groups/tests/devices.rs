@@ -318,6 +318,43 @@ async fn invitations_from_strangers_are_few_and_from_the_blocked_none() {
 }
 
 #[tokio::test]
+async fn nothing_leaves_that_could_not_be_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let g = alice.groups.create("team").unwrap();
+    alice.groups.invite(&alice.node, &g, &bid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[1].in_group(&g)).await;
+
+    // Alice's group state can't be written (here: its temporary file's
+    // name is taken), so her removing Bob must not reach him.
+    let blocker = dir.path().join("alice").join("groups.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(alice.groups.remove(&alice.node, &g, &bid).is_err());
+    assert!(alice.groups.send_text(&alice.node, &g, "lost").is_err());
+    for _ in 0..25 {
+        for n in [&mut alice, &mut bob] {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(bob.in_group(&g) && bob.texts(&g).is_empty());
+    assert_eq!(alice.groups.list()[0].3.len(), 2, "back to what was saved");
+
+    // Once it can be, the group carries on where both left it.
+    std::fs::remove_dir(&blocker).unwrap();
+    alice
+        .groups
+        .send_text(&alice.node, &g, "still here")
+        .unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[1].texts(&g) == ["still here"]
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_owner_adds_its_own_linked_device() {
     let dir = tempfile::tempdir().unwrap();
     let mut laptop = spawn(&dir, "laptop").await;

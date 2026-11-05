@@ -97,7 +97,7 @@ After every change, the full openmls key-value store and the group metadata are 
 file = nonce (12) || ChaCha20-Poly1305(KDF("state encryption key", identity_seed), nonce, ad = "groups", export)
 ```
 
-The key is derived from the identity seed, so group secrets are only as accessible as the identity: if the identity is passphrase-sealed, so is everything else. State is saved *before* any resulting message leaves, so a crash can't leave us behind an epoch our peers have already moved to.
+The key is derived from the identity seed, so group secrets are only as accessible as the identity: if the identity is passphrase-sealed, so is everything else. State is saved *before* any resulting message leaves, so a crash can't leave us behind an epoch our peers have already moved to. If it can't be saved (a full disk, say), nothing leaves: the change fails, and the groups go back to their last saved state, where the peers still are.
 
 ## CLI
 
