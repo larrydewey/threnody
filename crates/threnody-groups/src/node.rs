@@ -31,15 +31,18 @@ const HELD: &str = "group-held";
 const EXPECTED: &str = "group-expected";
 const OFFERED: &str = "group-offered";
 const VERSION: u8 = 1;
-const HELD_VERSION: u8 = 3;
+const HELD_VERSION: u8 = 4;
+/// `group-held` before it said whose message each one is.
+const HELD_VERSION_NO_ORIGIN: u8 = 3;
 /// `group-expected` with each group's owner.
 const EXPECTED_VERSION: u8 = 2;
-/// Messages held for one member; the oldest are dropped first. Messages
-/// from more than a few epochs back can't be read anyway.
+/// Messages held for one member. Messages from more than a few epochs
+/// back can't be read anyway.
 pub const MAX_HELD_PER_MEMBER: usize = 200;
-/// Bytes held for one member (a few files' worth), and for everyone; the
-/// oldest messages are dropped first. Any member can have us hold what it
-/// forwards, so this bounds what one can make us keep and rewrite.
+/// Bytes held for one member (a few files' worth), and for everyone. Any
+/// member can have us hold what it forwards, so this bounds what one can
+/// make us keep and rewrite. Past any of these, we drop from
+/// whoever has us hold the most, keeping commits and Welcomes longest.
 pub const MAX_HELD_BYTES_PER_MEMBER: usize = 32 << 20;
 pub const MAX_HELD_BYTES: usize = 128 << 20;
 /// Invitations waiting for consent from one inviter, and in all; the
@@ -53,6 +56,38 @@ pub struct Invite {
     pub group: GroupId,
     pub name: String,
     pub from: PublicIdentity,
+}
+
+/// A message waiting for its member to connect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    to: PublicIdentity,
+    /// The encoded `GroupWire`.
+    bytes: Vec<u8>,
+    /// The delivery tag to send it with.
+    tag: Tag,
+    /// The member whose message we forward; `None` for our own.
+    origin: Option<PublicIdentity>,
+    /// A commit, proposal or Welcome: the member can't read anything later
+    /// without it, so it is kept longest.
+    handshake: bool,
+}
+
+impl Held {
+    fn new(to: PublicIdentity, bytes: Vec<u8>, tag: Tag, origin: Option<PublicIdentity>) -> Self {
+        let handshake = match GroupWire::decode(&bytes) {
+            Ok(GroupWire::Message { message, .. }) => crate::is_handshake(&message),
+            Ok(GroupWire::Welcome { .. }) => true,
+            _ => false,
+        };
+        Self {
+            to,
+            bytes,
+            tag,
+            origin,
+            handshake,
+        }
+    }
 }
 
 /// What the user should see.
@@ -129,9 +164,8 @@ pub enum Update {
 pub struct GroupNode {
     groups: Groups,
     invites: Vec<Invite>,
-    /// Encoded `GroupWire::Message`s waiting for their member to connect,
-    /// with the delivery tag to send them with.
-    held: Vec<(PublicIdentity, Vec<u8>, Tag)>,
+    /// Messages waiting for their member to connect, oldest first.
+    held: Vec<Held>,
     /// Groups our other devices are in, with their owner (if the device
     /// said) whose invitation we accept.
     expected: Vec<(GroupId, Option<PublicIdentity>)>,
@@ -192,7 +226,7 @@ impl GroupNode {
 
     /// How many messages are waiting for `member` to connect.
     pub fn held_for(&self, member: &PublicIdentity) -> usize {
-        self.held.iter().filter(|(p, ..)| p == member).count()
+        self.held.iter().filter(|h| h.to == *member).count()
     }
 
     /// Creates a group that we own.
@@ -328,7 +362,7 @@ impl GroupNode {
         };
         // Copies held for this group's members are moot now.
         self.held
-            .retain(|(_, b, _)| GroupWire::decode(b).map_or(true, |w| w.group() != group));
+            .retain(|h| GroupWire::decode(&h.bytes).map_or(true, |w| w.group() != group));
         self.save_held();
         self.apply(node, out, true)
     }
@@ -554,7 +588,7 @@ impl GroupNode {
     ) -> Result<()> {
         let recipients = self.members(group)?.len().saturating_sub(1);
         let out = self.groups.send(group, content)?;
-        self.apply_tagged(node, out, true, tag(local_id, group))?;
+        self.apply_tagged(node, out, true, tag(local_id, group), None)?;
         let now = threnody_core::now_ms();
         node.append(
             ConversationId::Group(*group),
@@ -686,7 +720,7 @@ impl GroupNode {
                         relay_for: Some(*from.as_bytes()),
                     }
                 };
-                self.apply_tagged(node, out, false, t)
+                self.apply_tagged(node, out, false, t, Some(from))
             }
             GroupWire::AddDevice {
                 group,
@@ -827,19 +861,19 @@ impl GroupNode {
         if node.is_own_device(peer) {
             self.add_sibling(node, peer);
         }
-        if !self.held.iter().any(|(p, ..)| p == peer) {
+        if !self.held.iter().any(|h| h.to == *peer) {
             return;
         }
         let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|(p, ..)| p == peer);
+            .partition(|h| h.to == *peer);
         self.held = rest;
-        for (p, bytes, t) in mine {
+        for h in mine {
             if node
-                .send_tagged(&p, AppMessage::Group(bytes.clone()), t)
+                .send_tagged(&h.to, AppMessage::Group(h.bytes.clone()), h.tag)
                 .is_err()
             {
-                self.held.push((p, bytes, t));
+                self.held.push(h);
             }
         }
         self.save_held();
@@ -889,16 +923,18 @@ impl GroupNode {
 
     /// Persists, delivers `out`, and turns its events into updates.
     fn apply(&mut self, node: &Node, out: Output, may_forward: bool) -> Result<Vec<Update>> {
-        self.apply_tagged(node, out, may_forward, Tag::NONE)
+        self.apply_tagged(node, out, may_forward, Tag::NONE, None)
     }
 
-    /// [`Self::apply`], sending the copies with delivery tag `t`.
+    /// [`Self::apply`], sending the copies with delivery tag `t`, as
+    /// `origin`'s if we forward them for another member.
     fn apply_tagged(
         &mut self,
         node: &Node,
         out: Output,
         may_forward: bool,
         t: Tag,
+        origin: Option<PublicIdentity>,
     ) -> Result<Vec<Update>> {
         // Persist before anything leaves: a crash must not lose an epoch
         // that peers have already moved to. If it can't be saved, nothing
@@ -919,7 +955,7 @@ impl GroupNode {
             .map(|o| o.to)
             .collect();
         for o in out.send {
-            self.deliver_avoiding(node, o.to, o.wire, may_forward, t, &joining);
+            self.deliver_avoiding(node, o.to, o.wire, may_forward, t, &joining, origin);
         }
         if self.held.len() != held {
             self.save_held();
@@ -953,10 +989,11 @@ impl GroupNode {
         may_forward: bool,
         t: Tag,
     ) {
-        self.deliver_avoiding(node, to, wire, may_forward, t, &[]);
+        self.deliver_avoiding(node, to, wire, may_forward, t, &[], None);
     }
 
     /// [`Self::deliver`], never forwarding through those in `avoid`.
+    #[allow(clippy::too_many_arguments)]
     fn deliver_avoiding(
         &mut self,
         node: &Node,
@@ -965,6 +1002,7 @@ impl GroupNode {
         may_forward: bool,
         t: Tag,
         avoid: &[PublicIdentity],
+        origin: Option<PublicIdentity>,
     ) {
         let Ok(bytes) = wire.encode() else { return };
         let msg = AppMessage::Group(bytes.clone());
@@ -991,7 +1029,7 @@ impl GroupNode {
             }
         }
         // Hold it for when they connect, and try to make that happen.
-        hold(&mut self.held, to, bytes, t);
+        hold(&mut self.held, Held::new(to, bytes, t, origin));
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let node = node.clone();
             rt.spawn(async move {
@@ -1262,39 +1300,57 @@ impl GroupNode {
     }
 }
 
-/// Adds a message for `to` to `held`, then drops the oldest held for
-/// `to` past [`MAX_HELD_PER_MEMBER`] or [`MAX_HELD_BYTES_PER_MEMBER`],
-/// and the oldest of all past [`MAX_HELD_BYTES`].
-fn hold(
-    held: &mut Vec<(PublicIdentity, Vec<u8>, Tag)>,
-    to: PublicIdentity,
-    bytes: Vec<u8>,
-    t: Tag,
+/// Adds `new` to `held`, then drops what is past [`MAX_HELD_PER_MEMBER`]
+/// or [`MAX_HELD_BYTES_PER_MEMBER`] for its member, and past
+/// [`MAX_HELD_BYTES`] in all. What goes is chosen by [`victim`], so a
+/// member that floods us through `Forward` loses its own messages, and
+/// the commits a member needs outlast the files sent to it.
+fn hold(held: &mut Vec<Held>, new: Held) {
+    let to = new.to;
+    held.push(new);
+    let mine = |h: &Held| h.to == to;
+    let len = |h: &Held| h.bytes.len();
+    trim(held, &mine, &|_| 1, MAX_HELD_PER_MEMBER);
+    trim(held, &mine, &len, MAX_HELD_BYTES_PER_MEMBER);
+    trim(held, &|_| true, &len, MAX_HELD_BYTES);
+}
+
+/// Drops [`victim`]s until what `scope` picks weighs at most `cap`.
+fn trim(
+    held: &mut Vec<Held>,
+    scope: &dyn Fn(&Held) -> bool,
+    weight: &dyn Fn(&Held) -> usize,
+    cap: usize,
 ) {
-    held.push((to, bytes, t));
-    let (mut count, mut size) = (0, 0);
-    let mut keep: Vec<bool> = held
-        .iter()
-        .rev()
-        .map(|(p, b, _)| {
-            if *p != to {
-                return true;
-            }
-            count += 1;
-            size += b.len();
-            count <= MAX_HELD_PER_MEMBER && size <= MAX_HELD_BYTES_PER_MEMBER
-        })
-        .collect();
-    keep.reverse();
-    let mut total = 0;
-    for (k, (_, b, _)) in keep.iter_mut().zip(held.iter()).rev() {
-        if *k {
-            total += b.len();
-            *k = total <= MAX_HELD_BYTES;
+    while held.iter().filter(|h| scope(h)).map(weight).sum::<usize>() > cap {
+        let Some(i) = victim(held, scope, weight) else {
+            break;
+        };
+        held.remove(i);
+    }
+}
+
+/// Which of the held messages `scope` picks to drop: of those whose
+/// origin has the most `weight` among them, the oldest that isn't a
+/// handshake, or failing that the oldest handshake.
+fn victim(
+    held: &[Held],
+    scope: &dyn Fn(&Held) -> bool,
+    weight: &dyn Fn(&Held) -> usize,
+) -> Option<usize> {
+    let mut origins: Vec<(Option<PublicIdentity>, usize)> = Vec::new();
+    for h in held.iter().filter(|h| scope(h)) {
+        match origins.iter_mut().find(|(o, _)| *o == h.origin) {
+            Some((_, w)) => *w += weight(h),
+            None => origins.push((h.origin, weight(h))),
         }
     }
-    let mut keep = keep.into_iter();
-    held.retain(|_| keep.next().unwrap_or(true));
+    // On a tie, someone else's before our own.
+    let (origin, _) = origins.into_iter().max_by_key(|(o, w)| (*w, o.is_some()))?;
+    let theirs = |h: &&Held| scope(h) && h.origin == origin;
+    held.iter()
+        .position(|h| theirs(&h) && !h.handshake)
+        .or_else(|| held.iter().position(|h| theirs(&h)))
 }
 
 /// The tag for our own message, history entry `local_id` in `group`.
@@ -1323,7 +1379,8 @@ fn account_devices(node: &Node, peer: &PublicIdentity) -> Vec<PublicIdentity> {
 
 // Local state, inside encrypted state files:
 //   invites = VERSION || * ( group (16) | inviter (32) | name len (u16 LE) | name )
-//   held    = HELD_VERSION || * ( member (32) | delivery tag (Tag::LEN) | len (u32 LE) | GroupWire bytes )
+//   held    = HELD_VERSION || * ( member (32) | delivery tag (Tag::LEN) | origin (32, zeros if ours) | len (u32 LE) | GroupWire bytes )
+//             (version 3 had no origin)
 //   expected = EXPECTED_VERSION || * ( group (16) | owner (32, zeros if not known) )
 
 fn encode_invites(invites: &[Invite]) -> Vec<u8> {
@@ -1411,33 +1468,50 @@ fn decode_offered(b: &[u8]) -> Vec<(PublicIdentity, GroupId)> {
         .collect()
 }
 
-fn encode_held(held: &[(PublicIdentity, Vec<u8>, Tag)]) -> Vec<u8> {
+fn encode_held(held: &[Held]) -> Vec<u8> {
     let mut out = vec![HELD_VERSION];
-    for (p, b, t) in held {
-        out.extend_from_slice(p.as_bytes());
-        t.encode(&mut out);
-        out.extend_from_slice(&u32::try_from(b.len()).unwrap_or(u32::MAX).to_le_bytes());
-        out.extend_from_slice(b);
+    for h in held {
+        out.extend_from_slice(h.to.as_bytes());
+        h.tag.encode(&mut out);
+        out.extend_from_slice(&h.origin.map(|o| *o.as_bytes()).unwrap_or_default());
+        out.extend_from_slice(
+            &u32::try_from(h.bytes.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&h.bytes);
     }
     out
 }
 
-fn decode_held(b: &[u8]) -> Vec<(PublicIdentity, Vec<u8>, Tag)> {
+fn decode_held(b: &[u8]) -> Vec<Held> {
     let mut out = Vec::new();
-    let Some((&HELD_VERSION, mut rest)) = b.split_first() else {
-        return out;
+    let origins = match b.first() {
+        Some(&HELD_VERSION) => true,
+        Some(&HELD_VERSION_NO_ORIGIN) => false,
+        _ => return out,
     };
-    let head_len = 32 + Tag::LEN + 4;
-    while let Some((head, r)) = rest.split_at_checked(head_len) {
-        let n = 32 + Tag::LEN;
-        let len = u32::from_le_bytes([head[n], head[n + 1], head[n + 2], head[n + 3]]) as usize;
+    let mut rest = &b[1..];
+    let n = 32 + Tag::LEN;
+    let o = if origins { n + 32 } else { n };
+    while let Some((head, r)) = rest.split_at_checked(o + 4) {
+        let len = u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]) as usize;
         let Some((msg, r)) = r.split_at_checked(len) else {
             break;
         };
         rest = r;
         let peer: [u8; 32] = head[..32].try_into().unwrap_or_default();
+        let origin: [u8; 32] = head[n..o].try_into().unwrap_or_default();
+        let origin = (origin != [0; 32])
+            .then(|| PublicIdentity::from_bytes(&origin).ok())
+            .flatten();
         if let Ok(p) = PublicIdentity::from_bytes(&peer) {
-            out.push((p, msg.to_vec(), Tag::decode(&head[32..n])));
+            out.push(Held::new(
+                p,
+                msg.to_vec(),
+                Tag::decode(&head[32..n]),
+                origin,
+            ));
         }
     }
     out
@@ -1447,43 +1521,114 @@ fn decode_held(b: &[u8]) -> Vec<(PublicIdentity, Vec<u8>, Tag)> {
 mod tests {
     use super::*;
 
+    fn held(to: PublicIdentity, bytes: Vec<u8>, origin: Option<PublicIdentity>) -> Held {
+        Held {
+            to,
+            bytes,
+            tag: Tag::NONE,
+            origin,
+            handshake: false,
+        }
+    }
+
     #[test]
     fn what_is_held_is_bounded_oldest_first() {
         let (a, b) = (Identity::generate().public(), Identity::generate().public());
-        let mut held = Vec::new();
+        let mut q = Vec::new();
         let mib = |n: u8| vec![n; 1 << 20];
         // By bytes for one member: the newest 32 MiB stay.
         for n in 0..40 {
-            hold(&mut held, a, mib(n), Tag::NONE);
+            hold(&mut q, held(a, mib(n), None));
         }
-        hold(&mut held, b, mib(0), Tag::NONE);
-        let bytes = |held: &[(PublicIdentity, Vec<u8>, Tag)], p| {
-            held.iter()
-                .filter(|(q, ..)| *q == p)
-                .map(|(_, m, _)| m.len())
+        hold(&mut q, held(b, mib(0), None));
+        let bytes = |q: &[Held], p| {
+            q.iter()
+                .filter(|h| h.to == p)
+                .map(|h| h.bytes.len())
                 .sum::<usize>()
         };
-        assert_eq!(bytes(&held, a), MAX_HELD_BYTES_PER_MEMBER);
-        assert_eq!(held[0].1[0], 8, "the oldest went first");
+        assert_eq!(bytes(&q, a), MAX_HELD_BYTES_PER_MEMBER);
+        assert_eq!(q[0].bytes[0], 8, "the oldest went first");
         // By count, as before.
         for _ in 0..MAX_HELD_PER_MEMBER + 5 {
-            hold(&mut held, b, vec![1], Tag::NONE);
+            hold(&mut q, held(b, vec![1], None));
         }
-        assert_eq!(
-            held.iter().filter(|(p, ..)| *p == b).count(),
-            MAX_HELD_PER_MEMBER
-        );
+        assert_eq!(q.iter().filter(|h| h.to == b).count(), MAX_HELD_PER_MEMBER);
         // And in all, across members.
-        let mut held = Vec::new();
+        let mut q = Vec::new();
         for i in 0..10 {
             let p = Identity::generate().public();
             for _ in 0..20 {
-                hold(&mut held, p, mib(i), Tag::NONE);
+                hold(&mut q, held(p, mib(i), None));
             }
         }
-        let total: usize = held.iter().map(|(_, m, _)| m.len()).sum();
+        let total: usize = q.iter().map(|h| h.bytes.len()).sum();
         assert_eq!(total, MAX_HELD_BYTES);
-        assert_eq!(held.last().unwrap().1[0], 9, "the newest stay");
+        assert_eq!(q.last().unwrap().bytes[0], 9, "the newest stay");
+    }
+
+    #[test]
+    fn commits_and_others_messages_outlast_a_flood() {
+        let (a, b, m) = (
+            Identity::generate().public(),
+            Identity::generate().public(),
+            Identity::generate().public(),
+        );
+        let mib = |n: u8| vec![n; 1 << 20];
+        let commit = |to, origin| Held {
+            handshake: true,
+            ..held(to, vec![7; 100], origin)
+        };
+        // The commit adding `a`, then more files for `a` than we keep, and
+        // more small messages than we keep: the commit stays.
+        let mut q = vec![commit(a, None)];
+        for n in 0..40 {
+            hold(&mut q, held(a, mib(n), None));
+        }
+        for _ in 0..MAX_HELD_PER_MEMBER + 5 {
+            hold(&mut q, held(a, vec![1], None));
+        }
+        assert_eq!(q[0], commit(a, None));
+        // A commit the owner had us forward to `b`, our own message to `b`,
+        // then Mallory forwarding more than we keep in all: only hers go.
+        let mut q = vec![commit(b, Some(a)), held(b, mib(1), None)];
+        for _ in 0..20 {
+            let p = Identity::generate().public();
+            for n in 0..8 {
+                hold(&mut q, held(p, mib(n), Some(m)));
+            }
+        }
+        assert_eq!(q[..2], [commit(b, Some(a)), held(b, mib(1), None)]);
+        assert!(q.iter().map(|h| h.bytes.len()).sum::<usize>() <= MAX_HELD_BYTES);
+        // Likewise when she sends it all to `b`.
+        let mut q = vec![commit(b, Some(a)), held(b, mib(1), None)];
+        for n in 0..40 {
+            hold(
+                &mut q,
+                Held {
+                    handshake: true,
+                    ..held(b, mib(n), Some(m))
+                },
+            );
+        }
+        assert_eq!(q[..2], [commit(b, Some(a)), held(b, mib(1), None)]);
+    }
+
+    #[test]
+    fn commits_and_welcomes_count_as_handshakes() {
+        let (a, b) = (Identity::generate(), Identity::generate());
+        let (pa, pb) = (a.public(), b.public());
+        let (mut ga, mut gb) = (Groups::new(&a), Groups::new(&b));
+        let g = ga.create("team").unwrap();
+        ga.invite(&g, pb).unwrap();
+        let kp = gb.accept_invite(&g, pa).unwrap().send.remove(0).wire;
+        let welcome = ga.handle(pb, kp).unwrap().send.remove(0).wire;
+        gb.handle(pa, welcome.clone()).unwrap();
+        let text = ga.send_text(&g, "hi").unwrap().send.remove(0).wire;
+        let commit = ga.remove(&g, &pb).unwrap().send.remove(0).wire;
+        let handshake =
+            |w: GroupWire| Held::new(pb, w.encode().unwrap(), Tag::NONE, None).handshake;
+        assert!(handshake(welcome) && handshake(commit) && !handshake(text));
     }
 
     #[test]
@@ -1509,10 +1654,27 @@ mod tests {
             group: Some([1; 16]),
             relay_for: Some([2; 32]),
         };
-        let held = vec![(p, vec![1, 2, 3], t), (p, vec![], Tag::NONE)];
-        let b = encode_held(&held);
-        assert_eq!(decode_held(&b), held);
-        assert_eq!(decode_held(&b[..b.len() - 2]), held[..1]);
+        let o = Identity::generate().public();
+        let q = vec![
+            Held {
+                tag: t,
+                ..held(p, vec![1, 2, 3], Some(o))
+            },
+            held(p, vec![], None),
+        ];
+        let b = encode_held(&q);
+        assert_eq!(decode_held(&b), q);
+        assert_eq!(decode_held(&b[..b.len() - 2]), q[..1]);
+        // As saved before origins were.
+        let old = [
+            &[HELD_VERSION_NO_ORIGIN][..],
+            p.as_bytes(),
+            &[0; Tag::LEN],
+            &1u32.to_le_bytes(),
+            &[5],
+        ]
+        .concat();
+        assert_eq!(decode_held(&old), [held(p, vec![5], None)]);
         for d in [&[][..], &[9, 0, 0]] {
             assert!(decode_invites(d).is_empty() && decode_held(d).is_empty());
         }

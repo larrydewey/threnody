@@ -1242,6 +1242,22 @@ impl Groups {
     }
 }
 
+/// Whether `message` (the MLS message in a `GroupWire::Message`) is a
+/// commit or proposal, without which its member can't read what follows.
+/// Anyone can tell: MLS leaves the content type outside the encryption.
+#[cfg(feature = "node")]
+pub(crate) fn is_handshake(message: &[u8]) -> bool {
+    let Ok(msg) = MlsMessageIn::tls_deserialize_exact(message) else {
+        return false;
+    };
+    let content = match msg.extract() {
+        MlsMessageBodyIn::PrivateMessage(m) => m.content_type(),
+        MlsMessageBodyIn::PublicMessage(m) => m.content_type(),
+        _ => return false,
+    };
+    content != ContentType::Application
+}
+
 /// A name as we show it: at most [`MAX_NAME`] characters, without
 /// control characters or the invisible ones that reorder or hide text
 /// (bidirectional overrides and isolates, zero-width characters).
