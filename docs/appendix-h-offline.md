@@ -22,7 +22,7 @@ Bundle  = { 0: id_B, 1: spk_id, 2: spk_pub, 3: expiry_ms, 4: sig_spk, 5: [ { 0: 
 
 - **Distribution.** There is no directory. Once a session is mutually approved, each side sends the other a fresh bundle (`AppMessage::Prekeys`, kind 8) carrying the current SPK and 5 new OPKs reserved for that peer.
 - **Storage on the receiving side.** The receiver verifies every signature against the identity it authenticated in the session, then stores the bundle in its encrypted state. A new bundle replaces the old one.
-- **Clean-up.** A device keeps the OPK secrets it reserved for a peer for the last two bundles it sent that peer, and deletes older ones.
+- **Clean-up.** A device keeps the OPK secrets of a bundle until the bundle's `expiry_ms`, even after newer bundles replace it at the peer: a message the peer sealed to the old bundle may still be waiting at a mailbox. To bound storage, it keeps the OPK secrets of at most the last eight bundles it sent a peer and deletes older ones early. A message sealed to a deleted OPK can't be opened, so a peer whose sessions with us flap more than seven times while a message waits can still lose it.
 
 ## Sealed message
 

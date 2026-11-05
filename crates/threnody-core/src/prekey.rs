@@ -22,8 +22,10 @@ pub const SPK_ROTATE_MS: u64 = 7 * DAY_MS;
 pub const SPK_LIFETIME_MS: u64 = 21 * DAY_MS;
 /// One-time prekeys handed to a contact per bundle.
 pub const OPKS_PER_BUNDLE: usize = 5;
-/// Bundles per contact whose one-time prekey secrets we keep.
-const BATCHES_KEPT: usize = 2;
+/// Bundles per contact whose one-time prekey secrets we keep at most. A
+/// superseded bundle's secrets are otherwise kept until it expires, so a
+/// message sealed to it can still be opened after later sessions.
+const BATCHES_KEPT: usize = 8;
 const STATE_VERSION: u64 = 1;
 const NONCE: [u8; 12] = [0; 12];
 
@@ -189,6 +191,8 @@ struct Opk {
     secret: HybridSecret,
     peer: [u8; 32],
     batch: u64,
+    /// When the bundle that carried it expires.
+    expiry_ms: u64,
 }
 
 /// The recipient's secret prekey state (persist with `Home::save_state`).
@@ -221,6 +225,7 @@ impl PrekeyStore {
             self.retired.insert(0, old);
         }
         self.retired.retain(|k| now_ms < k.expiry_ms());
+        self.opks.retain(|_, o| now_ms < o.expiry_ms);
         self.seen.retain(|_, until| *until > now_ms);
     }
 
@@ -256,6 +261,7 @@ impl PrekeyStore {
     ) -> PrekeyBundle {
         self.maintain(now_ms);
         let owner = identity.public();
+        let expiry_ms = self.current.expiry_ms();
         let batch = self.next_batch;
         self.next_batch += 1;
         let mut opks = Vec::with_capacity(OPKS_PER_BUNDLE);
@@ -277,10 +283,11 @@ impl PrekeyStore {
                     secret,
                     peer: *peer.as_bytes(),
                     batch,
+                    expiry_ms,
                 },
             );
         }
-        // Keep only the newest batches reserved for this peer.
+        // However recent, keep only the newest batches reserved for this peer.
         let mut batches: Vec<u64> = self
             .opks
             .values()
@@ -294,7 +301,6 @@ impl PrekeyStore {
             self.opks
                 .retain(|_, o| o.peer != *peer.as_bytes() || o.batch >= cutoff);
         }
-        let expiry_ms = self.current.expiry_ms();
         let spk = self.current.secret.public().clone();
         PrekeyBundle {
             owner,
@@ -368,7 +374,7 @@ impl PrekeyStore {
         Ok(Zeroizing::new(cbor::to_vec(
             256 + self.opks.len() * 96 + self.seen.len() * 48,
             |e| {
-                e.map_len(7)?;
+                e.map_len(8)?;
                 e.u8(0)?.u64(STATE_VERSION)?;
                 e.u8(1)?;
                 spk(e, &self.current)?;
@@ -399,6 +405,14 @@ impl PrekeyStore {
                 for k in older {
                     spk(e, k)?;
                 }
+                // Expiry per batch, kept apart from key 3 so an older build
+                // can still read the one-time prekeys.
+                let expiries: HashMap<u64, u64> =
+                    self.opks.values().map(|o| (o.batch, o.expiry_ms)).collect();
+                e.u8(7)?.array_len(expiries.len())?;
+                for (batch, expiry) in expiries {
+                    e.array_len(2)?.u64(batch)?.u64(expiry)?;
+                }
                 Ok(())
             },
         )?))
@@ -420,6 +434,7 @@ impl PrekeyStore {
         let mut dec = Decoder::new(b);
         let (mut ver, mut current, mut previous, mut next_batch) = (None, None, None, None);
         let (mut opks, mut seen, mut older) = (HashMap::new(), HashMap::new(), Vec::new());
+        let mut expiries = HashMap::new();
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -440,6 +455,7 @@ impl PrekeyStore {
                                 secret: HybridSecret::from_seed(&seed),
                                 peer,
                                 batch,
+                                expiry_ms: u64::MAX,
                             },
                         );
                     }
@@ -459,6 +475,15 @@ impl PrekeyStore {
                         older.push(spk(d)?);
                     }
                 }
+                7 => {
+                    for _ in 0..d.array_len()? {
+                        if d.array_len()? != 2 {
+                            return Err(Error::Malformed("batch expiry"));
+                        }
+                        let batch = d.u64()?;
+                        expiries.insert(batch, d.u64()?);
+                    }
+                }
                 _ => return Ok(false),
             }
             Ok(true)
@@ -467,9 +492,18 @@ impl PrekeyStore {
         if ver != Some(STATE_VERSION) {
             return Err(Error::Malformed("prekey state version"));
         }
+        let current: Spk = required(current, "current spk")?;
+        // State from before batches had an expiry: no bundle we handed out
+        // outlives the current SPK.
+        for o in opks.values_mut() {
+            o.expiry_ms = expiries
+                .get(&o.batch)
+                .copied()
+                .unwrap_or(current.expiry_ms());
+        }
         let retired = previous.into_iter().chain(older).collect();
         Ok(Self {
-            current: required(current, "current spk")?,
+            current,
             retired,
             opks,
             next_batch: required(next_batch, "batch counter")?,
@@ -876,10 +910,28 @@ mod tests {
     }
 
     #[test]
+    fn superseded_batches_stay_readable_until_they_expire() {
+        let (alice, bob, mut store, mut book) = setup();
+        let sealed = book.seal(&alice, &bob.public(), b"held", NOW).unwrap();
+        // Two short sessions hand alice newer bundles while the message
+        // still waits at a mailbox.
+        for _ in 0..2 {
+            store.bundle_for(&bob, &alice.public(), NOW);
+        }
+        let mut store = PrekeyStore::decode(&store.encode().unwrap()).unwrap();
+        store
+            .open(&bob.public(), &sealed, NOW, known(&alice))
+            .unwrap();
+        // Unused one-time prekeys go when the bundles carrying them expire.
+        store.maintain(NOW + SPK_LIFETIME_MS);
+        assert!(store.opks.is_empty());
+    }
+
+    #[test]
     fn only_recent_batches_per_peer_are_kept() {
         let (alice, bob) = (Identity::generate(), Identity::generate());
         let mut store = PrekeyStore::new(NOW);
-        for _ in 0..4 {
+        for _ in 0..BATCHES_KEPT + 2 {
             store.bundle_for(&bob, &alice.public(), NOW);
         }
         assert_eq!(store.opks.len(), BATCHES_KEPT * OPKS_PER_BUNDLE);
