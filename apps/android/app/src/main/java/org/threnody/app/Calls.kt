@@ -26,7 +26,9 @@ import uniffi.threnody_ffi.ThrenodyNode
  * Calls (Appendix Q). The node runs the call and its audio (WebRTC on the
  * microphone and earpiece or speaker); this keeps track of the one call,
  * routes its audio, rings for incoming ones and opens [CallActivity], which
- * runs the camera ([CallCamera]) and shows the video.
+ * runs the camera ([CallCamera]) and shows the video. A group call (up to
+ * eight people in a group) is a call too, with [Call.group] set: it rings
+ * as an invitation to join, and its screen shows everyone's video.
  */
 object Calls {
     /** The call in progress, as the screen shows it. */
@@ -49,6 +51,10 @@ object Calls {
         val peerVideo: Boolean = false,
         /** Which camera we send: the front one, or the back one. */
         val frontCamera: Boolean = true,
+        /** A group call's group (hex id); null for a call with one contact. */
+        val group: String? = null,
+        /** A group call's other participants (device fingerprints), and whether each sends video. */
+        val members: Map<String, Boolean> = emptyMap(),
     )
 
     @Volatile var current: Call? = null
@@ -75,9 +81,9 @@ object Calls {
         return { reactionListeners.remove(l) }
     }
 
-    /** Floats `emoji` over both sides' video. */
+    /** Floats `emoji` over both sides' video (calls with one contact only). */
     fun react(ctx: Context, emoji: String) {
-        val c = current?.takeIf { it.state == "connected" || it.state == "interrupted" } ?: return
+        val c = current?.takeIf { (it.state == "connected" || it.state == "interrupted") && it.group == null } ?: return
         EmojiPicker.remember(ctx, emoji)
         reactionListeners.forEach { it(emoji) }
         Threading.background {
@@ -150,6 +156,29 @@ object Calls {
         }
     }
 
+    /**
+     * Starts a call in `group` (hex id), named `title`, ringing every other
+     * member; we relay for members without a session of their own.
+     */
+    fun startGroup(a: Activity, node: ThrenodyNode, persona: String?, group: String, title: String, video: Boolean = false) {
+        if (current != null) return Toast.makeText(a, "You're already in a call.", Toast.LENGTH_SHORT).show()
+        val need = missing(a, video)
+        if (need.isNotEmpty()) {
+            pendingCall = { startGroup(a, node, persona, group, title, video) }
+            return a.requestPermissions(need.toTypedArray(), MICROPHONE)
+        }
+        ended = null
+        val id = try { node.startGroupCall(group, video) } catch (e: Exception) {
+            Threnody.say("! group call: ${e.message}")
+            return Toast.makeText(a, "Couldn't start the call: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+        current = Call(node, persona, id, group, title, outgoing = true, state = "calling", video = video,
+            speaker = video && headset(a) == null, group = group)
+        inCall(a, true)
+        changed()
+        a.startActivity(Intent(a, CallActivity::class.java))
+    }
+
     /** The id of a call still reaching its peer (no node call yet). */
     private const val REACHING: ULong = 0u
 
@@ -179,7 +208,7 @@ object Calls {
         cancelRinging(a)
         Threading.background {
             try {
-                c.node.answerCall(c.id, video)
+                if (c.group != null) c.node.joinGroupCall(c.id, video) else c.node.answerCall(c.id, video)
                 current = c.copy(state = "connecting", video = video, speaker = video && headset(a) == null)
                 inCall(a, true)
             } catch (e: Exception) {
@@ -200,7 +229,7 @@ object Calls {
             ongoing(ctx)
             return changed()
         }
-        Threading.background { c.node.hangupCall(c.id) }
+        Threading.background { if (c.group != null) c.node.leaveGroupCall() else c.node.hangupCall(c.id) }
         cancelRinging(ctx)
     }
 
@@ -220,7 +249,9 @@ object Calls {
         }
         current = c.copy(video = on)
         Threading.background {
-            try { c.node.setCallVideo(on) } catch (e: Exception) { Threnody.say("! video: ${e.message}") }
+            try {
+                if (c.group != null) c.node.setGroupCallVideo(on) else c.node.setCallVideo(on)
+            } catch (e: Exception) { Threnody.say("! video: ${e.message}") }
         }
         // Video is for a speaker (or a headset), not an ear.
         if (on && !c.speaker && headset(a) == null) setSpeaker(a, true)
@@ -235,7 +266,9 @@ object Calls {
     fun pauseVideo(paused: Boolean) {
         val c = current?.takeIf { it.video && it.state != "incoming" } ?: return
         Threading.background {
-            try { c.node.setCallVideo(!paused) } catch (_: Exception) {}
+            try {
+                if (c.group != null) c.node.setGroupCallVideo(!paused) else c.node.setCallVideo(!paused)
+            } catch (_: Exception) {}
         }
     }
 
@@ -261,6 +294,31 @@ object Calls {
                 current = Call(node, persona, e.call, e.peer, Threnody.nameOf(node, e.peer), outgoing = false,
                     state = "incoming", peerVideo = e.video)
                 ring(ctx)
+            }
+            is NodeEvent.GroupCallRinging -> {
+                if (current != null) return
+                ended = null
+                val name = try { node.groups().firstOrNull { it.id == e.group }?.name } catch (_: Exception) { null }
+                current = Call(node, persona, e.call, e.group, name ?: "Group", outgoing = false,
+                    state = "incoming", group = e.group, members = mapOf(e.from to false))
+                ring(ctx)
+            }
+            is NodeEvent.GroupCallMember -> update(e.call) {
+                val members = if (e.joined) it.members + (e.device to (it.members[e.device] ?: false))
+                    else it.members - e.device
+                // Someone joined the call we started: it's under way.
+                val state = if (e.joined && it.state == "calling") "connecting" else it.state
+                it.copy(members = members, state = state)
+            }
+            is NodeEvent.GroupCallVideo -> update(e.call) { it.copy(members = it.members + (e.device to e.video)) }
+            is NodeEvent.GroupCallEnded -> {
+                val c = current?.takeIf { it.id == e.call } ?: return
+                current = null
+                cancelRinging(ctx)
+                ongoing(ctx)
+                inCall(ctx, false)
+                ended = if (c.state == "incoming") "Missed group call" else "Call ended"
+                if (c.state == "incoming") missed(ctx, c)
             }
             is NodeEvent.CallRinging -> update(e.call) { it.copy(state = "ringing") }
             is NodeEvent.CallStarted -> update(e.call) { it.copy(state = "connecting", peerVideo = e.peerVideo) }
@@ -501,8 +559,8 @@ object Calls {
         )
         val n = Notification.Builder(ctx, CHANNEL_RING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("${c.title} is calling")
-            .setContentText("Threnody voice call")
+            .setContentTitle(if (c.group != null) "Group call in ${c.title}" else "${c.title} is calling")
+            .setContentText(if (c.group != null) "Threnody group call" else "Threnody voice call")
             .apply {
                 // A call notification (Android 12+): the system rings it as
                 // a call, with Answer and Decline (on the lock screen too).
@@ -546,7 +604,7 @@ object Calls {
         )
         return Notification.Builder(ctx, CHANNEL_ONGOING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Call with ${c.title}")
+            .setContentTitle(if (c.group != null) "Group call in ${c.title}" else "Call with ${c.title}")
             .setContentText("Tap to return to the call")
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .setPublicVersion(public(ctx, "Call in progress"))
@@ -579,7 +637,7 @@ object Calls {
     private fun missed(ctx: Context, c: Call) {
         val n = Notification.Builder(ctx, CHANNEL_MISSED)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Missed call from ${c.title}")
+            .setContentTitle(if (c.group != null) "Missed group call in ${c.title}" else "Missed call from ${c.title}")
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .setPublicVersion(public(ctx, "Missed call"))
             .setAutoCancel(true)

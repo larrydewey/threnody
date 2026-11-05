@@ -172,10 +172,8 @@ class ChatActivity : Activity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         bar = TopBar(this) { finish() }.apply {
             title.text = if (group != null) "Group" else Threnody.short(device)
-            if (group == null) {
-                action(R.drawable.ic_videocam, "Video call") { call(video = true) }
-                action(R.drawable.ic_call, "Call") { call() }
-            }
+            action(R.drawable.ic_videocam, if (group != null) "Group video call" else "Video call") { call(video = true) }
+            action(R.drawable.ic_call, if (group != null) "Group call" else "Call") { call() }
             action(R.drawable.ic_search, "Search this chat") { search.open() }
             action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
         }
@@ -2529,9 +2527,12 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** Calls this contact: voice, or video with our camera on. */
+    /** Calls this contact, or starts a call in this group: voice, or video with our camera on. */
     private fun call(video: Boolean = false) {
         if (!::node.isInitialized) return
+        group?.let { g ->
+            return Calls.startGroup(this, node, persona, g, convo?.title ?: "Group", video)
+        }
         Calls.start(this, node, persona, device, convo?.title ?: Threnody.short(device), video)
     }
 

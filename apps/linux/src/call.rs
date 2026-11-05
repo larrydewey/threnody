@@ -2,9 +2,11 @@
 //! the dialog for an incoming one, and the video while either side sends
 //! it. The audio is the node's (WebRTC on the default microphone and
 //! speaker); our video comes from the camera ([`crate::camera`]) and the
-//! peer's from the node, drawn here.
+//! peer's from the node, drawn here. A group call (up to eight people in a
+//! group) shows a tile for each other participant instead of one picture.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +30,10 @@ struct Shown {
     video: bool,
     /// The peer's video reaches us while this is set.
     watching: Arc<AtomicBool>,
+    /// A group call's group (hex id).
+    group: Option<String>,
+    /// We answered (or joined, or placed) it.
+    joined: bool,
 }
 
 /// A frame for one of the two pictures.
@@ -50,6 +56,9 @@ pub struct CallBar {
     which: Cell<usize>,
     video: gtk::Overlay,
     remote: gtk::Picture,
+    /// A group call's participants: a tile each (picture, name).
+    grid: gtk::FlowBox,
+    tiles: RefCell<BTreeMap<String, (gtk::Picture, gtk::Overlay)>>,
     local: gtk::Picture,
     shown: RefCell<Option<Shown>>,
     camera: RefCell<Option<Camera>>,
@@ -145,8 +154,20 @@ impl CallBar {
             .build();
         local.add_css_class("call-self");
         local.set_visible(false);
+        let grid = gtk::FlowBox::builder()
+            .homogeneous(true)
+            .selection_mode(gtk::SelectionMode::None)
+            .min_children_per_line(1)
+            .max_children_per_line(3)
+            .hexpand(true)
+            .vexpand(true)
+            .visible(false)
+            .build();
+        let pictures = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pictures.append(&remote);
+        pictures.append(&grid);
         let video = gtk::Overlay::builder()
-            .child(&remote)
+            .child(&pictures)
             .height_request(360)
             .build();
         video.add_css_class("call-video");
@@ -178,6 +199,8 @@ impl CallBar {
             which: Cell::new(0),
             video,
             remote,
+            grid,
+            tiles: RefCell::default(),
             local,
             shown: RefCell::new(None),
             camera: RefCell::new(None),
@@ -355,7 +378,144 @@ impl CallBar {
             dialog: None,
             video,
             watching: Arc::default(),
+            group: None,
+            joined: false,
         });
+    }
+
+    /// Whether the call on screen is a group call.
+    fn group(&self) -> bool {
+        self.shown
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.group.is_some())
+    }
+
+    /// We started a call in `group` (hex id), named `title`: shown while
+    /// it lasts, others joining as they answer.
+    pub fn group_outgoing(
+        self: &Rc<Self>,
+        persona: Option<String>,
+        id: u64,
+        group: &str,
+        title: &str,
+        video: bool,
+    ) {
+        self.show(persona, id, title, "Waiting for others to join…", video);
+        if let Some(s) = self.shown.borrow_mut().as_mut() {
+            s.group = Some(group.to_owned());
+        }
+        self.running();
+    }
+
+    /// A call in `group`, started by `from` (a name), rings here: the bar,
+    /// and a dialog to join it (with video or not) or let it go.
+    pub fn group_incoming(
+        self: &Rc<Self>,
+        persona: Option<String>,
+        id: u64,
+        group: &str,
+        title: &str,
+        from: &str,
+        parent: &impl IsA<gtk::Widget>,
+    ) {
+        self.show(
+            persona,
+            id,
+            title,
+            &format!("Group call from {from}"),
+            false,
+        );
+        if let Some(s) = self.shown.borrow_mut().as_mut() {
+            s.group = Some(group.to_owned());
+        }
+        let d = ui::alert(
+            &format!("Group call in {title}"),
+            &format!(
+                "{from} started a call. Join with your microphone and speaker; with Video, your camera too."
+            ),
+            &[
+                ("decline", "Not Now"),
+                ("answer", "Join"),
+                ("video", "Join with Video"),
+            ],
+        );
+        d.set_response_appearance("answer", adw::ResponseAppearance::Suggested);
+        let weak = Rc::downgrade(self);
+        d.connect_response(None, move |_, r| {
+            let Some(this) = weak.upgrade() else { return };
+            if let Some(s) = this.shown.borrow_mut().as_mut() {
+                s.dialog = None;
+            }
+            match r {
+                "answer" => this.answer(id, false),
+                "video" => this.answer(id, true),
+                _ => this.hang_up(),
+            }
+        });
+        d.present(Some(parent));
+        if let Some(s) = self.shown.borrow_mut().as_mut() {
+            s.dialog = Some(d);
+        }
+    }
+
+    /// `device` (named `name`) joined or left group call `id`.
+    pub fn member(&self, id: u64, device: &str, name: &str, joined: bool) {
+        if !self.is(id) {
+            return;
+        }
+        if joined {
+            if self.tiles.borrow().contains_key(device) {
+                return;
+            }
+            let picture = gtk::Picture::builder()
+                .content_fit(gtk::ContentFit::Cover)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            let label = gtk::Label::builder()
+                .label(name)
+                .halign(gtk::Align::Start)
+                .valign(gtk::Align::End)
+                .margin_start(8)
+                .margin_bottom(6)
+                .build();
+            label.add_css_class("call-tile-name");
+            let tile = gtk::Overlay::builder().child(&picture).build();
+            tile.add_css_class("call-tile");
+            tile.add_overlay(&label);
+            self.grid.append(&tile);
+            self.tiles
+                .borrow_mut()
+                .insert(device.to_owned(), (picture, tile));
+            if self.status.label() == "Waiting for others to join…" {
+                self.status.set_label("Connecting…");
+            }
+        } else if let Some((_, tile)) = self.tiles.borrow_mut().remove(device)
+            && let Some(child) = tile.parent()
+        {
+            self.grid.remove(&child);
+        }
+        self.show_time();
+        self.layout();
+    }
+
+    /// `device` turned its video on or off in group call `id`.
+    pub fn member_video(&self, id: u64, device: &str, on: bool) {
+        if self.is(id)
+            && !on
+            && let Some((picture, _)) = self.tiles.borrow().get(device)
+        {
+            picture.set_paintable(gdk::Paintable::NONE);
+        }
+    }
+
+    /// Whether we're in call `id` (not just being rung).
+    pub fn joined(&self, id: u64) -> bool {
+        self.shown
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.id == id && s.joined)
     }
 
     fn is(&self, id: u64) -> bool {
@@ -428,9 +588,16 @@ impl CallBar {
         if let Some(s) = self.shown.borrow_mut().as_mut() {
             s.video = video;
         }
+        let group = self.group();
         let weak = Rc::downgrade(self);
         bg(
-            move || node.answer_call(id, video),
+            move || {
+                if group {
+                    node.join_group_call(id, video)
+                } else {
+                    node.answer_call(id, video)
+                }
+            },
             move |r| {
                 let Some(this) = weak.upgrade() else { return };
                 match r {
@@ -445,8 +612,15 @@ impl CallBar {
         let Some(id) = self.shown.borrow().as_ref().map(|s| s.id) else {
             return;
         };
+        let group = self.group();
         if let Some(node) = self.node() {
-            bg_quiet(move || node.hangup_call(id));
+            bg_quiet(move || {
+                if group {
+                    node.leave_group_call();
+                } else {
+                    node.hangup_call(id);
+                }
+            });
         }
     }
 
@@ -468,6 +642,9 @@ impl CallBar {
     /// The call runs: the controls, the peer's video, and our camera if
     /// we wanted it.
     fn running(self: &Rc<Self>) {
+        if let Some(s) = self.shown.borrow_mut().as_mut() {
+            s.joined = true;
+        }
         self.mute.set_visible(true);
         self.camera_button.set_visible(true);
         self.watch_video();
@@ -501,12 +678,36 @@ impl CallBar {
         self.start_camera();
     }
 
-    /// Shows the video area while either side sends video.
+    /// Shows the video area while either side sends video (in a group
+    /// call, while anyone else is in it: their tiles show their names).
     fn layout(&self) {
         let ours = self.camera.borrow().is_some();
+        let group = self.group();
+        let others = !self.tiles.borrow().is_empty();
         self.flip.set_visible(ours && crate::camera::count() > 1);
         self.local.set_visible(ours);
-        self.video.set_visible(ours || self.peer_video.get());
+        self.remote.set_visible(!group);
+        self.grid.set_visible(group && others);
+        self.video
+            .set_visible(ours || self.peer_video.get() || (group && others && self.joined_now()));
+    }
+
+    fn joined_now(&self) -> bool {
+        self.shown.borrow().as_ref().is_some_and(|s| s.joined)
+    }
+
+    /// Tells the other side (or the group) whether we send video.
+    fn tell_video(&self, on: bool) {
+        let group = self.group();
+        if let Some(node) = self.node() {
+            bg_quiet(move || {
+                let _ = if group {
+                    node.set_group_call_video(on)
+                } else {
+                    node.set_call_video(on)
+                };
+            });
+        }
     }
 
     fn show_camera_button(&self, on: bool) {
@@ -533,11 +734,7 @@ impl CallBar {
             self.camera.borrow_mut().take();
             self.local.set_paintable(gdk::Paintable::NONE);
             self.show_camera_button(false);
-            if let Some(node) = self.node() {
-                bg_quiet(move || {
-                    let _ = node.set_call_video(false);
-                });
-            }
+            self.tell_video(false);
         }
         self.layout();
     }
@@ -567,9 +764,7 @@ impl CallBar {
             Ok(c) => {
                 *self.camera.borrow_mut() = Some(c);
                 self.show_camera_button(true);
-                bg_quiet(move || {
-                    let _ = node.set_call_video(true);
-                });
+                self.tell_video(true);
                 let local = self.local.clone();
                 glib::spawn_future_local(async move {
                     while let Ok(p) = rx.recv().await {
@@ -587,7 +782,7 @@ impl CallBar {
 
     /// Draws the peer's video while the call lasts (a worker waits for its
     /// frames; only the newest is drawn).
-    fn watch_video(&self) {
+    fn watch_video(self: &Rc<Self>) {
         let Some(node) = self.node() else { return };
         let Some(watching) = self.shown.borrow().as_ref().map(|s| s.watching.clone()) else {
             return;
@@ -595,24 +790,44 @@ impl CallBar {
         if watching.swap(true, Ordering::SeqCst) {
             return;
         }
-        let (tx, rx) = async_channel::bounded::<Picture>(1);
+        // A frame, and whose (a group call's participant).
+        let (tx, rx) = async_channel::bounded::<(Option<String>, Picture)>(4);
         let w = watching.clone();
+        let group = self.group();
         std::thread::spawn(move || {
             while w.load(Ordering::SeqCst) {
-                if let Some(f) = node.next_video_frame(250) {
-                    let (width, height, rgba) = upright(f.width, f.height, f.rotation, f.rgba);
-                    let _ = tx.try_send(Picture {
-                        width,
-                        height,
-                        rgba,
-                    });
+                let frame = if group {
+                    node.next_group_video_frame(250)
+                        .map(|f| (Some(f.device), f.width, f.height, f.rotation, f.rgba))
+                } else {
+                    node.next_video_frame(250)
+                        .map(|f| (None, f.width, f.height, f.rotation, f.rgba))
+                };
+                if let Some((who, width, height, rotation, rgba)) = frame {
+                    let (width, height, rgba) = upright(width, height, rotation, rgba);
+                    let _ = tx.try_send((
+                        who,
+                        Picture {
+                            width,
+                            height,
+                            rgba,
+                        },
+                    ));
                 }
             }
         });
-        let remote = self.remote.clone();
+        let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            while let Ok(p) = rx.recv().await {
-                remote.set_paintable(Some(&texture(p)));
+            while let Ok((who, p)) = rx.recv().await {
+                let Some(this) = weak.upgrade() else { return };
+                match who {
+                    None => this.remote.set_paintable(Some(&texture(p))),
+                    Some(d) => {
+                        if let Some((picture, _)) = this.tiles.borrow().get(&d) {
+                            picture.set_paintable(Some(&texture(p)));
+                        }
+                    }
+                }
             }
         });
     }
@@ -631,7 +846,8 @@ impl CallBar {
                     self.log_media(id);
                 }
                 self.tick();
-                self.react.set_visible(true);
+                // Reactions are for calls with one contact.
+                self.react.set_visible(!self.group());
             }
             "interrupted" => self.status.set_label("Reconnecting…"),
             _ => self.status.set_label("Call failed"),
@@ -693,11 +909,14 @@ impl CallBar {
             return;
         };
         let s = since.elapsed().as_secs();
-        let t = if s >= 3600 {
+        let mut t = if s >= 3600 {
             format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
         } else {
             format!("{}:{:02}", s / 60, s % 60)
         };
+        if self.group() {
+            t.push_str(&format!(" · {} people", self.tiles.borrow().len() + 1));
+        }
         self.status.set_label(&t);
     }
 
@@ -716,6 +935,11 @@ impl CallBar {
         self.remote.set_paintable(gdk::Paintable::NONE);
         self.local.set_paintable(gdk::Paintable::NONE);
         self.peer_video.set(false);
+        for (_, (_, tile)) in std::mem::take(&mut *self.tiles.borrow_mut()) {
+            if let Some(child) = tile.parent() {
+                self.grid.remove(&child);
+            }
+        }
         self.layout();
         self.react.set_visible(false);
         while let Some(c) = self.floats.first_child() {
@@ -730,6 +954,7 @@ impl CallBar {
             ("unanswered", false) => "didn't answer",
             ("unanswered", true) => "missed call",
             ("failed", _) => "call failed",
+            _ if s.since.is_none() && !by_us && s.group.is_some() => "missed group call",
             _ if s.since.is_none() && !by_us => "missed call",
             _ => return None,
         };

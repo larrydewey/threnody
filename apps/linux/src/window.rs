@@ -1491,6 +1491,49 @@ impl App {
                 }
                 (None, None)
             }
+            NodeEvent::GroupCallRinging { group, call, from } => {
+                let title = self.group_title(persona.as_deref(), group);
+                let from = self.title_of(persona.as_deref(), from);
+                self.call.group_incoming(
+                    persona.clone(),
+                    *call,
+                    group,
+                    &title,
+                    &from,
+                    &self.window,
+                );
+                if !self.window.is_active() {
+                    self.notify_call(&format!("A group call in {title}"));
+                }
+                (None, None)
+            }
+            NodeEvent::GroupCallMember {
+                call,
+                device,
+                joined,
+                ..
+            } => {
+                let name = self.title_of(persona.as_deref(), device);
+                self.call.member(*call, device, &name, *joined);
+                (None, None)
+            }
+            NodeEvent::GroupCallVideo {
+                call,
+                device,
+                video,
+                ..
+            } => {
+                self.call.member_video(*call, device, *video);
+                (None, None)
+            }
+            NodeEvent::GroupCallEnded { call, .. } => {
+                self.app.withdraw_notification("call");
+                let joined = self.call.joined(*call);
+                if let Some(what) = self.call.ended(*call, "ended", joined) {
+                    self.toast(&what);
+                }
+                (None, None)
+            }
             NodeEvent::CallRinging { call, .. } => {
                 self.call.ringing(*call);
                 (None, None)
@@ -1658,6 +1701,33 @@ impl App {
                 match r {
                     Ok(id) => this.call.outgoing(persona, id, &title, video),
                     Err(e) => this.toast(&format!("Couldn't call {title}: {e}")),
+                }
+            },
+        );
+    }
+
+    /// Starts a call in group `conv`, with our camera on if `video`.
+    pub fn start_group_call(self: &Rc<Self>, conv: &Conversation, video: bool) {
+        if self.call.busy() {
+            return self.toast("You're already in a call.");
+        }
+        let Some(group) = conv.group.as_ref().map(|g| g.id.clone()) else {
+            return;
+        };
+        let persona = conv.chat.persona.clone();
+        let Ok(node) = self.core.node(persona.as_deref()) else {
+            return;
+        };
+        let title = conv.title.clone();
+        let weak = Rc::downgrade(self);
+        let g = group.clone();
+        bg(
+            move || node.start_group_call(g, video),
+            move |r| {
+                let Some(this) = weak.upgrade() else { return };
+                match r {
+                    Ok(id) => this.call.group_outgoing(persona, id, &group, &title, video),
+                    Err(e) => this.toast(&format!("Couldn't start the call: {e}")),
                 }
             },
         );

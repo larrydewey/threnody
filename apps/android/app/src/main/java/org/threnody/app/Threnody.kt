@@ -800,11 +800,14 @@ object Threnody {
                     }
                 }
                 is NodeEvent.CallIncoming, is NodeEvent.CallRinging, is NodeEvent.CallStarted,
-                is NodeEvent.CallMedia, is NodeEvent.CallVideo, is NodeEvent.CallReaction, is NodeEvent.CallEnded -> {
+                is NodeEvent.CallMedia, is NodeEvent.CallVideo, is NodeEvent.CallReaction, is NodeEvent.CallEnded,
+                is NodeEvent.GroupCallRinging, is NodeEvent.GroupCallMember, is NodeEvent.GroupCallVideo,
+                is NodeEvent.GroupCallEnded -> {
                     // The log is for transports: that a call happened, not with whom.
-                    if (e is NodeEvent.CallIncoming || e is NodeEvent.CallEnded) say("* call: ${e::class.simpleName}")
+                    if (e is NodeEvent.CallIncoming || e is NodeEvent.CallEnded || e is NodeEvent.GroupCallRinging ||
+                        e is NodeEvent.GroupCallEnded) say("* call: ${e::class.simpleName}")
                     Calls.onEvent(ctx, node, persona, e)
-                    if (e is NodeEvent.CallIncoming && visible > 0) {
+                    if ((e is NodeEvent.CallIncoming || e is NodeEvent.GroupCallRinging) && visible > 0) {
                         ctx.startActivity(Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }
                 }
