@@ -1987,6 +1987,15 @@ where
                                 let sealed = chan.seal(m)?;
                                 let _ = tokio::time::timeout(LAST_WORDS, write_frame(&mut wr, &sealed)).await;
                             }
+                            // Close gently, reading until the peer closes too:
+                            // closing with its frames unread would reset the
+                            // connection, and a reset can discard the
+                            // revocation before the peer reads it.
+                            let _ = tokio::time::timeout(LAST_WORDS, async {
+                                let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
+                                while let Some(Ok(_)) = inbox.recv().await {}
+                            })
+                            .await;
                         }
                         return Ok(());
                     }
