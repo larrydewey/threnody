@@ -771,6 +771,40 @@ impl GroupNode {
         self.save_held();
     }
 
+    /// Devices were removed from their accounts (`Event::AccountChanged`):
+    /// in the groups we own, they're removed as members, so later epochs
+    /// are unreadable to them, and nothing held for them is sent. Members
+    /// that don't own a group stop delivering to them, and leave the
+    /// removal to its owner.
+    pub fn revoked(&mut self, node: &Node, removed: &[PublicIdentity]) -> Vec<Update> {
+        let removed: Vec<PublicIdentity> = removed
+            .iter()
+            .copied()
+            .filter(|d| node.is_revoked(d))
+            .collect();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        let held = self.held.len();
+        self.held.retain(|(p, ..)| !removed.contains(p));
+        if self.held.len() != held {
+            self.save_held();
+        }
+        let me = node.identity();
+        let mut updates = Vec::new();
+        for (group, _, owner, members) in self.groups.list() {
+            if owner != me {
+                continue;
+            }
+            for d in members.iter().filter(|m| removed.contains(m)) {
+                if let Ok(out) = self.groups.remove(&group, d) {
+                    updates.extend(self.apply(node, out, true));
+                }
+            }
+        }
+        updates
+    }
+
     /// Adds our newly linked `device` to our groups (`Event::DeviceLinked`).
     pub fn linked(&mut self, node: &Node, device: &PublicIdentity) {
         if node.is_own_device(device) {
@@ -910,6 +944,10 @@ impl GroupNode {
         may_forward: bool,
         t: Tag,
     ) {
+        // A device removed from its account gets nothing more, by any path.
+        if node.is_revoked(&to) {
+            return;
+        }
         let Ok(bytes) = wire.encode() else { return };
         let msg = AppMessage::Group(bytes.clone());
         if node.send_tagged(&to, msg.clone(), t).is_ok() {

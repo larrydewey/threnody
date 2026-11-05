@@ -213,7 +213,7 @@ impl Node {
     }
 
     /// True for devices removed from their account (ours or a peer's).
-    pub(crate) fn is_revoked(&self, device: &PublicIdentity) -> bool {
+    pub fn is_revoked(&self, device: &PublicIdentity) -> bool {
         lock(&self.shared.account).state().removed.contains(device)
             || lock(&self.shared.accounts).is_revoked(device)
     }
@@ -475,7 +475,8 @@ impl Node {
         }
     }
 
-    /// A device left its account: stop trusting it everywhere.
+    /// A device left its account: stop trusting it everywhere, and seal
+    /// nothing more to it (its prekeys go).
     fn revoke_device(&self, device: &PublicIdentity) {
         {
             let mut contacts = lock(&self.shared.contacts);
@@ -486,6 +487,12 @@ impl Node {
                 c.approval_changed_ms = now_ms();
             }
             self.shared.save_contacts(&contacts);
+        }
+        {
+            let mut bundles = lock(&self.shared.bundles);
+            if bundles.remove(device) {
+                self.shared.persist_bundles(&bundles);
+            }
         }
         self.disconnect(device);
     }
@@ -770,6 +777,13 @@ impl Node {
             self.emit(Event::ThisDeviceRemoved);
         } else {
             self.revoke_device(device);
+            // As our other devices see it when the chain reaches them, so
+            // the groups this one runs drop the device too.
+            self.emit(Event::AccountChanged {
+                account: self.account().id(),
+                added: vec![],
+                removed: vec![*device],
+            });
         }
         Ok(())
     }

@@ -205,15 +205,21 @@ impl Node {
             .is_some_and(|b| self.send(to, AppMessage::Mailbox(b)).is_ok())
     }
 
-    /// True when we hold a usable prekey bundle for `peer`.
+    /// True when we hold a usable prekey bundle for `peer`, and it is
+    /// still a device of its account.
     pub fn can_send_offline(&self, peer: &PublicIdentity) -> bool {
-        lock(&self.shared.bundles).has(peer, now_ms())
+        lock(&self.shared.bundles).has(peer, now_ms()) && !self.is_revoked(peer)
     }
 
     /// Seals `msg` for `dest` and offers it to every live, mutually
     /// approved neighbour. Returns how many were asked; each answers with
     /// [`Event::DepositReceipt`].
     pub fn send_offline(&self, dest: &PublicIdentity, msg: &AppMessage) -> Result<usize> {
+        if self.is_revoked(dest) {
+            return Err(NetError::NotAllowed(
+                "that device was removed from its account".into(),
+            ));
+        }
         let sealed = {
             let mut book = lock(&self.shared.bundles);
             let sealed = book.seal(self.identity_ref(), dest, &msg.encode()?, now_ms())?;

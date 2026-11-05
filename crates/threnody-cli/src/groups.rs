@@ -232,6 +232,18 @@ impl GroupUi {
         }
     }
 
+    /// Devices were removed from their accounts: the groups we own drop
+    /// them, and none of our groups delivers to them any more.
+    pub fn revoked(
+        &mut self,
+        node: &Node,
+        name: &dyn Fn(&PublicIdentity) -> String,
+        removed: &[PublicIdentity],
+    ) {
+        let updates = self.groups.revoked(node, removed);
+        self.show(node, name, updates);
+    }
+
     /// Adds our newly linked `device` to our groups.
     pub fn linked(&mut self, node: &Node, device: &PublicIdentity) {
         self.groups.linked(node, device);

@@ -515,6 +515,12 @@ impl BundleBook {
             .is_some_and(|b| b.expiry_ms > now_ms)
     }
 
+    /// Forgets `peer`'s bundle (a device removed from its account).
+    /// Returns true if there was one.
+    pub fn remove(&mut self, peer: &PublicIdentity) -> bool {
+        self.bundles.remove(peer.as_bytes()).is_some()
+    }
+
     /// Seals `body` (an encoded `AppMessage`) from `identity` to `to`,
     /// consuming a one-time prekey if any is left.
     pub fn seal(

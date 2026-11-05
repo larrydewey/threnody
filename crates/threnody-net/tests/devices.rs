@@ -148,6 +148,7 @@ async fn removing_a_device_revokes_it_everywhere() {
     phone.node.link_with(&code).await.unwrap();
     let pid = phone.node.identity();
     wait_for(|| bob.node.account_of(&pid).is_some()).await;
+    wait_for(|| bob.node.can_send_offline(&pid)).await;
 
     // Not a device of ours: refused.
     assert!(laptop.node.remove_device(&bob.node.identity()).is_err());
@@ -160,6 +161,24 @@ async fn removing_a_device_revokes_it_everywhere() {
     )
     .await;
     assert!(laptop.node.account().state().removed.contains(&pid));
+    // The laptop's own groups hear of it as its siblings would.
+    next(
+        &mut laptop.rx,
+        |e| matches!(e, Event::AccountChanged { removed, .. } if removed.contains(&pid)),
+    )
+    .await;
+    // Nothing more is sealed to it: its prekeys are gone.
+    assert!(!bob.node.can_send_offline(&pid));
+    assert!(!laptop.node.can_send_offline(&pid));
+    let note = threnody_core::AppMessage::Text {
+        sent_ms: 0,
+        body: "still there?".into(),
+        expires_in_s: None,
+        id: 0,
+        quote: None,
+        forwarded: false,
+    };
+    assert!(bob.node.send_offline(&pid, &note).is_err());
     // The laptop is now the account's only device: it can't remove itself.
     assert!(laptop.node.remove_device(&laptop.node.identity()).is_err());
 

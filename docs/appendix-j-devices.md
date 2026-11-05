@@ -43,7 +43,7 @@ The account fingerprint is computed like a device fingerprint (Appendix A), as `
 - **Exchange.** Peers send their chain as `AppMessage::Account` (kind 11) at the start of every session, and again whenever it changes.
 - **Accepting a chain.** A receiver accepts a chain only if it is valid, its id matches what the receiver has stored for that account (pinned at first sight), and the session's device is in its current set.
 - **Updates.** A newer chain must *extend* the stored one. A different chain at or below the stored height is a **fork**: the receiver rejects it and warns, because forking requires a compromised device.
-- **Removal.** When a chain removes a device, every peer drops its sessions with that device, revokes its approvals, deletes its discovery key and prekeys, and refuses it from then on.
+- **Removal.** When a chain removes a device, every peer drops its sessions with that device, revokes its approvals, deletes its discovery key and prekeys, and refuses it from then on. Nothing more is sealed to it, and no group message goes to it by any path. Owners of groups it is in remove it from them (Appendix F, *Removal*), so later epochs are unreadable to it. Nothing more is sealed to it, and group messages are no longer delivered to it by any path. The owner of each group it is in removes it, as for any member (Appendix F), so later epochs are unreadable to it; the device that removed it does the same in groups it owns.
 
 ## Linking a device
 
