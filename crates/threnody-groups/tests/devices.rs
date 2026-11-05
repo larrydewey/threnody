@@ -27,6 +27,17 @@ struct N {
 async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
     let home = Home::new(dir.path().join(name));
     let identity = home.create_identity(None).unwrap();
+    start(home, identity).await
+}
+
+/// Starts `name` again from what it saved.
+async fn restart(dir: &tempfile::TempDir, name: &str) -> N {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    start(home, identity).await
+}
+
+async fn start(home: Home, identity: threnody_core::Identity) -> N {
     let groups = GroupNode::load(&home, &identity).unwrap();
     let (node, rx) = Node::new(NodeConfig {
         home,
@@ -168,6 +179,48 @@ async fn a_linked_device_joins_our_groups_with_their_history() {
     })
     .await;
     assert_eq!(phone.texts(&g).len(), 3, "no duplicates");
+}
+
+#[tokio::test]
+async fn a_member_offline_during_an_add_still_gets_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let mut dave = spawn(&dir, "dave").await;
+    let cid = approve(&mut alice, &mut carol).await;
+    // Dave isn't Alice's contact: she has no mailbox route to him.
+    let aid = dave.node.connect(&alice.addr, None).await.unwrap();
+    let did = dave.node.identity();
+    let g = alice.groups.create("team").unwrap();
+    alice.groups.invite(&alice.node, &g, &did).unwrap();
+    until(&mut [&mut alice, &mut dave], |ns| {
+        !ns[1].groups.invites().is_empty()
+    })
+    .await;
+    dave.groups.accept_from(&dave.node, &g, &aid).unwrap();
+    until(&mut [&mut alice, &mut dave], |ns| ns[1].in_group(&g)).await;
+
+    // Dave goes away; Alice adds Carol meanwhile. Carol, just invited,
+    // doesn't know the group yet: she can't pass Dave the commit.
+    dave.node.shutdown();
+    drop(dave);
+    alice.node.disconnect(&did);
+    alice.groups.invite(&alice.node, &g, &cid).unwrap();
+    until(&mut [&mut alice, &mut carol], |ns| ns[1].in_group(&g)).await;
+    assert_eq!(alice.groups.held_for(&did), 1, "the commit waits for Dave");
+
+    // Back, Dave catches up and reads what's said after.
+    let mut dave = restart(&dir, "dave").await;
+    dave.node.connect(&alice.addr, None).await.unwrap();
+    until(&mut [&mut alice, &mut carol, &mut dave], |ns| {
+        ns[2].groups.list()[0].3.len() == 3
+    })
+    .await;
+    alice.groups.send_text(&alice.node, &g, "hi all").unwrap();
+    until(&mut [&mut alice, &mut carol, &mut dave], |ns| {
+        ns[2].texts(&g) == ["hi all"] && ns[1].texts(&g) == ["hi all"]
+    })
+    .await;
 }
 
 #[tokio::test]

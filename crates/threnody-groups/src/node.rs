@@ -889,8 +889,16 @@ impl GroupNode {
         // that peers have already moved to.
         let _ = self.save();
         let held = self.held.len();
+        // Whoever this welcomes doesn't know the group until the Welcome
+        // is in: asked to forward anything before then, it would drop it.
+        let joining: Vec<PublicIdentity> = out
+            .send
+            .iter()
+            .filter(|o| matches!(o.wire, GroupWire::Welcome { .. }))
+            .map(|o| o.to)
+            .collect();
         for o in out.send {
-            self.deliver(node, o.to, o.wire, may_forward, t);
+            self.deliver_avoiding(node, o.to, o.wire, may_forward, t, &joining);
         }
         if self.held.len() != held {
             self.save_held();
@@ -912,6 +920,19 @@ impl GroupNode {
         may_forward: bool,
         t: Tag,
     ) {
+        self.deliver_avoiding(node, to, wire, may_forward, t, &[]);
+    }
+
+    /// [`Self::deliver`], never forwarding through those in `avoid`.
+    fn deliver_avoiding(
+        &mut self,
+        node: &Node,
+        to: PublicIdentity,
+        wire: GroupWire,
+        may_forward: bool,
+        t: Tag,
+        avoid: &[PublicIdentity],
+    ) {
         let Ok(bytes) = wire.encode() else { return };
         let msg = AppMessage::Group(bytes.clone());
         if node.send_tagged(&to, msg.clone(), t).is_ok() {
@@ -921,7 +942,7 @@ impl GroupNode {
             return;
         }
         if let (true, GroupWire::Message { group, message }) = (may_forward, &wire)
-            && let Some(via) = self.forwarder(node, group, &to)
+            && let Some(via) = self.forwarder(node, group, &to, avoid)
         {
             // Our own message asks for a receipt; one we forward doesn't.
             let fwd = GroupWire::Forward {
@@ -954,19 +975,21 @@ impl GroupNode {
         }
     }
 
-    /// A member other than `to` with a live session, the owner first.
+    /// A member other than `to` (and those in `avoid`) with a live
+    /// session, the owner first.
     fn forwarder(
         &self,
         node: &Node,
         group: &GroupId,
         to: &PublicIdentity,
+        avoid: &[PublicIdentity],
     ) -> Option<PublicIdentity> {
         let (_, _, owner, members) = self.groups.list().into_iter().find(|(g, ..)| g == group)?;
         let me = node.identity();
         let live: Vec<PublicIdentity> = node.sessions().iter().map(|s| s.peer).collect();
         let candidates = members
             .into_iter()
-            .filter(|m| m != to && *m != me && live.contains(m));
+            .filter(|m| m != to && *m != me && live.contains(m) && !avoid.contains(m));
         let mut candidates: Vec<_> = candidates.collect();
         candidates.sort_by_key(|m| *m != owner);
         candidates.into_iter().next()

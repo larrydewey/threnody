@@ -62,7 +62,7 @@ Members need not be contacts of each other, or online together. Each copy goes t
 
 1. The live session with that member. Sessions acknowledge group messages end to end, and resend them in the next session if the current one dies first (Appendix C, *Acknowledgements*).
 2. Sealed for the member's mailboxes (Appendix H), when we hold their prekeys.
-3. Forwarded by another member we have a session with, the owner first. The `Forward` carries the same MLS ciphertext and names the member to deliver it to. This applies to MLS messages only, never to key packages or Welcomes.
+3. Forwarded by another member we have a session with, the owner first. The `Forward` carries the same MLS ciphertext and names the member to deliver it to. This applies to MLS messages only, never to key packages or Welcomes. A member being welcomed by the same change (an add's commit goes out with its Welcome) is never the forwarder: it doesn't know the group until its Welcome is in, and would drop the message.
 4. Held by us and sent when the member next connects. Meanwhile we try to reach them through relays (Appendix G).
 
 A forwarder checks that the sender and the target are both members of the group as it knows it, and that the target is neither itself nor the sender. It then delivers a plain `Message` by steps 1, 2 and 4, and never forwards again, so a message crosses at most one forwarding member. Since the owner invited everyone, it usually has a session with every member, and a member that only ever talks to the owner still reaches the whole group.
