@@ -496,6 +496,13 @@ impl CallBar {
         {
             self.grid.remove(&child);
         }
+        // Two side by side, three or four as a square, more three across.
+        let n = self.tiles.borrow().len() as u32;
+        self.grid.set_max_children_per_line(match n {
+            0..=2 => n.max(1),
+            3..=4 => 2,
+            _ => 3,
+        });
         self.show_time();
         self.layout();
     }

@@ -209,7 +209,7 @@ async fn a_leg_goes_through_whoever_is_linked_to_both() {
         assert!(n.group_call_rang(GROUP, CALL, si, BASE, false));
         n.join_group_call(CALL, false).unwrap();
     }
-    assert_eq!(a.group_call_links(CALL), vec![si]);
+    assert_eq!(a.group_call_links(CALL, true), vec![si]);
     // Everyone hears everyone's join and links.
     joined(&s, ai, &[si, bi]);
     joined(&s, bi, &[ai]);
@@ -218,7 +218,7 @@ async fn a_leg_goes_through_whoever_is_linked_to_both() {
     joined(&b, ai, &[si, bi]);
     joined(&b, si, &[ai]);
     // A's links grew when B joined: the node says so.
-    let mut a_links = a.group_call_links(CALL);
+    let mut a_links = a.group_call_links(CALL, true);
     a_links.sort_by_key(|p| *p.as_bytes());
     let mut want = vec![si, bi];
     want.sort_by_key(|p| *p.as_bytes());

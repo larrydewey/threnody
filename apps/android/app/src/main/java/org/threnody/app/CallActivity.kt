@@ -391,10 +391,15 @@ class CallActivity : Activity() {
         if (who != tileViews.keys.sorted()) {
             tiles.removeAllViews()
             tileViews.clear()
+            // Upright, two people stack (each tile keeps a camera's shape);
+            // sideways, they sit side by side. More make a grid.
+            val upright = resources.configuration.orientation ==
+                android.content.res.Configuration.ORIENTATION_PORTRAIT
             tiles.columnCount = when {
                 who.size <= 1 -> 1
+                who.size == 2 -> if (upright) 1 else 2
                 who.size <= 4 -> 2
-                else -> 3
+                else -> if (upright) 2 else 3
             }
             for (d in who) {
                 val picture = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }

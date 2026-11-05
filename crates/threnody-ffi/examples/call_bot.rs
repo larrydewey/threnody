@@ -217,6 +217,10 @@ fn watch(node: std::sync::Arc<ThrenodyNode>) {
                 }
                 if at.elapsed() >= Duration::from_secs(2) {
                     println!("group video in, frames by device: {from:?}");
+                    if let Some(c) = node.current_group_call() {
+                        let who: Vec<_> = c.participants.iter().map(|p| &p.device[..9]).collect();
+                        println!("group call: hub {}, others {who:?}", &c.hub[..9]);
+                    }
                     (from, at) = (Default::default(), Instant::now());
                 }
                 continue;

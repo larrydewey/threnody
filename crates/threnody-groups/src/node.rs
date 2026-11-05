@@ -197,9 +197,10 @@ pub struct GroupNode {
     identity: Identity,
 }
 
-/// Our links in group call `call`, as sent in `Join` and `Update`.
-fn links(node: &Node, call: u64) -> Vec<[u8; 32]> {
-    node.group_call_links(call)
+/// Our links in group call `call`, as sent in `Join` and `Update` (to
+/// `everyone`, or to one member).
+fn links(node: &Node, call: u64, everyone: bool) -> Vec<[u8; 32]> {
+    node.group_call_links(call, everyone)
         .iter()
         .map(|p| *p.as_bytes())
         .collect()
@@ -607,7 +608,7 @@ impl GroupNode {
             .group;
         node.join_group_call(call, video)
             .map_err(|e| GroupError::Call(e.to_string()))?;
-        let links = links(node, call);
+        let links = links(node, call, true);
         self.send_call(
             node,
             &group,
@@ -635,7 +636,7 @@ impl GroupNode {
             .ok_or(GroupError::Unexpected("no such call"))?
             .group;
         node.set_group_call_video_flag(call, video);
-        let links = links(node, call);
+        let links = links(node, call, true);
         self.send_call(
             node,
             &group,
@@ -650,7 +651,7 @@ impl GroupNode {
         let Some(c) = node.group_call().filter(|c| c.call == call && c.joined) else {
             return Ok(());
         };
-        let links = links(node, call);
+        let links = links(node, call, true);
         let update = GroupCallMsg::Update {
             call,
             video: c.video,
@@ -766,7 +767,7 @@ impl GroupNode {
                     let join = GroupCallMsg::Join {
                         call,
                         video: c.video,
-                        links: self::links(node, call),
+                        links: self::links(node, call, false),
                     };
                     let _ = self.send_call(node, &group, &join, Some(&from));
                 }

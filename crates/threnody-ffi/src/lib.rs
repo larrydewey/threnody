@@ -3384,6 +3384,88 @@ mod tests {
         assert_eq!(carol.current_group_call().unwrap().hub, hub);
     }
 
+    /// The starter of a group call reaches only one member (the owner, who
+    /// reaches everyone): the starter's leg with the third member goes
+    /// through the owner, both ways, signalling and media.
+    #[cfg(feature = "calls")]
+    #[test]
+    fn a_starter_reaching_one_member_still_sees_everyone() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            node.set_cover_traffic(None);
+            node.set_call_devices(false);
+            node
+        };
+        // Owner O reaches P and E; P and E never meet. P starts the call.
+        let (owner, p, e) = (open("o"), open("p"), open("e"));
+        let addr = owner.listen("127.0.0.1:0".into()).unwrap();
+        let o_fp = owner.device_fingerprint();
+        for n in [&p, &e] {
+            n.connect(owner.invite_link(addr.clone())).unwrap();
+        }
+        let mut all = Pump::new(&[&*owner, &*p, &*e]);
+        let (p_fp, e_fp) = (p.device_fingerprint(), e.device_fingerprint());
+        all.until(
+            0,
+            |ev| matches!(ev, NodeEvent::Connected { peer, .. } if *peer == e_fp),
+        );
+        for (i, (n, f)) in [(&p, &p_fp), (&e, &e_fp)].into_iter().enumerate() {
+            owner.set_approval(f.clone(), true).unwrap();
+            n.set_approval(o_fp.clone(), true).unwrap();
+            all.until(i + 1, |ev| {
+                matches!(ev, NodeEvent::ApprovalChanged { mutual: true, .. })
+            });
+        }
+        let g = owner.create_group("relay".into()).unwrap();
+        for f in [&p_fp, &e_fp] {
+            owner.invite_to_group(g.clone(), f.clone()).unwrap();
+        }
+        all.until(1, |ev| matches!(ev, NodeEvent::GroupJoined { .. }));
+        all.until(2, |ev| matches!(ev, NodeEvent::GroupJoined { .. }));
+        owner.send_group_text(g.clone(), "ready?".into()).unwrap();
+        for i in [1, 2] {
+            all.until(i, |ev| matches!(ev, NodeEvent::GroupMessage { .. }));
+        }
+
+        let call = p.start_group_call(g.clone(), true).unwrap();
+        all.until(0, |ev| matches!(ev, NodeEvent::GroupCallRinging { .. }));
+        owner.join_group_call(call, true).unwrap();
+        all.until(2, |ev| matches!(ev, NodeEvent::GroupCallRinging { .. }));
+        e.join_group_call(call, true).unwrap();
+        // Everyone ends up seeing both others, and video from both.
+        let (w, h) = (160u32, 120u32);
+        let i420 = vec![128u8; (w * h + 2 * (w / 2) * (h / 2)) as usize];
+        let nodes = [&owner, &p, &e];
+        let fps = [&o_fp, &p_fp, &e_fp];
+        for (i, n) in nodes.into_iter().enumerate() {
+            let mut seen = std::collections::HashSet::new();
+            for round in 0..600 {
+                if round % 10 == 0 {
+                    all.settle();
+                }
+                for m in nodes {
+                    m.send_video_frame(w, h, 0, i420.clone());
+                }
+                if let Some(f) = n.next_group_video_frame(20) {
+                    seen.insert(f.device);
+                }
+                if seen.len() == 2 {
+                    break;
+                }
+            }
+            let roster = n.current_group_call().unwrap();
+            assert_eq!(
+                seen.len(),
+                2,
+                "{} saw {seen:?} (owner {o_fp}, starter {p_fp}, other {e_fp})",
+                fps[i]
+            );
+            assert_eq!(roster.participants.len(), 2, "{}", fps[i]);
+        }
+    }
+
     #[test]
     fn reconnect_redials_approved_contacts_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();

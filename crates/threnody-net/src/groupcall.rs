@@ -146,15 +146,18 @@ impl Node {
     }
 
     /// Our links in call `call` (the participants we have a session
-    /// with), for the group layer to send with `Join` or `Update`; noted
-    /// as told.
-    pub fn group_call_links(&self, call: u64) -> Vec<PublicIdentity> {
+    /// with), for the group layer to send with `Join` or `Update`. Noted
+    /// as told when they go to `everyone` (an answer to one newcomer
+    /// leaves the others still to tell).
+    pub fn group_call_links(&self, call: u64, everyone: bool) -> Vec<PublicIdentity> {
         let mut gc = lock(&self.shared.group_calls);
         let Some(c) = gc.current.as_mut().filter(|c| c.info.call == call) else {
             return Vec::new();
         };
         let mine = self.links_of(c);
-        c.told = mine.clone();
+        if everyone {
+            c.told = mine.clone();
+        }
         mine
     }
 
@@ -428,13 +431,17 @@ impl Node {
         self.connected(peer) && self.send_tracked(peer, AppMessage::Call(m)).is_ok()
     }
 
-    /// `CallMsg::Signal` from `peer` under leg id `leg`: our leg's, if we
-    /// have one with `peer`; reported as [`Event::GroupLegSignal`].
+    /// `CallMsg::Signal` from `peer` under leg id `leg`: our leg's with
+    /// `peer`; reported as [`Event::GroupLegSignal`]. It may come before
+    /// we've heard `peer` join (it travels in the session, the join in the
+    /// group), so it counts by the leg's id; the media layer holds it
+    /// until the leg opens.
     pub(crate) fn on_leg_signal(&self, peer: PublicIdentity, leg: u64, data: Vec<u8>) {
+        let me = self.identity();
         let call = {
             let gc = lock(&self.shared.group_calls);
             match gc.current.as_ref().filter(|c| {
-                c.info.joined && c.legs.get(&peer).is_some_and(|l| l.keys.call() == leg)
+                c.info.joined && call::leg_id(c.info.call, me.as_bytes(), peer.as_bytes()) == leg
             }) {
                 Some(c) => c.info.call,
                 None => return,
