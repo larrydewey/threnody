@@ -25,6 +25,10 @@ pub const FILE_VOICE: u64 = 2;
 pub const FILE_VIDEO: u64 = 4;
 /// `Text` and `File` flag (key 6): forwarded from another chat.
 pub const FORWARDED: u64 = 8;
+/// `Text` flag (key 6): the sender turned its disappearing timer off on
+/// purpose. Decoded as `expires_in_s: Some(0)`; key 4 is then left out,
+/// so a peer that doesn't know the flag reads no timer, as before it.
+pub const TIMER_OFF: u64 = 16;
 /// Longest voice or video message, in milliseconds.
 pub const MAX_CLIP_MS: u32 = 10 * 60 * 1000;
 
@@ -92,6 +96,9 @@ pub const FEATURE_LISTS: u64 = 4096;
 pub const FEATURE_TUNNEL: u64 = 8192;
 /// The peer understands `AppMessage::Push` (wake-up endpoints, Appendix R).
 pub const FEATURE_PUSH: u64 = 16384;
+/// The peer marks a disappearing timer it turned off with [`TIMER_OFF`],
+/// so a `Text` from it with no timer means it never chose one.
+pub const FEATURE_TIMER_OFF: u64 = 65536;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -106,7 +113,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_PIN
     | FEATURE_LISTS
     | FEATURE_TUNNEL
-    | FEATURE_PUSH;
+    | FEATURE_PUSH
+    | FEATURE_TIMER_OFF;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -467,24 +475,27 @@ impl AppMessage {
                     quote,
                     forwarded,
                 } => {
+                    let expiry = expires_in_s.filter(|&s| s > 0);
+                    let flags = u64::from(*forwarded) * FORWARDED
+                        + u64::from(*expires_in_s == Some(0)) * TIMER_OFF;
                     e.map_len(
-                        3 + usize::from(expires_in_s.is_some())
+                        3 + usize::from(expiry.is_some())
                             + usize::from(*id != 0)
-                            + usize::from(*forwarded)
+                            + usize::from(flags != 0)
                             + 3 * usize::from(quote.is_some()),
                     )?
                     .u8(0)?
                     .uint(kind::TEXT)?;
                     e.u8(1)?.uint(*sent_ms)?;
                     e.u8(2)?.str(body)?;
-                    if let Some(x) = expires_in_s {
-                        e.u8(4)?.u32(*x)?;
+                    if let Some(x) = expiry {
+                        e.u8(4)?.u32(x)?;
                     }
                     if *id != 0 {
                         e.u8(5)?.uint(*id)?;
                     }
-                    if *forwarded {
-                        e.u8(6)?.uint(FORWARDED)?;
+                    if flags != 0 {
+                        e.u8(6)?.uint(flags)?;
                     }
                     if let Some(q) = quote {
                         e.u8(10)?.uint(q.id)?;
@@ -790,7 +801,7 @@ impl AppMessage {
             kind::TEXT => Self::Text {
                 sent_ms: ts.unwrap_or(0),
                 body: required(text, "text body")?,
-                expires_in_s: expiry,
+                expires_in_s: expiry.or((flags & TIMER_OFF != 0).then_some(0)),
                 id: five.unwrap_or(0),
                 forwarded: flags & FORWARDED != 0,
                 // A quote names its message's sender (and, but for messages
@@ -1027,6 +1038,14 @@ mod tests {
                 id: 0,
                 quote: None,
                 forwarded: false,
+            },
+            AppMessage::Text {
+                sent_ms: 44,
+                body: "timer off on purpose".into(),
+                expires_in_s: Some(0),
+                id: 0,
+                quote: None,
+                forwarded: true,
             },
             AppMessage::File {
                 sent_ms: 1,

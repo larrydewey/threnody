@@ -88,6 +88,61 @@ async fn history_records_both_sides_and_disappearing_messages_vanish() {
     );
 }
 
+/// A peer that never chose a timer doesn't turn ours off by writing:
+/// neither one set for the chat nor a default. Turning it off on purpose
+/// still reaches the other side.
+#[tokio::test]
+async fn a_peer_without_a_timer_does_not_turn_ours_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx, a_addr) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    let message = |e: &Event| matches!(e, Event::Message { .. });
+
+    // Alice chose an hour; Bob, who never chose, writes first.
+    alice.set_timer(&bob_id, Some(3600)).unwrap();
+    bob.send_text(&a_id, "no timer here").unwrap();
+    next(&mut arx, message).await;
+    assert_eq!(alice.timer(&bob_id), Some(3600), "Alice's choice stands");
+    // Alice's next message carries it, and Bob adopts it.
+    alice.send_text(&bob_id, "an hour").unwrap();
+    next(&mut brx, message).await;
+    assert_eq!(bob.timer(&a_id), Some(3600));
+
+    // Bob turns it off on purpose: that does reach Alice.
+    bob.set_timer(&a_id, None).unwrap();
+    bob.send_text(&a_id, "off now").unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::TimerChanged { secs: None, .. })
+    })
+    .await;
+    assert_eq!(alice.timer(&bob_id), None);
+    let last = alice
+        .history(alice.conversation_for(&bob_id))
+        .unwrap()
+        .entries()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(last.text, "off now");
+    assert!(last.expires_at_ms.is_none(), "stays, not gone at once");
+
+    // A default Alice chose isn't pinned off by a chat Bob opens.
+    let (carol, _crx, _) = spawn(&dir, "carol").await;
+    alice.set_default_timer(Some(30));
+    let c_id = carol.identity();
+    carol.connect(&a_addr, None).await.unwrap();
+    carol.send_text(&a_id, "first").unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::Message { .. } | Event::MessageRequest { .. })
+    })
+    .await;
+    assert_eq!(alice.timer(&c_id), Some(30));
+}
+
 #[tokio::test]
 async fn messages_stay_by_default_and_disappear_when_chosen() {
     let dir = tempfile::tempdir().unwrap();

@@ -6,8 +6,8 @@ use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Quer
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
-    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_PIN, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
-    Mention, Quote,
+    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_PIN, FEATURE_REACT, FEATURE_READ,
+    FEATURE_TIMER_OFF, FEATURE_TYPING, Mention, Quote,
 };
 
 use crate::delivery::Tag;
@@ -874,7 +874,7 @@ impl Node {
         let msg = AppMessage::Text {
             sent_ms: now_ms(),
             body: body.to_owned(),
-            expires_in_s: timer,
+            expires_in_s: self.announced_timer(conv),
             id: local_id,
             quote: quote.clone(),
             forwarded,
@@ -1082,6 +1082,16 @@ impl Node {
             .home
             .save_history(self.identity_ref(), conv, &h)
             .map_err(NetError::from)
+    }
+
+    /// The timer our messages in `conv` carry: the effective one, or
+    /// `Some(0)` when the user turned it off on purpose (as opposed to
+    /// never choosing one), so the peer can tell the two apart.
+    fn announced_timer(&self, conv: ConversationId) -> Option<u32> {
+        match self.history(conv).ok().and_then(|h| h.timer_s) {
+            Some(0) => Some(0),
+            _ => self.effective_timer(conv),
+        }
     }
 
     /// The timer messages in `peer`'s conversation get now.
@@ -1292,15 +1302,22 @@ impl Node {
             return;
         };
         let conv = self.conversation_for(from);
+        // `Some(0)`: turned off on purpose. No timer at all from a peer that
+        // would have said so means it never chose one: ours stands, and
+        // it adopts ours from our next message. From an older peer it may
+        // mean either, and is taken as off, as such peers intend.
+        let expiry = expires_in_s.filter(|&s| s > 0);
+        let chosen = expires_in_s.is_some() || !self.supports(from, FEATURE_TIMER_OFF);
         let lock = threnody_core::history::history_lock();
-        if self.effective_timer(conv) != *expires_in_s
+        if chosen
+            && self.effective_timer(conv) != expiry
             && let Ok(mut h) = self.history(conv)
         {
-            h.timer_s = Some(expires_in_s.unwrap_or(0));
+            h.timer_s = Some(expiry.unwrap_or(0));
             let _ = self.shared.home.save_history(self.identity_ref(), conv, &h);
             self.emit(Event::TimerChanged {
                 peer: *from,
-                secs: *expires_in_s,
+                secs: expiry,
             });
         }
         drop(lock);
@@ -1310,7 +1327,7 @@ impl Node {
             false,
             body,
             offline,
-            *expires_in_s,
+            expiry,
             *id,
             Extras {
                 quote: quote.clone(),
