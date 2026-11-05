@@ -25,6 +25,10 @@ pub const MAX_TITLE: usize = 80;
 pub const MAX_ITEM_TEXT: usize = 500;
 /// Deepest nesting of an item.
 pub const MAX_INDENT: u8 = 3;
+/// How far ahead of our clock a change from elsewhere may be stamped: a
+/// clock that's a little fast is fine, but a stamp far in the future
+/// would win over every change for as long as it stays ahead.
+pub const MAX_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// A list's id: random, shared by everyone who has it.
 pub type ListId = [u8; 16];
@@ -34,6 +38,17 @@ pub type ListId = [u8; 16];
 pub struct Stamp {
     pub ms: u64,
     pub by: [u8; 32],
+}
+
+impl Stamp {
+    /// This stamp, moved past `prev` if that's later (a clock ahead of
+    /// ours), so that a change made after seeing `prev` wins over it.
+    fn after(self, prev: Stamp) -> Stamp {
+        Stamp {
+            ms: self.ms.max(prev.ms.saturating_add(1)),
+            by: self.by,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -92,8 +107,25 @@ impl List {
         f(i);
         i.text = clip(&i.text, MAX_ITEM_TEXT);
         i.indent = i.indent.min(MAX_INDENT);
-        i.stamp = stamp;
+        i.stamp = stamp.after(i.stamp);
         true
+    }
+
+    /// Renames the list, stamping the title.
+    pub fn rename(&mut self, title: &str, stamp: Stamp) {
+        self.title = clip(title.trim(), MAX_TITLE);
+        self.title_stamp = stamp.after(self.title_stamp);
+    }
+
+    /// Leaves out of a copy from elsewhere whatever is stamped more than
+    /// [`MAX_AHEAD_MS`] after `now`: such items, and the title's stamp (so
+    /// any other title wins over it).
+    pub fn drop_future(&mut self, now: u64) {
+        let limit = now.saturating_add(MAX_AHEAD_MS);
+        if self.title_stamp.ms > limit {
+            self.title_stamp = Stamp::default();
+        }
+        self.items.retain(|i| i.stamp.ms <= limit);
     }
 
     /// Adds an item after `after`; returns its id, or None if the list is
@@ -510,6 +542,41 @@ mod tests {
         other.items[0].deleted = false;
         assert!(!l.merge(&other));
         assert_eq!(l.items().len(), MAX_ITEMS);
+    }
+
+    #[test]
+    fn stamps_from_the_future_never_win() {
+        let now = 1_000_000;
+        let mut ours = List {
+            id: [5; 16],
+            title: "Trip".into(),
+            title_stamp: st(now - 10, 1),
+            ..List::default()
+        };
+        let x = ours.add(None, "tickets", false, st(now - 10, 1)).unwrap();
+        // A member stamps their change as far ahead as it goes.
+        let mut theirs = ours.clone();
+        theirs.title = "PWNED".into();
+        theirs.title_stamp = st(u64::MAX, 2);
+        theirs.items[0].text = "nothing".into();
+        theirs.items[0].stamp = st(u64::MAX, 2);
+        theirs.drop_future(now);
+        assert!(!ours.merge(&theirs));
+        assert_eq!(ours.title, "Trip");
+        assert_eq!(ours.items()[0].text, "tickets");
+
+        // A clock somewhat ahead is taken, and the next change here still
+        // beats it.
+        let mut ahead = ours.clone();
+        ahead.change(x, st(now + 60_000, 2), |i| i.text = "visas".into());
+        ahead.rename("Holiday", st(now + 60_000, 2));
+        ahead.drop_future(now);
+        assert!(ours.merge(&ahead));
+        assert_eq!(ours.title, "Holiday");
+        assert!(ours.change(x, st(now, 1), |i| i.done = true));
+        ours.rename("Trip", st(now, 1));
+        assert!(ahead.merge(&ours));
+        assert!(ahead.items()[0].done && ahead.title == "Trip");
     }
 
     #[test]

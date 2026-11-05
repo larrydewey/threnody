@@ -129,8 +129,7 @@ impl ThrenodyNode {
             return Err(fail("a list needs a name"));
         }
         self.change_list(&id, |l, s| {
-            l.title = title;
-            l.title_stamp = s;
+            l.rename(&title, s);
             true
         })?;
         Ok(())

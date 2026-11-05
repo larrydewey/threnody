@@ -369,13 +369,14 @@ impl Node {
             Ok(true)
         })
         .and_then(|()| finish(&dec));
-        let Some(list) = ok
+        let Some(mut list) = ok
             .ok()
             .and(required(l, "list").ok())
             .and_then(|b| List::decode(&b).ok())
         else {
             return;
         };
+        list.drop_future(now_ms());
         let id = list.id;
         let changed = {
             let mut ls = lock(&self.shared.lists);
@@ -421,7 +422,8 @@ impl Node {
         from: PublicIdentity,
         bytes: &[u8],
     ) -> Option<(Vec<u8>, Vec<[u8; 16]>)> {
-        let list = List::decode(bytes).ok()?;
+        let mut list = List::decode(bytes).ok()?;
+        list.drop_future(now_ms());
         let id = list.id;
         let (changed, new) = {
             let mut ls = lock(&self.shared.lists);
