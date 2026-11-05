@@ -602,3 +602,67 @@ async fn lists_are_shared_and_edited_together() {
     })
     .await;
 }
+
+/// Pumps every node for `d`, letting traffic settle.
+async fn settle(ns: &mut [&mut N], d: Duration) {
+    let end = tokio::time::Instant::now() + d;
+    while tokio::time::Instant::now() < end {
+        for n in ns.iter_mut() {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_device_that_leaves_a_group_stays_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = approve(&mut bob, &mut laptop).await;
+    let pid = phone.node.identity();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[0].node.account_of(&pid).is_some()
+    })
+    .await;
+
+    // Bob invites the account: both devices join directly.
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+
+    // The phone leaves; everyone sees it go.
+    phone.groups.leave(&phone.node, &g).unwrap();
+    let member = |n: &N| {
+        n.groups
+            .list()
+            .iter()
+            .any(|(x, .., m)| *x == g && m.contains(&pid))
+    };
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        !ns[2].in_group(&g) && !member(ns[0]) && !member(ns[1])
+    })
+    .await;
+
+    // The phone and the laptop meet again: the phone isn't put back.
+    phone.node.disconnect(&laptop.node.identity());
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].node.sessions().iter().all(|s| s.peer != pid)
+    })
+    .await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(!phone.in_group(&g), "the phone rejoined a group it left");
+    assert!(!member(&bob) && !member(&laptop));
+}
