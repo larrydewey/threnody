@@ -525,6 +525,26 @@ impl Node {
         match &calls.current {
             // The same offer again (resent over a new session): ring on.
             Some(c) if c.info.call == id => return,
+            // Glare: we're calling them as they call us. Both sides keep
+            // the call with the higher id, so ours rings there, or theirs
+            // rings here and ours gives way.
+            Some(c)
+                if c.info.peer == peer
+                    && c.info.outgoing
+                    && matches!(c.info.phase, Phase::Calling | Phase::Ringing) =>
+            {
+                let ours = c.info.call;
+                if ours > id {
+                    return;
+                }
+                drop(calls);
+                self.end_call(ours, HangupReason::Ended, true);
+                calls = lock(&self.shared.calls);
+                if calls.current.is_some() {
+                    drop(calls);
+                    return reply(HangupReason::Busy);
+                }
+            }
             Some(_) => {
                 drop(calls);
                 return reply(HangupReason::Busy);

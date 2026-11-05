@@ -226,6 +226,89 @@ async fn declined_busy_and_requests() {
     assert!(bob.call().is_none(), "requests don't ring");
 }
 
+/// Alice and Bob call each other at the same moment: instead of both
+/// hearing "busy", the call with the higher id rings and the other gives
+/// way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_calls_settle_on_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let ((alice, mut arx), (bob, mut brx), _) = pair(&dir, true).await;
+    alice.accept_contact(&bob.identity());
+    let rt = tokio::runtime::Handle::current();
+    // Both offers must leave before either arrives: place them from two
+    // threads at once, and try again on the rare run where one landed
+    // first.
+    let (a_call, b_call) = 'glare: {
+        for _ in 0..10 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let place = |from: &Node, to: threnody_core::PublicIdentity| {
+                let (from, barrier, rt) = (from.clone(), barrier.clone(), rt.clone());
+                std::thread::spawn(move || {
+                    let _guard = rt.enter();
+                    barrier.wait();
+                    from.start_call(&to, false)
+                })
+            };
+            let a = place(&alice, bob.identity());
+            let b = place(&bob, alice.identity());
+            match (a.join().unwrap(), b.join().unwrap()) {
+                (Ok(a), Ok(b)) => break 'glare (a, b),
+                (a, b) => {
+                    for id in [a, b].into_iter().flatten() {
+                        alice.hangup_call(id);
+                        bob.hangup_call(id);
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    while arx.try_recv().is_ok() || brx.try_recv().is_ok() {}
+                }
+            }
+        }
+        panic!("the two offers never crossed");
+    };
+    let (winner, ((caller, crx), (callee, cerx))) = if a_call > b_call {
+        (a_call, ((&alice, &mut arx), (&bob, &mut brx)))
+    } else {
+        (b_call, ((&bob, &mut brx), (&alice, &mut arx)))
+    };
+    let loser = a_call.min(b_call);
+    // The callee's own call gives way, and the caller's rings.
+    let Event::CallEnded { call, by_us, .. } =
+        next(cerx, 10, |e| matches!(e, Event::CallEnded { .. })).await
+    else {
+        unreachable!()
+    };
+    assert!(call == loser && by_us);
+    next(
+        cerx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == winner),
+    )
+    .await;
+    next(
+        &mut *crx,
+        10,
+        |e| matches!(e, Event::CallRinging { call, .. } if *call == winner),
+    )
+    .await;
+    assert_eq!(caller.call().unwrap().call, winner);
+    callee.answer_call(winner, false).unwrap();
+    next(
+        &mut *crx,
+        10,
+        |e| matches!(e, Event::CallStarted { call, .. } if *call == winner),
+    )
+    .await;
+    // Nobody heard "busy", and the call holds.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for n in [caller, callee] {
+        let c = n.call().expect("still in the call");
+        assert!(c.call == winner && c.phase == CallPhase::Active);
+    }
+    while let Ok(e) = crx.try_recv() {
+        assert!(!matches!(e, Event::CallEnded { .. }), "{e:?}");
+    }
+}
+
 /// A call over a TCP session moves to QUIC (for datagrams) when both
 /// sides have a QUIC endpoint, and carries on there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
