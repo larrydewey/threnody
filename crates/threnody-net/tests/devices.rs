@@ -522,7 +522,7 @@ async fn a_device_that_was_away_cant_undo_deleting_or_unsharing_a_list() {
     use threnody_core::history::ConversationId;
     let dir = tempfile::tempdir().unwrap();
     let mut laptop = spawn(&dir, "laptop").await;
-    let mut phone = spawn(&dir, "phone").await;
+    let phone = spawn(&dir, "phone").await;
     let code = laptop.node.create_link_code(laptop.addr.clone());
     phone.node.link_with(&code).await.unwrap();
     next(&mut laptop.rx, |e| matches!(e, Event::DeviceLinked { .. })).await;

@@ -688,13 +688,15 @@ impl Node {
                         shared_ms: 0,
                     };
                     sl.shared_now();
+                    // Shared with us again since we deleted it, maybe.
+                    let deleted = ls.deleted.clone();
+                    ls.deleted.retain(|d| *d != id);
                     ls.lists.push(sl);
                     if !ls.fits_from(conv) || !self.save_lists(&ls) {
                         ls.lists.pop();
+                        ls.deleted = deleted;
                         return None;
                     }
-                    // Shared with us again since we deleted it.
-                    ls.deleted.retain(|d| *d != id);
                     true
                 }
                 None => return None,
@@ -792,6 +794,29 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(List::decode(&out[0].0).unwrap().title, "Trip 49");
         assert!(node.take_list_forwards().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_list_shared_again_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = node(&dir);
+        let group = ConversationId::Group([3; 16]);
+        let id = node.create_list("Trip").unwrap();
+        node.share_list(&id, group);
+        let l = node.list(&id).unwrap().list;
+        node.delete_list(&id);
+        assert_eq!(lock(&node.shared.lists).deleted, [id]);
+        // A member changes it: it's ours again, and our devices keep it.
+        let mallory = Identity::generate().public();
+        assert!(
+            node.on_shared_list(group, mallory, &l.encode().unwrap())
+                .is_some()
+        );
+        assert!(node.list(&id).is_some());
+        let home = Home::new(dir.path().join("alice"));
+        let identity = home.load_identity(None).unwrap();
+        let stored = home.load_state(&identity, STATE).unwrap().unwrap();
+        assert!(Lists::decode(&stored).deleted.is_empty());
     }
 
     #[test]
