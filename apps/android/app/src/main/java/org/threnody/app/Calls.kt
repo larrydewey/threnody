@@ -280,6 +280,8 @@ object Calls {
                 ongoing(ctx)
                 inCall(ctx, false)
                 ended = when {
+                    e.reason == "answered elsewhere" -> "Answered on another device"
+                    e.reason == "declined elsewhere" -> "Declined on another device"
                     e.reason == "declined" && !e.byUs -> "Declined"
                     e.reason == "busy" -> "Busy"
                     e.reason == "unanswered" && !e.byUs -> "No answer"

@@ -28,6 +28,7 @@ reason: 0 ended, 1 declined, 2 busy, 3 unanswered, 4 failed,
 ```
 
 - **Offer.** The caller picks a random non-zero 64-bit call id and a fresh 32-byte secret.
+- **Every device rings.** The caller sends the same offer to every device of the callee's account that it has a session with and whose `Hello` has `FEATURE_CALLS`, and to any such device whose session comes up while the call still rings. The first device to answer takes the call: the caller sends the others `hangup` with reason 5 (`answered elsewhere`), and from then on only the answering device counts. A decline from any device ends the call, and the caller sends the others reason 6 (`declined elsewhere`). Any other `hangup` from one ringing device (busy, say) only drops that device, while the rest ring on. A device of our own account is called alone. Apps don't log a call answered or declined on another device as missed.
 - **Ringing.** The callee says it is ringing. Offers from someone not accepted (a message request) never ring. They get no answer at all, so a stranger can't tell whether we're there.
 - **Busy.** An offer while a call is in progress gets `busy`.
 - **Both calling at once.** When two people call each other at the same moment, each receives the other's offer while its own still rings. Rather than both answering `busy`, both sides keep the call with the higher call id: its caller ignores the other offer, and the other side ends its own call (sending `hangup`) and rings with the offer it received.
@@ -103,7 +104,6 @@ Inside, WebRTC still runs DTLS-SRTP. Its certificate fingerprints travel only in
 
 - Video: switching cameras, screen sharing, hardware-texture rendering (frames are copied as RGBA), and a frame size limited to the path's QUIC datagrams before path MTU discovery.
 - Android: Telecom integration (`ConnectionService`: car audio, other calls, headset buttons).
-- Ringing every device of an account, with `answered elsewhere` and `declined elsewhere`.
 - Group calls.
 - Media over onion circuits.
 - A Tamarin model of the call key derivation.

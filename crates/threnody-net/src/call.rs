@@ -1,8 +1,10 @@
 //! Voice and video calls (Appendix Q): the call state machine and moving
 //! sealed media between the peers.
 //!
-//! One call at a time, with one device of the peer: an offer while we're
-//! in a call gets `Busy`. Offers from people we haven't accepted (message
+//! One call at a time. A call rings every device of the peer's account
+//! that we have a session with (and any that connects while it rings);
+//! the first to answer takes it, and the others are told it was answered
+//! elsewhere. An offer while we're in a call gets `Busy`. Offers from people we haven't accepted (message
 //! requests) never ring; they are declined silently, as a request's
 //! messages wait silently. Media rides QUIC datagrams when the session is
 //! over QUIC, and `AppMessage::Media` in the session stream otherwise
@@ -95,6 +97,9 @@ pub struct CallStats {
 struct Call {
     info: CallInfo,
     stats: CallStats,
+    /// Our outgoing call, until answered: the peer's devices that got the
+    /// offer and haven't turned it down. Empty otherwise.
+    offered: Vec<PublicIdentity>,
     /// The secret we contributed (offer or answer), and the offer's when
     /// we're the callee.
     secret: Zeroizing<[u8; 32]>,
@@ -106,6 +111,19 @@ struct Call {
     last_reaction_ms: u64,
     media_tx: Option<mpsc::Sender<(u8, Vec<u8>)>>,
     media_rx: Option<mpsc::Receiver<(u8, Vec<u8>)>>,
+}
+
+impl Call {
+    /// Whether `device` speaks for the other side of this call: before an
+    /// outgoing call is answered, any device we offered it to; after, only
+    /// the one that answered (or, incoming, the one that called).
+    fn from(&self, device: &PublicIdentity) -> bool {
+        if self.offered.is_empty() {
+            self.info.peer == *device
+        } else {
+            self.offered.contains(device)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -133,11 +151,14 @@ impl Node {
     /// call; a relayed one moves to a direct path later if it can (see
     /// `upgrade_path`). It gives up after [`CALL_REACH_TIMEOUT`].
     pub async fn reach_for_call(&self, peer: &PublicIdentity) -> Result<()> {
-        let connected = || self.sessions().iter().any(|s| s.peer == *peer);
+        let devices = self.call_devices(peer);
+        let connected = || self.sessions().iter().any(|s| devices.contains(&s.peer));
         if connected() {
             return Ok(());
         }
-        self.seek(peer);
+        for d in &devices {
+            self.seek(d);
+        }
         let dial = {
             let (node, peer) = (self.clone(), *peer);
             tokio::spawn(async move { node.reach_peer(&peer).await })
@@ -178,16 +199,43 @@ impl Node {
         Ok(())
     }
 
-    /// Calls `peer`, which must be connected and support calls. Returns
+    /// `peer` and the other devices of its account: all of them ring when
+    /// we call. Just `peer` for our own devices.
+    fn call_devices(&self, peer: &PublicIdentity) -> Vec<PublicIdentity> {
+        match self.account_of(peer) {
+            Some(a) if !self.is_own_device(peer) => {
+                let mut out: Vec<_> = a.state().devices.iter().map(|(d, _)| *d).collect();
+                if !out.contains(peer) {
+                    out.push(*peer);
+                }
+                out
+            }
+            _ => vec![*peer],
+        }
+    }
+
+    /// Calls `peer`, which must be connected and support calls, ringing
+    /// every connected device of its account that takes calls. Returns
     /// the call id; [`Event::CallRinging`], [`Event::CallStarted`] or
     /// [`Event::CallEnded`] follow.
     pub fn start_call(&self, peer: &PublicIdentity, video: bool) -> Result<u64> {
-        if !self.sessions().iter().any(|s| s.peer == *peer) {
+        let live: Vec<PublicIdentity> = {
+            let sessions = self.sessions();
+            self.call_devices(peer)
+                .into_iter()
+                .filter(|d| sessions.iter().any(|s| s.peer == *d))
+                .collect()
+        };
+        if live.is_empty() {
             return Err(NetError::NotAllowed(
                 "calls need a connection to them".into(),
             ));
         }
-        if !self.supports(peer, FEATURE_CALLS) {
+        let offered: Vec<PublicIdentity> = live
+            .into_iter()
+            .filter(|d| self.supports(d, FEATURE_CALLS))
+            .collect();
+        if offered.is_empty() {
             return Err(NetError::NotAllowed("their app can't take calls".into()));
         }
         let mut calls = lock(&self.shared.calls);
@@ -201,16 +249,31 @@ impl Node {
             }
         };
         let secret = Zeroizing::new(random_bytes::<32>());
-        let offer = CallMsg::Offer {
-            call: id,
-            secret: *secret,
-            video,
+        let offer = AppMessage::Call(
+            CallMsg::Offer {
+                call: id,
+                secret: *secret,
+                video,
+            }
+            .encode()?,
+        );
+        let offered: Vec<PublicIdentity> = offered
+            .into_iter()
+            .filter(|d| self.send(d, offer.clone()).is_ok())
+            .collect();
+        if offered.is_empty() {
+            return Err(NetError::Closed);
+        }
+        let shown = if offered.contains(peer) {
+            *peer
+        } else {
+            offered[0]
         };
-        self.send(peer, AppMessage::Call(offer.encode()?))?;
         calls.current = Some(Call {
+            offered,
             info: CallInfo {
                 call: id,
-                peer: *peer,
+                peer: shown,
                 outgoing: true,
                 phase: Phase::Calling,
                 video,
@@ -426,7 +489,7 @@ impl Node {
             CallMsg::Ringing { .. } => {
                 let mut calls = lock(&self.shared.calls);
                 if let Some(c) = calls.current.as_mut().filter(|c| {
-                    c.info.call == id && c.info.peer == peer && c.info.phase == Phase::Calling
+                    c.info.call == id && c.from(&peer) && c.info.phase == Phase::Calling
                 }) {
                     c.info.phase = Phase::Ringing;
                     drop(calls);
@@ -437,11 +500,17 @@ impl Node {
                 let mut calls = lock(&self.shared.calls);
                 let Some(c) = calls.current.as_mut().filter(|c| {
                     c.info.call == id
-                        && c.info.peer == peer
+                        && c.from(&peer)
                         && matches!(c.info.phase, Phase::Calling | Phase::Ringing)
                 }) else {
                     return;
                 };
+                // This device takes the call; the others stop ringing.
+                let others: Vec<_> = std::mem::take(&mut c.offered)
+                    .into_iter()
+                    .filter(|d| *d != peer)
+                    .collect();
+                c.info.peer = peer;
                 c.keys = Some(MediaKeys::new(id, &c.secret, &secret, true));
                 let (tx, rx) = mpsc::channel(MEDIA_QUEUE);
                 (c.media_tx, c.media_rx) = (Some(tx), Some(rx));
@@ -450,6 +519,7 @@ impl Node {
                 c.info.answered_ms = now_ms();
                 c.last_rx_ms = now_ms();
                 drop(calls);
+                self.tell_hangup(id, &others, HangupReason::AnsweredElsewhere);
                 self.upgrade_for_media(peer);
                 self.emit(Event::CallStarted {
                     peer,
@@ -458,9 +528,27 @@ impl Node {
                 });
             }
             CallMsg::Hangup { reason, .. } => {
-                if self.call().is_some_and(|c| c.call == id && c.peer == peer) {
-                    self.end_call(id, reason, false);
+                let mut calls = lock(&self.shared.calls);
+                let Some(c) = calls
+                    .current
+                    .as_mut()
+                    .filter(|c| c.info.call == id && c.from(&peer))
+                else {
+                    return;
+                };
+                // One of several ringing devices is busy or gave up: the
+                // others ring on. A decline on any of them ends the call.
+                if c.offered.len() > 1 && reason != HangupReason::Declined {
+                    c.offered.retain(|d| *d != peer);
+                    if c.info.peer == peer {
+                        c.info.peer = c.offered[0];
+                    }
+                    return;
                 }
+                let others: Vec<_> = c.offered.iter().filter(|d| **d != peer).copied().collect();
+                drop(calls);
+                self.end_call(id, reason, false);
+                self.tell_hangup(id, &others, HangupReason::DeclinedElsewhere);
             }
             CallMsg::Signal { data, .. } => {
                 if self
@@ -497,7 +585,7 @@ impl Node {
                 if let Some(c) = calls
                     .current
                     .as_mut()
-                    .filter(|c| c.info.call == id && c.info.peer == peer)
+                    .filter(|c| c.info.call == id && c.from(&peer))
                 {
                     c.info.peer_video = video;
                     drop(calls);
@@ -529,7 +617,7 @@ impl Node {
             // the call with the higher id, so ours rings there, or theirs
             // rings here and ours gives way.
             Some(c)
-                if c.info.peer == peer
+                if c.from(&peer)
                     && c.info.outgoing
                     && matches!(c.info.phase, Phase::Calling | Phase::Ringing) =>
             {
@@ -552,6 +640,7 @@ impl Node {
             None => {}
         }
         calls.current = Some(Call {
+            offered: Vec::new(),
             info: CallInfo {
                 call: id,
                 peer,
@@ -620,9 +709,13 @@ impl Node {
             }
         };
         let Some(c) = ended else { return };
-        // Tracked: if the session drops now, the next one still says so.
-        if tell && let Ok(m) = (CallMsg::Hangup { call: id, reason }).encode() {
-            let _ = self.send_tracked(&c.info.peer, AppMessage::Call(m));
+        if tell {
+            let to = if c.offered.is_empty() {
+                vec![c.info.peer]
+            } else {
+                c.offered.clone()
+            };
+            self.tell_hangup(id, &to, reason);
         }
         self.emit(Event::CallEnded {
             peer: c.info.peer,
@@ -630,6 +723,47 @@ impl Node {
             reason,
             by_us: tell,
         });
+    }
+
+    /// Tells `devices` call `id` is over for them. Tracked: if the session
+    /// drops now, the next one still says so.
+    fn tell_hangup(&self, id: u64, devices: &[PublicIdentity], reason: HangupReason) {
+        let Ok(m) = (CallMsg::Hangup { call: id, reason }).encode() else {
+            return;
+        };
+        for d in devices {
+            let _ = self.send_tracked(d, AppMessage::Call(m.clone()));
+        }
+    }
+
+    /// A session with `device` just came up (its features are known):
+    /// if our call to its account is still ringing, it rings there too.
+    pub(crate) fn offer_to_late_device(&self, device: &PublicIdentity) {
+        if !self.supports(device, FEATURE_CALLS) {
+            return;
+        }
+        let mut calls = lock(&self.shared.calls);
+        let Some(c) = calls.current.as_mut().filter(|c| {
+            c.info.outgoing
+                && matches!(c.info.phase, Phase::Calling | Phase::Ringing)
+                && !c.offered.is_empty()
+                && !c.offered.contains(device)
+        }) else {
+            return;
+        };
+        if !self.call_devices(&c.info.peer).contains(device) {
+            return;
+        }
+        let offer = CallMsg::Offer {
+            call: c.info.call,
+            secret: *c.secret,
+            video: c.info.video,
+        };
+        if let Ok(m) = offer.encode()
+            && self.send(device, AppMessage::Call(m)).is_ok()
+        {
+            c.offered.push(*device);
+        }
     }
 
     /// Ends call `id` when it rings unanswered too long, or when its media
