@@ -111,7 +111,7 @@ op: 1 get key, 2 key, 3 get document, 4 document, 5 token request, 6 token,
     7 register, 8 registered (status 1 listed, 2 pending review), 9 refused
 ```
 
-A node answers at most 12 requests per anonymous link per minute and ignores the rest: every answer, a document or key of several kilobytes, waits for the link's cover ticks, so a stream of tiny requests would otherwise pile answers up without end. Any anonymous link with more than 4096 messages waiting is closed.
+A node answers at most 12 requests per anonymous link per minute and ignores the rest: every answer, a document or key of several kilobytes, waits for the link's cover ticks, so a stream of tiny requests would otherwise pile answers up without end. An anonymous link holds at most 1024 waiting cells of one circuit and 4096 waiting messages in all. A volunteer's links carry many people's circuits, so when a link is that far behind, the circuit with the most cells waiting is torn down (in both directions, its waiting cells dropped) and the link carries on; only a link filled by directory messages alone is closed.
 
 A volunteer registers with every subscribed directory over an anonymous link, as itself. The directory checks that the descriptor verifies and is current, and accepts at most 8 registrations per network per day. It then dials one of the descriptor's addresses over a fresh anonymous link, expecting the relay's identity. Only a relay that answers is listed, at once or after the operator's review (`--review-relays`, then `/directory list <relay>`).
 

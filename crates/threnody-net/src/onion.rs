@@ -164,6 +164,28 @@ impl OnionMsg {
 
 type Link = (PublicIdentity, u64);
 
+/// The circuit an encoded onion message is for, read without copying its
+/// cell.
+pub(crate) fn circ_of(b: &[u8]) -> Option<u64> {
+    let mut dec = Decoder::new(b);
+    let mut circ = None;
+    read_map(&mut dec, |k, d| {
+        if k == 1 {
+            circ = Some(d.u64()?);
+            return Ok(true);
+        }
+        Ok(false)
+    })
+    .ok()?;
+    circ
+}
+
+/// Tests only: an encoded DESTROY for `circ`.
+#[cfg(test)]
+pub(crate) fn test_destroy(circ: u64) -> Vec<u8> {
+    OnionMsg::Destroy { circ }.encode().unwrap()
+}
+
 /// One hop of a circuit we build.
 #[derive(Clone, Debug)]
 pub(crate) struct Hop {
@@ -872,6 +894,14 @@ impl Node {
         for l in links {
             self.onion_destroy(l, true);
         }
+    }
+
+    /// Circuit `link` has more cells waiting on its anonymous link than the
+    /// link can carry: it ends in both directions (its waiting cells are
+    /// gone), and the link carries on for its other circuits.
+    pub(crate) fn onion_overflowed(&self, link: Link) {
+        self.onion_send_via(&link.0, &OnionMsg::Destroy { circ: link.1 }, true);
+        self.onion_destroy(link, true);
     }
 
     /// Whether any circuit uses a link to `peer` (keeps anonymous links open).
