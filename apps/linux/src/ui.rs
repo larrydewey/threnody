@@ -125,7 +125,12 @@ pub fn choose(
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
     for (i, o) in options.iter().enumerate() {
-        let row = adw::ActionRow::builder().title(o).activatable(true).build();
+        // Options are plain text (often names others chose), and a row
+        // reads its title as markup.
+        let row = adw::ActionRow::builder()
+            .title(glib::markup_escape_text(o))
+            .activatable(true)
+            .build();
         if current == Some(i) {
             row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
         }
