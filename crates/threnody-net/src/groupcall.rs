@@ -267,8 +267,14 @@ impl Node {
         c.info.joined = true;
         c.info.video = video;
         let peers: Vec<_> = c.info.participants.iter().map(|(p, _)| *p).collect();
+        for p in &peers {
+            add_leg(c, &me, *p);
+        }
+        drop(gc);
+        // Media wants datagrams: legs over TCP sessions we dialed move to
+        // QUIC, as a one-to-one call's do.
         for p in peers {
-            add_leg(c, &me, p);
+            self.upgrade_for_media(p);
         }
         Ok(())
     }
@@ -307,8 +313,12 @@ impl Node {
         }
         let group = c.info.group;
         drop(gc);
-        // Try for a session of our own with it, where we can.
+        // Try for a session of our own with it, where we can, and one
+        // with datagrams.
         self.seek(&device);
+        if joined {
+            self.upgrade_for_media(device);
+        }
         self.emit(Event::GroupCallMember {
             group,
             call,

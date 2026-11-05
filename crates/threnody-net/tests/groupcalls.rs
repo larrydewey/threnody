@@ -232,3 +232,28 @@ async fn a_leg_goes_through_whoever_is_linked_to_both() {
     assert!(s.send_leg_media(CALL, &bi, 3, b"s to b").unwrap());
     assert_eq!(recv(&mut b_from_s).await, Some((3, b"s to b".to_vec())));
 }
+
+/// A leg over a TCP session we dialed moves to QUIC for datagrams, as a
+/// one-to-one call's does (over TCP, one late packet stalls the rest).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_call_legs_over_tcp_move_to_quic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _arx) = node(&dir, "a");
+    let (b, _brx) = node(&dir, "b");
+    a.listen_quic("127.0.0.1:0").await.unwrap();
+    let tcp = b.listen("127.0.0.1:0").await.unwrap();
+    b.listen_quic(&tcp.to_string()).await.unwrap();
+    let bi = a.connect(&tcp.to_string(), None).await.unwrap();
+    assert!(!a.media_datagrams(&bi));
+
+    b.start_group_call(GROUP, CALL, BASE, false).unwrap();
+    assert!(a.group_call_rang(GROUP, CALL, bi, BASE, false));
+    a.join_group_call(CALL, false).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !a.media_datagrams(&bi) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the leg's session moved to QUIC");
+}

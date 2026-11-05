@@ -124,6 +124,7 @@ A pair without a session sends its packets to a participant R that it reaches an
 
 ### Media
 
+- A leg over a direct TCP session that we dialed moves to QUIC, as a two-person call does (*Moving to QUIC* above), so its media goes as datagrams.
 - One WebRTC session runs per leg. They share the microphone (the platform audio device is reference-counted) and one camera source, so each camera frame feeds every leg.
 - Each participant uploads one stream per other participant, so the video uplink is divided among the legs: 700 kbit/s for one leg, down to 150 kbit/s each.
 - A leg with no media for 30 s drops that participant from our view of the call. They come back by joining again.

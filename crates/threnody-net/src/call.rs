@@ -465,7 +465,7 @@ impl Node {
     /// as datagrams. The new session replaces the TCP one; the call, whose
     /// keys aren't the session's, carries on. Only the dialer does this, so
     /// the two sides never race.
-    fn upgrade_for_media(&self, peer: PublicIdentity) {
+    pub(crate) fn upgrade_for_media(&self, peer: PublicIdentity) {
         let Some(s) = self
             .sessions()
             .into_iter()
