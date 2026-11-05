@@ -467,7 +467,7 @@ fn key_packages_for_unanswered_invitations_are_bounded() {
     net.node(&pb).accept_invite(&[0; 16], pa).unwrap();
     let one = size(&mut net) - base;
 
-    // Asking again for the same group replaces the key package.
+    // Asking again for the same group answers with the same key package.
     for _ in 0..10 {
         net.node(&pb).accept_invite(&[0; 16], pa).unwrap();
     }
@@ -494,6 +494,33 @@ fn key_packages_for_unanswered_invitations_are_bounded() {
             .iter()
             .any(|e| matches!(e, GroupEvent::Joined { .. }))
     );
+}
+
+#[test]
+fn a_welcome_built_from_the_first_of_several_answers_still_opens() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let g = net.node(&pa).create("team").unwrap();
+    // Alice asks twice (two of Bob's devices asked her to add a third,
+    // say) and Bob answers both; she adds him with the first answer.
+    net.node(&pa).invite(&g, pb).unwrap();
+    net.node(&pa).invite(&g, pb).unwrap();
+    let first = net.node(&pb).accept_invite(&g, pa).unwrap().send[0]
+        .wire
+        .clone();
+    let second = net.node(&pb).accept_invite(&g, pa).unwrap().send[0]
+        .wire
+        .clone();
+    let out = net.node(&pa).handle(pb, first).unwrap();
+    assert!(net.node(&pa).handle(pb, second).is_err());
+    let w = out.send.into_iter().find(|o| o.to == pb).unwrap().wire;
+    let res = net.node(&pb).handle(pa, w).unwrap();
+    assert!(res.events.contains(&GroupEvent::Joined {
+        group: g,
+        name: "team".into(),
+        owner: pa
+    }));
 }
 
 #[test]

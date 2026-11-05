@@ -553,8 +553,47 @@ impl Groups {
         })
     }
 
-    /// Consents to an invitation: sends `peer` a fresh key package.
+    /// Consents to an invitation: sends `peer` a key package for it.
     pub fn accept_invite(&mut self, group: &GroupId, peer: PublicIdentity) -> Result<Output> {
+        // The inviter may ask more than once before the add completes, and
+        // adds us with whichever answer reaches it first, so every answer
+        // to the same invitation is the same key package.
+        let unanswered = self
+            .key_packages
+            .iter()
+            .find(|(g, p, _)| g == group && *p == peer)
+            .map(|(.., kp)| kp.clone());
+        let stored = match unanswered {
+            Some(kp) => self
+                .provider
+                .storage()
+                .key_package::<_, KeyPackageBundle>(&kp)
+                .map_err(mls)?,
+            None => None,
+        };
+        let key_package = match stored {
+            Some(bundle) if bundle.key_package().life_time().validate().is_ok() => {
+                bundle.key_package().clone()
+            }
+            _ => self.new_key_package(group, peer)?,
+        };
+        let key_package = MlsMessageOut::from(key_package)
+            .tls_serialize_detached()
+            .map_err(mls)?;
+        Ok(Output {
+            send: vec![Outgoing {
+                to: peer,
+                wire: GroupWire::KeyPackage {
+                    group: *group,
+                    key_package,
+                },
+            }],
+            events: vec![],
+        })
+    }
+
+    /// Makes and stores a key package for `peer`'s invitation to `group`.
+    fn new_key_package(&mut self, group: &GroupId, peer: PublicIdentity) -> Result<KeyPackage> {
         let bundle = KeyPackage::builder()
             .build(
                 CIPHERSUITE,
@@ -578,19 +617,7 @@ impl Groups {
                 .delete_key_package(&kp)
                 .map_err(mls)?;
         }
-        let key_package = MlsMessageOut::from(bundle.key_package().clone())
-            .tls_serialize_detached()
-            .map_err(mls)?;
-        Ok(Output {
-            send: vec![Outgoing {
-                to: peer,
-                wire: GroupWire::KeyPackage {
-                    group: *group,
-                    key_package,
-                },
-            }],
-            events: vec![],
-        })
+        Ok(bundle.key_package().clone())
     }
 
     /// Deletes the key packages `which` picks, which no Welcome will need.
