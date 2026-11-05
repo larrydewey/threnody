@@ -45,6 +45,8 @@ class CallActivity : Activity() {
     /** A group call's participants, a tile each. */
     private lateinit var tiles: android.widget.GridLayout
     private val tileViews = mutableMapOf<String, ImageView>()
+    /** Whether each tile's participant sent video at the last refresh. */
+    private val tileVideo = mutableMapOf<String, Boolean>()
     private lateinit var local: TextureView
     private var unlisten: (() -> Unit)? = null
     private var unlistenReactions: (() -> Unit)? = null
@@ -391,6 +393,7 @@ class CallActivity : Activity() {
         if (who != tileViews.keys.sorted()) {
             tiles.removeAllViews()
             tileViews.clear()
+            tileVideo.clear()
             // Upright, two people stack (each tile keeps a camera's shape);
             // sideways, they sit side by side. More make a grid.
             val upright = resources.configuration.orientation ==
@@ -424,9 +427,12 @@ class CallActivity : Activity() {
                 tileViews[d] = picture
             }
         }
-        // Without video, a tile shows just the name.
+        // When someone turns their video off, their tile goes back to just
+        // the name (only then: clearing on every refresh made pictures flicker).
         for ((d, picture) in tileViews) {
-            if (c.members[d] != true) picture.setImageDrawable(null)
+            val sends = c.members[d] == true
+            if (tileVideo[d] == true && !sends) picture.setImageDrawable(null)
+            tileVideo[d] = sends
         }
     }
 

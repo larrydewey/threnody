@@ -147,10 +147,21 @@ fn main() {
                 device,
                 joined,
                 ..
-            } => println!(
-                "group call {call:x}: {device} {}",
-                if joined { "joined" } else { "left" }
-            ),
+            } => {
+                println!(
+                    "group call {call:x}: {device} {}",
+                    if joined { "joined" } else { "left" }
+                );
+                // Alone in it: leave, so the next call rings.
+                if !joined
+                    && node
+                        .current_group_call()
+                        .is_some_and(|c| c.participants.is_empty())
+                {
+                    println!("group call {call:x}: alone, leaving");
+                    node.leave_group_call();
+                }
+            }
             NodeEvent::GroupCallEnded { call, .. } => println!("group call {call:x} ended"),
             NodeEvent::GroupMembersChanged {
                 group: g, added, ..

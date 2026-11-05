@@ -304,7 +304,11 @@ object Calls {
                 ring(ctx)
             }
             is NodeEvent.GroupCallMember -> update(e.call) {
-                val members = if (e.joined) it.members + (e.device to (it.members[e.device] ?: false))
+                // Whether a newcomer sends video is the node's to say.
+                val sends = try {
+                    node.currentGroupCall()?.participants?.firstOrNull { p -> p.device == e.device }?.video
+                } catch (_: Exception) { null }
+                val members = if (e.joined) it.members + (e.device to (sends ?: it.members[e.device] ?: false))
                     else it.members - e.device
                 // Someone joined the call we started: it's under way.
                 val state = if (e.joined && it.state == "calling") "connecting" else it.state
