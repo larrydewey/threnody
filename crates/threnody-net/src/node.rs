@@ -27,6 +27,7 @@ use crate::account::LinkState;
 use crate::delivery::{Delivery, Tag, trackable};
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
+use crate::gate::Source;
 use crate::handshake;
 use crate::mailbox::MailboxStore;
 use crate::onion::OnionState;
@@ -487,6 +488,8 @@ pub(crate) struct Shared {
     pub(crate) recover: crate::recover::RecoverState,
     /// Anonymous links (see `anon`).
     pub(crate) anon: Mutex<crate::anon::AnonState>,
+    /// Inbound connections still in their handshake (see `gate`).
+    pub(crate) inbound: crate::gate::Gate,
     /// Directories, volunteering and relay tokens (see `volunteer`).
     pub(crate) volunteer: crate::volunteer::VolunteerState,
     /// Credentials held and exchanges in progress (see `cred`).
@@ -684,6 +687,7 @@ impl Node {
             reach: crate::reach::ReachState::new(!persona),
             recover: crate::recover::RecoverState::new(),
             anon: Mutex::default(),
+            inbound: crate::gate::Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE),
             volunteer: crate::volunteer::VolunteerState::new(),
             creds: Mutex::default(),
             calls: Mutex::default(),
@@ -888,11 +892,23 @@ impl Node {
                     a = listener.accept() => a,
                     () = &mut closed => break,
                 };
-                let Ok((stream, peer_addr)) = accepted else {
+                let (stream, peer_addr) = match accepted {
+                    Ok(a) => a,
+                    Err(_) => {
+                        // Most likely out of file descriptors. The listener
+                        // stays ready, so accepting again at once would spin.
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                // Over the limit the connection closes at once, before it
+                // holds anything for long.
+                let Some(pass) = node.shared.inbound.enter(Source::ip(peer_addr.ip())) else {
                     continue;
                 };
                 let node = node.clone();
                 tokio::spawn(async move {
+                    let _pass = pass;
                     if let Err(e) = node.run_inbound(stream, peer_addr).await {
                         node.shared.emit(Event::Rejected {
                             addr: peer_addr,
@@ -1027,6 +1043,11 @@ impl Node {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let _pass = self
+            .shared
+            .inbound
+            .enter(Source::Link)
+            .ok_or_else(|| NetError::Refused("too many links in their handshake".into()))?;
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
         self.check_policy(chan.peer())?;
         let peer = *chan.peer();
@@ -1706,6 +1727,8 @@ where
                             pending.push_back(AppMessage::Observed { addr });
                         }
                     }
+                    // The id of a tracked message delivered for the first time.
+                    let mut tracked = None;
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
                             // Acknowledge every copy (the last ack may have
@@ -1714,7 +1737,9 @@ where
                                 Some(AppMessage::Ack(ids)) if ids.len() < MAX_ACK_IDS => ids.push(id),
                                 _ => pending.push_back(AppMessage::Ack(vec![id])),
                             }
-                            shared.delivery(|d| d.first_delivery(&peer, id)).then_some(*inner)
+                            let first = shared.delivery(|d| d.first_delivery(&peer, id));
+                            tracked = first.then_some(id);
+                            first.then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
                             for tag in shared.delivery(|d| d.acked(&peer, &ids)) {
@@ -1839,7 +1864,16 @@ where
                             }
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
-                            node.record_incoming(&peer, &msg, false);
+                            if !node.record_incoming(&peer, &msg, false)
+                                && let Some(id) = tracked
+                            {
+                                // Not stored (a full disk, no file descriptors
+                                // left): unacknowledged, it stays with the
+                                // sender, who sends it again.
+                                unack(&mut pending, id);
+                                shared.delivery(|d| d.undeliver(&peer, id));
+                                continue;
+                            }
                             if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
                                 shared.emit(Event::Message { peer, msg });
                             } else {
@@ -1896,6 +1930,16 @@ fn is_wireguard(d: &[u8]) -> bool {
     d.len() >= 32 && (1..=4).contains(&d[0]) && d[1..4] == [0, 0, 0]
 }
 
+/// Takes `id` back out of the acknowledgements waiting in `pending`.
+fn unack(pending: &mut VecDeque<AppMessage>, id: u64) {
+    for m in pending.iter_mut() {
+        if let AppMessage::Ack(ids) = m {
+            ids.retain(|x| *x != id);
+        }
+    }
+    pending.retain(|m| !matches!(m, AppMessage::Ack(ids) if ids.is_empty()));
+}
+
 /// Call signalling and media, and tunnel packets: sent at once even under
 /// constant-rate cover traffic.
 fn urgent(m: &AppMessage) -> bool {
@@ -1923,6 +1967,13 @@ fn ready(
         (m, _) => Ok(m),
     }
 }
+
+/// Inbound connections in their handshake at once, and from one source.
+/// Each can sit for the handshake timeout without sending a byte.
+const MAX_HANDSHAKING: usize = 256;
+const MAX_HANDSHAKING_PER_SOURCE: usize = 16;
+/// The pause after a failed accept (see `listen`).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long after a session starts its setup messages skip the cover-traffic
 /// schedule.

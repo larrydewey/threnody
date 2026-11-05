@@ -91,6 +91,10 @@ sig_I    = Sign(id_I, L("initiator signature") || L(h3) || L(id_I) || L(""))
 - **Forward secrecy.** The ephemeral hybrid key is discarded once the handshake finishes.
 - **Policy is out of band.** The handshake only reports the peer's identity. Deciding whether to trust it (TOFU, a pinned fingerprint from an invite, or approved-only) is up to the caller (`threnody-net::node`).
 
+## Limits
+
+Anyone who can reach a listener can start a handshake, and each one holds a socket until it finishes or times out (15 s). A node runs at most 256 inbound handshakes at once over TCP and radio links, 16 from one source. An IPv6 source counts by its /64, and radio links (Bluetooth, Wi-Fi Direct), which have no address, share one allowance. Over the limit a connection is closed at once. If accepting fails (usually because the process is out of file descriptors), the listener pauses for 100 ms instead of trying again at once. QUIC has its own limits (Appendix N, *Security*).
+
 ## Not yet done
 
 - Tamarin models of identity hiding (needs observational equivalence) and of suite negotiation. Secrecy, forward secrecy, KCI resistance, hybrid security and mutual authentication are already proved in [`proofs/handshake.spthy`](../proofs/README.md).

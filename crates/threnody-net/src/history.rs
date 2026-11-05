@@ -1159,6 +1159,7 @@ impl Node {
     }
 
     /// [`Node::record`] for an incoming message with the sender's id.
+    /// False if it couldn't be stored.
     #[allow(clippy::too_many_arguments)]
     pub fn record_with_id(
         &self,
@@ -1170,7 +1171,7 @@ impl Node {
         timer: Option<u32>,
         remote_id: u64,
         extras: Extras,
-    ) {
+    ) -> bool {
         if !outgoing {
             self.unarchive(conv);
         }
@@ -1197,10 +1198,15 @@ impl Node {
             forwarded: extras.forwarded,
             list: None,
         };
-        let _ = self
+        if let Err(e) = self
             .shared
             .home
-            .append_history(self.identity_ref(), conv, entry, now);
+            .append_history(self.identity_ref(), conv, entry, now)
+        {
+            eprintln!("threnody: failed to save history: {e}");
+            return false;
+        }
+        true
     }
 
     /// Records a file received from (or sent to) `peer`'s conversation,
@@ -1269,7 +1275,14 @@ impl Node {
     }
 
     /// Records an incoming text, adopting the sender's timer setting.
-    pub(crate) fn record_incoming(&self, from: &PublicIdentity, msg: &AppMessage, offline: bool) {
+    /// Records an incoming text in its conversation; false if it couldn't
+    /// be stored (other messages need nothing here).
+    pub(crate) fn record_incoming(
+        &self,
+        from: &PublicIdentity,
+        msg: &AppMessage,
+        offline: bool,
+    ) -> bool {
         let AppMessage::Text {
             body,
             expires_in_s,
@@ -1279,7 +1292,7 @@ impl Node {
             ..
         } = msg
         else {
-            return;
+            return true;
         };
         let conv = self.conversation_for(from);
         let lock = threnody_core::history::history_lock();
@@ -1307,7 +1320,7 @@ impl Node {
                 forwarded: *forwarded,
                 ..Extras::default()
             },
-        );
+        )
     }
 
     /// Starts the background sweep of expired history.
