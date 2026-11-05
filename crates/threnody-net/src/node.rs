@@ -287,6 +287,32 @@ pub enum Event {
         reason: threnody_core::call::HangupReason,
         by_us: bool,
     },
+    /// `from` started group call `call` in `group`, or is in it: it rings
+    /// here (join with [`Node::join_group_call`]).
+    GroupCallRinging {
+        group: [u8; 16],
+        call: u64,
+        from: PublicIdentity,
+    },
+    /// `device` joined or left group call `call`.
+    GroupCallMember {
+        group: [u8; 16],
+        call: u64,
+        device: PublicIdentity,
+        joined: bool,
+    },
+    /// `device` turned its video on or off in group call `call`.
+    GroupCallVideo {
+        group: [u8; 16],
+        call: u64,
+        device: PublicIdentity,
+        video: bool,
+    },
+    /// We left group call `call`, or it stopped ringing here.
+    GroupCallEnded {
+        group: [u8; 16],
+        call: u64,
+    },
     /// A peer changed the conversation's disappearing-message timer.
     TimerChanged {
         peer: PublicIdentity,
@@ -570,6 +596,7 @@ pub(crate) struct Shared {
     pub(crate) creds: Mutex<crate::cred::CredState>,
     /// The current voice or video call (see `call`).
     pub(crate) calls: Mutex<crate::call::CallState>,
+    pub(crate) group_calls: Mutex<crate::groupcall::GroupCallState>,
     /// Wake-up endpoints, ours and contacts' (see `push`).
     pub(crate) push: Mutex<crate::push::PushState>,
     /// Bytes of frames from untrusted peers read but not yet handled,
@@ -826,6 +853,7 @@ impl Node {
             volunteer: crate::volunteer::VolunteerState::new(),
             creds: Mutex::default(),
             calls: Mutex::default(),
+            group_calls: Mutex::default(),
             push: Mutex::default(),
             untrusted_held: AtomicUsize::new(0),
         };

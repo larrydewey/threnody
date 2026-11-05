@@ -1420,7 +1420,11 @@ impl Ui {
             | Event::CallSignal { .. }
             | Event::CallVideo { .. }
             | Event::CallReaction { .. }
-            | Event::CallEnded { .. } => {}
+            | Event::CallEnded { .. }
+            | Event::GroupCallRinging { .. }
+            | Event::GroupCallMember { .. }
+            | Event::GroupCallVideo { .. }
+            | Event::GroupCallEnded { .. } => {}
             Event::Typing { peer, active } => {
                 if active {
                     say!("* {} is typing", self.name(&peer));
