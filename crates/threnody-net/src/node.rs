@@ -1045,6 +1045,8 @@ impl Node {
     pub fn shutdown(&self) {
         self.shared.shutdown.send_replace(true);
         lock(&self.shared.sessions).clear();
+        // Relay tokens spent a moment ago, not saved yet.
+        self.save_seen();
     }
 
     pub(crate) fn is_closed(&self) -> bool {

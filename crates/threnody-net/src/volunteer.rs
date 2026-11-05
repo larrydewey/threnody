@@ -55,6 +55,14 @@ const STATE_SUBS: &str = "directories";
 const STATE_WALLET: &str = "relay-wallet";
 const STATE_SERVER: &str = "directory-server";
 const STATE_SEEN: &str = "relay-seen";
+/// Pseudonyms seen since `STATE_SEEN` was last written.
+const STATE_SEEN_RECENT: &str = "relay-seen-recent";
+/// Spent pseudonyms are saved this long after the first new one, together.
+const SEEN_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// Once this many wait in `STATE_SEEN_RECENT`, they are folded into
+/// `STATE_SEEN`: each save writes only the recent ones, and the whole set
+/// (up to a few MB on a busy relay) is rewritten only now and then.
+const SEEN_FOLD: usize = 256;
 
 struct Subscription {
     link: DirectoryLink,
@@ -95,6 +103,23 @@ struct Wallet {
 
 type Seen = HashMap<u32, HashSet<[u8; credential::PSEUDONYM_LEN]>>;
 
+/// Token pseudonyms seen today and yesterday.
+#[derive(Default)]
+struct Spent {
+    all: Seen,
+    /// Those not yet in the saved `STATE_SEEN`.
+    recent: Seen,
+    /// A save is due.
+    dirty: bool,
+}
+
+impl Spent {
+    fn prune(&mut self, today: u32) {
+        self.all.retain(|e, _| *e + 1 >= today);
+        self.recent.retain(|e, _| *e + 1 >= today);
+    }
+}
+
 struct DirServer {
     issuer: Issuer,
     review: bool,
@@ -117,7 +142,9 @@ pub(crate) struct VolunteerState {
     relay: Mutex<Option<Vec<String>>>,
     /// Token pseudonyms seen, by epoch (each opens one circuit). Saved, so
     /// a restart doesn't let spent slots pay again.
-    seen: Mutex<Seen>,
+    seen: Mutex<Spent>,
+    /// Held while spent pseudonyms are written, so saves land in order.
+    seen_save: Mutex<()>,
     server: Mutex<Option<DirServer>>,
     /// Route through volunteer relays when contacts can't (on by default).
     use_volunteers: AtomicBool,
@@ -146,7 +173,8 @@ impl VolunteerState {
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             relay: Mutex::new(None),
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::default(),
+            seen_save: Mutex::new(()),
             server: Mutex::new(None),
             use_volunteers: AtomicBool::new(true),
             threshold: AtomicUsize::new(0),
@@ -197,8 +225,23 @@ impl Node {
         if let Ok(Some(b)) = home.load_state(id, STATE_WALLET) {
             *lock(&self.vol().wallet) = decode_wallet(&b).unwrap_or_default();
         }
-        if let Ok(Some(b)) = home.load_state(id, STATE_SEEN) {
-            *lock(&self.vol().seen) = decode_seen(&b).unwrap_or_default();
+        {
+            let load = |name| {
+                home.load_state(id, name)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| decode_seen(&b).ok())
+                    .unwrap_or_default()
+            };
+            let (mut all, recent) = (load(STATE_SEEN), load(STATE_SEEN_RECENT));
+            for (epoch, nyms) in &recent {
+                all.entry(*epoch).or_default().extend(nyms);
+            }
+            *lock(&self.vol().seen) = Spent {
+                all,
+                recent,
+                dirty: false,
+            };
         }
         if let Ok(Some(b)) = home.load_state(id, STATE_SERVER)
             && let Ok(issuer) = Issuer::new(id, 0)
@@ -725,15 +768,57 @@ impl Node {
 
     /// Records a token pseudonym as spent in `epoch`; false if it was
     /// already.
+    /// It is saved a moment later, with any others spent meanwhile: the
+    /// circuit doesn't wait for the disk.
     fn spend_pseudonym(&self, epoch: u32, nym: [u8; credential::PSEUDONYM_LEN]) -> bool {
-        let mut seen = lock(&self.vol().seen);
-        let today = credential::day(now_ms());
-        seen.retain(|e, _| *e + 1 >= today);
-        let fresh = seen.entry(epoch).or_default().insert(nym);
-        if fresh {
-            self.shared.save_state(STATE_SEEN, encode_seen(&seen));
+        let schedule = {
+            let mut seen = lock(&self.vol().seen);
+            seen.prune(credential::day(now_ms()));
+            if !seen.all.entry(epoch).or_default().insert(nym) {
+                return false;
+            }
+            seen.recent.entry(epoch).or_default().insert(nym);
+            !std::mem::replace(&mut seen.dirty, true)
+        };
+        if schedule {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    let node = self.clone();
+                    rt.spawn(async move {
+                        tokio::time::sleep(SEEN_SAVE_DELAY).await;
+                        let _ = tokio::task::spawn_blocking(move || node.save_seen()).await;
+                    });
+                }
+                Err(_) => self.save_seen(),
+            }
         }
-        fresh
+        true
+    }
+
+    /// Saves the pseudonyms spent since the last save, if any: on their
+    /// own, or, once there are enough of them, folded into the whole set.
+    pub(crate) fn save_seen(&self) {
+        let _order = lock(&self.vol().seen_save);
+        let (all, recent) = {
+            let mut seen = lock(&self.vol().seen);
+            if !std::mem::take(&mut seen.dirty) {
+                return;
+            }
+            seen.prune(credential::day(now_ms()));
+            let count: usize = seen.recent.values().map(HashSet::len).sum();
+            if count >= SEEN_FOLD {
+                seen.recent.clear();
+                (Some(encode_seen(&seen.all)), encode_seen(&seen.recent))
+            } else {
+                (None, encode_seen(&seen.recent))
+            }
+        };
+        // The whole set first: until the recent ones are cleared on disk
+        // too, loading takes both.
+        if let Some(all) = all {
+            self.shared.save_state(STATE_SEEN, all);
+        }
+        self.shared.save_state(STATE_SEEN_RECENT, recent);
     }
 
     // ----- Directory server -----
@@ -1287,6 +1372,64 @@ mod tests {
         let v = open(false);
         assert!(!v.spend_pseudonym(today, nym));
         assert!(v.spend_pseudonym(today, [8u8; credential::PSEUDONYM_LEN]));
+    }
+
+    #[tokio::test]
+    async fn spent_pseudonyms_are_saved_in_batches_off_the_circuit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |create: bool| {
+            let home = threnody_core::store::Home::new(dir.path().join("v"));
+            let identity = if create {
+                home.create_identity(None).unwrap()
+            } else {
+                home.load_identity(None).unwrap()
+            };
+            Node::new(crate::NodeConfig {
+                home,
+                identity,
+                policy: crate::AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+            .0
+        };
+        let saved = |v: &Node, name: &str| {
+            let b = v.shared.home.load_state(v.identity_ref(), name).unwrap();
+            b.map_or(0, |b| {
+                decode_seen(&b).unwrap().values().map(HashSet::len).sum()
+            })
+        };
+        let today = credential::day(now_ms());
+        let nym = |i: usize| {
+            let mut n = [0u8; credential::PSEUDONYM_LEN];
+            n[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            n
+        };
+        let v = open(true);
+        // A CREATE paying with a token doesn't wait for a disk write.
+        assert!(v.spend_pseudonym(today, nym(0)));
+        assert_eq!(saved(&v, STATE_SEEN) + saved(&v, STATE_SEEN_RECENT), 0);
+        tokio::time::sleep(SEEN_SAVE_DELAY * 2).await;
+        assert_eq!(saved(&v, STATE_SEEN_RECENT), 1);
+        // New ones are saved apart until there are enough to fold in, so
+        // the whole set is rewritten only now and then.
+        for i in 1..SEEN_FOLD + 10 {
+            assert!(v.spend_pseudonym(today, nym(i)));
+            if i % 64 == 0 {
+                tokio::time::sleep(SEEN_SAVE_DELAY * 2).await;
+            }
+        }
+        tokio::time::sleep(SEEN_SAVE_DELAY * 2).await;
+        assert!(saved(&v, STATE_SEEN) >= SEEN_FOLD);
+        assert!(saved(&v, STATE_SEEN_RECENT) < SEEN_FOLD);
+        // A relay that stops without shutting down keeps all but the last
+        // moment's.
+        drop(v);
+        let v = open(false);
+        for i in 0..SEEN_FOLD + 10 {
+            assert!(!v.spend_pseudonym(today, nym(i)), "{i} paid again");
+        }
     }
 
     #[test]
