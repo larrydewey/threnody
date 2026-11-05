@@ -343,3 +343,56 @@ async fn deposits_are_direct_when_onion_routing_is_off() {
     .await;
     let _ = (&mut r1.rx, &mut r2.rx);
 }
+
+/// Nothing from `rx` matching `pred` for a while.
+async fn quiet(rx: &mut UnboundedReceiver<Event>, pred: impl Fn(&Event) -> bool) -> bool {
+    timeout(Duration::from_millis(800), async {
+        loop {
+            match rx.recv().await {
+                Some(e) if pred(&e) => return,
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        }
+    })
+    .await
+    .is_err()
+}
+
+#[tokio::test]
+async fn a_blocked_contact_cannot_write_through_a_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+
+    // B blocks A, who still holds B's prekeys and seals through R.
+    b.node.block_contact(&aid);
+    wait_for(|| a.node.sessions().iter().all(|s| s.peer != bid)).await;
+    a.node.send_offline(&bid, &text("let me in")).unwrap();
+    next(&mut a.rx, |e| matches!(e, Event::DepositReceipt { .. })).await;
+    assert!(
+        quiet(&mut b.rx, |e| matches!(
+            e,
+            Event::OfflineMessage { .. }
+                | Event::MessageRequest { .. }
+                | Event::TimerChanged { .. }
+        ))
+        .await,
+        "a blocked contact's sealed message got through"
+    );
+    assert!(
+        b.node
+            .history(b.node.conversation_for(&aid))
+            .map_or(true, |h| h.entries().is_empty()),
+        "recorded in history"
+    );
+    let _ = &mut r.rx;
+}

@@ -466,22 +466,27 @@ impl Node {
 
     fn open_sealed(&self, via: PublicIdentity, sealed: &[u8]) {
         let me = self.identity();
-        let contacts = self.contacts();
+        // Only contacts we'd take a session from: not a blocked one, nor
+        // a device its account removed (it may still hold our prekeys).
+        let senders: Vec<PublicIdentity> = self
+            .contacts()
+            .iter()
+            .filter(|c| !c.blocked && !self.is_revoked(&c.key))
+            .map(|c| c.key)
+            .collect();
         let opened = {
             let mut store = lock(&self.shared.prekeys);
             let r = store.open(&me, sealed, now_ms(), |k| {
-                contacts
-                    .iter()
-                    .find(|c| c.key.as_bytes() == k)
-                    .map(|c| c.key)
+                senders.iter().find(|c| c.as_bytes() == k).copied()
             });
             if r.is_ok() {
                 self.shared.persist_prekeys(&store);
             }
             r
         };
-        // Failures (duplicates from several mailboxes, strangers, forgeries)
-        // are dropped silently, as for any unauthenticated input.
+        // Failures (duplicates from several mailboxes, strangers, blocked
+        // or removed senders, forgeries) are dropped silently, as for any
+        // unauthenticated input.
         if let Ok((from, body)) = opened
             && let Ok(msg) = AppMessage::decode(&body)
         {

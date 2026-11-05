@@ -516,3 +516,61 @@ async fn clearing_a_chat_keeps_the_contact_on_every_device() {
     assert_eq!(h.entries()[0].text, "new news", "old messages stay cleared");
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+#[tokio::test]
+async fn a_removed_device_cannot_write_through_a_mailbox() {
+    use threnody_core::AppMessage;
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut m = spawn(&dir, "m").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let (pid, bid) = (phone.node.identity(), bob.node.identity());
+    link(&mut phone, &mut bob).await;
+    link(&mut phone, &mut m).await;
+    link(&mut bob, &mut m).await;
+    wait_for(|| phone.node.can_send_offline(&bid)).await;
+    bob.node.accept_contact(&laptop.node.identity());
+
+    // The phone is stolen and removed; it still holds Bob's prekeys and
+    // seals to him through a mailbox that never heard of the removal.
+    laptop.node.remove_device(&pid).unwrap();
+    next(
+        &mut bob.rx,
+        |e| matches!(e, Event::AccountChanged { removed, .. } if removed.contains(&pid)),
+    )
+    .await;
+    wait_for(|| phone.node.sessions().iter().all(|s| s.peer != bid)).await;
+    let text = AppMessage::Text {
+        sent_ms: 0,
+        body: "pay 1 BTC to X".into(),
+        expires_in_s: None,
+        id: 0,
+        quote: None,
+        forwarded: false,
+    };
+    phone.node.send_offline(&bid, &text).unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DepositReceipt { .. })).await;
+    let got = timeout(Duration::from_millis(800), async {
+        loop {
+            if let Some(Event::OfflineMessage { .. } | Event::MessageRequest { .. }) =
+                bob.rx.recv().await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        got.is_err(),
+        "a removed device's sealed message got through"
+    );
+    assert!(
+        texts(&bob.node, &pid).is_empty(),
+        "recorded in the account's chat"
+    );
+    let _ = (&mut laptop.rx, &mut m.rx);
+}
