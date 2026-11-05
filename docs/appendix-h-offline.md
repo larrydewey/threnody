@@ -66,8 +66,8 @@ op: 1 deposit, 2 deliver, 3 receipt (status 0 declined, 1 held, 2 delivered now)
 
 - **Depositing.** If A has no session with B, A leaves the sealed message with every live, mutually approved neighbour except B. By default A deposits anonymously, as described below, and skips mailboxes that no circuit can reach. If no circuit can reach any mailbox, A sends `deposit { to: id_B, sealed }` directly.
 - **Holding.** A neighbour R accepts a direct deposit only if R is mutually approved with both A and B. It accepts an anonymous deposit only if R is mutually approved with B.
-- **Storage limits.** R holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days.
-- **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, then deletes its copy. If B gave R a wake-up endpoint, R wakes B when it starts holding the message (Appendix R).
+- **Storage limits.** R holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days. A sweep every minute drops messages held longer, whether or not B ever returns, and everything held for B goes as soon as R deletes or blocks B or B's account removes it.
+- **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, if B is still mutually approved, then deletes its copy. If B gave R a wake-up endpoint, R wakes B when it starts holding the message (Appendix R).
 - **Receipts.** Every deposit is answered with a receipt, so the sender knows whether each mailbox holds the message, delivered it immediately, or declined it.
 - **Duplicates.** B ignores duplicates by `h`, so depositing with several neighbours is safe.
 

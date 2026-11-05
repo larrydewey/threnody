@@ -396,3 +396,29 @@ async fn a_blocked_contact_cannot_write_through_a_mailbox() {
     );
     let _ = &mut r.rx;
 }
+
+#[tokio::test]
+async fn a_mailbox_drops_what_it_holds_for_a_contact_it_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.send_offline(&bid, &text("for b")).unwrap();
+    wait_for(|| r.node.held_messages() == 1).await;
+    r.node.delete_conversation(&bid);
+    assert_eq!(r.node.held_messages(), 0);
+    let _ = (&mut a.rx, &mut r.rx);
+}

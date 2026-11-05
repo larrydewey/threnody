@@ -141,6 +141,22 @@ impl MailboxStore {
             .collect()
     }
 
+    /// Drops what has been held too long, for every recipient. True if
+    /// anything went.
+    pub(crate) fn prune(&mut self, now: u64) -> bool {
+        let before = self.held_for();
+        self.held.retain(|_, q| {
+            q.retain(|(t, _)| now.saturating_sub(*t) < MAX_HOLD_MS);
+            !q.is_empty()
+        });
+        self.held_for() != before
+    }
+
+    /// Drops everything held for `to`. True if there was something.
+    pub(crate) fn forget(&mut self, to: &PublicIdentity) -> bool {
+        self.held.remove(to.as_bytes()).is_some()
+    }
+
     pub(crate) fn held_for(&self) -> usize {
         self.held.values().map(Vec::len).sum()
     }
@@ -287,7 +303,11 @@ impl Node {
     }
 
     /// Messages held for `peer`, to deliver now that it is connected.
+    /// Only to a mutually approved peer, as we only hold for one.
     pub(crate) fn mailbox_for(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
+        if !self.shared.mutual(peer) {
+            return Vec::new();
+        }
         let held = {
             let mut mb = lock(&self.shared.mailbox);
             let held = mb.take(peer, now_ms());
@@ -516,6 +536,22 @@ impl Node {
     pub fn held_messages(&self) -> usize {
         lock(&self.shared.mailbox).held_for()
     }
+
+    /// Drops held messages past [`MAX_HOLD_MS`], whoever they wait for.
+    pub(crate) fn sweep_mailbox(&self, now: u64) {
+        let mut mb = lock(&self.shared.mailbox);
+        if mb.prune(now) {
+            self.shared.persist_mailbox(&mb);
+        }
+    }
+
+    /// Drops what we hold for `peer`, a contact that is gone.
+    pub(crate) fn forget_held(&self, peer: &PublicIdentity) {
+        let mut mb = lock(&self.shared.mailbox);
+        if mb.forget(peer) {
+            self.shared.persist_mailbox(&mb);
+        }
+    }
 }
 
 fn encode_bundle_list(parts: &[Vec<u8>]) -> threnody_core::Result<Vec<u8>> {
@@ -574,5 +610,25 @@ mod tests {
         assert_eq!(again.held_for(), MAX_HELD_MESSAGES);
         assert_eq!(again.take(&id, 1).len(), MAX_HELD_MESSAGES);
         assert!(mb.take(&id, MAX_HOLD_MS + 1).is_empty(), "expired");
+    }
+
+    #[test]
+    fn expired_and_forgotten_messages_go_at_rest() {
+        let ids: Vec<PublicIdentity> = (1..=3)
+            .map(|i| threnody_core::Identity::from_seed(&[i; 32]).public())
+            .collect();
+        let mut mb = MailboxStore::default();
+        mb.hold(*ids[0].as_bytes(), vec![1], 0);
+        mb.hold(*ids[1].as_bytes(), vec![2], 0);
+        mb.hold(*ids[1].as_bytes(), vec![3], MAX_HOLD_MS);
+        mb.hold(*ids[2].as_bytes(), vec![4], MAX_HOLD_MS);
+        // Nobody comes back for the old ones: they still go.
+        assert!(mb.prune(MAX_HOLD_MS + 1));
+        assert!(!mb.prune(MAX_HOLD_MS + 1));
+        assert_eq!(mb.held_for(), 2);
+        assert!(!mb.held.contains_key(ids[0].as_bytes()));
+        assert!(mb.forget(&ids[2]) && !mb.forget(&ids[2]));
+        let again = MailboxStore::decode(&mb.encode().unwrap()).unwrap();
+        assert_eq!(again.held_for(), 1);
     }
 }

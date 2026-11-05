@@ -609,7 +609,14 @@ impl Node {
             None => AccountBook::default(),
         };
         let mailbox = match cfg.home.load_state(&cfg.identity, "mailbox")? {
-            Some(b) => MailboxStore::decode(&b)?,
+            Some(b) => {
+                let mut mb = MailboxStore::decode(&b)?;
+                if mb.prune(now) {
+                    cfg.home
+                        .save_state(&cfg.identity, "mailbox", &mb.encode()?)?;
+                }
+                mb
+            }
             None => MailboxStore::default(),
         };
         let folders = cfg
@@ -1176,6 +1183,7 @@ impl Node {
     pub(crate) fn forget_peer(&self, peer: &PublicIdentity) {
         self.shared.delivery(|d| d.forget_peer(peer));
         self.forget_push(peer);
+        self.forget_held(peer);
     }
 
     /// The QUIC connection under the session with `peer`, if it has one.
