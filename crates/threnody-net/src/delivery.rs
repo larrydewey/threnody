@@ -24,6 +24,9 @@ pub const MAX_UNACKED: usize = 256;
 pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
 /// Delivered ids remembered per peer to drop resent copies.
 pub const RECENT_IDS: usize = 4096;
+/// And at most this many across all peers (strangers each add theirs):
+/// the peers heard from longest ago are forgotten first.
+pub const MAX_DELIVERED_IDS: usize = 64 * 1024;
 /// Messages larger than this (files) are resent only within one run.
 pub const MAX_PERSISTED: usize = 64 * 1024;
 const VERSION: u8 = 4;
@@ -84,6 +87,8 @@ impl Tag {
 struct Recent {
     order: VecDeque<u64>,
     set: HashSet<u64>,
+    /// When we last delivered from this peer, in [`Delivery::clock`] ticks.
+    last: u64,
 }
 
 #[derive(Default)]
@@ -95,6 +100,10 @@ pub(crate) struct Delivery {
     /// Ids whose message is being handled: neither delivered again nor
     /// saved as delivered until it has been (see [`Delivery::delivered`]).
     opening: HashSet<(PublicIdentity, u64)>,
+    /// Ids in `delivered`, all peers together.
+    delivered_ids: usize,
+    /// Orders deliveries between peers.
+    clock: u64,
     /// Changed since last saved.
     pub unacked_dirty: bool,
     pub delivered_dirty: bool,
@@ -131,7 +140,10 @@ impl Delivery {
                 rest = r;
                 let peer: [u8; 32] = head[..32].try_into().unwrap_or_default();
                 if let Ok(p) = PublicIdentity::from_bytes(&peer) {
+                    // Saved oldest peer first.
+                    d.clock += 1;
                     let recent = d.delivered.entry(p).or_default();
+                    recent.last = d.clock;
                     for id in ids
                         .as_chunks::<8>()
                         .0
@@ -140,11 +152,13 @@ impl Delivery {
                     {
                         if recent.set.insert(id) {
                             recent.order.push_back(id);
+                            d.delivered_ids += 1;
                         }
                     }
                 }
             }
         }
+        d.trim_delivered(None);
         d
     }
 
@@ -168,10 +182,14 @@ impl Delivery {
         out
     }
 
-    /// `VERSION || * ( peer (32) | count (u32 LE) | ids (u64 BE each) )`
+    /// `VERSION || * ( peer (32) | count (u32 LE) | ids (u64 BE each) )`,
+    /// the peer delivered from longest ago first.
     pub fn encode_delivered(&self) -> Vec<u8> {
-        let mut out = vec![VERSION];
-        for (p, r) in &self.delivered {
+        let mut out = Vec::with_capacity(1 + self.delivered.len() * 36 + self.delivered_ids * 8);
+        out.push(VERSION);
+        let mut peers: Vec<_> = self.delivered.iter().collect();
+        peers.sort_by_key(|(_, r)| r.last);
+        for (p, r) in peers {
             out.extend_from_slice(p.as_bytes());
             out.extend_from_slice(
                 &u32::try_from(r.order.len())
@@ -262,17 +280,55 @@ impl Delivery {
     /// let through, has been handled.
     pub fn delivered(&mut self, peer: &PublicIdentity, id: u64) {
         self.opening.remove(&(*peer, id));
+        self.clock += 1;
         let r = self.delivered.entry(*peer).or_default();
+        r.last = self.clock;
         if !r.set.insert(id) {
             return;
         }
         r.order.push_back(id);
+        self.delivered_ids += 1;
         self.delivered_dirty = true;
         if r.order.len() > RECENT_IDS
             && let Some(old) = r.order.pop_front()
         {
             r.set.remove(&old);
+            self.delivered_ids -= 1;
         }
+        self.trim_delivered(Some(peer));
+    }
+
+    /// Forgets the peers delivered from longest ago (never `keep`) while
+    /// there are more than [`MAX_DELIVERED_IDS`] ids.
+    fn trim_delivered(&mut self, keep: Option<&PublicIdentity>) {
+        while self.delivered_ids > MAX_DELIVERED_IDS {
+            let Some(oldest) = self
+                .delivered
+                .iter()
+                .filter(|(p, _)| Some(*p) != keep)
+                .min_by_key(|(_, r)| r.last)
+                .map(|(p, _)| *p)
+            else {
+                return;
+            };
+            if let Some(r) = self.delivered.remove(&oldest) {
+                self.delivered_ids -= r.order.len();
+                self.delivered_dirty = true;
+            }
+        }
+    }
+
+    /// `peer` is gone (forgotten, blocked, removed from its account):
+    /// drops what we kept for it, sent or received.
+    pub fn forget_peer(&mut self, peer: &PublicIdentity) {
+        if let Some(q) = self.unacked.remove(peer) {
+            self.unacked_dirty |= q.iter().any(|(_, _, len, _)| *len <= MAX_PERSISTED);
+        }
+        if let Some(r) = self.delivered.remove(peer) {
+            self.delivered_ids -= r.order.len();
+            self.delivered_dirty = true;
+        }
+        self.opening.retain(|(p, _)| p != peer);
     }
 }
 
@@ -387,6 +443,45 @@ mod tests {
         assert!(Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
         d.delivered(&p, 7);
         assert!(!Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
+    }
+
+    #[test]
+    fn delivered_ids_are_bounded_across_peers_and_forgotten_with_them() {
+        let mut d = Delivery::default();
+        let peers: Vec<PublicIdentity> = (0..=MAX_DELIVERED_IDS / RECENT_IDS)
+            .map(|_| Identity::generate().public())
+            .collect();
+        for (n, p) in peers.iter().enumerate() {
+            for i in 0..RECENT_IDS as u64 {
+                let id = (n as u64) << 32 | i;
+                assert!(d.first_delivery(p, id));
+                d.delivered(p, id);
+            }
+        }
+        // The first peer, heard from longest ago, made room for the last.
+        assert_eq!(d.delivered.len(), peers.len() - 1);
+        assert!(d.first_delivery(&peers[0], 0));
+        let last = peers.last().unwrap();
+        assert!(!d.first_delivery(last, (peers.len() as u64 - 1) << 32));
+        // And the order survives a restart.
+        let again = Delivery::load(&[], &d.encode_delivered());
+        assert_eq!(again.delivered_ids, MAX_DELIVERED_IDS);
+        assert_eq!(
+            again
+                .delivered
+                .iter()
+                .min_by_key(|(_, r)| r.last)
+                .map(|(p, _)| p),
+            Some(&peers[1])
+        );
+
+        d.track(last, text("unsent"), Tag::NONE);
+        d.unacked_dirty = false;
+        d.delivered_dirty = false;
+        d.forget_peer(last);
+        assert!(d.unacked_dirty && d.delivered_dirty);
+        assert_eq!(d.unacked(last), 0);
+        assert!(d.first_delivery(last, (peers.len() as u64 - 1) << 32));
     }
 
     #[test]

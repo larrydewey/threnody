@@ -1171,6 +1171,12 @@ impl Node {
         self.push_wake(peer);
     }
 
+    /// `peer` is gone (forgotten, blocked, or removed from its account):
+    /// drops what we kept for it.
+    pub(crate) fn forget_peer(&self, peer: &PublicIdentity) {
+        self.shared.delivery(|d| d.forget_peer(peer));
+    }
+
     /// The QUIC connection under the session with `peer`, if it has one.
     pub(crate) fn datagrams_to(&self, peer: &PublicIdentity) -> Option<quinn::Connection> {
         lock(&self.shared.sessions)

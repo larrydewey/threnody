@@ -371,6 +371,7 @@ impl Node {
                     };
                     for (k, conv) in left {
                         self.disconnect(&k);
+                        self.forget_peer(&k);
                         let _ = self.shared.home.delete_history(conv);
                     }
                     // Chats cleared on our other device.
@@ -488,6 +489,7 @@ impl Node {
             self.shared.save_contacts(&contacts);
         }
         self.disconnect(device);
+        self.forget_peer(device);
     }
 
     fn on_own_chain(&self, from: PublicIdentity, own: AccountChain, chain: AccountChain) {

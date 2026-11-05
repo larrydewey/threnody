@@ -706,6 +706,7 @@ impl Node {
         });
         for d in devices {
             self.disconnect(&d);
+            self.forget_peer(&d);
         }
         let _ = self.shared.home.delete_history(conv);
     }
@@ -715,15 +716,20 @@ impl Node {
     pub fn delete_request(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
         let devices = self.mark_contacts(peer, |_| {});
+        let mut gone = Vec::new();
         self.update_contacts(|c| {
             for d in &devices {
                 if c.get(d).is_some_and(|x| !x.accepted) {
                     c.remove(d);
+                    gone.push(*d);
                 }
             }
         });
         for d in devices {
             self.disconnect(&d);
+        }
+        for d in &gone {
+            self.forget_peer(d);
         }
         let _ = self.shared.home.delete_history(conv);
     }
@@ -742,6 +748,7 @@ impl Node {
         });
         for d in &devices {
             self.disconnect(d);
+            self.forget_peer(d);
         }
         let _ = self.shared.home.delete_history(conv);
         self.push_contact_sync();
