@@ -738,6 +738,11 @@ object Threnody {
                 }
                 is NodeEvent.AccountChanged -> {
                     say("· $e")
+                    if (e.added.isNotEmpty() && e.account == node.accountFingerprint()) {
+                        // Another of our devices linked one: say so here too.
+                        ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
+                            "If you didn't link it, remove it in Devices.")
+                    }
                     // A verified contact gained a device we haven't verified.
                     if (e.added.isNotEmpty() && e.account != node.accountFingerprint()) {
                         val c = conversations(node).firstOrNull { c -> e.added.any { it in c.devices } }

@@ -547,6 +547,16 @@ impl Node {
                 .copied()
                 .filter(|d| !own.state().removed.contains(d))
                 .collect();
+            // Devices linked through another of ours: the app tells the
+            // user here too, as the linking device does (`DeviceLinked`).
+            let me = self.identity();
+            let added: Vec<PublicIdentity> = chain
+                .state()
+                .devices
+                .iter()
+                .map(|(d, _)| *d)
+                .filter(|d| *d != me && !own.state().has(d))
+                .collect();
             *lock(&self.shared.account) = chain.clone();
             self.persist_account();
             self.tag_own_devices();
@@ -558,7 +568,7 @@ impl Node {
             }
             self.emit(Event::AccountChanged {
                 account: chain.id(),
-                added: vec![],
+                added,
                 removed,
             });
             // Pass it on so every own device converges.

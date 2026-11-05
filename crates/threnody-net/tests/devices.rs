@@ -117,6 +117,29 @@ async fn link_a_device_sync_contacts_and_show_the_account_to_peers() {
 }
 
 #[tokio::test]
+async fn our_other_devices_hear_of_a_newly_linked_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut tablet = spawn(&dir, "tablet").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    tablet.node.link_with(&code).await.unwrap();
+    wait_for(|| tablet.node.is_own_device(&laptop.node.identity())).await;
+
+    // The laptop links the phone; the tablet learns of it as a new device
+    // of our own account, so it can tell the user too.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let (pid, account) = (phone.node.identity(), laptop.node.account().id());
+    next(&mut tablet.rx, |e| {
+        matches!(e, Event::AccountChanged { account: a, added, .. }
+            if *a == account && added.contains(&pid))
+    })
+    .await;
+    let _ = (&mut laptop.rx, &mut phone.rx);
+}
+
+#[tokio::test]
 async fn link_codes_are_single_use_and_must_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut laptop = spawn(&dir, "laptop").await;

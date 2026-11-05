@@ -1501,7 +1501,15 @@ impl App {
                 self.toast("This device was removed from your account.");
                 (None, None)
             }
+            // Linked here, or (seen as a new device of our own account)
+            // through another of our devices.
             NodeEvent::DeviceLinked { .. } => {
+                self.toast("A new device joined your account. If you didn't link it, remove it in Devices.");
+                (None, None)
+            }
+            NodeEvent::AccountChanged { account, added, .. }
+                if !added.is_empty() && *account == self.core.main.account_fingerprint() =>
+            {
                 self.toast("A new device joined your account. If you didn't link it, remove it in Devices.");
                 (None, None)
             }

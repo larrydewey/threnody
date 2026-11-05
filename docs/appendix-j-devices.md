@@ -65,7 +65,7 @@ existing device E                                  new device N
 - **Authenticating each side.** The code pins `fp(E)`, which authenticates E to N. The proof binds `s` to *this* session and *this* device, which authenticates N to E. An attacker without the code can't be added, and can't replay a proof into another session.
 - **Signing.** E sends the current chain and a proposed `Add(N)` link that E has already signed (`LinkOffer`). N checks that the proposal is exactly the next link adding N on top of that chain, then countersigns it (`LinkConsent`).
 - **Refusal.** A wrong or expired code gets an explicit `LinkRefused`, so N fails at once instead of waiting.
-- **Aftermath.** E then broadcasts the new chain to every session with a peer that may see it (see *Exchange*).
+- **Aftermath.** E then broadcasts the new chain to every session with a peer that may see it (see *Exchange*). Every device of the account tells its user that a device joined: E when the link completes, the others when the new chain reaches them. Anyone holding a leaked code can link a device without asking, so the user learns of it on whichever device they are using and can remove it.
 
 Apps name a device on creation: the CLI uses the host name, and the Android app uses the phone's model (it renames a device still called "device"). Only our own devices and accepted contacts see these names. `/device rename <device> <name>` and the app's *Devices* screen rename any device of the account.
 
