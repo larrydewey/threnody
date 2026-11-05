@@ -908,6 +908,81 @@ mod tests {
         assert_eq!(inner_beat_for(None), HEARTBEAT);
     }
 
+    type Events = tokio::sync::mpsc::UnboundedReceiver<Event>;
+
+    fn test_node(dir: &tempfile::TempDir, name: &str) -> (Node, Events) {
+        let home = threnody_core::store::Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_heartbeats_follow_the_cover_rate_they_advertise() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, mut arx) = test_node(&dir, "a");
+        let (c, mut crx) = test_node(&dir, "c");
+        // A phone on mobile data: slow cover, so a slow beat in circuits.
+        a.set_constant_rate(Some(Duration::from_secs(10)));
+        // A session inside a relay circuit (the relay itself plays no part).
+        let relay = threnody_core::Identity::generate().public();
+        let (x, y) = tokio::io::duplex(1 << 20);
+        let ((x, ax), (y, cy)) = tokio::join!(
+            async {
+                let mut x = x;
+                let ch = crate::handshake::initiate(&mut x, a.identity_ref()).await;
+                (x, ch.unwrap())
+            },
+            async {
+                let mut y = y;
+                let ch = crate::handshake::accept(&mut y, c.identity_ref()).await;
+                (y, ch.unwrap())
+            },
+        );
+        a.spawn_relayed_session(x, ax, relay, true);
+        c.spawn_relayed_session(y, cy, relay, false);
+        a.set_approval(&c.identity(), true).unwrap();
+        c.set_approval(&a.identity(), true).unwrap();
+        for rx in [&mut arx, &mut crx] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !matches!(
+                    rx.recv().await,
+                    Some(Event::ApprovalChanged { mutual: true, .. }) | None
+                ) {}
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // It joins Wi-Fi: faster cover, and new addresses to tell contacts.
+        // Then back to mobile data, with nothing else to tell, and then
+        // cover goes off. The lease `c` gives `a` must hold through each.
+        for rate in [Some(2), Some(10), None] {
+            a.set_constant_rate(rate.map(Duration::from_secs));
+            if rate == Some(2) {
+                a.broadcast_paths();
+            }
+            let ended = tokio::time::timeout(Duration::from_secs(600), async {
+                loop {
+                    match crx.recv().await {
+                        Some(Event::Disconnected { reason, .. }) => return reason,
+                        None => return "closed".into(),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            assert!(ended.is_err(), "ended at {rate:?} s: {ended:?}");
+            assert!(c.sessions().iter().any(|s| s.peer == a.identity()));
+        }
+    }
+
     #[test]
     fn saved_peers_round_trip() {
         let peer = threnody_core::Identity::generate().public();
