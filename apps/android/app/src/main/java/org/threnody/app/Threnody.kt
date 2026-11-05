@@ -231,13 +231,22 @@ object Threnody {
     }
 
     /**
-     * Keeps a received file: images and voice or video messages privately,
-     * others in Downloads. A persona keeps everything privately, so
-     * burning it leaves nothing.
+     * Keeps a received file: images, voice or video messages, and files
+     * that are sensitive or disappear ([privately]) privately, where the
+     * sweep removes them with their message; others in Downloads, where any
+     * app can read them and they outlive the message. A persona keeps
+     * everything privately, so burning it leaves nothing.
      */
-    private fun keep(ctx: Context, name: String, data: ByteArray, persona: String?, clip: Boolean): String? =
-        if (persona != null || clip || Media.isImage(name)) Media.savePrivate(ctx, name, data, persona)
+    private fun keep(ctx: Context, name: String, data: ByteArray, persona: String?, privately: Boolean): String? =
+        if (persona != null || privately || Media.isImage(name)) Media.savePrivate(ctx, name, data, persona)
         else saveDownload(ctx, name, data)?.toString()
+
+    /** Whether a chat's messages disappear; if it can't be told, they are taken to. */
+    private fun disappears(timer: () -> UInt?): Boolean = try {
+        timer() != null
+    } catch (_: Exception) {
+        true
+    }
 
     /**
      * New identities are called "device"; give this one the phone's model
@@ -659,7 +668,8 @@ object Threnody {
                 is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
                 is NodeEvent.File -> {
                     say("* ${short(e.peer)} sent a file (${e.data.size} bytes)")
-                    val location = keep(ctx, e.name, e.data, persona, e.clip != null)
+                    val privately = e.clip != null || e.sensitive || disappears { node.disappearing(e.peer) }
+                    val location = keep(ctx, e.name, e.data, persona, privately)
                     try {
                         node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), location, e.id,
                             FileOptions(e.sensitive, e.caption, e.album, e.clip, e.forwarded))
@@ -684,7 +694,8 @@ object Threnody {
                 }
                 is NodeEvent.GroupFile -> {
                     say("* group ${e.group.take(6)}: ${short(e.from)} sent a file (${e.data.size} bytes)")
-                    val location = keep(ctx, e.name, e.data, persona, e.clip != null)
+                    val privately = e.clip != null || e.sensitive || disappears { node.groupDisappearing(e.group) }
+                    val location = keep(ctx, e.name, e.data, persona, privately)
                     try {
                         node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location, e.id,
                             FileOptions(e.sensitive, e.caption, e.album, e.clip, e.forwarded))

@@ -2760,7 +2760,12 @@ impl ChatView {
                     "gif-{}.gif",
                     if id.is_empty() { "giphy".into() } else { id }
                 );
-                core.keep(persona.as_deref(), &name, &bytes, false)
+                let how = core::Keep {
+                    clip: false,
+                    sensitive: false,
+                    disappears: false,
+                };
+                core.keep(persona.as_deref(), &name, &bytes, how)
                     .ok_or_else(|| "couldn't save it".to_owned())
             },
             move |kept: Result<String, String>| {

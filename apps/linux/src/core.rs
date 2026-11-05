@@ -800,17 +800,16 @@ impl Core {
         Ok(free_path(&dir, &name))
     }
 
-    /// Keeps a received file: photos and voice or video messages
-    /// privately, others in Downloads/Threnody. A persona keeps everything
-    /// privately.
+    /// Keeps a received file: privately as [`Keep::privately`] says,
+    /// others in Downloads/Threnody. A persona keeps everything privately.
     pub fn keep(
         &self,
         persona: Option<&str>,
         name: &str,
         data: &[u8],
-        clip: bool,
+        how: Keep,
     ) -> Option<String> {
-        let dir = if persona.is_some() || clip || is_image(name) {
+        let dir = if persona.is_some() || how.privately(name) {
             self.media_dir(persona)
         } else {
             gtk::glib::user_special_dir(gtk::glib::UserDirectory::Downloads)
@@ -900,7 +899,14 @@ impl Core {
                     short(&peer),
                     data.len()
                 ));
-                let location = self.keep(persona, &name, &data, clip.is_some());
+                let how = Keep {
+                    clip: clip.is_some(),
+                    sensitive,
+                    disappears: node
+                        .disappearing(peer.clone())
+                        .map_or(true, |t| t.is_some()),
+                };
+                let location = self.keep(persona, &name, &data, how);
                 let options = FileOptions {
                     sensitive,
                     caption: caption.clone(),
@@ -951,7 +957,14 @@ impl Core {
                     short(&from),
                     data.len()
                 ));
-                let location = self.keep(persona, &name, &data, clip.is_some());
+                let how = Keep {
+                    clip: clip.is_some(),
+                    sensitive,
+                    disappears: node
+                        .group_disappearing(group.clone())
+                        .map_or(true, |t| t.is_some()),
+                };
+                let location = self.keep(persona, &name, &data, how);
                 let options = FileOptions {
                     sensitive,
                     caption: caption.clone(),
@@ -1296,6 +1309,27 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(candidate)
 }
 
+/// What decides where a received file is kept.
+#[derive(Clone, Copy, Debug)]
+pub struct Keep {
+    /// A voice or video message.
+    pub clip: bool,
+    /// The sender marked it sensitive.
+    pub sensitive: bool,
+    /// Its chat has disappearing messages (or that can't be told).
+    pub disappears: bool,
+}
+
+impl Keep {
+    /// Whether a file called `name` stays in the data directory, where the
+    /// sweep removes it with its message, rather than going to Downloads,
+    /// where any app can read it and it outlives the message: photos,
+    /// voice and video messages, and files that are sensitive or disappear.
+    pub fn privately(self, name: &str) -> bool {
+        self.clip || self.sensitive || self.disappears || is_image(name)
+    }
+}
+
 /// How long a kept file is safe from the sweep without a message referring
 /// to it: a clip being recorded, or a photo or GIF waiting to be sent, has
 /// no message yet.
@@ -1389,6 +1423,33 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_files_go_to_downloads() {
+        let plain = Keep {
+            clip: false,
+            sensitive: false,
+            disappears: false,
+        };
+        assert!(!plain.privately("report.pdf"));
+        assert!(plain.privately("photo.jpg"));
+        for private in [
+            Keep {
+                clip: true,
+                ..plain
+            },
+            Keep {
+                sensitive: true,
+                ..plain
+            },
+            Keep {
+                disappears: true,
+                ..plain
+            },
+        ] {
+            assert!(private.privately("report.pdf"), "{private:?}");
+        }
+    }
 
     #[test]
     fn the_sweep_keeps_notes_and_recent_files() {
