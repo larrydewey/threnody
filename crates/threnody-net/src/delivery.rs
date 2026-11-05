@@ -21,7 +21,8 @@ use threnody_core::message::{
 };
 use threnody_core::{AppMessage, PublicIdentity};
 
-/// Unacknowledged messages kept per peer; the oldest are dropped first.
+/// Unacknowledged messages kept per peer, and as many changes to
+/// conversations besides; the oldest of each are dropped first.
 pub const MAX_UNACKED: usize = 256;
 /// And at most this many bytes of them per peer.
 pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
@@ -206,9 +207,26 @@ impl Delivery {
         let len = m.encoded_len_hint();
         self.unacked_dirty |= len <= MAX_PERSISTED;
         let q = self.unacked.entry(*peer).or_default();
+        // Changes (deletions, edits, reactions, pins, lists) and other
+        // messages each have MAX_UNACKED places, so a run of changes for a
+        // device that is away can't push out the texts held for it.
+        let change = needs(&m) != 0;
         q.push_back((id, m.clone(), len, tag));
         let mut bytes: usize = q.iter().map(|(_, _, l, _)| l).sum();
-        while q.len() > MAX_UNACKED || (bytes > MAX_UNACKED_BYTES && q.len() > 1) {
+        while q
+            .iter()
+            .filter(|(_, m, ..)| (needs(m) != 0) == change)
+            .count()
+            > MAX_UNACKED
+        {
+            let Some(i) = q.iter().position(|(_, m, ..)| (needs(m) != 0) == change) else {
+                break;
+            };
+            if let Some((_, _, l, _)) = q.remove(i) {
+                bytes -= l;
+            }
+        }
+        while bytes > MAX_UNACKED_BYTES && q.len() > 1 {
             if let Some((_, _, l, _)) = q.pop_front() {
                 bytes -= l;
             }
@@ -367,6 +385,31 @@ mod tests {
         assert!(!d.seen_change(&p, &pin(false)), "a different change");
         assert!(!d.seen_change(&q, &pin(true)), "from another peer");
         assert!(!d.seen_change(&p, &text("a")) && !d.seen_change(&p, &text("a")));
+    }
+
+    #[test]
+    fn held_changes_do_not_push_out_held_texts() {
+        let p = Identity::generate().public();
+        let mut d = Delivery::default();
+        for i in 0..10 {
+            d.track(&p, text(&format!("t{i}")), Tag::NONE);
+        }
+        for i in 0..MAX_UNACKED as u64 + 50 {
+            let react = AppMessage::React {
+                conversation: vec![1; 16],
+                id: i,
+                emoji: "👍".into(),
+                add: true,
+            };
+            d.track(&p, react, Tag::NONE);
+        }
+        let held = d.resend(&p);
+        let texts = held
+            .iter()
+            .filter(|m| matches!(m, AppMessage::Tracked { inner, .. } if matches!(**inner, AppMessage::Text { .. })))
+            .count();
+        assert_eq!(texts, 10, "changes pushed out texts");
+        assert_eq!(held.len(), 10 + MAX_UNACKED, "changes keep their own room");
     }
 
     #[test]
