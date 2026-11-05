@@ -11,7 +11,7 @@ The interactive handshake (Appendix A) needs both ends online at the same moment
 
 Each device keeps:
 
-- **A signed prekey (SPK).** An X-Wing key pair with id `spk_id`, rotated every 7 days. The previous one is kept for another 14 days so messages still in flight can be read.
+- **A signed prekey (SPK).** An X-Wing key pair with id `spk_id`, rotated every 7 days. Bundles advertise it as valid (`expiry_ms`) for 21 days from its creation, and a retired SPK is kept until that expiry, so messages still in flight can be read. Up to two retired SPKs can be live at once.
 - **One-time prekeys (OPKs).** X-Wing key pairs, each with an id. Each is reserved for one contact, and its secret is deleted on first use.
 
 ```
@@ -39,7 +39,7 @@ Sealed = { 0: spk_id, 1: ct_s, ? 2: opk_id, ? 3: ct_o, 4: AEAD(k, nonce 0, ad = 
 
 `body` is a padded `AppMessage` (Appendix C), and each sealed message uses fresh encapsulations. On receipt, B:
 
-1. **Finds the keys.** Looks up the SPK (current or previous, unexpired) and the OPK, if one was used. If anything is missing, it rejects the message.
+1. **Finds the keys.** Looks up the SPK (current or retired, unexpired) and the OPK, if one was used. If anything is missing, it rejects the message.
 2. **Derives and decrypts.** Decapsulates, derives `k` and decrypts.
 3. **Checks the sender.** Verifies `sig_A` against the claimed `id_A`, which must be a known contact.
 4. **Consumes the OPK.** Deletes the OPK secret, if one was used.

@@ -194,7 +194,9 @@ struct Opk {
 /// The recipient's secret prekey state (persist with `Home::save_state`).
 pub struct PrekeyStore {
     current: Spk,
-    previous: Option<Spk>,
+    /// Earlier SPKs, newest first, each kept until its own expiry: bundles
+    /// carrying them are still valid, so senders may still seal to them.
+    retired: Vec<Spk>,
     opks: HashMap<u32, Opk>,
     next_batch: u64,
     /// Transcript hashes of accepted messages, with the time they may be forgotten.
@@ -205,7 +207,7 @@ impl PrekeyStore {
     pub fn new(now_ms: u64) -> Self {
         Self {
             current: Spk::generate(now_ms),
-            previous: None,
+            retired: Vec::new(),
             opks: HashMap::new(),
             next_batch: 0,
             seen: HashMap::new(),
@@ -216,15 +218,9 @@ impl PrekeyStore {
     pub fn maintain(&mut self, now_ms: u64) {
         if now_ms >= self.current.created_ms + SPK_ROTATE_MS {
             let old = std::mem::replace(&mut self.current, Spk::generate(now_ms));
-            self.previous = Some(old);
+            self.retired.insert(0, old);
         }
-        if self
-            .previous
-            .as_ref()
-            .is_some_and(|p| now_ms >= p.expiry_ms())
-        {
-            self.previous = None;
-        }
+        self.retired.retain(|k| now_ms < k.expiry_ms());
         self.seen.retain(|_, until| *until > now_ms);
     }
 
@@ -327,9 +323,8 @@ impl PrekeyStore {
     ) -> Result<(PublicIdentity, Vec<u8>)> {
         self.maintain(now_ms);
         let s = Sealed::decode(sealed)?;
-        let spk = [Some(&self.current), self.previous.as_ref()]
-            .into_iter()
-            .flatten()
+        let spk = std::iter::once(&self.current)
+            .chain(&self.retired)
             .find(|k| k.id == s.spk_id)
             .ok_or(Error::Decrypt)?;
         let ss_s = spk.secret.decapsulate(&s.ct_s)?;
@@ -373,12 +368,14 @@ impl PrekeyStore {
         Ok(Zeroizing::new(cbor::to_vec(
             256 + self.opks.len() * 96 + self.seen.len() * 48,
             |e| {
-                e.map_len(6)?;
+                e.map_len(7)?;
                 e.u8(0)?.u64(STATE_VERSION)?;
                 e.u8(1)?;
                 spk(e, &self.current)?;
+                // Key 2 holds the newest retired SPK, as it did when only
+                // one was kept; key 6 holds any older ones.
                 e.u8(2)?;
-                match &self.previous {
+                match self.retired.first() {
                     Some(p) => spk(e, p)?,
                     None => {
                         e.null()?;
@@ -396,6 +393,11 @@ impl PrekeyStore {
                 e.u8(5)?.array_len(self.seen.len())?;
                 for (h, until) in &self.seen {
                     e.array_len(2)?.bytes(h)?.u64(*until)?;
+                }
+                let older = self.retired.get(1..).unwrap_or_default();
+                e.u8(6)?.array_len(older.len())?;
+                for k in older {
+                    spk(e, k)?;
                 }
                 Ok(())
             },
@@ -417,7 +419,7 @@ impl PrekeyStore {
         }
         let mut dec = Decoder::new(b);
         let (mut ver, mut current, mut previous, mut next_batch) = (None, None, None, None);
-        let (mut opks, mut seen) = (HashMap::new(), HashMap::new());
+        let (mut opks, mut seen, mut older) = (HashMap::new(), HashMap::new(), Vec::new());
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -452,6 +454,11 @@ impl PrekeyStore {
                         seen.insert(h, d.u64()?);
                     }
                 }
+                6 => {
+                    for _ in 0..d.array_len()? {
+                        older.push(spk(d)?);
+                    }
+                }
                 _ => return Ok(false),
             }
             Ok(true)
@@ -460,9 +467,10 @@ impl PrekeyStore {
         if ver != Some(STATE_VERSION) {
             return Err(Error::Malformed("prekey state version"));
         }
+        let retired = previous.into_iter().chain(older).collect();
         Ok(Self {
             current: required(current, "current spk")?,
-            previous,
+            retired,
             opks,
             next_batch: required(next_batch, "batch counter")?,
             seen,
@@ -827,7 +835,7 @@ mod tests {
         let sealed = book.seal(&alice, &bob.public(), b"late", NOW).unwrap();
         let later = NOW + SPK_ROTATE_MS + 1;
         store.maintain(later);
-        assert!(store.previous.is_some());
+        assert_eq!(store.retired.len(), 1);
         store
             .open(&bob.public(), &sealed, later, known(&alice))
             .unwrap();
@@ -842,6 +850,29 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_retired_spk_lasts_as_long_as_its_bundle_says() {
+        let (alice, bob, mut store, mut book) = setup();
+        let day = SPK_ROTATE_MS / 7;
+        // Sealed on day 0, while bob rotates on days 8 and 15.
+        let sealed = book.seal(&alice, &bob.public(), b"slow", NOW).unwrap();
+        store.maintain(NOW + 8 * day);
+        store.maintain(NOW + 15 * day);
+        // The bundle is still valid, so the message must still open.
+        assert!(book.has(&bob.public(), NOW + 15 * day));
+        store
+            .open(&bob.public(), &sealed, NOW + 15 * day, known(&alice))
+            .unwrap();
+        // Saving and loading keeps every unexpired SPK.
+        let sealed2 = book.seal(&alice, &bob.public(), b"saved", NOW).unwrap();
+        let mut store = PrekeyStore::decode(&store.encode().unwrap()).unwrap();
+        store
+            .open(&bob.public(), &sealed2, NOW + 16 * day, known(&alice))
+            .unwrap();
+        store.maintain(NOW + SPK_LIFETIME_MS);
+        assert_eq!(store.retired.len(), 1, "the day-0 SPK expired");
     }
 
     #[test]
