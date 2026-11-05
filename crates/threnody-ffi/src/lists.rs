@@ -152,12 +152,17 @@ impl ThrenodyNode {
         text: String,
         heading: bool,
     ) -> Result<u64> {
-        let mut new = 0;
-        self.change_list(&id, |l, s| {
-            new = l.add(after, text.trim(), heading, s);
-            true
+        let mut new = None;
+        let saved = self.change_list(&id, |l, s| {
+            let item = l.add(after, text.trim(), heading, s);
+            new = Some(item);
+            item.is_some()
         })?;
-        Ok(new)
+        match new {
+            Some(Some(item)) if saved => Ok(item),
+            None => Err(fail("no such list")),
+            _ => Err(fail("the list is full")),
+        }
     }
 
     pub fn edit_list_item(&self, id: String, item: u64, text: String) -> Result<()> {

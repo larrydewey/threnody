@@ -12,8 +12,8 @@ use const_cbor::Decoder;
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::error::{Error, Result};
 
-/// Most lists, items per list (tombstones included), and characters in a
-/// title or an item.
+/// Most lists, items per list (tombstones included: the oldest go to make
+/// room), and characters in a title or an item.
 pub const MAX_LISTS: usize = 200;
 pub const MAX_ITEMS: usize = 1000;
 pub const MAX_TITLE: usize = 80;
@@ -91,8 +91,18 @@ impl List {
         true
     }
 
-    /// Adds an item after `after`; returns its id.
-    pub fn add(&mut self, after: Option<u64>, text: &str, heading: bool, stamp: Stamp) -> u64 {
+    /// Adds an item after `after`; returns its id, or None if the list is
+    /// full.
+    pub fn add(
+        &mut self,
+        after: Option<u64>,
+        text: &str,
+        heading: bool,
+        stamp: Stamp,
+    ) -> Option<u64> {
+        if !self.make_room() {
+            return None;
+        }
         let id = u64::from_le_bytes(crate::crypto::random_bytes()).max(1);
         let pos = self.pos_after(after);
         let indent = after
@@ -108,7 +118,33 @@ impl List {
             deleted: false,
             stamp,
         });
-        id
+        Some(id)
+    }
+
+    /// Makes room for one more item, if the list is full, by forgetting
+    /// the oldest deleted one; false if every item is still there.
+    ///
+    /// A forgotten deletion no longer spreads, so a copy that never heard
+    /// of it could bring that item back; but without this a list that has
+    /// seen [`MAX_ITEMS`] items could never take another.
+    fn make_room(&mut self) -> bool {
+        if self.items.len() < MAX_ITEMS {
+            return true;
+        }
+        let oldest = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.deleted)
+            .min_by_key(|(_, i)| i.stamp)
+            .map(|(k, _)| k);
+        match oldest {
+            Some(k) => {
+                self.items.swap_remove(k);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Takes in another copy: the newer of each item and of the title win.
@@ -127,7 +163,10 @@ impl List {
                     changed = true;
                 }
                 Some(_) => {}
-                None if self.items.len() < MAX_ITEMS => {
+                // A deletion we never saw the item of changes nothing to
+                // make room for.
+                None if self.items.len() >= MAX_ITEMS && o.deleted => {}
+                None if self.make_room() => {
                     self.items.push(o.clone());
                     changed = true;
                 }
@@ -182,10 +221,12 @@ impl List {
             } else {
                 (t, false, false)
             };
-            if text.is_empty() || self.items.len() >= MAX_ITEMS {
+            if text.is_empty() {
                 continue;
             }
-            let id = self.add(last, text, heading, stamp);
+            let Some(id) = self.add(last, text, heading, stamp) else {
+                break;
+            };
             self.change(id, stamp, |i| {
                 i.done = done;
                 i.indent = if heading { 0 } else { (spaces / 2) as u8 };
@@ -300,10 +341,10 @@ mod tests {
             title: "Groceries".into(),
             ..List::default()
         };
-        let milk = l.add(None, "milk", false, st(1, 1));
-        let eggs = l.add(Some(milk), "eggs", false, st(2, 1));
-        let bread = l.add(Some(milk), "bread", false, st(3, 1));
-        let top = l.add(None, "Dairy", true, st(4, 1));
+        let milk = l.add(None, "milk", false, st(1, 1)).unwrap();
+        let eggs = l.add(Some(milk), "eggs", false, st(2, 1)).unwrap();
+        let bread = l.add(Some(milk), "bread", false, st(3, 1)).unwrap();
+        let top = l.add(None, "Dairy", true, st(4, 1)).unwrap();
         let order: Vec<&str> = l.items().iter().map(|i| i.text.as_str()).collect();
         assert_eq!(order, ["Dairy", "milk", "bread", "eggs"]);
         assert!(l.change(eggs, st(5, 1), |i| i.done = true));
@@ -329,11 +370,11 @@ mod tests {
             id: [2; 16],
             ..List::default()
         };
-        let x = a.add(None, "socks", false, st(1, 1));
+        let x = a.add(None, "socks", false, st(1, 1)).unwrap();
         let mut b = a.clone();
         // Both change it; B's is later. A also adds an item, B deletes x.
         a.change(x, st(5, 1), |i| i.text = "wool socks".into());
-        let y = a.add(Some(x), "scarf", false, st(6, 1));
+        let y = a.add(Some(x), "scarf", false, st(6, 1)).unwrap();
         b.change(x, st(7, 2), |i| i.done = true);
         assert!(a.merge(&b) && b.merge(&a));
         assert_eq!(a, b, "both end the same");
@@ -345,6 +386,43 @@ mod tests {
         b.change(y, st(9, 2), |i| i.deleted = true);
         a.merge(&b);
         assert_eq!(a.items().len(), 1);
+    }
+
+    #[test]
+    fn deleted_items_make_room_for_new_ones() {
+        let mut a = List {
+            id: [4; 16],
+            ..List::default()
+        };
+        // A thousand items, added and cleared over time.
+        for n in 0..MAX_ITEMS as u64 {
+            let x = a.add(None, "old", false, st(n + 1, 1)).unwrap();
+            a.change(x, st(n + 1, 1), |i| i.deleted = true);
+        }
+        assert_eq!(a.items.len(), MAX_ITEMS);
+        let first = a.items.iter().min_by_key(|i| i.stamp).unwrap().id;
+        // The next goes in, in place of the oldest deletion, and survives
+        // saving and reaching another copy.
+        let eggs = a.add(None, "eggs", false, st(5000, 1)).unwrap();
+        assert_eq!(a.items.len(), MAX_ITEMS);
+        assert!(!a.items.iter().any(|i| i.id == first));
+        let back = List::decode(&a.encode().unwrap()).unwrap();
+        assert!(back.items().iter().any(|i| i.id == eggs));
+        let mut b = back.clone();
+        let milk = b.add(None, "milk", false, st(5001, 2)).unwrap();
+        assert!(a.merge(&b));
+        assert!(a.items().iter().any(|i| i.id == milk));
+        assert!(a.items.len() <= MAX_ITEMS);
+
+        // A list full of live items takes no more, rather than keeping one
+        // it can't save or send.
+        let mut full = List::default();
+        for n in 0..MAX_ITEMS as u64 {
+            full.add(None, "x", false, st(n + 1, 1)).unwrap();
+        }
+        assert_eq!(full.add(None, "one more", false, st(9999, 1)), None);
+        assert_eq!(full.add_markdown("- [ ] more", st(9999, 1)), 0);
+        assert_eq!(full.items.len(), MAX_ITEMS);
     }
 
     #[test]
