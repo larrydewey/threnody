@@ -31,6 +31,11 @@ use crate::wire::{self, MsgType};
 pub const MAX_SKIP: u32 = 1000;
 /// Maximum skipped keys retained overall; oldest are evicted first.
 pub const MAX_STORED_SKIPPED: usize = 2000;
+/// Maximum receiving chains with skipped keys; whole chains are evicted,
+/// oldest first. Every incoming frame is tried against each of them.
+pub const MAX_SKIPPED_CHAINS: usize = 8;
+/// Longest encrypted header accepted. A real one is about 2.4 KB.
+const MAX_ENC_HEADER: usize = 4096;
 
 type Key = Zeroizing<[u8; 32]>;
 
@@ -198,6 +203,11 @@ impl Ratchet {
         let nonce = required(nonce, "header nonce")?;
         let enc_header = required(enc_header, "encrypted header")?;
         let ct = required(ct, "ratchet ciphertext")?;
+        // Each stored header key costs a full open of the header, so refuse
+        // an oversized one before trying any.
+        if enc_header.len() > MAX_ENC_HEADER {
+            return Err(Error::Malformed("encrypted header too long"));
+        }
         let ad = message_ad(&self.session_id, &nonce, enc_header);
 
         if let Some(pt) = self.try_skipped(&nonce, enc_header, &ad, ct)? {
@@ -319,6 +329,18 @@ impl Ratchet {
             if self.skipped_order.len() > MAX_STORED_SKIPPED
                 && let Some(old) = self.skipped_order.pop_front()
             {
+                self.skipped.remove(&old);
+            }
+        }
+        // A chain's keys are stored together, so its slots are contiguous.
+        let mut chains: Vec<[u8; 32]> = self.skipped_order.iter().map(|(hk, _)| *hk).collect();
+        chains.dedup();
+        let excess = chains.len().saturating_sub(MAX_SKIPPED_CHAINS);
+        for hk in &chains[..excess] {
+            while let Some(old) = self.skipped_order.front().copied()
+                && old.0 == *hk
+            {
+                self.skipped_order.pop_front();
                 self.skipped.remove(&old);
             }
         }
@@ -455,6 +477,46 @@ mod tests {
             last = a.encrypt(b"x").unwrap();
         }
         assert!(matches!(b.decrypt(&last), Err(Error::TooManySkipped)));
+    }
+
+    #[test]
+    fn skipped_keys_span_few_chains() {
+        let (mut a, mut b) = pair();
+        // Each round a opens a new chain and withholds its first message,
+        // leaving b one skipped key per chain to try on every frame.
+        let mut withheld = Vec::new();
+        for _ in 0..3 * MAX_SKIPPED_CHAINS {
+            withheld.push(a.encrypt(b"held").unwrap());
+            let m = a.encrypt(b"sent").unwrap();
+            assert_eq!(b.decrypt(&m).unwrap(), b"sent");
+            let r = b.encrypt(b"step").unwrap();
+            assert_eq!(a.decrypt(&r).unwrap(), b"step");
+        }
+        let mut chains: Vec<[u8; 32]> = b.skipped_order.iter().map(|(hk, _)| *hk).collect();
+        chains.dedup();
+        assert_eq!(chains.len(), MAX_SKIPPED_CHAINS);
+        assert_eq!(b.skipped.len(), MAX_SKIPPED_CHAINS);
+        // The newest chains' late messages still open; the oldest are gone.
+        let last = withheld.pop().unwrap();
+        assert_eq!(b.decrypt(&last).unwrap(), b"held");
+        assert!(b.decrypt(&withheld[0]).is_err());
+    }
+
+    #[test]
+    fn oversized_headers_are_refused_unopened() {
+        let (mut a, mut b) = pair();
+        let body = cbor::to_vec(MAX_ENC_HEADER + 128, |e| {
+            e.map_len(3)?;
+            e.u8(0)?.bytes(&[0u8; 12])?;
+            e.u8(1)?.bytes(&[0u8; MAX_ENC_HEADER + 1])?;
+            e.u8(2)?.bytes(&[0u8; 32])?;
+            Ok(())
+        })
+        .unwrap();
+        let big = wire::encode_envelope(MsgType::Ratchet, &body).unwrap();
+        assert!(matches!(b.decrypt(&big), Err(Error::Malformed(_))));
+        let m = a.encrypt(b"x").unwrap();
+        assert_eq!(b.decrypt(&m).unwrap(), b"x");
     }
 
     #[test]
