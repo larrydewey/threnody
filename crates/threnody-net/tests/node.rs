@@ -355,6 +355,40 @@ async fn blocking_or_forgetting_takes_the_tunnel_down() {
     }
 }
 
+/// Revoking and approving again within one session pairs the tunnel
+/// on both sides again, not only on the side that revoked.
+#[tokio::test]
+async fn revoking_and_approving_again_pairs_the_tunnel_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+
+    alice.set_approval(&bob_id, false).unwrap();
+    next(&mut brx, |e| matches!(e, Event::TunnelDown { .. })).await;
+    assert!(alice.tunnel_peers().is_empty() && bob.tunnel_peers().is_empty());
+
+    alice.set_approval(&bob_id, true).unwrap();
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+    assert_eq!(alice.tunnel_peers(), vec![bob_id]);
+    assert_eq!(bob.tunnel_peers(), vec![alice.identity()]);
+    assert!(
+        alice
+            .contacts()
+            .get(&bob_id)
+            .is_some_and(|c| c.discovery_key.is_some()),
+        "discovery key derived again"
+    );
+}
+
 #[tokio::test]
 async fn no_tunnel_without_mutual_approval() {
     let dir = tempfile::tempdir().unwrap();

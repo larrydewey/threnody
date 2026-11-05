@@ -1880,7 +1880,19 @@ where
                         }
                     }
                 }
-                out = outbox.recv() => match out {
+                out = outbox.recv() => {
+                    // Our own revocation on its way out: what this session
+                    // set up under mutual approval (tunnel offer, discovery
+                    // key, prekeys, push) is set up afresh if it returns,
+                    // as when the peer revokes.
+                    if matches!(out, Some(AppMessage::Approval { approved: false })) {
+                        offered = false;
+                        took_offer = false;
+                        discovery_keyed = false;
+                        prekeys_sent = false;
+                        push_sent = false;
+                    }
+                    match out {
                     // Calls can't hide behind cover traffic (their media
                     // shows anyway), and a call can't wait for ticks.
                     Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
@@ -1905,7 +1917,8 @@ where
                         }
                         return Ok(());
                     }
-                },
+                    }
+                }
                 Ok(()) = rate.changed() => {
                     ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
                 }
