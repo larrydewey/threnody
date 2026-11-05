@@ -235,15 +235,19 @@ impl Delivery {
         })
     }
 
-    /// Drops what `peer` acknowledged; returns the tags that name entries.
-    pub fn acked(&mut self, peer: &PublicIdentity, ids: &[u64]) -> Vec<Tag> {
-        let mut tags = Vec::new();
+    /// Drops what `peer` acknowledged; returns the tags that name entries,
+    /// and the mailbox messages among it (a mailbox's copy can go now).
+    pub fn acked(&mut self, peer: &PublicIdentity, ids: &[u64]) -> (Vec<Tag>, Vec<Vec<u8>>) {
+        let (mut tags, mut mail) = (Vec::new(), Vec::new());
         if let Some(q) = self.unacked.get_mut(peer) {
             let before = q.len();
-            q.retain(|(id, _, _, tag)| {
+            q.retain_mut(|(id, m, _, tag)| {
                 let hit = ids.contains(id);
                 if hit && (tag.local_id != 0) {
                     tags.push(*tag);
+                }
+                if hit && let AppMessage::Mailbox(b) = m {
+                    mail.push(std::mem::take(b));
                 }
                 !hit
             });
@@ -252,7 +256,7 @@ impl Delivery {
                 self.unacked.remove(peer);
             }
         }
-        tags
+        (tags, mail)
     }
 
     /// The peer doesn't acknowledge: what was sent plain can't be tracked.
@@ -367,14 +371,19 @@ mod tests {
         assert_eq!(d.unacked(&p), 2);
         assert_eq!(d.resend(&p).len(), 2);
         assert_eq!(
-            d.acked(&p, &[id]),
+            d.acked(&p, &[id]).0,
             [Tag {
                 local_id: 5,
                 group: Some([7; 16]),
                 relay_for: Some([3; 32]),
             }]
         );
-        assert!(d.acked(&p, &[id]).is_empty(), "only once");
+        assert!(d.acked(&p, &[id]).0.is_empty(), "only once");
+        let AppMessage::Tracked { id, .. } = d.track(&p, AppMessage::Mailbox(vec![4]), Tag::NONE)
+        else {
+            panic!()
+        };
+        assert_eq!(d.acked(&p, &[id]), (vec![], vec![vec![4]]));
         assert_eq!(d.unacked(&p), 1);
         assert!(d.first_delivery(&p, 9) && !d.first_delivery(&p, 9));
         d.delivered(&p, 9);

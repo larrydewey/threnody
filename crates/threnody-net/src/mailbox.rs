@@ -13,7 +13,7 @@ use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::error::{NetError, Result};
-use crate::node::{Event, Node, lock};
+use crate::node::{Event, Node, Shared, lock};
 
 /// Per-recipient limits for held messages.
 pub const MAX_HELD_MESSAGES: usize = 100;
@@ -113,32 +113,87 @@ impl MailboxMsg {
 /// Sealed messages held for absent contacts.
 #[derive(Default)]
 pub(crate) struct MailboxStore {
-    held: HashMap<[u8; 32], Vec<(u64, Vec<u8>)>>,
+    held: HashMap<[u8; 32], Vec<Held>>,
+}
+
+struct Held {
+    at: u64,
+    sealed: Vec<u8>,
+    /// Out to the recipient in this run, waiting for its acknowledgement
+    /// (not saved: after a restart it goes again).
+    sent: bool,
+}
+
+/// Whether a delivery of `sealed` is too large for the acknowledgement
+/// state to keep across a restart (see [`crate::delivery::MAX_PERSISTED`]),
+/// so the store keeps it until the recipient acknowledges it. With room to
+/// spare for the `Deliver` and `Tracked` framing.
+fn kept_until_acked(sealed: &[u8]) -> bool {
+    sealed.len() + 256 > crate::delivery::MAX_PERSISTED
 }
 
 impl MailboxStore {
-    fn hold(&mut self, to: [u8; 32], sealed: Vec<u8>, now: u64) -> bool {
+    fn hold(&mut self, to: [u8; 32], sealed: Vec<u8>, now: u64, sent: bool) -> bool {
         let q = self.held.entry(to).or_default();
-        q.retain(|(t, _)| now.saturating_sub(*t) < MAX_HOLD_MS);
-        let bytes: usize = q.iter().map(|(_, s)| s.len()).sum();
+        q.retain(|h| now.saturating_sub(h.at) < MAX_HOLD_MS);
+        let bytes: usize = q.iter().map(|h| h.sealed.len()).sum();
         if q.len() >= MAX_HELD_MESSAGES
             || bytes + sealed.len() > MAX_HELD_BYTES
-            || q.iter().any(|(_, s)| *s == sealed)
+            || q.iter().any(|h| h.sealed == sealed)
         {
             return false;
         }
-        q.push((now, sealed));
+        q.push(Held {
+            at: now,
+            sealed,
+            sent,
+        });
         true
     }
 
-    pub(crate) fn take(&mut self, to: &PublicIdentity, now: u64) -> Vec<Vec<u8>> {
-        self.held
-            .remove(to.as_bytes())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(t, _)| now.saturating_sub(*t) < MAX_HOLD_MS)
-            .map(|(_, s)| s)
-            .collect()
+    /// What to deliver to `to` now. Small messages leave the store (the
+    /// acknowledgement state keeps them until `to` has them); large ones
+    /// stay until `to` acknowledges them ([`MailboxStore::delivered`]),
+    /// going out once per run. Also says whether the store changed.
+    pub(crate) fn take(&mut self, to: &PublicIdentity, now: u64) -> (Vec<Vec<u8>>, bool) {
+        let Some(q) = self.held.get_mut(to.as_bytes()) else {
+            return (Vec::new(), false);
+        };
+        let before = q.len();
+        let mut out = Vec::new();
+        q.retain_mut(|h| {
+            if now.saturating_sub(h.at) >= MAX_HOLD_MS {
+                return false;
+            }
+            if !kept_until_acked(&h.sealed) {
+                out.push(std::mem::take(&mut h.sealed));
+                return false;
+            }
+            if !h.sent {
+                h.sent = true;
+                out.push(h.sealed.clone());
+            }
+            true
+        });
+        let changed = q.len() != before;
+        if q.is_empty() {
+            self.held.remove(to.as_bytes());
+        }
+        (out, changed)
+    }
+
+    /// `to` acknowledged `sealed`: our copy goes. True if we had one.
+    pub(crate) fn delivered(&mut self, to: &PublicIdentity, sealed: &[u8]) -> bool {
+        let Some(q) = self.held.get_mut(to.as_bytes()) else {
+            return false;
+        };
+        let before = q.len();
+        q.retain(|h| h.sealed != sealed);
+        let gone = q.len() != before;
+        if q.is_empty() {
+            self.held.remove(to.as_bytes());
+        }
+        gone
     }
 
     /// Drops what has been held too long, for every recipient. True if
@@ -146,7 +201,7 @@ impl MailboxStore {
     pub(crate) fn prune(&mut self, now: u64) -> bool {
         let before = self.held_for();
         self.held.retain(|_, q| {
-            q.retain(|(t, _)| now.saturating_sub(*t) < MAX_HOLD_MS);
+            q.retain(|h| now.saturating_sub(h.at) < MAX_HOLD_MS);
             !q.is_empty()
         });
         self.held_for() != before
@@ -166,7 +221,7 @@ impl MailboxStore {
             .held
             .values()
             .flatten()
-            .map(|(_, s)| s.len() + 48)
+            .map(|h| h.sealed.len() + 48)
             .sum::<usize>()
             + 64;
         cbor::to_vec(size, |e| {
@@ -174,8 +229,8 @@ impl MailboxStore {
             e.u8(0)?.u64(STATE_VERSION)?;
             e.u8(1)?.array_len(self.held_for())?;
             for (to, q) in &self.held {
-                for (t, s) in q {
-                    e.array_len(3)?.bytes(to)?.u64(*t)?.bytes(s)?;
+                for h in q {
+                    e.array_len(3)?.bytes(to)?.u64(h.at)?.bytes(&h.sealed)?;
                 }
             }
             Ok(())
@@ -196,10 +251,11 @@ impl MailboxStore {
                         }
                         let to = fixed_bytes::<32>(d)?;
                         let t = d.u64()?;
-                        me.held
-                            .entry(to)
-                            .or_default()
-                            .push((t, d.bytes()?.to_vec()));
+                        me.held.entry(to).or_default().push(Held {
+                            at: t,
+                            sealed: d.bytes()?.to_vec(),
+                            sent: false,
+                        });
                     }
                 }
                 _ => return Ok(false),
@@ -310,8 +366,8 @@ impl Node {
         }
         let held = {
             let mut mb = lock(&self.shared.mailbox);
-            let held = mb.take(peer, now_ms());
-            if !held.is_empty() {
+            let (held, changed) = mb.take(peer, now_ms());
+            if changed {
                 self.shared.persist_mailbox(&mb);
             }
             held
@@ -460,16 +516,31 @@ impl Node {
             return DepositStatus::Declined;
         }
         if self.sessions().iter().any(|s| s.peer == dest) {
+            // A large one is kept until acknowledged, as below, in case
+            // we restart before then.
+            let kept = kept_until_acked(&sealed) && {
+                let mut mb = lock(&self.shared.mailbox);
+                let kept = mb.hold(to, sealed.clone(), now_ms(), true);
+                if kept {
+                    self.shared.persist_mailbox(&mb);
+                }
+                kept
+            };
             let deliver = MailboxMsg::Deliver {
                 sealed: sealed.clone(),
             };
             if self.mailbox_send(&dest, &deliver) {
                 return DepositStatus::Delivered;
             }
+            if kept {
+                let mut mb = lock(&self.shared.mailbox);
+                mb.delivered(&dest, &sealed);
+                self.shared.persist_mailbox(&mb);
+            }
         }
         let held = {
             let mut mb = lock(&self.shared.mailbox);
-            let held = mb.hold(to, sealed, now_ms());
+            let held = mb.hold(to, sealed, now_ms(), false);
             if held {
                 self.shared.persist_mailbox(&mb);
             }
@@ -554,6 +625,20 @@ impl Node {
     }
 }
 
+impl Shared {
+    /// `peer` has (or, not acknowledging, was sent) our delivery
+    /// `payload`: if we kept a copy until then, it goes.
+    pub(crate) fn mail_delivered(&self, peer: &PublicIdentity, payload: &[u8]) {
+        let Ok(MailboxMsg::Deliver { sealed }) = MailboxMsg::decode(payload) else {
+            return;
+        };
+        let mut mb = lock(&self.mailbox);
+        if mb.delivered(peer, &sealed) {
+            self.persist_mailbox(&mb);
+        }
+    }
+}
+
 fn encode_bundle_list(parts: &[Vec<u8>]) -> threnody_core::Result<Vec<u8>> {
     cbor::to_vec(parts.iter().map(Vec::len).sum::<usize>() + 16, |e| {
         e.array_len(parts.len())?;
@@ -600,16 +685,16 @@ mod tests {
         let id = threnody_core::Identity::from_seed(&[1; 32]).public();
         let to = *id.as_bytes();
         let mut mb = MailboxStore::default();
-        assert!(mb.hold(to, vec![0], 0));
-        assert!(!mb.hold(to, vec![0], 0), "duplicate");
+        assert!(mb.hold(to, vec![0], 0, false));
+        assert!(!mb.hold(to, vec![0], 0, false), "duplicate");
         for i in 1..MAX_HELD_MESSAGES {
-            assert!(mb.hold(to, vec![i as u8, 1], 0));
+            assert!(mb.hold(to, vec![i as u8, 1], 0, false));
         }
-        assert!(!mb.hold(to, vec![9, 9, 9], 0), "count limit");
+        assert!(!mb.hold(to, vec![9, 9, 9], 0, false), "count limit");
         let mut again = MailboxStore::decode(&mb.encode().unwrap()).unwrap();
         assert_eq!(again.held_for(), MAX_HELD_MESSAGES);
-        assert_eq!(again.take(&id, 1).len(), MAX_HELD_MESSAGES);
-        assert!(mb.take(&id, MAX_HOLD_MS + 1).is_empty(), "expired");
+        assert_eq!(again.take(&id, 1).0.len(), MAX_HELD_MESSAGES);
+        assert!(mb.take(&id, MAX_HOLD_MS + 1).0.is_empty(), "expired");
     }
 
     #[test]
@@ -618,10 +703,10 @@ mod tests {
             .map(|i| threnody_core::Identity::from_seed(&[i; 32]).public())
             .collect();
         let mut mb = MailboxStore::default();
-        mb.hold(*ids[0].as_bytes(), vec![1], 0);
-        mb.hold(*ids[1].as_bytes(), vec![2], 0);
-        mb.hold(*ids[1].as_bytes(), vec![3], MAX_HOLD_MS);
-        mb.hold(*ids[2].as_bytes(), vec![4], MAX_HOLD_MS);
+        mb.hold(*ids[0].as_bytes(), vec![1], 0, false);
+        mb.hold(*ids[1].as_bytes(), vec![2], 0, false);
+        mb.hold(*ids[1].as_bytes(), vec![3], MAX_HOLD_MS, false);
+        mb.hold(*ids[2].as_bytes(), vec![4], MAX_HOLD_MS, false);
         // Nobody comes back for the old ones: they still go.
         assert!(mb.prune(MAX_HOLD_MS + 1));
         assert!(!mb.prune(MAX_HOLD_MS + 1));
@@ -630,5 +715,24 @@ mod tests {
         assert!(mb.forget(&ids[2]) && !mb.forget(&ids[2]));
         let again = MailboxStore::decode(&mb.encode().unwrap()).unwrap();
         assert_eq!(again.held_for(), 1);
+    }
+
+    #[test]
+    fn large_messages_stay_until_acknowledged() {
+        let id = threnody_core::Identity::from_seed(&[1; 32]).public();
+        let big = vec![7; crate::delivery::MAX_PERSISTED];
+        let mut mb = MailboxStore::default();
+        mb.hold(*id.as_bytes(), vec![1], 0, false);
+        mb.hold(*id.as_bytes(), big.clone(), 0, false);
+        let (out, changed) = mb.take(&id, 1);
+        assert_eq!((out, changed), (vec![vec![1], big.clone()], true));
+        // Still held, but not sent twice in one run.
+        assert_eq!(mb.held_for(), 1);
+        assert_eq!(mb.take(&id, 1), (vec![], false));
+        // A restart before the acknowledgement: it goes again.
+        let mut again = MailboxStore::decode(&mb.encode().unwrap()).unwrap();
+        assert_eq!(again.take(&id, 1).0, vec![big.clone()]);
+        assert!(again.delivered(&id, &big) && !again.delivered(&id, &big));
+        assert_eq!(again.held_for(), 0);
     }
 }

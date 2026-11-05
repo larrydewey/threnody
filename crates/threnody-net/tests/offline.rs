@@ -422,3 +422,43 @@ async fn a_mailbox_drops_what_it_holds_for_a_contact_it_deletes() {
     assert_eq!(r.node.held_messages(), 0);
     let _ = (&mut a.rx, &mut r.rx);
 }
+
+#[tokio::test]
+async fn a_mailbox_keeps_a_large_message_until_the_recipient_acknowledges_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.set_prefer_onion(false);
+    let big = "x".repeat(90_000);
+    a.node.send_offline(&bid, &text(&big)).unwrap();
+    a.node.send_offline(&bid, &text("small")).unwrap();
+    wait_for(|| r.node.held_messages() == 2).await;
+
+    // B comes back; R delivers both, and lets the large one go only
+    // once B acknowledges it (a restart before then must not lose it).
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&r.addr, None).await.unwrap();
+    for want in [text(&big), text("small")] {
+        next(
+            &mut b2rx,
+            |e| matches!(e, Event::OfflineMessage { msg, .. } if *msg == want),
+        )
+        .await;
+    }
+    wait_for(|| r.node.held_messages() == 0).await;
+    let _ = (&mut a.rx, &mut r.rx);
+}

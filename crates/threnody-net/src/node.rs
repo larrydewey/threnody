@@ -1738,8 +1738,12 @@ where
                             first.then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
-                            for tag in shared.delivery(|d| d.acked(&peer, &ids)) {
+                            let (tags, mail) = shared.delivery(|d| d.acked(&peer, &ids));
+                            for tag in tags {
                                 node.mark_delivered(&peer, tag);
+                            }
+                            for m in mail {
+                                shared.mail_delivered(&peer, &m);
                             }
                             None
                         }
@@ -1942,6 +1946,10 @@ fn ready(
         (m @ AppMessage::Tracked { .. }, None) => Err(m),
         (AppMessage::Tracked { id, inner }, Some(false)) => {
             shared.delivery(|d| d.forget(peer, id));
+            // Sent plain is as delivered as it gets with this peer.
+            if let AppMessage::Mailbox(m) = &*inner {
+                shared.mail_delivered(peer, m);
+            }
             Ok(*inner)
         }
         (m, _) => Ok(m),
