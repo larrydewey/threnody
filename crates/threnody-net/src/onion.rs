@@ -313,8 +313,13 @@ impl OnionState {
 
 impl Node {
     fn onion_send(&self, to: &PublicIdentity, m: &OnionMsg) -> bool {
-        let Ok(b) = m.encode() else { return false };
         let anon = lock(&self.shared.onion).anon.contains(&(*to, m.circ()));
+        self.onion_send_via(to, m, anon)
+    }
+
+    /// Sends over the anonymous link to `to` when `anon`, else its session.
+    fn onion_send_via(&self, to: &PublicIdentity, m: &OnionMsg, anon: bool) -> bool {
+        let Ok(b) = m.encode() else { return false };
         if anon {
             return self.anon_send(to, AppMessage::Onion(b));
         }
@@ -358,15 +363,11 @@ impl Node {
     ) {
         let contact = !anon && self.shared.mutual(&from);
         let admitted = {
-            let mut st = lock(&self.shared.onion);
+            let st = lock(&self.shared.onion);
             let strangers = st.hops.keys().filter(|l| st.anon.contains(l)).count();
-            let ok = !st.hops.contains_key(&(from, circ))
+            !st.hops.contains_key(&(from, circ))
                 && st.hops.keys().filter(|(p, _)| *p == from).count() < MAX_CIRCUITS_PER_PEER
-                && (contact || strangers < MAX_STRANGER_HOPS);
-            if ok && anon {
-                st.anon.insert((from, circ));
-            }
-            ok
+                && (contact || strangers < MAX_STRANGER_HOPS)
         };
         // A stranger's circuit may end here; it goes further only if paid.
         let full = contact
@@ -379,19 +380,26 @@ impl Node {
             .then(|| onion::respond(self.identity_ref(), e_pub).ok())
             .flatten();
         let Some((keys, ct, sig)) = responded else {
-            self.onion_send(&from, &OnionMsg::Destroy { circ });
+            // Back the way it came; nothing of it is kept.
+            self.onion_send_via(&from, &OnionMsg::Destroy { circ }, anon);
             return;
         };
-        lock(&self.shared.onion).hops.insert(
-            (from, circ),
-            RelayHop {
-                keys,
-                full,
-                next: None,
-                endpoint: None,
-                deposit: None,
-            },
-        );
+        {
+            let mut st = lock(&self.shared.onion);
+            if anon {
+                st.anon.insert((from, circ));
+            }
+            st.hops.insert(
+                (from, circ),
+                RelayHop {
+                    keys,
+                    full,
+                    next: None,
+                    endpoint: None,
+                    deposit: None,
+                },
+            );
+        }
         let id = *self.identity().as_bytes();
         self.onion_send(&from, &OnionMsg::Created { circ, id, ct, sig });
     }
@@ -1229,6 +1237,46 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AcceptPolicy, NodeConfig};
+    use threnody_core::store::Home;
+
+    fn test_node(dir: &tempfile::TempDir, name: &str) -> Node {
+        let home = Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+        .0
+    }
+
+    fn create(circ: u64, e_pub: Vec<u8>) -> Vec<u8> {
+        OnionMsg::Create {
+            circ,
+            e_pub,
+            token: None,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refused_stranger_create_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "n");
+        let stranger = threnody_core::Identity::generate().public();
+        // Admitted, but the key is junk, so the hop is never made.
+        for circ in 0..8 {
+            node.on_onion_from(stranger, &create(circ, vec![1; 8]), true);
+        }
+        let st = lock(&node.shared.onion);
+        assert!(st.hops.is_empty());
+        assert!(st.anon.is_empty());
+    }
 
     #[test]
     fn anonymous_deposits_are_rate_limited_per_neighbour() {
