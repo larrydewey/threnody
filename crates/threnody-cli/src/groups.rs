@@ -317,9 +317,9 @@ impl GroupUi {
                 self.show(node, name, updates);
             }
             "decline" => {
-                let g = self.pending(it.next())?.group;
-                say!("* declined {}", self.label(&g));
-                self.groups.decline(&g);
+                let i = self.pending(it.next())?;
+                say!("* declined {}", self.label(&i.group));
+                self.groups.decline_from(&i.group, &i.from);
             }
             "remove" | "kick" => {
                 let (g, p) = (it.next(), it.next());

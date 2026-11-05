@@ -3501,7 +3501,16 @@ impl ChatView {
 
     fn decline_group(self: &Rc<Self>) {
         let Some(g) = self.group() else { return };
-        self.run("decline", move |n| n.decline_group_invite(g), None);
+        // Only the invitation shown.
+        let from = self.conv.borrow().invite.as_ref().map(|i| i.from.clone());
+        self.run(
+            "decline",
+            move |n| match from {
+                Some(from) => n.decline_group_invite_from(g, from),
+                None => n.decline_group_invite(g),
+            },
+            None,
+        );
         if let Some(a) = self.app.upgrade() {
             a.close_chat();
         }

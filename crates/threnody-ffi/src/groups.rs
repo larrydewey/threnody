@@ -277,6 +277,21 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Declines `from`'s invitation to `group` (both as `group_invites`
+    /// lists them), keeping anyone else's to the same group.
+    pub fn decline_group_invite_from(&self, group: String, from: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let mut groups = self.group_node();
+        let inviter = groups
+            .invites()
+            .iter()
+            .find(|i| i.group == g && fp(&i.from) == from)
+            .map(|i| i.from)
+            .ok_or_else(|| fail("no such invitation"))?;
+        groups.decline_from(&g, &inviter);
+        Ok(())
+    }
+
     /// Removes every device of `peer`'s account (we must own the group).
     pub fn remove_from_group(&self, group: String, peer: String) -> Result<()> {
         let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);

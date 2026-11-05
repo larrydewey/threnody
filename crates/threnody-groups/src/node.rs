@@ -299,6 +299,14 @@ impl GroupNode {
         self.save_invites();
     }
 
+    /// Declines `from`'s invitation to `group`, keeping any other
+    /// inviter's to the same group.
+    pub fn decline_from(&mut self, group: &GroupId, from: &PublicIdentity) {
+        self.invites
+            .retain(|i| !(i.group == *group && i.from == *from));
+        self.save_invites();
+    }
+
     /// Removes every device of `peer`'s account that is in the group (we
     /// must own it).
     pub fn remove(

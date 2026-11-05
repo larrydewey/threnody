@@ -385,6 +385,30 @@ async fn a_trusted_invitation_that_could_not_be_saved_waits_for_consent() {
 }
 
 #[tokio::test]
+async fn declining_one_inviter_keeps_anothers_invitation_to_the_same_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let (bob, mallory) = (
+        threnody_core::Identity::generate().public(),
+        threnody_core::Identity::generate().public(),
+    );
+    let request = GroupWire::KeyPackageRequest {
+        group: [3; 16],
+        name: "team".into(),
+    };
+    for from in [mallory, bob] {
+        alice
+            .groups
+            .incoming(&alice.node, from, &request.encode().unwrap())
+            .unwrap();
+    }
+    alice.groups.decline_from(&[3; 16], &mallory);
+    let invites = alice.groups.invites();
+    assert_eq!(invites.len(), 1);
+    assert_eq!(invites[0].from, bob);
+}
+
+#[tokio::test]
 async fn nothing_leaves_that_could_not_be_saved() {
     let dir = tempfile::tempdir().unwrap();
     let mut alice = spawn(&dir, "alice").await;
