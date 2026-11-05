@@ -263,9 +263,13 @@ impl ReachState {
     }
 }
 
-/// Whether a datagram is a KRPC (DHT) reply.
+/// The longest KRPC reply we take. We only send pings, and their replies
+/// are under 200 bytes; anything longer is not ours to read.
+const MAX_KRPC_REPLY: usize = 512;
+
+/// Whether a datagram is a KRPC (DHT) reply to one of our pings.
 pub(crate) fn is_krpc_reply(data: &[u8]) -> bool {
-    data.len() >= 12
+    (12..=MAX_KRPC_REPLY).contains(&data.len())
         && data[0] == b'd'
         && data.last() == Some(&b'e')
         && find(data, b"1:y1:r").is_some()
@@ -1502,6 +1506,10 @@ mod tests {
         assert_eq!(addr, "203.0.113.5:7450".parse().unwrap());
         assert!(!is_krpc_reply(&krpc_ping(*b"xy")), "a query is not a reply");
         assert!(!is_krpc_reply(&[0x40; 1200]));
+        let mut long = b"d1:y1:r".to_vec();
+        long.resize(60_000, b'x');
+        long.push(b'e');
+        assert!(!is_krpc_reply(&long), "far longer than any ping reply");
     }
 
     #[test]

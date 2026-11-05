@@ -42,6 +42,9 @@ pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A datagram that isn't QUIC: a probe or a DHT reply.
 pub(crate) type Foreign = (SocketAddr, Vec<u8>);
+/// Non-QUIC datagrams waiting to be looked at. Anyone can send them, so a
+/// flood beyond this is dropped, as the socket's own buffer would.
+const FOREIGN_QUEUE: usize = 256;
 
 /// Whether a datagram is something other than QUIC. Probes have the QUIC
 /// fixed bit clear (grease is off, so no QUIC peer clears it); DHT replies
@@ -54,7 +57,7 @@ fn is_foreign(data: &[u8]) -> bool {
 #[derive(Debug)]
 struct Demux {
     inner: Arc<dyn AsyncUdpSocket>,
-    foreign: mpsc::UnboundedSender<Foreign>,
+    foreign: mpsc::Sender<Foreign>,
 }
 
 impl AsyncUdpSocket for Demux {
@@ -81,7 +84,7 @@ impl AsyncUdpSocket for Demux {
                 // are never the same size as their neighbours.
                 if m.len == m.stride && is_foreign(&bufs[i][..m.len]) {
                     let src = SocketAddr::new(m.addr.ip().to_canonical(), m.addr.port());
-                    let _ = self.foreign.send((src, bufs[i][..m.len].to_vec()));
+                    let _ = self.foreign.try_send((src, bufs[i][..m.len].to_vec()));
                     continue;
                 }
                 if kept != i {
@@ -309,7 +312,7 @@ impl Node {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| NetError::Io(io::Error::other("no async runtime")))?;
         let socket = runtime.wrap_udp_socket(std_sock)?;
-        let (ftx, mut frx) = mpsc::unbounded_channel();
+        let (ftx, mut frx) = mpsc::channel(FOREIGN_QUEUE);
         let demux = Arc::new(Demux {
             inner: socket.clone(),
             foreign: ftx,
@@ -453,4 +456,51 @@ fn quic_error(e: impl std::fmt::Display) -> NetError {
         io::ErrorKind::ConnectionAborted,
         e.to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flood of datagrams shaped like DHT replies fills the queue to its
+    /// bound and no further, and QUIC behind it still gets through.
+    #[tokio::test]
+    async fn foreign_datagrams_beyond_the_queue_are_dropped() {
+        let runtime = quinn::default_runtime().unwrap();
+        let sock = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let demux = Demux {
+            inner: runtime.wrap_udp_socket(sock).unwrap(),
+            foreign: tx,
+        };
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for i in 4..24 {
+            // Each a different size, so the kernel never coalesces them.
+            let mut d = b"d1:y1:r".to_vec();
+            d.extend(std::iter::repeat_n(b'x', i));
+            d.push(b'e');
+            sender.send_to(&d, addr).unwrap();
+        }
+        // The QUIC fixed bit set: not foreign.
+        sender.send_to(&[0x40; 100], addr).unwrap();
+        let mut buf = [0u8; 2048];
+        let mut meta = [RecvMeta::default()];
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                let mut bufs = [io::IoSliceMut::new(&mut buf)];
+                demux.poll_recv(cx, &mut bufs, &mut meta)
+            }),
+        )
+        .await
+        .expect("QUIC behind the flood is received")
+        .unwrap();
+        assert_eq!((n, meta[0].len), (1, 100));
+        let mut queued = 0;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 4, "the queue holds its bound, the rest is dropped");
+    }
 }
