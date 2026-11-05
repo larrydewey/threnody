@@ -37,6 +37,11 @@ const EXPECTED_VERSION: u8 = 2;
 /// Messages held for one member; the oldest are dropped first. Messages
 /// from more than a few epochs back can't be read anyway.
 pub const MAX_HELD_PER_MEMBER: usize = 200;
+/// Bytes held for one member (a few files' worth), and for everyone; the
+/// oldest messages are dropped first. Any member can have us hold what it
+/// forwards, so this bounds what one can make us keep and rewrite.
+pub const MAX_HELD_BYTES_PER_MEMBER: usize = 32 << 20;
+pub const MAX_HELD_BYTES: usize = 128 << 20;
 
 /// An invitation waiting for the user's consent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -958,15 +963,7 @@ impl GroupNode {
             }
         }
         // Hold it for when they connect, and try to make that happen.
-        self.held.push((to, bytes, t));
-        let mine: Vec<usize> = (0..self.held.len())
-            .filter(|&i| self.held[i].0 == to)
-            .collect();
-        if let Some(extra) = mine.len().checked_sub(MAX_HELD_PER_MEMBER) {
-            for i in mine.into_iter().take(extra).rev() {
-                self.held.remove(i);
-            }
-        }
+        hold(&mut self.held, to, bytes, t);
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let node = node.clone();
             rt.spawn(async move {
@@ -1220,6 +1217,41 @@ impl GroupNode {
     }
 }
 
+/// Adds a message for `to` to `held`, then drops the oldest held for
+/// `to` past [`MAX_HELD_PER_MEMBER`] or [`MAX_HELD_BYTES_PER_MEMBER`],
+/// and the oldest of all past [`MAX_HELD_BYTES`].
+fn hold(
+    held: &mut Vec<(PublicIdentity, Vec<u8>, Tag)>,
+    to: PublicIdentity,
+    bytes: Vec<u8>,
+    t: Tag,
+) {
+    held.push((to, bytes, t));
+    let (mut count, mut size) = (0, 0);
+    let mut keep: Vec<bool> = held
+        .iter()
+        .rev()
+        .map(|(p, b, _)| {
+            if *p != to {
+                return true;
+            }
+            count += 1;
+            size += b.len();
+            count <= MAX_HELD_PER_MEMBER && size <= MAX_HELD_BYTES_PER_MEMBER
+        })
+        .collect();
+    keep.reverse();
+    let mut total = 0;
+    for (k, (_, b, _)) in keep.iter_mut().zip(held.iter()).rev() {
+        if *k {
+            total += b.len();
+            *k = total <= MAX_HELD_BYTES;
+        }
+    }
+    let mut keep = keep.into_iter();
+    held.retain(|_| keep.next().unwrap_or(true));
+}
+
 /// The tag for our own message, history entry `local_id` in `group`.
 fn tag(local_id: u64, group: &GroupId) -> Tag {
     Tag {
@@ -1369,6 +1401,45 @@ fn decode_held(b: &[u8]) -> Vec<(PublicIdentity, Vec<u8>, Tag)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_is_held_is_bounded_oldest_first() {
+        let (a, b) = (Identity::generate().public(), Identity::generate().public());
+        let mut held = Vec::new();
+        let mib = |n: u8| vec![n; 1 << 20];
+        // By bytes for one member: the newest 32 MiB stay.
+        for n in 0..40 {
+            hold(&mut held, a, mib(n), Tag::NONE);
+        }
+        hold(&mut held, b, mib(0), Tag::NONE);
+        let bytes = |held: &[(PublicIdentity, Vec<u8>, Tag)], p| {
+            held.iter()
+                .filter(|(q, ..)| *q == p)
+                .map(|(_, m, _)| m.len())
+                .sum::<usize>()
+        };
+        assert_eq!(bytes(&held, a), MAX_HELD_BYTES_PER_MEMBER);
+        assert_eq!(held[0].1[0], 8, "the oldest went first");
+        // By count, as before.
+        for _ in 0..MAX_HELD_PER_MEMBER + 5 {
+            hold(&mut held, b, vec![1], Tag::NONE);
+        }
+        assert_eq!(
+            held.iter().filter(|(p, ..)| *p == b).count(),
+            MAX_HELD_PER_MEMBER
+        );
+        // And in all, across members.
+        let mut held = Vec::new();
+        for i in 0..10 {
+            let p = Identity::generate().public();
+            for _ in 0..20 {
+                hold(&mut held, p, mib(i), Tag::NONE);
+            }
+        }
+        let total: usize = held.iter().map(|(_, m, _)| m.len()).sum();
+        assert_eq!(total, MAX_HELD_BYTES);
+        assert_eq!(held.last().unwrap().1[0], 9, "the newest stay");
+    }
 
     #[test]
     fn local_state_round_trips_and_tolerates_damage() {
