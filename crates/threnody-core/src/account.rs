@@ -602,7 +602,9 @@ impl FromStr for LinkCode {
             .ok_or(Error::Malformed("link code"))?;
         let (fp, rest) = rest.split_once('@').ok_or(Error::Malformed("link code"))?;
         let (addr, hex) = rest.rsplit_once('#').ok_or(Error::Malformed("link code"))?;
-        if hex.len() != 32 || addr.is_empty() {
+        // Checking for hex digits first also keeps the slicing below on
+        // character boundaries.
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) || addr.is_empty() {
             return Err(Error::Malformed("link code"));
         }
         let mut secret = [0u8; 16];
@@ -856,5 +858,25 @@ mod tests {
         );
         assert_ne!(code.proof(&sid, &n.public()), code.proof(&sid, &e.public()));
         assert!("threnody-link://x@y#00".parse::<LinkCode>().is_err());
+    }
+
+    #[test]
+    fn link_codes_with_stray_characters_are_rejected_not_panicked_on() {
+        let fp = Identity::generate().public().fingerprint().compact();
+        let good = format!("{LINK_SCHEME}{fp}@192.0.2.1:7450#{}", "0".repeat(32));
+        assert!(good.parse::<LinkCode>().is_ok());
+        // 32 bytes, but the first character is three of them.
+        let multibyte = format!(
+            "{LINK_SCHEME}{fp}@192.0.2.1:7450#\u{20ac}{}",
+            "0".repeat(29)
+        );
+        // A sign is not a hex digit, though u8::from_str_radix takes one.
+        let signed = format!("{LINK_SCHEME}{fp}@192.0.2.1:7450#+f{}", "0".repeat(30));
+        for code in [multibyte, signed] {
+            assert!(matches!(
+                code.parse::<LinkCode>(),
+                Err(Error::Malformed("link code"))
+            ));
+        }
     }
 }
