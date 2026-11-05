@@ -224,6 +224,18 @@ async fn credentials_are_issued_and_selectively_presented() {
         ("over18".to_owned(), "yes".to_owned()),
     ];
     let today = threnody_core::credential::day(threnody_core::now_ms());
+    // Until the holder accepts the issuer's messages, offers are declined.
+    issuer
+        .node
+        .offer_credential(&hid, "example/member/1", attrs.clone(), today + 30)
+        .unwrap();
+    next(
+        &mut issuer.rx,
+        |e| matches!(e, Event::CredentialFailed { reason, .. } if reason == "declined"),
+    )
+    .await;
+    assert!(holder.node.credential_offers().is_empty());
+    holder.node.accept_contact(&issuer.node.identity());
     issuer
         .node
         .offer_credential(&hid, "example/member/1", attrs.clone(), today + 30)
@@ -244,7 +256,6 @@ async fn credentials_are_issued_and_selectively_presented() {
     .await;
     let held = holder.node.credentials();
     assert_eq!(held.len(), 1);
-    let _ = &mut issuer.rx;
 
     let vid = holder.node.connect(&verifier.addr, None).await.unwrap();
     let hid2 = holder.node.identity();

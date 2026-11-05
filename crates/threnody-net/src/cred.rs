@@ -26,6 +26,8 @@ use crate::node::{Event, Node, lock};
 const STATE: &str = "credentials";
 /// Exchanges waiting for the user or the peer, per kind.
 const MAX_PENDING: usize = 64;
+/// Of those waiting for the user, from one peer.
+const MAX_PENDING_PER_PEER: usize = 8;
 
 /// A held credential, as apps show it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,12 +345,18 @@ impl Node {
                     attributes,
                     expires_day,
                 };
-                {
+                let taken = self.may_wait(&peer) && {
                     let mut st = lock(&self.shared.creds);
-                    if st.offers.len() >= MAX_PENDING {
-                        return;
+                    let theirs = st.offers.values().filter(|(o, _)| o.peer == peer).count();
+                    let room = st.offers.len() < MAX_PENDING && theirs < MAX_PENDING_PER_PEER;
+                    if room {
+                        st.offers.insert(id, (offer.clone(), key));
                     }
-                    st.offers.insert(id, (offer.clone(), key));
+                    room
+                };
+                if !taken {
+                    let _ = self.cred_send(&peer, &CredMsg::Decline { id });
+                    return;
                 }
                 self.emit(Event::CredentialOffered { offer });
             }
@@ -421,12 +429,18 @@ impl Node {
                     schema,
                     keys,
                 };
-                {
+                let taken = self.may_wait(&peer) && {
                     let mut st = lock(&self.shared.creds);
-                    if st.asks.len() >= MAX_PENDING {
-                        return;
+                    let theirs = st.asks.values().filter(|(a, _)| a.peer == peer).count();
+                    let room = st.asks.len() < MAX_PENDING && theirs < MAX_PENDING_PER_PEER;
+                    if room {
+                        st.asks.insert(id, (ask.clone(), nonce));
                     }
-                    st.asks.insert(id, (ask.clone(), nonce));
+                    room
+                };
+                if !taken {
+                    let _ = self.cred_send(&peer, &CredMsg::Decline { id });
+                    return;
                 }
                 self.emit(Event::CredentialAsked { ask });
             }
@@ -452,6 +466,14 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Whether an offer or ask from `peer` may wait for the user: only
+    /// from someone whose messages are accepted. A stranger's would show
+    /// past the message-request gate, one notification each. Anything
+    /// turned away is declined, so the peer hears of it.
+    fn may_wait(&self, peer: &PublicIdentity) -> bool {
+        self.is_accepted(peer)
     }
 
     fn check_proof(
@@ -492,6 +514,70 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_node(dir: &tempfile::TempDir) -> Node {
+        let home = threnody_core::store::Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+        .0
+    }
+
+    fn offer(from: &threnody_core::Identity, id: u64) -> Vec<u8> {
+        CredMsg::Offer {
+            id,
+            key: Issuer::new(from, 0).unwrap().key().encode().unwrap(),
+            schema: "example/member/1".into(),
+            attributes: vec![("member".into(), "yes".into())],
+            expires_day: 99_999,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn ask(id: u64) -> Vec<u8> {
+        CredMsg::Ask {
+            id,
+            schema: "example/member/1".into(),
+            keys: vec!["member".into()],
+            nonce: [0; 32],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn offers_and_asks_wait_only_from_accepted_peers_and_only_so_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir);
+        // A stranger's offers and asks are message requests' business.
+        let stranger = threnody_core::Identity::generate();
+        node.on_credential(stranger.public(), &offer(&stranger, 1));
+        node.on_credential(stranger.public(), &ask(2));
+        assert!(node.credential_offers().is_empty());
+        assert!(node.credential_asks().is_empty());
+        // An accepted peer can't take every slot either.
+        let friend = threnody_core::Identity::generate();
+        node.accept_contact(&friend.public());
+        for id in 0..100 {
+            node.on_credential(friend.public(), &offer(&friend, 10 + id));
+            node.on_credential(friend.public(), &ask(1000 + id));
+        }
+        assert_eq!(node.credential_offers().len(), MAX_PENDING_PER_PEER);
+        assert_eq!(node.credential_asks().len(), MAX_PENDING_PER_PEER);
+        let other = threnody_core::Identity::generate();
+        node.accept_contact(&other.public());
+        node.on_credential(other.public(), &offer(&other, 5000));
+        node.on_credential(other.public(), &ask(5001));
+        assert_eq!(node.credential_offers().len(), MAX_PENDING_PER_PEER + 1);
+        assert_eq!(node.credential_asks().len(), MAX_PENDING_PER_PEER + 1);
+    }
 
     #[test]
     fn held_credentials_round_trip() {
