@@ -70,7 +70,7 @@ op: 1 create, 2 created, 3 cell, 4 destroy
 ## Relay rules
 
 - **Who may create.** A node answers `CREATE` from any neighbour, with at most 64 circuits per neighbour. Only a hop created by a mutually approved neighbour, or paid with a relay token (Appendix P), may `EXTEND`; any other hop may only end there (`BEGIN` or `DEPOSIT`).
-- **Who to extend to.** On `EXTEND`, a node checks for a live direct session with a mutually approved contact whose fingerprint is `to`. If there is one, it sends that contact `CREATE` on a new link circuit and returns its `CREATED` fields as `EXTENDED`. A volunteer relay may instead dial the address the `EXTEND` carries (Appendix P). Otherwise it returns `EXTEND_FAILED`.
+- **Who to extend to.** On `EXTEND` on a hop a mutually approved neighbour created, a node checks for a live direct session with a mutually approved contact whose fingerprint is `to`. If there is one, it sends that contact `CREATE` on a new link circuit and returns its `CREATED` fields as `EXTENDED`. A volunteer relay may instead dial the address the `EXTEND` carries (Appendix P); a hop paid with a token goes on only that way, never to the relay's contacts. Otherwise it returns `EXTEND_FAILED`.
 - **Passing cells on.** Cells that aren't recognized are forwarded on the paired link circuit. Cells from the next hop get this hop's backward layer and are forwarded upstream.
 - **Teardown.** `DESTROY`, or losing either link, tears the circuit down in both directions. A hop that has neither extended nor begun a stream 120 s after its `CREATE` is torn down too (a deposit still arriving then is declined).
 

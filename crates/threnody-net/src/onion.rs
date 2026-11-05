@@ -213,6 +213,11 @@ struct RelayHop {
     /// May extend: the circuit came from a mutually approved neighbour, or
     /// paid with a token. Others may only end here (BEGIN or DEPOSIT).
     full: bool,
+    /// Came from a mutually approved neighbour's session: only such a
+    /// circuit may go on to our contacts. A paid one goes on only to the
+    /// address its EXTEND names, or a stranger could reach, and probe for,
+    /// people who relay for their contacts alone.
+    contact: bool,
     next: Option<Link>,
     endpoint: Option<mpsc::UnboundedSender<Vec<u8>>>,
     /// An anonymous mailbox deposit being received.
@@ -225,10 +230,11 @@ struct RelayHop {
 }
 
 impl RelayHop {
-    fn new(keys: HopKeys, full: bool, net: Option<[u8; 16]>) -> Self {
+    fn new(keys: HopKeys, contact: bool, paid: bool, net: Option<[u8; 16]>) -> Self {
         Self {
             keys,
-            full,
+            full: contact || paid,
+            contact,
             next: None,
             endpoint: None,
             deposit: None,
@@ -432,7 +438,7 @@ impl Node {
             if anon {
                 st.anon.insert((from, circ));
             }
-            let hop = RelayHop::new(keys, full, net);
+            let hop = RelayHop::new(keys, contact, full, net);
             self.watch_hop((from, circ), hop.born);
             st.hops.insert((from, circ), hop);
         }
@@ -605,19 +611,22 @@ impl Node {
         let Ok(req) = ExtendReq::decode(data) else {
             return fail(self);
         };
-        let allowed = lock(&self.shared.onion)
+        let (allowed, from_contact) = lock(&self.shared.onion)
             .hops
             .get(&up)
-            .is_some_and(|h| h.full && h.next.is_none());
+            .map_or((false, false), |h| (h.full && h.next.is_none(), h.contact));
         if !allowed {
             return fail(self);
         }
-        let contact = self
-            .sessions()
-            .into_iter()
-            .find(|s| s.via.is_none() && s.peer.fingerprint() == req.to && s.peer != up.0)
-            .map(|s| s.peer)
-            .filter(|p| self.shared.mutual(p));
+        let contact = from_contact
+            .then(|| {
+                self.sessions()
+                    .into_iter()
+                    .find(|s| s.via.is_none() && s.peer.fingerprint() == req.to && s.peer != up.0)
+                    .map(|s| s.peer)
+                    .filter(|p| self.shared.mutual(p))
+            })
+            .flatten();
         let c = u64::from_le_bytes(random_bytes());
         if let Some(next) = contact {
             lock(&self.shared.onion).extending.insert((next, c), up);
@@ -1316,6 +1325,83 @@ mod tests {
         .0
     }
 
+    async fn listening(dir: &tempfile::TempDir, name: &str) -> (Node, Events, String) {
+        let home = Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        let (node, rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
+        (node, rx, addr)
+    }
+
+    type Events = mpsc::UnboundedReceiver<crate::Event>;
+
+    async fn mutual(x: &Node, xrx: &mut Events, y: &Node, yrx: &mut Events, yaddr: &str) {
+        let yid = x.connect(yaddr, None).await.unwrap();
+        x.set_approval(&yid, true).unwrap();
+        y.set_approval(&x.identity(), true).unwrap();
+        for rx in [xrx, yrx] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !matches!(
+                    rx.recv().await,
+                    Some(crate::Event::ApprovalChanged { mutual: true, .. }) | None
+                ) {}
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A hop on `node` for a circuit from `from`, as if it had been created.
+    fn fake_hop(node: &Node, from: PublicIdentity, circ: u64, contact: bool, paid: bool) -> Link {
+        let (_, e_pub) = CreateState::new(node.identity().fingerprint());
+        let (keys, _, _) = onion::respond(node.identity_ref(), &e_pub).unwrap();
+        let mut st = lock(&node.shared.onion);
+        if !contact {
+            st.anon.insert((from, circ));
+        }
+        st.hops
+            .insert((from, circ), RelayHop::new(keys, contact, paid, None));
+        (from, circ)
+    }
+
+    fn extend_to(to: Fingerprint) -> Vec<u8> {
+        ExtendReq {
+            to,
+            e_pub: CreateState::new(to).1,
+            addr: None,
+            token: None,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn paid_strangers_never_reach_the_relays_contacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v, mut vrx, _) = listening(&dir, "v").await;
+        let (x, mut xrx, xaddr) = listening(&dir, "x").await;
+        mutual(&v, &mut vrx, &x, &mut xrx, &xaddr).await;
+        let xfp = x.identity().fingerprint();
+        // A stranger's hop, paid with a token: an EXTEND naming the
+        // relay's contact, with no address, gets nowhere.
+        let stranger = threnody_core::Identity::generate().public();
+        let up = fake_hop(&v, stranger, 1, false, true);
+        v.onion_extend(up, &extend_to(xfp));
+        assert!(lock(&v.shared.onion).extending.is_empty());
+        // A contact's circuit still goes on to the relay's contacts.
+        let friend = threnody_core::Identity::generate().public();
+        let up = fake_hop(&v, friend, 2, true, false);
+        v.onion_extend(up, &extend_to(xfp));
+        assert_eq!(lock(&v.shared.onion).extending.len(), 1);
+    }
+
     fn create(circ: u64, e_pub: Vec<u8>) -> Vec<u8> {
         OnionMsg::Create {
             circ,
@@ -1371,7 +1457,7 @@ mod tests {
             let link = (threnody_core::Identity::generate().public(), i as u64);
             st.anon.insert(link);
             st.hops
-                .insert(link, RelayHop::new(hop(), false, Some(here)));
+                .insert(link, RelayHop::new(hop(), false, false, Some(here)));
         }
         assert!(!st.stranger_room(Some(here)));
         assert!(st.stranger_room(Some(there)));
