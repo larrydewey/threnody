@@ -2,16 +2,20 @@
 //! (`docs/appendix-h-offline.md`).
 //!
 //! ```text
-//! MailboxMsg = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status }
+//! MailboxMsg = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status, ? 4: ref }
 //! op: 1 deposit, 2 deliver, 3 receipt (status 0 declined, 1 held, 2 delivered now)
 //! ```
+//!
+//! A deposit may carry a `ref`, which its receipt repeats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
+use crate::delivery::Tag;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, Shared, lock};
 
@@ -19,6 +23,9 @@ use crate::node::{Event, Node, Shared, lock};
 pub const MAX_HELD_MESSAGES: usize = 100;
 pub const MAX_HELD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_HOLD_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+/// How long a direct deposit waits for its receipt before the sender
+/// counts it declined.
+pub const RECEIPT_WAIT: Duration = Duration::from_secs(120);
 const STATE_VERSION: u64 = 1;
 
 /// What a mailbox did with a deposit.
@@ -42,9 +49,19 @@ impl DepositStatus {
 
 #[derive(Debug, PartialEq, Eq)]
 enum MailboxMsg {
-    Deposit { to: [u8; 32], sealed: Vec<u8> },
-    Deliver { sealed: Vec<u8> },
-    Receipt { to: [u8; 32], status: DepositStatus },
+    Deposit {
+        to: [u8; 32],
+        sealed: Vec<u8>,
+        reference: Option<u64>,
+    },
+    Deliver {
+        sealed: Vec<u8>,
+    },
+    Receipt {
+        to: [u8; 32],
+        status: DepositStatus,
+        reference: Option<u64>,
+    },
 }
 
 impl MailboxMsg {
@@ -55,19 +72,37 @@ impl MailboxMsg {
         } + 64;
         cbor::to_vec(size, |e| {
             match self {
-                Self::Deposit { to, sealed } => {
-                    e.map_len(3)?.u8(0)?.u8(1)?;
+                Self::Deposit {
+                    to,
+                    sealed,
+                    reference,
+                } => {
+                    e.map_len(3 + usize::from(reference.is_some()))?
+                        .u8(0)?
+                        .u8(1)?;
                     e.u8(1)?.bytes(to)?;
                     e.u8(2)?.bytes(sealed)?;
+                    if let Some(r) = reference {
+                        e.u8(4)?.u64(*r)?;
+                    }
                 }
                 Self::Deliver { sealed } => {
                     e.map_len(2)?.u8(0)?.u8(2)?;
                     e.u8(2)?.bytes(sealed)?;
                 }
-                Self::Receipt { to, status } => {
-                    e.map_len(3)?.u8(0)?.u8(3)?;
+                Self::Receipt {
+                    to,
+                    status,
+                    reference,
+                } => {
+                    e.map_len(3 + usize::from(reference.is_some()))?
+                        .u8(0)?
+                        .u8(3)?;
                     e.u8(1)?.bytes(to)?;
                     e.u8(3)?.u8(*status as u8)?;
+                    if let Some(r) = reference {
+                        e.u8(4)?.u64(*r)?;
+                    }
                 }
             }
             Ok(())
@@ -76,13 +111,15 @@ impl MailboxMsg {
 
     fn decode(b: &[u8]) -> threnody_core::Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut op, mut to, mut sealed, mut status) = (None, None, None, None);
+        let (mut op, mut to, mut sealed, mut status, mut reference) =
+            (None, None, None, None, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => op = Some(d.u8()?),
                 1 => to = Some(fixed_bytes::<32>(d)?),
                 2 => sealed = Some(d.bytes()?.to_vec()),
                 3 => status = Some(d.u8()?),
+                4 => reference = Some(d.u64()?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -92,6 +129,7 @@ impl MailboxMsg {
             1 => Self::Deposit {
                 to: required(to, "recipient")?,
                 sealed: required(sealed, "sealed message")?,
+                reference,
             },
             2 => Self::Deliver {
                 sealed: required(sealed, "sealed message")?,
@@ -104,6 +142,7 @@ impl MailboxMsg {
                     2 => DepositStatus::Delivered,
                     _ => return Err(threnody_core::Error::Malformed("deposit status")),
                 },
+                reference,
             },
             other => return Err(threnody_core::Error::UnexpectedType(u64::from(other))),
         })
@@ -270,6 +309,96 @@ impl MailboxStore {
     }
 }
 
+/// Our sealed messages waiting to hear whether any mailbox took them: one
+/// that every mailbox declines (or none answers for) waits for a session
+/// with its recipient instead, as if it had never been sealed.
+#[derive(Default)]
+pub(crate) struct Placements {
+    next: u64,
+    open: HashMap<u64, Placement>,
+    /// Direct deposits waiting for a receipt, per mailbox and recipient,
+    /// oldest first (a mailbox that doesn't repeat `ref` answers in order).
+    waiting: HashMap<(PublicIdentity, [u8; 32]), VecDeque<u64>>,
+}
+
+struct Placement {
+    dest: PublicIdentity,
+    msg: AppMessage,
+    tag: Tag,
+    /// Mailboxes asked, and how many of them declined.
+    asked: usize,
+    declined: usize,
+}
+
+impl Placements {
+    fn open(&mut self, dest: PublicIdentity, msg: AppMessage, tag: Tag, asked: usize) -> u64 {
+        self.next += 1;
+        self.open.insert(
+            self.next,
+            Placement {
+                dest,
+                msg,
+                tag,
+                asked,
+                declined: 0,
+            },
+        );
+        self.next
+    }
+
+    /// Takes `r` out entirely.
+    fn close(&mut self, r: u64) -> Option<Placement> {
+        self.waiting.retain(|_, q| {
+            q.retain(|x| *x != r);
+            !q.is_empty()
+        });
+        self.open.remove(&r)
+    }
+
+    /// `mailbox` answered for `to`: which deposit that was.
+    fn receipt(&mut self, mailbox: PublicIdentity, to: [u8; 32], r: Option<u64>) -> Option<u64> {
+        let q = self.waiting.get_mut(&(mailbox, to))?;
+        let r = match r {
+            Some(r) => q.remove(q.iter().position(|x| *x == r)?),
+            None => q.pop_front(),
+        };
+        if q.is_empty() {
+            self.waiting.remove(&(mailbox, to));
+        }
+        r
+    }
+
+    /// One more mailbox answered `status` for `r`. Returns the message to
+    /// keep for a session once none of them took it.
+    fn answer(&mut self, r: u64, status: DepositStatus) -> Option<Placement> {
+        let p = self.open.get_mut(&r)?;
+        if status != DepositStatus::Declined {
+            self.close(r);
+            return None;
+        }
+        p.declined += 1;
+        if p.declined < p.asked {
+            return None;
+        }
+        self.close(r)
+    }
+
+    /// One mailbox was never asked after all.
+    fn unask(&mut self, r: u64) -> Option<Placement> {
+        let p = self.open.get_mut(&r)?;
+        p.asked -= 1;
+        match p.asked {
+            // Nobody asked: the caller keeps the message itself.
+            0 => {
+                self.close(r);
+                None
+            }
+            n if p.declined >= n => self.close(r),
+            _ => None,
+        }
+    }
+}
+
 impl Node {
     fn mailbox_send(&self, to: &PublicIdentity, m: &MailboxMsg) -> bool {
         m.encode()
@@ -286,15 +415,29 @@ impl Node {
     /// approved neighbour. Returns how many were asked; each answers with
     /// [`Event::DepositReceipt`].
     pub fn send_offline(&self, dest: &PublicIdentity, msg: &AppMessage) -> Result<usize> {
+        self.deposit(dest, msg, None)
+    }
+
+    /// [`Node::send_offline`] for a message that must not be lost: if
+    /// every mailbox asked declines it, or doesn't answer within
+    /// [`RECEIPT_WAIT`], it waits for a session with `dest` as
+    /// [`Node::send_tagged`] would have sent it, under `tag`. An error
+    /// means no mailbox was asked, and the message is the caller's to keep.
+    pub fn send_offline_or_hold(
+        &self,
+        dest: &PublicIdentity,
+        msg: &AppMessage,
+        tag: Tag,
+    ) -> Result<usize> {
+        self.deposit(dest, msg, Some(tag))
+    }
+
+    fn deposit(&self, dest: &PublicIdentity, msg: &AppMessage, keep: Option<Tag>) -> Result<usize> {
         let sealed = {
             let mut book = lock(&self.shared.bundles);
             let sealed = book.seal(self.identity_ref(), dest, &msg.encode()?, now_ms())?;
             self.shared.persist_bundles(&book);
             sealed
-        };
-        let deposit = MailboxMsg::Deposit {
-            to: *dest.as_bytes(),
-            sealed,
         };
         let mailboxes: Vec<PublicIdentity> = self
             .sessions()
@@ -317,38 +460,56 @@ impl Node {
                 .collect(),
             _ => Vec::new(),
         };
+        let asked = if hidden.is_empty() {
+            mailboxes.len()
+        } else {
+            hidden.len()
+        };
+        let placement = match keep {
+            Some(tag) if asked > 0 => {
+                Some(lock(&self.shared.placements).open(*dest, msg.clone(), tag, asked))
+            }
+            _ => None,
+        };
+        let sealed = std::sync::Arc::new(sealed);
         if let (Some(handle), false) = (handle, hidden.is_empty()) {
-            let MailboxMsg::Deposit { sealed, .. } = &deposit else {
-                unreachable!()
-            };
-            let sealed = std::sync::Arc::new(sealed.clone());
             for m in &hidden {
                 let (node, m, dest, sealed) = (self.clone(), *m, *dest, sealed.clone());
-                let deposit = MailboxMsg::Deposit {
-                    to: *dest.as_bytes(),
-                    sealed: sealed.to_vec(),
-                };
                 handle.spawn(async move {
                     match node.onion_deposit(&m, &dest, &sealed).await {
-                        Ok(status) => node.emit(Event::DepositReceipt {
-                            mailbox: m,
-                            to: dest,
-                            status,
-                            anonymous: true,
-                        }),
+                        Ok(status) => {
+                            node.emit(Event::DepositReceipt {
+                                mailbox: m,
+                                to: dest,
+                                status,
+                                anonymous: true,
+                            });
+                            if let Some(r) = placement {
+                                node.placement_answer(r, status);
+                            }
+                        }
                         // Every circuit failed: deliver it rather than lose it.
                         Err(_) => {
-                            node.mailbox_send(&m, &deposit);
+                            if !node.deposit_direct(&m, &dest, &sealed, placement)
+                                && let Some(r) = placement
+                            {
+                                node.placement_answer(r, DepositStatus::Declined);
+                            }
                         }
                     }
                 });
             }
             return Ok(hidden.len());
         }
-        let n = mailboxes
-            .iter()
-            .filter(|m| self.mailbox_send(m, &deposit))
-            .count();
+        let mut n = 0;
+        for m in &mailboxes {
+            if self.deposit_direct(m, dest, &sealed, placement) {
+                n += 1;
+            } else if let Some(r) = placement {
+                let p = lock(&self.shared.placements).unask(r);
+                self.keep_for_session(p);
+            }
+        }
         if n == 0 {
             return Err(NetError::NoRoute(format!(
                 "{} (no mailbox neighbour online)",
@@ -356,6 +517,64 @@ impl Node {
             )));
         }
         Ok(n)
+    }
+
+    /// Deposits `sealed` for `dest` with `mailbox` directly. With a
+    /// placement `r`, waits for the receipt (at most [`RECEIPT_WAIT`]).
+    fn deposit_direct(
+        &self,
+        mailbox: &PublicIdentity,
+        dest: &PublicIdentity,
+        sealed: &[u8],
+        r: Option<u64>,
+    ) -> bool {
+        let key = (*mailbox, *dest.as_bytes());
+        if let Some(r) = r {
+            lock(&self.shared.placements)
+                .waiting
+                .entry(key)
+                .or_default()
+                .push_back(r);
+        }
+        let sent = self.mailbox_send(
+            mailbox,
+            &MailboxMsg::Deposit {
+                to: *dest.as_bytes(),
+                sealed: sealed.to_vec(),
+                reference: r,
+            },
+        );
+        let Some(r) = r else { return sent };
+        if !sent {
+            lock(&self.shared.placements).receipt(key.0, key.1, Some(r));
+            return false;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let node = self.clone();
+            handle.spawn(async move {
+                tokio::time::sleep(RECEIPT_WAIT).await;
+                // Still unanswered: as good as declined.
+                let late = lock(&node.shared.placements).receipt(key.0, key.1, Some(r));
+                if late.is_some() {
+                    node.placement_answer(r, DepositStatus::Declined);
+                }
+            });
+        }
+        true
+    }
+
+    fn placement_answer(&self, r: u64, status: DepositStatus) {
+        let p = lock(&self.shared.placements).answer(r, status);
+        self.keep_for_session(p);
+    }
+
+    /// No mailbox took it: send it now if a session came up meanwhile,
+    /// else hold it for the next one.
+    fn keep_for_session(&self, p: Option<Placement>) {
+        let Some(p) = p else { return };
+        if self.send_tagged(&p.dest, p.msg.clone(), p.tag).is_err() {
+            self.hold(&p.dest, p.msg, p.tag);
+        }
     }
 
     /// Messages held for `peer`, to deliver now that it is connected.
@@ -463,22 +682,46 @@ impl Node {
             return;
         };
         match msg {
-            MailboxMsg::Deposit { to, sealed } if to == *self.identity().as_bytes() => {
+            MailboxMsg::Deposit {
+                to,
+                sealed,
+                reference,
+            } if to == *self.identity().as_bytes() => {
                 self.open_sealed(from, &sealed);
                 self.mailbox_send(
                     &from,
                     &MailboxMsg::Receipt {
                         to,
                         status: DepositStatus::Delivered,
+                        reference,
                     },
                 );
             }
-            MailboxMsg::Deposit { to, sealed } => {
+            MailboxMsg::Deposit {
+                to,
+                sealed,
+                reference,
+            } => {
                 let status = self.accept_deposit(&from, to, sealed);
-                self.mailbox_send(&from, &MailboxMsg::Receipt { to, status });
+                self.mailbox_send(
+                    &from,
+                    &MailboxMsg::Receipt {
+                        to,
+                        status,
+                        reference,
+                    },
+                );
             }
             MailboxMsg::Deliver { sealed } => self.open_sealed(from, &sealed),
-            MailboxMsg::Receipt { to, status } => {
+            MailboxMsg::Receipt {
+                to,
+                status,
+                reference,
+            } => {
+                let placed = lock(&self.shared.placements).receipt(from, to, reference);
+                if let Some(r) = placed {
+                    self.placement_answer(r, status);
+                }
                 if let Ok(to) = PublicIdentity::from_bytes(&to) {
                     self.emit(Event::DepositReceipt {
                         mailbox: from,
@@ -673,11 +916,23 @@ mod tests {
             MailboxMsg::Deposit {
                 to: [1; 32],
                 sealed: vec![1, 2],
+                reference: None,
+            },
+            MailboxMsg::Deposit {
+                to: [1; 32],
+                sealed: vec![1, 2],
+                reference: Some(7),
             },
             MailboxMsg::Deliver { sealed: vec![3] },
             MailboxMsg::Receipt {
                 to: [2; 32],
                 status: DepositStatus::Held,
+                reference: None,
+            },
+            MailboxMsg::Receipt {
+                to: [2; 32],
+                status: DepositStatus::Declined,
+                reference: Some(u64::MAX),
             },
         ] {
             assert_eq!(MailboxMsg::decode(&m.encode().unwrap()).unwrap(), m);
@@ -715,6 +970,40 @@ mod tests {
         assert!(mb.forget(&ids[2]) && !mb.forget(&ids[2]));
         let again = MailboxStore::decode(&mb.encode().unwrap()).unwrap();
         assert_eq!(again.held_for(), 1);
+    }
+
+    #[test]
+    fn a_placement_is_kept_only_when_no_mailbox_took_it() {
+        let id = |i| threnody_core::Identity::from_seed(&[i; 32]).public();
+        let (m1, m2, dest) = (id(1), id(2), id(3));
+        let to = *dest.as_bytes();
+        let mut p = Placements::default();
+        let open = |p: &mut Placements, asked| {
+            let r = p.open(dest, AppMessage::Cover, Tag::NONE, asked);
+            for m in [m1, m2] {
+                p.waiting.entry((m, to)).or_default().push_back(r);
+            }
+            r
+        };
+        // Both decline; one mailbox doesn't repeat the reference.
+        let r = open(&mut p, 2);
+        assert_eq!(p.receipt(m1, to, None), Some(r));
+        assert!(p.answer(r, DepositStatus::Declined).is_none());
+        assert_eq!(p.receipt(m2, to, Some(r)), Some(r));
+        assert!(p.answer(r, DepositStatus::Declined).is_some());
+        // One holds it: done, whatever the other says.
+        let r = open(&mut p, 2);
+        assert!(p.answer(r, DepositStatus::Held).is_none());
+        assert!(p.waiting.is_empty() && p.open.is_empty());
+        assert!(p.answer(r, DepositStatus::Declined).is_none());
+        // One couldn't be asked, the other declines.
+        let r = open(&mut p, 2);
+        assert!(p.unask(r).is_none());
+        assert!(p.answer(r, DepositStatus::Declined).is_some());
+        // None could be asked: the caller keeps it.
+        let r = open(&mut p, 1);
+        assert!(p.unask(r).is_none());
+        assert!(p.open.is_empty() && p.waiting.is_empty());
     }
 
     #[test]

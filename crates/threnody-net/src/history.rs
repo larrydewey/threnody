@@ -894,7 +894,8 @@ impl Node {
             }
             // Try to reach it directly while the message waits.
             self.seek(d);
-            if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
+            // Should every mailbox decline it, it waits here after all.
+            if self.can_send_offline(d) && self.send_offline_or_hold(d, &msg, tag).is_ok() {
                 r.sealed += 1;
             } else {
                 self.hold(d, msg.clone(), tag);

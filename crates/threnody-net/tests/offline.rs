@@ -462,3 +462,41 @@ async fn a_mailbox_keeps_a_large_message_until_the_recipient_acknowledges_it() {
     wait_for(|| r.node.held_messages() == 0).await;
     let _ = (&mut a.rx, &mut r.rx);
 }
+
+#[tokio::test]
+async fn a_message_every_mailbox_declines_waits_for_the_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await; // r never approves b: it declines
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| a.node.sessions().iter().all(|s| s.peer != bid)).await;
+
+    let sent = a.node.send_text(&bid, "declined but not lost").unwrap();
+    assert_eq!(sent.sealed, 1);
+    next(&mut a.rx, |e| {
+        matches!(
+            e,
+            Event::DepositReceipt {
+                status: DepositStatus::Declined,
+                ..
+            }
+        )
+    })
+    .await;
+
+    // B comes back to A directly, and gets it.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&a.addr, None).await.unwrap();
+    next(&mut b2rx, |e| {
+        matches!(e, Event::Message { msg: AppMessage::Text { body, .. }, .. } if body == "declined but not lost")
+    })
+    .await;
+    let _ = &mut r.rx;
+}

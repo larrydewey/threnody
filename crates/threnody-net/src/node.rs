@@ -460,6 +460,8 @@ pub(crate) struct Shared {
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
     pub(crate) mailbox: Mutex<MailboxStore>,
+    /// Our sealed messages waiting to hear whether a mailbox took them.
+    pub(crate) placements: Mutex<crate::mailbox::Placements>,
     pub(crate) onion: Mutex<OnionState>,
     pub(crate) account: Mutex<AccountChain>,
     pub(crate) accounts: Mutex<AccountBook>,
@@ -674,6 +676,7 @@ impl Node {
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
             mailbox: Mutex::new(mailbox),
+            placements: Mutex::default(),
             onion: Mutex::new(OnionState::default()),
             ble: Mutex::default(),
             account: Mutex::new(account),

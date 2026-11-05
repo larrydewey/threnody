@@ -878,7 +878,8 @@ impl GroupNode {
         if node.send_tagged(&to, msg.clone(), t).is_ok() {
             return;
         }
-        if node.can_send_offline(&to) && node.send_offline(&to, &msg).is_ok() {
+        // Should every mailbox decline it, the node keeps it for a session.
+        if node.can_send_offline(&to) && node.send_offline_or_hold(&to, &msg, t).is_ok() {
             return;
         }
         if let (true, GroupWire::Message { group, message }) = (may_forward, &wire)

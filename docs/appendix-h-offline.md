@@ -60,15 +60,18 @@ The signature means sealed messages are not deniable, the same as the interactiv
 Mailbox traffic is carried as `AppMessage::Mailbox` (kind 9):
 
 ```
-Mailbox = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status }
+Mailbox = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status, ? 4: ref (uint) }
 op: 1 deposit, 2 deliver, 3 receipt (status 0 declined, 1 held, 2 delivered now)
 ```
+
+A deposit may carry a `ref`, and the receipt for it repeats it. Mailboxes that predate `ref` ignore it and answer without one; their receipts are matched to deposits in order.
 
 - **Depositing.** If A has no session with B, A leaves the sealed message with every live, mutually approved neighbour except B. By default A deposits anonymously, as described below, and skips mailboxes that no circuit can reach. If no circuit can reach any mailbox, A sends `deposit { to: id_B, sealed }` directly.
 - **Holding.** A neighbour R accepts a direct deposit only if R is mutually approved with both A and B. It accepts an anonymous deposit only if R is mutually approved with B.
 - **Storage limits.** R holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days. A sweep every minute drops messages held longer, whether or not B ever returns, and everything held for B goes as soon as R deletes or blocks B or B's account removes it.
 - **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, if B is still mutually approved, then deletes its copy. A copy too large for the acknowledgement state (over 64 KiB, Appendix C) is deleted only once B acknowledges it, so a restart of R in between doesn't lose it; R sends it again after a restart. If B gave R a wake-up endpoint, R wakes B when it starts holding the message (Appendix R).
 - **Receipts.** Every deposit is answered with a receipt, so the sender knows whether each mailbox holds the message, delivered it immediately, or declined it.
+- **When every mailbox declines.** For a text or group message, A keeps the sealed message's plain copy until it hears back. If every mailbox it asked declines, or a direct deposit has no receipt after 2 minutes, A sends the message over a session with B if one has come up meanwhile, and otherwise keeps it for the next one, as if it had never been sealed (Appendix C, *Acknowledgements*). A mailbox that holds or delivers it ends the wait.
 - **Duplicates.** B ignores duplicates by `h`, so depositing with several neighbours is safe.
 
 ### Anonymous deposits
