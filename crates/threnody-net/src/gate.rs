@@ -17,7 +17,8 @@ use crate::node::lock;
 pub(crate) enum Source {
     Ip(IpAddr),
     /// A radio link (Bluetooth, Wi-Fi Direct): no address to tell
-    /// callers apart, so they share one allowance.
+    /// callers apart, so they share one allowance (in a gate of their
+    /// own: load from the internet mustn't shut out the local fallback).
     Link,
 }
 

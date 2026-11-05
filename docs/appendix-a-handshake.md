@@ -93,7 +93,7 @@ sig_I    = Sign(id_I, L("initiator signature") || L(h3) || L(id_I) || L(""))
 
 ## Limits
 
-Anyone who can reach a listener can start a handshake, and each one holds a socket until it finishes or times out (15 s). A node runs at most 256 inbound handshakes at once over TCP and radio links, 16 from one source. An IPv6 source counts by its /64, and radio links (Bluetooth, Wi-Fi Direct), which have no address, share one allowance. Over the limit a connection is closed at once. If accepting fails (usually because the process is out of file descriptors), the listener pauses for 100 ms instead of trying again at once. QUIC has its own limits (Appendix N, *Security*).
+Anyone who can reach a listener can start a handshake, and each one holds a socket until it finishes or times out (15 s). A node runs at most 256 inbound TCP handshakes at once, 16 from one source; an IPv6 source counts by its /64. Radio links (Bluetooth, Wi-Fi Direct) have no address to tell callers apart, so they share one allowance of 16, kept apart from TCP's so that load from the internet can't shut out the local fallback. Over the limit a connection is closed at once. If accepting fails (usually because the process is out of file descriptors), the listener pauses for 100 ms instead of trying again at once. QUIC has its own limits (Appendix N, *Security*). These limits end with the handshake: a session it starts is not counted. Under the `Anyone` accept policy, a peer that makes a fresh identity for each connection can still hold one session, and one socket, per identity.
 
 ## Not yet done
 

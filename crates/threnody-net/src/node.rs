@@ -488,8 +488,10 @@ pub(crate) struct Shared {
     pub(crate) recover: crate::recover::RecoverState,
     /// Anonymous links (see `anon`).
     pub(crate) anon: Mutex<crate::anon::AnonState>,
-    /// Inbound connections still in their handshake (see `gate`).
+    /// Inbound TCP connections still in their handshake (see `gate`).
     pub(crate) inbound: crate::gate::Gate,
+    /// The same for radio links, apart so internet load can't fill it.
+    pub(crate) link_inbound: crate::gate::Gate,
     /// The same for QUIC (see `quic`).
     pub(crate) quic_inbound: crate::gate::Gate,
     /// Directories, volunteering and relay tokens (see `volunteer`).
@@ -690,6 +692,10 @@ impl Node {
             recover: crate::recover::RecoverState::new(),
             anon: Mutex::default(),
             inbound: crate::gate::Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE),
+            link_inbound: crate::gate::Gate::new(
+                MAX_HANDSHAKING_PER_SOURCE,
+                MAX_HANDSHAKING_PER_SOURCE,
+            ),
             quic_inbound: crate::gate::Gate::new(
                 crate::quic::MAX_HANDSHAKING,
                 crate::quic::MAX_HANDSHAKING_PER_SOURCE,
@@ -1051,7 +1057,7 @@ impl Node {
     {
         let _pass = self
             .shared
-            .inbound
+            .link_inbound
             .enter(Source::Link)
             .ok_or_else(|| NetError::Refused("too many links in their handshake".into()))?;
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;

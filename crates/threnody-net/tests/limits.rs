@@ -107,3 +107,46 @@ async fn radio_links_share_one_allowance_for_handshakes() {
         "{r:?}"
     );
 }
+
+/// Connections over the internet can't use up the allowance of radio
+/// links: with every TCP place taken, a Bluetooth handshake still goes
+/// through.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn internet_load_leaves_radio_links_their_own_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bob, _brx) = node(&dir, "bob");
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let from = |host: u8| async move {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind(([127, 0, 0, host], 0).into()).unwrap();
+        sock.connect(addr).await.unwrap()
+    };
+    // Sixteen silent connections from each of sixteen addresses: every
+    // place for TCP handshakes.
+    let mut idle = Vec::new();
+    for host in 1..=16 {
+        for _ in 0..16 {
+            idle.push(from(host).await);
+        }
+    }
+    let mut extra = from(17).await;
+    assert!(closed(&mut extra).await, "TCP is full");
+
+    let (alice, _arx) = node(&dir, "alice");
+    let (x, y) = tokio::io::duplex(1 << 16);
+    let b = bob.clone();
+    let accepted = tokio::spawn(async move { b.accept_stream(y, "ble", "alice".into()).await });
+    timeout(
+        Duration::from_secs(10),
+        alice.connect_stream(x, "ble", "bob".into(), Some(bob.identity().fingerprint())),
+    )
+    .await
+    .expect("handshake answered")
+    .unwrap();
+    assert_eq!(
+        accepted.await.unwrap().unwrap(),
+        alice.identity(),
+        "the radio link was let in"
+    );
+}
