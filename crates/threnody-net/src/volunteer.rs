@@ -424,7 +424,12 @@ impl Node {
                 DirMsg::Token { issued, .. } => {
                     let issued = Issued::decode(&issued)?;
                     let cred = req.finish(&key, &issued)?;
-                    if cred.header.schema != RELAY_SCHEMA || cred.header.expires_day != epoch {
+                    // No attributes: their count shows on every token, so
+                    // one would mark this client's circuits.
+                    if cred.header.schema != RELAY_SCHEMA
+                        || cred.header.expires_day != epoch
+                        || !cred.attributes.is_empty()
+                    {
                         return Err(NetError::Protocol(threnody_core::Error::Malformed(
                             "directory issued the wrong credential",
                         )));

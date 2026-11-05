@@ -78,7 +78,7 @@ binding    = KDF("… relay token binding", e_pub)        the hop's ephemeral X-
 - **Issuing.** A client asks each directory for credentials for today and tomorrow, over a fresh anonymous link. A directory issues at most 8 per day to one network (an IPv4 /24 or an IPv6 /56). It learns an address, which says nothing about the circuits the credential later pays for.
 - **Spending.** For each circuit through a volunteer relay, the client picks an unused slot for that relay and day. The resulting pseudonym is the same whenever that slot is reused, and unrelated across slots, relays and days. A relay accepts a token if all of these hold:
   - it is for this relay;
-  - it is for today or yesterday;
+  - it is for today or yesterday, and its credential is for that same day (`expires_day` = epoch) and has no attributes. A credential valid on other days too would pay for their slots as well, and an attribute count, which every presentation shows, could mark one client's circuits; clients refuse such credentials from a directory too;
   - it is bound to the CREATE's `e_pub`;
   - a directory this relay is registered with issued it;
   - its pseudonym hasn't been seen this epoch.
