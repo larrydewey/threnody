@@ -516,3 +516,41 @@ async fn clearing_a_chat_keeps_the_contact_on_every_device() {
     assert_eq!(h.entries()[0].text, "new news", "old messages stay cleared");
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+#[tokio::test]
+async fn blocking_and_unblocking_follow_us_across_our_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    let blocked = |n: &Node| n.contacts().get(&bid).is_some_and(|c| c.blocked);
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+
+    // Blocking on the phone reaches the connected laptop at once.
+    phone.node.block_contact(&bid);
+    wait_for(|| blocked(&laptop.node)).await;
+
+    // Approving again on the laptop unblocks on the phone, and the phone's
+    // older block doesn't come back when the two next meet.
+    laptop.node.set_approval(&bid, true).unwrap();
+    wait_for(|| !blocked(&phone.node)).await;
+    let lid = laptop.node.identity();
+    phone.node.disconnect(&lid);
+    wait_for(|| {
+        laptop
+            .node
+            .sessions()
+            .iter()
+            .all(|s| s.peer != phone.node.identity())
+    })
+    .await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!blocked(&laptop.node), "unblocking stuck on the laptop");
+    assert!(!blocked(&phone.node), "unblocking stuck on the phone");
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}

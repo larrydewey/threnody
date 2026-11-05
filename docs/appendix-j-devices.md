@@ -72,7 +72,7 @@ Apps name a device on creation: the CLI uses the host name, and the Android app 
 ## Own devices
 
 - Devices in the same account approve each other automatically.
-- They exchange `ContactSync` snapshots at the start of each session and after changes. Approval and verification flags merge last-writer-wins on `approval_changed_ms`, and petnames and addresses fill in where missing.
+- They exchange `ContactSync` snapshots at the start of each session and after changes. Approval, verification and block flags merge last-writer-wins on `approval_changed_ms`, and petnames and addresses fill in where missing. Blocking moves `approval_changed_ms` like approving does, so approving a blocked contact again unblocks it on every device (only approving unblocks); at equal times a block wins, because older devices block without moving the time.
 - They share message history (below).
 
 ## History

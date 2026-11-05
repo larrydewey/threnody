@@ -696,18 +696,24 @@ impl Node {
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
-    /// and are refused, and our conversation with them is deleted.
+    /// and are refused, and our conversation with them is deleted. Our
+    /// other devices learn the block through contact sync.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        let now = now_ms();
         let devices = self.mark_contacts(peer, |c| {
             c.blocked = true;
             c.accepted = false;
             c.local_approved = false;
+            // Blocking is an approval change: the latest of a block and an
+            // approval wins across our devices.
+            c.approval_changed_ms = c.approval_changed_ms.max(now);
         });
         for d in devices {
             self.disconnect(&d);
         }
         let _ = self.shared.home.delete_history(conv);
+        self.push_contact_sync();
     }
 
     /// Deletes a message request: the contact and the conversation go, and

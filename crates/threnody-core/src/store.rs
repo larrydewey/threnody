@@ -584,9 +584,11 @@ impl Contacts {
         c.encode()
     }
 
-    /// Merges a snapshot from one of our own devices. Approval and
-    /// verification are last-writer-wins on `approval_changed_ms`; names,
-    /// addresses and accounts fill gaps. Returns true if anything changed.
+    /// Merges a snapshot from one of our own devices. Approval,
+    /// verification and blocking are last-writer-wins on
+    /// `approval_changed_ms` (a tie keeps a block, as devices that predate
+    /// this rule block without moving it); names, addresses and accounts
+    /// fill gaps. Returns true if anything changed.
     pub fn merge_snapshot(&mut self, bytes: &[u8], now_ms: u64) -> Result<bool> {
         let other = Self::decode(bytes)?;
         let mut changed = false;
@@ -623,7 +625,21 @@ impl Contacts {
                     if o.approval_changed_ms > c.approval_changed_ms {
                         c.local_approved = o.local_approved;
                         c.verified = o.verified;
+                        // Only approving again unblocks; a later revocation
+                        // that never saw the block leaves it in place.
+                        c.blocked = o.blocked || (c.blocked && !o.local_approved);
+                        if o.blocked {
+                            c.accepted = false;
+                        }
                         c.approval_changed_ms = o.approval_changed_ms;
+                        changed = true;
+                    } else if o.approval_changed_ms == c.approval_changed_ms
+                        && o.blocked
+                        && !c.blocked
+                    {
+                        c.blocked = true;
+                        c.accepted = false;
+                        c.local_approved = false;
                         changed = true;
                     }
                     if c.petname.is_none() && o.petname.is_some() {
@@ -638,13 +654,9 @@ impl Contacts {
                         c.account = o.account;
                         changed = true;
                     }
-                    // Accepting or blocking on one device does on all.
-                    if o.accepted && !c.accepted {
+                    // Accepting on one device does on all, unless blocked.
+                    if o.accepted && !c.accepted && !c.blocked {
                         c.accepted = true;
-                        changed = true;
-                    }
-                    if o.blocked && !c.blocked {
-                        c.blocked = true;
                         changed = true;
                     }
                     // Clearing a chat on one device clears it on all.
@@ -941,6 +953,56 @@ mod sync_tests {
                 .unwrap(),
             "idempotent"
         );
+    }
+
+    #[test]
+    fn blocking_and_unblocking_merge_last_writer_wins() {
+        let bob = Identity::generate().public();
+        let book = |blocked: bool, approved: bool, at: u64| {
+            let mut c = Contacts::default();
+            c.observe(bob, None, 1);
+            let b = c.get_mut(&bob).unwrap();
+            b.blocked = blocked;
+            b.local_approved = approved;
+            b.accepted = !blocked;
+            b.approval_changed_ms = at;
+            c
+        };
+        // Blocked on this device at 10, approved again on the other at 20:
+        // the unblock wins, and the older block doesn't come back.
+        let mut mine = book(true, false, 10);
+        let theirs = book(false, true, 20);
+        assert!(
+            mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 30)
+                .unwrap()
+        );
+        let b = mine.get(&bob).unwrap();
+        assert!(!b.blocked && b.local_approved && b.accepted, "unblocked");
+        let mut theirs = theirs;
+        theirs
+            .merge_snapshot(&book(true, false, 10).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        assert!(!theirs.get(&bob).unwrap().blocked, "stale block ignored");
+
+        // A later block wins over an earlier approval, and clears acceptance.
+        let mut mine = book(false, true, 10);
+        mine.merge_snapshot(&book(true, false, 20).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        let b = mine.get(&bob).unwrap();
+        assert!(b.blocked && !b.local_approved && !b.accepted);
+
+        // Revoking approval later, unaware of the block, doesn't unblock.
+        let mut mine = book(true, false, 10);
+        mine.merge_snapshot(&book(false, false, 20).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        assert!(mine.get(&bob).unwrap().blocked);
+
+        // A device that blocks without moving the time still blocks.
+        let mut mine = book(false, true, 10);
+        mine.merge_snapshot(&book(true, false, 10).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        let b = mine.get(&bob).unwrap();
+        assert!(b.blocked && !b.local_approved && !b.accepted);
     }
 }
 
