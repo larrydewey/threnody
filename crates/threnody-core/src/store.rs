@@ -357,8 +357,10 @@ pub struct Contact {
     /// means both still recognise each other. Cleared on revocation.
     pub discovery_older: Vec<[u8; 32]>,
     /// The peer's latest `Hello` had `FEATURE_TIMED_PROBES`: probes to and
-    /// from it under these discovery keys are timed (Appendix N), and an
-    /// untimed one claiming to be from it is ignored. Cleared with the keys.
+    /// from it under its discovery keys are timed (Appendix N), and an
+    /// untimed one claiming to be from it is ignored. It describes the
+    /// peer's build, so it outlives the keys, but it is this device's
+    /// knowledge and is not synced to our others.
     pub timed_probes: bool,
     /// Account this device belongs to (Appendix J), once its chain is known.
     pub account: Option<AccountId>,
@@ -425,7 +427,6 @@ impl Contact {
     pub fn clear_discovery_keys(&mut self) {
         self.discovery_key = None;
         self.discovery_older.clear();
-        self.timed_probes = false;
     }
 
     /// Keys to recognise this peer's beacons with: current first.
@@ -586,6 +587,7 @@ impl Contacts {
         for x in &mut c.list {
             x.clear_discovery_keys();
             x.remote_approved = false;
+            x.timed_probes = false;
         }
         c.encode()
     }
@@ -621,6 +623,7 @@ impl Contacts {
                     let mut c = o;
                     c.clear_discovery_keys();
                     c.remote_approved = false;
+                    c.timed_probes = false;
                     c.first_seen_ms = now_ms;
                     self.list.push(c);
                     changed = true;
@@ -933,6 +936,7 @@ mod sync_tests {
         t.petname = Some("bob".into());
         t.remote_approved = true;
         theirs.get_mut(&carol).unwrap().discovery_key = Some([9; 32]);
+        theirs.get_mut(&carol).unwrap().timed_probes = true;
 
         assert!(
             mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 5)
@@ -944,7 +948,7 @@ mod sync_tests {
         assert_eq!(b.discovery_key, Some([1; 32]), "own pairwise key kept");
         let c = mine.get(&carol).unwrap();
         assert!(
-            c.discovery_key.is_none() && !c.remote_approved,
+            c.discovery_key.is_none() && !c.remote_approved && !c.timed_probes,
             "pairwise state not copied"
         );
         assert!(
@@ -1040,7 +1044,10 @@ mod passphrase_tests {
         assert_eq!(back.list[0], c);
         c.clear_discovery_keys();
         assert_eq!(c.recognition_keys().count(), 0);
-        assert!(!c.timed_probes);
+        // What the peer's build supports doesn't change with approval: a
+        // contact approved again in the same session (no new Hello) still
+        // gets timed probes under its next key.
+        assert!(c.timed_probes);
     }
 
     #[test]

@@ -258,6 +258,58 @@ async fn only_timed_probes_start_a_punch() {
 }
 
 #[tokio::test]
+async fn approval_withdrawn_and_restored_keeps_probes_timed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&b_tcp.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    let keyed = |n: &Node, p: &threnody_core::PublicIdentity| {
+        let contacts = n.contacts();
+        contacts
+            .get(p)
+            .is_some_and(|c| c.discovery_key.is_some() && c.timed_probes)
+    };
+    let settle = |n: &Node, p| {
+        let (n, p) = (n.clone(), p);
+        async move {
+            timeout(Duration::from_secs(5), async {
+                while !keyed(&n, &p) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(settle(&bob, alice.identity()).await);
+    // Alice withdraws approval and gives it back within one session: Bob
+    // forgets his keys for her and gets a fresh one, but no new Hello.
+    alice.set_approval(&bob_id, false).unwrap();
+    next(&mut brx, 10, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: false, .. })
+    })
+    .await;
+    alice.set_approval(&bob_id, true).unwrap();
+    next(&mut brx, 10, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    assert!(
+        settle(&bob, alice.identity()).await,
+        "Bob went back to untimed probes for Alice"
+    );
+}
+
+#[tokio::test]
 async fn nothing_reaches_out_while_turned_off() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _arx) = node(&dir, "alice");
