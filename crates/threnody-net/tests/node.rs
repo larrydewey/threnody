@@ -389,6 +389,68 @@ async fn revoking_and_approving_again_pairs_the_tunnel_again() {
     );
 }
 
+/// A contact can't offer another contact's WireGuard key, or ours, as
+/// its own: WireGuard knows peers by key, so that would take over the
+/// other's tunnel. The first holder keeps the key.
+#[tokio::test]
+async fn a_tunnel_offer_cannot_claim_anothers_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let (carol, mut crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
+    let addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    for (n, rx) in [(&bob, &mut brx), (&carol, &mut crx)] {
+        let aid = n.connect(&addr, None).await.unwrap();
+        n.set_approval(&aid, true).unwrap();
+        alice.set_approval(&n.identity(), true).unwrap();
+        next(rx, |e| matches!(e, Event::TunnelUp { .. })).await;
+    }
+    timeout(Duration::from_secs(10), async {
+        while alice.tunnel_peers().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let key_of = |id| {
+        alice
+            .tunnel_peer_entries()
+            .into_iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, tp)| tp.wg_public)
+    };
+    let (bob_key, carol_key) = (key_of(bob.identity()), key_of(carol.identity()));
+    assert!(bob_key.is_some() && carol_key.is_some() && bob_key != carol_key);
+    // Alice's own key is what carol holds for her.
+    let alice_key = carol
+        .tunnel_peer_entries()
+        .into_iter()
+        .find(|(k, _)| *k == alice.identity())
+        .map(|(_, tp)| tp.wg_public)
+        .unwrap();
+
+    let aid = alice.identity();
+    for stolen in [carol_key.unwrap(), alice_key] {
+        bob.send(
+            &aid,
+            AppMessage::TunnelOffer {
+                wg_public: stolen,
+                port: 9,
+            },
+        )
+        .unwrap();
+    }
+    // Something after the offers, to know they've been handled.
+    bob.send_text(&aid, "after").unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::Message { .. } | Event::MessageRequest { .. })
+    })
+    .await;
+    assert_eq!(key_of(bob.identity()), bob_key);
+    assert_eq!(key_of(carol.identity()), carol_key);
+    assert_eq!(alice.tunnel_peers().len(), 2);
+}
+
 #[tokio::test]
 async fn no_tunnel_without_mutual_approval() {
     let dir = tempfile::tempdir().unwrap();

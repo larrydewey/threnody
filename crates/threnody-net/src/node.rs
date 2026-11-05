@@ -523,6 +523,26 @@ impl Shared {
         }
     }
 
+    /// Records `peer`'s tunnel, unless its WireGuard key is ours or
+    /// already another peer's. WireGuard knows peers by key, so a contact
+    /// offering someone else's key would take over that peer's entry (and,
+    /// once revoked, remove it). The first to hold a key keeps it. Returns
+    /// whether it was recorded.
+    fn add_tunnel_peer(&self, peer: PublicIdentity, tp: TunnelPeer) -> bool {
+        if lock(&self.tunnel).is_some_and(|(_, ours)| ours == tp.wg_public) {
+            return false;
+        }
+        let mut peers = lock(&self.tunnel_peers);
+        if peers
+            .iter()
+            .any(|(id, p)| *id != peer && p.wg_public == tp.wg_public)
+        {
+            return false;
+        }
+        peers.insert(peer, tp);
+        true
+    }
+
     pub(crate) fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
         let r = bytes.and_then(|b| self.home.save_state(&self.identity, name, b.as_ref()));
         if let Err(e) = r {
@@ -1810,7 +1830,15 @@ where
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 };
-                                lock(&shared.tunnel_peers).insert(peer, tp.clone());
+                                if !shared.add_tunnel_peer(peer, tp.clone()) {
+                                    shared.emit(Event::ReachNote {
+                                        note: format!(
+                                            "tunnel offer from {} refused: its key is not its own",
+                                            peer.fingerprint()
+                                        ),
+                                    });
+                                    continue;
+                                }
                                 // They may have offered while our tunnels
                                 // were off, and so ignored ours: answer
                                 // their first offer with ours.
