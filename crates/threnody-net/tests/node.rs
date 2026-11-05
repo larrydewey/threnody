@@ -172,6 +172,51 @@ async fn pinned_mismatch_never_reveals_the_dialer() {
 }
 
 #[tokio::test]
+async fn strangers_cannot_park_big_frames_without_limit() {
+    use threnody_net::frame::MAX_FRAME;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    // Throwaway identities authenticate, then each sends all but the last
+    // byte of a maximal frame and stalls. Together they ask for more than
+    // bob holds for strangers.
+    let mut links = Vec::new();
+    for _ in 0..5 {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        threnody_net::handshake::initiate(&mut s, &Identity::generate(), None)
+            .await
+            .unwrap();
+        let _ = s.write_all(&(MAX_FRAME as u32).to_be_bytes()).await;
+        let _ = s.write_all(&vec![0; MAX_FRAME - 1]).await;
+        links.push(s);
+    }
+    let checks: Vec<_> = links
+        .into_iter()
+        .map(|mut s| {
+            tokio::spawn(async move {
+                let mut buf = vec![0; 1 << 16];
+                let ended = timeout(Duration::from_secs(5), async {
+                    while let Ok(n) = s.read(&mut buf).await
+                        && n > 0
+                    {}
+                })
+                .await;
+                ended.is_ok()
+            })
+        })
+        .collect();
+    let mut closed = 0;
+    for c in checks {
+        closed += usize::from(c.await.unwrap());
+    }
+    // At least one stranger was cut off, but not every one.
+    assert!(closed >= 1, "bob held every stalled frame");
+    assert!(closed < 5);
+}
+
+#[tokio::test]
 async fn approved_only_policy_rejects_strangers() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);

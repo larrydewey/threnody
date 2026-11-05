@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 use crate::account::LinkState;
 use crate::delivery::{Delivery, Tag, trackable};
 use crate::error::{NetError, Result};
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{MAX_FRAME, read_body_metered, read_len, write_frame};
 use crate::handshake;
 use crate::mailbox::MailboxStore;
 use crate::onion::OnionState;
@@ -496,6 +496,9 @@ pub(crate) struct Shared {
     pub(crate) calls: Mutex<crate::call::CallState>,
     /// Wake-up endpoints, ours and contacts' (see `push`).
     pub(crate) push: Mutex<crate::push::PushState>,
+    /// Bytes of frames from untrusted peers read but not yet handled,
+    /// across every session (see `read_inbound`).
+    untrusted_held: AtomicUsize,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -689,6 +692,7 @@ impl Node {
             creds: Mutex::default(),
             calls: Mutex::default(),
             push: Mutex::default(),
+            untrusted_held: AtomicUsize::new(0),
         };
         let node = Self {
             shared: Arc::new(shared),
@@ -1472,10 +1476,11 @@ where
     let (mut rd, mut wr) = tokio::io::split(stream);
 
     // Frame reads are not cancellation-safe, so they get their own task.
-    let (in_tx, mut inbox) = mpsc::channel::<Result<Vec<u8>>>(16);
+    let (in_tx, mut inbox) = mpsc::channel::<Result<Inbound>>(16);
+    let reader_shared = node.shared.clone();
     let reader = tokio::spawn(async move {
         loop {
-            let r = read_frame(&mut rd).await;
+            let r = read_inbound(&reader_shared, &mut rd, || reader_shared.mutual(&peer)).await;
             let stop = !matches!(r, Ok(Some(_)));
             let item = match r {
                 Ok(Some(f)) => Ok(f),
@@ -1677,7 +1682,8 @@ where
                     };
                     // Any authentication failure ends the session: on a
                     // reliable stream it can only mean tampering or a broken peer.
-                    let opened = chan.open(&frame)?;
+                    let opened = chan.open(&frame.bytes)?;
+                    drop(frame);
                     if peer_acks.is_none() {
                         let features = match opened {
                             AppMessage::Hello { features } => features,
@@ -1920,6 +1926,73 @@ fn ready(
         }
         (m, _) => Ok(m),
     }
+}
+
+/// What frames from untrusted peers may hold at once, across every
+/// session: four maximal frames. Past it their frames are refused (and the
+/// session ends) until some are handled; trusted peers are unaffected.
+const UNTRUSTED_BUDGET: usize = 4 * MAX_FRAME;
+/// An untrusted peer's frame that stops arriving for this long ends the
+/// session. Cover traffic on a metered link spaces frames 10 s apart, and
+/// each onion hop adds its own spacing, so a live transfer never pauses
+/// this long.
+const UNTRUSTED_STALL: Duration = Duration::from_secs(120);
+
+/// A frame a session's reader has read, keeping its share of the untrusted
+/// budget until handled.
+pub(crate) struct Inbound {
+    pub(crate) bytes: Vec<u8>,
+    _held: Option<Held>,
+}
+
+/// Bytes counted against [`UNTRUSTED_BUDGET`], given back on drop.
+struct Held {
+    shared: Arc<Shared>,
+    n: usize,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.shared
+            .untrusted_held
+            .fetch_sub(self.n, Ordering::Relaxed);
+    }
+}
+
+/// Reads a session's next frame; `Ok(None)` on clean end of stream.
+///
+/// Authentication alone is cheap (anyone can make an identity), so frames
+/// from a peer `trusted` says no to, asked once each frame's length is in,
+/// are read a step at a time against [`UNTRUSTED_BUDGET`] and must keep
+/// arriving (see [`UNTRUSTED_STALL`]). Without this a stranger could
+/// announce maximal frames on many sessions and make us hold them forever.
+pub(crate) async fn read_inbound<R: AsyncRead + Unpin>(
+    shared: &Arc<Shared>,
+    rd: &mut R,
+    trusted: impl Fn() -> bool,
+) -> Result<Option<Inbound>> {
+    let Some(len) = read_len(rd, MAX_FRAME).await? else {
+        return Ok(None);
+    };
+    if trusted() {
+        let mut bytes = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(rd, &mut bytes).await?;
+        return Ok(Some(Inbound { bytes, _held: None }));
+    }
+    let mut held = Held {
+        shared: shared.clone(),
+        n: 0,
+    };
+    let bytes = read_body_metered(rd, len, UNTRUSTED_STALL, |step| {
+        let taken = shared.untrusted_held.fetch_add(step, Ordering::Relaxed) + step;
+        held.n += step;
+        taken <= UNTRUSTED_BUDGET
+    })
+    .await?;
+    Ok(Some(Inbound {
+        bytes,
+        _held: Some(held),
+    }))
 }
 
 /// How long after a session starts its setup messages skip the cover-traffic
