@@ -32,6 +32,8 @@ const EXPECTED: &str = "group-expected";
 const OFFERED: &str = "group-offered";
 const VERSION: u8 = 1;
 const HELD_VERSION: u8 = 3;
+/// `group-expected` with each group's owner.
+const EXPECTED_VERSION: u8 = 2;
 /// Messages held for one member; the oldest are dropped first. Messages
 /// from more than a few epochs back can't be read anyway.
 pub const MAX_HELD_PER_MEMBER: usize = 200;
@@ -121,8 +123,9 @@ pub struct GroupNode {
     /// Encoded `GroupWire::Message`s waiting for their member to connect,
     /// with the delivery tag to send them with.
     held: Vec<(PublicIdentity, Vec<u8>, Tag)>,
-    /// Groups our other devices are in, whose invitations we accept.
-    expected: Vec<GroupId>,
+    /// Groups our other devices are in, with their owner (if the device
+    /// said) whose invitation we accept.
+    expected: Vec<(GroupId, Option<PublicIdentity>)>,
     /// Groups we have had our own other devices added to, once each, so
     /// one that leaves a group isn't put back.
     offered: Vec<(PublicIdentity, GroupId)>,
@@ -210,12 +213,30 @@ impl GroupNode {
         Ok(invited)
     }
 
-    /// Accepts the invitation to `group`.
+    /// Accepts the first invitation to `group` (the one [`Self::invites`]
+    /// lists first).
     pub fn accept(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
+        let from = self
+            .invites
+            .iter()
+            .find(|i| i.group == *group)
+            .ok_or(GroupError::UnknownGroup)?
+            .from;
+        self.accept_from(node, group, &from)
+    }
+
+    /// Accepts `from`'s invitation to `group`: only `from` gets a key
+    /// package, and only its Welcome is taken.
+    pub fn accept_from(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        from: &PublicIdentity,
+    ) -> Result<Vec<Update>> {
         let i = self
             .invites
             .iter()
-            .position(|i| i.group == *group)
+            .position(|i| i.group == *group && i.from == *from)
             .ok_or(GroupError::UnknownGroup)?;
         let inv = self.invites.remove(i);
         self.save_invites();
@@ -658,7 +679,11 @@ impl GroupNode {
                 };
                 Ok(self.apply_tagged(node, out, false, t))
             }
-            GroupWire::AddDevice { group, device } => self.add_device(node, from, group, device),
+            GroupWire::AddDevice {
+                group,
+                device,
+                owner,
+            } => self.add_device(node, from, group, device, owner),
             wire => {
                 let out = self.groups.handle(from, wire)?;
                 Ok(self.apply(node, out, true))
@@ -667,26 +692,35 @@ impl GroupNode {
     }
 
     /// `from` asks us to add `device`, another device of its account, to
-    /// `group`; or, from our own device about us, says to join it.
+    /// `group`; or, from our own device about us, says to join it when
+    /// `owner` invites us.
     fn add_device(
         &mut self,
         node: &Node,
         from: PublicIdentity,
         group: GroupId,
         device: [u8; 32],
+        owner: Option<[u8; 32]>,
     ) -> Result<Vec<Update>> {
         let device = PublicIdentity::from_bytes(&device)?;
         if device == node.identity() {
             if !node.is_own_device(&from) {
                 return Ok(Vec::new());
             }
-            if !self.expected.contains(&group) {
-                self.expected.push(group);
-                self.save_expected();
-            }
+            // Only the owner's invitation is taken on our device's word.
+            // From an older device that doesn't name it, we still ask.
+            let owner = owner.map(|o| PublicIdentity::from_bytes(&o)).transpose()?;
+            self.expected.retain(|(g, _)| *g != group);
+            self.expected.push((group, owner));
+            self.save_expected();
             // The invitation may already be waiting.
-            if self.invites.iter().any(|i| i.group == group) {
-                return self.accept(node, &group);
+            if let Some(owner) = owner
+                && self
+                    .invites
+                    .iter()
+                    .any(|i| i.group == group && i.from == owner)
+            {
+                return self.accept_from(node, &group, &owner);
             }
             return Ok(Vec::new());
         }
@@ -720,11 +754,18 @@ impl GroupNode {
         }
         for (group, _, owner, members, roles) in todo {
             self.offered.push((*sibling, group));
-            let hint = GroupWire::AddDevice {
+            let hint = |owner| GroupWire::AddDevice {
                 group,
                 device: *sibling.as_bytes(),
+                owner,
             };
-            self.deliver(node, *sibling, hint.clone(), false, Tag::NONE);
+            self.deliver(
+                node,
+                *sibling,
+                hint(Some(*owner.as_bytes())),
+                false,
+                Tag::NONE,
+            );
             let can_commit = members
                 .iter()
                 .position(|m| *m == me)
@@ -735,7 +776,7 @@ impl GroupNode {
                     self.apply(node, out, true);
                 }
             } else {
-                self.deliver(node, owner, hint, true, Tag::NONE);
+                self.deliver(node, owner, hint(None), true, Tag::NONE);
             }
         }
         self.save_offered();
@@ -817,11 +858,9 @@ impl GroupNode {
     }
 
     fn save_expected(&self) {
-        let mut out = vec![VERSION];
-        for g in &self.expected {
-            out.extend_from_slice(g);
-        }
-        let _ = self.home.save_state(&self.identity, EXPECTED, &out);
+        let _ = self
+            .home
+            .save_state(&self.identity, EXPECTED, &encode_expected(&self.expected));
     }
 
     fn save_offered(&self) {
@@ -936,21 +975,22 @@ impl GroupNode {
     fn event(&mut self, node: &Node, e: GroupEvent, updates: &mut Vec<Update>) {
         updates.push(match e {
             GroupEvent::Joined { group, name, owner } => {
-                if self.expected.contains(&group) {
-                    self.expected.retain(|g| *g != group);
+                if self.expected.iter().any(|(g, _)| *g == group) {
+                    self.expected.retain(|(g, _)| *g != group);
                     self.save_expected();
                 }
                 Update::Joined { group, name, owner }
             }
             GroupEvent::InviteRequested { group, name, peer } => {
-                // Mutually approved contacts are trusted to add us; anyone
-                // else needs explicit consent.
+                // Mutually approved contacts are trusted to add us, and so
+                // is the owner of a group our own device says to join;
+                // anyone else needs explicit consent.
                 let trusted = node
                     .contacts()
                     .get(&peer)
                     .is_some_and(|c| c.mutually_approved())
                     || node.is_own_device(&peer)
-                    || self.expected.contains(&group);
+                    || self.expected.contains(&(group, Some(peer)));
                 if trusted && let Ok(out) = self.groups.accept_invite(&group, peer) {
                     updates.extend(self.apply(node, out, true));
                     return;
@@ -1184,6 +1224,7 @@ fn account_devices(node: &Node, peer: &PublicIdentity) -> Vec<PublicIdentity> {
 // Local state, inside encrypted state files:
 //   invites = VERSION || * ( group (16) | inviter (32) | name len (u16 LE) | name )
 //   held    = HELD_VERSION || * ( member (32) | delivery tag (Tag::LEN) | len (u32 LE) | GroupWire bytes )
+//   expected = EXPECTED_VERSION || * ( group (16) | owner (32, zeros if not known) )
 
 fn encode_invites(invites: &[Invite]) -> Vec<u8> {
     let mut out = vec![VERSION];
@@ -1221,9 +1262,37 @@ fn decode_invites(b: &[u8]) -> Vec<Invite> {
     out
 }
 
-fn decode_expected(b: &[u8]) -> Vec<GroupId> {
+fn encode_expected(expected: &[(GroupId, Option<PublicIdentity>)]) -> Vec<u8> {
+    let mut out = vec![EXPECTED_VERSION];
+    for (g, owner) in expected {
+        out.extend_from_slice(g);
+        out.extend_from_slice(owner.as_ref().map_or(&[0; 32], |o| o.as_bytes()));
+    }
+    out
+}
+
+fn decode_expected(b: &[u8]) -> Vec<(GroupId, Option<PublicIdentity>)> {
     match b.split_first() {
-        Some((&VERSION, rest)) => rest.as_chunks::<16>().0.to_vec(),
+        Some((&EXPECTED_VERSION, rest)) => rest
+            .as_chunks::<48>()
+            .0
+            .iter()
+            .map(|c| {
+                let (group, owner) = c.split_at(16);
+                let owner = <&[u8; 32]>::try_from(owner)
+                    .ok()
+                    .filter(|o| **o != [0; 32])
+                    .and_then(|o| PublicIdentity::from_bytes(o).ok());
+                (group.try_into().unwrap_or_default(), owner)
+            })
+            .collect(),
+        // Saved before owners were: those groups' invitations need consent.
+        Some((&VERSION, rest)) => rest
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|g| (*g, None))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -1308,5 +1377,12 @@ mod tests {
         for d in [&[][..], &[9, 0, 0]] {
             assert!(decode_invites(d).is_empty() && decode_held(d).is_empty());
         }
+        // Expected groups, with and without an owner, and as first saved.
+        let expected = vec![([1; 16], Some(p)), ([2; 16], None)];
+        assert_eq!(decode_expected(&encode_expected(&expected)), expected);
+        assert_eq!(
+            decode_expected(&[&[VERSION][..], &[3; 16]].concat()),
+            [([3; 16], None)]
+        );
     }
 }

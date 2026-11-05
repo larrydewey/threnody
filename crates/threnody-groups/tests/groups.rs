@@ -495,3 +495,52 @@ fn key_packages_for_unanswered_invitations_are_bounded() {
             .any(|e| matches!(e, GroupEvent::Joined { .. }))
     );
 }
+
+#[test]
+fn a_welcome_must_come_from_whom_we_gave_a_key_package() {
+    let (a, b, c) = (
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+    );
+    let (pa, pb, pc) = (a.public(), b.public(), c.public());
+    let mut net = Net::new(&[&a, &b, &c]);
+    // Alice's Welcome for Bob into `g`, Bob having given key packages to
+    // those in `gave`.
+    let welcome = |net: &mut Net, gave: &[PublicIdentity]| {
+        let g = net.node(&pa).create("team").unwrap();
+        net.accept = true;
+        let out = net.node(&pa).invite(&g, pc).unwrap();
+        net.deliver(pa, out);
+        net.accept = false;
+        net.node(&pa).invite(&g, pb).unwrap();
+        let mut kp = None;
+        for p in gave {
+            let out = net.node(&pb).accept_invite(&g, *p).unwrap();
+            if *p == pa {
+                kp = Some(out.send[0].wire.clone());
+            }
+        }
+        let out = net.node(&pa).handle(pb, kp.unwrap()).unwrap();
+        let w = out.send.into_iter().find(|o| o.to == pb).unwrap().wire;
+        (g, w)
+    };
+
+    // Passed on by Carol, another member Bob gave nothing: refused, and
+    // Bob can still join from Alice, with Alice as the owner.
+    let (g, w) = welcome(&mut net, &[pa]);
+    assert!(net.node(&pb).handle(pc, w.clone()).is_err());
+    assert!(net.node(&pb).list().is_empty());
+    let res = net.node(&pb).handle(pa, w).unwrap();
+    assert!(res.events.contains(&GroupEvent::Joined {
+        group: g,
+        name: "team".into(),
+        owner: pa
+    }));
+
+    // Bob accepted Carol's invitation to that group too, but she didn't
+    // make this Welcome: still refused.
+    let (g, w) = welcome(&mut net, &[pa, pc]);
+    assert!(net.node(&pb).handle(pc, w).is_err());
+    assert!(!net.node(&pb).list().iter().any(|(id, ..)| *id == g));
+}

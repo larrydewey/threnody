@@ -18,7 +18,8 @@ Every leaf uses a `BasicCredential` whose identity is exactly the leaf's 32-byte
 There is no delivery service. Group traffic is carried as `AppMessage::Group(GroupWire)` (Appendix C, kind 6) inside the authenticated 1:1 ratchets:
 
 ```
-GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (32), ? 5: reference }
+GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (32), ? 5: reference,
+              ? 6: owner (32) }
   1 KeyPackageRequest  owner -> invitee           (name)
   2 KeyPackage         invitee -> owner           (MlsMessage(KeyPackage))
   3 Welcome            owner -> new member        (MlsMessage(Welcome), ratchet tree in extension)
@@ -28,8 +29,10 @@ GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (3
   6 Receipt            forwarder -> sender      (member = who acknowledged, reference)
   7 Leave              member -> owner          (remove me)
   8 AddDevice          member -> owner, and     (member = another device of the sender's account)
-                       member -> that device
+                       member -> that device    (and owner = the group's owner)
 ```
+
+Receivers ignore keys they don't know, so older members skip `owner`.
 
 The sender fans every message out to each other member. The groups use the pure-ciphertext wire format, so commits are encrypted too.
 
@@ -80,9 +83,9 @@ Spec §6.2 leaves admin semantics to the application layer.
   2. The invitee consents by returning a fresh key package. Requests from mutually approved contacts are accepted automatically; anyone else needs `/group accept`. The invitee keeps the key package's private keys (in its group state) only until a Welcome uses them. Another request for the same group from the same peer replaces it, and at most 16 are kept, the oldest deleted first.
   3. The owner completes adds only for key packages it asked for, and only when the key package comes from the identity it invited.
   4. The owner commits the add, sends the Welcome to the new member, and sends the commit to the existing members.
-- **Joining checks.** On a Welcome, the joiner checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members.
+- **Joining checks.** The joiner takes a Welcome only from someone whose invitation to that group it accepted (gave a key package to), before it uses up the key package, and only if that sender made the Welcome (signed its group info). It then checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members, and records the inviter as the owner. Several people can invite us to the same group id. Accepting one of them sends a key package to that inviter only.
 - **Leaving.** A member leaves by sending the owner `Leave` and forgetting the group at once. The owner commits its removal for the remaining members. An owner can't leave, but deleting the group removes every other member in one commit and then forgets it.
-- **Linked devices.** When a device is linked into an account (or first connects to a sibling after this was introduced), each sibling has it join every group the sibling is in, once per group: it invites the device itself if it may commit, and otherwise sends the owner `AddDevice`. The owner invites the device only if the sender is a member and both are devices of the same account, according to the sender's account chain. The sibling also sends `AddDevice` to the device itself, which then accepts the owner's invitation to that group automatically, as it does an invitation from its own sibling.
+- **Linked devices.** When a device is linked into an account (or first connects to a sibling after this was introduced), each sibling has it join every group the sibling is in, once per group: it invites the device itself if it may commit, and otherwise sends the owner `AddDevice`. The owner invites the device only if the sender is a member and both are devices of the same account, according to the sender's account chain. The sibling also sends `AddDevice` to the device itself, naming the group's owner. The device then accepts that owner's invitation to that group automatically, as it does an invitation from its own sibling. Anyone else's invitation to the group still needs consent. An `AddDevice` from an older sibling doesn't name the owner, so that invitation needs consent too.
 - **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it. The removed member then deletes the group and its secrets, as on leaving, so the owner can invite it again.
 - **Past epochs.** Application messages from up to five past epochs are still accepted, to tolerate reordering around commits.
 

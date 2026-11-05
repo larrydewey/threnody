@@ -977,6 +977,15 @@ impl Groups {
         if self.groups.contains_key(&group) {
             return Err(GroupError::Unexpected("already in group"));
         }
+        // Only from someone whose invitation to this group we accepted;
+        // anyone else's must not use up the key package.
+        if !self
+            .key_packages
+            .iter()
+            .any(|(g, p, _)| *g == group && *p == from)
+        {
+            return Err(GroupError::Unexpected("welcome we didn't ask for"));
+        }
         let msg = MlsMessageIn::tls_deserialize_exact(bytes).map_err(mls)?;
         let MlsMessageBodyIn::Welcome(welcome) = msg.extract() else {
             return Err(GroupError::Unexpected("not a welcome"));
@@ -992,10 +1001,14 @@ impl Groups {
             .max_past_epochs(MAX_PAST_EPOCHS)
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .build();
-        let mls = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
-            .map_err(mls)?
-            .into_group(&self.provider)
-            .map_err(mls)?;
+        let staged =
+            StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None).map_err(mls)?;
+        // ...and who made the Welcome, so it's the owner we record.
+        let sender = staged.welcome_sender().map_err(mls)?;
+        if identity_of(sender.credential(), sender.signature_key().as_slice())? != from {
+            return Err(GroupError::Unexpected("welcome made by someone else"));
+        }
+        let mls = staged.into_group(&self.provider).map_err(mls)?;
         if mls.group_id().as_slice() != group {
             return Err(GroupError::Unexpected("group id mismatch"));
         }

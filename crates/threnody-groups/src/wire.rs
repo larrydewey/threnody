@@ -3,11 +3,12 @@
 //!
 //! ```text
 //! GroupWire = { 0: kind uint, 1: group_id bstr, ? 2: payload bstr, ? 3: name tstr,
-//!               ? 4: member bstr .size 32, ? 5: reference uint }
+//!               ? 4: member bstr .size 32, ? 5: reference uint, ? 6: owner bstr .size 32 }
 //! kind: 1 key-package request, 2 key package, 3 welcome, 4 MLS message,
 //!       5 forward (an MLS message for another member),
 //!       6 receipt (that member acknowledged a forwarded message),
-//!       7 leave (a member asks the owner to remove it)
+//!       7 leave (a member asks the owner to remove it),
+//!       8 add device (6: the group's owner, to the device itself)
 //! ```
 
 use const_cbor::Decoder;
@@ -55,8 +56,13 @@ pub enum GroupWire {
     Leave { group: GroupId },
     /// Between devices of one account: add `device` (another device of the
     /// sender's account) to this group. To the owner, a request; to
-    /// `device` itself, word to accept the invitation that follows.
-    AddDevice { group: GroupId, device: [u8; 32] },
+    /// `device` itself, word to accept the invitation that follows from
+    /// `owner` (absent from older senders).
+    AddDevice {
+        group: GroupId,
+        device: [u8; 32],
+        owner: Option<[u8; 32]>,
+    },
 }
 
 impl GroupWire {
@@ -98,13 +104,18 @@ impl GroupWire {
             Self::Leave { .. } => (7, None, None, None, 0),
             Self::AddDevice { device, .. } => (8, None, None, Some(device), 0),
         };
-        let size = payload.map_or(0, <[u8]>::len) + name.map_or(0, str::len) + 48;
+        let owner = match self {
+            Self::AddDevice { owner, .. } => owner.as_ref(),
+            _ => None,
+        };
+        let size = payload.map_or(0, <[u8]>::len) + name.map_or(0, str::len) + 96;
         cbor::to_vec(size, |e| {
             e.map_len(
                 2 + usize::from(payload.is_some())
                     + usize::from(name.is_some())
                     + usize::from(to.is_some())
-                    + usize::from(reference != 0),
+                    + usize::from(reference != 0)
+                    + usize::from(owner.is_some()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.bytes(self.group())?;
@@ -120,6 +131,9 @@ impl GroupWire {
             if reference != 0 {
                 e.u8(5)?.u64(reference)?;
             }
+            if let Some(o) = owner {
+                e.u8(6)?.bytes(o)?;
+            }
             Ok(())
         })
     }
@@ -128,6 +142,7 @@ impl GroupWire {
         let mut dec = Decoder::new(b);
         let (mut kind, mut group, mut payload, mut name, mut to) = (None, None, None, None, None);
         let mut reference = 0;
+        let mut owner = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -136,6 +151,7 @@ impl GroupWire {
                 3 => name = Some(d.str()?.to_owned()),
                 4 => to = Some(cbor::fixed_bytes::<32>(d)?),
                 5 => reference = d.u64()?,
+                6 => owner = Some(cbor::fixed_bytes::<32>(d)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -175,6 +191,7 @@ impl GroupWire {
             8 => Self::AddDevice {
                 group,
                 device: required(to, "device")?,
+                owner,
             },
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
@@ -700,6 +717,12 @@ mod tests {
             GroupWire::AddDevice {
                 group: g,
                 device: [7; 32],
+                owner: None,
+            },
+            GroupWire::AddDevice {
+                group: g,
+                device: [7; 32],
+                owner: Some([6; 32]),
             },
         ] {
             assert_eq!(GroupWire::decode(&m.encode().unwrap()).unwrap(), m);

@@ -8,7 +8,7 @@ use threnody_core::history::{ConversationId, FileNote};
 use threnody_core::store::Home;
 use threnody_core::{Identity, PublicIdentity};
 use threnody_groups::GroupId;
-use threnody_groups::node::{GroupNode, Update};
+use threnody_groups::node::{GroupNode, Invite, Update};
 use threnody_net::Node;
 
 pub const HELP: &str = "\
@@ -266,7 +266,7 @@ impl GroupUi {
     }
 
     /// Picks pending invitation `n` (1-based; the latest by default).
-    fn pending(&self, n: Option<&str>) -> Result<GroupId> {
+    fn pending(&self, n: Option<&str>) -> Result<Invite> {
         let invites = self.groups.invites();
         if invites.is_empty() {
             bail!("no pending invitations");
@@ -275,7 +275,7 @@ impl GroupUi {
         if n == 0 || n > invites.len() {
             bail!("pick 1..={}", invites.len());
         }
-        Ok(invites[n - 1].group)
+        Ok(invites[n - 1].clone())
     }
 
     /// `/group ...` and `/groups`.
@@ -310,13 +310,14 @@ impl GroupUi {
                 say!("* invitation sent to {} ({n} device(s))", name(&p));
             }
             "accept" => {
-                let g = self.pending(it.next())?;
-                say!("* accepting {}", self.label(&g));
-                let updates = self.groups.accept(node, &g)?;
+                let i = self.pending(it.next())?;
+                say!("* accepting {}", self.label(&i.group));
+                // That inviter's, even if others invite us to the same id.
+                let updates = self.groups.accept_from(node, &i.group, &i.from)?;
                 self.show(node, name, updates);
             }
             "decline" => {
-                let g = self.pending(it.next())?;
+                let g = self.pending(it.next())?.group;
                 say!("* declined {}", self.label(&g));
                 self.groups.decline(&g);
             }

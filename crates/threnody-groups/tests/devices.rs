@@ -7,6 +7,7 @@ use std::time::Duration;
 use threnody_core::history::ConversationId;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, PublicIdentity};
+use threnody_groups::GroupWire;
 use threnody_groups::node::{GroupNode, Update};
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -19,6 +20,8 @@ struct N {
     groups: GroupNode,
     /// What incoming group traffic produced, for the app to show.
     updates: Vec<Update>,
+    /// Every group message that arrived, as sent.
+    wires: Vec<(PublicIdentity, GroupWire)>,
 }
 
 async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
@@ -40,6 +43,7 @@ async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
         addr,
         groups,
         updates: Vec::new(),
+        wires: Vec::new(),
     }
 }
 
@@ -57,6 +61,9 @@ impl N {
                     msg: AppMessage::Group(b),
                     ..
                 } => {
+                    if let Ok(w) = GroupWire::decode(&b) {
+                        self.wires.push((peer, w));
+                    }
                     if let Ok(u) = self.groups.incoming(&self.node, peer, &b) {
                         self.updates.extend(u);
                     }
@@ -161,6 +168,61 @@ async fn a_linked_device_joins_our_groups_with_their_history() {
     })
     .await;
     assert_eq!(phone.texts(&g).len(), 3, "no duplicates");
+}
+
+#[tokio::test]
+async fn a_linked_device_takes_only_the_owners_invitation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut mallory = spawn(&dir, "mallory").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+
+    // Mallory knows the group's id and invites the phone to it first.
+    let pid = mallory.node.connect(&phone.addr, None).await.unwrap();
+    let request = GroupWire::KeyPackageRequest {
+        group: g,
+        name: "team".into(),
+    };
+    mallory
+        .node
+        .send(&pid, AppMessage::Group(request.encode().unwrap()))
+        .unwrap();
+    let mid = mallory.node.identity();
+    until(&mut [&mut phone, &mut mallory], |ns| {
+        ns[0].groups.invites().iter().any(|i| i.from == mid)
+    })
+    .await;
+
+    // The laptop says to join the group: the phone takes Bob's
+    // invitation, not Mallory's.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(
+        &mut [&mut bob, &mut laptop, &mut phone, &mut mallory],
+        |ns| ns[2].in_group(&g),
+    )
+    .await;
+    for _ in 0..25 {
+        for n in [&mut bob, &mut laptop, &mut phone, &mut mallory] {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(phone.groups.list()[0].2, bob.node.identity());
+    assert!(phone.groups.invites().iter().any(|i| i.from == mid));
+    assert!(
+        !mallory
+            .wires
+            .iter()
+            .any(|(_, w)| matches!(w, GroupWire::KeyPackage { .. })),
+        "Mallory got a key package"
+    );
 }
 
 #[tokio::test]

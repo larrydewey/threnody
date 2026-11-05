@@ -250,6 +250,26 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Accepts `from`'s invitation to `group` (both as `group_invites`
+    /// lists them), when more than one person invites us to that group.
+    pub fn accept_group_invite_from(&self, group: String, from: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let inviter = self
+            .group_node()
+            .invites()
+            .iter()
+            .find(|i| i.group == g && fp(&i.from) == from)
+            .map(|i| i.from)
+            .ok_or_else(|| fail("no such invitation"))?;
+        let _guard = self.rt.enter();
+        let updates = self
+            .group_node()
+            .accept_from(&self.node, &g, &inviter)
+            .map_err(fail)?;
+        self.queue_updates(updates);
+        Ok(())
+    }
+
     pub fn decline_group_invite(&self, group: String) -> Result<()> {
         let g = self.group_id(&group)?;
         self.group_node().decline(&g);

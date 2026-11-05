@@ -3487,9 +3487,14 @@ impl ChatView {
 
     fn join_group(self: &Rc<Self>) {
         let Some(g) = self.group() else { return };
+        // The invitation shown: others may invite us to the same group.
+        let from = self.conv.borrow().invite.as_ref().map(|i| i.from.clone());
         self.run(
             "join",
-            move |n| n.accept_group_invite(g),
+            move |n| match from {
+                Some(from) => n.accept_group_invite_from(g, from),
+                None => n.accept_group_invite(g),
+            },
             Some("Joined".into()),
         );
     }
