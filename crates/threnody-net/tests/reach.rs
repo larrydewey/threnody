@@ -435,6 +435,265 @@ async fn a_silently_dead_path_is_repaired_within_seconds() {
     );
 }
 
+/// Slowing cover traffic mid-session (as a phone does when its network
+/// turns metered) tells the peer the new heartbeat first: its lease,
+/// sized for the old one, must not end the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slowing_cover_traffic_mid_session_keeps_the_session() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    // Every 200 ms: Bob's lease for Alice is then 3 s.
+    for n in [&alice, &bob] {
+        n.set_constant_rate(Some(Duration::from_millis(200)));
+    }
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    let b_quic = bob.listen_quic("127.0.0.1:0").await.unwrap();
+    for n in [&alice, &bob] {
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    // Wait until both know their own addresses, so `Paths` carry them.
+    timeout(Duration::from_secs(10), async {
+        while alice.reachability().candidates.is_empty() || bob.reachability().candidates.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let bob_id = alice.connect_quic(b_quic, None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Let the `Paths` messages cross.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    alice.set_constant_rate(Some(Duration::from_secs(4)));
+    let dropped = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Event::Disconnected { reason, .. }) = brx.recv().await {
+                return reason;
+            }
+        }
+    })
+    .await;
+    assert!(dropped.is_err(), "session dropped: {dropped:?}");
+    assert!(alice.sessions().iter().any(|s| s.peer == bob_id));
+}
+
+/// A TCP proxy to `to` passing at most `per_s` bytes a second from the
+/// dialer, as a slow uplink would; the other way at full speed.
+async fn slow_proxy(to: std::net::SocketAddr, per_s: usize) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(to).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut buf = vec![0u8; per_s / 10];
+        while let Ok(n) = cr.read(&mut buf).await {
+            if n == 0 || sw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    addr
+}
+
+/// A file that takes longer to arrive than the lease still gets through:
+/// its bytes arriving count as the peer talking, not just whole frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_slower_than_the_lease_still_arrives() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    // Every 200 ms: the lease is then 3 s.
+    for n in [&alice, &bob] {
+        n.set_constant_rate(Some(Duration::from_millis(200)));
+    }
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    bob.listen_quic("127.0.0.1:0").await.unwrap();
+    for n in [&alice, &bob] {
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    timeout(Duration::from_secs(10), async {
+        while alice.reachability().candidates.is_empty() || bob.reachability().candidates.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+    // 1.5 MB at 300 kB/s: about 5 s for the one frame.
+    let proxy = slow_proxy(b_tcp, 300_000).await;
+    let bob_id = alice.connect(&proxy.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Let the `Paths` messages cross.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    alice
+        .send_file(
+            &bob_id,
+            threnody_net::history::OutgoingFile {
+                name: "big.bin".into(),
+                data: vec![7u8; 1_500_000],
+                location: None,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+                clip: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    let got = next(&mut brx, 30, |e| {
+        matches!(
+            e,
+            Event::Disconnected { .. }
+                | Event::Message {
+                    msg: AppMessage::File { .. },
+                    ..
+                }
+        )
+    })
+    .await;
+    assert!(
+        matches!(got, Event::Message { .. }),
+        "the session ended first: {got:?}"
+    );
+}
+
+/// A TCP proxy to `to` that, once `stall` is set, passes one more byte
+/// from the dialer and then nothing, leaving the connection open: a link
+/// that died partway through a frame. The other way flows freely.
+async fn stalling_proxy(
+    to: std::net::SocketAddr,
+    stall: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::net::SocketAddr {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(to).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = cr.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            if stall.load(Ordering::Relaxed) {
+                let _ = sw.write_all(&buf[..1]).await;
+                // Hold both halves open without passing anything more.
+                std::future::pending::<()>().await;
+            }
+            if sw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
+/// A link that dies partway through a frame still ends the session when
+/// the lease runs out: the bytes that did arrive count once, not forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_cut_off_midway_still_lets_the_lease_expire() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    // Every 200 ms: the lease is then 3 s.
+    for n in [&alice, &bob] {
+        n.set_constant_rate(Some(Duration::from_millis(200)));
+    }
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    alice.listen_quic("127.0.0.1:0").await.unwrap();
+    bob.listen_quic("127.0.0.1:0").await.unwrap();
+    for n in [&alice, &bob] {
+        n.start_reach(cfg.clone()).unwrap();
+    }
+    timeout(Duration::from_secs(10), async {
+        while alice.reachability().candidates.is_empty() || bob.reachability().candidates.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+    let stall = std::sync::Arc::new(AtomicBool::new(false));
+    let proxy = stalling_proxy(b_tcp, stall.clone()).await;
+    let bob_id = alice.connect(&proxy.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Let the `Paths` messages cross.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    stall.store(true, Ordering::Relaxed);
+    let got = next(&mut brx, 15, |e| matches!(e, Event::Disconnected { .. })).await;
+    let Event::Disconnected { reason, .. } = got else {
+        unreachable!()
+    };
+    assert!(reason.contains("lease"), "ended otherwise: {reason}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strangers_find_each_other_by_handle() {
     let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())

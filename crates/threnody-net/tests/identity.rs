@@ -155,12 +155,12 @@ async fn a_persona_is_unlinkable_until_it_reveals_its_identity() {
             .is_err()
     );
 
+    let link = format!(
+        "threnody://{}@10.0.0.1:7450",
+        main_id.fingerprint().compact()
+    );
     p.node
-        .reveal(
-            &bid,
-            LinkProof::sign(&me, &pkey),
-            Some("threnody://ME@10.0.0.1:7450".into()),
-        )
+        .reveal(&bid, LinkProof::sign(&me, &pkey), Some(link.clone()))
         .unwrap();
     let Event::IdentityRevealed {
         peer,
@@ -171,10 +171,29 @@ async fn a_persona_is_unlinkable_until_it_reveals_its_identity() {
         unreachable!()
     };
     assert_eq!((peer, identity), (pkey, main_id));
-    assert_eq!(invite.as_deref(), Some("threnody://ME@10.0.0.1:7450"));
+    assert_eq!(invite.as_deref(), Some(link.as_str()));
     // Kept with the contact, for when the app wasn't watching.
     let kept = b.node.contacts().get(&pkey).unwrap().revealed.clone();
     assert_eq!(kept, Some((main_id, invite)));
+
+    // An invite that doesn't lead to the proven identity (someone else's,
+    // or an address nothing pins) is dropped: adding them would dial it.
+    let elsewhere = format!(
+        "threnody://{}@10.0.0.2:7450",
+        other.public().fingerprint().compact()
+    );
+    for invite in [elsewhere, "10.0.0.2:7450".to_owned()] {
+        p.node
+            .reveal(&bid, LinkProof::sign(&me, &pkey), Some(invite))
+            .unwrap();
+        let Event::IdentityRevealed {
+            identity, invite, ..
+        } = next(&mut b.rx, |e| matches!(e, Event::IdentityRevealed { .. })).await
+        else {
+            unreachable!()
+        };
+        assert_eq!((identity, invite), (main_id, None));
+    }
     // A persona manages no personas of its own.
     assert!(p.node.personas().is_err() && p.node.link_proof(&bid).is_err());
     let _ = &mut p.rx;

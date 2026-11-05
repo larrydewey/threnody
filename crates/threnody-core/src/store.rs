@@ -384,6 +384,10 @@ pub struct Contact {
     /// The user cleared the conversation up to this time: on every one of
     /// our devices, older messages go and don't come back (0 = never).
     pub cleared_ms: u64,
+    /// The feature bits of this peer's latest `Hello`, kept across
+    /// restarts so that what arrives before a session does (mailbox
+    /// deliveries, say) is read as the peer meant it.
+    pub features: u64,
 }
 
 impl Contact {
@@ -408,6 +412,7 @@ impl Contact {
             shares: Vec::new(),
             revealed: None,
             cleared_ms: 0,
+            features: 0,
         }
     }
 
@@ -633,6 +638,11 @@ impl Contacts {
                         c.local_approved = o.local_approved;
                         c.verified = o.verified;
                         c.approval_changed_ms = o.approval_changed_ms;
+                        // Revoked on our other device: the discovery keys
+                        // go here too (Appendix E).
+                        if !c.local_approved {
+                            c.clear_discovery_keys();
+                        }
                         changed = true;
                     }
                     if c.petname.is_none() && o.petname.is_some() {
@@ -688,6 +698,7 @@ impl Contacts {
                         + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
                         + usize::from(c.cleared_ms != 0)
                         + usize::from(c.timed_probes)
+                        + usize::from(c.features != 0)
                         + 2;
                     e.map_len(n)?;
                     e.u8(0)?.bytes(c.key.as_bytes())?;
@@ -742,6 +753,9 @@ impl Contacts {
                     }
                     if c.timed_probes {
                         e.u8(19)?.bool(true)?;
+                    }
+                    if c.features != 0 {
+                        e.u8(20)?.u64(c.features)?;
                     }
                 }
                 if !self.forgotten.is_empty() {
@@ -811,6 +825,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         shares: Vec::new(),
         revealed: None,
         cleared_ms: 0,
+        features: 0,
     };
     let (mut revealed, mut invite) = (None, None);
     read_map(d, |k, d| {
@@ -851,6 +866,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             17 => invite = Some(d.str()?.to_owned()),
             18 => c.cleared_ms = d.u64()?,
             19 => c.timed_probes = d.bool()?,
+            20 => c.features = d.u64()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -893,6 +909,7 @@ mod tests {
         ct.account = Some(AccountId([5; 32]));
         ct.approval_changed_ms = 77;
         ct.blocked = true;
+        ct.features = 1 << 16;
         assert!(!ct.accepted, "new contacts start as message requests");
         home.save_contacts(&c).unwrap();
         let loaded = home.load_contacts().unwrap();
@@ -920,12 +937,15 @@ mod sync_tests {
     #[test]
     fn snapshots_merge_last_writer_wins_without_pairwise_secrets() {
         let (bob, carol) = (Identity::generate().public(), Identity::generate().public());
+        let dave = Identity::generate().public();
         let mut mine = Contacts::default();
-        mine.observe(bob, None, 1);
-        let c = mine.get_mut(&bob).unwrap();
-        c.local_approved = true;
-        c.approval_changed_ms = 10;
-        c.discovery_key = Some([1; 32]);
+        for (k, key) in [(bob, 1), (dave, 2)] {
+            mine.observe(k, None, 1);
+            let c = mine.get_mut(&k).unwrap();
+            c.local_approved = true;
+            c.approval_changed_ms = 10;
+            c.discovery_key = Some([key; 32]);
+        }
 
         let mut theirs = Contacts::default();
         theirs.observe(bob, Some("bob.example:1".into()), 1);
@@ -937,6 +957,10 @@ mod sync_tests {
         t.remote_approved = true;
         theirs.get_mut(&carol).unwrap().discovery_key = Some([9; 32]);
         theirs.get_mut(&carol).unwrap().timed_probes = true;
+        theirs.observe(dave, None, 1);
+        let d = theirs.get_mut(&dave).unwrap();
+        d.local_approved = true; // approved again, still approved
+        d.approval_changed_ms = 20;
 
         assert!(
             mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 5)
@@ -945,7 +969,9 @@ mod sync_tests {
         let b = mine.get(&bob).unwrap();
         assert!(!b.local_approved, "later revocation wins");
         assert_eq!(b.petname.as_deref(), Some("bob"));
-        assert_eq!(b.discovery_key, Some([1; 32]), "own pairwise key kept");
+        assert!(b.discovery_key.is_none(), "a revocation takes the key");
+        let d = mine.get(&dave).unwrap();
+        assert_eq!(d.discovery_key, Some([2; 32]), "own pairwise key kept");
         let c = mine.get(&carol).unwrap();
         assert!(
             c.discovery_key.is_none() && !c.remote_approved && !c.timed_probes,

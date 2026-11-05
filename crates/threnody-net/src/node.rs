@@ -71,6 +71,13 @@ impl std::fmt::Debug for Secret {
 /// the userspace device.
 pub(crate) type TunnelInbound = mpsc::Sender<(PublicIdentity, Vec<u8>)>;
 
+/// Whether a tunnel endpoint says where to send: one learned only over a
+/// link with no IP address (Bluetooth) doesn't, and WireGuard then waits
+/// for the peer's own packets to show it.
+pub fn has_endpoint(endpoint: &SocketAddr) -> bool {
+    !endpoint.ip().is_unspecified()
+}
+
 /// A peer's WireGuard tunnel info.
 #[derive(Clone)]
 pub struct TunnelPeer {
@@ -527,6 +534,41 @@ impl Shared {
         }
     }
 
+    /// Where `peer`'s tunnel endpoint is, offered `port` on a session from
+    /// `addr`. A link with no IP address (Bluetooth) has an unspecified
+    /// one: the endpoint an earlier session gave stays, else it is left
+    /// unspecified (see [`has_endpoint`]) until the peer's packets show it.
+    fn tunnel_endpoint(&self, peer: &PublicIdentity, addr: SocketAddr, port: u16) -> SocketAddr {
+        let ip = if addr.ip().is_unspecified() {
+            lock(&self.tunnel_peers)
+                .get(peer)
+                .map_or(addr.ip(), |tp| tp.endpoint.ip())
+        } else {
+            addr.ip()
+        };
+        SocketAddr::new(ip, port)
+    }
+
+    /// Records `peer`'s tunnel, unless its WireGuard key is ours or
+    /// already another peer's. WireGuard knows peers by key, so a contact
+    /// offering someone else's key would take over that peer's entry (and,
+    /// once revoked, remove it). The first to hold a key keeps it. Returns
+    /// whether it was recorded.
+    fn add_tunnel_peer(&self, peer: PublicIdentity, tp: TunnelPeer) -> bool {
+        if lock(&self.tunnel).is_some_and(|(_, ours)| ours == tp.wg_public) {
+            return false;
+        }
+        let mut peers = lock(&self.tunnel_peers);
+        if peers
+            .iter()
+            .any(|(id, p)| *id != peer && p.wg_public == tp.wg_public)
+        {
+            return false;
+        }
+        peers.insert(peer, tp);
+        true
+    }
+
     pub(crate) fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
         let r = bytes.and_then(|b| self.home.save_state(&self.identity, name, b.as_ref()));
         if let Err(e) = r {
@@ -718,8 +760,26 @@ impl Node {
         *lock(&self.shared.policy)
     }
 
+    /// Sets who may hold a session with us. Sessions the new policy would
+    /// refuse end at once rather than when they next reconnect.
     pub fn set_policy(&self, p: AcceptPolicy) {
         *lock(&self.shared.policy) = p;
+        self.enforce_policy();
+    }
+
+    /// Ends sessions the accept policy refuses now, as it would have at
+    /// accept: after it tightens, or an approval it relied on is revoked.
+    /// Sessions we dialed ourselves stay, as the policy never covered them.
+    pub(crate) fn enforce_policy(&self) {
+        let refused: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .filter(|s| !s.outbound && self.check_policy(&s.peer).is_err())
+            .map(|s| s.peer)
+            .collect();
+        for peer in refused {
+            self.disconnect(&peer);
+        }
     }
 
     pub fn constant_rate(&self) -> Option<Duration> {
@@ -833,21 +893,16 @@ impl Node {
         // Then add/update each peer
         for peer in self.tunnel_peers_full() {
             let psk = zeroize::Zeroizing::new(threnody_core::tunnel::base64(&peer.psk.0[..]));
+            let key = threnody_core::tunnel::base64(&peer.wg_public);
+            let endpoint = peer.endpoint.to_string();
+            let allowed = format!("{}/128", peer.overlay);
+            let mut args = vec!["set", iface, "peer", &key, "preshared-key", "/dev/stdin"];
+            if has_endpoint(&peer.endpoint) {
+                args.extend(["endpoint", &endpoint]);
+            }
+            args.extend(["allowed-ips", &allowed, "persistent-keepalive", "25"]);
             let mut child = Command::new("wg")
-                .args([
-                    "set",
-                    iface,
-                    "peer",
-                    &threnody_core::tunnel::base64(&peer.wg_public),
-                    "preshared-key",
-                    "/dev/stdin",
-                    "endpoint",
-                    &peer.endpoint.to_string(),
-                    "allowed-ips",
-                    &format!("{}/128", peer.overlay),
-                    "persistent-keepalive",
-                    "25",
-                ])
+                .args(args)
                 .stdin(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -1241,6 +1296,15 @@ impl Node {
             .is_some_and(|f| f & feature != 0)
     }
 
+    /// Like [`Node::supports`], but for a peer with no session since we
+    /// started, by what it said in its last one (saved with the contact).
+    pub(crate) fn known_to_support(&self, peer: &PublicIdentity, feature: u64) -> bool {
+        let latest = lock(&self.shared.peer_features).get(peer).copied();
+        latest
+            .or_else(|| lock(&self.shared.contacts).get(peer).map(|c| c.features))
+            .is_some_and(|f| f & feature != 0)
+    }
+
     /// How many messages to `peer` are waiting for an acknowledgement.
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
         lock(&self.shared.delivery).unacked(peer)
@@ -1269,8 +1333,22 @@ impl Node {
             self.shared.tunnel_down(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });
+        if !approved {
+            // Under `ApprovedOnly` the peer has no business holding a
+            // session any more (the revocation above still goes first).
+            self.enforce_policy();
+        }
         self.push_contact_sync();
         Ok(())
+    }
+
+    /// Takes back what mutual approval gave `peer`, when it is blocked or
+    /// forgotten rather than revoked: its tunnel peer goes at once, and it
+    /// is told we no longer approve it, so its side removes ours too. The
+    /// session may end right after; its last act is to send that.
+    pub(crate) fn withdraw_approval(&self, peer: &PublicIdentity) {
+        self.shared.tunnel_down(peer);
+        let _ = self.send(peer, AppMessage::Approval { approved: false });
     }
 
     /// Ends the session with `peer`, if any.
@@ -1420,6 +1498,7 @@ impl Node {
         });
 
         let node = self.clone();
+        let started = tokio::time::Instant::now();
         tokio::spawn(async move {
             let result = run_session(&node, stream, chan, addr, via, over, rx).await;
             // Closed on purpose (either side) is not a loss to repair.
@@ -1436,6 +1515,17 @@ impl Node {
                 if sessions.get(&peer).is_some_and(|h| h.id == id) {
                     sessions.remove(&peer);
                 }
+                current
+            };
+            // When both sides dial at once, the other side may drop this
+            // session (see `loses_duplicate`) before its twin reaches us:
+            // a young one gets a moment for the twin before counting as
+            // a disconnection.
+            let young = started.elapsed() < Duration::from_millis(DUPLICATE_WINDOW_MS);
+            let current = if current && via.is_none() && young {
+                tokio::time::sleep(TWIN_GRACE).await;
+                !node.connected(&peer)
+            } else {
                 current
             };
             // Circuits relayed over this link die with it (unless a newer
@@ -1475,7 +1565,11 @@ where
     let on_standby = matches!(over, Over::Standby);
     let shared: &Shared = &node.shared;
     let peer = *chan.peer();
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, mut wr) = tokio::io::split(stream);
+    // Bytes of a frame still arriving (a large file) count as the peer
+    // talking, for the lease: a whole frame may take longer than it.
+    let heard = Heard::new();
+    let mut rd = heard.reader(rd);
 
     // Frame reads are not cancellation-safe, so they get their own task.
     let (in_tx, mut inbox) = mpsc::channel::<Result<Inbound>>(16);
@@ -1512,7 +1606,8 @@ where
 
     let make_ticker = |rate: Option<Duration>| {
         rate.map(|d| {
-            let mut t = tokio::time::interval(d);
+            // No slower than the longest heartbeat a lease allows.
+            let mut t = tokio::time::interval(d.min(crate::recover::MAX_BEAT));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             t
         })
@@ -1538,8 +1633,12 @@ where
     let mut early_paths: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
-    let mut heartbeat = tokio::time::interval(node.beat_for(inner));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let make_heartbeat = || {
+        let mut t = tokio::time::interval(node.beat_for(inner));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    };
+    let mut heartbeat = make_heartbeat();
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
     let mut push_sent = false;
@@ -1663,8 +1762,18 @@ where
                 }
                 pending = waiting;
             }
+            // The lease runs from whatever came in last, a whole frame or
+            // just some bytes of one.
+            let since = last_rx.max(heard.last());
             tokio::select! {
-                () = lease_expired(lease, last_rx) => {
+                () = lease_expired(lease, since) => {
+                    // Bytes came in after `since`, or frames wait unread
+                    // after a long write of ours: not silent. Only bytes
+                    // newer than `since` count: a frame cut off midway
+                    // would otherwise hold the session open for good.
+                    if heard.last() > since || !inbox.is_empty() {
+                        continue;
+                    }
                     return Err(NetError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "lease expired (peer silent)",
@@ -1693,6 +1802,16 @@ where
                             _ => 0,
                         };
                         lock(&shared.peer_features).insert(peer, features);
+                        {
+                            // Kept for what arrives before the next session.
+                            let mut contacts = lock(&shared.contacts);
+                            if let Some(c) = contacts.get_mut(&peer)
+                                && c.features != features
+                            {
+                                c.features = features;
+                                shared.save_contacts(&contacts);
+                            }
+                        }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
                         // Remembered across restarts: probes matter most
                         // when there is no session to ask in.
@@ -1777,15 +1896,25 @@ where
                             }
                         }
                         AppMessage::TunnelOffer { wg_public, port } => {
-                            // Spec §8: tunnels only between mutually approved devices.
-                            if lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
+                            // Spec §8: tunnels only between mutually approved
+                            // devices, offered on direct sessions only: the
+                            // address of a relayed one is the relay's.
+                            if via.is_none() && lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
                                 let tp = TunnelPeer {
                                     wg_public,
-                                    endpoint: SocketAddr::new(addr.ip(), port),
+                                    endpoint: shared.tunnel_endpoint(&peer, addr, port),
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 };
-                                lock(&shared.tunnel_peers).insert(peer, tp.clone());
+                                if !shared.add_tunnel_peer(peer, tp.clone()) {
+                                    shared.emit(Event::ReachNote {
+                                        note: format!(
+                                            "tunnel offer from {} refused: its key is not its own",
+                                            peer.fingerprint()
+                                        ),
+                                    });
+                                    continue;
+                                }
                                 // They may have offered while our tunnels
                                 // were off, and so ignored ours: answer
                                 // their first offer with ours.
@@ -1855,7 +1984,19 @@ where
                         }
                     }
                 }
-                out = outbox.recv() => match out {
+                out = outbox.recv() => {
+                    // Our own revocation on its way out: what this session
+                    // set up under mutual approval (tunnel offer, discovery
+                    // key, prekeys, push) is set up afresh if it returns,
+                    // as when the peer revokes.
+                    if matches!(out, Some(AppMessage::Approval { approved: false })) {
+                        offered = false;
+                        took_offer = false;
+                        discovery_keyed = false;
+                        prekeys_sent = false;
+                        push_sent = false;
+                    }
+                    match out {
                     // Calls can't hide behind cover traffic (their media
                     // shows anyway), and a call can't wait for ticks.
                     Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
@@ -1865,30 +2006,48 @@ where
                         }
                     }
                     Some(m) => pending.push_back(m),
-                    None => return Ok(()), // replaced or disconnected locally
-                },
+                    None => {
+                        // Replaced or disconnected locally. A revocation
+                        // queued just before (a block, say) still goes, even
+                        // under cover traffic, so the peer drops its side.
+                        // Only while it still holds: a replaced session's
+                        // stale one must not undo a later approval.
+                        let revoked = !lock(&shared.contacts).get(&peer).is_some_and(|c| c.local_approved);
+                        if revoked && chan.can_send() {
+                            for m in pending.iter().filter(|m| matches!(m, AppMessage::Approval { approved: false })) {
+                                let sealed = chan.seal(m)?;
+                                let _ = tokio::time::timeout(LAST_WORDS, write_frame(&mut wr, &sealed)).await;
+                            }
+                            // Close gently, reading until the peer closes too:
+                            // closing with its frames unread would reset the
+                            // connection, and a reset can discard the
+                            // revocation before the peer reads it.
+                            let _ = tokio::time::timeout(LAST_WORDS, async {
+                                let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
+                                while let Some(Ok(_)) = inbox.recv().await {}
+                            })
+                            .await;
+                        }
+                        return Ok(());
+                    }
+                    }
+                }
                 Ok(()) = rate.changed() => {
-                    ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
-                    // The beat follows the rate, and the peer hears of it
-                    // first: from now on our `Paths` (`broadcast_paths`)
-                    // advertise the new beat, and a peer told of a faster
-                    // beat than we keep would end the session as silent.
-                    let beat = node.beat_for(inner);
-                    if beat != heartbeat.period() {
-                        let now = tokio::time::Instant::now();
-                        heartbeat = tokio::time::interval_at(now + beat, beat);
-                        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        if paths_sent
-                            && shared.mutual(&peer)
-                            && let Some(m) = node.paths_message(inner)
-                        {
-                            let at = pending
-                                .iter()
-                                .rposition(|m| matches!(m, AppMessage::Hello { .. } | AppMessage::Approval { .. }))
-                                .map_or(0, |i| i + 1);
-                            pending.insert(at, m);
+                    // The peer's lease follows the heartbeat our `Paths`
+                    // announced: announce the new one at once, before
+                    // sending less often, or a slower rate would outlast
+                    // the old lease and the peer would end the session.
+                    if paths_sent && shared.mutual(&peer) && node.supports(&peer, FEATURE_PATHS) {
+                        if chan.can_send() {
+                            if let Some(m) = node.paths_message(inner) {
+                                write_frame(&mut wr, &chan.seal(&m)?).await?;
+                            }
+                        } else {
+                            paths_sent = false;
                         }
                     }
+                    ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
+                    heartbeat = make_heartbeat();
                 }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {
@@ -2022,6 +2181,13 @@ pub(crate) async fn read_inbound<R: AsyncRead + Unpin>(
 /// schedule.
 const SETUP_BURST: Duration = Duration::from_secs(5);
 
+/// How long a session ended locally may take to send its last revocation.
+const LAST_WORDS: Duration = Duration::from_secs(1);
+
+/// How long a young session that ended waits for a twin (see
+/// `spawn_session`) before it counts as a disconnection.
+const TWIN_GRACE: Duration = Duration::from_millis(500);
+
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;
 
@@ -2035,6 +2201,58 @@ enum Over {
     /// network's address, not ours.
     Standby,
     Other,
+}
+
+/// When bytes from the peer last arrived on a session, partial frames
+/// included, shared with the session's reader task.
+#[derive(Clone)]
+struct Heard {
+    t0: tokio::time::Instant,
+    /// Milliseconds after `t0`.
+    at_ms: Arc<AtomicU64>,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Self {
+            t0: tokio::time::Instant::now(),
+            at_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        self.t0 + Duration::from_millis(self.at_ms.load(Ordering::Relaxed))
+    }
+
+    /// `inner`, noting here whenever bytes arrive on it.
+    fn reader<R>(&self, inner: R) -> HeardReader<R> {
+        HeardReader {
+            inner,
+            heard: self.clone(),
+        }
+    }
+}
+
+struct HeardReader<R> {
+    inner: R,
+    heard: Heard,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for HeardReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            let ms = this.heard.t0.elapsed().as_millis() as u64;
+            this.heard.at_ms.store(ms, Ordering::Relaxed);
+        }
+        r
+    }
 }
 
 /// Resolves when `lease` has passed since `last_rx`; never without a lease.

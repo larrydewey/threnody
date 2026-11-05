@@ -1467,16 +1467,22 @@ Address = {}/128\n",
         for peer in self.node.tunnel_peers_full() {
             let psk = threnody_core::tunnel::base64(&peer.psk.0[..]);
             let peer_overlay = peer.overlay;
+            // Learned over Bluetooth only: WireGuard finds it from its packets.
+            let endpoint = if threnody_net::node::has_endpoint(&peer.endpoint) {
+                format!("Endpoint = {}\n", peer.endpoint)
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
                 "\n[Peer]\n\
 PublicKey = {}\n\
 PresharedKey = {}\n\
-Endpoint = {}\n\
+{}\
 AllowedIPs = {}/128\n\
 PersistentKeepalive = 25\n",
                 threnody_core::tunnel::base64(&peer.wg_public),
                 psk,
-                peer.endpoint,
+                endpoint,
                 peer_overlay
             ));
         }
@@ -2572,7 +2578,9 @@ mod tests {
         assert_eq!(seen.name.as_deref(), Some("Stall 12"));
         assert_eq!(seen.shared_profile.len(), 1);
 
-        me.reveal_through(p.clone(), b_fp, Some("threnody://ME@10.0.0.2:7450".into()))
+        // The main identity's own link: one naming anyone else is dropped.
+        let link = me.invite_link("10.0.0.2:7450".into());
+        me.reveal_through(p.clone(), b_fp, Some(link.clone()))
             .unwrap();
         let e = wait(&bob, |e| matches!(e, NodeEvent::IdentityRevealed { .. }));
         assert_eq!(
@@ -2580,7 +2588,7 @@ mod tests {
             NodeEvent::IdentityRevealed {
                 peer: p_fp.clone(),
                 identity: me.device_fingerprint(),
-                invite: Some("threnody://ME@10.0.0.2:7450".into()),
+                invite: Some(link),
             }
         );
         let seen = bob

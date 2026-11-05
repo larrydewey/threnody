@@ -229,6 +229,35 @@ async fn approved_only_policy_rejects_strangers() {
     assert!(bob.sessions().is_empty());
 }
 
+/// Tightening the policy, or revoking under `ApprovedOnly`, ends the
+/// sessions it would now refuse instead of letting them run on.
+#[tokio::test]
+async fn tightening_the_policy_ends_sessions_it_now_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let (carol, mut crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
+    let addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    // Bob is a stranger; Carol becomes a mutually approved contact.
+    bob.connect(&addr, None).await.unwrap();
+    let alice_id = carol.connect(&addr, None).await.unwrap();
+    carol.set_approval(&alice_id, true).unwrap();
+    alice.set_approval(&carol.identity(), true).unwrap();
+    next(&mut crx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+
+    alice.set_policy(AcceptPolicy::ApprovedOnly);
+    next(&mut brx, |e| matches!(e, Event::Disconnected { .. })).await;
+    let peers = |n: &Node| n.sessions().into_iter().map(|s| s.peer).collect::<Vec<_>>();
+    assert_eq!(peers(&alice), vec![carol.identity()]);
+
+    alice.set_approval(&carol.identity(), false).unwrap();
+    next(&mut crx, |e| matches!(e, Event::Disconnected { .. })).await;
+    assert!(alice.sessions().is_empty());
+}
+
 #[tokio::test]
 async fn constant_rate_mode_delivers_and_hides_idle() {
     let dir = tempfile::tempdir().unwrap();
@@ -352,6 +381,194 @@ async fn tunnels_follow_mutual_approval() {
     .await;
     next(&mut brx, |e| matches!(e, Event::TunnelDown { .. })).await;
     assert!(alice.tunnel_peers().is_empty());
+}
+
+/// Blocking or forgetting an approved contact takes its tunnel down on
+/// both sides, as revoking does, even under cover traffic.
+#[tokio::test]
+async fn blocking_or_forgetting_takes_the_tunnel_down() {
+    for forget in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let rate = Some(Duration::from_millis(200));
+        let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, rate);
+        let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, rate);
+        let addr = bob.listen("127.0.0.1:0").await.unwrap();
+        let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+        bob.accept_contact(&alice.identity());
+        alice.set_approval(&bob_id, true).unwrap();
+        bob.set_approval(&alice.identity(), true).unwrap();
+        let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+        next(&mut arx, up).await;
+        next(&mut brx, up).await;
+
+        if forget {
+            alice.delete_conversation(&bob_id);
+        } else {
+            alice.block_contact(&bob_id);
+        }
+        assert!(alice.tunnel_peers().is_empty(), "forget: {forget}");
+        next(&mut arx, |e| {
+            matches!(
+                e,
+                Event::TunnelDown {
+                    wg_public: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        // Bob hears of it before the session ends, and drops his side.
+        next(&mut brx, |e| matches!(e, Event::TunnelDown { .. })).await;
+        assert!(bob.tunnel_peers().is_empty(), "forget: {forget}");
+    }
+}
+
+/// Revoking and approving again within one session pairs the tunnel
+/// on both sides again, not only on the side that revoked.
+#[tokio::test]
+async fn revoking_and_approving_again_pairs_the_tunnel_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+
+    alice.set_approval(&bob_id, false).unwrap();
+    next(&mut brx, |e| matches!(e, Event::TunnelDown { .. })).await;
+    assert!(alice.tunnel_peers().is_empty() && bob.tunnel_peers().is_empty());
+
+    alice.set_approval(&bob_id, true).unwrap();
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+    assert_eq!(alice.tunnel_peers(), vec![bob_id]);
+    assert_eq!(bob.tunnel_peers(), vec![alice.identity()]);
+    assert!(
+        alice
+            .contacts()
+            .get(&bob_id)
+            .is_some_and(|c| c.discovery_key.is_some()),
+        "discovery key derived again"
+    );
+}
+
+/// A contact can't offer another contact's WireGuard key, or ours, as
+/// its own: WireGuard knows peers by key, so that would take over the
+/// other's tunnel. The first holder keeps the key.
+#[tokio::test]
+async fn a_tunnel_offer_cannot_claim_anothers_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let (carol, mut crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
+    let addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    for (n, rx) in [(&bob, &mut brx), (&carol, &mut crx)] {
+        let aid = n.connect(&addr, None).await.unwrap();
+        n.set_approval(&aid, true).unwrap();
+        alice.set_approval(&n.identity(), true).unwrap();
+        next(rx, |e| matches!(e, Event::TunnelUp { .. })).await;
+    }
+    timeout(Duration::from_secs(10), async {
+        while alice.tunnel_peers().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let key_of = |id| {
+        alice
+            .tunnel_peer_entries()
+            .into_iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, tp)| tp.wg_public)
+    };
+    let (bob_key, carol_key) = (key_of(bob.identity()), key_of(carol.identity()));
+    assert!(bob_key.is_some() && carol_key.is_some() && bob_key != carol_key);
+    // Alice's own key is what carol holds for her.
+    let alice_key = carol
+        .tunnel_peer_entries()
+        .into_iter()
+        .find(|(k, _)| *k == alice.identity())
+        .map(|(_, tp)| tp.wg_public)
+        .unwrap();
+
+    let aid = alice.identity();
+    for stolen in [carol_key.unwrap(), alice_key] {
+        bob.send(
+            &aid,
+            AppMessage::TunnelOffer {
+                wg_public: stolen,
+                port: 9,
+            },
+        )
+        .unwrap();
+    }
+    // Something after the offers, to know they've been handled.
+    bob.send_text(&aid, "after").unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::Message { .. } | Event::MessageRequest { .. })
+    })
+    .await;
+    assert_eq!(key_of(bob.identity()), bob_key);
+    assert_eq!(key_of(carol.identity()), carol_key);
+    assert_eq!(alice.tunnel_peers().len(), 2);
+}
+
+/// A session over Bluetooth has no IP address: a tunnel offer on it
+/// keeps the endpoint an earlier session gave, rather than pointing
+/// WireGuard at 0.0.0.0.
+#[tokio::test]
+async fn a_bluetooth_session_keeps_the_tunnel_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+    let entry = || {
+        alice
+            .tunnel_peer_entries()
+            .into_iter()
+            .find(|(k, _)| *k == bob_id)
+            .map(|(_, tp)| (tp.endpoint, *tp.psk.0))
+            .unwrap()
+    };
+    let (direct, psk) = entry();
+    assert!(!direct.ip().is_unspecified());
+
+    // The same pair over a Bluetooth link replaces the TCP session.
+    let (a_end, b_end) = tokio::io::duplex(1 << 16);
+    let bob2 = bob.clone();
+    let accept =
+        tokio::spawn(async move { bob2.accept_stream(b_end, "ble", "AA:BB".into()).await });
+    alice
+        .connect_stream(a_end, "ble", "CC:DD".into(), None)
+        .await
+        .unwrap();
+    accept.await.unwrap().unwrap();
+    // Its offer arrives with the new session's PSK.
+    let (e, _) = timeout(Duration::from_secs(10), async {
+        loop {
+            let now = entry();
+            if now.1 != psk {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("offered over the link");
+    assert_eq!(e, direct);
 }
 
 #[tokio::test]
@@ -752,6 +969,68 @@ async fn turning_tunnels_on_mid_session_still_pairs_both_sides() {
     next(&mut brx, up).await;
     assert_eq!(alice.tunnel_peers(), vec![bob_id]);
     assert_eq!(bob.tunnel_peers(), vec![alice.identity()]);
+}
+
+/// A TCP proxy to `to` that holds back what the dialer sends by `delay`.
+async fn late_requests(to: std::net::SocketAddr, delay: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(to).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = cr.read(&mut buf).await {
+            tokio::time::sleep(delay).await;
+            if n == 0 || sw.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
+/// Both sides dialing at once keep one session, and neither reports a
+/// disconnection for the duplicate the other dropped, even when that
+/// duplicate was, for a moment, the only session on one side.
+#[tokio::test]
+async fn simultaneous_dials_report_no_disconnection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let a_addr = alice.listen("127.0.0.1:0").await.unwrap();
+    let b_addr = bob.listen("127.0.0.1:0").await.unwrap();
+    // Both keep the session the smaller key (x) dialed. x dials first,
+    // over a slow path; y dials a moment later. x has its own session
+    // first, so drops y's at once, while y still holds that as its only
+    // one: x's session completes on y's side only later.
+    let alice_smaller = alice.identity().as_bytes() < bob.identity().as_bytes();
+    let (x, y, yrx, y_addr) = if alice_smaller {
+        (&alice, &bob, &mut brx, b_addr)
+    } else {
+        (&bob, &alice, &mut arx, a_addr)
+    };
+    let x_addr = if alice_smaller { a_addr } else { b_addr };
+    let slow = late_requests(y_addr, Duration::from_millis(200)).await;
+    let x2 = x.clone();
+    let dial = tokio::spawn(async move { x2.connect(&slow, None).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    y.connect(&x_addr.to_string(), None).await.unwrap();
+    dial.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(y.sessions().len(), 1);
+    assert_eq!(x.sessions().len(), 1);
+    while let Ok(e) = yrx.try_recv() {
+        assert!(
+            !matches!(e, Event::Disconnected { .. }),
+            "spurious disconnection: {e:?}"
+        );
+    }
 }
 
 #[tokio::test]

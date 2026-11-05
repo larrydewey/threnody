@@ -382,3 +382,52 @@ async fn deposits_are_direct_when_onion_routing_is_off() {
     .await;
     let _ = (&mut r1.rx, &mut r2.rx);
 }
+
+/// A message with no timer that arrives through a mailbox after a restart,
+/// before any session with its sender, doesn't turn our timer off: the
+/// sender's `Hello` bits are kept with the contact.
+#[tokio::test]
+async fn a_mailbox_message_after_a_restart_keeps_our_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    // B chose an hour; A never chose a timer.
+    b.node.set_timer(&aid, Some(3600)).unwrap();
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.send_offline(&bid, &text("no timer here")).unwrap();
+    wait_for(|| r.node.held_messages() == 1).await;
+
+    // B restarts and hears from A only through R.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&r.addr, None).await.unwrap();
+    next(
+        &mut b2rx,
+        |e| matches!(e, Event::OfflineMessage { msg, .. } if *msg == text("no timer here")),
+    )
+    .await;
+    assert!(b2.sessions().iter().all(|s| s.peer != aid));
+    assert_eq!(b2.timer(&aid), Some(3600), "B's choice stands");
+    let last = b2
+        .history(b2.conversation_for(&aid))
+        .unwrap()
+        .entries()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(last.text, "no timer here");
+    assert_eq!(last.expires_at_ms.map(|t| t - last.at_ms), Some(3_600_000));
+    let _ = (&mut a.rx, &mut r.rx);
+}

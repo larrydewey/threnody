@@ -810,11 +810,20 @@ fn main() -> Result<()> {
         }
         Cmd::Name { peer, name } => edit_contact(&home, &peer, |c| c.petname = Some(name))?,
         Cmd::Approve { peer } => {
-            edit_contact(&home, &peer, |c| c.local_approved = true)?;
+            edit_contact(&home, &peer, |c| {
+                c.local_approved = true;
+                c.approval_changed_ms = threnody_core::now_ms();
+            })?;
             println!("Approved. The peer learns this at your next session.");
         }
         Cmd::Revoke { peer } => {
-            edit_contact(&home, &peer, |c| c.local_approved = false)?;
+            // Dated, so our other devices follow it rather than undo it,
+            // and the discovery keys go as with any revocation.
+            edit_contact(&home, &peer, |c| {
+                c.local_approved = false;
+                c.approval_changed_ms = threnody_core::now_ms();
+                c.clear_discovery_keys();
+            })?;
             println!("Revoked. The peer learns this at your next session.");
         }
         Cmd::Verify { peer } => {

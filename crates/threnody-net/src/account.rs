@@ -347,6 +347,12 @@ impl Node {
                         .collect();
                     let cleared_before: std::collections::HashMap<PublicIdentity, u64> =
                         keys.iter().copied().collect();
+                    // (approved, blocked) before the merge.
+                    let trust_before: std::collections::HashMap<PublicIdentity, (bool, bool)> =
+                        lock(&self.shared.contacts)
+                            .iter()
+                            .map(|c| (c.key, (c.local_approved, c.blocked)))
+                            .collect();
                     let keys: Vec<PublicIdentity> = keys.into_iter().map(|(k, _)| k).collect();
                     let before: Vec<(PublicIdentity, ConversationId)> = keys
                         .into_iter()
@@ -370,8 +376,29 @@ impl Node {
                             .collect()
                     };
                     for (k, conv) in left {
+                        self.withdraw_approval(&k);
                         self.disconnect(&k);
                         let _ = self.shared.home.delete_history(conv);
+                    }
+                    // Contacts revoked or blocked on our other device lose
+                    // their tunnel here too, and blocked ones their session.
+                    let withdrawn: Vec<(PublicIdentity, bool)> = lock(&self.shared.contacts)
+                        .iter()
+                        .filter_map(|c| {
+                            let (approved, blocked) = *trust_before.get(&c.key)?;
+                            let newly_blocked = c.blocked && !blocked;
+                            (newly_blocked || (approved && !c.local_approved))
+                                .then_some((c.key, newly_blocked))
+                        })
+                        .collect();
+                    if !withdrawn.is_empty() {
+                        for (k, newly_blocked) in withdrawn {
+                            self.withdraw_approval(&k);
+                            if newly_blocked {
+                                self.disconnect(&k);
+                            }
+                        }
+                        self.enforce_policy();
                     }
                     // Chats cleared on our other device.
                     let cleared: Vec<(PublicIdentity, u64)> = lock(&self.shared.contacts)
