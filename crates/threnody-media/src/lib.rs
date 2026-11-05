@@ -7,8 +7,10 @@
 
 pub mod call;
 pub mod driver;
+pub mod group;
 pub mod rtc;
 pub mod turn;
 
 pub use call::CallMedia;
 pub use driver::{Driver, MediaState};
+pub use group::GroupMedia;

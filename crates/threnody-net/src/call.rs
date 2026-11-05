@@ -563,6 +563,8 @@ impl Node {
                         call: id,
                         data,
                     });
+                } else {
+                    self.on_leg_signal(peer, id, data);
                 }
             }
             CallMsg::Reaction { emoji, .. } => {

@@ -133,6 +133,35 @@ pub struct Wires {
     pub media: Box<dyn Fn(u8, Vec<u8>) + Send + Sync>,
 }
 
+/// How a media session sends video.
+pub struct VideoOut {
+    /// Where our camera's frames go: a session's own, or one shared by
+    /// all the legs of a group call (one frame feeds every leg).
+    pub source: NativeVideoSource,
+    /// The most each session's video sends, in bits a second.
+    pub max_bitrate: u64,
+}
+
+impl Default for VideoOut {
+    fn default() -> Self {
+        Self {
+            source: video_source(),
+            max_bitrate: VIDEO_MAX_BITRATE,
+        }
+    }
+}
+
+/// A video source at the negotiated resolution.
+pub fn video_source() -> NativeVideoSource {
+    NativeVideoSource::new(
+        VideoResolution {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+        },
+        false,
+    )
+}
+
 /// What we send as audio.
 pub enum AudioIn {
     /// The platform's microphone (and its playout for what we receive),
@@ -156,6 +185,7 @@ pub struct MediaSession {
     /// Our camera's frames go here (see [`MediaSession::send_video`]).
     video: NativeVideoSource,
     video_track: MediaStreamTrack,
+    video_sender: RtpSender,
 }
 
 impl MediaSession {
@@ -164,6 +194,26 @@ impl MediaSession {
     pub async fn start(
         caller: bool,
         audio: AudioIn,
+        wires: Wires,
+        on_track: impl FnMut(TrackEvent) + Send + Sync + 'static,
+        on_state: impl FnMut(PeerConnectionState) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::start_with(
+            caller,
+            audio,
+            VideoOut::default(),
+            wires,
+            on_track,
+            on_state,
+        )
+        .await
+    }
+
+    /// [`MediaSession::start`], sending video as `video` says.
+    pub async fn start_with(
+        caller: bool,
+        audio: AudioIn,
+        video: VideoOut,
         wires: Wires,
         on_track: impl FnMut(TrackEvent) + Send + Sync + 'static,
         on_state: impl FnMut(PeerConnectionState) + Send + Sync + 'static,
@@ -209,21 +259,19 @@ impl MediaSession {
         // Video is negotiated from the start, off until the camera turns
         // on: turning it on then needs no new offer (and no glare when both
         // sides do it at once).
-        let video = NativeVideoSource::new(
-            VideoResolution {
-                width: VIDEO_WIDTH,
-                height: VIDEO_HEIGHT,
-            },
-            false,
-        );
+        let VideoOut {
+            source: video,
+            max_bitrate,
+        } = video;
         let video_track =
             MediaStreamTrack::Video(factory().create_video_track("video", video.clone()));
         video_track.set_enabled(false);
         let sender = pc
             .add_track(video_track.clone(), &["call"])
             .map_err(|e| anyhow!("video track: {e:?}"))?;
-        limit_video(&sender);
+        limit_video(&sender, max_bitrate);
         let mut session = Self {
+            video_sender: sender,
             pc,
             from_peer,
             early: Mutex::new(Vec::new()),
@@ -354,15 +402,13 @@ impl MediaSession {
     /// One camera frame (I420), turned `rotation` degrees clockwise to be
     /// upright.
     pub fn send_video(&self, frame: &I420Buffer, rotation: u32) {
-        let rotation = match rotation {
-            90 => VideoRotation::VideoRotation90,
-            180 => VideoRotation::VideoRotation180,
-            270 => VideoRotation::VideoRotation270,
-            _ => VideoRotation::VideoRotation0,
-        };
-        let mut f = VideoFrame::new(rotation, frame);
-        f.timestamp_us = time_us();
-        self.video.capture_frame(&f);
+        capture(&self.video, frame, rotation);
+    }
+
+    /// Caps what our video sends, in bits a second (a group call shares
+    /// the uplink among its legs).
+    pub fn set_video_bitrate(&self, max: u64) {
+        limit_video(&self.video_sender, max);
     }
 
     pub fn state(&self) -> PeerConnectionState {
@@ -390,15 +436,29 @@ impl Drop for MediaSession {
     }
 }
 
-/// Caps the video sender's bitrate (see [`VIDEO_MAX_BITRATE`]); under
-/// pressure it gives up some resolution and some frame rate.
-fn limit_video(sender: &RtpSender) {
+/// Feeds one camera frame (I420), turned `rotation` degrees clockwise to
+/// be upright, to `source`.
+pub fn capture(source: &NativeVideoSource, frame: &I420Buffer, rotation: u32) {
+    let rotation = match rotation {
+        90 => VideoRotation::VideoRotation90,
+        180 => VideoRotation::VideoRotation180,
+        270 => VideoRotation::VideoRotation270,
+        _ => VideoRotation::VideoRotation0,
+    };
+    let mut f = VideoFrame::new(rotation, frame);
+    f.timestamp_us = time_us();
+    source.capture_frame(&f);
+}
+
+/// Caps the video sender's bitrate at `max` (see [`VIDEO_MAX_BITRATE`]);
+/// under pressure it gives up some resolution and some frame rate.
+fn limit_video(sender: &RtpSender, max: u64) {
     let mut p = sender.parameters();
     if p.encodings.is_empty() {
         p.encodings.push(RtpEncodingParameters::default());
     }
     for e in &mut p.encodings {
-        e.max_bitrate = Some(VIDEO_MAX_BITRATE);
+        e.max_bitrate = Some(max);
         e.max_framerate = Some(30.0);
     }
     p.set_degradation_preference(DegradationPreference::Balanced);

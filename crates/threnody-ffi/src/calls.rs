@@ -180,10 +180,21 @@ impl ThrenodyNode {
         let _ = on;
     }
 
-    /// Mutes or unmutes our microphone in the current call.
+    /// Mutes or unmutes our microphone in the current call, one-to-one or
+    /// group.
     pub fn set_call_muted(&self, muted: bool) {
         #[cfg(feature = "calls")]
-        self.media.set_muted(muted);
+        {
+            self.media.set_muted(muted);
+            if let Some(m) = self
+                .group_media
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                m.set_muted(muted);
+            }
+        }
         #[cfg(not(feature = "calls"))]
         let _ = muted;
     }
@@ -211,7 +222,21 @@ impl ThrenodyNode {
     /// it in (or the frame is the wrong size).
     pub fn send_video_frame(&self, width: u32, height: u32, rotation: u32, i420: Vec<u8>) -> bool {
         #[cfg(feature = "calls")]
-        return self.media.send_video(width, height, rotation, &i420);
+        {
+            let group = self
+                .group_media
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(m) = group {
+                let Some(b) = threnody_media::driver::i420_buffer(width, height, &i420) else {
+                    return false;
+                };
+                m.send_video(&b, rotation);
+                return true;
+            }
+            self.media.send_video(width, height, rotation, &i420)
+        }
         #[cfg(not(feature = "calls"))]
         {
             let _ = (width, height, rotation, i420);

@@ -334,6 +334,48 @@ impl Node {
         }
     }
 
+    /// Sends the media layer's signalling for our leg with `peer` over our
+    /// own session with it (in the ratchet, as `CallMsg::Signal` under the
+    /// leg's id). False when there's no session: the group layer sends it
+    /// in a group message instead (`GroupCallMsg::Leg`), never the hub.
+    pub fn send_leg_signal(&self, call: u64, peer: &PublicIdentity, data: Vec<u8>) -> bool {
+        let leg = {
+            let gc = lock(&self.shared.group_calls);
+            match gc
+                .current
+                .as_ref()
+                .filter(|c| c.info.call == call && c.info.joined)
+                .and_then(|c| c.legs.get(peer))
+            {
+                Some(l) => l.keys.call(),
+                None => return false,
+            }
+        };
+        let Ok(m) = (call::CallMsg::Signal { call: leg, data }).encode() else {
+            return false;
+        };
+        self.connected(peer) && self.send_tracked(peer, AppMessage::Call(m)).is_ok()
+    }
+
+    /// `CallMsg::Signal` from `peer` under leg id `leg`: our leg's, if we
+    /// have one with `peer`; reported as [`Event::GroupLegSignal`].
+    pub(crate) fn on_leg_signal(&self, peer: PublicIdentity, leg: u64, data: Vec<u8>) {
+        let call = {
+            let gc = lock(&self.shared.group_calls);
+            match gc.current.as_ref().filter(|c| {
+                c.info.joined && c.legs.get(&peer).is_some_and(|l| l.keys.call() == leg)
+            }) {
+                Some(c) => c.info.call,
+                None => return,
+            }
+        };
+        self.emit(Event::GroupLegSignal {
+            call,
+            from: peer,
+            data,
+        });
+    }
+
     /// Takes the stream of received media on our leg with `peer` in call
     /// `call`: `(stream, payload)`. Only the first caller gets it.
     pub fn group_leg_media(

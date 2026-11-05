@@ -297,18 +297,22 @@ pub fn valid_reaction(emoji: &str) -> bool {
 ///
 /// ```text
 /// GroupCallMsg = { 0: op, 1: call uint, ? 2: device bstr(32), ? 3: flags uint,
-///                  ? 4: data bstr }
-/// op: 1 start (device = hub, flags), 2 join (flags), 3 leave,
+///                  ? 4: data bstr, ? 5: secret bstr(32) }
+/// op: 1 start (device = hub, flags, secret), 2 join (flags), 3 leave,
 ///     4 leg (device = to, data), 5 hub (device = new hub), 6 update (flags)
 /// flags: 1 = video
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum GroupCallMsg {
-    /// The sender started call `call`, relayed through `hub`.
+    /// The sender started call `call`, relayed through `hub`. `secret`
+    /// keys its legs ([`MediaKeys::for_leg`]): it goes only inside the
+    /// group's encryption, and isn't tied to the group's epoch, so members
+    /// at another epoch still agree on it.
     Start {
         call: u64,
         hub: [u8; 32],
         video: bool,
+        secret: [u8; 32],
     },
     Join {
         call: u64,
@@ -336,6 +340,20 @@ pub enum GroupCallMsg {
     },
 }
 
+impl std::fmt::Debug for GroupCallMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never log the secret, nor the leg's session descriptions.
+        match self {
+            Self::Start { call, video, .. } => write!(f, "Start({call:x}, video={video})"),
+            Self::Join { call, video } => write!(f, "Join({call:x}, video={video})"),
+            Self::Leave { call } => write!(f, "Leave({call:x})"),
+            Self::Leg { call, data, .. } => write!(f, "Leg({call:x}, {} bytes)", data.len()),
+            Self::Hub { call, .. } => write!(f, "Hub({call:x})"),
+            Self::Update { call, video } => write!(f, "Update({call:x}, video={video})"),
+        }
+    }
+}
+
 impl GroupCallMsg {
     pub fn call(&self) -> u64 {
         match self {
@@ -356,9 +374,15 @@ impl GroupCallMsg {
         };
         cbor::to_vec(size, |e| {
             match self {
-                Self::Start { call, hub, video } => {
-                    e.map_len(4)?.u8(0)?.u8(1)?.u8(1)?.u64(*call)?;
+                Self::Start {
+                    call,
+                    hub,
+                    video,
+                    secret,
+                } => {
+                    e.map_len(5)?.u8(0)?.u8(1)?.u8(1)?.u64(*call)?;
                     e.u8(2)?.bytes(hub)?.u8(3)?.u64(flags(*video))?;
+                    e.u8(5)?.bytes(secret)?;
                 }
                 Self::Join { call, video } => {
                     e.map_len(3)?.u8(0)?.u8(2)?.u8(1)?.u64(*call)?;
@@ -387,6 +411,7 @@ impl GroupCallMsg {
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut op, mut call, mut device, mut flags, mut data) = (None, None, None, 0, None);
+        let mut secret = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => op = Some(d.u8()?),
@@ -394,6 +419,7 @@ impl GroupCallMsg {
                 2 => device = Some(fixed_bytes::<32>(d)?),
                 3 => flags = d.u64()?,
                 4 => data = Some(d.bytes()?.to_vec()),
+                5 => secret = Some(fixed_bytes::<32>(d)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -410,6 +436,7 @@ impl GroupCallMsg {
                 call,
                 hub: device()?,
                 video,
+                secret: required(secret, "group call secret")?,
             },
             2 => Self::Join { call, video },
             3 => Self::Leave { call },
@@ -728,6 +755,7 @@ mod tests {
                 call: 5,
                 hub: [1; 32],
                 video: true,
+                secret: [4; 32],
             },
             GroupCallMsg::Join {
                 call: 5,

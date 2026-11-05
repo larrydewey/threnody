@@ -308,6 +308,14 @@ pub enum Event {
         device: PublicIdentity,
         video: bool,
     },
+    /// Signalling for the media layer on our leg with `from` in group call
+    /// `call` (sent with [`Node::send_leg_signal`], or arriving in a group
+    /// message).
+    GroupLegSignal {
+        call: u64,
+        from: PublicIdentity,
+        data: Vec<u8>,
+    },
     /// We left group call `call`, or it stopped ringing here.
     GroupCallEnded {
         group: [u8; 16],

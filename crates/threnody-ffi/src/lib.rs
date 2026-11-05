@@ -24,6 +24,7 @@ mod folders;
 mod lists;
 pub use folders::{ChatUnread, FolderInfo, QuietSlotInfo};
 pub use lists::{ListInfo, ListItemInfo};
+mod groupcalls;
 mod groups;
 mod persona;
 mod push;
@@ -35,6 +36,7 @@ pub use volunteer::{
 };
 
 pub use calls::{CallRecord, CallStats, VideoFrame};
+pub use groupcalls::{GroupCallParticipant, GroupCallRecord, GroupVideoFrame};
 pub use groups::{GroupInfo, GroupInvite};
 use threnody_groups::node::GroupNode;
 
@@ -497,6 +499,32 @@ pub enum NodeEvent {
         reason: String,
         by_us: bool,
     },
+    /// `from` started a call in `group`, or is in one: it rings here
+    /// (`join_group_call`, or `leave_group_call` to stop it).
+    GroupCallRinging {
+        group: String,
+        call: u64,
+        from: String,
+    },
+    /// `device` joined or left the group call.
+    GroupCallMember {
+        group: String,
+        call: u64,
+        device: String,
+        joined: bool,
+    },
+    /// `device` turned its video on or off in the group call.
+    GroupCallVideo {
+        group: String,
+        call: u64,
+        device: String,
+        video: bool,
+    },
+    /// We left the group call, or it stopped ringing here.
+    GroupCallEnded {
+        group: String,
+        call: u64,
+    },
     Connected {
         peer: String,
         via: Option<String>,
@@ -794,7 +822,13 @@ pub struct ThrenodyNode {
     rt: Runtime,
     node: Node,
     events: Mutex<UnboundedReceiver<Event>>,
-    groups: Mutex<GroupNode>,
+    groups: Arc<Mutex<GroupNode>>,
+    /// The group call's media (see `groupcalls`).
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    group_media: groupcalls::GroupMedia,
+    /// Leg signalling from the group call's media, sent in order.
+    #[cfg_attr(not(feature = "calls"), allow(dead_code))]
+    leg_signals: groupcalls::LegSignals,
     /// Events produced while handling another (group traffic, call
     /// media), not yet returned.
     queued: Arc<Mutex<VecDeque<NodeEvent>>>,
@@ -938,6 +972,9 @@ fn text_of(msg: &AppMessage) -> Option<String> {
 }
 
 fn convert(e: Event) -> NodeEvent {
+    if let Some(g) = groupcalls::convert(&e) {
+        return g;
+    }
     match e {
         Event::Connected { peer, via, .. } => NodeEvent::Connected {
             peer: fp(&peer),
@@ -1289,11 +1326,31 @@ impl ThrenodyNode {
             let _guard = rt.enter();
             calls::media(&node, queued.clone())
         };
+        let groups = Arc::new(Mutex::new(groups));
+        // The group call's leg signalling goes out in the order the media
+        // made it (an offer before its candidates).
+        let (leg_signals, mut legs) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let (node, groups) = (node.clone(), groups.clone());
+            rt.spawn(async move {
+                while let Some((call, peer, data)) = legs.recv().await {
+                    let _ = groups
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .send_call_leg(&node, call, &peer, data);
+                }
+            });
+        }
         Ok(Arc::new(Self {
             rt,
             node,
             events: Mutex::new(events),
-            groups: Mutex::new(groups),
+            groups,
+            #[cfg(feature = "calls")]
+            group_media: Mutex::new(None),
+            #[cfg(not(feature = "calls"))]
+            group_media: (),
+            leg_signals,
             queued,
             media,
             #[cfg(all(feature = "boringtun", unix))]
@@ -2482,6 +2539,9 @@ impl ThrenodyNode {
                 // Media-layer signalling (SDP, ICE) is for the call's
                 // media only, and never reaches the app or its logs.
                 ref e @ Event::CallSignal { .. } => self.call_event(e),
+                Event::GroupLegSignal { call, from, data } => {
+                    self.group_leg_signal(call, from, data)
+                }
                 other => {
                     match &other {
                         Event::Connected { peer, .. } => self.group_connected(peer),
@@ -2498,6 +2558,7 @@ impl ThrenodyNode {
                         _ => {}
                     }
                     self.call_event(&other);
+                    self.group_call_event(&other);
                     return Some(convert(other));
                 }
             }
@@ -3201,6 +3262,121 @@ mod tests {
             }
             panic!("event did not arrive");
         }
+    }
+
+    /// A group call through the apps' API: it rings, both members join,
+    /// every leg's media connects (Bob and Carol's through Alice, the
+    /// hub), and video reaches each participant from both others.
+    #[cfg(feature = "calls")]
+    #[test]
+    fn group_calls_ring_join_and_carry_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            node.set_cover_traffic(None);
+            node.set_call_devices(false);
+            node
+        };
+        let (alice, bob, carol) = (open("a"), open("b"), open("c"));
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let a_fp = alice.device_fingerprint();
+        for n in [&bob, &carol] {
+            n.connect(alice.invite_link(addr.clone())).unwrap();
+        }
+        let mut all = Pump::new(&[&*alice, &*bob, &*carol]);
+        let (b_fp, c_fp) = (bob.device_fingerprint(), carol.device_fingerprint());
+        all.until(
+            0,
+            |e| matches!(e, NodeEvent::Connected { peer, .. } if *peer == c_fp),
+        );
+        for (i, (n, f)) in [(&bob, &b_fp), (&carol, &c_fp)].into_iter().enumerate() {
+            alice.set_approval(f.clone(), true).unwrap();
+            n.set_approval(a_fp.clone(), true).unwrap();
+            all.until(i + 1, |e| {
+                matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+            });
+        }
+        let g = alice.create_group("band".into()).unwrap();
+        for f in [&b_fp, &c_fp] {
+            alice.invite_to_group(g.clone(), f.clone()).unwrap();
+        }
+        all.until(1, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+        all.until(2, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+        alice.send_group_text(g.clone(), "ready?".into()).unwrap();
+        for i in [1, 2] {
+            all.until(i, |e| matches!(e, NodeEvent::GroupMessage { .. }));
+        }
+
+        let call = alice.start_group_call(g.clone(), true).unwrap();
+        for i in [1, 2] {
+            let r = all.until(i, |e| matches!(e, NodeEvent::GroupCallRinging { .. }));
+            assert_eq!(
+                r,
+                NodeEvent::GroupCallRinging {
+                    group: g.clone(),
+                    call,
+                    from: a_fp.clone()
+                }
+            );
+        }
+        bob.join_group_call(call, true).unwrap();
+        all.until(2, |e| {
+            matches!(e, NodeEvent::GroupCallMember { joined: true, .. })
+        });
+        carol.join_group_call(call, true).unwrap();
+        for i in [0, 1] {
+            all.until(i, |e| {
+                matches!(e, NodeEvent::GroupCallMember { device, joined: true, .. } if *device == c_fp)
+            });
+        }
+        // Each side's legs connect: two for everyone.
+        for i in 0..3 {
+            for _ in 0..2 {
+                all.until(
+                    i,
+                    |e| matches!(e, NodeEvent::CallMedia { state, .. } if state == "connected"),
+                );
+            }
+        }
+        for n in [&alice, &bob, &carol] {
+            let c = n.current_group_call().unwrap();
+            assert!(c.joined && c.participants.len() == 2 && c.hub == a_fp);
+        }
+
+        // Everyone's camera; everyone sees both others.
+        let (w, h) = (160u32, 120u32);
+        let i420 = vec![128u8; (w * h + 2 * (w / 2) * (h / 2)) as usize];
+        let fps = [&a_fp, &b_fp, &c_fp];
+        for (i, n) in [&alice, &bob, &carol].into_iter().enumerate() {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..300 {
+                for m in [&alice, &bob, &carol] {
+                    m.send_video_frame(w, h, 0, i420.clone());
+                }
+                if let Some(f) = n.next_group_video_frame(30) {
+                    seen.insert(f.device);
+                }
+                if seen.len() == 2 {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), 2, "participant {i} saw {seen:?}");
+            assert!(!seen.contains(fps[i]));
+        }
+
+        // Alice (the hub) leaves: Bob and Carol carry on with a new hub.
+        alice.leave_group_call();
+        all.until(0, |e| matches!(e, NodeEvent::GroupCallEnded { .. }));
+        for i in [1, 2] {
+            all.until(i, |e| {
+                matches!(e, NodeEvent::GroupCallMember { device, joined: false, .. } if *device == a_fp)
+            });
+        }
+        assert!(alice.current_group_call().is_none());
+        let hub = bob.current_group_call().unwrap().hub;
+        assert!(hub == b_fp || hub == c_fp);
+        assert_eq!(carol.current_group_call().unwrap().hub, hub);
     }
 
     #[test]
