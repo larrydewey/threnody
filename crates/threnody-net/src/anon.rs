@@ -33,6 +33,9 @@ const MAX_PER_ADDRESS: usize = 16;
 /// An outbound link nothing has used for this long is closed.
 const IDLE: Duration = Duration::from_secs(120);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Messages waiting for cover ticks on one link, at most: a link this far
+/// behind is useless, and whoever is filling it is closed off.
+const MAX_QUEUED: usize = 4096;
 
 struct Handle {
     id: u64,
@@ -123,6 +126,30 @@ impl Node {
     /// Where the far end of an anonymous link is (for per-address limits).
     pub(crate) fn anon_addr(&self, to: &PublicIdentity) -> Option<SocketAddr> {
         lock(&self.shared.anon).links.get(to).map(|h| h.addr)
+    }
+
+    /// Tests only: an inbound anonymous link from `peer` at `addr` whose
+    /// outgoing messages land in the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn fake_anon_link(
+        &self,
+        peer: PublicIdentity,
+        addr: SocketAddr,
+    ) -> mpsc::UnboundedReceiver<AppMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut st = lock(&self.shared.anon);
+        st.next_id += 1;
+        let id = st.next_id;
+        st.links.insert(
+            peer,
+            Handle {
+                id,
+                tx,
+                addr,
+                outbound: false,
+            },
+        );
+        rx
     }
 
     /// Number of anonymous links open (both directions).
@@ -235,6 +262,9 @@ where
                     }
                 }
                 out = outbox.recv() => match out {
+                    Some(_) if pending.len() >= MAX_QUEUED => {
+                        return Err(NetError::Refused("anonymous link too far behind".into()));
+                    }
                     Some(m) => {
                         last_use = tokio::time::Instant::now();
                         pending.push_back(m);

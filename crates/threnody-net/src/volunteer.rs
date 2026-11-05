@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map};
@@ -110,6 +110,9 @@ pub(crate) struct VolunteerState {
     subs: Mutex<Vec<Subscription>>,
     wallet: Mutex<Wallet>,
     pending: Mutex<HashMap<u64, (PublicIdentity, oneshot::Sender<DirMsg>)>>,
+    /// Per anonymous link: start of the current minute and directory
+    /// requests in it.
+    requests: Mutex<HashMap<PublicIdentity, (Instant, u32)>>,
     /// Our relay descriptor's addresses while volunteering.
     relay: Mutex<Option<Vec<String>>>,
     /// Token pseudonyms seen, by epoch (each opens one circuit). Saved, so
@@ -141,6 +144,7 @@ impl VolunteerState {
             subs: Mutex::new(Vec::new()),
             wallet: Mutex::new(Wallet::default()),
             pending: Mutex::new(HashMap::new()),
+            requests: Mutex::new(HashMap::new()),
             relay: Mutex::new(None),
             seen: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
@@ -151,6 +155,10 @@ impl VolunteerState {
         }
     }
 }
+
+/// Directory requests answered per anonymous link per minute: every
+/// answer queues for the link's cover ticks, so more would pile up.
+const MAX_DIRECTORY_REQUESTS_PER_MINUTE: u32 = 12;
 
 /// The part of an address that limits issuance: a /24 or a /56.
 pub(crate) fn network(ip: IpAddr) -> [u8; 16] {
@@ -979,7 +987,9 @@ impl Node {
             | DirMsg::GetDocument { .. }
             | DirMsg::TokenRequest { .. }
             | DirMsg::Register { .. } => {
-                self.serve_request(peer, msg);
+                if self.directory_request_allowed(peer) {
+                    self.serve_request(peer, msg);
+                }
             }
             answer => {
                 let mut pending = lock(&self.vol().pending);
@@ -992,12 +1002,27 @@ impl Node {
         }
     }
 
+    /// Whether another request from the link to `peer` is answered this
+    /// minute. Beyond that they are dropped: each answer would wait for
+    /// the link's cover ticks, and the queue would grow without end.
+    fn directory_request_allowed(&self, peer: PublicIdentity) -> bool {
+        let now = Instant::now();
+        let mut rate = lock(&self.vol().requests);
+        let (start, n) = rate.entry(peer).or_insert((now, 0));
+        if now.duration_since(*start) >= Duration::from_secs(60) {
+            (*start, *n) = (now, 0);
+        }
+        *n += 1;
+        *n <= MAX_DIRECTORY_REQUESTS_PER_MINUTE
+    }
+
     pub(crate) fn dir_busy(&self, peer: &PublicIdentity) -> bool {
         lock(&self.vol().pending).values().any(|(p, _)| p == peer)
     }
 
     pub(crate) fn dir_link_closed(&self, peer: &PublicIdentity) {
         lock(&self.vol().pending).retain(|_, (p, _)| p != peer);
+        lock(&self.vol().requests).remove(peer);
     }
 }
 
@@ -1196,6 +1221,40 @@ mod tests {
         let v6a: IpAddr = "2001:db8:1:2:3::1".parse().unwrap();
         let v6b: IpAddr = "2001:db8:1:2:4::1".parse().unwrap();
         assert_eq!(network(v6a), network(v6b));
+    }
+
+    #[tokio::test]
+    async fn one_link_gets_only_so_many_directory_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = threnody_core::store::Home::new(dir.path().join("d"));
+        let identity = home.create_identity(None).unwrap();
+        let (d, _rx) = Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        d.serve_directory("127.0.0.1:7450", false).unwrap();
+        let ask = |id| DirMsg::GetKey { id }.encode().unwrap();
+        let stranger = threnody_core::Identity::generate().public();
+        let mut out = d.fake_anon_link(stranger, "192.0.2.1:1".parse().unwrap());
+        // Each answer is kilobytes and waits for a cover tick: a stream of
+        // tiny requests must not pile them up without end.
+        for id in 0..200 {
+            d.on_directory(stranger, &ask(id));
+        }
+        let mut answers = 0;
+        while out.try_recv().is_ok() {
+            answers += 1;
+        }
+        assert_eq!(answers, MAX_DIRECTORY_REQUESTS_PER_MINUTE as usize);
+        // Another link has its own allowance.
+        let other = threnody_core::Identity::generate().public();
+        let mut out = d.fake_anon_link(other, "198.51.100.1:1".parse().unwrap());
+        d.on_directory(other, &ask(1000));
+        assert!(out.try_recv().is_ok());
     }
 
     #[tokio::test]
