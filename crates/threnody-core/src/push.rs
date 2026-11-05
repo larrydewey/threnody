@@ -35,8 +35,10 @@ pub struct WebPushKeys {
 /// Where and how to wake a device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushTarget {
-    /// The UnifiedPush (Web Push) endpoint: `https://`, or `http://` to a
-    /// loopback address (tests, a distributor on the same machine).
+    /// The UnifiedPush (Web Push) endpoint: `https://` to a public host.
+    /// The contact, not the device, sends to it, so nothing local to the
+    /// device (loopback, private networks) makes sense, and it would point
+    /// the contact at its own network.
     pub url: String,
     pub keys: Option<WebPushKeys>,
     /// Cover wake-ups per day the contact sends, at random times.
@@ -50,10 +52,16 @@ pub struct PushTarget {
 pub struct PushReg(pub Option<PushTarget>);
 
 impl PushTarget {
-    /// Checks the URL: `https://` with a host, or `http://` to loopback;
+    /// Checks the URL: `https://` to a public host (see [`valid_url`]);
     /// no user info, no whitespace, at most [`MAX_URL`] bytes.
     pub fn validate(&self) -> Result<()> {
-        valid_url(&self.url)?;
+        self.validate_with(false)
+    }
+
+    /// [`PushTarget::validate`], also taking loopback endpoints (plain
+    /// `http://` too) with `loopback`: for tests on one machine only.
+    pub fn validate_with(&self, loopback: bool) -> Result<()> {
+        valid_url_with(&self.url, loopback)?;
         if self.dummies_per_day > MAX_DUMMIES_PER_DAY {
             return Err(Error::Malformed("push dummies"));
         }
@@ -66,37 +74,103 @@ impl PushTarget {
     }
 }
 
-/// The URL's scheme, host and port check of [`PushTarget::validate`].
+/// The URL's scheme and host check of [`PushTarget::validate`]: `https://`
+/// to a public host. Not an address on loopback, a private network,
+/// link-local or otherwise not routed on the internet, nor `localhost`, a
+/// single-label name (which resolve on the local network) or a name with a
+/// trailing dot. Hosts are
+/// read as an HTTP client reads them, so `https://2130706433/` is
+/// 127.0.0.1. A name that resolves to such an address is the sender's to
+/// refuse when it connects.
 pub fn valid_url(url: &str) -> Result<()> {
+    valid_url_with(url, false)
+}
+
+/// [`valid_url`], also taking loopback hosts, over plain `http://` too,
+/// with `loopback`: for tests on one machine only.
+pub fn valid_url_with(url: &str, loopback: bool) -> Result<()> {
     let bad = Error::Malformed("push endpoint");
     if url.len() > MAX_URL || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(bad);
     }
-    let (secure, rest) = if let Some(r) = url.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (false, r)
-    } else {
-        return Err(bad);
-    };
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or(Error::Malformed("push endpoint"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
         return Err(bad);
     }
-    if !secure {
-        let host = match authority.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or(""),
-            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
-        };
-        let loopback = host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        if !loopback {
-            return Err(bad);
-        }
+    let parsed = reqwest::Url::parse(url).map_err(|_| Error::Malformed("push endpoint"))?;
+    let host = parsed.host_str().unwrap_or("");
+    let ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .ok();
+    let local = match ip {
+        Some(ip) => ip.is_loopback(),
+        None => host == "localhost" || host.ends_with(".localhost"),
+    };
+    if loopback && local {
+        return Ok(());
+    }
+    let public = match ip {
+        Some(ip) => public_ip(&ip),
+        None => !local && host.contains('.') && !host.ends_with('.'),
+    };
+    if parsed.scheme() != "https" || !public {
+        return Err(bad);
     }
     Ok(())
+}
+
+/// Whether `ip` is routed on the public internet: not loopback, private,
+/// shared (CGNAT), link-local, unspecified, broadcast, multicast,
+/// documentation, benchmarking or reserved space, including IPv4 addresses
+/// embedded in IPv6 ones.
+pub fn public_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && b & 0xc0 == 64)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && b & 0xfe == 18))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embedded = |o: [u16; 2]| {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    (o[0] >> 8) as u8,
+                    o[0] as u8,
+                    (o[1] >> 8) as u8,
+                    o[1] as u8,
+                ))
+            };
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return public_ip(&std::net::IpAddr::V4(v4));
+            }
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) carry IPv4 ones.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return public_ip(&embedded([seg[6], seg[7]]));
+            }
+            if seg[0] == 0x2002 {
+                return public_ip(&embedded([seg[1], seg[2]]));
+            }
+            // Global unicast (2000::/3), less documentation (2001:db8::/32).
+            seg[0] & 0xe000 == 0x2000 && !(seg[0] == 0x2001 && seg[1] == 0x0db8)
+        }
+    }
 }
 
 impl PushReg {
@@ -121,6 +195,12 @@ impl PushReg {
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
+        Self::decode_with(b, false)
+    }
+
+    /// [`PushReg::decode`], also taking loopback endpoints with
+    /// `loopback` (see [`PushTarget::validate_with`]).
+    pub fn decode_with(b: &[u8], loopback: bool) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut url, mut p256dh, mut auth, mut dummies, mut expires) = (None, None, None, 0, 0);
         read_map(&mut dec, |k, d| {
@@ -152,7 +232,7 @@ impl PushReg {
             dummies_per_day: dummies,
             expires_ms: expires,
         };
-        t.validate()?;
+        t.validate_with(loopback)?;
         Ok(Self(Some(t)))
     }
 }
@@ -190,10 +270,8 @@ mod tests {
     fn urls_are_checked() {
         for ok in [
             "https://ntfy.sh/upAbC",
-            "https://[2001:db8::1]:8443/x",
-            "http://127.0.0.1:9/x",
-            "http://localhost/x",
-            "http://[::1]:80/",
+            "https://[2606:4700::1111]:8443/x",
+            "https://1.1.1.1/x?y=1",
         ] {
             assert!(valid_url(ok).is_ok(), "{ok}");
         }
@@ -208,6 +286,44 @@ mod tests {
         ] {
             assert!(valid_url(bad).is_err(), "{bad}");
         }
+        // Nothing on the waker's own machine or network: a contact's URL
+        // is fetched by us.
+        for local in [
+            "http://127.0.0.1:2375/containers/web/kill",
+            "http://localhost/x",
+            "http://[::1]:80/",
+            "https://127.0.0.1/x",
+            "https://localhost:8443/x",
+            "https://api.localhost/x",
+            "https://router/x",
+            "https://localhost./x",
+            "https://10.0.0.1/x",
+            "https://192.168.1.1/admin",
+            "https://172.16.5.4/x",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/x",
+            "https://0.0.0.0/x",
+            "https://[fd00::1]/x",
+            "https://[fe80::1]/x",
+            "https://[::ffff:127.0.0.1]/x",
+            "https://[64:ff9b::a00:1]/x",
+            "https://[2002:c0a8:101::1]/x",
+            "https://[2001:db8::1]/x",
+            "https://2130706433/x",
+            "https://0x7f.1/x",
+            "https://017700000001/x",
+        ] {
+            assert!(valid_url(local).is_err(), "{local}");
+        }
+        // Only tests on one machine take loopback.
+        for test in [
+            "http://127.0.0.1:9/x",
+            "http://localhost/x",
+            "https://[::1]/",
+        ] {
+            assert!(valid_url_with(test, true).is_ok(), "{test}");
+        }
+        assert!(valid_url_with("https://192.168.1.1/x", true).is_err());
         assert!(valid_url(&format!("https://h/{}", "a".repeat(MAX_URL))).is_err());
         let mut t = target();
         t.dummies_per_day = MAX_DUMMIES_PER_DAY + 1;
