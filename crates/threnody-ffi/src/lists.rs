@@ -120,7 +120,10 @@ impl ThrenodyNode {
             return Err(fail("a list needs a name"));
         }
         let _guard = self.rt.enter();
-        Ok(hex(&self.node.create_list(&title)))
+        self.node
+            .create_list(&title)
+            .map(|id| hex(&id))
+            .ok_or_else(|| fail("there are too many lists to start another"))
     }
 
     pub fn rename_list(&self, id: String, title: String) -> Result<()> {

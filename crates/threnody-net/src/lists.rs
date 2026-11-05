@@ -24,6 +24,17 @@ use crate::node::{Event, Node, lock};
 /// Where lists are kept (encrypted).
 pub(crate) const STATE: &str = "lists";
 
+/// How many bytes of stored lists changes from others may fill, of the
+/// [`cbor::MAX_ENCODED`] they can take: the rest is kept for our own.
+const MAX_FROM_OTHERS: usize = 12 << 20;
+/// How many bytes of the lists shared with one chat its changes may fill,
+/// and how many lists it may start here, so that one contact or group
+/// can't take the room of every other.
+const MAX_CHAT_BYTES: usize = 3 << 20;
+const MAX_CHAT_LISTS: usize = 50;
+/// List slots only lists we start may fill.
+const OWN_LISTS: usize = 50;
+
 /// A list with the conversations it's shared with.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SharedList {
@@ -40,6 +51,31 @@ pub(crate) struct Lists {
 }
 
 impl Lists {
+    /// Whether `conv` may start another list here.
+    fn room_for(&self, conv: ConversationId) -> bool {
+        self.lists.len() < MAX_LISTS - OWN_LISTS
+            && self
+                .lists
+                .iter()
+                .filter(|l| l.shared.contains(&conv))
+                .count()
+                < MAX_CHAT_LISTS
+    }
+
+    /// Whether the lists, after a change from `conv`, are within what
+    /// others' changes may fill: in all, and of those shared with `conv`.
+    fn fits_from(&self, conv: ConversationId) -> bool {
+        let (mut all, mut chat) = (0, 0);
+        for l in &self.lists {
+            let n = l.list.encode().map_or(usize::MAX, |b| b.len()) + l.shared.len() * 40 + 8;
+            all += n;
+            if l.shared.contains(&conv) {
+                chat += n;
+            }
+        }
+        all <= MAX_FROM_OTHERS && chat <= MAX_CHAT_BYTES
+    }
+
     pub fn encode(&self) -> threnody_core::Result<Vec<u8>> {
         let parts: Vec<(Vec<u8>, &[ConversationId])> = self
             .lists
@@ -126,8 +162,19 @@ fn sync_payload(l: &SharedList, deleted: bool) -> Option<Vec<u8>> {
 }
 
 impl Node {
-    fn save_lists(&self, l: &Lists) {
-        self.shared.save_state(STATE, l.encode());
+    /// Saves the lists; false if they no longer fit, and then the caller
+    /// undoes its change, so that what we show is what we keep.
+    fn save_lists(&self, l: &Lists) -> bool {
+        match l.encode() {
+            Ok(b) => {
+                self.shared.save_state(STATE, Ok(b));
+                true
+            }
+            Err(e) => {
+                eprintln!("threnody: lists too large to save: {e}");
+                false
+            }
+        }
     }
 
     /// Who changed it: our account, so our devices count as one.
@@ -151,8 +198,9 @@ impl Node {
             .cloned()
     }
 
-    /// Starts a list; returns its id.
-    pub fn create_list(&self, title: &str) -> ListId {
+    /// Starts a list; returns its id, or None if there are too many (or
+    /// they're too large) to keep another.
+    pub fn create_list(&self, title: &str) -> Option<ListId> {
         let id: ListId = threnody_core::crypto::random_bytes();
         let stamp = self.list_stamp();
         let sl = SharedList {
@@ -166,17 +214,24 @@ impl Node {
         };
         {
             let mut ls = lock(&self.shared.lists);
+            if ls.lists.len() >= MAX_LISTS {
+                return None;
+            }
             ls.lists.push(sl.clone());
-            self.save_lists(&ls);
+            if !self.save_lists(&ls) {
+                ls.lists.pop();
+                return None;
+            }
         }
         self.push_list(&sl, false);
-        id
+        Some(id)
     }
 
     /// Changes list `id` with `f` (given the stamp to use); if it changed
     /// anything, keeps it and sends it to our devices and the contacts it's
     /// shared with. Returns the list and the groups it's shared with, which
-    /// the caller sends it to (inside MLS); None if nothing changed.
+    /// the caller sends it to (inside MLS); None if nothing changed, or the
+    /// change would make the lists too large to keep.
     pub fn edit_list(
         &self,
         id: &ListId,
@@ -185,13 +240,16 @@ impl Node {
         let stamp = self.list_stamp();
         let sl = {
             let mut ls = lock(&self.shared.lists);
-            let sl = ls.lists.iter_mut().find(|l| l.list.id == *id)?;
-            if !f(&mut sl.list, stamp) {
+            let k = ls.lists.iter().position(|l| l.list.id == *id)?;
+            let before = ls.lists[k].list.clone();
+            if !f(&mut ls.lists[k].list, stamp) {
                 return None;
             }
-            let sl = sl.clone();
-            self.save_lists(&ls);
-            sl
+            if !self.save_lists(&ls) {
+                ls.lists[k].list = before;
+                return None;
+            }
+            ls.lists[k].clone()
         };
         self.push_list(&sl, false);
         self.send_list_out(&sl, None)
@@ -206,13 +264,15 @@ impl Node {
     ) -> Option<(Vec<u8>, Vec<[u8; 16]>)> {
         let sl = {
             let mut ls = lock(&self.shared.lists);
-            let sl = ls.lists.iter_mut().find(|l| l.list.id == *id)?;
-            if !sl.shared.contains(&conv) {
-                sl.shared.push(conv);
+            let k = ls.lists.iter().position(|l| l.list.id == *id)?;
+            if !ls.lists[k].shared.contains(&conv) {
+                ls.lists[k].shared.push(conv);
+                if !self.save_lists(&ls) {
+                    ls.lists[k].shared.pop();
+                    return None;
+                }
             }
-            let sl = sl.clone();
-            self.save_lists(&ls);
-            sl
+            ls.lists[k].clone()
         };
         self.note_list(conv, *self.identity().as_bytes(), true, &sl.list);
         self.push_list(&sl, false);
@@ -388,21 +448,30 @@ impl Node {
                 }
                 (None, true) => false,
                 (Some(k), false) => {
+                    let before = ls.lists[k].clone();
                     let x = &mut ls.lists[k];
                     let mut c = x.list.merge(&list);
                     if x.shared != shared {
                         x.shared = shared;
                         c = true;
                     }
+                    if c && !self.save_lists(&ls) {
+                        ls.lists[k] = before;
+                        return;
+                    }
                     c
                 }
                 (None, false) if ls.lists.len() < MAX_LISTS => {
                     ls.lists.push(SharedList { list, shared });
+                    if !self.save_lists(&ls) {
+                        ls.lists.pop();
+                        return;
+                    }
                     true
                 }
                 (None, false) => false,
             };
-            if changed {
+            if changed && deleted {
                 self.save_lists(&ls);
             }
             changed
@@ -425,35 +494,41 @@ impl Node {
         let mut list = List::decode(bytes).ok()?;
         list.drop_future(now_ms());
         let id = list.id;
-        let (changed, new) = {
+        // What it changes is kept only within what `conv` may fill (see
+        // `MAX_CHAT_BYTES`), and undone otherwise.
+        let new = {
             let mut ls = lock(&self.shared.lists);
             let at = ls.lists.iter().position(|x| x.list.id == id);
-            let room = ls.lists.len() < MAX_LISTS;
-            let r = match at {
+            match at {
                 // Only from those it's shared with.
                 Some(k) if ls.lists[k].shared.contains(&conv) => {
-                    (ls.lists[k].list.merge(&list), false)
+                    let before = ls.lists[k].list.clone();
+                    if !ls.lists[k].list.merge(&list) {
+                        return None;
+                    }
+                    if !ls.fits_from(conv) || !self.save_lists(&ls) {
+                        ls.lists[k].list = before;
+                        return None;
+                    }
+                    false
                 }
-                Some(_) => (false, false),
-                None if room => {
+                Some(_) => return None,
+                None if ls.room_for(conv) => {
                     ls.lists.push(SharedList {
                         list: list.clone(),
                         shared: vec![conv],
                     });
-                    (true, true)
+                    if !ls.fits_from(conv) || !self.save_lists(&ls) {
+                        ls.lists.pop();
+                        return None;
+                    }
+                    true
                 }
-                None => (false, false),
-            };
-            if r.0 {
-                self.save_lists(&ls);
+                None => return None,
             }
-            r
         };
         if new {
             self.note_list(conv, *from.as_bytes(), false, &list);
-        }
-        if !changed {
-            return None;
         }
         self.emit(Event::ListChanged { id });
         let sl = self.list(&id)?;

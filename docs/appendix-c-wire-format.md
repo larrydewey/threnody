@@ -140,6 +140,8 @@ A list is a checklist that merges rather than being replaced, since everyone who
 
 A list shared with a contact goes to their devices as `AppMessage::List` (`{ 0 => 28, 2 => list }`, tracked, to devices whose `Hello` has bit 4096); one shared with a group goes inside MLS (Appendix F). Receivers merge it if it's shared with that conversation; a list new to them is kept as shared with it, and a history entry there records it (history key 19: the list id). A device that merges something new passes the list on to the other conversations it's shared with, so everyone converges; a merge that changes nothing stops there. Our own devices exchange lists with whom each is shared (Appendix J).
 
+A device keeps at most 200 lists, and what others send only within limits, so that no contact or group can crowd out the rest or make the stored lists too large to save: lists started by others fill at most 150 of the 200, and at most 50 come from any one conversation (counting those shared with it); lists take at most 12 MiB stored after a change from others, and those shared with one conversation at most 3 MiB. A new list or a change past these is ignored. A change of our own that would make the stored lists too large to save is refused, as is starting a 201st list.
+
 ### Photos and files
 
 A file can carry a caption (key 7), a sensitive flag (key 6, bit 1) and an album id (key 8). Files sent together, such as several photos, are sent as separate `File` messages with the same random album id, and the caption travels with the first. Receivers show an album as one message. A sensitive file is shown covered, and is not even decoded until the user opens it. The flag is the sender's request; a receiver can ignore it.
