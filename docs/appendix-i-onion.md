@@ -52,7 +52,7 @@ digest    = BLAKE3-keyed(d, le64(n) || plaintext with digest zeroed)[0..4]
 | 5 | DATA | stream bytes (≤ 2039) |
 | 6 | END | — |
 | 7 | DEPOSIT | `to` (32) ‖ `total_len` (u32 BE) ‖ sealed bytes; the rest follows in DATA (Appendix H) |
-| 8 | DEPOSITED | `status` (1): 0 declined, 1 held, 2 delivered now |
+| 8 | DEPOSITED | `status` (1): 0 declined, 1 held, 2 delivered now (older nodes; now reported as held, see Appendix H) |
 
 The end-to-end Threnody handshake and session (Appendices A and B) run over the byte stream carried in DATA cells, so the destination authenticates A in the usual way.
 

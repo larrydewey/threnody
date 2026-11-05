@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{NetError, Result};
 use crate::handshake;
+use crate::mailbox::DepositStatus;
 use crate::node::{Node, lock};
 
 /// Most circuits one neighbour may hold through us.
@@ -496,7 +497,7 @@ impl Node {
                 .filter(|h| h.born == born && !h.in_use())
                 .map_or((false, false), |h| (true, h.deposit.is_some()));
             if depositing {
-                let declined = crate::mailbox::DepositStatus::Declined as u8;
+                let declined = DepositStatus::Declined as u8;
                 node.onion_reply(up, &Payload::new(Cmd::Deposited, vec![declined]));
             }
             if stalled {
@@ -756,7 +757,7 @@ impl Node {
         if started {
             self.onion_deposit_check(up);
         } else {
-            self.onion_deposited(up, crate::mailbox::DepositStatus::Declined);
+            self.onion_deposited(up, DepositStatus::Declined);
         }
     }
 
@@ -774,14 +775,19 @@ impl Node {
         };
         let Some(d) = done else { return };
         let status = if d.sealed.len() == d.total {
-            self.store_deposit(d.to, d.sealed)
+            // The depositor could be anyone: "delivered now" would tell
+            // them the recipient is online. Held says all they need.
+            match self.store_deposit(d.to, d.sealed) {
+                DepositStatus::Delivered => DepositStatus::Held,
+                s => s,
+            }
         } else {
-            crate::mailbox::DepositStatus::Declined
+            DepositStatus::Declined
         };
         self.onion_deposited(up, status);
     }
 
-    fn onion_deposited(&self, up: Link, status: crate::mailbox::DepositStatus) {
+    fn onion_deposited(&self, up: Link, status: DepositStatus) {
         self.onion_reply(up, &Payload::new(Cmd::Deposited, vec![status as u8]));
         self.onion_destroy(up, true);
     }
@@ -1095,7 +1101,7 @@ impl Node {
         route: &OnionRoute,
         to: &PublicIdentity,
         sealed: &[u8],
-    ) -> Result<crate::mailbox::DepositStatus> {
+    ) -> Result<DepositStatus> {
         let first = route.first;
         let (circ, mut onion, mut rx) = self.build_circuit(route).await?;
         let result = async {
@@ -1130,10 +1136,8 @@ impl Node {
                     if let Ok((h, p)) = onion.unwrap(back)
                         && h == last
                         && p.cmd == Cmd::Deposited
-                        && let Some(status) = p
-                            .data
-                            .first()
-                            .and_then(|b| crate::mailbox::DepositStatus::from_wire(*b))
+                        && let Some(status) =
+                            p.data.first().and_then(|b| DepositStatus::from_wire(*b))
                     {
                         return Ok(status);
                     }
@@ -1156,7 +1160,7 @@ impl Node {
         mailbox: &PublicIdentity,
         to: &PublicIdentity,
         sealed: &[u8],
-    ) -> Result<crate::mailbox::DepositStatus> {
+    ) -> Result<DepositStatus> {
         let mut routes: Vec<OnionRoute> = self
             .onion_paths(mailbox.fingerprint(), &[to.fingerprint()], 2)
             .into_iter()

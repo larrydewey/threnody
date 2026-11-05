@@ -77,7 +77,7 @@ A mailbox that takes a direct deposit learns that A wrote to B. To hide A, the d
 
 1. A picks a path `R1, R2, M`. R1 is a live, mutually approved neighbour, R2 is another mutually approved contact, and neither is M or B.
 2. A builds the circuit and sends `DEPOSIT` to M: `to (32) ‖ total_len (u32 BE) ‖ first bytes`. The rest of the sealed message follows in `DATA` cells.
-3. Once `total_len` bytes have arrived, M holds or delivers the message exactly as it would a direct deposit. It answers `DEPOSITED` with the status byte, then tears the circuit down.
+3. Once `total_len` bytes have arrived, M holds or delivers the message exactly as it would a direct deposit. It answers `DEPOSITED` with the status byte, then tears the circuit down. The status is never "delivered now": M doesn't know who is asking, and that would tell them B is online. A message passed straight on is reported as held.
 
 M only sees R2, so it learns that someone sent something to B, but not who. M declines a `DEPOSIT` if the circuit already carries a stream or another deposit, if `to` isn't M's mutually approved contact, if `total_len` exceeds 16 MiB, or if the neighbour carrying the circuit has already passed 30 anonymous deposits in the current minute. That neighbour is the only party M can hold responsible. Over an anonymous link (Appendix P), where a new identity costs nothing, the neighbour's network (a /24 or a /56) counts instead. M also declines a deposit that would bring the deposits still arriving to more than 64 MiB in all, or more than 16 MiB over anonymous links from one network, and one that isn't complete 120 s after the circuit's `CREATE` (Appendix I).
 
