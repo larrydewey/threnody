@@ -47,6 +47,8 @@ The plaintext is a padded `AppMessage` (Appendix C).
 ### Limits and failure handling
 
 - `MAX_SKIP` is 1000 per chain. At most 2000 skipped keys are kept in total, and the oldest are evicted first.
+- Skipped keys are kept for at most 8 receiving chains. When a ninth chain stores one, every key of the oldest chain is evicted. The receiver tries each of those chains' header keys on every incoming frame, so this bounds that work.
+- An `enc_header` longer than 4096 bytes is rejected as malformed before any header key is tried. A real header is about 2.4 KB.
 - Decryption runs on a copy of the state and commits only if authentication succeeds. A forged or corrupted frame therefore cannot desynchronise the session.
 - Each message key is used once. A replayed message fails with `Replay`.
 - A header key is reused for every message in its chain, so header nonces are random. That is safe for far more than `MAX_SKIP` messages per chain.

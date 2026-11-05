@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use threnody_core::rendezvous;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity};
 use threnody_net::reach::ReachConfig;
@@ -183,6 +184,129 @@ async fn contacts_find_each_other_through_the_dht() {
         unreachable!()
     };
     assert_eq!(msg, text("found you"));
+}
+
+#[tokio::test]
+async fn only_timed_probes_start_a_punch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&b_tcp.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    // Both said in their Hello that they time their probes.
+    let keyed = |n: &Node, p: &threnody_core::PublicIdentity| {
+        let contacts = n.contacts();
+        contacts
+            .get(p)
+            .is_some_and(|c| c.discovery_key.is_some() && c.timed_probes)
+    };
+    timeout(Duration::from_secs(5), async {
+        while !keyed(&bob, &alice.identity()) || !keyed(&alice, &bob_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    alice.disconnect(&bob_id);
+    next(&mut brx, 10, |e| matches!(e, Event::Disconnected { .. })).await;
+
+    let b_quic = bob.listen_quic("127.0.0.1:0").await.unwrap();
+    bob.start_reach(ReachConfig {
+        bootstrap: Some(vec!["127.0.0.1:1".into()]),
+        reflectors: vec![],
+        loopback: true,
+        ..ReachConfig::default()
+    })
+    .unwrap();
+    let d = bob
+        .contacts()
+        .get(&alice.identity())
+        .unwrap()
+        .discovery_key
+        .unwrap();
+    let me = alice.identity();
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let punching = |e: &Event| matches!(e, Event::Punching { peer, .. } if *peer == me);
+
+    // An untimed probe, as anyone who once captured one could replay.
+    sock.send_to(&rendezvous::probe(&d, &me), b_quic)
+        .await
+        .unwrap();
+    let r = timeout(Duration::from_millis(1500), async {
+        while let Some(e) = brx.recv().await {
+            if punching(&e) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(r.is_err(), "an untimed probe started a punch");
+
+    let now = threnody_core::now_ms() / 1000;
+    sock.send_to(&rendezvous::timed_probe(&d, &me, now), b_quic)
+        .await
+        .unwrap();
+    next(&mut brx, 5, punching).await;
+}
+
+#[tokio::test]
+async fn approval_withdrawn_and_restored_keeps_probes_timed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b_tcp = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&b_tcp.to_string(), None).await.unwrap();
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    for rx in [&mut arx, &mut brx] {
+        next(rx, 10, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    let keyed = |n: &Node, p: &threnody_core::PublicIdentity| {
+        let contacts = n.contacts();
+        contacts
+            .get(p)
+            .is_some_and(|c| c.discovery_key.is_some() && c.timed_probes)
+    };
+    let settle = |n: &Node, p| {
+        let (n, p) = (n.clone(), p);
+        async move {
+            timeout(Duration::from_secs(5), async {
+                while !keyed(&n, &p) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(settle(&bob, alice.identity()).await);
+    // Alice withdraws approval and gives it back within one session: Bob
+    // forgets his keys for her and gets a fresh one, but no new Hello.
+    alice.set_approval(&bob_id, false).unwrap();
+    next(&mut brx, 10, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: false, .. })
+    })
+    .await;
+    alice.set_approval(&bob_id, true).unwrap();
+    next(&mut brx, 10, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    assert!(
+        settle(&bob, alice.identity()).await,
+        "Bob went back to untimed probes for Alice"
+    );
 }
 
 #[tokio::test]

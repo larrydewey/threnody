@@ -437,20 +437,13 @@ impl Node {
         let (ours, theirs) = tokio::io::duplex(1 << 20);
         self.bind_endpoint(via, circ, ours);
         let mut stream = theirs;
-        let chan = match handshake::initiate(&mut stream, self.identity_ref()).await {
+        let chan = match handshake::initiate(&mut stream, self.identity_ref(), Some(dest)).await {
             Ok(c) => c,
             Err(e) => {
                 self.close_circuit(via, circ);
                 return Err(e);
             }
         };
-        if chan.peer().fingerprint() != dest {
-            self.close_circuit(via, circ);
-            return Err(NetError::IdentityMismatch {
-                expected: dest.to_string(),
-                got: chan.peer().fingerprint().to_string(),
-            });
-        }
         let peer = *chan.peer();
         self.spawn_relayed_session(stream, chan, via, true);
         Ok(peer)

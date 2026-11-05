@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 use crate::quic::{Quic, canonical};
-use crate::reach::{Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply};
+use crate::reach::{Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply, probes_for};
 
 /// How long the side that didn't move keeps trying after losing a session.
 pub(crate) const RECOVER_FOR: Duration = Duration::from_secs(60);
@@ -831,10 +831,10 @@ impl Node {
             .map(|(p, pp)| (*p, pp.clone()))
             .collect();
         for (peer, pp) in peers {
-            let Some(d) = contacts
+            let Some((d, timed)) = contacts
                 .get(&peer)
                 .filter(|c| c.mutually_approved())
-                .and_then(|c| c.discovery_key)
+                .and_then(|c| c.discovery_key.map(|d| (d, c.timed_probes)))
             else {
                 continue;
             };
@@ -845,12 +845,16 @@ impl Node {
                     .chain(pp.theirs.main.iter().map(|c| c.addr))
                     .filter(|a| is_public(&a.ip()));
                 for t in targets.take(8) {
-                    let _ = s.send_raw(t, &rendezvous::probe(&d, &me));
+                    for p in probes_for(&d, &me, timed) {
+                        let _ = s.send_raw(t, &p);
+                    }
                 }
             }
             if let Some(m) = &main {
                 for c in pp.theirs.standby.iter().take(8) {
-                    let _ = m.send_raw(c.addr, &rendezvous::probe(&d, &me));
+                    for p in probes_for(&d, &me, timed) {
+                        let _ = m.send_raw(c.addr, &p);
+                    }
                 }
             }
         }

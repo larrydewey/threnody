@@ -11,7 +11,7 @@ The interactive handshake (Appendix A) needs both ends online at the same moment
 
 Each device keeps:
 
-- **A signed prekey (SPK).** An X-Wing key pair with id `spk_id`, rotated every 7 days. The previous one is kept for another 14 days so messages still in flight can be read.
+- **A signed prekey (SPK).** An X-Wing key pair with id `spk_id`, rotated every 7 days. Bundles advertise it as valid (`expiry_ms`) for 21 days from its creation, and a retired SPK is kept until that expiry, so messages still in flight can be read. Up to two retired SPKs can be live at once.
 - **One-time prekeys (OPKs).** X-Wing key pairs, each with an id. Each is reserved for one contact, and its secret is deleted on first use.
 
 ```
@@ -22,7 +22,7 @@ Bundle  = { 0: id_B, 1: spk_id, 2: spk_pub, 3: expiry_ms, 4: sig_spk, 5: [ { 0: 
 
 - **Distribution.** There is no directory. Once a session is mutually approved, each side sends the other a fresh bundle (`AppMessage::Prekeys`, kind 8) carrying the current SPK and 5 new OPKs reserved for that peer.
 - **Storage on the receiving side.** The receiver verifies every signature against the identity it authenticated in the session, then stores the bundle in its encrypted state. A new bundle replaces the old one.
-- **Clean-up.** A device keeps the OPK secrets it reserved for a peer for the last two bundles it sent that peer, and deletes older ones.
+- **Clean-up.** A device keeps the OPK secrets of a bundle until the bundle's `expiry_ms`, even after newer bundles replace it at the peer: a message the peer sealed to the old bundle may still be waiting at a mailbox. To bound storage, it keeps the OPK secrets of at most the last eight bundles it sent a peer and deletes older ones early. A message sealed to a deleted OPK can't be opened, so a peer whose sessions with us flap more than seven times while a message waits can still lose it.
 
 ## Sealed message
 
@@ -39,7 +39,7 @@ Sealed = { 0: spk_id, 1: ct_s, ? 2: opk_id, ? 3: ct_o, 4: AEAD(k, nonce 0, ad = 
 
 `body` is a padded `AppMessage` (Appendix C), and each sealed message uses fresh encapsulations. On receipt, B:
 
-1. **Finds the keys.** Looks up the SPK (current or previous, unexpired) and the OPK, if one was used. If anything is missing, it rejects the message.
+1. **Finds the keys.** Looks up the SPK (current or retired, unexpired) and the OPK, if one was used. If anything is missing, it rejects the message.
 2. **Derives and decrypts.** Decapsulates, derives `k` and decrypts.
 3. **Checks the sender.** Verifies `sig_A` against the claimed `id_A`, which must be a known contact.
 4. **Consumes the OPK.** Deletes the OPK secret, if one was used.

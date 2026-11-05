@@ -24,6 +24,7 @@ use threnody_core::crypto::random_bytes;
 use threnody_core::rendezvous::{
     self, Candidate, CandidateKind, Candidates, FLAG_SYMMETRIC, epoch, record_keys,
 };
+use threnody_core::store::{Contact, Contacts};
 use threnody_core::{PublicIdentity, now_ms};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -1251,11 +1252,14 @@ impl Node {
             }
             // A contact's discovery key, or for someone found through a
             // handle (Appendix S), the handle's probe key.
-            let Some(d) = self
+            let Some((d, timed)) = self
                 .contacts()
                 .get(&peer)
-                .and_then(|c| c.discovery_key)
-                .or_else(|| lock(&self.rdv().handles.probe_keys).get(&peer).copied())
+                .and_then(|c| c.discovery_key.map(|d| (d, c.timed_probes)))
+                .or_else(|| {
+                    let keys = lock(&self.rdv().handles.probe_keys);
+                    keys.get(&peer).map(|d| (*d, false))
+                })
             else {
                 break false;
             };
@@ -1266,7 +1270,9 @@ impl Node {
             probed = Some(Instant::now());
             let targets = lock(&punch.targets).clone();
             for t in &targets {
-                let _ = quic.send_raw(*t, &rendezvous::probe(&d, &me));
+                for p in probes_for(&d, &me, timed) {
+                    let _ = quic.send_raw(*t, &p);
+                }
             }
             let idle = dialing.as_ref().is_none_or(|h| h.is_finished());
             let quiet = heard.is_none_or(|h| h.elapsed() > Duration::from_secs(5));
@@ -1334,17 +1340,11 @@ impl Node {
         if !self.reach_enabled() {
             return;
         }
-        let contacts = self.contacts();
-        let keys = contacts
-            .iter()
-            .filter(|c| c.mutually_approved())
-            .flat_map(|c| c.recognition_keys().map(move |k| (&c.key, k)));
         let handle_keys: Vec<(PublicIdentity, [u8; 32])> = lock(&self.rdv().handles.probe_keys)
             .iter()
             .map(|(p, k)| (*p, *k))
             .collect();
-        let keys = keys.chain(handle_keys.iter().map(|(p, k)| (p, k)));
-        let Some(peer) = rendezvous::recognise_probe(data, keys) else {
+        let Some(peer) = recognise(data, now_ms() / 1000, &self.contacts(), &handle_keys) else {
             return;
         };
         let punch = lock(&self.rdv().inner).punches.get(&peer).cloned();
@@ -1390,6 +1390,50 @@ impl Node {
             self.rdv().regather.notify_one();
         }
     }
+}
+
+/// Probes from `me` under discovery key `d`. A contact whose `Hello` said
+/// it times its probes (`timed`) gets a timed one only. Any other gets an
+/// untimed one, all an older build understands, and a timed one as well:
+/// it may have upgraded since its last `Hello` reached us, and then it
+/// ignores untimed probes from us.
+pub(crate) fn probes_for(
+    d: &[u8; 32],
+    me: &PublicIdentity,
+    timed: bool,
+) -> Vec<[u8; rendezvous::PROBE_LEN]> {
+    let mut probes = vec![rendezvous::timed_probe(d, me, now_ms() / 1000)];
+    if !timed {
+        probes.push(rendezvous::probe(d, me));
+    }
+    probes
+}
+
+/// Who sent probe `data`, if anyone we know: a mutually approved contact
+/// or someone found through a handle (`handle_keys`, Appendix S).
+///
+/// A timed probe is recognised from every mutually approved contact,
+/// whatever we last heard about its build, so two sides that disagree
+/// about it still recognise each other. An untimed one, which anyone who
+/// once saw it could replay, is never recognised from a contact that
+/// times its probes.
+fn recognise(
+    data: &[u8],
+    now_secs: u64,
+    contacts: &Contacts,
+    handle_keys: &[(PublicIdentity, [u8; 32])],
+) -> Option<PublicIdentity> {
+    fn keys(c: &Contact) -> impl Iterator<Item = (&PublicIdentity, &[u8; 32])> {
+        c.recognition_keys().map(move |k| (&c.key, k))
+    }
+    let mutual = || contacts.iter().filter(|c| c.mutually_approved());
+    let timed = mutual().flat_map(keys);
+    let untimed = mutual()
+        .filter(|c| !c.timed_probes)
+        .flat_map(keys)
+        .chain(handle_keys.iter().map(|(p, k)| (p, k)));
+    rendezvous::recognise_timed_probe(data, now_secs, timed)
+        .or_else(|| rendezvous::recognise_probe(data, untimed))
 }
 
 async fn join_dht(cfg: &ReachConfig, warm: &[String]) -> std::io::Result<AsyncDht> {
@@ -1488,6 +1532,40 @@ pub(crate) async fn get_latest(dht: &AsyncDht, key: &[u8; 32], salt: &[u8]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probes_are_recognised_when_the_sides_disagree_about_timing() {
+        let alice = threnody_core::Identity::generate().public();
+        let d = [5; 32];
+        let mut book = Contacts::default();
+        book.observe(alice, None, 0);
+        let c = book.get_mut(&alice).unwrap();
+        (c.local_approved, c.remote_approved) = (true, true);
+        c.set_discovery_key(d);
+        let now = now_ms() / 1000;
+
+        // Bob hasn't seen Alice's new Hello yet, but she already times
+        // her probes: he still knows them.
+        book.get_mut(&alice).unwrap().timed_probes = false;
+        let timed = rendezvous::timed_probe(&d, &alice, now);
+        assert_eq!(recognise(&timed, now, &book, &[]), Some(alice));
+
+        // The other way round: Alice still thinks Bob is old, Bob knows
+        // she times. What she sends includes a probe he accepts.
+        book.get_mut(&alice).unwrap().timed_probes = true;
+        let sent = probes_for(&d, &alice, false);
+        assert_eq!(sent.len(), 2);
+        assert!(
+            sent.iter()
+                .any(|p| recognise(p, now, &book, &[]) == Some(alice))
+        );
+        // But an untimed probe alone is still refused for her.
+        assert_eq!(
+            recognise(&rendezvous::probe(&d, &alice), now, &book, &[]),
+            None
+        );
+        assert_eq!(probes_for(&d, &alice, true).len(), 1);
+    }
 
     #[test]
     fn krpc_replies_are_told_apart_and_parsed() {

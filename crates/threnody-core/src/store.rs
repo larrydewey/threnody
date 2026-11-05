@@ -356,6 +356,12 @@ pub struct Contact {
     /// leave each side with a different "latest" key; keeping recent ones
     /// means both still recognise each other. Cleared on revocation.
     pub discovery_older: Vec<[u8; 32]>,
+    /// The peer's latest `Hello` had `FEATURE_TIMED_PROBES`: probes to and
+    /// from it under its discovery keys are timed (Appendix N), and an
+    /// untimed one claiming to be from it is ignored. It describes the
+    /// peer's build, so it outlives the keys, but it is this device's
+    /// knowledge and is not synced to our others.
+    pub timed_probes: bool,
     /// Account this device belongs to (Appendix J), once its chain is known.
     pub account: Option<AccountId>,
     /// When the approval or verification flags last changed (own-device
@@ -393,6 +399,7 @@ impl Contact {
             last_seen_ms: now_ms,
             discovery_key: None,
             discovery_older: Vec::new(),
+            timed_probes: false,
             account: None,
             approval_changed_ms: 0,
             accepted: false,
@@ -580,6 +587,7 @@ impl Contacts {
         for x in &mut c.list {
             x.clear_discovery_keys();
             x.remote_approved = false;
+            x.timed_probes = false;
         }
         c.encode()
     }
@@ -615,6 +623,7 @@ impl Contacts {
                     let mut c = o;
                     c.clear_discovery_keys();
                     c.remote_approved = false;
+                    c.timed_probes = false;
                     c.first_seen_ms = now_ms;
                     self.list.push(c);
                     changed = true;
@@ -678,6 +687,7 @@ impl Contacts {
                         + usize::from(c.revealed.is_some())
                         + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
                         + usize::from(c.cleared_ms != 0)
+                        + usize::from(c.timed_probes)
                         + 2;
                     e.map_len(n)?;
                     e.u8(0)?.bytes(c.key.as_bytes())?;
@@ -729,6 +739,9 @@ impl Contacts {
                     }
                     if c.cleared_ms != 0 {
                         e.u8(18)?.u64(c.cleared_ms)?;
+                    }
+                    if c.timed_probes {
+                        e.u8(19)?.bool(true)?;
                     }
                 }
                 if !self.forgotten.is_empty() {
@@ -788,6 +801,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         last_seen_ms: 0,
         discovery_key: None,
         discovery_older: Vec::new(),
+        timed_probes: false,
         account: None,
         approval_changed_ms: 0,
         // Contacts saved before message requests existed were wanted.
@@ -836,6 +850,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             16 => revealed = Some(fixed_bytes::<32>(d)?),
             17 => invite = Some(d.str()?.to_owned()),
             18 => c.cleared_ms = d.u64()?,
+            19 => c.timed_probes = d.bool()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -921,6 +936,7 @@ mod sync_tests {
         t.petname = Some("bob".into());
         t.remote_approved = true;
         theirs.get_mut(&carol).unwrap().discovery_key = Some([9; 32]);
+        theirs.get_mut(&carol).unwrap().timed_probes = true;
 
         assert!(
             mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 5)
@@ -932,7 +948,7 @@ mod sync_tests {
         assert_eq!(b.discovery_key, Some([1; 32]), "own pairwise key kept");
         let c = mine.get(&carol).unwrap();
         assert!(
-            c.discovery_key.is_none() && !c.remote_approved,
+            c.discovery_key.is_none() && !c.remote_approved && !c.timed_probes,
             "pairwise state not copied"
         );
         assert!(
@@ -1018,6 +1034,7 @@ mod passphrase_tests {
             c.set_discovery_key([k; 32]);
         }
         c.set_discovery_key([4; 32]);
+        c.timed_probes = true;
         assert_eq!(c.discovery_key, Some([4; 32]));
         assert_eq!(c.discovery_older, vec![[3; 32], [2; 32]]);
         assert_eq!(c.recognition_keys().count(), 3);
@@ -1027,6 +1044,10 @@ mod passphrase_tests {
         assert_eq!(back.list[0], c);
         c.clear_discovery_keys();
         assert_eq!(c.recognition_keys().count(), 0);
+        // What the peer's build supports doesn't change with approval: a
+        // contact approved again in the same session (no new Hello) still
+        // gets timed probes under its next key.
+        assert!(c.timed_probes);
     }
 
     #[test]

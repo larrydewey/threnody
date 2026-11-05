@@ -92,6 +92,9 @@ pub const FEATURE_LISTS: u64 = 4096;
 pub const FEATURE_TUNNEL: u64 = 8192;
 /// The peer understands `AppMessage::Push` (wake-up endpoints, Appendix R).
 pub const FEATURE_PUSH: u64 = 16384;
+/// The peer sends timed hole-punching probes and accepts only those from
+/// us (`rendezvous::timed_probe`, Appendix N).
+pub const FEATURE_TIMED_PROBES: u64 = 32768;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -106,7 +109,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_PIN
     | FEATURE_LISTS
     | FEATURE_TUNNEL
-    | FEATURE_PUSH;
+    | FEATURE_PUSH
+    | FEATURE_TIMED_PROBES;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 

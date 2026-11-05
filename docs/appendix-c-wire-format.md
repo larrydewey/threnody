@@ -38,7 +38,7 @@ AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Rela
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
-                                                           ; 8192 tunnel, 16384 push); absent = 0
+                                                           ; 8192 tunnel, 16384 push, 32768 timed probes); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
@@ -158,7 +158,9 @@ Before encryption, an `AppMessage` is padded ISO/IEC 7816-4 style: a `0x80` byte
 
 ## Stream framing (transport)
 
-On stream transports, each frame is prefixed with its length as a `u32` in big-endian byte order. The maximum is 16 MiB plus 4 KiB.
+On stream transports, each frame is prefixed with its length as a `u32` in big-endian byte order. The maximum is 16 MiB plus 4 KiB. Until the handshake has authenticated the peer, the maximum is 16 KiB: handshake messages and the anonymous-link marker are far smaller, and a receiver refuses a longer length prefix without reading the frame.
+
+Authentication does not make a peer trusted: anyone can make an identity, and nodes accept strangers by default. Frames from a peer that is not mutually approved, and every frame on an anonymous link, are read a piece at a time, so memory follows the bytes that have arrived rather than the length prefix. All such frames read but not yet handled share one budget per node, four maximal frames. A frame that would exceed it is refused and its session ends; the sender can try again on a later session. Such a frame must also keep arriving: one that stalls for 120 seconds ends the session. Mutually approved contacts are not limited by either rule. These are receiver rules only; nothing changes on the wire.
 
 ## Local storage
 

@@ -1092,14 +1092,8 @@ impl Node {
         });
 
         let mut stream = theirs;
-        let chan = handshake::initiate(&mut stream, self.identity_ref()).await?;
         let dest = route.hops.last().ok_or(NetError::Closed)?.fp;
-        if chan.peer().fingerprint() != dest {
-            return Err(NetError::IdentityMismatch {
-                expected: dest.to_string(),
-                got: chan.peer().fingerprint().to_string(),
-            });
-        }
+        let chan = handshake::initiate(&mut stream, self.identity_ref(), Some(dest)).await?;
         let peer = *chan.peer();
         self.spawn_onion_session(stream, chan, first, true);
         Ok(peer)

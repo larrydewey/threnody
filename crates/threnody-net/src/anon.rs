@@ -21,9 +21,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::error::{NetError, Result};
-use crate::frame::{read_frame, write_frame};
+use crate::frame::write_frame;
 use crate::handshake;
-use crate::node::{Node, lock};
+use crate::node::{Inbound, Node, lock, read_inbound};
 
 /// The first frame of an anonymous link.
 pub(crate) const MAGIC: &[u8] = b"threnody anonymous link v1";
@@ -78,16 +78,8 @@ impl Node {
         } else {
             Identity::from_seed(&self.identity_ref().seed())
         };
-        let chan = handshake::initiate(&mut stream, &me).await?;
+        let chan = handshake::initiate(&mut stream, &me, expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         self.spawn_anon(stream, chan, remote, true);
         Ok(peer)
     }
@@ -178,10 +170,12 @@ where
 {
     let peer = *chan.peer();
     let (mut rd, mut wr) = tokio::io::split(stream);
-    let (in_tx, mut inbox) = mpsc::channel::<Result<Vec<u8>>>(16);
+    let (in_tx, mut inbox) = mpsc::channel::<Result<Inbound>>(16);
+    let shared = node.shared.clone();
     let reader = tokio::spawn(async move {
         loop {
-            let r = read_frame(&mut rd).await;
+            // Nobody on an anonymous link is trusted with memory.
+            let r = read_inbound(&shared, &mut rd, || false).await;
             let stop = !matches!(r, Ok(Some(_)));
             let item = match r {
                 Ok(Some(f)) => Ok(f),
@@ -221,7 +215,7 @@ where
                         Some(Err(NetError::Closed)) | None => return Ok(()),
                         Some(Err(e)) => return Err(e),
                     };
-                    match chan.open(&frame)? {
+                    match chan.open(&frame.bytes)? {
                         AppMessage::Onion(p) => {
                             last_use = tokio::time::Instant::now();
                             node.on_onion_from(peer, &p, true);
