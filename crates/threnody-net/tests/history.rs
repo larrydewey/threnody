@@ -107,6 +107,22 @@ async fn a_peer_without_a_timer_does_not_turn_ours_off() {
     bob.send_text(&a_id, "no timer here").unwrap();
     next(&mut arx, message).await;
     assert_eq!(alice.timer(&bob_id), Some(3600), "Alice's choice stands");
+    // And it applies to Bob's message too, as to every one in the chat.
+    let last = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
+    let theirs = last(&alice, &bob_id);
+    assert_eq!(theirs.text, "no timer here");
+    assert_eq!(
+        theirs.expires_at_ms.map(|t| t - theirs.at_ms),
+        Some(3_600_000),
+        "a timer-less message in a disappearing chat disappears"
+    );
     // Alice's next message carries it, and Bob adopts it.
     alice.send_text(&bob_id, "an hour").unwrap();
     next(&mut brx, message).await;
@@ -120,15 +136,9 @@ async fn a_peer_without_a_timer_does_not_turn_ours_off() {
     })
     .await;
     assert_eq!(alice.timer(&bob_id), None);
-    let last = alice
-        .history(alice.conversation_for(&bob_id))
-        .unwrap()
-        .entries()
-        .last()
-        .cloned()
-        .unwrap();
-    assert_eq!(last.text, "off now");
-    assert!(last.expires_at_ms.is_none(), "stays, not gone at once");
+    let off = last(&alice, &bob_id);
+    assert_eq!(off.text, "off now");
+    assert!(off.expires_at_ms.is_none(), "stays, not gone at once");
 
     // A default Alice chose isn't pinned off by a chat Bob opens.
     let (carol, _crx, _) = spawn(&dir, "carol").await;
