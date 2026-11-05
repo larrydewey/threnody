@@ -1306,7 +1306,7 @@ impl Node {
         // would have said so means it never chose one: ours stands, and
         // it adopts ours from our next message. From an older peer it may
         // mean either, and is taken as off, as such peers intend.
-        let chosen = expires_in_s.is_some() || !self.supports(from, FEATURE_TIMER_OFF);
+        let chosen = expires_in_s.is_some() || !self.known_to_support(from, FEATURE_TIMER_OFF);
         let lock = threnody_core::history::history_lock();
         // A message with no timer of its own goes when ours says: in a
         // disappearing chat, it must not stay for good.

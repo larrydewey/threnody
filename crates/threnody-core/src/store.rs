@@ -378,6 +378,10 @@ pub struct Contact {
     /// The user cleared the conversation up to this time: on every one of
     /// our devices, older messages go and don't come back (0 = never).
     pub cleared_ms: u64,
+    /// The feature bits of this peer's latest `Hello`, kept across
+    /// restarts so that what arrives before a session does (mailbox
+    /// deliveries, say) is read as the peer meant it.
+    pub features: u64,
 }
 
 impl Contact {
@@ -401,6 +405,7 @@ impl Contact {
             shares: Vec::new(),
             revealed: None,
             cleared_ms: 0,
+            features: 0,
         }
     }
 
@@ -683,6 +688,7 @@ impl Contacts {
                         + usize::from(c.revealed.is_some())
                         + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
                         + usize::from(c.cleared_ms != 0)
+                        + usize::from(c.features != 0)
                         + 2;
                     e.map_len(n)?;
                     e.u8(0)?.bytes(c.key.as_bytes())?;
@@ -734,6 +740,9 @@ impl Contacts {
                     }
                     if c.cleared_ms != 0 {
                         e.u8(18)?.u64(c.cleared_ms)?;
+                    }
+                    if c.features != 0 {
+                        e.u8(19)?.u64(c.features)?;
                     }
                 }
                 if !self.forgotten.is_empty() {
@@ -802,6 +811,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         shares: Vec::new(),
         revealed: None,
         cleared_ms: 0,
+        features: 0,
     };
     let (mut revealed, mut invite) = (None, None);
     read_map(d, |k, d| {
@@ -841,6 +851,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             16 => revealed = Some(fixed_bytes::<32>(d)?),
             17 => invite = Some(d.str()?.to_owned()),
             18 => c.cleared_ms = d.u64()?,
+            19 => c.features = d.u64()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -883,6 +894,7 @@ mod tests {
         ct.account = Some(AccountId([5; 32]));
         ct.approval_changed_ms = 77;
         ct.blocked = true;
+        ct.features = 1 << 16;
         assert!(!ct.accepted, "new contacts start as message requests");
         home.save_contacts(&c).unwrap();
         let loaded = home.load_contacts().unwrap();

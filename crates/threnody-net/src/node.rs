@@ -1304,6 +1304,15 @@ impl Node {
             .is_some_and(|f| f & feature != 0)
     }
 
+    /// Like [`Node::supports`], but for a peer with no session since we
+    /// started, by what it said in its last one (saved with the contact).
+    pub(crate) fn known_to_support(&self, peer: &PublicIdentity, feature: u64) -> bool {
+        let latest = lock(&self.shared.peer_features).get(peer).copied();
+        latest
+            .or_else(|| lock(&self.shared.contacts).get(peer).map(|c| c.features))
+            .is_some_and(|f| f & feature != 0)
+    }
+
     /// How many messages to `peer` are waiting for an acknowledgement.
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
         lock(&self.shared.delivery).unacked(peer)
@@ -1798,6 +1807,16 @@ where
                             _ => 0,
                         };
                         lock(&shared.peer_features).insert(peer, features);
+                        {
+                            // Kept for what arrives before the next session.
+                            let mut contacts = lock(&shared.contacts);
+                            if let Some(c) = contacts.get_mut(&peer)
+                                && c.features != features
+                            {
+                                c.features = features;
+                                shared.save_contacts(&contacts);
+                            }
+                        }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
                         node.send_profile(&peer);
                         if let Some(addr) = observed
