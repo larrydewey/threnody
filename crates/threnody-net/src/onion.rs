@@ -269,12 +269,12 @@ pub(crate) struct OnionState {
     cover_traffic: HashMap<Link, CoverTrafficState>,
     /// Our first-hop CREATEs awaiting CREATED.
     creating: HashMap<Link, oneshot::Sender<CreatedFields>>,
-    /// Per neighbour: start of the current minute and deposits in it.
-    deposit_rate: HashMap<PublicIdentity, (Instant, u32)>,
+    /// Per carrier: start of the current minute and deposits in it.
+    deposit_rate: HashMap<Carrier, (Instant, u32)>,
     /// Link circuits that run over anonymous links rather than sessions.
     anon: HashSet<Link>,
-    /// Per neighbour: start of the current minute and tokens checked in it.
-    token_rate: HashMap<PublicIdentity, (Instant, u32)>,
+    /// Per carrier: start of the current minute and tokens checked in it.
+    token_rate: HashMap<Carrier, (Instant, u32)>,
 }
 
 /// State for cover traffic on a circuit we initiated.
@@ -321,6 +321,22 @@ impl CoverTrafficState {
 
 /// Relay tokens checked per neighbour per minute: each costs pairings.
 pub const MAX_TOKEN_CHECKS_PER_MINUTE: u32 = 120;
+/// Anonymous deposits still arriving may hold this many bytes in all.
+const MAX_PENDING_DEPOSIT_BYTES: usize = 4 * crate::mailbox::MAX_HELD_BYTES;
+
+/// Who answers for a circuit: the neighbour that carried it to us or,
+/// over an anonymous link, where any identity costs nothing, its network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Carrier {
+    Peer(PublicIdentity),
+    Network([u8; 16]),
+}
+
+impl Carrier {
+    fn of(link: &Link, net: Option<[u8; 16]>) -> Self {
+        net.map_or(Self::Peer(link.0), Self::Network)
+    }
+}
 
 impl OnionState {
     /// Whether another stranger's hop fits, from network `net`.
@@ -332,7 +348,7 @@ impl OnionState {
         all < MAX_STRANGER_HOPS && here < MAX_STRANGER_HOPS_PER_NETWORK
     }
 
-    fn token_check_allowed(&mut self, from: PublicIdentity) -> bool {
+    fn token_check_allowed(&mut self, from: Carrier) -> bool {
         let now = Instant::now();
         if self.token_rate.len() > 4 * MAX_STRANGER_HOPS {
             self.token_rate
@@ -346,14 +362,32 @@ impl OnionState {
         *n <= MAX_TOKEN_CHECKS_PER_MINUTE
     }
 
-    fn deposit_allowed(&mut self, from: PublicIdentity) -> bool {
+    fn deposit_allowed(&mut self, from: Carrier) -> bool {
         let now = Instant::now();
+        if self.deposit_rate.len() > 4 * MAX_STRANGER_HOPS {
+            self.deposit_rate
+                .retain(|_, (s, _)| now.duration_since(*s) < Duration::from_secs(60));
+        }
         let (start, n) = self.deposit_rate.entry(from).or_insert((now, 0));
         if now.duration_since(*start) >= Duration::from_secs(60) {
             (*start, *n) = (now, 0);
         }
         *n += 1;
         *n <= MAX_DEPOSITS_PER_MINUTE
+    }
+
+    /// Whether a deposit of `total` bytes may start arriving over a hop
+    /// from network `net`: while they arrive, deposits are held in memory,
+    /// so all of them together, and those from any one network, are capped.
+    fn deposit_room(&self, net: Option<[u8; 16]>, total: usize) -> bool {
+        let (all, here) = self
+            .hops
+            .values()
+            .filter_map(|h| h.deposit.as_ref().map(|d| (h.net, d.total)))
+            .fold((0, 0), |(a, n), (from, t)| {
+                (a + t, n + if net.is_some() && from == net { t } else { 0 })
+            });
+        all + total <= MAX_PENDING_DEPOSIT_BYTES && here + total <= crate::mailbox::MAX_HELD_BYTES
     }
 }
 
@@ -419,10 +453,10 @@ impl Node {
                 && (contact || st.stranger_room(net))
         };
         // A stranger's circuit may end here; it goes further only if paid.
-        let full = contact
-            || token.is_some_and(|t| {
+        let paid = !contact
+            && token.is_some_and(|t| {
                 admitted
-                    && lock(&self.shared.onion).token_check_allowed(from)
+                    && lock(&self.shared.onion).token_check_allowed(Carrier::of(&(from, circ), net))
                     && self.accept_token(t, e_pub)
             });
         let responded = admitted
@@ -438,7 +472,7 @@ impl Node {
             if anon {
                 st.anon.insert((from, circ));
             }
-            let hop = RelayHop::new(keys, contact, full, net);
+            let hop = RelayHop::new(keys, contact, paid, net);
             self.watch_hop((from, circ), hop.born);
             st.hops.insert((from, circ), hop);
         }
@@ -686,19 +720,27 @@ impl Node {
     /// We are the circuit's last hop and a mailbox: someone, hidden from us,
     /// leaves a sealed message for one of our contacts.
     fn onion_deposit_start(&self, up: Link, data: &[u8]) {
+        let head = data.get(..DEPOSIT_HEAD).and_then(|h| {
+            let to: [u8; 32] = h[..32].try_into().ok()?;
+            let total = u32::from_be_bytes(h[32..].try_into().ok()?) as usize;
+            (total <= crate::mailbox::MAX_HELD_BYTES).then_some((to, total))
+        });
+        // Only for our own mutually approved contacts: anything else would
+        // be declined once complete, so it is declined before it is kept.
+        let head = head
+            .filter(|(to, _)| PublicIdentity::from_bytes(to).is_ok_and(|d| self.shared.mutual(&d)));
         let started = {
             let mut st = lock(&self.shared.onion);
-            let free = st
-                .hops
-                .get(&up)
+            let hop = st.hops.get(&up);
+            let free = hop
                 .is_some_and(|h| h.next.is_none() && h.endpoint.is_none() && h.deposit.is_none());
-            let head = data.get(..DEPOSIT_HEAD).and_then(|h| {
-                let to: [u8; 32] = h[..32].try_into().ok()?;
-                let total = u32::from_be_bytes(h[32..].try_into().ok()?) as usize;
-                (total <= crate::mailbox::MAX_HELD_BYTES).then_some((to, total))
-            });
+            let net = hop.and_then(|h| h.net);
             match head {
-                Some((to, total)) if free && st.deposit_allowed(up.0) => {
+                Some((to, total))
+                    if free
+                        && st.deposit_room(net, total)
+                        && st.deposit_allowed(Carrier::of(&up, net)) =>
+                {
                     if let Some(h) = st.hops.get_mut(&up) {
                         h.deposit = Some(PendingDeposit {
                             to,
@@ -1530,14 +1572,75 @@ mod tests {
     fn anonymous_deposits_are_rate_limited_per_neighbour() {
         let mut st = OnionState::default();
         let (x, y) = (
-            threnody_core::Identity::generate().public(),
-            threnody_core::Identity::generate().public(),
+            Carrier::Peer(threnody_core::Identity::generate().public()),
+            Carrier::Peer(threnody_core::Identity::generate().public()),
         );
         for _ in 0..MAX_DEPOSITS_PER_MINUTE {
             assert!(st.deposit_allowed(x));
         }
         assert!(!st.deposit_allowed(x));
         assert!(st.deposit_allowed(y));
+        // Over anonymous links identities are free: the network counts.
+        let stranger = |n| {
+            let link = (threnody_core::Identity::generate().public(), 1);
+            Carrier::of(&link, Some([n; 16]))
+        };
+        for _ in 0..MAX_DEPOSITS_PER_MINUTE {
+            assert!(st.deposit_allowed(stranger(1)));
+        }
+        assert!(!st.deposit_allowed(stranger(1)));
+        assert!(st.deposit_allowed(stranger(2)));
+    }
+
+    #[tokio::test]
+    async fn deposits_still_arriving_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "m");
+        let contact = threnody_core::Identity::generate().public();
+        node.set_approval(&contact, true).unwrap();
+        lock(&node.shared.contacts)
+            .get_mut(&contact)
+            .unwrap()
+            .remote_approved = true;
+        let deposit = |to: &PublicIdentity, total: usize| {
+            let mut d = to.as_bytes().to_vec();
+            d.extend_from_slice(&u32::try_from(total).unwrap().to_be_bytes());
+            d.extend_from_slice(&[0; 100]);
+            d
+        };
+        let pending = |node: &Node| {
+            lock(&node.shared.onion)
+                .hops
+                .values()
+                .filter(|h| h.deposit.is_some())
+                .count()
+        };
+        // Not our contact: declined at once, nothing buffered.
+        let stranger = threnody_core::Identity::generate().public();
+        let up = fake_hop(&node, stranger, 1, false, false);
+        let nobody = threnody_core::Identity::generate().public();
+        node.onion_deposit_start(up, &deposit(&nobody, 4096));
+        assert_eq!(pending(&node), 0);
+        // One network may have one large deposit arriving at a time.
+        let max = crate::mailbox::MAX_HELD_BYTES;
+        let hop_from = |n: u8, circ| {
+            let from = threnody_core::Identity::generate().public();
+            let up = fake_hop(&node, from, circ, false, false);
+            lock(&node.shared.onion).hops.get_mut(&up).unwrap().net = Some([n; 16]);
+            up
+        };
+        let a = hop_from(1, 2);
+        node.onion_deposit_start(a, &deposit(&contact, max));
+        assert_eq!(pending(&node), 1);
+        let b = hop_from(1, 3);
+        node.onion_deposit_start(b, &deposit(&contact, max));
+        assert_eq!(pending(&node), 1);
+        // And all of them together only so much.
+        for n in 2..=MAX_PENDING_DEPOSIT_BYTES.div_ceil(max) as u8 + 1 {
+            let up = hop_from(n, 10 + u64::from(n));
+            node.onion_deposit_start(up, &deposit(&contact, max));
+        }
+        assert_eq!(pending(&node), MAX_PENDING_DEPOSIT_BYTES / max);
     }
 
     #[test]

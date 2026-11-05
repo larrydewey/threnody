@@ -83,7 +83,7 @@ binding    = KDF("… relay token binding", e_pub)        the hop's ephemeral X-
   - a directory this relay is registered with issued it;
   - its pseudonym hasn't been seen this epoch.
 
-  So one credential opens at most 64 circuits per relay per day, and the relay learns nothing else about it. A relay checks at most 120 tokens per neighbour per minute, since each check costs pairings.
+  So one credential opens at most 64 circuits per relay per day, and the relay learns nothing else about it. A relay checks at most 120 tokens per neighbour per minute, since each check costs pairings; over anonymous links, where identities are free, per neighbour network (a /24 or a /56).
 - **Clients** keep the credentials and used slots in encrypted state (`relay-wallet`). Used slots are never reused, and credentials older than yesterday are dropped.
 
 ## Circuits
