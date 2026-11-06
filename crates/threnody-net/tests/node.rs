@@ -1188,3 +1188,43 @@ async fn constant_rate_frames_are_all_one_size() {
     );
     eprintln!("constant-rate frame on the wire: {} bytes", seen[0]);
 }
+
+#[tokio::test]
+async fn features_default_to_everything() {
+    use threnody_core::message::{FEATURE_CALLS, FEATURES};
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    assert_eq!(alice.local_features(), FEATURES);
+    alice.withhold_features(0);
+    assert_eq!(alice.local_features(), FEATURES);
+    alice.withhold_features(FEATURE_CALLS);
+    alice.withhold_features(FEATURE_CALLS);
+    assert_eq!(alice.local_features(), FEATURES & !FEATURE_CALLS);
+    assert_eq!(alice.local_features() | FEATURE_CALLS, FEATURES);
+}
+
+#[tokio::test]
+async fn withheld_features_stay_out_of_hello() {
+    use threnody_core::message::{FEATURE_ACKS, FEATURE_CALLS, FEATURE_LISTS, FEATURES};
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    alice.withhold_features(FEATURE_CALLS);
+    assert_eq!(alice.local_features(), FEATURES & !FEATURE_CALLS);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice
+        .connect(&addr.to_string(), Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    let a_id = alice.identity();
+    timeout(Duration::from_secs(10), async {
+        while !(bob.supports(&a_id, FEATURE_ACKS) && alice.supports(&bob_id, FEATURE_ACKS)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both Hellos arrive");
+    assert!(!bob.supports(&a_id, FEATURE_CALLS));
+    assert!(bob.supports(&a_id, FEATURE_LISTS));
+    assert!(alice.supports(&bob_id, FEATURE_CALLS));
+}

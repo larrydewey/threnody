@@ -291,7 +291,9 @@ where
         }
     });
     let mut pending = Backlog::default();
-    // Opens the ratchet; nothing about us beyond what every node supports.
+    // Opens the ratchet; nothing about us beyond what every node supports:
+    // the full FEATURES, even where the node withholds some from contacts,
+    // so anonymous links can't tell builds apart.
     let _ = pending.push(AppMessage::Hello { features: FEATURES });
     let mut rate = node.shared.constant_rate.subscribe();
     let make_ticker = |r: Option<Duration>| {
