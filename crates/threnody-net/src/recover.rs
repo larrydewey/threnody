@@ -37,7 +37,9 @@ use tokio::task::JoinSet;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 use crate::quic::{Quic, canonical};
-use crate::reach::{Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply, probes_for};
+use crate::reach::{
+    ReachConfig, Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply, probes_for,
+};
 
 /// How long the side that didn't move keeps trying after losing a session.
 pub(crate) const RECOVER_FOR: Duration = Duration::from_secs(60);
@@ -67,6 +69,9 @@ const HOLE_KEEPALIVE: Duration = Duration::from_secs(20);
 /// address. An idle mobile radio takes a second or more to wake, so the
 /// first IPv4 answers came too late at 1.5 s in testing.
 const STANDBY_WAIT: Duration = Duration::from_secs(4);
+/// A contact's `Paths` wakes the keepalive round at most this often: a
+/// contact sending one after another can't keep our radio busy.
+const PATHS_KICK_GAP: Duration = Duration::from_secs(10);
 /// The recovery slot record is per session, so it has no epochs.
 const SLOT_EPOCH: u64 = 0;
 /// State file for recovery slots and peers' paths, so a restarted app can
@@ -171,6 +176,11 @@ pub(crate) struct RecoverState {
     on_mobile: AtomicBool,
     /// Wakes the keepalive loop (a hole to open now).
     kick: Notify,
+    /// When a contact's `Paths` last woke it.
+    paths_kick: Mutex<Option<Instant>>,
+    /// A `learn_standby` is running (one at a time), and whether it was
+    /// asked for again meanwhile.
+    learning: Mutex<(bool, bool)>,
     /// When the current recovery began, for the timings in the log.
     t0: Mutex<Option<Instant>>,
 }
@@ -187,6 +197,8 @@ impl RecoverState {
             force: AtomicBool::new(false),
             on_mobile: AtomicBool::new(false),
             kick: Notify::new(),
+            paths_kick: Mutex::default(),
+            learning: Mutex::default(),
             t0: Mutex::default(),
         }
     }
@@ -338,17 +350,32 @@ impl Node {
         }
         let paths = Paths::decode(payload).ok()?;
         let lease = lease_for(paths.beat_ms);
-        let (new_standby, new_main) = {
+        let (new_standby, new_main, changed) = {
             let mut peers = lock(&self.rec().peers);
             let p = peers.entry(peer).or_default();
-            let changed = p.theirs.standby != paths.standby;
+            let standby = p.theirs.standby != paths.standby;
             let main = p.theirs.main != paths.main;
+            let changed = p.theirs != paths;
             p.theirs = paths;
             p.updated_ms = now_ms();
-            (changed && !p.theirs.standby.is_empty(), main)
+            (standby && !p.theirs.standby.is_empty(), main, changed)
         };
-        self.save_recovery();
-        if new_main {
+        // The same paths again (each session sends them) change nothing
+        // worth a write; the time they came is saved with the next change.
+        if changed {
+            self.save_recovery();
+        }
+        // A contact sending one `Paths` after another gets one round per
+        // [`PATHS_KICK_GAP`]; the regular rounds pick up the rest.
+        let kick = (new_main || new_standby) && {
+            let mut last = lock(&self.rec().paths_kick);
+            let due = last.is_none_or(|t| t.elapsed() >= PATHS_KICK_GAP);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if new_main && kick {
             // Open our standby socket's hole toward its new addresses now:
             // the next round may come after the network has changed.
             self.rec().force.store(true, Ordering::Relaxed);
@@ -373,7 +400,9 @@ impl Node {
                 ),
             });
             // Open our side of its standby hole now, not at the next keepalive.
-            self.rec().kick.notify_one();
+            if kick {
+                self.rec().kick.notify_one();
+            }
         }
         Some(lease)
     }
@@ -732,7 +761,28 @@ impl Node {
         let Some(cfg) = self.reach_config().filter(|_| self.reach_enabled()) else {
             return;
         };
-        let targets = self.reflectors(&cfg).await;
+        // One at a time: two would clear each other's pings. Asked for
+        // again meanwhile (a new standby socket), the running one goes again.
+        {
+            let mut l = lock(&self.rec().learning);
+            if l.0 {
+                l.1 = true;
+                return;
+            }
+            *l = (true, false);
+        }
+        loop {
+            self.learn_standby_with(&cfg).await;
+            let mut l = lock(&self.rec().learning);
+            if !std::mem::take(&mut l.1) {
+                l.0 = false;
+                break;
+            }
+        }
+    }
+
+    async fn learn_standby_with(&self, cfg: &ReachConfig) {
+        let targets = self.reflectors(cfg).await;
         let Some(quic) = lock(&self.rec().standby).as_ref().map(|s| s.quic.clone()) else {
             return;
         };
@@ -924,6 +974,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standby_holes_go_only_to_public_addresses_of_recent_peers() {
+        let at = |a: &str| Candidate {
+            kind: CandidateKind::Reflexive,
+            addr: a.parse().unwrap(),
+        };
+        let now = 10 * ANNOUNCE_WITHIN_MS;
+        let mut pp = PeerPaths {
+            updated_ms: now - 1000,
+            theirs: Paths {
+                main: vec![],
+                standby: vec![
+                    at("127.0.0.1:631"),
+                    at("192.168.1.1:53"),
+                    at("224.0.0.251:5353"),
+                    at("203.0.113.9:40000"),
+                ],
+                beat_ms: 2000,
+            },
+            ..PeerPaths::default()
+        };
+        assert_eq!(
+            standby_targets(&pp, now),
+            ["203.0.113.9:40000".parse::<SocketAddr>().unwrap()]
+        );
+        // A peer heard from over a day ago: its standby mapping is long gone.
+        pp.updated_ms = now - ANNOUNCE_WITHIN_MS - 1;
+        assert!(standby_targets(&pp, now).is_empty());
+    }
+
+    #[test]
     fn heartbeats_inside_circuits_leave_room_on_constant_rate_links() {
         for rate in [500, 2000, 5000, 10_000, 30_000].map(Duration::from_millis) {
             let beat = inner_beat_for(Some(rate));
@@ -1017,34 +1097,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn standby_holes_go_only_to_public_addresses_of_recent_peers() {
-        let at = |a: &str| Candidate {
-            kind: CandidateKind::Reflexive,
-            addr: a.parse().unwrap(),
-        };
-        let now = 10 * ANNOUNCE_WITHIN_MS;
-        let mut pp = PeerPaths {
-            updated_ms: now - 1000,
-            theirs: Paths {
-                main: vec![],
-                standby: vec![
-                    at("127.0.0.1:631"),
-                    at("192.168.1.1:53"),
-                    at("224.0.0.251:5353"),
-                    at("203.0.113.9:40000"),
-                ],
+    /// The file `name` somewhere under `dir`.
+    fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(f) = find_file(&p, name) {
+                    return Some(f);
+                }
+            } else if p.file_name().is_some_and(|n| n == name) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn repeated_paths_neither_rewrite_state_nor_keep_waking_the_radio() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _arx) = test_node(&dir, "a");
+        let peer = threnody_core::Identity::generate().public();
+        a.update_contacts(|c| {
+            c.observe(peer, None, 0);
+            let x = c.get_mut(&peer).unwrap();
+            (x.local_approved, x.remote_approved) = (true, true);
+        });
+        let paths = |port: u16| {
+            Paths {
+                main: vec![Candidate {
+                    kind: CandidateKind::Reflexive,
+                    addr: SocketAddr::new([203, 0, 113, 4].into(), port),
+                }],
+                standby: vec![],
                 beat_ms: 2000,
-            },
-            ..PeerPaths::default()
+            }
+            .encode()
+            .unwrap()
         };
-        assert_eq!(
-            standby_targets(&pp, now),
-            ["203.0.113.9:40000".parse::<SocketAddr>().unwrap()]
+        a.on_paths(peer, &paths(1)).unwrap();
+        let state = find_file(dir.path(), "recovery.state").expect("saved");
+        assert!(a.rec().force.swap(false, Ordering::Relaxed));
+        // The same again: nothing to write.
+        std::fs::remove_file(&state).unwrap();
+        a.on_paths(peer, &paths(1)).unwrap();
+        assert!(!state.exists(), "the same paths were written again");
+        // New ones are kept, but don't force another standby round so soon.
+        a.on_paths(peer, &paths(2)).unwrap();
+        assert!(state.exists());
+        assert!(
+            !a.rec().force.load(Ordering::Relaxed),
+            "a second Paths within seconds forced another standby round"
         );
-        // A peer heard from over a day ago: its standby mapping is long gone.
-        pp.updated_ms = now - ANNOUNCE_WITHIN_MS - 1;
-        assert!(standby_targets(&pp, now).is_empty());
     }
 
     #[test]
