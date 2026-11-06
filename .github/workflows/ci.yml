@@ -68,6 +68,8 @@ jobs:
       - run: cargo test --workspace --all-features --locked --no-fail-fast
       - name: Tests (threnody-ffi without calls)
         run: cargo test -p threnody-ffi --locked --no-fail-fast
+      - name: CLI without Bluetooth (the ble gate still builds)
+        run: cargo build -p threnody-cli --no-default-features --locked
 
   bindings:
     name: FFI bindings (Python test)

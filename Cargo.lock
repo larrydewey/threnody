@@ -5806,9 +5806,7 @@ name = "threnody-cli"
 version = "0.18.0"
 dependencies = [
  "anyhow",
- "bluer",
  "clap",
- "futures-util",
  "jiff",
  "keyring",
  "qrcode",
@@ -5817,6 +5815,7 @@ dependencies = [
  "threnody-core",
  "threnody-groups",
  "threnody-net",
+ "threnody-radio",
  "tokio",
  "zeroize",
 ]
@@ -5880,6 +5879,7 @@ dependencies = [
  "threnody-groups",
  "threnody-media",
  "threnody-net",
+ "threnody-radio",
  "threnody-tun",
  "tokio",
  "uniffi",
@@ -5941,6 +5941,20 @@ dependencies = [
  "threnody-tun",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "threnody-radio"
+version = "0.18.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bluer",
+ "futures-util",
+ "tempfile",
+ "threnody-core",
+ "threnody-net",
+ "tokio",
 ]
 
 [[package]]

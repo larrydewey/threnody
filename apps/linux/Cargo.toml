@@ -19,10 +19,11 @@ boringtun = ["threnody-ffi/boringtun"]
 nfc = ["dep:pcsc"]
 
 [dependencies]
-threnody-ffi = { path = "../../crates/threnody-ffi", features = ["boringtun", "calls"] }
+threnody-ffi = { path = "../../crates/threnody-ffi", features = ["boringtun", "calls", "radio"] }
 threnody-core.workspace = true
 # GTK 4.14 and libadwaita 1.5 are what Ubuntu 24.04 and Debian 13 ship.
-gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+# gio_v2_80: the power-saver monitor (GLib 2.70+; both ship 2.80 or later).
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14", "gio_v2_80"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 async-channel = "2.5"
 keyring = "4.2"

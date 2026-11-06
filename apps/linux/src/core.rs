@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use threnody_ffi::{
     Clip, ContactInfo, FileOptions, GroupInfo, GroupInvite, HistoryEntry, NodeEvent, PersonaRecord,
@@ -24,6 +24,20 @@ pub type Node = Arc<ThrenodyNode>;
 
 /// The port the main identity listens on, as on Android and in the CLI.
 pub const PORT: u16 = 7450;
+
+/// How long after "Faster link" the Wi-Fi Direct group offered back is
+/// joined without asking (as the CLI's `/wifi-direct request`).
+const ASKED_FOR: Duration = Duration::from_secs(120);
+
+/// A Wi-Fi Direct group a contact offered without being asked, kept for
+/// "Faster link" to take.
+struct DirectOffered {
+    peer: String,
+    ssid: String,
+    passphrase: String,
+    addr: String,
+    at: Instant,
+}
 
 /// What the window hears from the nodes.
 pub enum UiEvent {
@@ -196,6 +210,27 @@ pub struct Core {
     log: Mutex<String>,
     ui: async_channel::Sender<UiEvent>,
     metered: AtomicBool,
+    /// The window is shown (not hidden by "Keep running when closed").
+    visible: AtomicBool,
+    /// The system's power saver is on.
+    power_saver: AtomicBool,
+    /// Whether the nodes poll contacts at the foreground rate (as they
+    /// start).
+    foreground: AtomicBool,
+    /// Held across `update_foreground`, so the last caller applies the
+    /// current state.
+    foreground_op: Mutex<()>,
+    /// Held across `apply_radio`: its settings read and the start or stop
+    /// it leads to, so a quick on-then-off always ends off.
+    radio_op: Mutex<()>,
+    /// Contacts asked to host a Wi-Fi Direct group, and when.
+    asked_direct: Mutex<HashMap<String, Instant>>,
+    /// The latest Wi-Fi Direct offer nobody asked for.
+    offered_direct: Mutex<Option<DirectOffered>>,
+    /// The link of the relay directory this identity runs, if it does.
+    directory_link: Mutex<Option<String>>,
+    /// The last word on volunteering or directories (`VolunteerNote`).
+    volunteer_note: Mutex<Option<String>>,
     redialing: Mutex<HashSet<Option<String>>>,
     /// The conversation on screen while the window is focused; its
     /// messages don't notify.
@@ -243,6 +278,15 @@ impl Core {
             log: Mutex::new(String::new()),
             ui,
             metered: AtomicBool::new(false),
+            visible: AtomicBool::new(true),
+            power_saver: AtomicBool::new(false),
+            foreground: AtomicBool::new(true),
+            foreground_op: Mutex::new(()),
+            radio_op: Mutex::new(()),
+            asked_direct: Mutex::new(HashMap::new()),
+            offered_direct: Mutex::new(None),
+            directory_link: Mutex::new(None),
+            volunteer_note: Mutex::new(None),
             redialing: Mutex::new(HashSet::new()),
             watching: Mutex::new(None),
             _lock: lock_file,
@@ -262,6 +306,15 @@ impl Core {
         core.main.set_file_store(Arc::new(LinuxFiles {
             dir: core.media_dir(None),
         }));
+        // Radios and the relay roles can take seconds to start: the
+        // window shouldn't wait.
+        let weak = Arc::downgrade(&core);
+        std::thread::spawn(move || {
+            if let Some(core) = weak.upgrade() {
+                core.apply_radio();
+                core.start_roles();
+            }
+        });
         // Tunnels as the setting says from the start: on, they come back
         // with the peers kept from the last run; off, anything a killed
         // run left on disk goes.
@@ -358,6 +411,297 @@ impl Core {
                 self.cover_ms().map_or("—".into(), |ms| format!("{ms} ms"))
             ));
         }
+        self.update_foreground();
+    }
+
+    // ----- Nearby: Bluetooth and Wi-Fi Direct -----
+
+    /// Starts or stops Bluetooth and leaves Wi-Fi Direct groups as the
+    /// Nearby settings say (main identity only: anonymous identities never
+    /// use radios). Blocks: call it off the GTK thread. Not run on network
+    /// changes, so a computer without an adapter doesn't retry and log
+    /// each time.
+    pub fn apply_radio(&self) {
+        // Settings are read under the lock: whichever call runs last sees
+        // the latest switches, and a start still running when the switch
+        // goes off finishes before that call stops it.
+        let _op = lock(&self.radio_op);
+        let (bluetooth, wifi_direct) = {
+            let s = self.settings();
+            (
+                s.opted_in(settings::BLUETOOTH),
+                s.opted_in(settings::WIFI_DIRECT),
+            )
+        };
+        let running = self.main.bluetooth_running();
+        if bluetooth && !running {
+            match self.main.start_bluetooth() {
+                Ok(psm) => self.say(format!(
+                    "Bluetooth LE: advertising, L2CAP psm {psm}; approved contacts nearby connect automatically"
+                )),
+                Err(e) => self.say(format!("! Bluetooth LE unavailable: {e}")),
+            }
+        } else if !bluetooth {
+            // Always: stopping what isn't running costs nothing.
+            self.main.stop_bluetooth();
+            if running {
+                self.say("* Bluetooth LE off");
+            }
+        }
+        if !wifi_direct {
+            lock(&self.offered_direct).take();
+            // A join still running counts: it's left once done.
+            if self.main.wifi_direct_busy() {
+                let n = self.main.leave_wifi_direct();
+                self.say(format!("* left {n} Wi-Fi Direct group(s)"));
+            }
+        }
+    }
+
+    /// "Faster link" in a contact's chat: joins the group `devices` (the
+    /// contact's) offered unasked in the last two minutes, else asks
+    /// `device` to host one, whose offer is then joined when it comes.
+    /// Returns what happened, for a toast. Blocks.
+    pub fn faster_link(
+        self: &Arc<Self>,
+        devices: &[String],
+        device: &str,
+        title: &str,
+    ) -> Result<String, String> {
+        let waiting = {
+            let mut o = lock(&self.offered_direct);
+            match o.as_ref() {
+                Some(d) if devices.contains(&d.peer) && d.at.elapsed() < ASKED_FOR => o.take(),
+                _ => None,
+            }
+        };
+        if let Some(d) = waiting {
+            self.join_wifi_direct(d.peer, d.ssid, d.passphrase, d.addr);
+            return Ok(format!("Joining {title}'s Wi-Fi Direct link…"));
+        }
+        self.main
+            .request_wifi_direct(device.to_owned())
+            .map_err(|e| e.to_string())?;
+        lock(&self.asked_direct).insert(device.to_owned(), Instant::now());
+        Ok(format!("Asked {title} to set up Wi-Fi Direct…"))
+    }
+
+    /// An offer from a contact (main identity only): joined if we asked
+    /// that contact for it lately, else kept for "Faster link". Joining
+    /// takes this computer's Wi-Fi off its network, so a contact can't
+    /// make it happen alone.
+    fn wifi_direct_offer(self: &Arc<Self>, peer: &str, ssid: &str, passphrase: &str, addr: &str) {
+        let who = short(peer);
+        if !self.settings().opted_in(settings::WIFI_DIRECT) {
+            self.say(format!(
+                "* {who} offers a Wi-Fi Direct link; turn on Join Wi-Fi Direct links in Preferences to use it"
+            ));
+            return;
+        }
+        let asked = {
+            let mut asked = lock(&self.asked_direct);
+            asked.retain(|_, t| t.elapsed() < ASKED_FOR);
+            asked.remove(peer).is_some()
+        };
+        if asked {
+            self.join_wifi_direct(
+                peer.to_owned(),
+                ssid.to_owned(),
+                passphrase.to_owned(),
+                addr.to_owned(),
+            );
+        } else {
+            *lock(&self.offered_direct) = Some(DirectOffered {
+                peer: peer.to_owned(),
+                ssid: ssid.to_owned(),
+                passphrase: passphrase.to_owned(),
+                addr: addr.to_owned(),
+                at: Instant::now(),
+            });
+            self.say(format!(
+                "* {who} offers a Wi-Fi Direct link ({ssid}); Faster link in their chat takes it \
+                 (the Wi-Fi leaves its network meanwhile)"
+            ));
+        }
+    }
+
+    /// Joins in the background: it takes up to a minute.
+    fn join_wifi_direct(
+        self: &Arc<Self>,
+        peer: String,
+        ssid: String,
+        passphrase: String,
+        addr: String,
+    ) {
+        let weak = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let Some(core) = weak.upgrade() else { return };
+            let who = short(&peer);
+            core.say(format!("* joining {who}'s Wi-Fi Direct group {ssid}…"));
+            match core
+                .main
+                .join_wifi_direct(peer, ssid.clone(), passphrase, addr)
+            {
+                Ok(()) => core.say(format!("* joined {who}'s Wi-Fi Direct group {ssid}")),
+                Err(e) => core.say(format!("! Wi-Fi Direct: {e}")),
+            }
+        });
+    }
+
+    // ----- Volunteering and running a relay directory -----
+
+    /// Volunteers and serves a directory as the settings say (main
+    /// identity only: net refuses both for anonymous identities). Blocks.
+    fn start_roles(&self) {
+        let (volunteer, directory, review) = {
+            let s = self.settings();
+            (
+                s.text(settings::VOLUNTEER_ADDRS).map(str::to_owned),
+                s.text(settings::DIRECTORY_ADDR).map(str::to_owned),
+                s.flag(settings::DIRECTORY_REVIEW),
+            )
+        };
+        if let Some(text) = volunteer {
+            match threnody_ffi::relay_addrs(text)
+                .and_then(|a| self.main.set_volunteer(a.clone()).map(|()| a))
+            {
+                Ok(addrs) => {
+                    self.say(format!("* volunteering as a relay at {}", addrs.join(", ")));
+                    self.check_volunteer_port(&addrs);
+                }
+                Err(e) => self.say(format!("! volunteering: {e}")),
+            }
+        }
+        if let Some(addr) = directory {
+            match self.main.serve_directory(addr, review) {
+                Ok(link) => {
+                    self.say("* serving a relay directory");
+                    *lock(&self.directory_link) = Some(link);
+                }
+                Err(e) => self.say(format!("! relay directory: {e}")),
+            }
+        } else if self.main.serving_directory() {
+            self.say(
+                "* this identity serves a relay directory; set its address in Preferences to get its link",
+            );
+        }
+    }
+
+    /// A directory checks that a volunteer is reachable at its address:
+    /// after a fallback to another port, a saved address may not be.
+    fn check_volunteer_port(&self, addrs: &[String]) {
+        if volunteer_port_moved(addrs, self.port) {
+            self.say(format!(
+                "! volunteer address uses port {PORT}, but it was taken: this computer listens on {}",
+                self.port
+            ));
+        }
+    }
+
+    /// Volunteers at the addresses in `text` (`host:port`s), or stops
+    /// (`None`), and keeps the choice. Returns the addresses. Blocks.
+    pub fn set_volunteer(&self, text: Option<&str>) -> Result<Vec<String>, String> {
+        let Some(text) = text else {
+            self.main
+                .set_volunteer(Vec::new())
+                .map_err(|e| e.to_string())?;
+            self.settings().set_text(settings::VOLUNTEER_ADDRS, "");
+            self.say("* stopped volunteering as a relay");
+            return Ok(Vec::new());
+        };
+        let addrs = threnody_ffi::relay_addrs(text.to_owned()).map_err(|e| e.to_string())?;
+        self.main
+            .set_volunteer(addrs.clone())
+            .map_err(|e| e.to_string())?;
+        self.settings()
+            .set_text(settings::VOLUNTEER_ADDRS, &addrs.join(","));
+        self.say(format!("* volunteering as a relay at {}", addrs.join(", ")));
+        self.check_volunteer_port(&addrs);
+        Ok(addrs)
+    }
+
+    /// Runs a relay directory at `addr`, and keeps the choice; returns
+    /// its link. Blocks.
+    pub fn serve_directory(&self, addr: &str, review: bool) -> Result<String, String> {
+        let link = self
+            .main
+            .serve_directory(addr.trim().to_owned(), review)
+            .map_err(|e| e.to_string())?;
+        {
+            let mut s = self.settings();
+            s.set_text(settings::DIRECTORY_ADDR, addr.trim());
+            s.set_flag(settings::DIRECTORY_REVIEW, review);
+        }
+        *lock(&self.directory_link) = Some(link.clone());
+        self.say("* serving a relay directory");
+        Ok(link)
+    }
+
+    /// Stops the directory and forgets it, so it doesn't start again.
+    pub fn stop_directory(&self) {
+        self.main.stop_serving_directory();
+        {
+            let mut s = self.settings();
+            s.set_text(settings::DIRECTORY_ADDR, "");
+            s.set_text(settings::DIRECTORY_REVIEW, "");
+        }
+        lock(&self.directory_link).take();
+        self.say("* stopped serving the relay directory");
+    }
+
+    pub fn directory_link(&self) -> Option<String> {
+        lock(&self.directory_link).clone()
+    }
+
+    pub fn volunteer_note(&self) -> Option<String> {
+        lock(&self.volunteer_note).clone()
+    }
+
+    /// An address to suggest for volunteering or a directory (blocks:
+    /// reachability asks the node).
+    pub fn suggested_public_addr(&self) -> Option<String> {
+        let r = self.main.reachability();
+        suggest_public_addr(&r.addresses, r.symmetric, self.port)
+    }
+
+    // ----- Foreground -----
+
+    /// The window was shown or hidden. Only notes it: call it on the GTK
+    /// thread, in signal order, then `update_foreground` off that thread.
+    pub fn set_window_visible(&self, on: bool) {
+        self.visible.store(on, Ordering::Relaxed);
+    }
+
+    /// The system's power saver was turned on or off. Only notes it, as
+    /// `set_window_visible` does.
+    pub fn set_power_saver(&self, on: bool) {
+        self.power_saver.store(on, Ordering::Relaxed);
+    }
+
+    /// Polls contacts at the foreground rate unless the window is hidden
+    /// and the network is metered or power saver is on. Blocks briefly.
+    pub fn update_foreground(&self) {
+        let _op = lock(&self.foreground_op);
+        let on = foreground_wanted(
+            self.visible.load(Ordering::Relaxed),
+            self.metered.load(Ordering::Relaxed),
+            self.power_saver.load(Ordering::Relaxed),
+        );
+        if self.foreground.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        self.main.set_foreground(on);
+        let personas: Vec<Node> = lock(&self.personas)
+            .values()
+            .map(|p| p.node.clone())
+            .collect();
+        for p in personas {
+            p.set_foreground(on);
+        }
+        self.say(format!(
+            "* polling contacts at the {} rate",
+            if on { "foreground" } else { "background" }
+        ));
     }
 
     fn cover_ms(&self) -> Option<u32> {
@@ -747,6 +1091,7 @@ impl Core {
         let key = format!("port_{}", rec.id);
         let want = self.settings().number(&key).unwrap_or(0);
         self.apply_privacy_to(&node, true);
+        node.set_foreground(self.foreground.load(Ordering::Relaxed));
         let addr = node
             .listen(format!("0.0.0.0:{want}"))
             .or_else(|_| node.listen("0.0.0.0:0".into()))
@@ -1135,6 +1480,31 @@ impl Core {
                     forwarded,
                 }
             }
+            // The passphrase is only for joining; nothing past here needs it.
+            NodeEvent::WifiDirectOffer {
+                peer,
+                ssid,
+                passphrase,
+                addr,
+            } => {
+                let e = NodeEvent::WifiDirectOffer {
+                    peer,
+                    ssid,
+                    passphrase: String::new(),
+                    addr,
+                };
+                self.say(describe(&e));
+                // Anonymous identities never get here (their nodes drop
+                // offers); were one to, it still mustn't join.
+                if persona.is_none()
+                    && let NodeEvent::WifiDirectOffer {
+                        peer, ssid, addr, ..
+                    } = &e
+                {
+                    self.wifi_direct_offer(peer, ssid, &passphrase, addr);
+                }
+                e
+            }
             e => {
                 match &e {
                     NodeEvent::Connected { peer, via } => self.say(format!(
@@ -1184,7 +1554,16 @@ impl Core {
                     NodeEvent::Fallback { peer, notice } => {
                         self.say(format!("* {}: {notice}", short(peer)));
                     }
-                    other => self.say(format!("· {other:?}")),
+                    NodeEvent::VolunteerNote { note } if persona.is_none() => {
+                        self.say(format!("* {note}"));
+                        *lock(&self.volunteer_note) = Some(note.clone());
+                    }
+                    // Hosting needs root access to wpa_supplicant.
+                    NodeEvent::WifiDirectRequested { peer } => self.say(format!(
+                        "* {} asked for a Wi-Fi Direct link; this computer can only join groups",
+                        short(peer)
+                    )),
+                    other => self.say(describe(other)),
                 }
                 e
             }
@@ -1415,8 +1794,111 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
     out
 }
 
+/// Whether contacts are polled at the foreground rate: always while the
+/// window is shown; hidden, unless the network is metered or power saver
+/// is on (a desktop on mains power and an unmetered network keeps it, as
+/// a contact's punch only lasts minutes).
+/// Whether volunteer addresses name the usual port while this computer
+/// fell back to another. Only then: a router's mapping or a reflected
+/// address (what `suggest_public_addr` offers) often has a port of its
+/// own, and that's fine.
+fn volunteer_port_moved(addrs: &[String], listening: u16) -> bool {
+    let ports: Vec<u16> = addrs
+        .iter()
+        .filter_map(|a| a.rsplit_once(':')?.1.parse().ok())
+        .collect();
+    listening != PORT && ports.contains(&PORT) && !ports.contains(&listening)
+}
+
+pub fn foreground_wanted(visible: bool, metered: bool, power_saver: bool) -> bool {
+    visible || !(metered || power_saver)
+}
+
+/// A public address to suggest for volunteering or a directory: the
+/// first of ours (as contacts would dial them) whose IP is global, kept
+/// as reported; `port` only fills in one without a port. None behind a
+/// symmetric NAT, whose reflected address nobody can dial.
+pub fn suggest_public_addr(addresses: &[String], symmetric: bool, port: u16) -> Option<String> {
+    use std::net::{IpAddr, SocketAddr};
+    if symmetric {
+        return None;
+    }
+    let global = |ip: IpAddr| match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (a == 100 && (b & 0xc0) == 64))
+        }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
+    };
+    addresses.iter().find_map(|a| {
+        if let Ok(sa) = a.parse::<SocketAddr>() {
+            return global(sa.ip()).then(|| a.clone());
+        }
+        let ip = a.parse::<IpAddr>().ok()?;
+        global(ip).then(|| SocketAddr::new(ip, port).to_string())
+    })
+}
+
 pub fn short(fp: &str) -> String {
     fp.chars().take(9).collect()
+}
+
+/// An event for the log, which is for transports, not content: events
+/// carrying secrets (a Wi-Fi Direct passphrase) or content (credential
+/// attributes, pseudonyms, group names, reactions) are logged by kind and
+/// short ids only; anything else by its `Debug` text.
+pub fn describe(e: &NodeEvent) -> String {
+    match e {
+        NodeEvent::WifiDirectOffer {
+            peer, ssid, addr, ..
+        } => format!(
+            "· WifiDirectOffer {{ peer: {}, ssid: {ssid:?}, addr: {addr} }}",
+            short(peer)
+        ),
+        NodeEvent::CredentialOffered { offer } => format!(
+            "· CredentialOffered {{ id: {}, peer: {}, schema: {:?} }}",
+            offer.id,
+            short(&offer.peer),
+            offer.schema
+        ),
+        NodeEvent::CredentialAsked { ask } => format!(
+            "· CredentialAsked {{ id: {}, peer: {}, schema: {:?} }}",
+            ask.id,
+            short(&ask.peer),
+            ask.schema
+        ),
+        NodeEvent::CredentialPresented {
+            id, peer, schema, ..
+        } => format!(
+            "· CredentialPresented {{ id: {id}, peer: {}, schema: {schema:?} }}",
+            short(peer)
+        ),
+        NodeEvent::GroupInvited {
+            group, from, quiet, ..
+        } => format!(
+            "· GroupInvited {{ group: {}, from: {}, quiet: {quiet} }}",
+            short(group),
+            short(from)
+        ),
+        NodeEvent::GroupJoined { group, owner, .. } => format!(
+            "· GroupJoined {{ group: {}, owner: {} }}",
+            short(group),
+            short(owner)
+        ),
+        NodeEvent::IdentityRevealed { peer, .. } => {
+            format!("· IdentityRevealed {{ peer: {} }}", short(peer))
+        }
+        NodeEvent::CallReaction { peer, call, .. } => {
+            format!("· CallReaction {{ peer: {}, call: {call} }}", short(peer))
+        }
+        NodeEvent::Other { description } => description.clone(),
+        other => format!("· {other:?}"),
+    }
 }
 
 pub fn is_image(name: &str) -> bool {
@@ -1838,5 +2320,121 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         clear_dir(&dir.join("missing"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_never_logs_secrets_or_content() {
+        use threnody_ffi::{CredentialOfferRecord, ProfileAttr};
+        let peer = "ABCDEFGHIJKLMNOP".to_string();
+        let offer = describe(&NodeEvent::WifiDirectOffer {
+            peer: peer.clone(),
+            ssid: "DIRECT-th-abcd".into(),
+            passphrase: "s3cretpass".into(),
+            addr: "192.168.49.1:7450".into(),
+        });
+        assert!(!offer.contains("s3cretpass"), "{offer}");
+        assert!(offer.contains("DIRECT-th-abcd"), "{offer}");
+
+        let attr = |key: &str, value: &str| ProfileAttr {
+            key: key.into(),
+            value: value.into(),
+        };
+        let credential = describe(&NodeEvent::CredentialOffered {
+            offer: CredentialOfferRecord {
+                id: 7,
+                peer: peer.clone(),
+                issuer: "issuer".into(),
+                schema: "club/member".into(),
+                attributes: vec![attr("name", "Jane Roe")],
+                expires_day: 0,
+            },
+        });
+        assert!(!credential.contains("Jane Roe"), "{credential}");
+        assert!(credential.contains("club/member"), "{credential}");
+
+        let presented = describe(&NodeEvent::CredentialPresented {
+            id: 3,
+            peer: peer.clone(),
+            issuer: "issuer".into(),
+            schema: "age/over18".into(),
+            attributes: vec![attr("born", "1990-01-01")],
+            pseudonym: "nym123".into(),
+        });
+        assert!(!presented.contains("1990-01-01"), "{presented}");
+        assert!(!presented.contains("nym123"), "{presented}");
+        assert!(presented.contains("age/over18"), "{presented}");
+
+        let invited = describe(&NodeEvent::GroupInvited {
+            group: "0123456789abcdef".into(),
+            name: "Secret club".into(),
+            from: peer.clone(),
+            quiet: false,
+        });
+        assert!(!invited.contains("Secret club"), "{invited}");
+        assert!(invited.contains("012345678"), "{invited}");
+
+        let delivered = NodeEvent::Delivered {
+            peer: peer.clone(),
+            group: None,
+        };
+        assert!(describe(&delivered).contains(&format!("{delivered:?}")));
+        let other = NodeEvent::Other {
+            description: "radio: hello".into(),
+        };
+        assert_eq!(describe(&other), "radio: hello");
+    }
+
+    #[test]
+    fn foreground_when_shown_or_unconstrained() {
+        for metered in [false, true] {
+            for saver in [false, true] {
+                assert!(foreground_wanted(true, metered, saver));
+                assert_eq!(foreground_wanted(false, metered, saver), !metered && !saver);
+            }
+        }
+    }
+
+    #[test]
+    fn public_address_suggestion() {
+        let pick = |a: &[&str], symmetric: bool| {
+            let a: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            suggest_public_addr(&a, symmetric, 7450)
+        };
+        let private = [
+            "192.168.1.5:7450",
+            "10.0.0.1:7450",
+            "100.64.0.1:1",
+            "127.0.0.1:1",
+            "fe80::1",
+        ];
+        assert_eq!(pick(&private, false), None);
+        let mut v4 = private.to_vec();
+        v4.push("203.0.113.9:40000");
+        assert_eq!(pick(&v4, false).as_deref(), Some("203.0.113.9:40000"));
+        let mut v6 = private.to_vec();
+        v6.push("[2001:db8::1]:7450");
+        assert_eq!(pick(&v6, false).as_deref(), Some("[2001:db8::1]:7450"));
+        assert_eq!(
+            pick(&["2001:db8::2"], false).as_deref(),
+            Some("[2001:db8::2]:7450")
+        );
+        assert_eq!(pick(&[], false), None);
+        assert_eq!(pick(&["203.0.113.9:40000"], true), None);
+    }
+
+    #[test]
+    fn volunteer_port_warning_only_after_a_fallback() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A mapped or reflected port of its own is fine.
+        assert!(!volunteer_port_moved(&v(&["203.0.113.9:40000"]), PORT));
+        assert!(!volunteer_port_moved(&v(&["203.0.113.9:40000"]), 40001));
+        assert!(!volunteer_port_moved(&v(&["203.0.113.9:7450"]), PORT));
+        // Saved with the usual port, which was taken this time.
+        assert!(volunteer_port_moved(&v(&["203.0.113.9:7450"]), 40001));
+        assert!(!volunteer_port_moved(
+            &v(&["203.0.113.9:7450", "198.51.100.2:40001"]),
+            40001
+        ));
+        assert!(!volunteer_port_moved(&v(&["relay.example"]), 40001));
     }
 }

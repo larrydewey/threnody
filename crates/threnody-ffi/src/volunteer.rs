@@ -67,6 +67,49 @@ pub(crate) fn ask_record(a: CredentialAsk) -> CredentialAskRecord {
     }
 }
 
+/// Credential offers and asks from one contact, waiting for an answer.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PendingCredentials {
+    pub offers: Vec<CredentialOfferRecord>,
+    pub asks: Vec<CredentialAskRecord>,
+}
+
+/// A relay registered with the directory this node runs.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DirectoryRelayRecord {
+    pub fingerprint: String,
+    pub addrs: Vec<String>,
+    /// Whether clients see it (it may wait for review).
+    pub listed: bool,
+    pub expires_ms: u64,
+}
+
+/// Parses relay addresses the user typed: `host:port`s separated by
+/// commas or spaces. An IPv6 host needs brackets (`[::1]:7450`). The list
+/// must also pass the descriptor rule (1 to 8, each at most 64 bytes).
+#[uniffi::export]
+pub fn relay_addrs(text: String) -> Result<Vec<String>> {
+    let addrs: Vec<String> = text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|a| !a.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for a in &addrs {
+        let ok = a.rsplit_once(':').is_some_and(|(host, port)| {
+            let bracketed = host.len() > 2 && host.starts_with('[') && host.ends_with(']');
+            !host.is_empty()
+                && (bracketed || !host.contains([':', '[', ']']))
+                && port.parse::<u16>().is_ok_and(|p| p > 0)
+        });
+        if !ok {
+            return Err(fail(format!("{a:?} isn't host:port")));
+        }
+    }
+    threnody_core::directory::check_relay_addrs(&addrs)
+        .map_err(|_| fail("give 1 to 8 addresses, each at most 64 characters"))?;
+    Ok(addrs)
+}
+
 pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -127,6 +170,50 @@ impl ThrenodyNode {
         self.node.volunteering()
     }
 
+    /// Runs a relay directory on this identity, reachable at `addr`
+    /// (`host:port`); returns the `threnody-dir://` link to share. With
+    /// `review`, registered relays wait for `set_relay_listed`. Not for an
+    /// anonymous identity.
+    pub fn serve_directory(&self, addr: String, review: bool) -> Result<String> {
+        threnody_core::directory::check_relay_addrs(std::slice::from_ref(&addr)).map_err(fail)?;
+        let _guard = self.rt.enter();
+        self.node.serve_directory(&addr, review).map_err(fail)
+    }
+
+    /// Stops the directory and deletes its state; returns whether one ran.
+    pub fn stop_serving_directory(&self) -> bool {
+        self.node.stop_serving_directory()
+    }
+
+    pub fn serving_directory(&self) -> bool {
+        self.node.serving_directory()
+    }
+
+    /// Relays registered with our directory.
+    pub fn directory_relays(&self) -> Vec<DirectoryRelayRecord> {
+        let mut out: Vec<DirectoryRelayRecord> = self
+            .node
+            .directory_relays()
+            .into_iter()
+            .map(|r| DirectoryRelayRecord {
+                fingerprint: fp(&r.identity),
+                addrs: r.addrs,
+                listed: r.listed,
+                expires_ms: r.expires_ms,
+            })
+            .collect();
+        out.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        out
+    }
+
+    /// Lists (or unlists) a registered relay; `Ok(false)` if there is no
+    /// such relay.
+    pub fn set_relay_listed(&self, relay: String, listed: bool) -> Result<bool> {
+        let f: threnody_core::Fingerprint = relay.parse().map_err(fail)?;
+        let _guard = self.rt.enter();
+        Ok(self.node.set_relay_listed(&f, listed))
+    }
+
     // ----- Credentials -----
 
     pub fn credentials(&self) -> Vec<CredentialRecord> {
@@ -162,6 +249,29 @@ impl ThrenodyNode {
                 expires,
             )
             .map_err(fail)
+    }
+
+    /// The offers and asks from `peer`'s account (any of its devices)
+    /// still waiting for an answer, in a stable order (by id).
+    pub fn pending_credentials(&self, peer: String) -> Result<PendingCredentials> {
+        let devices = self.account_devices(&self.resolve(&peer)?);
+        let mut offers: Vec<CredentialOfferRecord> = self
+            .node
+            .credential_offers()
+            .into_iter()
+            .filter(|o| devices.contains(&o.peer))
+            .map(offer_record)
+            .collect();
+        offers.sort_by_key(|o| o.id);
+        let mut asks: Vec<CredentialAskRecord> = self
+            .node
+            .credential_asks()
+            .into_iter()
+            .filter(|a| devices.contains(&a.peer))
+            .map(ask_record)
+            .collect();
+        asks.sort_by_key(|a| a.id);
+        Ok(PendingCredentials { offers, asks })
     }
 
     pub fn credential_offers(&self) -> Vec<CredentialOfferRecord> {
