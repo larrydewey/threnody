@@ -58,9 +58,14 @@ jobs:
           # Android version codes must grow with each release.
           code=$(( major * 1000000 + minor * 1000 + patch ))
           echo "code=$code" >> "$GITHUB_OUTPUT"
-          # F-Droid's update checker reads the literal.
+          # F-Droid's update checker reads the literal, and its listing wants
+          # a changelog for each versionCode (rc tags share the release's).
           grep -q "^ *versionCode = $code\$" apps/android/app/build.gradle.kts \
             || { echo "::error::app/build.gradle.kts versionCode is not $code"; exit 1; }
+          changelog="fastlane/metadata/android/en-US/changelogs/$code.txt"
+          test -s "$changelog" || { echo "::error::no Android changelog $changelog"; exit 1; }
+          (( $(wc -m < "$changelog") <= 500 )) \
+            || { echo "::error::$changelog is over F-Droid's 500 characters"; exit 1; }
           [[ "$version" == *-* ]] && pre=true || pre=false
           echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
 

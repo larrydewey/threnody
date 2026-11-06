@@ -206,7 +206,7 @@ crates/threnody-ffi/bindings.sh    # generate bindings, run the Python binding t
 
 Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, Android builds with and without calls (the second as F-Droid builds it), an iOS simulator build and a dependency advisory check (`.github/workflows/ci.yml`). It also builds and tests on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
 
-To release, bump `version` in the workspace `Cargo.toml` and the matching `versionCode` and `versionName` literals in `apps/android/app/build.gradle.kts` (the Android build fails if they differ), then push a matching tag:
+To release, bump `version` in the workspace `Cargo.toml` and the matching `versionCode` and `versionName` literals in `apps/android/app/build.gradle.kts` (the Android build fails if they differ), add the Android changelog `fastlane/metadata/android/en-US/changelogs/<versionCode>.txt` (500 characters at most) and set the version in the F-Droid recipe (`apps/android/fdroid/org.threnody.app.yml`), then push a matching tag:
 
 ```sh
 git tag -a v0.2.0 -m "Threnody 0.2.0" && git push origin v0.2.0
