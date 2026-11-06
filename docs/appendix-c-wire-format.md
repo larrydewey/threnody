@@ -254,6 +254,7 @@ A backup leaves out:
 - **One-time prekeys,** ours (`prekeys`) and those we hold for contacts (`bundles`). A restored copy would let a sealed message that was already opened be opened again, or seal a second message to a prekey a contact already used. Fresh ones are made and handed out as sessions come up. Messages sealed to the lost device's prekeys can't be opened.
 - **Relay tokens** (`relay-wallet`, Appendix P), each of which can be spent once.
 - **Anonymous identities** (Appendix M). A backup would link them to the main identity.
+- **Saved tunnel peers** (`tunnels`, Appendix D, *Persistence*). Their PSKs come from sessions with this device, so they never leave it.
 - **Received files' contents.** History keeps only where the app saved them.
 
 **Restoring** replaces the identity, contacts, state and personas in a data directory. The backup is opened and checked first, so a wrong passphrase or a damaged file changes nothing. The restored identity is sealed the way a new one would be (the keyring, a passphrase, or the Android Keystore). Apps can't stop their node while they run, so they *stage* a restore in `<data dir>.restore` and restart. The staged files replace the old ones before the node next opens. The user's other files in the data directory, such as downloads, stay.
