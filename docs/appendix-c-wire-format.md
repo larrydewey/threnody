@@ -194,7 +194,7 @@ Versions before the contact book was encrypted kept it unencrypted in `contacts.
 - **A name** given there wins, except a `my <device>` name, which the older version gives our own devices by itself, where the encrypted book has one.
 - **The later sighting** (key 7) brings its address, the peer's approval and its feature bits. Anything else missing from the encrypted book is filled in from the plain one.
 
-Deletions recorded in the plain file (key 2) are kept, and the deleted contacts' conversations are deleted too (0.17.3 deleted only the files under the old names).
+Deletions recorded in the plain file (key 2) are kept, and the deleted contacts' conversations are deleted too (0.17.3 deleted only the files under the old names). Deleting a message request leaves no record there, so a contact from before the downgrade whose returning request was deleted then stays, with its conversation.
 
 **Going back to a version before 0.18.0** after upgrading is not supported, but loses nothing. The older version can't read `contacts.state` or the keyed history names, so while it runs it shows no contacts and no history. Contacts that reach it come back as new, unnamed and unapproved, and it writes what it learns to a fresh `contacts.cbor` and to history under the old names. It never touches the files 0.18.0 wrote. When 0.18.0 next opens the home, both are merged back as described above. Contacts added while downgraded keep their names and approvals. Blocks, deletions, approvals, revocations, verifications and names given then are kept, and verifications and approvals from before are not undone by a contact only being seen again. Messages sent and received then join their conversations, and timers, drafts and notification settings chosen then are kept.
 
