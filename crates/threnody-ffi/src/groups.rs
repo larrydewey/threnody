@@ -416,6 +416,37 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// The mentions an app names (by member device) in group `g`, as a
+    /// message carries them; those naming no member are left out.
+    pub(crate) fn group_mentions(&self, g: &GroupId, mentions: &[MentionInfo]) -> Vec<Mention> {
+        let members = self
+            .group_node()
+            .list()
+            .into_iter()
+            .find(|(id, ..)| id == g)
+            .map(|(.., m)| m)
+            .unwrap_or_default();
+        mentions
+            .iter()
+            .filter_map(|m| {
+                let d = members.iter().find(|d| fp(d) == m.device)?;
+                Some(Mention {
+                    start: m.start,
+                    len: m.len,
+                    who: self.node.reactor_of(d),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether we're a member of group `g`.
+    pub(crate) fn in_group(&self, g: &GroupId) -> bool {
+        self.group_node()
+            .list()
+            .into_iter()
+            .any(|(id, ..)| id == *g)
+    }
+
     /// A group (or invitation) by hex id prefix.
     pub(crate) fn group_id(&self, id: &str) -> Result<GroupId> {
         let gn = self.group_node();
@@ -635,7 +666,11 @@ impl ThrenodyNode {
     /// it. Its history stays.
     pub fn leave_group(&self, group: String) -> Result<()> {
         let g = self.group_id(&group)?;
-        self.group_change(|gn| gn.leave(&self.node, &g))
+        self.group_change(|gn| gn.leave(&self.node, &g))?;
+        // Leaving is our choice, like deleting a chat: what we scheduled
+        // there goes (being removed fails it when due, so we hear of it).
+        self.node.drop_scheduled(ConversationId::Group(g));
+        Ok(())
     }
 
     /// Sends text to every other member (recorded in the group's history).
@@ -853,24 +888,7 @@ impl ThrenodyNode {
             (Some(at), Some(d)) => self.node.quote_of(conv, crate::entry_at(at, d)),
             _ => None,
         };
-        let members = self
-            .group_node()
-            .list()
-            .into_iter()
-            .find(|(id, ..)| *id == g)
-            .map(|(.., m)| m)
-            .unwrap_or_default();
-        let mentions = mentions
-            .iter()
-            .filter_map(|m| {
-                let d = members.iter().find(|d| fp(d) == m.device)?;
-                Some(Mention {
-                    start: m.start,
-                    len: m.len,
-                    who: self.node.reactor_of(d),
-                })
-            })
-            .collect();
+        let mentions = self.group_mentions(&g, &mentions);
         let _guard = self.rt.enter();
         self.group_node()
             .send_message(&self.node, &g, &text, quote, mentions)

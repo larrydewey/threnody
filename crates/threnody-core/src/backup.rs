@@ -18,9 +18,11 @@
 //! Left out on purpose: one-time prekeys (ours and our contacts'), since
 //! restoring used ones would let old sealed messages replay or be sealed
 //! twice to the same key; relay tokens, which are spent once; personas,
-//! which must stay unlinkable to the main identity; and saved tunnel
-//! peers, whose PSKs are bound to sessions with this device, so they
-//! never leave it. See `docs/appendix-c-wire-format.md`, *Backups*.
+//! which must stay unlinkable to the main identity; scheduled messages,
+//! since a backup restored later must not suddenly send old messages, or
+//! send them a second time while the old device still runs; and saved
+//! tunnel peers, whose PSKs are bound to sessions with this device, so
+//! they never leave it. See `docs/appendix-c-wire-format.md`, *Backups*.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,13 +44,16 @@ const MAGIC: &[u8] = b"threnody backup\n";
 const PURPOSE: &str = "threnody v1 backup";
 const VERSION: u64 = 1;
 
-/// State files a backup leaves out (see the module comment). `tunnels`:
-/// PSKs are bound to sessions with this device, so they never leave it.
+/// State files a backup leaves out (see the module comment). Scheduled
+/// messages among them: restored later, they would send old messages, or
+/// send them twice if the old device still runs. `tunnels`: PSKs are
+/// bound to sessions with this device, so they never leave it.
 const LEFT_OUT: &[&str] = &[
     "prekeys",
     "bundles",
     "relay-wallet",
     "personas",
+    "scheduled",
     crate::tunnel::STATE,
 ];
 
@@ -461,6 +466,40 @@ mod tests {
         assert!(home.dir().join("downloads/photo.jpg").exists());
         assert!(!staging_dir(home.dir()).unwrap().exists());
         assert!(!apply_staged_restore(&home).unwrap(), "applied once");
+    }
+
+    #[test]
+    fn scheduled_state_is_not_backed_up() {
+        let (a, b) = (temp(), temp());
+        let old = Home::new(a.path());
+        let id = old.create_identity(None).unwrap();
+        old.save_state(&id, "scheduled", b"send later").unwrap();
+        old.save_state(&id, "lists", b"groceries").unwrap();
+        let backup = old.export_backup_with(&id, PW, FAST).unwrap();
+        let names: Vec<String> = states_in(&backup, PW).into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n == "scheduled"));
+        assert!(names.iter().any(|n| n == "lists"));
+
+        let new = Home::new(b.path());
+        let r = new.restore_backup(&backup, PW, None).unwrap();
+        assert!(new.load_state(&r.identity, "scheduled").unwrap().is_none());
+        assert!(new.load_state(&r.identity, "lists").unwrap().is_some());
+    }
+
+    #[test]
+    fn restoring_drops_a_pending_schedule() {
+        let (a, b) = (temp(), temp());
+        let old = Home::new(a.path());
+        let id = old.create_identity(None).unwrap();
+        let backup = old.export_backup_with(&id, PW, FAST).unwrap();
+
+        // The same identity, with messages scheduled since the backup.
+        let home = Home::new(b.path());
+        home.restore_backup(&backup, PW, None).unwrap();
+        home.save_state(&id, "scheduled", b"send later").unwrap();
+        home.restore_backup(&backup, PW, None).unwrap();
+        assert!(home.load_state(&id, "scheduled").unwrap().is_none());
+        assert!(!home.dir().join("scheduled.state").exists());
     }
 
     #[test]

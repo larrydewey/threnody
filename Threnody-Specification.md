@@ -198,6 +198,7 @@ Safety-number style continuous verification MUST be supported and encouraged.
 - Optional encrypted multi-device sync.
 - User-controlled encrypted backups (no plaintext ever leaves the user’s devices unless the user explicitly exports it).
 - Local search, within one conversation or across all of them. Search runs over history decrypted in memory; implementations MUST NOT write a plaintext search index to disk.
+- Scheduled sending is local to the sending device; scheduled messages are stored encrypted, are not synced or backed up, and are indistinguishable on the wire from messages sent by hand.
 
 ---
 

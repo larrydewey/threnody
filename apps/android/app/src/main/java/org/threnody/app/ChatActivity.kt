@@ -41,6 +41,7 @@ import uniffi.threnody_ffi.MemberRole
 import uniffi.threnody_ffi.MentionInfo
 import uniffi.threnody_ffi.NotifyLevel
 import uniffi.threnody_ffi.QuoteInfo
+import uniffi.threnody_ffi.ScheduledInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
@@ -95,6 +96,12 @@ class ChatActivity : Activity() {
     /** The message the next one replies to, shown above the compose bar. */
     private var replyTo: HistoryEntry? = null
     private lateinit var replyBar: LinearLayout
+    /** "🕓 2 scheduled · next Tue 08:00" above the compose bar; opens the list. */
+    private lateinit var scheduledBar: TextView
+    /** This chat's scheduled messages, soonest first. */
+    private var scheduled: List<ScheduledInfo> = emptyList()
+    /** This chat has a disappearing timer (it applies to scheduled messages when sent). */
+    private var timerOn = false
     /** The messages on screen, so a quote can jump to what it quotes. */
     private var onScreen: List<HistoryEntry> = emptyList()
     private var unsubscribe: (() -> Unit)? = null
@@ -243,6 +250,14 @@ class ChatActivity : Activity() {
         }
         root.addView(pinBar, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        scheduledBar = label("", 14f, R.color.accent).apply {
+            setBackgroundColor(color(R.color.bar))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            visibility = View.GONE
+            background = ripple()
+            setOnClickListener { scheduledList() }
+        }
+        root.addView(scheduledBar, matchWrap)
         root.addView(replyBar, matchWrap)
         root.addView(composeBar, matchWrap)
         setContentView(root)
@@ -355,6 +370,12 @@ class ChatActivity : Activity() {
             }
             addView(field, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             sendButton = button(R.drawable.ic_send, "Send", R.color.accent) { send() }.apply { visibility = View.GONE }
+            if (!note) {
+                // Holding Send offers to send later; the press doesn't send.
+                sendButton.contentDescription = "Send (hold to send later)"
+                sendButton.tooltipText = "Send (hold to send later)"
+                sendButton.setOnLongClickListener { v -> Design.mediumHaptic(v); laterMenu(v); true }
+            }
             addView(sendButton, LinearLayout.LayoutParams(dp(48), dp(48)))
             micButton = button(R.drawable.ic_mic, "Hold to record a voice message", R.color.accent) {}
             micButton.setOnTouchListener { v, ev -> voiceTouch(v, ev) }
@@ -703,6 +724,12 @@ class ChatActivity : Activity() {
         if (::node.isInitialized) refreshSoon()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Exact alarms may have been allowed meanwhile: set the alarm again.
+        Threading.background { Scheduled.arm(applicationContext) }
+    }
+
     override fun onStop() {
         started = false
         saveDraft()
@@ -734,6 +761,8 @@ class ChatActivity : Activity() {
                 is NodeEvent.Delivered -> e.group == g
                 is NodeEvent.Reacted -> e.group == g
                 is NodeEvent.Pinned -> e.group == g
+                is NodeEvent.ScheduledChanged -> e.group == g
+                is NodeEvent.ScheduledFailed -> e.group == g
                 else -> false
             }
         }
@@ -759,6 +788,8 @@ class ChatActivity : Activity() {
             is NodeEvent.CredentialReceived -> e.peer
             is NodeEvent.CredentialPresented -> e.peer
             is NodeEvent.CredentialFailed -> e.peer
+            is NodeEvent.ScheduledChanged -> e.peer ?: return false
+            is NodeEvent.ScheduledFailed -> e.peer ?: return false
             is NodeEvent.AccountChanged -> return true
             else -> return false
         }
@@ -833,6 +864,16 @@ class ChatActivity : Activity() {
             }
         } catch (_: Exception) { "" } else ""
         val canPin = g == null || try { node.mayPinInGroup(g) } catch (_: Exception) { false }
+        val later = try {
+            when {
+                note -> emptyList()
+                g != null -> node.groupScheduled(g)
+                else -> node.scheduled(device)
+            }
+        } catch (_: Exception) { emptyList() }
+        val timer = !note && try {
+            (if (g != null) node.groupDisappearing(g) else node.disappearing(device)) != null
+        } catch (_: Exception) { false }
         // Credential offers and requests from this contact, waiting for an answer.
         val mine = c?.devices ?: listOf(device)
         val offers = if (g == null && !note) node.credentialOffers().filter { it.peer in mine } else emptyList()
@@ -844,6 +885,8 @@ class ChatActivity : Activity() {
             info = gi
             mayPin = canPin
             showPins(pinned)
+            timerOn = timer
+            showScheduled(later)
             // What we left unsent here last time.
             if (!draftShown) {
                 draftShown = true
@@ -1797,6 +1840,240 @@ class ChatActivity : Activity() {
         }
     }
 
+    // ----- Send later -----
+
+    /** Held Send: offer to send the message later. */
+    private fun laterMenu(anchor: View) {
+        if (compose.text.isBlank() || !::node.isInitialized) return
+        PopupMenu(this, anchor).apply {
+            menu.add("Send later…").setOnMenuItemClickListener { pickTime(null) { sendLater(it) }; true }
+        }.show()
+    }
+
+    /** "14:05", "tomorrow 08:00", "Tue 08:00" or "12 Mar 08:00", in local time. */
+    private fun whenText(ms: Long): String {
+        val zone = java.time.ZoneId.systemDefault()
+        val at = java.time.Instant.ofEpochMilli(ms).atZone(zone)
+        val today = java.time.LocalDate.now(zone)
+        val days = java.time.temporal.ChronoUnit.DAYS.between(today, at.toLocalDate())
+        val locale = java.util.Locale.getDefault()
+        val clock = time(ms)
+        return when (days) {
+            0L -> clock
+            1L -> "tomorrow $clock"
+            in 2L..6L -> at.format(java.time.format.DateTimeFormatter.ofPattern("EEE", locale)) + " " + clock
+            else -> at.format(java.time.format.DateTimeFormatter.ofPattern(
+                DateFormat.getBestDateTimePattern(locale, if (at.year == today.year) "dMMM" else "dMMMy"), locale)) + " " + clock
+        }
+    }
+
+    /**
+     * Asks when to send: in an hour, this evening (before 19:00), tomorrow
+     * morning, or a date and time. Quick choices count from when one is
+     * tapped. [current] is the time an item has now, if it has one.
+     */
+    private fun pickTime(current: Long?, done: (Long) -> Unit) {
+        val zone = java.time.ZoneId.systemDefault()
+        val now = java.time.ZonedDateTime.now(zone)
+        val choices = mutableListOf<Pair<String, () -> java.time.ZonedDateTime>>()
+        choices += "In 1 hour (${time(now.plusHours(1).toInstant().toEpochMilli())})" to {
+            java.time.ZonedDateTime.now(zone).plusHours(1)
+        }
+        if (now.hour < 19) choices += "This evening, ${time(now.withHour(20).withMinute(0).toInstant().toEpochMilli())}" to {
+            java.time.ZonedDateTime.now(zone).withHour(20).withMinute(0).withSecond(0).withNano(0)
+        }
+        val morning = { java.time.ZonedDateTime.now(zone).plusDays(1).withHour(8).withMinute(0).withSecond(0).withNano(0) }
+        choices += "Tomorrow morning, ${whenText(morning().toInstant().toEpochMilli()).removePrefix("tomorrow ")} (" +
+            morning().format(java.time.format.DateTimeFormatter.ofPattern("EEE", java.util.Locale.getDefault())) + ")" to morning
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val dialog = SecureBuilder(this)
+            .setTitle(if (current == null) "Send later" else "Change time")
+            .setView(ScrollView(this).apply { addView(list) })
+            .setNegativeButton("Cancel", null)
+            .create()
+        fun row(text: String, onClick: () -> Unit) = label(text, 16f, R.color.text).apply {
+            setPadding(dp(24), dp(14), dp(24), dp(14))
+            background = ripple()
+            setOnClickListener { dialog.dismiss(); onClick() }
+        }
+        fun pick(due: Long) {
+            if (due <= System.currentTimeMillis()) {
+                Toast.makeText(this, "Pick a time in the future", Toast.LENGTH_LONG).show()
+            } else done(due)
+        }
+        for ((text, at) in choices) list.addView(row(text) { pick(at().toInstant().toEpochMilli()) }, matchWrap)
+        list.addView(row("Pick date and time…") { pickDateTime(current, ::pick) }, matchWrap)
+        // Woken by pushes without exact alarms, it may send a few minutes late.
+        if (Push.active(this) && !Scheduled.exactAllowed(this) && android.os.Build.VERSION.SDK_INT >= 31) {
+            list.addView(row("May send a few minutes late. Allow exact timing") {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                        Uri.parse("package:$packageName")))
+                } catch (_: Exception) {}
+            }.apply { setTextColor(color(R.color.accent)); textSize = 14f; maxLines = 3 }, matchWrap)
+        }
+        list.addView(label("Sends from this device. Threnody needs to be running here (it wakes itself on Android).",
+            13f, R.color.muted, maxLines = 4).apply { setPadding(dp(24), dp(12), dp(24), 0) }, matchWrap)
+        dialog.show()
+    }
+
+    /** A date (today up to a year ahead), then a time. */
+    private fun pickDateTime(current: Long?, done: (Long) -> Unit) {
+        val zone = java.time.ZoneId.systemDefault()
+        val start = java.time.Instant.ofEpochMilli(current ?: (System.currentTimeMillis() + 3_600_000)).atZone(zone)
+        val now = System.currentTimeMillis()
+        android.app.DatePickerDialog(this, { _, y, m, d ->
+            android.app.TimePickerDialog(this, { _, h, min ->
+                done(java.time.ZonedDateTime.of(y, m + 1, d, h, min, 0, 0, zone).toInstant().toEpochMilli())
+            }, start.hour, start.minute, DateFormat.is24HourFormat(this)).apply { Privacy.secure(this) }.show()
+        }, start.year, start.monthValue - 1, start.dayOfMonth).apply {
+            datePicker.minDate = now
+            datePicker.maxDate = now + 365L * 24 * 3_600_000
+            Privacy.secure(this)
+        }.show()
+    }
+
+    /**
+     * Schedules what's in the compose field (with the reply and mentions)
+     * for [due], as [send] sends it now. The field clears only once the
+     * time is picked; on an error the text comes back.
+     */
+    private fun sendLater(due: Long) {
+        val raw = compose.text.toString()
+        val text = raw.trim()
+        if (text.isEmpty() || !::node.isInitialized || note) return
+        val mentions = if (group != null) Mentions.of(compose.text, raw.indexOf(text), text) else emptyList()
+        val to = replyTo
+        replyingTo(null)
+        typingHandler.removeCallbacks(stopTyping)
+        compose.setText("") // also says we stopped typing
+        Threading.background {
+            val g = group
+            val error = try {
+                if (g != null) node.scheduleGroupText(g, text, due.toULong(), to?.atMs, to?.device, mentions)
+                else node.scheduleText(device, text, due.toULong(), to?.atMs, to?.device)
+                null
+            } catch (e: Exception) {
+                e.message ?: "Couldn't schedule it"
+            }
+            refresh()
+            runOnUiThread {
+                if (error == null) {
+                    Toast.makeText(this, "Scheduled for ${whenText(due)}", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+                    if (compose.text.isEmpty()) compose.setText(text)
+                }
+            }
+        }
+    }
+
+    /** What the scheduled bar says; hidden with nothing scheduled. */
+    private fun showScheduled(list: List<ScheduledInfo>) {
+        scheduled = list
+        if (list.isEmpty()) {
+            scheduledBar.visibility = View.GONE
+            return
+        }
+        val failed = list.count { it.failed != null }
+        val waiting = list.filter { it.failed == null }
+        scheduledBar.text = buildString {
+            append("🕓 ${list.size} scheduled")
+            waiting.firstOrNull()?.let { append(" · next ${whenText(it.dueMs.toLong())}") }
+            if (failed > 0) append(" · ⚠ $failed not sent")
+        }
+        scheduledBar.setTextColor(color(if (failed > 0) R.color.warning else R.color.accent))
+        scheduledBar.contentDescription = "${scheduledBar.text}. Tap to see them."
+        scheduledBar.visibility = View.VISIBLE
+    }
+
+    /** This chat's scheduled messages; tapping one offers what to do with it. */
+    private fun scheduledList() {
+        val items = scheduled
+        if (items.isEmpty()) return
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val dialog = SecureBuilder(this)
+            .setTitle("Scheduled messages")
+            .setView(ScrollView(this).apply { addView(list) })
+            .setNegativeButton("Close", null)
+            .create()
+        for (item in items) {
+            list.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(24), dp(10), dp(24), dp(10))
+                background = ripple()
+                addView(label(whenText(item.dueMs.toLong()) + if (item.quote != null) "  ↩ reply" else "",
+                    13f, R.color.accent))
+                addView(label(item.text, 15f, R.color.text).apply {
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                })
+                item.failed?.let {
+                    addView(label("⚠ Not sent: ${Scheduled.reasonText(it)}", 13f, R.color.warning, maxLines = 2))
+                }
+                if (item.sending) addView(label("Sending now…", 13f, R.color.muted))
+                setOnClickListener {
+                    dialog.dismiss()
+                    if (item.sending) beingSent() else scheduledActions(item)
+                }
+            }, matchWrap)
+        }
+        if (timerOn) list.addView(label("Disappearing messages apply when it's sent.", 13f, R.color.muted, maxLines = 3)
+            .apply { setPadding(dp(24), dp(8), dp(24), 0) }, matchWrap)
+        dialog.show()
+    }
+
+    /** Send now, edit, move or delete one scheduled message. */
+    private fun scheduledActions(item: ScheduledInfo) {
+        SecureBuilder(this)
+            .setTitle(whenText(item.dueMs.toLong()))
+            .setItems(arrayOf("Send now", "Edit text", "Change time", "Delete")) { _, which ->
+                when (which) {
+                    0 -> Threading.background { runScheduled("send it") { node.sendScheduledNow(item.id) } }
+                    1 -> editScheduled(item)
+                    2 -> pickTime(item.dueMs.toLong()) { due ->
+                        Threading.background {
+                            runScheduled("change the time") { node.reschedule(item.id, due.toULong()) }
+                        }
+                    }
+                    3 -> SecureBuilder(this)
+                        .setMessage("Delete this scheduled message? It won't be sent.")
+                        .setPositiveButton("Delete") { _, _ ->
+                            Threading.background { runScheduled("delete it") { node.cancelScheduled(item.id) } }
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+            }
+            .show()
+    }
+
+    private fun editScheduled(item: ScheduledInfo) {
+        val field = EditText(this).apply {
+            setText(item.text)
+            setSelection(text.length)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        SecureBuilder(this)
+            .setTitle("Edit scheduled message")
+            .setView(android.widget.FrameLayout(this).apply {
+                setPadding(dp(20), dp(8), dp(20), 0)
+                addView(field)
+            })
+            .setPositiveButton("Save") { _, _ ->
+                val text = field.text.toString().trim()
+                Threading.background { runScheduled("edit it") { node.editScheduled(item.id, text) } }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun attach(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
@@ -2731,6 +3008,20 @@ class ChatActivity : Activity() {
         if (code == VOICE_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) {
             Toast.makeText(this, "Hold the microphone to record", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * Runs a call on one scheduled message; false means it's being sent
+     * right now (or already went), so nothing changed: say so.
+     */
+    private fun runScheduled(what: String, f: () -> Boolean) {
+        var done = true
+        run(what) { done = f() }
+        if (!done) runOnUiThread { beingSent() }
+    }
+
+    private fun beingSent() {
+        Toast.makeText(this, "It's being sent now", Toast.LENGTH_SHORT).show()
     }
 
     /** Runs a node call, reporting failure, then refreshes. */

@@ -17,6 +17,8 @@ enum Paths {
     /// Received files, kept out of backups like the node's directory.
     static let media = support.appendingPathComponent("media", isDirectory: true)
     static let refreshTask = "org.threnody.app.refresh"
+    /// The reminder that a scheduled message is due.
+    static let scheduledReminder = "scheduled-next"
 
     static var hasIdentity: Bool {
         FileManager.default.fileExists(atPath: home.appendingPathComponent("identity.cbor").path)
@@ -144,6 +146,10 @@ extension NodeEvent {
             return peer
         case let .file(peer, _, _, _, _, _, _, _, _, _):
             return peer
+        case let .scheduledChanged(peer?, _):
+            return peer
+        case let .scheduledFailed(peer?, _, _, _):
+            return peer
         default:
             return nil
         }
@@ -233,6 +239,9 @@ final class NodeStore: ObservableObject {
         myDevice = n.deviceFingerprint()
         n.setForeground(on: active)
         n.reconnect()
+        // iOS applies no settings of its own: the node's defaults are its
+        // settings, so scheduled messages may go out now.
+        n.startScheduledSending()
         // The store lives as long as the process.
         Self.pump(n) { e in Task { @MainActor in self.handle(e) } }
         // Files of messages that are gone: a minute after start, then every five.
@@ -249,6 +258,7 @@ final class NodeStore: ObservableObject {
         }
         phase = .ready
         refresh()
+        armScheduled()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
@@ -287,6 +297,11 @@ final class NodeStore: ObservableObject {
             notify(peer, "New message request", quiet: false, anonymous: true)
         case let .disconnected(peer, _):
             if conversation(peer)?.mutual == true { node?.reconnect() }
+        case .scheduledChanged:
+            armScheduled()
+        case let .scheduledFailed(peer?, _, _, reason):
+            // Why, never the text.
+            notify(peer, "Scheduled message not sent: \(Self.reasonText(reason))", quiet: false)
         default:
             break
         }
@@ -328,6 +343,37 @@ final class NodeStore: ObservableObject {
         content.threadIdentifier = c?.key ?? peer
         content.userInfo = ["chat": c?.key ?? peer]
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
+    /// Why a scheduled message wasn't sent.
+    nonisolated static func reasonText(_ r: ScheduleFailure) -> String {
+        switch r {
+        case .missed: return "missed its time"
+        case .contact: return "the contact was blocked or removed"
+        case .group: return "you're no longer in the group"
+        case .error: return "couldn't send"
+        case .removed: return "this device was removed from your account"
+        }
+    }
+
+    /// iOS suspends the app, so a scheduled message goes only while it
+    /// runs: at its time, a reminder (saying nothing of who or what) asks
+    /// to open the app, and a background refresh is asked for then too.
+    func armScheduled() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [Paths.scheduledReminder])
+        guard let next = node?.nextScheduledMs() else { return }
+        let wait = max(1, Date(ms: next).timeIntervalSinceNow)
+        let content = UNMutableNotificationContent()
+        content.title = "Threnody"
+        content.body = "A scheduled message is due. Open Threnody to send it."
+        content.sound = .default
+        center.add(UNNotificationRequest(
+            identifier: Paths.scheduledReminder,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: wait, repeats: false)
+        ))
+        scheduleRefresh(at: Date(ms: next))
     }
 
     /// Reloads the chat list; calls while one runs coalesce into one more.
@@ -390,6 +436,9 @@ final class NodeStore: ObservableObject {
             node?.setForeground(on: true)
             node?.reconnect()
             refresh()
+            // Sends what's due, and replaces a stale reminder.
+            node?.startScheduledSending()
+            armScheduled()
         case .background:
             active = false
             node?.setForeground(on: false)
@@ -411,9 +460,13 @@ final class NodeStore: ObservableObject {
         backgroundTask = .invalid
     }
 
-    func scheduleRefresh() {
+    /// Asks iOS for a background refresh in 15 minutes, or sooner when a
+    /// scheduled message is due (`at`).
+    func scheduleRefresh(at: Date? = nil) {
+        var earliest = Date(timeIntervalSinceNow: 15 * 60)
+        if let due = at ?? node?.nextScheduledMs().map({ Date(ms: $0) }) { earliest = min(earliest, due) }
         let request = BGAppRefreshTaskRequest(identifier: Paths.refreshTask)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        request.earliestBeginDate = earliest
         try? BGTaskScheduler.shared.submit(request)
     }
 
@@ -425,7 +478,19 @@ final class NodeStore: ObservableObject {
         node?.reconnect()
         let work = Task {
             do {
-                try await Task.sleep(for: .seconds(20))
+                // The node opens asynchronously on a cold start.
+                let started = Date()
+                while node == nil && Date().timeIntervalSince(started) < 5 {
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+                // Scheduled messages that are due go now (at once if none are).
+                if let n = node {
+                    _ = try? await offMain { n.runDueScheduled(timeoutMs: 20_000) }
+                    armScheduled()
+                }
+                // At least the usual while for mailboxes to deliver.
+                let left = 20 - Date().timeIntervalSince(started)
+                if left > 0 { try await Task.sleep(for: .seconds(left)) }
                 task.setTaskCompleted(success: true)
             } catch {}
         }
@@ -442,7 +507,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification)
         async -> UNNotificationPresentationOptions {
-        [.banner, .sound]
+        // The app is open: the scheduled message is going out already.
+        if notification.request.identifier == Paths.scheduledReminder { return [] }
+        return [.banner, .sound]
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
