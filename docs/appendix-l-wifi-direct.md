@@ -24,11 +24,12 @@ These are carried as `AppMessage::Direct` (Appendix C, kind 12):
 
 ```
 DirectMsg = { 0: op, ? 1: ssid tstr, ? 2: passphrase tstr, ? 3: addr tstr }
-op: 1 offer (ssid ≤ 32 bytes, passphrase 8–63, addr = ip:port literal)
+op: 1 offer (ssid 1–32 bytes without control characters, passphrase 8–63
+             printable ASCII characters, addr = ip:port literal)
     2 request (asks the peer to host and offer)
 ```
 
-Both messages are only sent to, and only honoured from, **mutually approved peers on a session over a nearby link**: Bluetooth (any stream transport), or TCP or QUIC whose peer address is loopback, private (RFC 1918, IPv6 unique local) or link-local. A peer reached through relays isn't nearby, and nor is one dialed or hole-punched across the internet; neither is trusted with link credentials, or with moving our radio, just because it is reachable. Each peer gets at most one request and one offer honoured every 30 seconds; the rest are dropped, since each makes a phone host a new group or a laptop leave its network. Malformed offers are refused on both ends. An anonymous identity's node (Appendix M) neither sends nor honours them: a group would show a nearby contact the phone, and the main identity listening on it. Older peers send the same messages and see no change unless they are far away or repeat themselves.
+Both messages are only sent to, and only honoured from, **mutually approved peers on a session over a nearby link**: Bluetooth (any stream transport), or TCP or QUIC whose peer address is loopback, private (RFC 1918, IPv6 unique local) or link-local. A peer reached through relays isn't nearby, and nor is one dialed or hole-punched across the internet; neither is trusted with link credentials, or with moving our radio, just because it is reachable. Each peer gets at most one request and one offer honoured every 30 seconds; the rest are dropped, since each makes a phone host a new group or a laptop leave its network. Malformed offers are refused on both ends, including an SSID with control characters or a passphrase that isn't printable ASCII (WPA2 requires printable ASCII anyway, so no sender is affected; it also keeps a passphrase from breaking the line-based files a joiner hands to NetworkManager). An anonymous identity's node (Appendix M) neither sends nor honours them: a group would show a nearby contact the phone, and the main identity listening on it. Older peers send the same messages and see no change unless they are far away or repeat themselves.
 
 ## Platforms
 

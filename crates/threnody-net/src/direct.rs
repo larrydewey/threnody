@@ -104,8 +104,17 @@ impl DirectMsg {
                 if o.ssid.is_empty() || o.ssid.len() > MAX_SSID {
                     return Err(bad("ssid length"));
                 }
+                if o.ssid.chars().any(char::is_control) {
+                    return Err(bad("ssid characters"));
+                }
                 if !(8..=MAX_PASSPHRASE).contains(&o.passphrase.len()) {
                     return Err(bad("passphrase length"));
+                }
+                // WPA2 passphrases are printable ASCII. Anything else could
+                // also break the line-based files joiners hand to tools
+                // like NetworkManager.
+                if !o.passphrase.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+                    return Err(bad("passphrase characters"));
                 }
                 if o.addr.len() > MAX_ADDR || o.addr.parse::<std::net::SocketAddr>().is_err() {
                     return Err(bad("group address"));
@@ -232,6 +241,28 @@ mod tests {
         assert!(bad(&|x| x.ssid = "x".repeat(33)));
         assert!(bad(&|x| x.addr = "example.com:80".into()));
         assert!(!format!("{o:?}").contains("horse"), "passphrase not logged");
+    }
+
+    #[test]
+    fn offers_with_unprintable_passphrases_are_refused() {
+        let o = DirectOffer {
+            ssid: "DIRECT-th-abcd".into(),
+            passphrase: "abcdefgh 12~".into(),
+            addr: "192.168.49.1:7450".into(),
+        };
+        let m = DirectMsg::Offer(o.clone());
+        assert_eq!(DirectMsg::decode(&m.encode().unwrap()).unwrap(), m);
+        let bad = |f: &dyn Fn(&mut DirectOffer)| {
+            let mut x = o.clone();
+            f(&mut x);
+            DirectMsg::decode(&DirectMsg::Offer(x).encode().unwrap()).is_err()
+        };
+        assert!(bad(&|x| x.passphrase = "abcdefgh\nmode=ap".into()));
+        assert!(bad(&|x| x.passphrase = "abcdefgh\r".into()));
+        assert!(bad(&|x| x.passphrase = "abcdefgh\u{7f}".into()));
+        assert!(bad(&|x| x.passphrase = "abcdefghé".into()));
+        assert!(bad(&|x| x.ssid = "DIRECT-\nx".into()));
+        assert!(bad(&|x| x.ssid = "DIRECT-\u{1b}x".into()));
     }
 
     #[test]
