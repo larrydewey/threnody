@@ -94,5 +94,5 @@ If any extension fails, A destroys the circuit and tries the next path.
 ## Known limits
 
 - **Unauthenticated layers.** As in Tor's original design, the per-hop layers aren't individually authenticated. Tampering is detected end to end, because the inner session is AEAD. But colluding first and last hops could tag cells to confirm they are on the same circuit, and such hops can already link them by timing.
-- **No cover traffic inside circuits.** Link-level constant-rate mode (§9 layer 1) still applies to each hop, and pads every frame of the link to an onion cell's size (Appendix C, *Padding*), so a link's ticks look the same whether or not they carry a cell.
+- **No cover traffic inside circuits.** Link-level constant-rate mode (§9 layer 1) still applies to each hop, and pads every frame of the link to at least an onion cell's size (Appendix C, *Padding*), so a link's ticks look the same whether they carry a cell or cover, when both ends pad this way.
 - **Contacts-only relays.** Without directories, A can only use relays that are its own contacts. Volunteer relays from subscribed directories (Appendix P) lift this.
