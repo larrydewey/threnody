@@ -129,7 +129,7 @@ The project rule holds: the always-on connection, with cover traffic, stays the 
 - With an endpoint, the app stops its foreground service a minute after it goes to the background (not during a call), then shuts its nodes down and ends its process. Nothing runs until the next wake-up or until the user opens the app.
 - On a wake-up, the connector's `PushService` starts the foreground service in wake mode (a brief "Checking for messages" notification). That brings the nodes up, runs `wake_sync`, and sleeps again if the app is still in the background.
 - Turning the setting off unregisters the endpoint, withdraws it from contacts, and brings back the always-on service.
-- With scheduled messages pending, the app sets an `AlarmManager` alarm for the next one (exact if the user allowed *Alarms & reminders*, otherwise allowed to run late in Doze). The alarm starts the foreground service in a scheduled-send mode (a brief "Sending scheduled messages" notification), which sends what is due, waits for it to be acknowledged, and sleeps again. After a reboot, a boot receiver does the same if anything is pending, since alarms don't survive a reboot.
+- With scheduled messages pending, the app sets an `AlarmManager` alarm for the next one (exact if the user allowed *Alarms & reminders*, otherwise allowed to run late in Doze). The alarm starts the foreground service in a scheduled-send mode (a brief "Sending scheduled messages" notification), which sends what is due, waits for it to be acknowledged, and sleeps again. It doesn't sleep while a scheduled message is still on its way. After a reboot, a boot receiver does the same if anything is pending, since alarms don't survive a reboot.
 
 ## Linux and the CLI
 

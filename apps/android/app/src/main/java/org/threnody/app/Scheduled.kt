@@ -31,6 +31,13 @@ object Scheduled {
         return File(home, "personas").listFiles()?.any { File(it, "scheduled.state").exists() } == true
     }
 
+    /** Some node is sending a scheduled message right now (don't end the process under it). */
+    fun inFlight(): Boolean = try {
+        nodes().any { it.scheduledSending() > 0u }
+    } catch (e: Exception) {
+        false
+    }
+
     /** The main node and every anonymous identity's, those that are open. */
     private fun nodes(): List<ThrenodyNode> =
         listOfNotNull(Threnody.running()) + Threnody.personaIds().mapNotNull(Threnody::personaNode)

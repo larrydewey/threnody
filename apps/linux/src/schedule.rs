@@ -9,9 +9,8 @@ use threnody_ffi::{ScheduleFailure, ScheduledInfo};
 
 use crate::ui;
 
-/// What the picker and the list say about who sends it.
-pub const CAVEAT: &str = "Sends from this device. Threnody needs to be running here \
-     (closing the window keeps it running).";
+/// What the picker says about who sends it.
+pub const CAVEAT: &str = "Sends from this device while Threnody is running here.";
 
 /// The quick choices, as of `now` (local time): in an hour, this evening
 /// at 20:00 (offered before 19:00), tomorrow at 08:00.
@@ -259,6 +258,9 @@ pub fn list_dialog(
         if let Some(f) = item.failed {
             subtitle.push_str(&format!("\n⚠ Not sent: {}", failure_text(f)));
         }
+        if item.sending {
+            subtitle.push_str("\nSending now…");
+        }
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&title))
             .subtitle(subtitle)
@@ -294,6 +296,8 @@ pub fn list_dialog(
             .popover(&pop)
             .build();
         button.add_css_class("flat");
+        // Being sent: nothing to change any more.
+        button.set_sensitive(!item.sending);
         row.add_suffix(&button);
         row.set_activatable_widget(Some(&button));
         list.append(&row);

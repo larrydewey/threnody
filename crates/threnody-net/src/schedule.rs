@@ -24,6 +24,7 @@
 //! On the wire a scheduled message is an ordinary one. See Appendix C,
 //! "Scheduled messages".
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -182,6 +183,10 @@ pub(crate) struct Schedule {
     /// Due group items for the app's MLS engine (see
     /// [`Node::take_due_group_scheduled`]).
     pub to_groups: Vec<Scheduled>,
+    /// Items being sent whose conversation the user dropped since (see
+    /// [`Schedule::retain`]): never sent, never listed or written, and
+    /// gone once their send ends.
+    dropped: HashSet<u64>,
 }
 
 /// A node's schedule and its timer.
@@ -193,6 +198,10 @@ pub(crate) struct ScheduleState {
     /// Set by [`Node::start_scheduled_sending`] once the app has applied
     /// its settings.
     pub started: AtomicBool,
+    /// Held while an item is checked and sent, and while a conversation's
+    /// items are dropped: a send either ends before the drop (which then
+    /// deletes what it wrote) or sees the drop and doesn't happen.
+    pub gate: Mutex<()>,
 }
 
 impl ScheduleState {
@@ -262,8 +271,20 @@ impl Schedule {
         &self.items
     }
 
+    /// The items the user hasn't dropped.
+    pub fn listed(&self) -> impl Iterator<Item = &Scheduled> {
+        self.items.iter().filter(|s| !self.dropped.contains(&s.id))
+    }
+
+    /// Whether item `id`'s conversation was dropped while it was being
+    /// sent.
+    pub fn is_dropped(&self, id: u64) -> bool {
+        self.dropped.contains(&id)
+    }
+
+    /// Nothing listed (what's left is only being sent, dropped).
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.listed().next().is_none()
     }
 
     /// Adds `s`, due at `s.due_ms`, with fresh jitter; checks its text,
@@ -322,9 +343,10 @@ impl Schedule {
             .count()
     }
 
-    /// Ends item `id`'s send: gone when sent, else failed with the reason.
-    /// Returns the item.
+    /// Ends item `id`'s send: gone when sent (or dropped meanwhile), else
+    /// failed with the reason. Returns the item.
     pub fn finish(&mut self, id: u64, r: std::result::Result<(), Failure>) -> Option<Scheduled> {
+        let r = if self.dropped.remove(&id) { Ok(()) } else { r };
         match r {
             Ok(()) => {
                 let i = self.items.iter().position(|s| s.id == id)?;
@@ -397,12 +419,18 @@ impl Schedule {
         Some(self.items.remove(i))
     }
 
-    /// Keeps the items `keep` chooses (and those being sent, which finish
-    /// first); returns the others.
+    /// Keeps the items `keep` chooses; returns the others. Those being
+    /// sent stay until their send ends, marked dropped: their send checks
+    /// that first ([`Node::scheduled_send_gate`]).
     pub fn retain(&mut self, keep: impl Fn(&Scheduled) -> bool) -> Vec<Scheduled> {
-        let (kept, gone) = std::mem::take(&mut self.items)
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.items)
             .into_iter()
-            .partition(|s| s.status == Status::Sending || keep(s));
+            .partition(|s| keep(s) || s.status == Status::Sending);
+        for s in &kept {
+            if s.status == Status::Sending && !keep(s) {
+                self.dropped.insert(s.id);
+            }
+        }
         self.items = kept;
         gone
     }
@@ -424,11 +452,12 @@ impl Schedule {
     /// ? 8: failure }` (Appendix C). Items being sent are written as
     /// waiting.
     pub fn encode(&self) -> threnody_core::Result<Vec<u8>> {
-        let hint = 64 + self.text_bytes() + self.items.len() * 256;
+        let items: Vec<&Scheduled> = self.listed().collect();
+        let hint = 64 + self.text_bytes() + items.len() * 256;
         cbor::to_vec(hint, |e| {
             e.map_len(2)?.u8(0)?.u8(VERSION)?;
-            e.u8(1)?.array_len(self.items.len())?;
-            for s in &self.items {
+            e.u8(1)?.array_len(items.len())?;
+            for s in &items {
                 let failed = match s.status {
                     Status::Failed(f) => Some(f),
                     _ => None,
@@ -688,7 +717,10 @@ impl Node {
 
     /// Every item, soonest first.
     pub fn all_scheduled(&self) -> Vec<Scheduled> {
-        let mut v = lock(&self.shared.schedule.items).items().to_vec();
+        let mut v: Vec<Scheduled> = lock(&self.shared.schedule.items)
+            .listed()
+            .cloned()
+            .collect();
         v.sort_by_key(|s| (s.due_ms, s.created_ms));
         v
     }
@@ -723,6 +755,18 @@ impl Node {
     /// When the next item fires (ms since the epoch).
     pub fn next_scheduled_ms(&self) -> Option<u64> {
         lock(&self.shared.schedule.items).next_fire()
+    }
+
+    /// Runs `send` for item `id`, unless its conversation was dropped
+    /// while it was being sent (then `None`). [`Node::drop_scheduled`]
+    /// waits for a `send` running here, so a send never lands after the
+    /// user blocked or deleted the chat.
+    pub fn scheduled_send_gate<R>(&self, id: u64, send: impl FnOnce() -> R) -> Option<R> {
+        let _gate = lock(&self.shared.schedule.gate);
+        if lock(&self.shared.schedule.items).is_dropped(id) {
+            return None;
+        }
+        Some(send())
     }
 
     /// Replaces item `id`'s text; false if there's no such item, or it's
@@ -786,6 +830,10 @@ impl Node {
             .iter()
             .map(|c| (c.key, c.blocked))
             .collect();
+        // The device it was scheduled to blocked: the contact is.
+        if contacts.iter().any(|(k, blocked)| *k == stored && *blocked) {
+            return None;
+        }
         let live = |d: &PublicIdentity| {
             contacts.iter().any(|(k, blocked)| k == d && !blocked) && !self.is_revoked(d)
         };
@@ -833,18 +881,26 @@ impl Node {
             return Err(Failure::Error);
         }
         let node = self.clone();
-        let extras = Extras {
-            quote: s.quote.clone(),
-            ..Extras::default()
-        };
-        let (text, id) = (s.text.clone(), s.id);
         // History I/O: off the runtime's (few) workers.
-        match tokio::task::spawn_blocking(move || node.send_message_with(&p, &text, extras, id))
-            .await
-        {
-            Ok(Ok(_)) => Ok(()),
-            _ => Err(Failure::Error),
-        }
+        tokio::task::spawn_blocking(move || {
+            // The user may have blocked or deleted the chat while we tried
+            // to reach them: look again, under the gate, right before.
+            node.scheduled_send_gate(s.id, || {
+                let Some(p) = node.route(&s) else {
+                    return Err(Failure::Contact);
+                };
+                let extras = Extras {
+                    quote: s.quote.clone(),
+                    ..Extras::default()
+                };
+                node.send_message_with(&p, &s.text, extras, s.id)
+                    .map(|_| ())
+                    .map_err(|_| Failure::Error)
+            })
+            .unwrap_or(Ok(()))
+        })
+        .await
+        .unwrap_or(Err(Failure::Error))
     }
 
     /// Sends what's due: contacts' items here (each to a live device),
@@ -873,7 +929,10 @@ impl Node {
             self.scheduled_changed(s.target);
         }
         let mut handled = missed.len();
-        let mut peers = tokio::task::JoinSet::new();
+        // Spawned, not in a JoinSet: a caller that stops waiting (an app's
+        // time budget running out) must not abort a send half-way, or the
+        // item would stay "sending" until a restart.
+        let mut peers = Vec::new();
         for s in send {
             if let Target::Group(g) = s.target {
                 lock(&self.shared.schedule.items).to_groups.push(s);
@@ -885,15 +944,16 @@ impl Node {
                 continue;
             }
             let node = self.clone();
-            peers.spawn(async move {
+            peers.push(tokio::spawn(async move {
                 let id = s.id;
                 let r = node.send_scheduled_peer(s).await;
                 if !node.is_closed() {
                     node.finish_scheduled(id, r);
                 }
-            });
+            }));
         }
-        while peers.join_next().await.is_some() {
+        for p in peers {
+            let _ = p.await;
             handled += 1;
         }
         handled
@@ -917,7 +977,8 @@ impl Node {
         self.scheduled_changed(s.target);
     }
 
-    /// How many items are being sent right now.
+    /// How many items are being sent right now (apps keep the process up
+    /// while any are).
     pub fn scheduled_sending(&self) -> usize {
         let s = lock(&self.shared.schedule.items);
         s.sending() + s.to_groups.len()
@@ -926,14 +987,18 @@ impl Node {
     /// Drops conversation `conv`'s items: the user blocked or deleted it,
     /// or left the group.
     pub fn drop_scheduled(&self, conv: ConversationId) {
-        let ids: Vec<u64> = self.scheduled_in(conv).into_iter().map(|s| s.id).collect();
-        if ids.is_empty() {
+        let items = self.scheduled_in(conv);
+        let Some(first) = items.first().map(|s| s.target) else {
             return;
+        };
+        let ids: Vec<u64> = items.iter().map(|s| s.id).collect();
+        {
+            // After any send under way (the caller then deletes what it
+            // wrote); later ones see the drop.
+            let _gate = lock(&self.shared.schedule.gate);
+            self.schedule_mut(|s| s.retain(|x| !ids.contains(&x.id)));
         }
-        let gone = self.schedule_mut(|s| s.retain(|x| !ids.contains(&x.id)));
-        if let Some(s) = gone.first() {
-            self.scheduled_changed(s.target);
-        }
+        self.scheduled_changed(first);
     }
 
     /// Fails every waiting item with `f`; returns how many.
@@ -1010,7 +1075,7 @@ mod tests {
     fn with(items: Vec<Scheduled>) -> Schedule {
         Schedule {
             items,
-            to_groups: Vec::new(),
+            ..Schedule::default()
         }
     }
 
@@ -1291,5 +1356,26 @@ mod tests {
         let gone = s.retain(|x| x.target != Target::Group([1; 16]));
         assert_eq!(gone.iter().map(|x| x.id).collect::<Vec<_>>(), vec![1]);
         assert_eq!(s.items.iter().map(|x| x.id).collect::<Vec<_>>(), vec![2, 3]);
+        // The one being sent is dropped: not listed, not written, and its
+        // send ends as gone whatever it reports.
+        assert!(s.is_dropped(2) && !s.is_dropped(3));
+        assert_eq!(s.listed().map(|x| x.id).collect::<Vec<_>>(), vec![3]);
+        let back = Schedule::decode(&s.encode().unwrap());
+        assert_eq!(back.items.iter().map(|x| x.id).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(s.sending(), 1);
+        assert!(s.finish(2, Err(Failure::Error)).is_some());
+        assert_eq!(s.items.iter().map(|x| x.id).collect::<Vec<_>>(), vec![3]);
+        assert!(!s.is_dropped(2));
+        assert_eq!(s.sending(), 0);
+    }
+
+    #[test]
+    fn only_dropped_items_left_is_empty() {
+        let mut x = item(1, NOW);
+        x.status = Status::Sending;
+        let mut s = with(vec![x]);
+        assert!(!s.is_empty());
+        s.retain(|_| false);
+        assert!(s.is_empty());
     }
 }

@@ -52,7 +52,7 @@ struct ChatView: View {
             compose
         }
         .sheet(isPresented: $showLater) {
-            LaterSheet(initial: nil, text: nil) { date, _ in sendLater(date) }
+            LaterSheet(initial: nil, text: nil) { date, _ in if let date { sendLater(date) } }
         }
         .sheet(isPresented: $showScheduled) {
             ScheduledList(items: scheduled) { item, action in scheduledAction(item, action) }
@@ -227,15 +227,23 @@ struct ChatView: View {
         let id = item.id
         switch action {
         case .sendNow:
-            act { _ = $0.sendScheduledNow(id: id) }
+            act { if !$0.sendScheduledNow(id: id) { throw BeingSent() } }
         case .delete:
-            act { _ = $0.cancelScheduled(id: id) }
+            act { if !$0.cancelScheduled(id: id) { throw BeingSent() } }
         case let .edit(newText, date):
-            let due = UInt64(max(0, date.timeIntervalSince1970 * 1000))
+            // A time only when the user picked one: a missed message keeps
+            // its (past) time and waits for "Send Now".
+            let due = date.map { UInt64(max(0, $0.timeIntervalSince1970 * 1000)) }
             let (oldText, oldDue) = (item.text, item.dueMs)
             act { n in
-                if newText != oldText { _ = try n.editScheduled(id: id, text: newText) }
-                if due != oldDue { _ = try n.reschedule(id: id, dueMs: due) }
+                if newText != oldText {
+                    let edited = try n.editScheduled(id: id, text: newText)
+                    if !edited { throw BeingSent() }
+                }
+                if let due, due != oldDue {
+                    let moved = try n.reschedule(id: id, dueMs: due)
+                    if !moved { throw BeingSent() }
+                }
             }
         }
         Task { await load() }
@@ -419,14 +427,21 @@ private struct TypingBubble: View {
     }
 }
 
+/// A scheduled message changed under us: it's being sent (or went).
+private struct BeingSent: LocalizedError {
+    var errorDescription: String? { "It's being sent now." }
+}
+
 /// Picks when to send: a minute from now up to a year ahead. With `text`,
-/// edits a scheduled message's text too.
+/// edits a scheduled message's text too, and hands back a date only if
+/// the user picked one.
 struct LaterSheet: View {
     let initial: Date?
     let text: String?
-    let onPick: (Date, String) -> Void
+    let onPick: (Date?, String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var date = Date().addingTimeInterval(3600)
+    @State private var dateTouched = false
     @State private var draft = ""
 
     var body: some View {
@@ -440,7 +455,7 @@ struct LaterSheet: View {
                 Section {
                     DatePicker(
                         "Send at",
-                        selection: $date,
+                        selection: Binding(get: { date }, set: { date = $0; dateTouched = true }),
                         in: Date().addingTimeInterval(60)...Date().addingTimeInterval(365 * 86_400)
                     )
                     .datePickerStyle(.graphical)
@@ -456,7 +471,7 @@ struct LaterSheet: View {
                     Button(text == nil ? "Schedule" : "Save") {
                         let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                         dismiss()
-                        onPick(date, t)
+                        onPick(text == nil || dateTouched ? date : nil, t)
                     }
                     .disabled(text != nil && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
@@ -473,7 +488,8 @@ struct LaterSheet: View {
 struct ScheduledList: View {
     enum Action {
         case sendNow, delete
-        case edit(String, Date)
+        /// The new text, and a new time if one was picked.
+        case edit(String, Date?)
     }
 
     let items: [ScheduledInfo]
@@ -492,8 +508,12 @@ struct ScheduledList: View {
                         if let f = item.failed {
                             Text("⚠ Not sent: \(NodeStore.reasonText(f))").font(.caption).foregroundStyle(.orange)
                         }
+                        if item.sending {
+                            Text("Sending now…").font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
+                .disabled(item.sending)
                 .swipeActions(edge: .trailing) {
                     Button("Delete", role: .destructive) { onAction(item, .delete) }
                 }

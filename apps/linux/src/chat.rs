@@ -2840,10 +2840,7 @@ impl ChatView {
                 match act {
                     schedule::Act::SendNow => t.run(
                         "send it",
-                        move |n| {
-                            n.send_scheduled_now(id);
-                            Ok(())
-                        },
+                        move |n| being_sent(n.send_scheduled_now(id)),
                         None,
                     ),
                     schedule::Act::Edit => {
@@ -2859,7 +2856,7 @@ impl ChatView {
                                 let Some(t) = weak.upgrade() else { return };
                                 t.run(
                                     "edit it",
-                                    move |n| n.edit_scheduled(id, text).map(|_| ()),
+                                    move |n| being_sent(n.edit_scheduled(id, text)?),
                                     None,
                                 );
                             },
@@ -2874,7 +2871,7 @@ impl ChatView {
                             }
                             t.run(
                                 "change the time",
-                                move |n| n.reschedule(id, due).map(|_| ()),
+                                move |n| being_sent(n.reschedule(id, due)?),
                                 None,
                             );
                         });
@@ -2891,10 +2888,7 @@ impl ChatView {
                                 let Some(t) = weak.upgrade() else { return };
                                 t.run(
                                     "delete it",
-                                    move |n| {
-                                        n.cancel_scheduled(id);
-                                        Ok(())
-                                    },
+                                    move |n| being_sent(n.cancel_scheduled(id)),
                                     None,
                                 );
                             },
@@ -4241,6 +4235,18 @@ fn send_file_to(
 
 /// Whether `q` quotes `e`: by message id, or for a message too old to
 /// have one, by sender and text (as the node matches them).
+/// A call on one scheduled message: false means it's being sent right
+/// now (or already went), so nothing changed.
+fn being_sent(done: bool) -> Result<(), threnody_ffi::ThrenodyError> {
+    if done {
+        Ok(())
+    } else {
+        Err(threnody_ffi::ThrenodyError::Failed {
+            reason: "it's being sent now".into(),
+        })
+    }
+}
+
 fn quotes(q: &threnody_ffi::QuoteInfo, e: &HistoryEntry) -> bool {
     if q.id != 0 {
         return e.id == q.id;

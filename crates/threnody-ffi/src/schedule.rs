@@ -60,6 +60,8 @@ pub struct ScheduledInfo {
     pub quote: Option<QuoteInfo>,
     /// Set once it couldn't be sent (it stays until the user acts).
     pub failed: Option<ScheduleFailure>,
+    /// Being sent right now: it can't be edited, moved or deleted.
+    pub sending: bool,
 }
 
 fn info(s: &Scheduled) -> ScheduledInfo {
@@ -81,6 +83,7 @@ fn info(s: &Scheduled) -> ScheduledInfo {
             Status::Failed(f) => Some(f.into()),
             Status::Waiting | Status::Sending => None,
         },
+        sending: s.status == Status::Sending,
     }
 }
 
@@ -109,22 +112,28 @@ impl ThrenodyNode {
             let Target::Group(g) = s.target else {
                 continue;
             };
-            let r = if self.node.already_sent(ConversationId::Group(g), s.id) {
-                Ok(())
-            } else if !self.in_group(&g) {
-                Err(Failure::Group)
-            } else {
-                let _guard = self.rt.enter();
-                let extras = Extras {
-                    quote: s.quote.clone(),
-                    mentions: s.mentions.clone(),
-                    forwarded: false,
-                };
-                // A member: any failure is not "left the group".
-                self.group_node()
-                    .send_text_with_id(&self.node, &g, &s.text, extras, s.id)
-                    .map_err(|_| Failure::Error)
-            };
+            // Left meanwhile (the user dropped it): not sent.
+            let r = self
+                .node
+                .scheduled_send_gate(s.id, || {
+                    if self.node.already_sent(ConversationId::Group(g), s.id) {
+                        return Ok(());
+                    }
+                    if !self.in_group(&g) {
+                        return Err(Failure::Group);
+                    }
+                    let _guard = self.rt.enter();
+                    let extras = Extras {
+                        quote: s.quote.clone(),
+                        mentions: s.mentions.clone(),
+                        forwarded: false,
+                    };
+                    // A member: any failure is not "left the group".
+                    self.group_node()
+                        .send_text_with_id(&self.node, &g, &s.text, extras, s.id)
+                        .map_err(|_| Failure::Error)
+                })
+                .unwrap_or(Ok(()));
             self.node.finish_scheduled(s.id, r);
         }
     }
@@ -221,6 +230,12 @@ impl ThrenodyNode {
         self.node.next_scheduled_ms()
     }
 
+    /// How many scheduled messages are being sent right now: an app that
+    /// would end its process (to sleep until woken) waits for them.
+    pub fn scheduled_sending(&self) -> u32 {
+        u32::try_from(self.node.scheduled_sending()).unwrap_or(u32::MAX)
+    }
+
     /// Replaces a scheduled message's text; false if it's gone or being
     /// sent.
     pub fn edit_scheduled(&self, id: u64, text: String) -> Result<bool> {
@@ -250,9 +265,17 @@ impl ThrenodyNode {
         let budget = Duration::from_millis(u64::from(timeout_ms));
         let deadline = std::time::Instant::now() + budget;
         // What the scheduler is already sending isn't handed out again.
+        // Spawned: when the budget runs out we stop waiting, but the sends
+        // go on (dropping a JoinHandle doesn't abort its task).
+        let node = self.node.clone();
+        let pass = self
+            .rt
+            .spawn(async move { node.send_due_scheduled().await });
         let n = self
             .rt
-            .block_on(async { tokio::time::timeout(budget, self.node.send_due_scheduled()).await })
+            .block_on(async { tokio::time::timeout(budget, pass).await })
+            .ok()
+            .and_then(std::result::Result::ok)
             .unwrap_or(0);
         self.send_due_group_scheduled();
         self.start_scheduled_sending();

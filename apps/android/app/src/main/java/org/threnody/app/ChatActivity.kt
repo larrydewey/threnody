@@ -1953,7 +1953,11 @@ class ChatActivity : Activity() {
                 item.failed?.let {
                     addView(label("⚠ Not sent: ${Scheduled.reasonText(it)}", 13f, R.color.warning, maxLines = 2))
                 }
-                setOnClickListener { dialog.dismiss(); scheduledActions(item) }
+                if (item.sending) addView(label("Sending now…", 13f, R.color.muted))
+                setOnClickListener {
+                    dialog.dismiss()
+                    if (item.sending) beingSent() else scheduledActions(item)
+                }
             }, matchWrap)
         }
         if (timerOn) list.addView(label("Disappearing messages apply when it's sent.", 13f, R.color.muted, maxLines = 3)
@@ -1967,15 +1971,17 @@ class ChatActivity : Activity() {
             .setTitle(whenText(item.dueMs.toLong()))
             .setItems(arrayOf("Send now", "Edit text", "Change time", "Delete")) { _, which ->
                 when (which) {
-                    0 -> Threading.background { run("send it") { node.sendScheduledNow(item.id) } }
+                    0 -> Threading.background { runScheduled("send it") { node.sendScheduledNow(item.id) } }
                     1 -> editScheduled(item)
                     2 -> pickTime(item.dueMs.toLong()) { due ->
-                        Threading.background { run("change the time") { node.reschedule(item.id, due.toULong()) } }
+                        Threading.background {
+                            runScheduled("change the time") { node.reschedule(item.id, due.toULong()) }
+                        }
                     }
                     3 -> SecureBuilder(this)
                         .setMessage("Delete this scheduled message? It won't be sent.")
                         .setPositiveButton("Delete") { _, _ ->
-                            Threading.background { run("delete it") { node.cancelScheduled(item.id) } }
+                            Threading.background { runScheduled("delete it") { node.cancelScheduled(item.id) } }
                         }
                         .setNegativeButton("Cancel", null)
                         .show()
@@ -1999,7 +2005,7 @@ class ChatActivity : Activity() {
             })
             .setPositiveButton("Save") { _, _ ->
                 val text = field.text.toString().trim()
-                Threading.background { run("edit it") { node.editScheduled(item.id, text) } }
+                Threading.background { runScheduled("edit it") { node.editScheduled(item.id, text) } }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -2825,6 +2831,20 @@ class ChatActivity : Activity() {
         if (code == VOICE_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) {
             Toast.makeText(this, "Hold the microphone to record", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * Runs a call on one scheduled message; false means it's being sent
+     * right now (or already went), so nothing changed: say so.
+     */
+    private fun runScheduled(what: String, f: () -> Boolean) {
+        var done = true
+        run(what) { done = f() }
+        if (!done) runOnUiThread { beingSent() }
+    }
+
+    private fun beingSent() {
+        Toast.makeText(this, "It's being sent now", Toast.LENGTH_SHORT).show()
     }
 
     /** Runs a node call, reporting failure, then refreshes. */

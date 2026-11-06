@@ -4244,6 +4244,46 @@ mod tests {
     }
 
     #[test]
+    fn run_due_scheduled_out_of_time_leaves_the_send_going() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, _, b_fp) = scheduling_pair(&dir);
+        let b = alice.resolve(&b_fp).unwrap();
+        // Bob gone, his address silent: reaching him outlasts the budget.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap().to_string();
+        bob.shutdown();
+        for _ in 0..100 {
+            if alice.node.sessions().iter().all(|s| s.peer != b) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        alice
+            .node
+            .update_contacts(|c| c.get_mut(&b).unwrap().last_addr = Some(addr));
+        let id = alice
+            .schedule_text(b_fp.clone(), "eventually".into(), in_ms(200), None, None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        alice.run_due_scheduled(500);
+        // Still going, not abandoned half-way.
+        assert_eq!(alice.scheduled_sending(), 1);
+        assert!(alice.all_scheduled()[0].sending);
+        assert!(!alice.cancel_scheduled(id));
+        for _ in 0..300 {
+            if alice.scheduled_sending() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(alice.scheduled_sending(), 0);
+        // Sent (sealed or held for Bob), or failed for the user to retry:
+        // either way it ended.
+        assert!(alice.all_scheduled().iter().all(|s| !s.sending));
+        drop(silent);
+    }
+
+    #[test]
     fn run_due_scheduled_sends_group_items_without_the_pump() {
         let dir = tempfile::tempdir().unwrap();
         let (alice, bob, _, g) = scheduling_group(&dir);

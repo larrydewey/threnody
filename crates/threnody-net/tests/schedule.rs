@@ -429,6 +429,59 @@ async fn contact_deleted_elsewhere_fails_and_is_not_re_added() {
     );
 }
 
+/// Bob gone, his last address a socket that never answers: a scheduled
+/// send to him waits in its reach (up to `REACH_FIRST`).
+async fn unreachable(a: &N, b: &N, bid: &PublicIdentity) -> std::net::TcpListener {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = silent.local_addr().unwrap().to_string();
+    b.node.shutdown();
+    wait_for(|| a.node.sessions().iter().all(|s| s.peer != *bid)).await;
+    a.node
+        .update_contacts(|c| c.get_mut(bid).unwrap().last_addr = Some(addr));
+    silent
+}
+
+#[tokio::test]
+async fn blocking_or_deleting_while_it_is_being_sent_stops_it() {
+    for block in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = spawn(&dir, "a").await;
+        let mut b = spawn(&dir, "b").await;
+        let bid = pair(&mut a, &mut b).await;
+        let conv = a.node.conversation_for(&bid);
+        let _silent = unreachable(&a, &b, &bid).await;
+        let s = a
+            .node
+            .schedule_text(&bid, "too late", None, in_ms(200))
+            .unwrap();
+        a.node.start_scheduled_sending();
+        wait_for(|| a.node.scheduled_sending() > 0).await;
+        if block {
+            a.node.block_contact(&bid);
+        } else {
+            a.node.delete_conversation(&bid);
+        }
+        // Gone from the list at once, and from disk.
+        assert!(a.node.all_scheduled().is_empty());
+        assert!(!dir.path().join("a").join("scheduled.state").exists());
+        // Its send ends (after the reach) without sending anything.
+        timeout(Duration::from_secs(30), async {
+            while a.node.scheduled_sending() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the send ended");
+        assert!(!a.node.already_sent(conv, s.id));
+        assert!(!a.node.already_sent(a.node.conversation_for(&bid), s.id));
+        match a.node.contacts().get(&bid) {
+            Some(c) => assert!(block && c.blocked && !c.accepted, "{c:?}"),
+            None => assert!(!block, "a blocked contact stays, blocked"),
+        }
+        assert!(!dir.path().join("a").join("scheduled.state").exists());
+    }
+}
+
 #[tokio::test]
 async fn a_device_removed_from_its_account_is_routed_around() {
     let dir = tempfile::tempdir().unwrap();
@@ -456,6 +509,44 @@ async fn a_device_removed_from_its_account_is_routed_around() {
     next(&mut b2.rx, |e| is_text(e, "to b")).await;
     sent_entry(&a.node, &b1id, s.id).await;
     wait_for(|| a.node.scheduled_in(account).is_empty()).await;
+}
+
+#[tokio::test]
+async fn the_scheduled_device_blocked_is_not_routed_around() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut b1 = spawn(&dir, "b1").await;
+    let mut b2 = spawn(&dir, "b2").await;
+    let b1id = link(&mut a, &mut b1).await;
+    let code = b1.node.create_link_code(b1.addr.clone());
+    b2.node.link_with(&code).await.unwrap();
+    let b2id = b2.node.identity();
+    wait_for(|| a.node.account_of(&b2id).is_some()).await;
+    a.node.connect(&b2.addr, None).await.unwrap();
+    b2.node.accept_contact(&a.node.identity());
+
+    let s = a
+        .node
+        .schedule_text(&b1id, "blocked", None, in_ms(500))
+        .unwrap();
+    // Only the device it was scheduled to is marked (as a block synced
+    // before we knew its account's other device would leave it).
+    a.node
+        .update_contacts(|c| c.get_mut(&b1id).unwrap().blocked = true);
+    assert!(a.node.contacts().get(&b2id).is_some_and(|c| !c.blocked));
+    a.node.start_scheduled_sending();
+    let Event::ScheduledFailed { id, reason, .. } =
+        next(&mut a.rx, |e| matches!(e, Event::ScheduledFailed { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!((id, reason), (s.id, Failure::Contact));
+    assert!(
+        none_within(&mut b2.rx, Duration::from_millis(1000), |e| is_text(
+            e, "blocked"
+        ))
+        .await
+    );
 }
 
 #[tokio::test]

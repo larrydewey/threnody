@@ -36,6 +36,8 @@ object Push {
     private val ROTATE_MS = TimeUnit.DAYS.toMillis(30)
     /** Grace in the background before sleeping, for a quick app switch. */
     private const val SLEEP_AFTER_S = 60L
+    /** How soon to try sleeping again after a scheduled send held it off. */
+    private const val SCHEDULED_RETRY_S = 20L
     /** Longest a wake-up sync runs. */
     const val WAKE_MS = 60_000u
 
@@ -185,6 +187,11 @@ object Push {
     fun sleepIfIdle(ctx: Context) {
         if (!active(ctx) || Threnody.visible > 0 || waking || Scheduled.sending || Calls.current != null ||
             Privacy.tunnels(ctx)) return
+        // A scheduled message is going out: look again once it has.
+        if (Scheduled.inFlight()) {
+            Threading.scheduleOnce(SCHEDULED_RETRY_S, TimeUnit.SECONDS) { sleepIfIdle(ctx) }
+            return
+        }
         // Scheduled messages still wake the phone to go out.
         Scheduled.arm(ctx)
         Threnody.say("* push: sleeping until woken")
