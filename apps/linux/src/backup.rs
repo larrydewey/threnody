@@ -274,7 +274,10 @@ fn ask_identity_passphrase(app: &Rc<App>, data: Vec<u8>, backup_pw: String) {
         ui::bg(
             move || {
                 let store = threnody_core::store::Home::new(&home);
-                store.load_identity(Some(pw.as_bytes())).is_ok().then_some(pw)
+                store
+                    .load_identity(Some(pw.as_bytes()))
+                    .is_ok()
+                    .then_some(pw)
             },
             move |r| match r {
                 Some(pw) => stage(&a, data, backup_pw, Some(pw)),

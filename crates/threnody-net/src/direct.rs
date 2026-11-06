@@ -144,11 +144,7 @@ impl Node {
     /// Whether `peer` is mutually approved and connected over a nearby
     /// link, i.e. nearby and trusted with our link credentials.
     fn direct_neighbour(&self, peer: &PublicIdentity) -> bool {
-        self.shared.mutual(peer)
-            && self
-                .sessions()
-                .iter()
-                .any(|s| s.peer == *peer && nearby(s))
+        self.shared.mutual(peer) && self.sessions().iter().any(|s| s.peer == *peer && nearby(s))
     }
 
     /// Takes `peer`'s request (or offer) unless one was taken within
@@ -249,7 +245,13 @@ mod tests {
             assert!(nearby_link("tcp", false, ip(local)), "{local}");
             assert!(nearby_link("quic", false, ip(local)), "{local}");
         }
-        for far in ["203.0.113.7", "8.8.8.8", "100.64.0.1", "2001:db8::1", "::ffff:1.1.1.1"] {
+        for far in [
+            "203.0.113.7",
+            "8.8.8.8",
+            "100.64.0.1",
+            "2001:db8::1",
+            "::ffff:1.1.1.1",
+        ] {
             assert!(!nearby_link("tcp", false, ip(far)), "{far}");
             assert!(!nearby_link("quic", false, ip(far)), "{far}");
         }

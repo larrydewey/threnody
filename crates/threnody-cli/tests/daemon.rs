@@ -231,7 +231,11 @@ fn a_replaced_identity_starts_with_nothing_of_the_old_one() {
     let a = dir.path().join("a");
     let old = init(&a);
     // State sealed under the old seed.
-    assert!(threnody(&a, &["invite", "127.0.0.1:1", "--no-qr"]).status.success());
+    assert!(
+        threnody(&a, &["invite", "127.0.0.1:1", "--no-qr"])
+            .status
+            .success()
+    );
     std::fs::create_dir_all(a.join("downloads")).unwrap();
     std::fs::write(a.join("downloads/photo.jpg"), b"jpeg").unwrap();
 
@@ -262,7 +266,14 @@ fn an_anonymous_identity_burns_itself_when_its_time_is_up() {
     init(&a);
     let made = threnody(
         &a,
-        &["persona", "new", "brief", "--burn-after", "4s", "--no-keyring"],
+        &[
+            "persona",
+            "new",
+            "brief",
+            "--burn-after",
+            "4s",
+            "--no-keyring",
+        ],
     );
     assert!(made.status.success(), "{made:?}");
     let made = String::from_utf8_lossy(&made.stdout).into_owned();

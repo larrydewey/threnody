@@ -571,8 +571,9 @@ fn quiet_on_closed_stdout() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let msg = info.payload().downcast_ref::<String>().map(String::as_str);
-        if msg.is_some_and(|m| m.starts_with("failed printing to stdout") && m.contains("Broken pipe"))
-        {
+        if msg.is_some_and(|m| {
+            m.starts_with("failed printing to stdout") && m.contains("Broken pipe")
+        }) {
             std::process::exit(0);
         }
         default(info);
