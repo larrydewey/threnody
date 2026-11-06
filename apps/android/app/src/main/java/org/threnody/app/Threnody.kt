@@ -75,7 +75,11 @@ object Threnody {
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
         openPersonas(ctx.applicationContext, it)
         applyPrivacy(ctx)
+        // Settings applied: scheduled messages may go out now.
+        it.startScheduledSending()
+        for (n in personaNodes.values) n.startScheduledSending()
         Push.apply(ctx.applicationContext, it)
+        Threading.background { Scheduled.arm(ctx.applicationContext) }
         Tunnels.resume(ctx.applicationContext, it)
         Handles.resume(ctx.applicationContext, it)
         redialOnNetwork(ctx.applicationContext, it)
@@ -129,6 +133,8 @@ object Threnody {
         val port = prefs(ctx).getInt("port_${rec.id}", 0)
         applyPrivacyTo(ctx, n)
         val addr = try { n.listen("0.0.0.0:$port") } catch (_: Exception) { n.listen("0.0.0.0:0") }
+        // Settings applied: its scheduled messages may go out now.
+        n.startScheduledSending()
         prefs(ctx).edit().putInt("port_${rec.id}", addr.substringAfterLast(':').toInt()).apply()
         personaNodes[rec.id] = n
         pump(ctx, n, rec.id)
@@ -160,6 +166,8 @@ object Threnody {
         main.burnPersona(id)
         forgetPersona(ctx, id)
         refreshLabels(main)
+        // Its scheduled messages went with it.
+        Threading.background { Scheduled.arm(ctx.applicationContext) }
     }
 
     fun renamePersona(ctx: Context, id: String, label: String) {
@@ -727,6 +735,16 @@ object Threnody {
                             disappearing { node.groupHistory(e.group, 1u) })
                     }
                 }
+                is NodeEvent.GroupChangeFailed -> {
+                    // Whatever is on screen, as on Linux: an admin change given
+                    // up on is easily missed otherwise.
+                    say("* group ${e.group.take(6)}: a change of ours failed")
+                    val name = node.groups().firstOrNull { it.id == e.group }?.name ?: "the group"
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        android.widget.Toast.makeText(ctx, "Couldn't apply your change to $name: ${e.reason}",
+                            android.widget.Toast.LENGTH_LONG).show()
+                    }
+                }
                 is NodeEvent.GroupInvited -> {
                     say("* ${short(e.from)} invites us to a group")
                     if (e.quiet) {
@@ -820,6 +838,27 @@ object Threnody {
                 }
                 // The tunnel's preshared key stays out of the log.
                 is NodeEvent.TunnelUp -> say("* tunnel up with ${short(e.peer)} at ${e.endpoint}")
+                is NodeEvent.ScheduledChanged -> {
+                    say("* scheduled messages changed")
+                    Threading.background { Scheduled.arm(ctx) }
+                }
+                is NodeEvent.ScheduledFailed -> {
+                    // The reason only, never the text.
+                    say("! a scheduled message wasn't sent (${e.reason})")
+                    val g = e.group
+                    val title: String
+                    val k: String
+                    if (g != null) {
+                        k = g
+                        title = node.groups().firstOrNull { it.id == g }?.name ?: "Group"
+                    } else {
+                        val d = e.peer ?: ""
+                        k = key(node.contacts(), d)
+                        title = nameOf(node, d)
+                    }
+                    ThrenodyService.notifyScheduledFailed(ctx, k, e.peer, g, title,
+                        Scheduled.reasonText(e.reason), persona)
+                }
                 is NodeEvent.Fallback -> {
                     notices[persona to e.peer] = e.notice
                     say("* ${short(e.peer)}: ${e.notice}")

@@ -34,11 +34,16 @@ import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileFetch
 import uniffi.threnody_ffi.FileInfo
 import uniffi.threnody_ffi.FileOptions
+import uniffi.threnody_ffi.GroupBanner
 import uniffi.threnody_ffi.GroupInfo
 import uniffi.threnody_ffi.GroupInvite
+import uniffi.threnody_ffi.GroupMemberAction
+import uniffi.threnody_ffi.GroupMemberRow
+import uniffi.threnody_ffi.MemberRole
 import uniffi.threnody_ffi.MentionInfo
 import uniffi.threnody_ffi.NotifyLevel
 import uniffi.threnody_ffi.QuoteInfo
+import uniffi.threnody_ffi.ScheduledInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
@@ -94,6 +99,12 @@ class ChatActivity : Activity() {
     /** The message the next one replies to, shown above the compose bar. */
     private var replyTo: HistoryEntry? = null
     private lateinit var replyBar: LinearLayout
+    /** "🕓 2 scheduled · next Tue 08:00" above the compose bar; opens the list. */
+    private lateinit var scheduledBar: TextView
+    /** This chat's scheduled messages, soonest first. */
+    private var scheduled: List<ScheduledInfo> = emptyList()
+    /** This chat has a disappearing timer (it applies to scheduled messages when sent). */
+    private var timerOn = false
     /** The messages on screen, so a quote can jump to what it quotes. */
     private var onScreen: List<HistoryEntry> = emptyList()
     private var unsubscribe: (() -> Unit)? = null
@@ -242,6 +253,14 @@ class ChatActivity : Activity() {
         }
         root.addView(pinBar, matchWrap)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        scheduledBar = label("", 14f, R.color.accent).apply {
+            setBackgroundColor(color(R.color.bar))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            visibility = View.GONE
+            background = ripple()
+            setOnClickListener { scheduledList() }
+        }
+        root.addView(scheduledBar, matchWrap)
         root.addView(replyBar, matchWrap)
         root.addView(composeBar, matchWrap)
         setContentView(root)
@@ -354,6 +373,12 @@ class ChatActivity : Activity() {
             }
             addView(field, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
             sendButton = button(R.drawable.ic_send, "Send", R.color.accent) { send() }.apply { visibility = View.GONE }
+            if (!note) {
+                // Holding Send offers to send later; the press doesn't send.
+                sendButton.contentDescription = "Send (hold to send later)"
+                sendButton.tooltipText = "Send (hold to send later)"
+                sendButton.setOnLongClickListener { v -> Design.mediumHaptic(v); laterMenu(v); true }
+            }
             addView(sendButton, LinearLayout.LayoutParams(dp(48), dp(48)))
             micButton = button(R.drawable.ic_mic, "Hold to record a voice message", R.color.accent) {}
             micButton.setOnTouchListener { v, ev -> voiceTouch(v, ev) }
@@ -694,11 +719,20 @@ class ChatActivity : Activity() {
                 is NodeEvent.CredentialFailed -> runOnUiThread {
                     Toast.makeText(this, "Credential: ${e.reason}", Toast.LENGTH_LONG).show()
                 }
+                is NodeEvent.GroupMembersChanged -> memberNotice(e)?.let { text ->
+                    runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
+                }
                 else -> {}
             }
             refreshSoon()
         }
         if (::node.isInitialized) refreshSoon()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Exact alarms may have been allowed meanwhile: set the alarm again.
+        Threading.background { Scheduled.arm(applicationContext) }
     }
 
     override fun onStop() {
@@ -723,11 +757,17 @@ class ChatActivity : Activity() {
                 is NodeEvent.GroupMessage -> e.group == g
                 is NodeEvent.GroupFile -> e.group == g
                 is NodeEvent.GroupMembersChanged -> e.group == g
+                is NodeEvent.GroupRoleChanged -> e.group == g
+                is NodeEvent.GroupChangeFailed -> e.group == g
+                is NodeEvent.GroupOutOfStep -> e.group == g
+                is NodeEvent.GroupUpgradePending -> e.group == g
                 is NodeEvent.GroupJoined -> e.group == g
                 is NodeEvent.GroupLeft -> e.group == g
                 is NodeEvent.Delivered -> e.group == g
                 is NodeEvent.Reacted -> e.group == g
                 is NodeEvent.Pinned -> e.group == g
+                is NodeEvent.ScheduledChanged -> e.group == g
+                is NodeEvent.ScheduledFailed -> e.group == g
                 else -> false
             }
         }
@@ -753,6 +793,8 @@ class ChatActivity : Activity() {
             is NodeEvent.CredentialReceived -> e.peer
             is NodeEvent.CredentialPresented -> e.peer
             is NodeEvent.CredentialFailed -> e.peer
+            is NodeEvent.ScheduledChanged -> e.peer ?: return false
+            is NodeEvent.ScheduledFailed -> e.peer ?: return false
             is NodeEvent.AccountChanged -> return true
             else -> return false
         }
@@ -827,6 +869,16 @@ class ChatActivity : Activity() {
             }
         } catch (_: Exception) { "" } else ""
         val canPin = g == null || try { node.mayPinInGroup(g) } catch (_: Exception) { false }
+        val later = try {
+            when {
+                note -> emptyList()
+                g != null -> node.groupScheduled(g)
+                else -> node.scheduled(device)
+            }
+        } catch (_: Exception) { emptyList() }
+        val timer = !note && try {
+            (if (g != null) node.groupDisappearing(g) else node.disappearing(device)) != null
+        } catch (_: Exception) { false }
         // Credential offers and requests from this contact, waiting for an answer.
         val mine = c?.devices ?: listOf(device)
         val offers = if (g == null && !note) node.credentialOffers().filter { it.peer in mine } else emptyList()
@@ -838,6 +890,8 @@ class ChatActivity : Activity() {
             info = gi
             mayPin = canPin
             showPins(pinned)
+            timerOn = timer
+            showScheduled(later)
             // What we left unsent here last time.
             if (!draftShown) {
                 draftShown = true
@@ -990,11 +1044,63 @@ class ChatActivity : Activity() {
         bar.title.text = g.name
         bar.subtitle.text = listOfNotNull(
             members(g.members.size),
-            if (g.owned) "you're the owner" else null,
+            when (g.myRole) {
+                MemberRole.OWNER -> "you're the owner"
+                MemberRole.ADMIN -> "you're an admin"
+                else -> null
+            },
         ).joinToString(" · ")
-        if (g.owned && g.members.size == 1) {
-            banner("Only you are in this group. Invite contacts to it.", "Invite" to { inviteToGroup() })
+        if (g.updateNeeded) {
+            banner("This group's roles come from a newer Threnody. Update to change them here.", warning = true)
         }
+        when (val b = g.banner) {
+            is GroupBanner.OutOfStep -> banner(
+                "This device fell out of step with the group. Asking the others to bring it back…", warning = true)
+            is GroupBanner.CanClaim -> banner(
+                "${Threnody.nameOf(node, b.owner)} hasn't been seen in this group for 14 days. You're next in line.",
+                "Take over as owner" to { claimGroup() },
+            )
+            is GroupBanner.PendingChanges -> {
+                val text = "${b.count} ${if (b.count == 1u) "change is" else "changes are"} waiting for " +
+                    "${Threnody.nameOf(node, b.coordinator)} to come online."
+                if (g.myRole == MemberRole.OWNER) {
+                    banner(text, "Apply from this device" to {
+                        Threading.background { run("apply the changes") { node.takeOverGroup(g.id) } }
+                    })
+                } else banner(text)
+            }
+            is GroupBanner.UpgradePending -> banner(
+                "Admins can be added once ${b.outdated.joinToString(", ") { Threnody.nameOf(node, it) }} " +
+                    "update Threnody.")
+            is GroupBanner.OnlyYou -> if (g.myRole != MemberRole.MEMBER) {
+                banner("Only you are in this group. Invite contacts to it.", "Invite" to { inviteToGroup() })
+            } else banner("Only you are in this group.")
+            null -> {}
+        }
+    }
+
+    /** "Carol was added by Bob", for a change someone else made. */
+    private fun memberNotice(e: NodeEvent.GroupMembersChanged): String? {
+        val by = e.by ?: return null
+        val me = try { node.deviceFingerprint() } catch (_: Exception) { return null }
+        if (by == me) return null
+        val who = (e.added + e.removed).firstOrNull() ?: return null
+        if (who == by) return null
+        val name = Threnody.nameOf(node, who)
+        val byName = Threnody.nameOf(node, by)
+        return if (e.added.isNotEmpty()) "$name was added by $byName" else "$name was removed by $byName"
+    }
+
+    private fun claimGroup() {
+        val g = info ?: return
+        SecureBuilder(this)
+            .setTitle("Take over ${g.name}?")
+            .setMessage("You become its owner. The old owner becomes an admin, and this can't be undone.")
+            .setPositiveButton("Take over") { _, _ ->
+                Threading.background { run("take over") { node.claimGroupOwnership(g.id) } }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun clearBanner() {
@@ -1841,6 +1947,240 @@ class ChatActivity : Activity() {
         }
     }
 
+    // ----- Send later -----
+
+    /** Held Send: offer to send the message later. */
+    private fun laterMenu(anchor: View) {
+        if (compose.text.isBlank() || !::node.isInitialized) return
+        PopupMenu(this, anchor).apply {
+            menu.add("Send later…").setOnMenuItemClickListener { pickTime(null) { sendLater(it) }; true }
+        }.show()
+    }
+
+    /** "14:05", "tomorrow 08:00", "Tue 08:00" or "12 Mar 08:00", in local time. */
+    private fun whenText(ms: Long): String {
+        val zone = java.time.ZoneId.systemDefault()
+        val at = java.time.Instant.ofEpochMilli(ms).atZone(zone)
+        val today = java.time.LocalDate.now(zone)
+        val days = java.time.temporal.ChronoUnit.DAYS.between(today, at.toLocalDate())
+        val locale = java.util.Locale.getDefault()
+        val clock = time(ms)
+        return when (days) {
+            0L -> clock
+            1L -> "tomorrow $clock"
+            in 2L..6L -> at.format(java.time.format.DateTimeFormatter.ofPattern("EEE", locale)) + " " + clock
+            else -> at.format(java.time.format.DateTimeFormatter.ofPattern(
+                DateFormat.getBestDateTimePattern(locale, if (at.year == today.year) "dMMM" else "dMMMy"), locale)) + " " + clock
+        }
+    }
+
+    /**
+     * Asks when to send: in an hour, this evening (before 19:00), tomorrow
+     * morning, or a date and time. Quick choices count from when one is
+     * tapped. [current] is the time an item has now, if it has one.
+     */
+    private fun pickTime(current: Long?, done: (Long) -> Unit) {
+        val zone = java.time.ZoneId.systemDefault()
+        val now = java.time.ZonedDateTime.now(zone)
+        val choices = mutableListOf<Pair<String, () -> java.time.ZonedDateTime>>()
+        choices += "In 1 hour (${time(now.plusHours(1).toInstant().toEpochMilli())})" to {
+            java.time.ZonedDateTime.now(zone).plusHours(1)
+        }
+        if (now.hour < 19) choices += "This evening, ${time(now.withHour(20).withMinute(0).toInstant().toEpochMilli())}" to {
+            java.time.ZonedDateTime.now(zone).withHour(20).withMinute(0).withSecond(0).withNano(0)
+        }
+        val morning = { java.time.ZonedDateTime.now(zone).plusDays(1).withHour(8).withMinute(0).withSecond(0).withNano(0) }
+        choices += "Tomorrow morning, ${whenText(morning().toInstant().toEpochMilli()).removePrefix("tomorrow ")} (" +
+            morning().format(java.time.format.DateTimeFormatter.ofPattern("EEE", java.util.Locale.getDefault())) + ")" to morning
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val dialog = SecureBuilder(this)
+            .setTitle(if (current == null) "Send later" else "Change time")
+            .setView(ScrollView(this).apply { addView(list) })
+            .setNegativeButton("Cancel", null)
+            .create()
+        fun row(text: String, onClick: () -> Unit) = label(text, 16f, R.color.text).apply {
+            setPadding(dp(24), dp(14), dp(24), dp(14))
+            background = ripple()
+            setOnClickListener { dialog.dismiss(); onClick() }
+        }
+        fun pick(due: Long) {
+            if (due <= System.currentTimeMillis()) {
+                Toast.makeText(this, "Pick a time in the future", Toast.LENGTH_LONG).show()
+            } else done(due)
+        }
+        for ((text, at) in choices) list.addView(row(text) { pick(at().toInstant().toEpochMilli()) }, matchWrap)
+        list.addView(row("Pick date and time…") { pickDateTime(current, ::pick) }, matchWrap)
+        // Woken by pushes without exact alarms, it may send a few minutes late.
+        if (Push.active(this) && !Scheduled.exactAllowed(this) && android.os.Build.VERSION.SDK_INT >= 31) {
+            list.addView(row("May send a few minutes late. Allow exact timing") {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                        Uri.parse("package:$packageName")))
+                } catch (_: Exception) {}
+            }.apply { setTextColor(color(R.color.accent)); textSize = 14f; maxLines = 3 }, matchWrap)
+        }
+        list.addView(label("Sends from this device. Threnody needs to be running here (it wakes itself on Android).",
+            13f, R.color.muted, maxLines = 4).apply { setPadding(dp(24), dp(12), dp(24), 0) }, matchWrap)
+        dialog.show()
+    }
+
+    /** A date (today up to a year ahead), then a time. */
+    private fun pickDateTime(current: Long?, done: (Long) -> Unit) {
+        val zone = java.time.ZoneId.systemDefault()
+        val start = java.time.Instant.ofEpochMilli(current ?: (System.currentTimeMillis() + 3_600_000)).atZone(zone)
+        val now = System.currentTimeMillis()
+        android.app.DatePickerDialog(this, { _, y, m, d ->
+            android.app.TimePickerDialog(this, { _, h, min ->
+                done(java.time.ZonedDateTime.of(y, m + 1, d, h, min, 0, 0, zone).toInstant().toEpochMilli())
+            }, start.hour, start.minute, DateFormat.is24HourFormat(this)).apply { Privacy.secure(this) }.show()
+        }, start.year, start.monthValue - 1, start.dayOfMonth).apply {
+            datePicker.minDate = now
+            datePicker.maxDate = now + 365L * 24 * 3_600_000
+            Privacy.secure(this)
+        }.show()
+    }
+
+    /**
+     * Schedules what's in the compose field (with the reply and mentions)
+     * for [due], as [send] sends it now. The field clears only once the
+     * time is picked; on an error the text comes back.
+     */
+    private fun sendLater(due: Long) {
+        val raw = compose.text.toString()
+        val text = raw.trim()
+        if (text.isEmpty() || !::node.isInitialized || note) return
+        val mentions = if (group != null) Mentions.of(compose.text, raw.indexOf(text), text) else emptyList()
+        val to = replyTo
+        replyingTo(null)
+        typingHandler.removeCallbacks(stopTyping)
+        compose.setText("") // also says we stopped typing
+        Threading.background {
+            val g = group
+            val error = try {
+                if (g != null) node.scheduleGroupText(g, text, due.toULong(), to?.atMs, to?.device, mentions)
+                else node.scheduleText(device, text, due.toULong(), to?.atMs, to?.device)
+                null
+            } catch (e: Exception) {
+                e.message ?: "Couldn't schedule it"
+            }
+            refresh()
+            runOnUiThread {
+                if (error == null) {
+                    Toast.makeText(this, "Scheduled for ${whenText(due)}", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+                    if (compose.text.isEmpty()) compose.setText(text)
+                }
+            }
+        }
+    }
+
+    /** What the scheduled bar says; hidden with nothing scheduled. */
+    private fun showScheduled(list: List<ScheduledInfo>) {
+        scheduled = list
+        if (list.isEmpty()) {
+            scheduledBar.visibility = View.GONE
+            return
+        }
+        val failed = list.count { it.failed != null }
+        val waiting = list.filter { it.failed == null }
+        scheduledBar.text = buildString {
+            append("🕓 ${list.size} scheduled")
+            waiting.firstOrNull()?.let { append(" · next ${whenText(it.dueMs.toLong())}") }
+            if (failed > 0) append(" · ⚠ $failed not sent")
+        }
+        scheduledBar.setTextColor(color(if (failed > 0) R.color.warning else R.color.accent))
+        scheduledBar.contentDescription = "${scheduledBar.text}. Tap to see them."
+        scheduledBar.visibility = View.VISIBLE
+    }
+
+    /** This chat's scheduled messages; tapping one offers what to do with it. */
+    private fun scheduledList() {
+        val items = scheduled
+        if (items.isEmpty()) return
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val dialog = SecureBuilder(this)
+            .setTitle("Scheduled messages")
+            .setView(ScrollView(this).apply { addView(list) })
+            .setNegativeButton("Close", null)
+            .create()
+        for (item in items) {
+            list.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(24), dp(10), dp(24), dp(10))
+                background = ripple()
+                addView(label(whenText(item.dueMs.toLong()) + if (item.quote != null) "  ↩ reply" else "",
+                    13f, R.color.accent))
+                addView(label(item.text, 15f, R.color.text).apply {
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                })
+                item.failed?.let {
+                    addView(label("⚠ Not sent: ${Scheduled.reasonText(it)}", 13f, R.color.warning, maxLines = 2))
+                }
+                if (item.sending) addView(label("Sending now…", 13f, R.color.muted))
+                setOnClickListener {
+                    dialog.dismiss()
+                    if (item.sending) beingSent() else scheduledActions(item)
+                }
+            }, matchWrap)
+        }
+        if (timerOn) list.addView(label("Disappearing messages apply when it's sent.", 13f, R.color.muted, maxLines = 3)
+            .apply { setPadding(dp(24), dp(8), dp(24), 0) }, matchWrap)
+        dialog.show()
+    }
+
+    /** Send now, edit, move or delete one scheduled message. */
+    private fun scheduledActions(item: ScheduledInfo) {
+        SecureBuilder(this)
+            .setTitle(whenText(item.dueMs.toLong()))
+            .setItems(arrayOf("Send now", "Edit text", "Change time", "Delete")) { _, which ->
+                when (which) {
+                    0 -> Threading.background { runScheduled("send it") { node.sendScheduledNow(item.id) } }
+                    1 -> editScheduled(item)
+                    2 -> pickTime(item.dueMs.toLong()) { due ->
+                        Threading.background {
+                            runScheduled("change the time") { node.reschedule(item.id, due.toULong()) }
+                        }
+                    }
+                    3 -> SecureBuilder(this)
+                        .setMessage("Delete this scheduled message? It won't be sent.")
+                        .setPositiveButton("Delete") { _, _ ->
+                            Threading.background { runScheduled("delete it") { node.cancelScheduled(item.id) } }
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+            }
+            .show()
+    }
+
+    private fun editScheduled(item: ScheduledInfo) {
+        val field = EditText(this).apply {
+            setText(item.text)
+            setSelection(text.length)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        SecureBuilder(this)
+            .setTitle("Edit scheduled message")
+            .setView(android.widget.FrameLayout(this).apply {
+                setPadding(dp(20), dp(8), dp(20), 0)
+                addView(field)
+            })
+            .setPositiveButton("Save") { _, _ ->
+                val text = field.text.toString().trim()
+                Threading.background { runScheduled("edit it") { node.editScheduled(item.id, text) } }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun attach(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
@@ -2379,53 +2719,105 @@ class ChatActivity : Activity() {
         PopupMenu(this, anchor).apply {
             menu.add("Media, files and links").setOnMenuItemClickListener { media(g.name); true }
             menu.add("Members").setOnMenuItemClickListener { members(); true }
-            if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
+            if (g.myRole != MemberRole.MEMBER) {
+                menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
+            }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
             menu.add("Clear chat…").setOnMenuItemClickListener {
                 Chats.clear(this@ChatActivity, node, g.name, null, g.id) { refresh() }
                 true
             }
-            menu.add(if (g.owned) "Delete group" else "Leave group").setOnMenuItemClickListener { leaveGroup(); true }
+            if (g.owned) menu.add("Delete group").setOnMenuItemClickListener { deleteGroup(); true }
+            menu.add("Leave group").setOnMenuItemClickListener { leaveGroup(); true }
             show()
         }
     }
 
-    /** The members, by name; the owner can remove them. */
+    /** The members, one row per account, with what we may do to each. */
     private fun members() {
         val g = info ?: return
         Threading.background {
-            // One row per account: a contact's devices are invited and removed together.
-            val contacts = node.contacts()
-            val me = node.deviceFingerprint()
-        myDevice = me
-            val rows = g.members.groupBy { fp -> if (fp == me) me else Threnody.key(contacts, fp) }
-                .map { (_, devices) -> devices.first() }
-            val labels = rows.map { fp ->
-                Threnody.nameOf(node, fp) + if (fp == g.owner) " (owner)" else ""
+            val rows = try { node.groupMemberRows(g.id) } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this, "Couldn't list members: ${e.message}", Toast.LENGTH_LONG).show() }
+                return@background
+            }
+            val labels = rows.map { r ->
+                val name = if (r.isMe) "You" else Threnody.nameOf(node, r.fingerprint)
+                name + when (r.role) {
+                    MemberRole.OWNER -> " (owner)"
+                    MemberRole.ADMIN -> " (admin)"
+                    else -> ""
+                } + if (r.successor) " (successor)" else ""
             }
             runOnUiThread {
-                val d = SecureBuilder(this)
+                SecureBuilder(this)
                     .setTitle(members(g.members.size))
+                    .setItems(labels.toTypedArray()) { _, i -> if (rows[i].actions.isNotEmpty()) memberActions(rows[i], labels[i]) }
                     .setNegativeButton("Close", null)
-                if (g.owned) {
-                    d.setItems(labels.toTypedArray()) { _, i ->
-                        if (rows[i] != me) removeMember(rows[i], labels[i])
-                    }
-                } else {
-                    d.setItems(labels.toTypedArray(), null)
-                }
-                d.show()
+                    .show()
             }
         }
     }
 
-    private fun removeMember(fp: String, name: String) {
-        val g = group ?: return
+    private fun actionLabel(a: GroupMemberAction): String = when (a) {
+        GroupMemberAction.MAKE_ADMIN -> "Make admin"
+        GroupMemberAction.REMOVE_ADMIN -> "Remove as admin"
+        GroupMemberAction.MAKE_SUCCESSOR -> "Make successor"
+        GroupMemberAction.NO_LONGER_SUCCESSOR -> "No longer successor"
+        GroupMemberAction.MAKE_OWNER -> "Make owner"
+        GroupMemberAction.USE_AS_COORDINATOR -> "Apply changes from this device"
+        GroupMemberAction.REMOVE -> "Remove from group"
+        GroupMemberAction.REMOVE_THIS_DEVICE -> "Remove the lost coordinating device"
+        GroupMemberAction.STEP_DOWN -> "Step down as admin"
+    }
+
+    /** What a confirm says before each action. */
+    private fun actionConfirm(a: GroupMemberAction, name: String, group: String): String = when (a) {
+        GroupMemberAction.MAKE_ADMIN -> "$name can invite and remove members and pin messages. " +
+            "Members will see which devices are yours and $name's."
+        GroupMemberAction.REMOVE_ADMIN -> "$name stays in $group as a member."
+        GroupMemberAction.MAKE_SUCCESSOR -> "If you're not seen in $group for 14 days, $name may take it over."
+        GroupMemberAction.NO_LONGER_SUCCESSOR -> "Nobody will be able to take $group over if you disappear."
+        GroupMemberAction.MAKE_OWNER -> "$name owns $group from now on. You become an admin and can't undo this."
+        GroupMemberAction.USE_AS_COORDINATOR -> "Changes to $group are applied from this device from now on."
+        GroupMemberAction.REMOVE -> "They stop receiving new messages in $group. They can be invited again later."
+        GroupMemberAction.REMOVE_THIS_DEVICE -> "This device takes over applying changes and removes your lost " +
+            "device from $group."
+        GroupMemberAction.STEP_DOWN -> "You stay in $group as a member."
+    }
+
+    private fun memberActions(r: GroupMemberRow, label: String) {
+        val g = info ?: return
+        val name = if (r.isMe) "You" else Threnody.nameOf(node, r.fingerprint)
         SecureBuilder(this)
-            .setTitle("Remove $name?")
-            .setMessage("They stop receiving new messages in ${info?.name}. You can invite them again later.")
-            .setPositiveButton("Remove") { _, _ -> Threading.background { run("remove") { node.removeFromGroup(g, fp) } } }
-            .setNegativeButton("Cancel", null)
+            .setTitle(label)
+            .setItems(r.actions.map { actionLabel(it) }.toTypedArray()) { _, i ->
+                val a = r.actions[i]
+                SecureBuilder(this)
+                    .setTitle(actionLabel(a) + "?")
+                    .setMessage(actionConfirm(a, name, g.name))
+                    .setPositiveButton(actionLabel(a)) { _, _ ->
+                        Threading.background {
+                            run(actionLabel(a).lowercase()) {
+                                when (a) {
+                                    GroupMemberAction.MAKE_ADMIN -> node.promoteInGroup(g.id, r.fingerprint)
+                                    GroupMemberAction.REMOVE_ADMIN, GroupMemberAction.STEP_DOWN ->
+                                        node.demoteInGroup(g.id, r.fingerprint)
+                                    GroupMemberAction.MAKE_SUCCESSOR -> node.setGroupSuccessor(g.id, r.fingerprint)
+                                    GroupMemberAction.NO_LONGER_SUCCESSOR -> node.setGroupSuccessor(g.id, null)
+                                    GroupMemberAction.MAKE_OWNER -> node.transferGroupOwnership(g.id, r.fingerprint)
+                                    GroupMemberAction.USE_AS_COORDINATOR ->
+                                        node.useAsCoordinator(g.id, node.deviceFingerprint())
+                                    GroupMemberAction.REMOVE -> node.removeFromGroup(g.id, r.fingerprint)
+                                    GroupMemberAction.REMOVE_THIS_DEVICE -> node.removeLostCoordinator(g.id)
+                                }
+                            }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            .setNegativeButton("Close", null)
             .show()
     }
 
@@ -2460,15 +2852,77 @@ class ChatActivity : Activity() {
 
     private fun leaveGroup() {
         val g = info ?: return
+        Threading.background {
+            // The last owner account, with others in the group: hand it over first.
+            val rows = try { node.groupMemberRows(g.id) } catch (_: Exception) { emptyList() }
+            val lastOwner = g.owned && rows.none { !it.isMe && it.role == MemberRole.OWNER } &&
+                rows.any { !it.isMe }
+            runOnUiThread {
+                if (lastOwner) {
+                    chooseNewOwner(g)
+                    return@runOnUiThread
+                }
+                SecureBuilder(this)
+                    .setTitle("Leave ${g.name}?")
+                    .setMessage("You stop receiving its messages. Its history stays on your devices; " +
+                        "it can invite you again.")
+                    .setPositiveButton("Leave") { _, _ ->
+                        Threading.background {
+                            run("leave") { node.leaveGroup(g.id) }
+                            runOnUiThread { finish() }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    /** The last owner leaving: someone else owns the group first. */
+    private fun chooseNewOwner(g: GroupInfo) {
+        Threading.background {
+            val rows = try { node.groupMemberRows(g.id).filter { !it.isMe } } catch (_: Exception) { emptyList() }
+            // Admins first.
+            val sorted = rows.sortedBy { if (it.role == MemberRole.ADMIN) 0 else 1 }
+            val labels = sorted.map { Threnody.nameOf(node, it.fingerprint) + if (it.role == MemberRole.ADMIN) " (admin)" else "" }
+            runOnUiThread {
+                SecureBuilder(this)
+                    .setTitle("Choose a new owner first")
+                    .setItems(labels.toTypedArray()) { _, i ->
+                        val r = sorted[i]
+                        SecureBuilder(this)
+                            .setTitle("Make ${labels[i]} the owner and leave?")
+                            .setMessage("${g.name} goes on without you. This can't be undone.")
+                            .setPositiveButton("Leave") { _, _ ->
+                                Threading.background {
+                                    // Nothing changes if it can't go through
+                                    // yet (members still to update, say).
+                                    var done = false
+                                    run("hand over the group") {
+                                        node.transferGroupOwnershipAndLeave(g.id, r.fingerprint)
+                                        done = true
+                                    }
+                                    if (done) runOnUiThread { finish() }
+                                }
+                            }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                    }
+                    .setNeutralButton("Delete instead") { _, _ -> deleteGroup() }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun deleteGroup() {
+        val g = info ?: return
         SecureBuilder(this)
-            .setTitle(if (g.owned) "Delete ${g.name}?" else "Leave ${g.name}?")
-            .setMessage(
-                if (g.owned) "Everyone is removed and the group ends. Its history stays on your devices."
-                else "You stop receiving its messages. Its history stays on your devices; the owner can invite you again.",
-            )
-            .setPositiveButton(if (g.owned) "Delete" else "Leave") { _, _ ->
+            .setTitle("Delete ${g.name}?")
+            .setMessage("Everyone is removed and the group ends. Its history stays on your devices.")
+            .setPositiveButton("Delete") { _, _ ->
                 Threading.background {
-                    run(if (g.owned) "delete the group" else "leave") { node.leaveGroup(g.id) }
+                    run("delete the group") { node.deleteGroup(g.id) }
                     runOnUiThread { finish() }
                 }
             }
@@ -2658,6 +3112,20 @@ class ChatActivity : Activity() {
         if (code == VOICE_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) {
             Toast.makeText(this, "Hold the microphone to record", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * Runs a call on one scheduled message; false means it's being sent
+     * right now (or already went), so nothing changed: say so.
+     */
+    private fun runScheduled(what: String, f: () -> Boolean) {
+        var done = true
+        run(what) { done = f() }
+        if (!done) runOnUiThread { beingSent() }
+    }
+
+    private fun beingSent() {
+        Toast.makeText(this, "It's being sent now", Toast.LENGTH_SHORT).show()
     }
 
     /** Runs a node call, reporting failure, then refreshes. */

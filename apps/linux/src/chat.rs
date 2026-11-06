@@ -6,12 +6,15 @@ use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use threnody_ffi::{Clip, FileFetch, FileOptions, HistoryEntry, TickMark};
+use threnody_ffi::{
+    Clip, FileFetch, FileOptions, GroupBanner, GroupInfo, GroupMemberAction, GroupMemberRow,
+    HistoryEntry, MemberRole, TickMark,
+};
 
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target};
 use crate::ui::{self, bg};
 use crate::window::App;
-use crate::{clip, gifs, settings};
+use crate::{clip, gifs, schedule, settings};
 
 /// How many messages a chat loads (more to reach an older search match).
 const HISTORY: u32 = 1000;
@@ -98,6 +101,15 @@ pub struct ChatView {
     peer_quiet: RefCell<Option<glib::SourceId>>,
     /// Above the composer while replying: what the reply quotes.
     reply_bar: gtk::Box,
+    /// Above the composer: how many messages are scheduled here, and
+    /// when the next goes; clicking lists them.
+    scheduled_bar: gtk::Button,
+    scheduled: RefCell<Vec<threnody_ffi::ScheduledInfo>>,
+    /// The chat has a disappearing timer (it applies to scheduled
+    /// messages when they're sent).
+    timer_on: Cell<bool>,
+    /// "Send later…", from the send button's right-click or long-press.
+    later_menu: gtk::PopoverMenu,
     /// Under the header: the pinned messages; clicking steps through them.
     pin_bar: gtk::Button,
     pins: RefCell<Vec<HistoryEntry>>,
@@ -119,6 +131,7 @@ impl Drop for ChatView {
     fn drop(&mut self) {
         // A popover's parent doesn't take it down with itself.
         self.mention_popover.unparent();
+        self.later_menu.unparent();
         self.save_draft();
     }
 }
@@ -288,7 +301,12 @@ impl ChatView {
         video.add_css_class("circular");
         video.set_valign(gtk::Align::End);
         let send = gtk::Button::from_icon_name("go-up-symbolic");
-        send.set_tooltip_text(Some("Send (Enter)"));
+        let note = conv.chat.target == Target::Note;
+        send.set_tooltip_text(Some(if note {
+            "Send (Enter)"
+        } else {
+            "Send (Enter) · Send later (Ctrl+Enter or right-click)"
+        }));
         send.add_css_class("suggested-action");
         send.add_css_class("circular");
         send.set_valign(gtk::Align::End);
@@ -342,6 +360,21 @@ impl ChatView {
         root.add_top_bar(&header);
         root.add_top_bar(&search_bar);
         root.set_content(Some(&body));
+        let scheduled_bar = gtk::Button::new();
+        scheduled_bar.add_css_class("flat");
+        scheduled_bar.add_css_class("pin-bar");
+        scheduled_bar.set_visible(false);
+        scheduled_bar.set_tooltip_text(Some("Show the scheduled messages"));
+        root.add_bottom_bar(
+            &adw::Clamp::builder()
+                .maximum_size(860)
+                .child(&scheduled_bar)
+                .build(),
+        );
+        let later_items = gio::Menu::new();
+        later_items.append(Some("Send later…"), Some("chat.send-later"));
+        let later_menu = gtk::PopoverMenu::from_model(Some(&later_items));
+        later_menu.set_parent(&send);
         let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         reply_bar.add_css_class("reply-bar");
         reply_bar.set_visible(false);
@@ -392,6 +425,10 @@ impl ChatView {
             typing_timeout: RefCell::new(None),
             sending_typing: Cell::new(false),
             reply_bar,
+            scheduled_bar,
+            scheduled: RefCell::new(Vec::new()),
+            timer_on: Cell::new(false),
+            later_menu,
             reply_to: RefCell::new(None),
             pin_bar,
             pins: RefCell::new(Vec::new()),
@@ -424,6 +461,48 @@ impl ChatView {
             }
         });
         let weak = Rc::downgrade(&this);
+        this.scheduled_bar.connect_clicked(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.scheduled_list();
+            }
+        });
+        // Right-click or long-press on Send offers to send later. Both
+        // claim the press, so it doesn't also send at once.
+        if !note {
+            let actions = gio::SimpleActionGroup::new();
+            let later = gio::SimpleAction::new("send-later", None);
+            let weak = Rc::downgrade(&this);
+            later.connect_activate(move |_, _| {
+                if let Some(t) = weak.upgrade() {
+                    t.send_later();
+                }
+            });
+            actions.add_action(&later);
+            send.insert_action_group("chat", Some(&actions));
+            let right = gtk::GestureClick::new();
+            right.set_button(gdk::BUTTON_SECONDARY);
+            right.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(&this);
+            right.connect_pressed(move |g, _, _, _| {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(t) = weak.upgrade() {
+                    t.offer_later();
+                }
+            });
+            send.add_controller(right);
+            let hold = gtk::GestureLongPress::new();
+            hold.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(&this);
+            hold.connect_pressed(move |g, _, _| {
+                // Else the release still clicks, and sends now.
+                g.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(t) = weak.upgrade() {
+                    t.offer_later();
+                }
+            });
+            send.add_controller(hold);
+        }
+        let weak = Rc::downgrade(&this);
         attach.connect_clicked(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.pick_files();
@@ -443,12 +522,22 @@ impl ChatView {
                 }
             });
         }
-        // Enter sends; Shift+Enter starts a new line.
+        // Enter sends; Shift+Enter starts a new line; Ctrl+Enter sends later.
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(&this);
         keys.connect_key_pressed(move |_, key, _, mods| {
             let enter = matches!(key, gdk::Key::Return | gdk::Key::KP_Enter);
+            // Checked first: "Enter without Shift" would take it otherwise.
+            // Notes to self aren't scheduled: there it sends, as before.
+            if enter
+                && mods.contains(gdk::ModifierType::CONTROL_MASK)
+                && let Some(t) = weak.upgrade()
+                && !t.is_note()
+            {
+                t.send_later();
+                return glib::Propagation::Stop;
+            }
             if enter && !mods.contains(gdk::ModifierType::SHIFT_MASK) {
                 if let Some(t) = weak.upgrade() {
                     t.send();
@@ -894,20 +983,16 @@ impl ChatView {
             } else {
                 format!("{} members", g.members.len())
             }];
-            if g.owned {
-                parts.push("you're the owner".into());
+            match g.my_role {
+                MemberRole::Owner => parts.push("you're the owner".into()),
+                MemberRole::Admin => parts.push("you're an admin".into()),
+                MemberRole::Member => {}
             }
             if let Some(l) = &persona_label {
                 parts.insert(0, format!("🎭 as {l}"));
             }
             self.title.set_subtitle(&parts.join(" · "));
-            if g.owned && g.members.len() == 1 {
-                self.show_banner(
-                    "Only you are in this group. Invite contacts to it.",
-                    false,
-                    &[("Invite", Self::invite_to_group as Action)],
-                );
-            }
+            self.group_banner(g);
         } else if matches!(c.chat.target, Target::Group(_)) {
             self.title.set_subtitle("not a member");
             self.show_banner(
@@ -1036,6 +1121,103 @@ impl ChatView {
         self.header();
     }
 
+    /// The one banner `GroupInfo` asks for (the same as Android's).
+    fn group_banner(self: &Rc<Self>, g: &GroupInfo) {
+        let name = |fp: &str| {
+            self.node()
+                .map_or_else(|| core::short(fp), |n| Core::name_of(&n, fp))
+        };
+        if g.update_needed {
+            self.show_banner(
+                "This group's roles come from a newer Threnody. Update to change them here.",
+                true,
+                &[],
+            );
+        }
+        match &g.banner {
+            Some(GroupBanner::OutOfStep) => self.show_banner(
+                "This device fell out of step with the group. Asking the others to bring it back…",
+                true,
+                &[],
+            ),
+            Some(GroupBanner::CanClaim { owner }) => self.show_banner(
+                &format!(
+                    "{} hasn't been seen in this group for 14 days. You're next in line.",
+                    name(owner)
+                ),
+                false,
+                &[("Take over as owner", Self::claim_group as Action)],
+            ),
+            Some(GroupBanner::PendingChanges { count, coordinator }) => {
+                let text = format!(
+                    "{count} {} waiting for {} to come online.",
+                    if *count == 1 {
+                        "change is"
+                    } else {
+                        "changes are"
+                    },
+                    name(coordinator)
+                );
+                if g.my_role == MemberRole::Owner {
+                    self.show_banner(
+                        &text,
+                        false,
+                        &[("Apply from this device", Self::take_over_group as Action)],
+                    );
+                } else {
+                    self.show_banner(&text, false, &[]);
+                }
+            }
+            Some(GroupBanner::UpgradePending { outdated }) => {
+                let names: Vec<String> = outdated.iter().map(|o| name(o)).collect();
+                self.show_banner(
+                    &format!(
+                        "Admins can be added once {} update Threnody.",
+                        names.join(", ")
+                    ),
+                    false,
+                    &[],
+                );
+            }
+            Some(GroupBanner::OnlyYou) if g.my_role != MemberRole::Member => self.show_banner(
+                "Only you are in this group. Invite contacts to it.",
+                false,
+                &[("Invite", Self::invite_to_group as Action)],
+            ),
+            Some(GroupBanner::OnlyYou) => {
+                self.show_banner("Only you are in this group.", false, &[]);
+            }
+            None => {}
+        }
+    }
+
+    fn claim_group(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let Some(info) = self.conv.borrow().group.clone() else {
+            return;
+        };
+        let weak = self.weak_self.clone();
+        ui::confirm(
+            &app.window,
+            &format!("Take over {}?", info.name),
+            "You become its owner. The old owner becomes an admin, and this can't be undone.",
+            "Take over",
+            true,
+            move || {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(g) = t.group() else { return };
+                t.run("take over", move |n| n.claim_group_ownership(g), None);
+            },
+        );
+    }
+
+    fn take_over_group(self: &Rc<Self>) {
+        let Some(g) = self.group() else { return };
+        self.run("apply the changes", move |n| n.take_over_group(g), None);
+    }
+
     fn show_banner(self: &Rc<Self>, text: &str, warning: bool, buttons: &[(&str, Action)]) {
         let l = ui::label(text, &[]);
         self.banner.append(&l);
@@ -1080,7 +1262,7 @@ impl ChatView {
         };
         if let Some(g) = &c.group {
             add("Members", "members", Self::members);
-            if g.owned {
+            if g.my_role != MemberRole::Member {
                 add("Invite contacts", "invite", Self::invite_to_group);
             }
             add("Media, files and links", "media", Self::media);
@@ -1088,15 +1270,10 @@ impl ChatView {
             add("Disappearing messages", "timer", Self::disappearing);
             add("Notifications", "notify", Self::notifications);
             add("Clear chat…", "clear", Self::clear);
-            add(
-                if g.owned {
-                    "Delete group…"
-                } else {
-                    "Leave group…"
-                },
-                "leave",
-                Self::leave_group,
-            );
+            if g.owned {
+                add("Delete group…", "delete", Self::delete_group);
+            }
+            add("Leave group…", "leave", Self::leave_group);
         } else if c.invite.is_none() && matches!(c.chat.target, Target::Contact(_)) {
             add("Media, files and links", "media", Self::media);
             add("Rename", "rename", Self::rename);
@@ -1172,9 +1349,21 @@ impl ChatView {
                     Some(g) => node.group_draft(g.clone()).unwrap_or_default(),
                     None => node.draft(device.clone()).unwrap_or_default(),
                 };
-                (n, entries, pins, may_pin, draft)
+                let (scheduled, timer) = match &group {
+                    _ if note => (Vec::new(), false),
+                    Some(g) => (
+                        node.group_scheduled(g.clone()).unwrap_or_default(),
+                        node.group_disappearing(g.clone())
+                            .is_ok_and(|t| t.is_some()),
+                    ),
+                    None => (
+                        node.scheduled(device.clone()).unwrap_or_default(),
+                        node.disappearing(device.clone()).is_ok_and(|t| t.is_some()),
+                    ),
+                };
+                (n, entries, pins, may_pin, draft, scheduled, timer)
             },
-            move |(n, entries, pins, may_pin, draft)| {
+            move |(n, entries, pins, may_pin, draft, scheduled, timer)| {
                 let Some(t) = weak.upgrade() else { return };
                 // What we left unsent here last time.
                 if !t.loaded.get() && !draft.is_empty() {
@@ -1187,6 +1376,8 @@ impl ChatView {
                 t.limit.set(n);
                 t.may_pin.set(may_pin);
                 t.show_pins(pins);
+                t.timer_on.set(timer);
+                t.show_scheduled(scheduled);
                 if !t.loaded.replace(true) || *t.entries.borrow() != entries {
                     t.display_entries(entries);
                 }
@@ -2750,6 +2941,187 @@ impl ChatView {
 
     // ----- Sending -----
 
+    /// The composer's text, if there's any to send.
+    fn composed(&self) -> Option<String> {
+        let buf = self.input.buffer();
+        let text = buf
+            .text(&buf.start_iter(), &buf.end_iter(), false)
+            .trim()
+            .to_owned();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Shows "Send later…" by the send button.
+    fn offer_later(&self) {
+        if self.composed().is_some() {
+            self.later_menu.popup();
+        }
+    }
+
+    /// Asks when, then schedules what's in the composer (with the reply
+    /// and mentions). The composer is left alone until a time is picked,
+    /// so cancelling loses nothing.
+    fn send_later(self: &Rc<Self>) {
+        if self.is_note() || self.composed().is_none() {
+            return;
+        }
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let weak = self.weak_self.clone();
+        schedule::pick_time(&app.window, None, move |due| {
+            if let Some(t) = weak.upgrade() {
+                t.schedule_composed(due);
+            }
+        });
+    }
+
+    fn schedule_composed(self: &Rc<Self>, due: u64) {
+        if !schedule::in_future(due) {
+            return self.toast("Pick a time in the future");
+        }
+        let Some(text) = self.composed() else { return };
+        let Some(node) = self.node() else { return };
+        let buf = self.input.buffer();
+        let mentions = self.take_mentions(&buf);
+        // Clearing the composer also says we stopped typing.
+        buf.set_text("");
+        let (group, device) = (self.group(), self.device());
+        let (at, d) = self
+            .reply_to
+            .borrow()
+            .as_ref()
+            .map(|e| (e.at_ms, e.device.clone()))
+            .unzip();
+        self.reply(None);
+        let weak = self.weak_self.clone();
+        let sent = text.clone();
+        bg(
+            move || match group {
+                Some(g) => node.schedule_group_text(g, sent, due, at, d, mentions),
+                None => node.schedule_text(device, sent, due, at, d),
+            },
+            move |r| {
+                let Some(t) = weak.upgrade() else { return };
+                match r {
+                    Ok(_) => t.toast(&format!("Scheduled for {}", schedule::when_label(due))),
+                    Err(e) => {
+                        t.toast(&e.to_string());
+                        let buf = t.input.buffer();
+                        if buf.char_count() == 0 {
+                            buf.set_text(&text);
+                        }
+                    }
+                }
+                t.reload();
+            },
+        );
+    }
+
+    /// The scheduled bar: "🕓 2 scheduled · next Tue 08:00"; hidden with
+    /// nothing scheduled.
+    fn show_scheduled(&self, items: Vec<threnody_ffi::ScheduledInfo>) {
+        self.scheduled_bar.set_visible(!items.is_empty());
+        if !items.is_empty() {
+            let failed = items.iter().filter(|i| i.failed.is_some()).count();
+            let mut text = format!("🕓 {} scheduled", items.len());
+            if let Some(next) = items.iter().find(|i| i.failed.is_none()) {
+                text.push_str(&format!(" · next {}", schedule::when_label(next.due_ms)));
+            }
+            if failed > 0 {
+                text.push_str(&format!(" · ⚠ {failed} not sent"));
+            }
+            let l = ui::label(&text, &["caption"]);
+            if failed > 0 {
+                l.add_css_class("warning");
+            } else {
+                l.add_css_class("accent");
+            }
+            self.scheduled_bar.set_child(Some(&l));
+        }
+        *self.scheduled.borrow_mut() = items;
+    }
+
+    /// This chat's scheduled messages, to send now, edit, move or delete.
+    fn scheduled_list(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let items = self.scheduled.borrow().clone();
+        if items.is_empty() {
+            return;
+        }
+        let weak = self.weak_self.clone();
+        schedule::list_dialog(
+            &app.window,
+            &items,
+            self.timer_on.get(),
+            move |act, item| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let id = item.id;
+                match act {
+                    schedule::Act::SendNow => t.run(
+                        "send it",
+                        move |n| being_sent(n.send_scheduled_now(id)),
+                        None,
+                    ),
+                    schedule::Act::Edit => {
+                        let weak = t.weak_self.clone();
+                        ui::ask_text(
+                            &app.window,
+                            "Edit scheduled message",
+                            "",
+                            "Message",
+                            &item.text,
+                            "Save",
+                            move |text| {
+                                let Some(t) = weak.upgrade() else { return };
+                                t.run(
+                                    "edit it",
+                                    move |n| being_sent(n.edit_scheduled(id, text)?),
+                                    None,
+                                );
+                            },
+                        );
+                    }
+                    schedule::Act::Move => {
+                        let weak = t.weak_self.clone();
+                        schedule::pick_time(&app.window, Some(item.due_ms), move |due| {
+                            let Some(t) = weak.upgrade() else { return };
+                            if !schedule::in_future(due) {
+                                return t.toast("Pick a time in the future");
+                            }
+                            t.run(
+                                "change the time",
+                                move |n| being_sent(n.reschedule(id, due)?),
+                                None,
+                            );
+                        });
+                    }
+                    schedule::Act::Delete => {
+                        let weak = t.weak_self.clone();
+                        ui::confirm(
+                            &app.window,
+                            "Delete this scheduled message?",
+                            "It won't be sent.",
+                            "Delete",
+                            true,
+                            move || {
+                                let Some(t) = weak.upgrade() else { return };
+                                t.run(
+                                    "delete it",
+                                    move |n| being_sent(n.cancel_scheduled(id)),
+                                    None,
+                                );
+                            },
+                        );
+                    }
+                }
+            },
+        );
+    }
+
     fn send(self: &Rc<Self>) {
         let buf = self.input.buffer();
         let text = buf
@@ -3694,6 +4066,8 @@ impl ChatView {
         }
     }
 
+    /// The members, one row per account (as on Android), with what we
+    /// may do to each.
     fn members(self: &Rc<Self>) {
         let Some(app) = self.app.upgrade() else {
             return;
@@ -3702,50 +4076,109 @@ impl ChatView {
             return;
         };
         let Some(node) = self.node() else { return };
-        let me = node.device_fingerprint();
-        let names: Vec<String> = info
-            .members
+        let rows = match node.group_member_rows(info.id.clone()) {
+            Ok(r) => r,
+            Err(e) => return self.toast(&format!("Couldn't list members: {e}")),
+        };
+        let names: Vec<String> = rows
             .iter()
-            .map(|m| {
-                let mut n = Core::name_of(&node, m);
-                if *m == info.owner {
-                    n.push_str(" · owner");
+            .map(|r| {
+                let mut n = if r.is_me {
+                    "You".to_owned()
+                } else {
+                    Core::name_of(&node, &r.fingerprint)
+                };
+                match r.role {
+                    MemberRole::Owner => n.push_str(" (owner)"),
+                    MemberRole::Admin => n.push_str(" (admin)"),
+                    MemberRole::Member => {}
+                }
+                if r.successor {
+                    n.push_str(" (successor)");
                 }
                 n
             })
             .collect();
-        let body = if info.owned {
-            "Click a member to remove them."
-        } else {
-            "Only the owner can add and remove members."
+        let body = match info.my_role {
+            MemberRole::Member => "Owners and admins can add and remove members.",
+            _ => {
+                "Click a member for what you can do. Owners and admins can add and remove members."
+            }
         };
         let weak = self.weak_self.clone();
-        let members = info.members.clone();
-        let (heading, shown) = (info.name.clone(), names.clone());
-        ui::choose(&app.window, &heading, body, &shown, None, move |i| {
+        let shown = names.clone();
+        ui::choose(&app.window, &info.name, body, &shown, None, move |i| {
+            let Some(t) = weak.upgrade() else { return };
+            if !rows[i].actions.is_empty() {
+                t.member_actions(rows[i].clone(), names[i].clone());
+            }
+        });
+    }
+
+    fn member_actions(self: &Rc<Self>, row: GroupMemberRow, label: String) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let Some(info) = self.conv.borrow().group.clone() else {
+            return;
+        };
+        let labels: Vec<String> = row
+            .actions
+            .iter()
+            .map(|a| action_label(*a).to_owned())
+            .collect();
+        let weak = self.weak_self.clone();
+        ui::choose(&app.window, &label, "", &labels, None, move |i| {
             let Some(t) = weak.upgrade() else { return };
             let Some(app) = t.app.upgrade() else { return };
-            let fp = members[i].clone();
-            if !info.owned || fp == me {
-                return;
-            }
-            let name = names[i].clone();
-            let (weak, gname) = (Rc::downgrade(&t), info.name.clone());
+            let a = row.actions[i];
+            let name = if row.is_me {
+                "You".to_owned()
+            } else {
+                t.node().map_or_else(
+                    || core::short(&row.fingerprint),
+                    |n| Core::name_of(&n, &row.fingerprint),
+                )
+            };
+            let (weak, fp, gname) = (
+                Rc::downgrade(&t),
+                row.fingerprint.clone(),
+                info.name.clone(),
+            );
             ui::confirm(
                 &app.window,
-                &format!("Remove {name}?"),
-                &format!(
-                    "They stop receiving new messages in {gname}. You can invite them again later."
+                &format!("{}?", action_label(a)),
+                &action_confirm(a, &name, &gname),
+                action_label(a),
+                matches!(
+                    a,
+                    GroupMemberAction::Remove
+                        | GroupMemberAction::MakeOwner
+                        | GroupMemberAction::RemoveThisDevice
                 ),
-                "Remove",
-                true,
                 move || {
-                    if let (Some(t), Some(g)) =
-                        (weak.upgrade(), weak.upgrade().and_then(|t| t.group()))
-                    {
-                        let fp = fp.clone();
-                        t.run("remove", move |n| n.remove_from_group(g, fp), None);
-                    }
+                    let Some(t) = weak.upgrade() else { return };
+                    let Some(g) = t.group() else { return };
+                    let fp = fp.clone();
+                    t.run(
+                        &action_label(a).to_lowercase(),
+                        move |n| match a {
+                            GroupMemberAction::MakeAdmin => n.promote_in_group(g, fp),
+                            GroupMemberAction::RemoveAdmin | GroupMemberAction::StepDown => {
+                                n.demote_in_group(g, fp)
+                            }
+                            GroupMemberAction::MakeSuccessor => n.set_group_successor(g, Some(fp)),
+                            GroupMemberAction::NoLongerSuccessor => n.set_group_successor(g, None),
+                            GroupMemberAction::MakeOwner => n.transfer_group_ownership(g, fp),
+                            GroupMemberAction::UseAsCoordinator => {
+                                let me = n.device_fingerprint();
+                                n.use_as_coordinator(g, me)
+                            }
+                            GroupMemberAction::Remove => n.remove_from_group(g, fp),
+                            GroupMemberAction::RemoveThisDevice => n.remove_lost_coordinator(g),
+                        },
+                        None,
+                    );
                 },
             );
         });
@@ -3801,25 +4234,102 @@ impl ChatView {
         let Some(info) = self.conv.borrow().group.clone() else {
             return;
         };
+        // The last owner account, with others in the group: hand it over
+        // first.
+        let rows = self
+            .node()
+            .and_then(|n| n.group_member_rows(info.id.clone()).ok())
+            .unwrap_or_default();
+        let last_owner = info.owned
+            && !rows.iter().any(|r| !r.is_me && r.role == MemberRole::Owner)
+            && rows.iter().any(|r| !r.is_me);
+        if last_owner {
+            return self.choose_new_owner(&info, rows);
+        }
         let weak = self.weak_self.clone();
         ui::confirm(
             &app.window,
-            &if info.owned {
-                format!("Delete {}?", info.name)
-            } else {
-                format!("Leave {}?", info.name)
-            },
-            if info.owned {
-                "Everyone is removed and the group ends. Its history stays on your devices."
-            } else {
-                "You stop receiving its messages. Its history stays on your devices; the owner can invite you again."
-            },
-            if info.owned { "Delete" } else { "Leave" },
+            &format!("Leave {}?", info.name),
+            "You stop receiving its messages. Its history stays on your devices; it can invite you again.",
+            "Leave",
             true,
             move || {
                 let Some(t) = weak.upgrade() else { return };
                 let Some(g) = t.group() else { return };
                 t.run("leave", move |n| n.leave_group(g), None);
+            },
+        );
+    }
+
+    /// The last owner leaving: someone else owns the group first.
+    fn choose_new_owner(self: &Rc<Self>, info: &GroupInfo, rows: Vec<GroupMemberRow>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let Some(node) = self.node() else { return };
+        // Admins first.
+        let mut rows: Vec<GroupMemberRow> = rows.into_iter().filter(|r| !r.is_me).collect();
+        rows.sort_by_key(|r| r.role != MemberRole::Admin);
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let mut n = Core::name_of(&node, &r.fingerprint);
+                if r.role == MemberRole::Admin {
+                    n.push_str(" (admin)");
+                }
+                n
+            })
+            .collect();
+        let (weak, gname) = (self.weak_self.clone(), info.name.clone());
+        ui::choose(
+            &app.window,
+            "Choose a new owner first",
+            &format!("{gname} goes on without you. To end it for everyone, delete it instead."),
+            &names.clone(),
+            None,
+            move |i| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let (weak, fp) = (Rc::downgrade(&t), rows[i].fingerprint.clone());
+                ui::confirm(
+                    &app.window,
+                    &format!("Make {} the owner and leave?", names[i]),
+                    "This can't be undone.",
+                    "Leave",
+                    true,
+                    move || {
+                        let Some(t) = weak.upgrade() else { return };
+                        let Some(g) = t.group() else { return };
+                        let fp = fp.clone();
+                        t.run(
+                            "hand over the group",
+                            move |n| n.transfer_group_ownership_and_leave(g, fp),
+                            None,
+                        );
+                    },
+                );
+            },
+        );
+    }
+
+    fn delete_group(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let Some(info) = self.conv.borrow().group.clone() else {
+            return;
+        };
+        let weak = self.weak_self.clone();
+        ui::confirm(
+            &app.window,
+            &format!("Delete {}?", info.name),
+            "Everyone is removed and the group ends. Its history stays on your devices.",
+            "Delete",
+            true,
+            move || {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(g) = t.group() else { return };
+                t.run("delete the group", move |n| n.delete_group(g), None);
             },
         );
     }
@@ -4116,6 +4626,18 @@ fn send_file_to(
 
 /// Whether `q` quotes `e`: by message id, or for a message too old to
 /// have one, by sender and text (as the node matches them).
+/// A call on one scheduled message: false means it's being sent right
+/// now (or already went), so nothing changed.
+fn being_sent(done: bool) -> Result<(), threnody_ffi::ThrenodyError> {
+    if done {
+        Ok(())
+    } else {
+        Err(threnody_ffi::ThrenodyError::Failed {
+            reason: "it's being sent now".into(),
+        })
+    }
+}
+
 fn quotes(q: &threnody_ffi::QuoteInfo, e: &HistoryEntry) -> bool {
     if q.id != 0 {
         return e.id == q.id;
@@ -4126,6 +4648,49 @@ fn quotes(q: &threnody_ffi::QuoteInfo, e: &HistoryEntry) -> bool {
         e.text.as_str()
     };
     e.device == q.author && !q.text.is_empty() && snippet.starts_with(&q.text)
+}
+
+fn action_label(a: GroupMemberAction) -> &'static str {
+    match a {
+        GroupMemberAction::MakeAdmin => "Make admin",
+        GroupMemberAction::RemoveAdmin => "Remove as admin",
+        GroupMemberAction::MakeSuccessor => "Make successor",
+        GroupMemberAction::NoLongerSuccessor => "No longer successor",
+        GroupMemberAction::MakeOwner => "Make owner",
+        GroupMemberAction::UseAsCoordinator => "Apply changes from this device",
+        GroupMemberAction::Remove => "Remove from group",
+        GroupMemberAction::RemoveThisDevice => "Remove the lost coordinating device",
+        GroupMemberAction::StepDown => "Step down as admin",
+    }
+}
+
+/// What a confirm says before each member action (the same as Android's).
+fn action_confirm(a: GroupMemberAction, name: &str, group: &str) -> String {
+    match a {
+        GroupMemberAction::MakeAdmin => format!(
+            "{name} can invite and remove members and pin messages. Members will see which devices are yours and {name}'s."
+        ),
+        GroupMemberAction::RemoveAdmin => format!("{name} stays in {group} as a member."),
+        GroupMemberAction::MakeSuccessor => {
+            format!("If you're not seen in {group} for 14 days, {name} may take it over.")
+        }
+        GroupMemberAction::NoLongerSuccessor => {
+            format!("Nobody will be able to take {group} over if you disappear.")
+        }
+        GroupMemberAction::MakeOwner => {
+            format!("{name} owns {group} from now on. You become an admin and can't undo this.")
+        }
+        GroupMemberAction::UseAsCoordinator => {
+            format!("Changes to {group} are applied from this device from now on.")
+        }
+        GroupMemberAction::Remove => {
+            format!("They stop receiving new messages in {group}. They can be invited again later.")
+        }
+        GroupMemberAction::RemoveThisDevice => format!(
+            "This device takes over applying changes and removes your lost device from {group}."
+        ),
+        GroupMemberAction::StepDown => format!("You stay in {group} as a member."),
+    }
 }
 
 #[cfg(test)]

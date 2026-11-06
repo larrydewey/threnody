@@ -266,6 +266,8 @@ impl Core {
         // with the peers kept from the last run; off, anything a killed
         // run left on disk goes.
         core.apply_tunnels();
+        // Settings applied: scheduled messages may go out now.
+        core.main.start_scheduled_sending();
         core.apply_handle();
         core.name_this_device();
         core.pump(core.main.clone(), None, Arc::new(AtomicBool::new(true)));
@@ -732,6 +734,8 @@ impl Core {
             .and_then(|p| p.parse().ok())
             .unwrap_or(0);
         self.settings().set_number(&key, Some(u32::from(port)));
+        // Settings applied: its scheduled messages may go out now.
+        node.start_scheduled_sending();
         let alive = Arc::new(AtomicBool::new(true));
         self.pump(node.clone(), Some(rec.id.clone()), alive.clone());
         node.reconnect();

@@ -33,6 +33,7 @@ pub mod reach;
 pub mod receipts;
 mod recover;
 pub mod relay;
+pub mod schedule;
 pub mod sync;
 mod tunnels;
 pub mod volunteer;

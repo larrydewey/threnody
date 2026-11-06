@@ -14,8 +14,8 @@ use threnody_ffi::{NodeEvent, ProfileAttr};
 use crate::call::CallBar;
 use crate::chat::{ChatView, Key};
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target, UiEvent};
-use crate::settings;
 use crate::ui::{self, bg};
+use crate::{schedule, settings};
 
 /// The most messages the app-wide search shows.
 const SEARCH_ALL: u32 = 200;
@@ -1419,8 +1419,43 @@ impl App {
                 }
                 (Some(peer.clone()), None)
             }
+            NodeEvent::GroupMembersChanged {
+                group,
+                added,
+                removed,
+                by,
+            } => {
+                // "Carol was added by Bob", while the group is open.
+                if let Some(by) = by
+                    && self.showing_group(group)
+                    && self
+                        .core
+                        .node(persona.as_deref())
+                        .is_ok_and(|n| n.device_fingerprint() != *by)
+                    && let Some(who) = added.iter().chain(removed).next()
+                    && who != by
+                {
+                    let (who, by) = (
+                        self.name(persona.as_deref(), who),
+                        self.name(persona.as_deref(), by),
+                    );
+                    self.toast(&if added.is_empty() {
+                        format!("{who} was removed by {by}")
+                    } else {
+                        format!("{who} was added by {by}")
+                    });
+                }
+                (Some(group.clone()), None)
+            }
+            NodeEvent::GroupChangeFailed { group, reason } => {
+                let name = self.title_of(persona.as_deref(), group);
+                self.toast(&format!("Couldn't apply your change to {name}: {reason}"));
+                (Some(group.clone()), None)
+            }
             NodeEvent::GroupJoined { group, .. }
-            | NodeEvent::GroupMembersChanged { group, .. }
+            | NodeEvent::GroupRoleChanged { group, .. }
+            | NodeEvent::GroupOutOfStep { group }
+            | NodeEvent::GroupUpgradePending { group, .. }
             | NodeEvent::GroupLeft { group } => (Some(group.clone()), None),
             NodeEvent::CredentialOffered { offer } => {
                 self.credential_offer(persona.clone(), offer.clone());
@@ -1591,6 +1626,21 @@ impl App {
                 }
                 (None, None)
             }
+            // Reload the chat's scheduled bar.
+            NodeEvent::ScheduledChanged { peer, group } => (group.clone().or(peer.clone()), None),
+            // Told apart from the chat's messages, and never with the text.
+            NodeEvent::ScheduledFailed {
+                peer,
+                group,
+                reason,
+                ..
+            } => {
+                let about = group.clone().or(peer.clone());
+                if let Some(a) = &about {
+                    self.notify_scheduled_failed(persona.as_deref(), a, group.is_some(), *reason);
+                }
+                (about, None)
+            }
             _ => (None, None),
         };
 
@@ -1661,6 +1711,116 @@ impl App {
             }
         }
         self.refresh_soon();
+    }
+
+    /// Whether the open chat is `group`.
+    fn showing_group(&self, group: &str) -> bool {
+        self.chat
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| matches!(&c.chat().target, Target::Group(g) if g == group))
+    }
+
+    /// A scheduled message to `about` (a contact's device, or a group)
+    /// wasn't sent: say why, unless that chat is on screen (its bar does).
+    fn notify_scheduled_failed(
+        &self,
+        persona: Option<&str>,
+        about: &str,
+        group: bool,
+        reason: threnody_ffi::ScheduleFailure,
+    ) {
+        let chat = self
+            .conversation_of(persona, about)
+            .map(|c| c.chat)
+            .unwrap_or_else(|| ChatRef {
+                persona: persona.map(str::to_owned),
+                target: if group {
+                    Target::Group(about.to_owned())
+                } else {
+                    Target::Contact(about.to_owned())
+                },
+            });
+        let watching = self
+            .core
+            .watching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if watching.as_ref() == Some(&chat) {
+            return;
+        }
+        let title = if group {
+            self.group_title(persona, about)
+        } else {
+            self.title_of(persona, about)
+        };
+        let body = format!(
+            "Scheduled message not sent: {}",
+            schedule::failure_text(reason)
+        );
+        // As for messages: with private notifications, not who or what.
+        let private = self.core.settings().flag(settings::PRIVATE_NOTIFICATIONS);
+        let n = if private {
+            let n = gio::Notification::new("Threnody");
+            n.set_body(Some("New message"));
+            n
+        } else {
+            let n = gio::Notification::new(&title);
+            n.set_body(Some(&body));
+            n
+        };
+        n.set_default_action_and_target_value(
+            "app.open-chat",
+            Some(&chat_variant(&chat).to_variant()),
+        );
+        // Its own id: it doesn't replace the chat's message notification.
+        self.app
+            .send_notification(Some(&format!("scheduled-{}", notification_id(&chat))), &n);
+    }
+
+    /// How many messages are scheduled, across every identity, that won't
+    /// go while the app is closed.
+    fn waiting_scheduled(&self) -> usize {
+        let mut nodes = vec![self.core.main.clone()];
+        nodes.extend(
+            self.core
+                .persona_ids()
+                .iter()
+                .filter_map(|id| self.core.node(Some(id)).ok()),
+        );
+        nodes
+            .iter()
+            .map(|n| {
+                n.all_scheduled()
+                    .iter()
+                    .filter(|s| s.failed.is_none())
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Quits, asking first if scheduled messages would then not be sent.
+    pub fn confirm_quit(self: &Rc<Self>) {
+        let n = self.waiting_scheduled();
+        if n == 0 {
+            return self.app.quit();
+        }
+        let app = self.app.clone();
+        // Hidden in the background: show it, so the question can be seen.
+        self.window.present();
+        ui::confirm(
+            &self.window,
+            "Quit Threnody?",
+            &if n == 1 {
+                "1 scheduled message won't be sent while Threnody is closed.".to_owned()
+            } else {
+                format!("{n} scheduled messages won't be sent while Threnody is closed.")
+            },
+            "Quit",
+            true,
+            move || app.quit(),
+        );
     }
 
     fn title_of(&self, persona: Option<&str>, peer: &str) -> String {
@@ -1828,6 +1988,10 @@ impl App {
             if this.core.settings().flag(settings::BACKGROUND) {
                 w.set_visible(false);
                 this.update_watching();
+                glib::Propagation::Stop
+            } else if this.waiting_scheduled() > 0 {
+                // Scheduled messages would not go: ask first.
+                this.confirm_quit();
                 glib::Propagation::Stop
             } else {
                 this.app.quit();

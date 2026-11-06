@@ -29,6 +29,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Scheduled messages: an alarm wakes the phone to send them (exact
+         only if the user allows it), and after a reboot. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <application
         android:name=".ThrenodyApplication"
@@ -93,6 +97,16 @@
             android:exported="false"
             android:grantUriPermissions="true" />
         <receiver android:name=".Calls$Decline" android:exported="false" />
+        <!-- Scheduled messages: the alarm, and setting it again after a
+             reboot or an update, or once exact alarms are allowed. -->
+        <receiver android:name=".Scheduled$Alarm" android:exported="false" />
+        <receiver android:name=".Scheduled$Boot" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
         <!-- Only the system's Telecom binds to it (its permission). -->
         <service android:name=".CallConnectionService" android:exported="true"
             android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">

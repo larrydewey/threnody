@@ -712,6 +712,8 @@ impl Node {
             self.tag_own_devices();
             if removed.contains(&self.identity()) {
                 self.emit(Event::ThisDeviceRemoved);
+                // Contacts no longer take this device as us.
+                self.fail_all_scheduled(crate::schedule::Failure::Removed);
             }
             for d in &removed {
                 self.revoke_device(d);
@@ -982,6 +984,7 @@ impl Node {
         self.broadcast_chain();
         if *device == self.identity() {
             self.emit(Event::ThisDeviceRemoved);
+            self.fail_all_scheduled(crate::schedule::Failure::Removed);
         } else {
             self.revoke_device(device);
             // As our other devices see it when the chain reaches them, so

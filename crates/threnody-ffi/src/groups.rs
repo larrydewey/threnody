@@ -5,8 +5,8 @@
 use threnody_core::PublicIdentity;
 use threnody_core::history::{ConversationId, FileNote};
 use threnody_core::message::Mention;
-use threnody_groups::GroupId;
-use threnody_groups::node::{Invite, Update};
+use threnody_groups::node::{Banner, Invite, MemberAction, MemberRow, Update};
+use threnody_groups::{GroupError, GroupId};
 
 use threnody_net::history::OutgoingFile;
 
@@ -21,13 +21,139 @@ pub struct GroupInfo {
     /// Hex group id, used to address the group in every call.
     pub id: String,
     pub name: String,
+    /// The coordinating device: the owner device that applies changes.
     pub owner: String,
     /// Member device fingerprints, including ours.
     pub members: Vec<String>,
     /// Member roles corresponding to `members`: 0=Owner, 1=Admin, 2=Member
     pub member_roles: Vec<u8>,
-    /// Whether we own it (only the owner adds and removes members).
+    /// Whether we're an owner (owners and admins add and remove members;
+    /// only owners change roles or delete the group).
     pub owned: bool,
+    /// The owner's devices, the admins and the successor's devices.
+    pub owners: Vec<String>,
+    pub admins: Vec<String>,
+    pub successors: Vec<String>,
+    /// Same as `owner`.
+    pub lead: String,
+    pub my_role: MemberRole,
+    /// Our changes waiting for the coordinating device.
+    pub pending_changes: u32,
+    /// Members whose version doesn't support roles yet.
+    pub outdated: Vec<String>,
+    /// We're the successor and the owner has been silent long enough.
+    pub can_claim: bool,
+    /// The group's roles come from a newer version: update Threnody.
+    pub update_needed: bool,
+    /// We asked to be brought back in step and haven't been yet.
+    pub out_of_step: bool,
+    /// The one banner to show over the chat, if any.
+    pub banner: Option<GroupBanner>,
+}
+
+/// The one banner a group shows, most pressing first.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupBanner {
+    /// "This device fell out of step with the group. Asking the others to
+    /// bring it back…"
+    OutOfStep,
+    /// "<owner> hasn't been seen in this group for 14 days. You're next in
+    /// line." with Take over as owner (`claim_group_ownership`).
+    CanClaim { owner: String },
+    /// "N changes are waiting for <coordinator> to come online." On an
+    /// owner device, also Apply from this device (`take_over_group`).
+    PendingChanges { count: u32, coordinator: String },
+    /// "Admins can be added once <names> update Threnody."
+    UpgradePending { outdated: Vec<String> },
+    /// "Only you are in this group."
+    OnlyYou,
+}
+
+/// What can be done to one row of `group_member_rows`, each matching one
+/// method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupMemberAction {
+    /// `promote_in_group`
+    MakeAdmin,
+    /// `demote_in_group`
+    RemoveAdmin,
+    /// `set_group_successor` with the row
+    MakeSuccessor,
+    /// `set_group_successor` with none
+    NoLongerSuccessor,
+    /// `transfer_group_ownership`
+    MakeOwner,
+    /// `use_as_coordinator` (this device)
+    UseAsCoordinator,
+    /// `remove_from_group`
+    Remove,
+    /// `remove_lost_coordinator`
+    RemoveThisDevice,
+    /// `demote_in_group` with ourselves
+    StepDown,
+}
+
+/// One row of a group's members: an account, or a device we can't tie
+/// to one.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GroupMemberRow {
+    /// The device that stands for the row (pass it to the methods).
+    pub fingerprint: String,
+    pub devices: Vec<String>,
+    pub role: MemberRole,
+    pub successor: bool,
+    pub is_me: bool,
+    pub coordinator: bool,
+    pub actions: Vec<GroupMemberAction>,
+}
+
+fn role(r: threnody_groups::MemberRole) -> MemberRole {
+    match r {
+        threnody_groups::MemberRole::Owner => MemberRole::Owner,
+        threnody_groups::MemberRole::Admin => MemberRole::Admin,
+        threnody_groups::MemberRole::Member => MemberRole::Member,
+    }
+}
+
+fn action(a: MemberAction) -> GroupMemberAction {
+    match a {
+        MemberAction::MakeAdmin => GroupMemberAction::MakeAdmin,
+        MemberAction::RemoveAdmin => GroupMemberAction::RemoveAdmin,
+        MemberAction::MakeSuccessor => GroupMemberAction::MakeSuccessor,
+        MemberAction::NoLongerSuccessor => GroupMemberAction::NoLongerSuccessor,
+        MemberAction::MakeOwner => GroupMemberAction::MakeOwner,
+        MemberAction::UseAsCoordinator => GroupMemberAction::UseAsCoordinator,
+        MemberAction::Remove => GroupMemberAction::Remove,
+        MemberAction::RemoveThisDevice => GroupMemberAction::RemoveThisDevice,
+        MemberAction::StepDown => GroupMemberAction::StepDown,
+    }
+}
+
+fn member_row(r: MemberRow) -> GroupMemberRow {
+    GroupMemberRow {
+        fingerprint: fp(&r.device),
+        devices: r.devices.iter().map(fp).collect(),
+        role: role(r.role),
+        successor: r.successor,
+        is_me: r.me,
+        coordinator: r.coordinator,
+        actions: r.actions.into_iter().map(action).collect(),
+    }
+}
+
+fn group_banner(b: Banner) -> GroupBanner {
+    match b {
+        Banner::OutOfStep => GroupBanner::OutOfStep,
+        Banner::CanClaim { owner } => GroupBanner::CanClaim { owner: fp(&owner) },
+        Banner::PendingChanges { count, coordinator } => GroupBanner::PendingChanges {
+            count,
+            coordinator: fp(&coordinator),
+        },
+        Banner::UpgradePending { outdated } => GroupBanner::UpgradePending {
+            outdated: outdated.iter().map(fp).collect(),
+        },
+        Banner::OnlyYou => GroupBanner::OnlyYou,
+    }
 }
 
 /// Member role in a group.
@@ -78,16 +204,27 @@ fn event(u: Update) -> NodeEvent {
                 quiet,
             }
         }
-        Update::MemberAdded { group, member } => NodeEvent::GroupMembersChanged {
+        Update::MemberAdded { group, member, by } => NodeEvent::GroupMembersChanged {
             group: hex(&group),
             added: vec![fp(&member)],
             removed: vec![],
+            by: by.as_ref().map(fp),
         },
-        Update::MemberRemoved { group, member } => NodeEvent::GroupMembersChanged {
+        Update::MemberRemoved { group, member, by } => NodeEvent::GroupMembersChanged {
             group: hex(&group),
             added: vec![],
             removed: vec![fp(&member)],
+            by: by.as_ref().map(fp),
         },
+        Update::ChangeFailed { group, reason } => NodeEvent::GroupChangeFailed {
+            group: hex(&group),
+            reason,
+        },
+        Update::UpgradePending { group, outdated } => NodeEvent::GroupUpgradePending {
+            group: hex(&group),
+            outdated: outdated.iter().map(fp).collect(),
+        },
+        Update::OutOfStep { group } => NodeEvent::GroupOutOfStep { group: hex(&group) },
         Update::Left { group } => NodeEvent::GroupLeft { group: hex(&group) },
         Update::RoleChanged {
             group,
@@ -181,11 +318,17 @@ impl ThrenodyNode {
         self.group_node().linked(&self.node, device);
     }
 
-    /// Devices left their accounts: the groups we own drop them, and none
-    /// of our groups delivers to them any more.
+    /// Devices left their accounts: they lose their roles and are removed
+    /// from our groups (by us if we coordinate, proposed if we may, taken
+    /// over from if one coordinated for our account), and none of our
+    /// groups delivers to them any more.
     pub(crate) fn group_revoked(&self, removed: &[PublicIdentity]) {
         let _guard = self.rt.enter();
         let updates = self.group_node().revoked(&self.node, removed);
+        self.queue_updates(updates);
+    }
+
+    pub(crate) fn queue_group_updates(&self, updates: Vec<Update>) {
         self.queue_updates(updates);
     }
 
@@ -207,6 +350,101 @@ impl ThrenodyNode {
                 u => Some(u),
             })
             .collect()
+    }
+
+    /// `peer` as a member of group `g` (by fingerprint), or else as a
+    /// contact: members needn't be contacts.
+    fn member(&self, g: &GroupId, peer: &str) -> Result<PublicIdentity> {
+        let found = self
+            .group_node()
+            .list()
+            .into_iter()
+            .find(|(id, ..)| id == g)
+            .and_then(|(.., members)| members.into_iter().find(|m| fp(m) == peer));
+        match found {
+            Some(p) => Ok(p),
+            None => self.resolve(peer),
+        }
+    }
+
+    fn group_info(
+        &self,
+        g: GroupId,
+        name: String,
+        owner: PublicIdentity,
+        members: Vec<PublicIdentity>,
+        roles: Vec<threnody_groups::MemberRole>,
+    ) -> GroupInfo {
+        let me = self.node.identity();
+        let gn = self.group_node();
+        let now = threnody_core::now_ms();
+        let roster = gn
+            .roster(&g)
+            .unwrap_or_else(|_| threnody_groups::Roster::legacy(owner));
+        let my_role = roster.role(&me);
+        GroupInfo {
+            id: hex(&g),
+            name,
+            owner: fp(&owner),
+            members: members.iter().map(fp).collect(),
+            member_roles: roles.iter().map(|r| r.to_wire()).collect(),
+            owned: my_role == threnody_groups::MemberRole::Owner,
+            owners: roster.owners.iter().map(fp).collect(),
+            admins: roster.admins.iter().map(fp).collect(),
+            successors: roster.successors.iter().map(fp).collect(),
+            lead: fp(&roster.lead),
+            my_role: role(my_role),
+            pending_changes: u32::try_from(gn.pending_changes(&g)).unwrap_or(u32::MAX),
+            outdated: gn.outdated(&g).iter().map(fp).collect(),
+            can_claim: gn.can_claim(&self.node, &g, now),
+            update_needed: roster.update_needed(),
+            out_of_step: gn.out_of_step(&g),
+            banner: gn.banner(&self.node, &g, now).map(group_banner),
+        }
+    }
+
+    /// Runs a group change and queues what it brings.
+    fn group_change(
+        &self,
+        f: impl FnOnce(
+            &mut threnody_groups::node::GroupNode,
+        ) -> std::result::Result<Vec<Update>, GroupError>,
+    ) -> Result<()> {
+        let _guard = self.rt.enter();
+        let updates = f(&mut self.group_node()).map_err(fail)?;
+        self.queue_updates(updates);
+        Ok(())
+    }
+
+    /// The mentions an app names (by member device) in group `g`, as a
+    /// message carries them; those naming no member are left out.
+    pub(crate) fn group_mentions(&self, g: &GroupId, mentions: &[MentionInfo]) -> Vec<Mention> {
+        let members = self
+            .group_node()
+            .list()
+            .into_iter()
+            .find(|(id, ..)| id == g)
+            .map(|(.., m)| m)
+            .unwrap_or_default();
+        mentions
+            .iter()
+            .filter_map(|m| {
+                let d = members.iter().find(|d| fp(d) == m.device)?;
+                Some(Mention {
+                    start: m.start,
+                    len: m.len,
+                    who: self.node.reactor_of(d),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether we're a member of group `g`.
+    pub(crate) fn in_group(&self, g: &GroupId) -> bool {
+        self.group_node()
+            .list()
+            .into_iter()
+            .any(|(id, ..)| id == *g)
     }
 
     /// A group (or invitation) by hex id prefix.
@@ -241,19 +479,22 @@ impl ThrenodyNode {
     }
 
     pub fn groups(&self) -> Vec<GroupInfo> {
-        let me = self.node.identity();
-        self.group_node()
-            .list_with_roles()
-            .into_iter()
-            .map(|(g, name, owner, members, roles)| GroupInfo {
-                id: hex(&g),
-                name,
-                owner: fp(&owner),
-                members: members.iter().map(fp).collect(),
-                member_roles: roles.iter().map(|r| *r as u8).collect(),
-                owned: owner == me,
-            })
+        let list = self.group_node().list_with_roles();
+        list.into_iter()
+            .map(|(g, name, owner, members, roles)| self.group_info(g, name, owner, members, roles))
             .collect()
+    }
+
+    /// One row per account of `group`'s members (a device we can't tie to
+    /// an account is its own row): owners, then admins, then members, with
+    /// what this device may do to each.
+    pub fn group_member_rows(&self, group: String) -> Result<Vec<GroupMemberRow>> {
+        let g = self.group_id(&group)?;
+        let rows = self
+            .group_node()
+            .member_rows(&self.node, &g)
+            .map_err(fail)?;
+        Ok(rows.into_iter().map(member_row).collect())
     }
 
     /// Invitations waiting for `accept_group_invite` or `decline_group_invite`.
@@ -261,8 +502,9 @@ impl ThrenodyNode {
         self.group_node().invites().iter().map(invite).collect()
     }
 
-    /// Invites every device of `peer`'s account (we must own the group).
-    /// They join once they accept (automatically if they approved us).
+    /// Invites every device of `peer`'s account (owners and admins may).
+    /// They join once they accept (automatically if they approved us); an
+    /// admin's invitation completes once the coordinating device applies it.
     pub fn invite_to_group(&self, group: String, peer: String) -> Result<()> {
         let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
         let _guard = self.rt.enter();
@@ -321,40 +563,113 @@ impl ThrenodyNode {
         Ok(())
     }
 
-    /// Removes every device of `peer`'s account (we must own the group).
+    /// Removes every device of `peer`'s account (owners may remove anyone
+    /// but the owner; admins, members only).
     pub fn remove_from_group(&self, group: String, peer: String) -> Result<()> {
-        let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
+        let g = self.group_id(&group)?;
+        let p = self.member(&g, &peer)?;
         let _guard = self.rt.enter();
         let updates = self.group_node().remove(&self.node, &g, &p).map_err(fail)?;
         self.queue_updates(updates);
         Ok(())
     }
 
-    /// Promotes `peer` to Admin (only the group owner can do this).
+    /// Owner: makes every device of `peer`'s account in the group an
+    /// admin (members see who the owner's and that account's devices are).
     pub fn promote_in_group(&self, group: String, peer: String) -> Result<()> {
-        let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
-        let _guard = self.rt.enter();
-        let updates = self.group_node().promote(&self.node, &g, p).map_err(fail)?;
-        self.queue_updates(updates);
-        Ok(())
+        let g = self.group_id(&group)?;
+        let p = self.member(&g, &peer)?;
+        self.group_change(|gn| gn.promote(&self.node, &g, p))
     }
 
-    /// Demotes `peer` from Admin to Member (only the group owner can do this).
+    /// Owner: `peer`'s account is no longer an admin. With our own
+    /// fingerprint, an admin steps down.
     pub fn demote_in_group(&self, group: String, peer: String) -> Result<()> {
-        let (g, p) = (self.group_id(&group)?, self.resolve(&peer)?);
-        let _guard = self.rt.enter();
-        let updates = self.group_node().demote(&self.node, &g, p).map_err(fail)?;
-        self.queue_updates(updates);
-        Ok(())
+        let g = self.group_id(&group)?;
+        let p = self.member(&g, &peer)?;
+        self.group_change(|gn| gn.demote(&self.node, &g, p))
     }
 
-    /// Leaves a group (a member asks the owner to remove it) or, for the
-    /// owner, deletes it for everyone. Its history stays.
+    /// Owner: hands the group to `peer`'s account; our devices become
+    /// admins. Can't be undone by us.
+    pub fn transfer_group_ownership(&self, group: String, peer: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let p = self.member(&g, &peer)?;
+        self.group_change(|gn| gn.transfer(&self.node, &g, p))
+    }
+
+    /// Owner: hands the group to `peer`'s account and leaves it ("Choose a
+    /// new owner first"). Fails, changing nothing, while the group waits
+    /// for members to update.
+    pub fn transfer_group_ownership_and_leave(&self, group: String, peer: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let p = self.member(&g, &peer)?;
+        self.group_change(|gn| gn.transfer_and_leave(&self.node, &g, p))
+    }
+
+    /// Owner: makes `peer`'s account (an admin) the successor, who may take
+    /// over should the owner be silent for 14 days; `None` clears it.
+    pub fn set_group_successor(&self, group: String, peer: Option<String>) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let p = peer.map(|p| self.member(&g, &p)).transpose()?;
+        self.group_change(|gn| gn.set_successor(&self.node, &g, p))
+    }
+
+    /// The successor takes ownership (offered when `GroupInfo::can_claim`).
+    /// The old owner becomes an admin; it can't be undone.
+    pub fn claim_group_ownership(&self, group: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.group_change(|gn| gn.claim(&self.node, &g))
+    }
+
+    /// An owner device applies waiting changes itself, taking over as the
+    /// coordinating device without the current one (the banner's Apply
+    /// from this device).
+    pub fn take_over_group(&self, group: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.group_change(|gn| gn.take_over(&self.node, &g))
+    }
+
+    /// An owner device asks for `device` (an owner device, usually this
+    /// one) to coordinate from now on.
+    pub fn use_as_coordinator(&self, group: String, device: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let d = self.member(&g, &device)?;
+        self.group_change(|gn| gn.use_as_coordinator(&self.node, &g, d))
+    }
+
+    /// Takes over from a lost coordinating device of ours and removes it
+    /// from the group.
+    pub fn remove_lost_coordinator(&self, group: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.group_change(|gn| gn.remove_coordinator(&self.node, &g))
+    }
+
+    /// Owner: deletes the group for everyone. Its history stays here.
+    pub fn delete_group(&self, group: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        self.group_change(|gn| gn.delete(&self.node, &g))
+    }
+
+    /// Debug builds only (a no-op in release builds): the owner's silence
+    /// before a successor may take over, in ms (0: the usual 14 days).
+    pub fn set_succession_silence_for_testing(&self, ms: u64) {
+        #[cfg(debug_assertions)]
+        threnody_groups::node::set_succession_silence_for_testing(ms);
+        #[cfg(not(debug_assertions))]
+        let _ = ms;
+    }
+
+    /// Leaves a group: the coordinating device removes us. The last owner
+    /// account must transfer ownership (`transfer_group_ownership`) or
+    /// delete the group (`delete_group`) instead, unless nobody else is in
+    /// it. Its history stays.
     pub fn leave_group(&self, group: String) -> Result<()> {
         let g = self.group_id(&group)?;
-        let _guard = self.rt.enter();
-        let updates = self.group_node().leave(&self.node, &g).map_err(fail)?;
-        self.queue_updates(updates);
+        self.group_change(|gn| gn.leave(&self.node, &g))?;
+        // Leaving is our choice, like deleting a chat: what we scheduled
+        // there goes (being removed fails it when due, so we hear of it).
+        self.node.drop_scheduled(ConversationId::Group(g));
         Ok(())
     }
 
@@ -584,31 +899,15 @@ impl ThrenodyNode {
             (Some(at), Some(d)) => self.node.quote_of(conv, crate::entry_at(at, d)),
             _ => None,
         };
-        let members = self
-            .group_node()
-            .list()
-            .into_iter()
-            .find(|(id, ..)| *id == g)
-            .map(|(.., m)| m)
-            .unwrap_or_default();
-        let mentions = mentions
-            .iter()
-            .filter_map(|m| {
-                let d = members.iter().find(|d| fp(d) == m.device)?;
-                Some(Mention {
-                    start: m.start,
-                    len: m.len,
-                    who: self.node.reactor_of(d),
-                })
-            })
-            .collect();
+        let mentions = self.group_mentions(&g, &mentions);
         let _guard = self.rt.enter();
         self.group_node()
             .send_message(&self.node, &g, &text, quote, mentions)
             .map_err(fail)
     }
 
-    /// Whether we may pin messages in `group` (we own it, or are an admin).
+    /// Whether we may pin messages in `group` (we're an owner or admin, as
+    /// every member agrees).
     pub fn may_pin_in_group(&self, group: String) -> Result<bool> {
         let g = self.group_id(&group)?;
         Ok(self.group_node().may_pin(&g, &self.node.identity()))

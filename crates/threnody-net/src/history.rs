@@ -779,6 +779,8 @@ impl Node {
     /// with them. Our other devices learn the block through contact sync.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        // Before the contacts change: their items are found through them.
+        self.drop_scheduled(conv);
         let now = now_ms();
         let devices = self.mark_contacts(peer, |c| {
             c.blocked = true;
@@ -813,6 +815,7 @@ impl Node {
             return false;
         }
         let conv = self.conversation_for(peer);
+        self.drop_scheduled(conv);
         let devices = self.mark_contacts(peer, |_| {});
         let mut gone = Vec::new();
         self.update_contacts(|c| {
@@ -839,6 +842,7 @@ impl Node {
     /// sync) on our other devices. If they write again, it's a new request.
     pub fn delete_conversation(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        self.drop_scheduled(conv);
         let devices = self.mark_contacts(peer, |_| {});
         let now = now_ms();
         self.update_contacts(|c| {
@@ -963,12 +967,33 @@ impl Node {
         quote: Option<Quote>,
         forwarded: bool,
     ) -> Result<SendReport> {
+        let extras = Extras {
+            quote,
+            forwarded,
+            ..Extras::default()
+        };
+        self.send_message_with(peer, body, extras, local_id())
+    }
+
+    /// [`Node::send_message`], with what it quotes and whether it's
+    /// forwarded in `extras`, recorded (and sent) under `local_id`: a
+    /// scheduled message keeps the id it was scheduled with, so it is
+    /// never sent twice (see `schedule`).
+    pub fn send_message_with(
+        &self,
+        peer: &PublicIdentity,
+        body: &str,
+        extras: Extras,
+        local_id: u64,
+    ) -> Result<SendReport> {
+        let Extras {
+            quote, forwarded, ..
+        } = extras;
         // Writing to someone accepts them.
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
         let timer = self.effective_timer(conv);
         // The message carries its history id, so we can delete it later.
-        let local_id = local_id();
         let msg = AppMessage::Text {
             sent_ms: now_ms(),
             body: body.to_owned(),

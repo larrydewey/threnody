@@ -7,8 +7,8 @@ use anyhow::{Result, anyhow, bail};
 use threnody_core::history::{ConversationId, FileNote};
 use threnody_core::store::Home;
 use threnody_core::{Identity, PublicIdentity};
-use threnody_groups::GroupId;
 use threnody_groups::node::{GroupNode, Invite, Update};
+use threnody_groups::{GroupId, MemberRole};
 use threnody_net::Node;
 
 pub const HELP: &str = "\
@@ -16,9 +16,16 @@ pub const HELP: &str = "\
   /group invite <group> <peer>          add a contact (every device of theirs)
   /group accept [n]                     accept a pending invitation
   /group decline [n]                    decline a pending invitation
-  /group remove <group> <peer>          remove a member (owner only)
-  /group leave <group>                  leave (or, as owner, delete) a group
-  /groups                               list groups and members
+  /group remove <group> <peer>          remove a member (owners; admins remove members)
+  /group leave <group>                  leave a group (the last owner transfers or deletes)
+  /group delete <group>                 delete a group for everyone (owners)
+  /group admin <group> <peer>           make a member an admin (owners)
+  /group unadmin <group> <peer>         take admin away; your own name: step down
+  /group owner <group> <peer>           hand the group over (you become an admin)
+  /group successor <group> <peer|none>  who may take over if you go silent (an admin)
+  /group claim <group>                  as successor, take over a silent owner's group
+  /group coordinate <group>             apply changes from this owner device now
+  /groups                               list groups, members and roles
   /g <group> <text>                     send to a group
   /ghistory <group> [count]             a group's recent messages, numbered
   /gr <group> <n> <text>                reply to message n of the last /ghistory, quoting it
@@ -109,23 +116,53 @@ impl GroupUi {
                     i.name,
                     self.groups.invites().len()
                 ),
-                Update::MemberAdded { group, member } => {
-                    say!("* {} joined {}", name(&member), self.label(&group));
+                Update::MemberAdded { group, member, by } => match by {
+                    Some(by) if by != member && by != node.identity() => say!(
+                        "* {} was added to {} by {}",
+                        name(&member),
+                        self.label(&group),
+                        name(&by)
+                    ),
+                    _ => say!("* {} joined {}", name(&member), self.label(&group)),
+                },
+                Update::MemberRemoved { group, member, by } => match by {
+                    Some(by) if by != member && by != node.identity() => say!(
+                        "* {} was removed from {} by {}",
+                        name(&member),
+                        self.label(&group),
+                        name(&by)
+                    ),
+                    _ => say!("* {} left {}", name(&member), self.label(&group)),
+                },
+                Update::ChangeFailed { group, reason } => {
+                    say!(
+                        "! couldn't apply your change to {}: {reason}",
+                        self.label(&group)
+                    );
                 }
-                Update::MemberRemoved { group, member } => {
-                    say!("* {} left {}", name(&member), self.label(&group));
+                Update::UpgradePending { group, outdated } => {
+                    let names: Vec<String> = outdated.iter().map(name).collect();
+                    say!(
+                        "* admins can be added to {} once {} update Threnody",
+                        self.label(&group),
+                        names.join(", ")
+                    );
                 }
+                Update::OutOfStep { group } => say!(
+                    "! this device fell out of step with {}; asking the others to bring it back",
+                    self.label(&group)
+                ),
                 Update::RoleChanged {
-                    group: _,
+                    group,
                     member,
                     role,
                 } => {
-                    let role_str = match role {
-                        threnody_groups::MemberRole::Owner => "owner",
-                        threnody_groups::MemberRole::Admin => "admin",
-                        threnody_groups::MemberRole::Member => "member",
-                    };
-                    say!("* {} is now {}", name(&member), role_str);
+                    say!(
+                        "* {} is now {} in {}",
+                        name(&member),
+                        role_name(role),
+                        self.label(&group)
+                    );
                 }
                 Update::Left { group } => {
                     say!("* you were removed from group #{}", short(&group));
@@ -234,8 +271,15 @@ impl GroupUi {
         }
     }
 
-    /// Devices were removed from their accounts: the groups we own drop
-    /// them, and none of our groups delivers to them any more.
+    /// What waited at shutdown (see `GroupNode::resume_all`).
+    pub fn resume(&mut self, node: &Node, name: &dyn Fn(&PublicIdentity) -> String) {
+        let updates = self.groups.resume_all(node);
+        self.show(node, name, updates);
+    }
+
+    /// Devices were removed from their accounts: they lose their roles and
+    /// their place in our groups, and none of our groups delivers to them
+    /// any more.
     pub fn revoked(
         &mut self,
         node: &Node,
@@ -285,6 +329,51 @@ impl GroupUi {
         origin: &PublicIdentity,
     ) {
         self.groups.relayed(node, member, group, reference, origin);
+    }
+
+    /// `q` among `g`'s members (by name or fingerprint prefix), or else a
+    /// contact: members needn't be contacts.
+    fn member(
+        &self,
+        g: &GroupId,
+        q: &str,
+        name: &dyn Fn(&PublicIdentity) -> String,
+        resolve: &dyn Fn(&str) -> Result<PublicIdentity>,
+    ) -> Result<PublicIdentity> {
+        let members = self
+            .groups
+            .list()
+            .into_iter()
+            .find(|(id, ..)| id == g)
+            .map(|(.., m)| m)
+            .unwrap_or_default();
+        let hits: Vec<PublicIdentity> = members
+            .into_iter()
+            .filter(|m| {
+                name(m) == q
+                    || (q.len() >= 4
+                        && threnody_core::identity::fingerprint_matches_prefix(&m.fingerprint(), q))
+            })
+            .collect();
+        match hits.as_slice() {
+            [p] => Ok(*p),
+            [] => resolve(q),
+            _ => bail!("{q:?} matches several members"),
+        }
+    }
+
+    /// Our changes still waiting for the coordinator, if any.
+    fn pending_note(&self, g: &GroupId, name: &dyn Fn(&PublicIdentity) -> String) {
+        let n = self.groups.pending_changes(g);
+        if n == 0 {
+            return;
+        }
+        if let Ok(r) = self.groups.roster(g) {
+            say!(
+                "    {n} change(s) waiting for {} to come online (/group coordinate to apply them from an owner device)",
+                name(&r.lead)
+            );
+        }
     }
 
     /// Picks pending invitation `n` (1-based; the latest by default).
@@ -348,11 +437,12 @@ impl GroupUi {
                 let (Some(g), Some(p)) = (g, p) else {
                     bail!("usage: /group remove <group> <peer>")
                 };
-                let (g, p) = (self.find(g)?, resolve(p)?);
+                let g = self.find(g)?;
+                let p = self.member(&g, p, name, resolve)?;
                 let updates = self.groups.remove(node, &g, &p)?;
                 self.show(node, name, updates);
             }
-            "leave" | "delete" => {
+            "leave" => {
                 let g = self.find(
                     it.next()
                         .ok_or_else(|| anyhow!("usage: /group leave <group>"))?,
@@ -360,6 +450,55 @@ impl GroupUi {
                 let label = self.label(&g);
                 self.groups.leave(node, &g)?;
                 say!("* left {label}");
+            }
+            "delete" => {
+                let g = self.find(
+                    it.next()
+                        .ok_or_else(|| anyhow!("usage: /group delete <group>"))?,
+                )?;
+                let label = self.label(&g);
+                self.groups.delete(node, &g)?;
+                say!("* deleted {label} for everyone");
+            }
+            cmd @ ("admin" | "unadmin" | "owner" | "successor") => {
+                let (g, p) = (it.next(), it.next());
+                let (Some(g), Some(p)) = (g, p) else {
+                    bail!("usage: /group {cmd} <group> <peer>")
+                };
+                let g = self.find(g)?;
+                let updates = if cmd == "successor" && p == "none" {
+                    self.groups.set_successor(node, &g, None)?
+                } else {
+                    let p = self.member(&g, p, name, resolve)?;
+                    match cmd {
+                        "admin" => self.groups.promote(node, &g, p)?,
+                        "unadmin" => self.groups.demote(node, &g, p)?,
+                        "owner" => self.groups.transfer(node, &g, p)?,
+                        _ => self.groups.set_successor(node, &g, Some(p))?,
+                    }
+                };
+                self.show(node, name, updates);
+                self.pending_note(&g, name);
+            }
+            "claim" => {
+                let g = self.find(
+                    it.next()
+                        .ok_or_else(|| anyhow!("usage: /group claim <group>"))?,
+                )?;
+                if !self.groups.can_claim(node, &g, threnody_core::now_ms()) {
+                    bail!("only the successor, once the owner has been silent for 14 days");
+                }
+                let updates = self.groups.claim(node, &g)?;
+                self.show(node, name, updates);
+            }
+            "coordinate" => {
+                let g = self.find(
+                    it.next()
+                        .ok_or_else(|| anyhow!("usage: /group coordinate <group>"))?,
+                )?;
+                let updates = self.groups.take_over(node, &g)?;
+                self.show(node, name, updates);
+                say!("* this device now applies changes to {}", self.label(&g));
             }
             "list" => self.list(name),
             other => bail!("unknown /group {other}; try /help"),
@@ -372,24 +511,35 @@ impl GroupUi {
         if groups.is_empty() {
             say!("No groups. /group new <name>");
         }
-        for (id, _, owner, members) in groups {
+        for (id, _, lead, members) in groups {
+            let roster = self.groups.roster(&id).ok();
             let names: Vec<String> = members
                 .iter()
                 .map(|m| {
+                    let mut s = name(m);
+                    if let Some(r) = &roster {
+                        match r.role(m) {
+                            MemberRole::Member => {}
+                            role => s.push_str(&format!(" ({})", role_name(role))),
+                        }
+                        if r.successors.contains(m) {
+                            s.push_str(" (successor)");
+                        }
+                    }
                     let held = self.groups.held_for(m);
                     if held > 0 {
-                        format!("{} ({held} held)", name(m))
-                    } else {
-                        name(m)
+                        s.push_str(&format!(" ({held} held)"));
                     }
+                    s
                 })
                 .collect();
             say!(
-                "  {}  owner {}  members: {}",
+                "  {}  coordinated by {}  members: {}",
                 self.label(&id),
-                name(&owner),
+                name(&lead),
                 names.join(", ")
             );
+            self.pending_note(&id, name);
         }
         for (i, inv) in self.groups.invites().iter().enumerate() {
             say!(
@@ -533,5 +683,13 @@ impl GroupUi {
         let g = self.find(g)?;
         self.groups.send_text(node, &g, text)?;
         Ok(())
+    }
+}
+
+fn role_name(role: MemberRole) -> &'static str {
+    match role {
+        MemberRole::Owner => "owner",
+        MemberRole::Admin => "admin",
+        MemberRole::Member => "member",
     }
 }
