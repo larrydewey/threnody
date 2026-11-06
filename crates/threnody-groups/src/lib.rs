@@ -1933,10 +1933,7 @@ impl Groups {
             return out;
         }
         self.draining = true;
-        loop {
-            let Some(g) = self.groups.get_mut(group) else {
-                break;
-            };
+        while let Some(g) = self.groups.get_mut(group) {
             if g.future.is_empty() {
                 break;
             }

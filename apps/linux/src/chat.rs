@@ -4198,44 +4198,6 @@ fn quotes(q: &threnody_ffi::QuoteInfo, e: &HistoryEntry) -> bool {
     e.device == q.author && !q.text.is_empty() && snippet.starts_with(&q.text)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn photos_the_node_cant_strip_go_as_jpeg() {
-        let dir = std::env::temp_dir().join(format!("threnody-prepare-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tiff = dir.join("scan.tiff");
-        let p = gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, 40, 30)
-            .unwrap();
-        p.fill(0x3366_99ff);
-        p.savev(&tiff, "tiff", &[]).unwrap();
-        let data = std::fs::read(&tiff).unwrap();
-        let (name, out) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
-        assert_eq!(name, "scan.jpg");
-        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
-
-        // Whatever it is called.
-        let misnamed = dir.join("misnamed.jpg");
-        std::fs::copy(&tiff, &misnamed).unwrap();
-        let (name, out) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
-        assert_eq!(name, "misnamed.jpg");
-        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
-
-        // Formats the node strips itself pass through untouched.
-        let png = dir.join("a.png");
-        let (name, out) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
-        assert!(name == "a.png" && out == b"as is");
-
-        // One it can't read isn't sent with its metadata.
-        let heic = dir.join("broken.heic");
-        std::fs::write(&heic, b"not a picture").unwrap();
-        assert!(prepare(&heic, "broken.heic".into(), b"not a picture".to_vec()).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 fn action_label(a: GroupMemberAction) -> &'static str {
     match a {
         GroupMemberAction::MakeAdmin => "Make admin",
@@ -4276,5 +4238,43 @@ fn action_confirm(a: GroupMemberAction, name: &str, group: &str) -> String {
             "This device takes over applying changes and removes your lost device from {group}."
         ),
         GroupMemberAction::StepDown => format!("You stay in {group} as a member."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn photos_the_node_cant_strip_go_as_jpeg() {
+        let dir = std::env::temp_dir().join(format!("threnody-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tiff = dir.join("scan.tiff");
+        let p = gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, 40, 30)
+            .unwrap();
+        p.fill(0x3366_99ff);
+        p.savev(&tiff, "tiff", &[]).unwrap();
+        let data = std::fs::read(&tiff).unwrap();
+        let (name, out) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
+        assert_eq!(name, "scan.jpg");
+        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
+
+        // Whatever it is called.
+        let misnamed = dir.join("misnamed.jpg");
+        std::fs::copy(&tiff, &misnamed).unwrap();
+        let (name, out) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
+        assert_eq!(name, "misnamed.jpg");
+        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
+
+        // Formats the node strips itself pass through untouched.
+        let png = dir.join("a.png");
+        let (name, out) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
+        assert!(name == "a.png" && out == b"as is");
+
+        // One it can't read isn't sent with its metadata.
+        let heic = dir.join("broken.heic");
+        std::fs::write(&heic, b"not a picture").unwrap();
+        assert!(prepare(&heic, "broken.heic".into(), b"not a picture".to_vec()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

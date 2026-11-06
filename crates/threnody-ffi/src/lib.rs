@@ -3913,7 +3913,7 @@ mod tests {
         all.until(1, |e| matches!(e, NodeEvent::GroupRoleChanged { .. }));
         assert_eq!(bob.groups()[0].my_role, groups::MemberRole::Admin);
         assert!(bob.may_pin_in_group(g.clone()).unwrap());
-        assert_eq!(carol.groups()[0].admins, [b_fp.clone()]);
+        assert_eq!(carol.groups()[0].admins, std::slice::from_ref(&b_fp));
         let rows = alice.group_member_rows(g.clone()).unwrap();
         let row = |fp: &str| rows.iter().find(|r| r.fingerprint == fp).unwrap().clone();
         assert!(
