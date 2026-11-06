@@ -683,6 +683,15 @@ impl Node {
         code
     }
 
+    /// Whether a link code we issued is still out (see `Node::admit`).
+    pub(crate) fn link_code_out(&self) -> bool {
+        !self.shared.persona
+            && lock(&self.shared.linking)
+                .codes
+                .iter()
+                .any(|(_, t)| t.elapsed() < LINK_CODE_TTL)
+    }
+
     fn on_link_request(&self, from: PublicIdentity, proof: [u8; 32], name: &str) {
         let Some(session_id) = self
             .sessions()

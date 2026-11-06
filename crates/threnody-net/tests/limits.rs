@@ -306,3 +306,41 @@ async fn idle_stranger_sessions_close_and_contacts_stay() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(has(&bob, &carol), "an accepted contact never idles out");
 }
+
+/// A new device of ours linking while strangers hold every place from
+/// its network still gets in. One let in past the limit that doesn't
+/// link is closed after the grace.
+#[tokio::test]
+async fn linking_a_device_gets_past_a_full_strangers_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, _lrx) = node(&dir, "laptop");
+    let addr = laptop.listen("127.0.0.1:0").await.unwrap().to_string();
+    let pin = Some(laptop.identity().fingerprint());
+    let mut four = Vec::new();
+    for i in 0..4 {
+        let (s, rx) = node(&dir, &format!("s{i}"));
+        s.connect(&addr, pin).await.unwrap();
+        four.push((s, rx));
+    }
+    assert!(until(5, || laptop.sessions().len() == 4).await);
+
+    let code = laptop.create_link_code(addr.clone());
+    let (phone, _prx) = node(&dir, "phone");
+    timeout(Duration::from_secs(20), phone.link_with(&code))
+        .await
+        .expect("linking finished")
+        .expect("the new device linked");
+    assert!(until(5, || laptop.is_own_device(&phone.identity())).await);
+
+    // Another code is out, but whoever comes now doesn't link with it.
+    let _code = laptop.create_link_code(addr.clone());
+    laptop.set_link_grace(Duration::from_millis(800));
+    let (eve, _erx) = node(&dir, "eve");
+    eve.connect(&addr, pin).await.unwrap();
+    assert!(until(5, || has(&laptop, &eve)).await, "let in to link");
+    assert!(
+        until(5, || !has(&laptop, &eve)).await,
+        "and closed when it didn't"
+    );
+    assert!(has(&laptop, &phone), "the linked device stays");
+}

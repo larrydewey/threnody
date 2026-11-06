@@ -555,6 +555,11 @@ pub(crate) struct Shared {
     /// How long a stranger's session lasts without application traffic
     /// (see [`STRANGER_IDLE`]); tests shorten it.
     stranger_idle: Mutex<Duration>,
+    /// Places past [`MAX_STRANGERS`] for a new device of ours linking
+    /// while a link code is out (see [`MAX_LINKING`]), and how long one
+    /// may stay a stranger's; tests shorten that.
+    pub(crate) linkers: crate::gate::Gate,
+    link_grace: Mutex<Duration>,
     /// Peers whose waiting messages we try to deliver again (see
     /// `retry_held`), and the first wait between tries.
     retrying: Mutex<HashSet<PublicIdentity>>,
@@ -814,6 +819,8 @@ impl Node {
             ),
             strangers: crate::gate::Gate::new(MAX_STRANGERS, MAX_STRANGERS_PER_SOURCE),
             stranger_idle: Mutex::new(STRANGER_IDLE),
+            linkers: crate::gate::Gate::new(MAX_LINKING, MAX_LINKING_PER_SOURCE),
+            link_grace: Mutex::new(LINK_GRACE),
             retrying: Mutex::default(),
             retry_after: Mutex::new(RETRY_AFTER),
             volunteer: crate::volunteer::VolunteerState::new(),
@@ -1304,21 +1311,45 @@ impl Node {
     /// [`MAX_STRANGERS`], which the returned pass holds. Relay and onion
     /// circuits don't come through here: they ride on a contact's
     /// session, hold no socket of ours, and are capped per neighbour.
-    pub(crate) fn admit(&self, peer: &PublicIdentity, source: Source) -> Result<Option<Pass>> {
+    ///
+    /// A new device of ours, linking with a code we issued, is a stranger
+    /// until it shows the code inside its session: while a code is out,
+    /// one past the limit takes one of [`MAX_LINKING`] places instead,
+    /// and must have become ours within [`LINK_GRACE`].
+    pub(crate) fn admit(
+        &self,
+        peer: &PublicIdentity,
+        source: Source,
+    ) -> Result<Option<StrangerPass>> {
         self.check_policy(peer)?;
         if !self.is_stranger(peer) {
             return Ok(None);
         }
-        self.shared
-            .strangers
-            .enter(source)
-            .map(Some)
-            .ok_or_else(|| {
-                NetError::Refused(format!(
-                    "{} (too many strangers connected; it can try again later)",
-                    peer.fingerprint()
-                ))
-            })
+        if let Some(place) = self.shared.strangers.enter(source) {
+            return Ok(Some(StrangerPass {
+                _place: place,
+                linking: false,
+            }));
+        }
+        if self.link_code_out()
+            && let Some(place) = self.shared.linkers.enter(source)
+        {
+            return Ok(Some(StrangerPass {
+                _place: place,
+                linking: true,
+            }));
+        }
+        Err(NetError::Refused(format!(
+            "{} (too many strangers connected; it can try again later)",
+            peer.fingerprint()
+        )))
+    }
+
+    /// Tests only: how long a session let in past the strangers' limit
+    /// for linking may stay a stranger's (normally [`LINK_GRACE`]).
+    #[doc(hidden)]
+    pub fn set_link_grace(&self, grace: Duration) {
+        *lock(&self.shared.link_grace) = grace;
     }
 
     /// Tests only: how long a stranger's session may go without
@@ -1661,7 +1692,7 @@ impl Node {
         addr: SocketAddr,
         outbound: bool,
         route: Route,
-        stranger: Option<Pass>,
+        stranger: Option<StrangerPass>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1827,7 +1858,7 @@ async fn run_session<S>(
     over: Over,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
     outbound: bool,
-    mut stranger_pass: Option<Pass>,
+    mut stranger_pass: Option<StrangerPass>,
     heard_ms: Arc<AtomicU64>,
 ) -> Result<()>
 where
@@ -1910,13 +1941,19 @@ where
     // `Node::chain_wanted`).
     let mut early_chain: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
-    let setup_until = last_rx + SETUP_BURST;
+    let began = last_rx;
+    let setup_until = began + SETUP_BURST;
     // A stranger's session (one we didn't dial, from someone we haven't
     // accepted) ends after this long without application traffic either
     // way, and holds its place among the strangers' until then or until
     // we accept it.
     let mut stranger = !outbound && node.is_stranger(&peer);
     let stranger_idle = *lock(&shared.stranger_idle);
+    // Let in past the limit to link: it has this long to become ours.
+    let link_grace = stranger_pass
+        .as_ref()
+        .is_some_and(|p| p.linking)
+        .then(|| *lock(&shared.link_grace));
     let mut last_app = last_rx;
     let make_heartbeat = || {
         let mut t = tokio::time::interval(node.beat_for(inner));
@@ -2063,6 +2100,14 @@ where
             // just some bytes of one.
             let since = last_rx.max(heard.last());
             tokio::select! {
+                () = lease_expired(link_grace.filter(|_| stranger), began) => {
+                    if node.is_stranger(&peer) {
+                        return Err(NetError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "not linked in time",
+                        )));
+                    }
+                }
                 () = lease_expired(stranger.then_some(stranger_idle), last_app) => {
                     if node.is_stranger(&peer) {
                         return Err(NetError::Io(std::io::Error::new(
@@ -2602,6 +2647,22 @@ pub const MAX_STRANGERS_PER_SOURCE: usize = 4;
 /// A stranger's session ends after this long without application
 /// traffic (anything but cover) either way.
 pub const STRANGER_IDLE: Duration = Duration::from_secs(5 * 60);
+/// Places past [`MAX_STRANGERS`] (in all, and from one network) for a
+/// new device of ours that comes to link while a link code is out: one
+/// stranger's crowd mustn't keep the user from adding a device. A session
+/// let in there must have become one of our devices within
+/// [`LINK_GRACE`], or it ends.
+pub const MAX_LINKING: usize = 4;
+pub const MAX_LINKING_PER_SOURCE: usize = 2;
+pub const LINK_GRACE: Duration = Duration::from_secs(30);
+
+/// A stranger's place (see [`Node::admit`]), held while its session runs
+/// as a stranger's.
+pub(crate) struct StrangerPass {
+    _place: Pass,
+    /// Let in past the limit to link a device (see [`MAX_LINKING`]).
+    linking: bool,
+}
 
 /// Messages waiting for a peer that isn't mutually approved are tried
 /// again after this, then after twice as long each time up to
