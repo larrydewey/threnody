@@ -54,7 +54,8 @@ jobs:
         with:
           toolchain: stable
       - name: Linux build dependencies (BlueZ, GTK 4, libadwaita)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libpcsclite-dev
+        # The base and good GStreamer plugins: the QR scanner test runs a pipeline.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libpcsclite-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good
       # libwebrtc's hermetic libc++ needs clang 21+; ubuntu-24.04 ships 18.
       - name: clang 21 (threnody-media links libwebrtc)
         run: |

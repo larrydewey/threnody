@@ -7,6 +7,8 @@ import android.text.format.DateUtils
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
+import uniffi.threnody_ffi.LinkKind
+import uniffi.threnody_ffi.classifyLink
 
 /**
  * Relay directories (Appendix P): lists of volunteer relays and the
@@ -101,7 +103,7 @@ object DirectoryUi {
             })
             .setPositiveButton("Subscribe") { _, _ ->
                 val link = field.text.toString().trim()
-                if (link.startsWith(SCHEME)) subscribe(a, link)
+                if (classifyLink(link)?.kind == LinkKind.DIRECTORY) subscribe(a, link)
                 else Toast.makeText(a, "That isn't a $SCHEME link", Toast.LENGTH_LONG).show()
             }
             .setNegativeButton("Cancel", null)
