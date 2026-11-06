@@ -69,6 +69,9 @@ const REDIAL_EVERY: Duration = Duration::from_secs(5);
 const LOST_DIAL_AFTER: Duration = Duration::from_secs(15);
 /// Contacts punched at once.
 const MAX_PUNCHES: usize = 4;
+/// Of those, people met through a handle or invite (Appendix S): anyone
+/// with one can knock, so knocks must leave room for contacts.
+const MAX_STRANGER_PUNCHES: usize = 2;
 /// Candidates probed per contact (so at most 32 probes in flight).
 const MAX_TARGETS: usize = 8;
 /// Waits before punching a contact again after failures.
@@ -186,6 +189,12 @@ struct Punch {
     /// Done only once a direct session exists (a relayed one is up
     /// already: see [`Urge::Upgrade`]).
     direct: bool,
+    /// Someone met through a handle or invite, not a contact: whoever
+    /// wrote its addresses (a knock, a record) may not be it, so we dial
+    /// only where its probes came from.
+    stranger: bool,
+    /// Where the peer's probes came from.
+    heard_from: Mutex<Vec<SocketAddr>>,
 }
 
 struct Published {
@@ -319,14 +328,20 @@ pub(crate) fn is_global_v6(ip: &IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xe000 == 0x2000)
 }
 
+/// A unicast address on the internet: not private, shared (CGNAT),
+/// loopback, link-local, multicast, broadcast, "this network" (0/8) or
+/// reserved (240/4).
 pub(crate) fn is_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             !(v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)
+                || v4.is_multicast()
+                || o[0] == 0
+                || o[0] >= 240
+                || o[0] == 100 && o[1] & 0xc0 == 64)
         }
         v6 => is_global_v6(v6),
     }
@@ -751,11 +766,12 @@ impl Node {
                 }
             }
         }
-        // Two answers are enough (one can't show a symmetric NAT).
+        // Three answers are enough: two that agree outvote one that lies,
+        // and three that differ show a symmetric NAT.
         let deadline = Instant::now() + REFLECT_WAIT;
         while !targets.is_empty()
             && Instant::now() < deadline
-            && lock(&self.rdv().inner).reflected.len() < 2
+            && lock(&self.rdv().inner).reflected.len() < 3
         {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -776,24 +792,16 @@ impl Node {
         let contacts = self.contacts();
         // Only approved peers' observations count: anyone else could steer
         // our probes at an address of its choosing.
-        let observed = inner
+        let observed: Vec<SocketAddr> = inner
             .observed
             .iter()
             .filter(|(p, _)| contacts.get(p).is_some_and(|c| c.mutually_approved()))
-            .map(|(_, a)| *a);
-        let seen: Vec<SocketAddr> = inner.reflected.values().copied().chain(observed).collect();
-        let mut reflexive: Vec<SocketAddr> = Vec::new();
-        for a in seen.iter().filter(|a| is_public(&a.ip()) && a.is_ipv4()) {
-            if !reflexive.contains(a) {
-                reflexive.push(*a);
-            }
-        }
-        // Two observers seeing one address at different ports: symmetric NAT.
-        let symmetric = reflexive.iter().any(|a| {
-            reflexive
-                .iter()
-                .any(|b| a.ip() == b.ip() && a.port() != b.port())
-        });
+            .map(|(_, a)| *a)
+            .collect();
+        let reported: Vec<SocketAddr> = inner.reflected.values().copied().collect();
+        let seen: Vec<SocketAddr> = reported.iter().chain(&observed).copied().collect();
+        let dht_ip = dht_guess.map(|g| IpAddr::V4(*g.ip()));
+        let (mut reflexive, symmetric) = outside_v4(&reported, &observed, dht_ip);
         if reflexive.is_empty()
             && let Some(g) = dht_guess
             && is_public(&IpAddr::V4(*g.ip()))
@@ -1099,11 +1107,20 @@ impl Node {
         {
             return false;
         }
+        // Anyone with a handle or invite can write a knock or record with
+        // addresses of their choosing: a stranger is probed only at public
+        // addresses (loopback too when we listen there, for tests), never
+        // our LAN or a broadcast one.
+        let stranger = !self.shared.mutual(&peer);
+        let on_loopback = quic.local.ip().is_loopback();
+        let allowed = |ip: IpAddr| {
+            quic.can_reach(ip) && (!stranger || is_public(&ip) || on_loopback && ip.is_loopback())
+        };
         let mut sorted = candidates.to_vec();
         sorted.sort_by_key(|c| c.kind.rank());
         let mut targets: Vec<SocketAddr> = Vec::new();
         for a in sorted.iter().map(|c| c.addr) {
-            if quic.can_reach(a.ip()) && !targets.contains(&a) && targets.len() < MAX_TARGETS {
+            if allowed(a.ip()) && !targets.contains(&a) && targets.len() < MAX_TARGETS {
                 targets.push(a);
             }
         }
@@ -1115,9 +1132,11 @@ impl Node {
                 .is_some_and(|(_, until)| Instant::now() < *until);
             let recovering = matches!(urge, Urge::Moved | Urge::Lost);
             let running = inner.punches.contains_key(&peer);
+            let strangers = inner.punches.values().filter(|p| p.stranger).count();
             if targets.is_empty()
                 || (backing_off && urge == Urge::Start && !running)
                 || (inner.punches.len() >= MAX_PUNCHES && !recovering && !running)
+                || (stranger && strangers >= MAX_STRANGER_PUNCHES && !running)
             {
                 return false;
             }
@@ -1161,7 +1180,6 @@ impl Node {
                 ),
             };
             let p = Arc::new(Punch {
-                targets: Mutex::new(targets),
                 lasts,
                 brisk: lasts.min(SEEK_FOR),
                 heard: Notify::new(),
@@ -1172,6 +1190,14 @@ impl Node {
                 // it hears the other; the larger leaves it to that side.
                 defer: urge == Urge::Lost && self.identity().as_bytes() > peer.as_bytes(),
                 direct: urge == Urge::Upgrade,
+                stranger,
+                // A probe brought this on: it came from there.
+                heard_from: Mutex::new(if urge == Urge::Probed {
+                    targets.clone()
+                } else {
+                    Vec::new()
+                }),
+                targets: Mutex::new(targets),
             });
             inner.punches.insert(peer, p.clone());
             inner.last_punch.insert(peer, now_ms());
@@ -1262,7 +1288,7 @@ impl Node {
                 .and_then(|c| c.discovery_key.map(|d| (d, c.timed_probes)))
                 .or_else(|| {
                     let keys = lock(&self.rdv().handles.probe_keys);
-                    keys.get(&peer).map(|d| (*d, false))
+                    keys.get(&peer).map(|(d, _)| (*d, false))
                 })
             else {
                 break false;
@@ -1280,7 +1306,20 @@ impl Node {
             }
             let idle = dialing.as_ref().is_none_or(|h| h.is_finished());
             let quiet = heard.is_none_or(|h| h.elapsed() > Duration::from_secs(5));
-            if punch.we_dial && brisk && idle && quiet && Instant::now() >= next_dial {
+            // A stranger only where it was heard from: the addresses it gave
+            // us may be anyone's (Appendix S).
+            let targets = if punch.stranger {
+                lock(&punch.heard_from).clone()
+            } else {
+                targets
+            };
+            if punch.we_dial
+                && brisk
+                && idle
+                && quiet
+                && !targets.is_empty()
+                && Instant::now() >= next_dial
+            {
                 next_dial = Instant::now() + REDIAL_EVERY;
                 let node = self.clone();
                 dialing = Some(tokio::spawn(async move {
@@ -1346,7 +1385,7 @@ impl Node {
         }
         let handle_keys: Vec<(PublicIdentity, [u8; 32])> = lock(&self.rdv().handles.probe_keys)
             .iter()
-            .map(|(p, k)| (*p, *k))
+            .map(|(p, (k, _))| (*p, *k))
             .collect();
         let Some(peer) = recognise(data, now_ms() / 1000, &self.contacts(), &handle_keys) else {
             return;
@@ -1365,6 +1404,13 @@ impl Node {
                     }
                     new
                 };
+                {
+                    let mut h = lock(&p.heard_from);
+                    if !h.contains(&src) {
+                        h.insert(0, src);
+                        h.truncate(MAX_TARGETS);
+                    }
+                }
                 if new {
                     self.emit(Event::ReachNote {
                         note: format!("probe from {} at {src}", peer.fingerprint()),
@@ -1438,6 +1484,49 @@ fn recognise(
         .chain(handle_keys.iter().map(|(p, k)| (p, k)));
     rendezvous::recognise_timed_probe(data, now_secs, timed)
         .or_else(|| rendezvous::recognise_probe(data, untimed))
+}
+
+/// Our outside IPv4 addresses, from where DHT nodes (`reported`, one
+/// address each) and mutually approved contacts (`vouched`) saw us, and
+/// whether our NAT looks symmetric (Appendix N §2).
+///
+/// An address two observers agree on is trusted, as is one a contact saw.
+/// Without any, the addresses at an IP two observers (or the DHT client's
+/// own view, `dht_ip`) agree on are kept, whatever their ports: that is
+/// how a symmetric NAT, a new port per destination, looks. So a single
+/// DHT node can neither add an address of its choosing nor, where two
+/// others agree, make our NAT look symmetric.
+fn outside_v4(
+    reported: &[SocketAddr],
+    vouched: &[SocketAddr],
+    dht_ip: Option<IpAddr>,
+) -> (Vec<SocketAddr>, bool) {
+    let public = |a: &&SocketAddr| a.is_ipv4() && is_public(&a.ip());
+    let all: Vec<SocketAddr> = reported
+        .iter()
+        .chain(vouched)
+        .filter(public)
+        .copied()
+        .collect();
+    let count = |f: &dyn Fn(&SocketAddr) -> bool| all.iter().filter(|a| f(a)).count();
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for a in &all {
+        if (count(&|b| b == a) >= 2 || vouched.contains(a)) && !out.contains(a) {
+            out.push(*a);
+        }
+    }
+    if !out.is_empty() {
+        return (out, false);
+    }
+    for a in &all {
+        if (count(&|b| b.ip() == a.ip()) >= 2 || dht_ip == Some(a.ip())) && !out.contains(a) {
+            out.push(*a);
+        }
+    }
+    let symmetric = out
+        .iter()
+        .any(|a| out.iter().any(|b| a.ip() == b.ip() && a.port() != b.port()));
+    (out, symmetric)
 }
 
 async fn join_dht(cfg: &ReachConfig, warm: &[String]) -> std::io::Result<AsyncDht> {
@@ -1591,6 +1680,37 @@ mod tests {
     }
 
     #[test]
+    fn one_dht_node_cannot_steer_our_outside_address() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let ours = a("203.0.113.5:7450");
+        // A liar among honest reflectors: neither its port nor its
+        // address gets in, and the NAT doesn't look symmetric.
+        let (list, symmetric) = outside_v4(
+            &[ours, ours, a("203.0.113.5:9999"), a("198.51.100.1:53")],
+            &[],
+            None,
+        );
+        assert_eq!((list, symmetric), (vec![ours], false));
+        // One answer alone, unconfirmed, isn't an address.
+        assert_eq!(outside_v4(&[a("198.51.100.1:53")], &[], None).0, []);
+        // Unless the DHT's own view of our IP agrees.
+        assert_eq!(outside_v4(&[ours], &[], Some(ours.ip())).0, [ours]);
+        // A contact's word is enough.
+        assert_eq!(outside_v4(&[], &[ours], None).0, [ours]);
+        // A port per destination at one IP: symmetric.
+        let sym = [
+            a("203.0.113.5:1001"),
+            a("203.0.113.5:1002"),
+            a("203.0.113.5:1003"),
+        ];
+        let (list, symmetric) = outside_v4(&sym, &[], None);
+        assert_eq!(list, sym);
+        assert!(symmetric);
+        // Private addresses never count.
+        assert_eq!(outside_v4(&[a("10.0.0.2:7450"); 3], &[], None).0, []);
+    }
+
+    #[test]
     fn public_addresses_exclude_private_and_shared_ranges() {
         for a in [
             "10.1.2.3",
@@ -1598,6 +1718,12 @@ mod tests {
             "100.64.0.1",
             "127.0.0.1",
             "fe80::1",
+            "0.1.2.3",
+            "224.0.0.251",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
+            "ff02::1",
         ] {
             assert!(!is_public(&a.parse().unwrap()), "{a}");
         }

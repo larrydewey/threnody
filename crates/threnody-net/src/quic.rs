@@ -177,6 +177,13 @@ impl Quic {
         })
     }
 
+    /// Waits until the socket takes a datagram: a socket just opened
+    /// refuses [`Quic::send_raw`] until the runtime has seen it writable.
+    pub(crate) async fn writable(&self) -> io::Result<()> {
+        let mut poller = self.socket.clone().create_io_poller();
+        std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx)).await
+    }
+
     /// Whether this socket can reach `ip` at all.
     pub(crate) fn can_reach(&self, ip: IpAddr) -> bool {
         self.ipv6 || ip.is_ipv4()

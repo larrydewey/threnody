@@ -18,7 +18,7 @@ The beacon is the private LAN beacon of Appendix E, with two changes:
 
 A beacon does not fit a 31-byte legacy advert, so both platforms use **extended advertising**: BlueZ with `SecondaryChannel = 1M`, and Android with `AdvertisingSet` in non-legacy mode. Scanners must accept non-legacy adverts. On Android that means `ScanSettings.setLegacy(false)`.
 
-The advert carries no name and no identity. Nodes replace it at least once a minute, so the nonce, the tags and (on Android) the resolvable private address all change.
+The advert carries no name and no identity. Nodes replace it at least once a minute, so the nonce, the tags and (on Android) the random address all change. Android starts a new advertising set for each beacon and then stops the old one: the stack gives every set an address of its own, while new data in the same set keeps its address, which the stack otherwise changes only every 15 minutes or so.
 
 ## Connecting
 
@@ -66,6 +66,11 @@ A Pixel 8a (Android API 37) and a Linux laptop (BlueZ 5.87), in both directions:
 
 ## Privacy
 
-To anyone without a discovery key, the advert shows only that *a* Threnody device is nearby, plus its PSM. Beacons are unlinkable to each other, and the phone's Bluetooth address rotates. Only mutually approved contacts can recognise the device. Its presence is still visible: hiding that would mean dropping the fixed service UUID, so that scanners have to test every extended advert they hear.
+To anyone without a discovery key, the advert shows only that *a* Threnody device is nearby, plus its PSM. A beacon's contents are unlinkable to another's, and the phone's Bluetooth address changes with each beacon. Only mutually approved contacts can recognise the device. Its presence is still visible: hiding that would mean dropping the fixed service UUID, so that scanners have to test every extended advert they hear.
+
+**What still links beacons, stated honestly:**
+- **The PSM.** It is assigned when the node starts listening and stays the same for as long as the process runs, so a scanner can follow it across address changes. It is one of about 128 dynamic values, so it identifies a device only together with timing and place. Rotating it would mean reopening the listener every refresh.
+- **Linux's address.** BlueZ advertises from the adapter's own fixed address unless LE privacy is on (`Privacy = device` in `/etc/bluetooth/main.conf`, off by default). Turning it on needs root, so `threnody run --ble` can't do it; users who want their laptop's beacons unlinkable should set it.
+- **Replays.** A beacon replayed within its epochs makes nearby contacts of its sender dial the replayer, after 45 s even the ones with the larger key (Appendix E, "Replays").
 
 Android starts listening, advertising and scanning whenever the node starts, once the Bluetooth permissions have been granted, so the foreground service brings Bluetooth back without the Activity.
