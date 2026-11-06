@@ -111,7 +111,8 @@ Type a line to send it to the current peer. Commands:
   /keepalive <secs>                     gap between keepalives on contacts' standby paths
   /devices   /device add [host:port]   /device rename <name> <new>   /device remove <name>
   /ble scan [secs]   /ble connect <n|address>   Bluetooth LE (Linux)
-  /wifi-direct [request|leave]          ask the current peer for a Wi-Fi Direct link
+  /wifi-direct [request|join|leave]     ask the current peer for a Wi-Fi Direct link
+                                        (join: take a link offered unasked)
   /history [peer] [n]                   recent messages (stored encrypted)
   /search [@peer|@group] <words>        find messages everywhere, or in one chat;
                                         \"quoted words\" match as a phrase
@@ -152,9 +153,19 @@ struct Ui {
     wifi_direct: bool,
     /// NetworkManager profiles of Wi-Fi Direct groups we joined.
     joined: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// While a join runs (one at a time).
+    joining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Peers we asked to host a Wi-Fi Direct group, and when.
+    asked_direct: std::cell::RefCell<std::collections::HashMap<PublicIdentity, std::time::Instant>>,
+    /// The latest offer nobody asked for, for `/wifi-direct join`.
+    offered: std::cell::RefCell<Option<(PublicIdentity, threnody_net::DirectOffer)>>,
     scratch: PathBuf,
     main_identity: Option<Identity>,
 }
+
+/// How long after `/wifi-direct request` the group offered back is
+/// joined without asking.
+const ASKED_FOR: Duration = Duration::from_secs(120);
 
 pub async fn run(opts: Options) -> Result<()> {
     let downloads = opts.home.dir().join("downloads");
@@ -290,6 +301,9 @@ pub async fn run(opts: Options) -> Result<()> {
         ble_seen: std::sync::Arc::default(),
         wifi_direct: opts.wifi_direct,
         joined: std::sync::Arc::default(),
+        joining: std::sync::Arc::default(),
+        asked_direct: std::cell::RefCell::default(),
+        offered: std::cell::RefCell::default(),
         scratch: opts_dir,
         main_identity: opts.main_identity,
     };
@@ -950,17 +964,58 @@ impl Ui {
             );
             return;
         }
-        say!(
-            "* {who} offers a Wi-Fi Direct link ({}); joining…",
-            offer.ssid
-        );
-        let (node, joined, scratch) = (
+        // Joining takes the Wi-Fi off its network, so only a group we
+        // asked this peer for is joined unasked.
+        let asked = self
+            .asked_direct
+            .borrow_mut()
+            .remove(&peer)
+            .is_some_and(|t| t.elapsed() < ASKED_FOR);
+        if !asked {
+            say!(
+                "* {who} offers a Wi-Fi Direct link ({}); /wifi-direct join takes it \
+                 (the Wi-Fi leaves its network meanwhile)",
+                offer.ssid
+            );
+            *self.offered.borrow_mut() = Some((peer, offer));
+            return;
+        }
+        self.join_wifi_direct(peer, offer);
+    }
+
+    fn join_wifi_direct(&self, peer: PublicIdentity, offer: threnody_net::DirectOffer) {
+        use std::sync::atomic::Ordering;
+        let who = self.name(&peer);
+        let on_one = !self
+            .joined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        if on_one {
+            say!(
+                "* not joining {who}'s Wi-Fi Direct group ({}): already on one; /wifi-direct leave first",
+                offer.ssid
+            );
+            return;
+        }
+        if self.joining.swap(true, Ordering::SeqCst) {
+            say!(
+                "* not joining {who}'s Wi-Fi Direct group ({}): already joining one",
+                offer.ssid
+            );
+            return;
+        }
+        say!("* joining {who}'s Wi-Fi Direct group ({})…", offer.ssid);
+        let (node, joined, joining, scratch) = (
             self.node.clone(),
             std::sync::Arc::clone(&self.joined),
+            std::sync::Arc::clone(&self.joining),
             self.scratch.clone(),
         );
         tokio::spawn(async move {
-            match crate::wifidirect::join(&offer, &scratch).await {
+            let r = crate::wifidirect::join(&offer, &scratch).await;
+            joining.store(false, Ordering::SeqCst);
+            match r {
                 Ok(name) => {
                     joined
                         .lock()
@@ -1981,10 +2036,22 @@ impl Ui {
                         say!("  note: run with --wifi-direct to join the group offered back");
                     }
                     self.node.request_wifi_direct(&peer)?;
+                    self.asked_direct
+                        .borrow_mut()
+                        .insert(peer, std::time::Instant::now());
                     say!("* asked {} for a Wi-Fi Direct link", self.name(&peer));
                 }
+                "join" => {
+                    if !self.wifi_direct {
+                        bail!("run with --wifi-direct to join Wi-Fi Direct groups");
+                    }
+                    let Some((peer, offer)) = self.offered.borrow_mut().take() else {
+                        bail!("no Wi-Fi Direct offer waiting");
+                    };
+                    self.join_wifi_direct(peer, offer);
+                }
                 "leave" => self.leave_wifi_direct().await,
-                _ => bail!("usage: /wifi-direct [request|leave]"),
+                _ => bail!("usage: /wifi-direct [request|join|leave]"),
             },
             "handle" => match arg.map(str::trim) {
                 None | Some("") => match self.node.handle() {

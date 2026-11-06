@@ -28,7 +28,7 @@ op: 1 offer (ssid ≤ 32 bytes, passphrase 8–63, addr = ip:port literal)
     2 request (asks the peer to host and offer)
 ```
 
-Both messages are only sent to, and only honoured from, **mutually approved peers on direct sessions**. A peer reached through relays isn't nearby, and isn't trusted with link credentials just because it is reachable. Malformed offers are refused on both ends.
+Both messages are only sent to, and only honoured from, **mutually approved peers on a session over a nearby link**: Bluetooth (any stream transport), or TCP or QUIC whose peer address is loopback, private (RFC 1918, IPv6 unique local) or link-local. A peer reached through relays isn't nearby, and nor is one dialed or hole-punched across the internet; neither is trusted with link credentials, or with moving our radio, just because it is reachable. Each peer gets at most one request and one offer honoured every 30 seconds; the rest are dropped, since each makes a phone host a new group or a laptop leave its network. Malformed offers are refused on both ends. Older peers send the same messages and see no change unless they are far away or repeat themselves.
 
 ## Platforms
 
@@ -38,7 +38,7 @@ Both messages are only sent to, and only honoured from, **mutually approved peer
   - Both are API 29+ and need `NEARBY_WIFI_DEVICES` (`neverForLocation`).
   - An incoming request is answered by hosting a group and offering it.
 - **Linux joins.**
-  - `threnody run --wifi-direct` joins offered groups as an ordinary Wi-Fi client through NetworkManager.
+  - `threnody run --wifi-direct` joins offered groups as an ordinary Wi-Fi client through NetworkManager. It joins at once only a group it asked that peer for in the last two minutes (`/wifi-direct request`); an offer nobody asked for waits for `/wifi-direct join`. It joins one group at a time.
   - The profile is temporary: no autoconnect, no default route, no DNS.
   - The passphrase goes through a 0600 `passwd-file` rather than the command line.
   - The Wi-Fi interface leaves its usual network while joined. `/wifi-direct leave`, or exiting, deletes the profile, and NetworkManager then reconnects the usual network.

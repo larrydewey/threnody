@@ -461,6 +461,9 @@ pub(crate) struct Shared {
     tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
     tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    /// When each peer's last Wi-Fi Direct request and offer were taken
+    /// (see `direct`), to take at most one of each per interval.
+    pub(crate) direct_taken: Mutex<HashMap<(PublicIdentity, bool), std::time::Instant>>,
     /// Where WireGuard packets that arrive over sessions go: the userspace
     /// device (`wg_userspace`), when one runs.
     tunnel_inbound: Mutex<Option<TunnelInbound>>,
@@ -708,6 +711,7 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
+            direct_taken: Mutex::new(HashMap::new()),
             tunnel_inbound: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
             prekeys: Mutex::new(prekeys),

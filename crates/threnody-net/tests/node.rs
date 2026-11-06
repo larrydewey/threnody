@@ -929,6 +929,17 @@ async fn wifi_direct_offers_only_between_approved_neighbours() {
     alice.request_wifi_direct(&bob_id).unwrap();
     let e = next(&mut brx, |e| matches!(e, Event::WifiDirectRequested { .. })).await;
     assert!(matches!(e, Event::WifiDirectRequested { peer } if peer == alice.identity()));
+    // Asking again at once makes no second group.
+    alice.request_wifi_direct(&bob_id).unwrap();
+    let again = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if let Event::WifiDirectRequested { .. } = brx.recv().await.unwrap() {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(again.is_err(), "a second request so soon is dropped");
 
     bob.offer_wifi_direct(&alice.identity(), offer.clone())
         .unwrap();

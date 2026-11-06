@@ -173,8 +173,10 @@ enum Cmd {
         /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
         ble: bool,
-        /// Join Wi-Fi Direct groups that approved contacts offer (through
-        /// NetworkManager; the Wi-Fi interface leaves its network meanwhile).
+        /// Join Wi-Fi Direct groups that nearby approved contacts offer
+        /// (through NetworkManager; the Wi-Fi interface leaves its network
+        /// meanwhile): those asked for with /wifi-direct request, others
+        /// after /wifi-direct join.
         #[arg(long)]
         wifi_direct: bool,
         /// Do not send or listen for LAN discovery beacons.
