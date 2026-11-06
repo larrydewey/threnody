@@ -12,14 +12,23 @@ use const_cbor::Decoder;
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::error::{Error, Result};
 
-/// Most lists, items per list (tombstones included), and characters in a
-/// title or an item.
+/// Most lists, items per list (tombstones included: the oldest go to make
+/// room), and characters in a title or an item.
 pub const MAX_LISTS: usize = 200;
 pub const MAX_ITEMS: usize = 1000;
+/// Most items not deleted that we add ourselves. The rest of
+/// [`MAX_ITEMS`] is kept for deletions, so a full copy taking in another
+/// copy's new items forgets old deletions rather than recent ones, or
+/// rather than refusing the items.
+pub const MAX_LIVE: usize = 900;
 pub const MAX_TITLE: usize = 80;
 pub const MAX_ITEM_TEXT: usize = 500;
 /// Deepest nesting of an item.
 pub const MAX_INDENT: u8 = 3;
+/// How far ahead of our clock a change from elsewhere may be stamped: a
+/// clock that's a little fast is fine, but a stamp far in the future
+/// would win over every change for as long as it stays ahead.
+pub const MAX_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// A list's id: random, shared by everyone who has it.
 pub type ListId = [u8; 16];
@@ -29,6 +38,17 @@ pub type ListId = [u8; 16];
 pub struct Stamp {
     pub ms: u64,
     pub by: [u8; 32],
+}
+
+impl Stamp {
+    /// This stamp, moved past `prev` if that's later (a clock ahead of
+    /// ours), so that a change made after seeing `prev` wins over it.
+    fn after(self, prev: Stamp) -> Stamp {
+        Stamp {
+            ms: self.ms.max(prev.ms.saturating_add(1)),
+            by: self.by,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -87,12 +107,39 @@ impl List {
         f(i);
         i.text = clip(&i.text, MAX_ITEM_TEXT);
         i.indent = i.indent.min(MAX_INDENT);
-        i.stamp = stamp;
+        i.stamp = stamp.after(i.stamp);
         true
     }
 
-    /// Adds an item after `after`; returns its id.
-    pub fn add(&mut self, after: Option<u64>, text: &str, heading: bool, stamp: Stamp) -> u64 {
+    /// Renames the list, stamping the title.
+    pub fn rename(&mut self, title: &str, stamp: Stamp) {
+        self.title = clip(title.trim(), MAX_TITLE);
+        self.title_stamp = stamp.after(self.title_stamp);
+    }
+
+    /// Leaves out of a copy from elsewhere whatever is stamped more than
+    /// [`MAX_AHEAD_MS`] after `now`: such items, and the title's stamp (so
+    /// any other title wins over it).
+    pub fn drop_future(&mut self, now: u64) {
+        let limit = now.saturating_add(MAX_AHEAD_MS);
+        if self.title_stamp.ms > limit {
+            self.title_stamp = Stamp::default();
+        }
+        self.items.retain(|i| i.stamp.ms <= limit);
+    }
+
+    /// Adds an item after `after`; returns its id, or None if the list is
+    /// full ([`MAX_LIVE`] items).
+    pub fn add(
+        &mut self,
+        after: Option<u64>,
+        text: &str,
+        heading: bool,
+        stamp: Stamp,
+    ) -> Option<u64> {
+        if self.items.iter().filter(|i| !i.deleted).count() >= MAX_LIVE || !self.make_room() {
+            return None;
+        }
         let id = u64::from_le_bytes(crate::crypto::random_bytes()).max(1);
         let pos = self.pos_after(after);
         let indent = after
@@ -108,7 +155,36 @@ impl List {
             deleted: false,
             stamp,
         });
-        id
+        Some(id)
+    }
+
+    /// Makes room for one more item, if the list is full, by forgetting
+    /// the oldest deleted one (the smallest stamp, then id, so every copy
+    /// picks the same); false if every item is still there.
+    ///
+    /// A forgotten deletion no longer spreads, so a copy that never heard
+    /// of it could bring that item back; but without this a list that has
+    /// seen [`MAX_ITEMS`] items could never take another. Since we add at
+    /// most [`MAX_LIVE`] ourselves, a full list keeps some deletions, and
+    /// the ones forgotten are the oldest of those.
+    fn make_room(&mut self) -> bool {
+        if self.items.len() < MAX_ITEMS {
+            return true;
+        }
+        let oldest = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.deleted)
+            .min_by_key(|(_, i)| (i.stamp, i.id))
+            .map(|(k, _)| k);
+        match oldest {
+            Some(k) => {
+                self.items.swap_remove(k);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Takes in another copy: the newer of each item and of the title win.
@@ -127,7 +203,10 @@ impl List {
                     changed = true;
                 }
                 Some(_) => {}
-                None if self.items.len() < MAX_ITEMS => {
+                // A deletion of an item we never had doesn't push out a
+                // deletion we keep.
+                None if self.items.len() >= MAX_ITEMS && o.deleted => {}
+                None if self.make_room() => {
                     self.items.push(o.clone());
                     changed = true;
                 }
@@ -182,10 +261,12 @@ impl List {
             } else {
                 (t, false, false)
             };
-            if text.is_empty() || self.items.len() >= MAX_ITEMS {
+            if text.is_empty() {
                 continue;
             }
-            let id = self.add(last, text, heading, stamp);
+            let Some(id) = self.add(last, text, heading, stamp) else {
+                break;
+            };
             self.change(id, stamp, |i| {
                 i.done = done;
                 i.indent = if heading { 0 } else { (spaces / 2) as u8 };
@@ -300,10 +381,10 @@ mod tests {
             title: "Groceries".into(),
             ..List::default()
         };
-        let milk = l.add(None, "milk", false, st(1, 1));
-        let eggs = l.add(Some(milk), "eggs", false, st(2, 1));
-        let bread = l.add(Some(milk), "bread", false, st(3, 1));
-        let top = l.add(None, "Dairy", true, st(4, 1));
+        let milk = l.add(None, "milk", false, st(1, 1)).unwrap();
+        let eggs = l.add(Some(milk), "eggs", false, st(2, 1)).unwrap();
+        let bread = l.add(Some(milk), "bread", false, st(3, 1)).unwrap();
+        let top = l.add(None, "Dairy", true, st(4, 1)).unwrap();
         let order: Vec<&str> = l.items().iter().map(|i| i.text.as_str()).collect();
         assert_eq!(order, ["Dairy", "milk", "bread", "eggs"]);
         assert!(l.change(eggs, st(5, 1), |i| i.done = true));
@@ -329,11 +410,11 @@ mod tests {
             id: [2; 16],
             ..List::default()
         };
-        let x = a.add(None, "socks", false, st(1, 1));
+        let x = a.add(None, "socks", false, st(1, 1)).unwrap();
         let mut b = a.clone();
         // Both change it; B's is later. A also adds an item, B deletes x.
         a.change(x, st(5, 1), |i| i.text = "wool socks".into());
-        let y = a.add(Some(x), "scarf", false, st(6, 1));
+        let y = a.add(Some(x), "scarf", false, st(6, 1)).unwrap();
         b.change(x, st(7, 2), |i| i.done = true);
         assert!(a.merge(&b) && b.merge(&a));
         assert_eq!(a, b, "both end the same");
@@ -345,6 +426,157 @@ mod tests {
         b.change(y, st(9, 2), |i| i.deleted = true);
         a.merge(&b);
         assert_eq!(a.items().len(), 1);
+    }
+
+    #[test]
+    fn deleted_items_make_room_for_new_ones() {
+        let mut a = List {
+            id: [4; 16],
+            ..List::default()
+        };
+        // A thousand items, added and cleared over time.
+        for n in 0..MAX_ITEMS as u64 {
+            let x = a.add(None, "old", false, st(n + 1, 1)).unwrap();
+            a.change(x, st(n + 1, 1), |i| i.deleted = true);
+        }
+        assert_eq!(a.items.len(), MAX_ITEMS);
+        let first = a.items.iter().min_by_key(|i| i.stamp).unwrap().id;
+        // The next goes in, in place of the oldest deletion, and survives
+        // saving and reaching another copy.
+        let eggs = a.add(None, "eggs", false, st(5000, 1)).unwrap();
+        assert_eq!(a.items.len(), MAX_ITEMS);
+        assert!(!a.items.iter().any(|i| i.id == first));
+        let back = List::decode(&a.encode().unwrap()).unwrap();
+        assert!(back.items().iter().any(|i| i.id == eggs));
+        let mut b = back.clone();
+        let milk = b.add(None, "milk", false, st(5001, 2)).unwrap();
+        assert!(a.merge(&b));
+        assert!(a.items().iter().any(|i| i.id == milk));
+        assert!(a.items.len() <= MAX_ITEMS);
+
+        // A list of MAX_LIVE items takes no more from us, even with
+        // deletions it could forget: those are kept for merging.
+        let mut full = List::default();
+        for n in 0..MAX_LIVE as u64 {
+            full.add(None, "x", false, st(n + 1, 1)).unwrap();
+        }
+        let gone = full.add(None, "gone", false, st(9998, 1)).is_none();
+        assert!(gone, "full");
+        let x = full.items[0].id;
+        full.change(x, st(9998, 1), |i| i.deleted = true);
+        full.add(None, "y", false, st(9999, 1)).unwrap();
+        assert_eq!(full.add(None, "one more", false, st(9999, 1)), None);
+        assert_eq!(full.add_markdown("- [ ] more", st(9999, 1)), 0);
+        assert_eq!(full.items().len(), MAX_LIVE);
+    }
+
+    /// A list of `live` items and `dead` deletions, all deleted at once (as
+    /// clearing ticked items does), so their stamps tie.
+    fn worn(live: usize, dead: usize) -> List {
+        let mut l = List {
+            id: [6; 16],
+            ..List::default()
+        };
+        for n in 0..(live + dead) as u64 {
+            l.items.push(Item {
+                id: n + 1,
+                text: "x".into(),
+                pos: n as f64,
+                deleted: n < dead as u64,
+                stamp: st(if n < dead as u64 { 7 } else { n + 10 }, 1),
+                ..Item::default()
+            });
+        }
+        l
+    }
+
+    fn ids(l: &List) -> Vec<u64> {
+        let mut v: Vec<u64> = l.items.iter().map(|i| i.id).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn full_copies_adding_at_once_end_the_same() {
+        // Two copies of a full list, its items in a different order on each
+        // (as merging leaves them); each adds an item at once.
+        let base = worn(MAX_LIVE - 1, MAX_ITEMS - MAX_LIVE + 1);
+        let mut a = base.clone();
+        let mut b = base.clone();
+        b.items.reverse();
+        let x = a.add(None, "from a", false, st(5000, 1)).unwrap();
+        let y = b.add(None, "from b", false, st(5000, 2)).unwrap();
+        assert_eq!(ids(&a).len(), MAX_ITEMS);
+        assert!(a.merge(&b) && b.merge(&a));
+        // Both have both, and forgot the same deletions to make room.
+        for l in [&a, &b] {
+            assert!(l.items().iter().any(|i| i.id == x));
+            assert!(l.items().iter().any(|i| i.id == y));
+        }
+        assert_eq!(ids(&a), ids(&b));
+        assert!(!a.merge(&b) && !b.merge(&a));
+    }
+
+    #[test]
+    fn a_full_list_takes_no_unknown_deletion() {
+        // Deletions of items we never had don't push out the deletions we
+        // keep (which would let those items come back from older copies).
+        let mut l = worn(MAX_LIVE, MAX_ITEMS - MAX_LIVE);
+        let before = ids(&l);
+        let mut other = List {
+            id: l.id,
+            ..List::default()
+        };
+        for n in 0..200 {
+            other.items.push(Item {
+                id: 50_000 + n,
+                deleted: true,
+                stamp: st(5000, 2),
+                ..Item::default()
+            });
+        }
+        assert!(!l.merge(&other));
+        assert_eq!(ids(&l), before);
+        // Every item live: a new one can't come in, as nothing may go.
+        let mut l = worn(MAX_ITEMS, 0);
+        other.items[0].deleted = false;
+        assert!(!l.merge(&other));
+        assert_eq!(l.items().len(), MAX_ITEMS);
+    }
+
+    #[test]
+    fn stamps_from_the_future_never_win() {
+        let now = 1_000_000;
+        let mut ours = List {
+            id: [5; 16],
+            title: "Trip".into(),
+            title_stamp: st(now - 10, 1),
+            ..List::default()
+        };
+        let x = ours.add(None, "tickets", false, st(now - 10, 1)).unwrap();
+        // A member stamps their change as far ahead as it goes.
+        let mut theirs = ours.clone();
+        theirs.title = "PWNED".into();
+        theirs.title_stamp = st(u64::MAX, 2);
+        theirs.items[0].text = "nothing".into();
+        theirs.items[0].stamp = st(u64::MAX, 2);
+        theirs.drop_future(now);
+        assert!(!ours.merge(&theirs));
+        assert_eq!(ours.title, "Trip");
+        assert_eq!(ours.items()[0].text, "tickets");
+
+        // A clock somewhat ahead is taken, and the next change here still
+        // beats it.
+        let mut ahead = ours.clone();
+        ahead.change(x, st(now + 60_000, 2), |i| i.text = "visas".into());
+        ahead.rename("Holiday", st(now + 60_000, 2));
+        ahead.drop_future(now);
+        assert!(ours.merge(&ahead));
+        assert_eq!(ours.title, "Holiday");
+        assert!(ours.change(x, st(now, 1), |i| i.done = true));
+        ours.rename("Trip", st(now, 1));
+        assert!(ahead.merge(&ours));
+        assert!(ahead.items()[0].done && ahead.title == "Trip");
     }
 
     #[test]

@@ -680,9 +680,9 @@ impl Node {
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
-    /// and are refused, their tunnels and discovery keys go, and our
-    /// conversation with them is deleted. Our other devices learn the
-    /// block through contact sync.
+    /// and are refused, their tunnels and discovery keys go, our
+    /// conversation with them is deleted, and lists are no longer shared
+    /// with them. Our other devices learn the block through contact sync.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
         let now = now_ms();
@@ -701,6 +701,7 @@ impl Node {
             self.disconnect(&d);
         }
         let _ = self.shared.home.delete_history(conv);
+        self.unshare_lists_with(conv);
         self.push_contact_sync();
     }
 

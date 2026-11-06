@@ -197,7 +197,10 @@ class ListsActivity : Activity() {
     private fun newList() {
         Lists.ask(this, "New list", "", "Groceries, Christmas ideas…") { title ->
             Threading.background {
-                val id = try { node.createList(title) } catch (e: Exception) { return@background }
+                val id = try { node.createList(title) } catch (e: Exception) {
+                    runOnUiThread { Toast.makeText(this, "Couldn't start the list: ${e.message}", Toast.LENGTH_LONG).show() }
+                    return@background
+                }
                 runOnUiThread { Lists.open(this, id) }
             }
         }

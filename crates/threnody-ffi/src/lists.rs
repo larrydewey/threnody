@@ -120,7 +120,10 @@ impl ThrenodyNode {
             return Err(fail("a list needs a name"));
         }
         let _guard = self.rt.enter();
-        Ok(hex(&self.node.create_list(&title)))
+        self.node
+            .create_list(&title)
+            .map(|id| hex(&id))
+            .ok_or_else(|| fail("there are too many lists to start another"))
     }
 
     pub fn rename_list(&self, id: String, title: String) -> Result<()> {
@@ -129,8 +132,7 @@ impl ThrenodyNode {
             return Err(fail("a list needs a name"));
         }
         self.change_list(&id, |l, s| {
-            l.title = title;
-            l.title_stamp = s;
+            l.rename(&title, s);
             true
         })?;
         Ok(())
@@ -152,12 +154,17 @@ impl ThrenodyNode {
         text: String,
         heading: bool,
     ) -> Result<u64> {
-        let mut new = 0;
-        self.change_list(&id, |l, s| {
-            new = l.add(after, text.trim(), heading, s);
-            true
+        let mut new = None;
+        let saved = self.change_list(&id, |l, s| {
+            let item = l.add(after, text.trim(), heading, s);
+            new = Some(item);
+            item.is_some()
         })?;
-        Ok(new)
+        match new {
+            Some(Some(item)) if saved => Ok(item),
+            None => Err(fail("no such list")),
+            _ => Err(fail("the list is full")),
+        }
     }
 
     pub fn edit_list_item(&self, id: String, item: u64, text: String) -> Result<()> {

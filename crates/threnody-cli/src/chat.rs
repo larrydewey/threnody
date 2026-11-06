@@ -1598,7 +1598,10 @@ impl Ui {
             Event::LinkRejected { device } => {
                 say!("! rejected a link attempt from {}", self.name(&device))
             }
-            Event::ListChanged { .. } => say!("* a list changed"),
+            Event::ListChanged { .. } => {
+                say!("* a list changed");
+                self.groups.forward_lists(&self.node);
+            }
             Event::FoldersChanged { from } => {
                 say!("* folders updated from {}", self.name(&from))
             }

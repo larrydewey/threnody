@@ -812,9 +812,9 @@ async fn lists_are_shared_and_edited_together() {
     let aid = alice.node.identity();
 
     // Alice's shopping list, shared with Bob.
-    let id = alice.node.create_list("Groceries");
+    let id = alice.node.create_list("Groceries").unwrap();
     alice.node.edit_list(&id, |l, s| {
-        let milk = l.add(None, "milk", false, s);
+        let milk = l.add(None, "milk", false, s).unwrap();
         l.add(Some(milk), "eggs", false, s);
         true
     });
