@@ -762,7 +762,8 @@ pub enum NodeEvent {
     },
     /// A mutually approved peer offered a WireGuard tunnel. The app
     /// should apply this to its WireGuard interface (or userspace
-    /// implementation like boringtun on Android).
+    /// implementation like boringtun on Android). Also repeats with the
+    /// same PSK when the peer's endpoint moves.
     TunnelUp {
         peer: String,
         wg_public: Vec<u8>,
@@ -770,7 +771,9 @@ pub enum NodeEvent {
         overlay: String,
         psk: Vec<u8>,
     },
-    /// A tunnel peer was removed (approval revoked or tunnel port changed).
+    /// A tunnel peer was removed (approval revoked, the contact blocked
+    /// or deleted, or its device left its account). Turning tunnels off
+    /// emits nothing.
     TunnelDown {
         peer: String,
     },
@@ -1559,8 +1562,11 @@ impl ThrenodyNode {
 
     /// Enables or disables WireGuard tunnel offering on `port`. When
     /// enabled, the node offers tunnels to mutually approved peers and
-    /// emits `TunnelUp` events when peers offer tunnels to us. Changing
-    /// this restarts tunnel state.
+    /// emits `TunnelUp` events when peers offer tunnels to us. Turning
+    /// tunnels on restores peers saved by an earlier run (Appendix D,
+    /// *Persistence*); `None` forgets every peer and deletes the saved
+    /// ones, even when tunnels were already off. Changing the port keeps
+    /// peers.
     pub fn set_tunnel_port(&self, port: Option<u16>) -> Result<()> {
         let _guard = self.rt.enter();
         self.node.set_tunnel_port(port).map_err(fail)
@@ -2654,6 +2660,26 @@ impl ThrenodyNode {
 mod tests {
     use super::*;
 
+    /// Apps open nodes with tunnels off and call `set_tunnel_port(None)`
+    /// when they find them off at start: that deletes saved tunnel keys a
+    /// run killed mid-toggle left behind.
+    #[test]
+    fn tunnel_port_none_deletes_saved_tunnels() {
+        let dir = tempfile::tempdir().unwrap();
+        for port in [Some(51820), None] {
+            let path = dir.path().join(format!("{port:?}"));
+            let node = ThrenodyNode::open(path.display().to_string(), None, port).unwrap();
+            let home = Home::new(&path);
+            let identity = home.load_identity(None).unwrap();
+            home.save_state(&identity, threnody_core::tunnel::STATE, b"saved keys")
+                .unwrap();
+            let file = path.join("tunnels.state");
+            assert!(file.exists());
+            node.set_tunnel_port(None).unwrap();
+            assert!(!file.exists(), "port {port:?}");
+        }
+    }
+
     fn wait(node: &ThrenodyNode, pred: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
         for _ in 0..200 {
             if let Some(e) = node.next_event(100)
@@ -3335,11 +3361,18 @@ mod tests {
         }
 
         /// The first event of node `target` matching `pred` (earlier ones are dropped).
+        #[track_caller]
         fn until(&mut self, target: usize, pred: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
-            for _ in 0..400 {
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            let mut skipped = VecDeque::new();
+            while std::time::Instant::now() < end {
                 while let Some(e) = self.seen[target].pop_front() {
                     if pred(&e) {
                         return e;
+                    }
+                    skipped.push_back(format!("{e:?}"));
+                    if skipped.len() > 20 {
+                        skipped.pop_front();
                     }
                 }
                 for (i, n) in self.nodes.iter().enumerate() {
@@ -3348,7 +3381,7 @@ mod tests {
                     }
                 }
             }
-            panic!("event did not arrive");
+            panic!("event did not arrive at node {target}; it last saw {skipped:#?}");
         }
     }
 

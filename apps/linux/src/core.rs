@@ -258,6 +258,10 @@ impl Core {
             ));
         }
         core.apply_privacy_to(&core.main, false);
+        // Tunnels as the setting says from the start: on, they come back
+        // with the peers kept from the last run; off, anything a killed
+        // run left on disk goes.
+        core.apply_tunnels();
         core.apply_handle();
         core.name_this_device();
         core.pump(core.main.clone(), None, Arc::new(AtomicBool::new(true)));
@@ -353,6 +357,17 @@ impl Core {
     fn apply_tunnels(&self) {
         let on = self.settings().opted_in(settings::TUNNELS);
         if on == self.main.tunnel_port().is_some() {
+            if !on {
+                // Nothing of tunnels stays on disk while they're off:
+                // neither saved peers nor a wg-quick config with plaintext
+                // PSKs, left by a run that was killed or whose setting
+                // changed while the app was closed. Both are cheap when
+                // there is nothing to delete.
+                if let Err(e) = self.main.set_tunnel_port(None) {
+                    self.say(format!("! tunnels: {e}"));
+                }
+                self.write_wireguard_conf();
+            }
             return;
         }
         let port = on.then_some(threnody_core::tunnel::DEFAULT_PORT);

@@ -174,7 +174,7 @@ pub async fn run(opts: Options) -> Result<()> {
     crate::out::set_service(control.is_some());
     let groups =
         GroupUi::load(&opts.home, &opts.identity, downloads.clone()).context("loading groups")?;
-    let tunnels = opts
+    let mut tunnels = opts
         .tunnel
         .as_ref()
         .map(|t| {
@@ -194,6 +194,20 @@ pub async fn run(opts: Options) -> Result<()> {
         constant_rate: opts.constant_rate,
         tunnel_port: opts.tunnel.as_ref().map(|t| t.port),
     })?;
+    // Peers kept from the last run (Appendix D, *Persistence*).
+    if let Some(t) = tunnels.as_mut() {
+        let restored = node.tunnel_peer_entries();
+        let n = restored.len();
+        match t.restore(restored) {
+            Ok(0) => {}
+            Ok(n) => say!("* {n} tunnel(s) restored from the last run"),
+            Err(e) => say!("! restoring {n} tunnel(s) (config written): {e:#}"),
+        }
+    } else {
+        // Tunnels off for this run: peers an earlier `--tunnel` run saved
+        // don't stay on disk, as in the apps.
+        let _ = node.set_tunnel_port(None);
+    }
     node.set_prefer_onion(opts.onion_first);
     node.set_use_volunteers(opts.use_volunteers);
     node.set_directory_threshold(opts.directory_threshold);
@@ -1539,7 +1553,7 @@ impl Ui {
                 if let Some(t) = self.tunnels.as_mut() {
                     match t.up(&peer, wg_public, endpoint, psk) {
                         Ok(()) => say!(
-                            "* tunnel to {who}: {overlay} via {endpoint} (PSK from this session)"
+                            "* tunnel to {who}: {overlay} via {endpoint} (PSK from the session)"
                         ),
                         Err(e) => say!("! tunnel to {who}: {e:#}"),
                     }

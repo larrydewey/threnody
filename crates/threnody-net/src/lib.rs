@@ -33,6 +33,7 @@ pub mod receipts;
 mod recover;
 pub mod relay;
 pub mod sync;
+mod tunnels;
 pub mod volunteer;
 #[cfg(feature = "boringtun")]
 pub mod wg_userspace;

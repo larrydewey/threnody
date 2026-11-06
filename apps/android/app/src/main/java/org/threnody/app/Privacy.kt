@@ -93,7 +93,8 @@ object Privacy {
     /**
      * WireGuard tunnels to mutually approved contacts (Appendix D), through
      * the phone's VPN slot. Off unless chosen: Android runs one VPN at a
-     * time, so this would displace another VPN app.
+     * time, so this would displace another VPN app. Tunnel peers are kept
+     * (encrypted) across restarts while this is on.
      */
     fun tunnels(ctx: Context) = prefs(ctx).getBoolean(TUNNELS, false)
 
