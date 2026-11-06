@@ -103,6 +103,6 @@ mod tests {
     #[test]
     fn the_buffer_fits_the_largest_response() {
         // more || chunk || SW1 SW2
-        assert!(RECV >= 1 + threnody_core::tap::CHUNK + 2);
+        const { assert!(RECV >= 1 + threnody_core::tap::CHUNK + 2) };
     }
 }
