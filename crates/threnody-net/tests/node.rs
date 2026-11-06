@@ -401,12 +401,15 @@ async fn blocking_or_forgetting_takes_the_tunnel_down() {
         next(&mut arx, up).await;
         next(&mut brx, up).await;
 
+        let saved = dir.path().join("alice").join("tunnels.state");
+        assert!(saved.exists());
         if forget {
             alice.delete_conversation(&bob_id);
         } else {
             alice.block_contact(&bob_id);
         }
         assert!(alice.tunnel_peers().is_empty(), "forget: {forget}");
+        assert!(!saved.exists(), "forget: {forget}");
         next(&mut arx, |e| {
             matches!(
                 e,
@@ -569,6 +572,72 @@ async fn a_bluetooth_session_keeps_the_tunnel_endpoint() {
     .await
     .expect("offered over the link");
     assert_eq!(e, direct);
+}
+
+/// Tunnel peers are kept encrypted at rest (Appendix D, *Persistence*):
+/// neither the PSK nor the peer's identity shows in the file.
+#[tokio::test]
+async fn tunnel_peers_are_saved_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+
+    let psk = *alice.tunnel_peers_full()[0].psk.0;
+    let raw = std::fs::read(dir.path().join("alice").join("tunnels.state")).unwrap();
+    assert!(!raw.windows(32).any(|w| w == psk));
+    assert!(!raw.windows(32).any(|w| w == bob_id.as_bytes()));
+    let home = Home::new(dir.path().join("alice"));
+    let plain = home
+        .load_state(alice.identity_ref(), threnody_core::tunnel::STATE)
+        .unwrap()
+        .unwrap();
+    let saved = threnody_core::tunnel::decode_saved(&plain).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].peer, bob_id);
+    assert_eq!(*saved[0].psk, psk);
+    assert_eq!(saved[0].wg_public, alice.tunnel_peers_full()[0].wg_public);
+}
+
+/// An anonymous identity keeps nothing of its tunnels on disk.
+#[tokio::test]
+async fn personas_never_save_tunnels() {
+    use threnody_core::persona::Personas;
+    let dir = tempfile::tempdir().unwrap();
+    let main_home = Home::new(dir.path().join("me"));
+    let me = main_home.create_identity(None).unwrap();
+    let (_, home, pid) = Personas::new(&main_home, &me)
+        .create("market", None, None, 0)
+        .unwrap();
+    let persona_dir = home.dir().to_path_buf();
+    let (p, mut prx) = Node::new(NodeConfig {
+        home,
+        identity: pid,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: Some(51820),
+    })
+    .unwrap();
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = p.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&p.identity());
+    p.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&p.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut prx, up).await;
+    next(&mut brx, up).await;
+    assert_eq!(p.tunnel_peers(), vec![bob_id]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!persona_dir.join("tunnels.state").exists());
+    assert!(dir.path().join("bob").join("tunnels.state").exists());
 }
 
 #[tokio::test]

@@ -230,3 +230,278 @@ async fn tunnels_fall_back_to_quic_sessions_when_udp_is_blocked() {
 async fn tunnels_fall_back_to_tcp_sessions_when_udp_is_blocked() {
     crosses_over_the_session(false).await;
 }
+
+// Persistence (Appendix D, *Persistence*): peers kept across restarts.
+
+/// Opens a node again from the home `node` made, with tunnels on `port`.
+/// Nothing reaches across the internet: nothing but the test dials.
+fn reopen(dir: &tempfile::TempDir, name: &str, port: u16) -> (Node, UnboundedReceiver<Event>) {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    let (n, rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: Some(port),
+    })
+    .unwrap();
+    n.set_reach(false);
+    (n, rx)
+}
+
+struct Pair {
+    alice: Node,
+    bob: Node,
+    brx: UnboundedReceiver<Event>,
+    a_port: u16,
+    b_port: u16,
+}
+
+/// Alice and Bob, mutually approved over a TCP session, each holding
+/// the other's tunnel.
+async fn pair(dir: &tempfile::TempDir) -> Pair {
+    let (a_port, b_port) = (free_udp_port(), free_udp_port());
+    let (alice, mut arx) = node(dir, "alice", a_port);
+    let (bob, mut brx) = node(dir, "bob", b_port);
+    alice.set_reach(false);
+    bob.set_reach(false);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    up(&mut arx).await;
+    up(&mut brx).await;
+    // Each side answers the other's first offer with its own: let those
+    // land too.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = arx;
+    Pair {
+        alice,
+        bob,
+        brx,
+        a_port,
+        b_port,
+    }
+}
+
+fn entry(n: &Node, peer: &threnody_core::PublicIdentity) -> Option<threnody_net::node::TunnelPeer> {
+    n.tunnel_peer_entries()
+        .into_iter()
+        .find(|(k, _)| k == peer)
+        .map(|(_, tp)| tp)
+}
+
+fn saved(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    dir.path().join(name).join("tunnels.state")
+}
+
+/// Stops `n` and gives its tasks a moment to finish writing.
+async fn stop(n: Node) {
+    n.shutdown();
+    drop(n);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Whether some `TunnelUp` arrives within `wait`.
+async fn tunnel_up_within(rx: &mut UnboundedReceiver<Event>, wait: Duration) -> Option<Event> {
+    timeout(wait, async {
+        loop {
+            match rx.recv().await {
+                Some(e @ Event::TunnelUp { .. }) => return e,
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+#[tokio::test]
+async fn tunnels_survive_a_restart_without_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair {
+        alice, bob, b_port, ..
+    } = pair(&dir).await;
+    let (aid, bid) = (alice.identity(), bob.identity());
+    let (b_tun, b_in, mut b_out) = mem_tun();
+    let _b = WgDevice::start(bob.clone(), b_tun, b_port).await.unwrap();
+    let bob_psk = *entry(&bob, &aid).unwrap().psk.0;
+    assert!(saved(&dir, "alice").exists());
+    stop(alice).await;
+
+    // Alice comes back on another port and dials no one.
+    let a_port2 = free_udp_port();
+    let (alice, _arx) = reopen(&dir, "alice", a_port2);
+    assert_eq!(alice.tunnel_peers(), vec![bid]);
+    assert!(alice.sessions().is_empty());
+    assert_eq!(*entry(&alice, &bid).unwrap().psk.0, bob_psk);
+
+    let (a_tun, a_in, mut a_out) = mem_tun();
+    let _a = WgDevice::start(alice.clone(), a_tun, a_port2)
+        .await
+        .unwrap();
+    let (a_ip, b_ip) = (overlay_addr(&aid), overlay_addr(&bid));
+    let hello = ipv6_udp(a_ip, b_ip, b"back again");
+    let got = timeout(Duration::from_secs(10), async {
+        loop {
+            a_in.send(hello.clone()).unwrap();
+            if let Ok(Some(p)) = timeout(Duration::from_millis(300), b_out.recv()).await {
+                return p;
+            }
+        }
+    })
+    .await
+    .expect("a packet crossed the restored tunnel");
+    assert_eq!(got, hello);
+    let reply = ipv6_udp(b_ip, a_ip, b"welcome back");
+    b_in.send(reply.clone()).unwrap();
+    let back = timeout(Duration::from_secs(5), a_out.recv())
+        .await
+        .expect("reply crossed")
+        .unwrap();
+    assert_eq!(back, reply);
+    assert!(alice.sessions().is_empty(), "no session was needed");
+}
+
+#[tokio::test]
+async fn restore_skips_contacts_no_longer_mutual() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair { alice, bob, .. } = pair(&dir).await;
+    let bid = bob.identity();
+    stop(alice).await;
+    // Revoked while the node was down (as an older version or another
+    // tool might leave it): the restore filter, not `tunnel_down`.
+    let home = Home::new(dir.path().join("alice"));
+    let id = home.load_identity(None).unwrap();
+    let mut contacts = home.load_contacts(&id).unwrap();
+    contacts.get_mut(&bid).unwrap().local_approved = false;
+    home.save_contacts(&id, &contacts).unwrap();
+
+    let (alice, _arx) = reopen(&dir, "alice", free_udp_port());
+    assert!(alice.tunnel_peers().is_empty());
+    assert!(
+        !saved(&dir, "alice").exists(),
+        "the restore pruned the file"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_tunnel_state_is_forgotten_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", free_udp_port());
+    stop(alice).await;
+    std::fs::write(saved(&dir, "alice"), b"not a state file at all").unwrap();
+    let (alice, _arx) = reopen(&dir, "alice", free_udp_port());
+    assert!(alice.tunnel_peers().is_empty());
+    assert!(!saved(&dir, "alice").exists());
+}
+
+#[tokio::test]
+async fn turning_tunnels_off_deletes_saved_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair { alice, a_port, .. } = pair(&dir).await;
+    assert!(saved(&dir, "alice").exists());
+    alice.set_tunnel_port(None).unwrap();
+    assert!(!saved(&dir, "alice").exists());
+    assert!(alice.tunnel_peers().is_empty());
+    // Nothing comes back: Bob took an offer this session already, so he
+    // doesn't answer the new one (Appendix D, *Not yet done*).
+    alice.set_tunnel_port(Some(a_port)).unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(alice.tunnel_peers().is_empty());
+    assert!(!saved(&dir, "alice").exists());
+}
+
+#[tokio::test]
+async fn port_change_keeps_peers_and_moves_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair {
+        alice,
+        bob,
+        mut brx,
+        ..
+    } = pair(&dir).await;
+    let (aid, bid) = (alice.identity(), bob.identity());
+    let psk = *entry(&bob, &aid).unwrap().psk.0;
+    while brx.try_recv().is_ok() {}
+    let new = free_udp_port();
+    alice.set_tunnel_port(Some(new)).unwrap();
+    assert_eq!(alice.tunnel_peers(), vec![bid]);
+    let Some(Event::TunnelUp {
+        endpoint, psk: p, ..
+    }) = tunnel_up_within(&mut brx, Duration::from_secs(5)).await
+    else {
+        panic!("Bob heard of the new port");
+    };
+    assert_eq!(endpoint.port(), new);
+    assert_eq!(*p.0, psk, "the same session's PSK");
+    assert_eq!(entry(&bob, &aid).unwrap().endpoint.port(), new);
+    assert!(
+        tunnel_up_within(&mut brx, Duration::from_millis(1000))
+            .await
+            .is_none(),
+        "exactly one"
+    );
+}
+
+#[tokio::test]
+async fn identical_reoffers_change_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair {
+        alice,
+        mut brx,
+        a_port,
+        ..
+    } = pair(&dir).await;
+    let file = saved(&dir, "bob");
+    let mtime = || std::fs::metadata(&file).unwrap().modified().unwrap();
+    // Bob's own startup writes settle first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while brx.try_recv().is_ok() {}
+    let before = mtime();
+    alice.set_tunnel_port(Some(a_port)).unwrap();
+    assert!(
+        tunnel_up_within(&mut brx, Duration::from_millis(1500))
+            .await
+            .is_none()
+    );
+    assert_eq!(mtime(), before, "nothing written");
+}
+
+#[tokio::test]
+async fn tunnels_off_race_never_resurrects_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair {
+        alice, bob, b_port, ..
+    } = pair(&dir).await;
+    // Alice keeps moving her port, so each offer changes Bob's entry and
+    // makes him save it, while Bob turns tunnels off and on.
+    let a = alice.clone();
+    let mover = tokio::spawn(async move {
+        let (p1, p2) = (free_udp_port(), free_udp_port());
+        loop {
+            for p in [p1, p2] {
+                a.set_tunnel_port(Some(p)).unwrap();
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        }
+    });
+    let file = saved(&dir, "bob");
+    for _ in 0..30 {
+        bob.set_tunnel_port(None).unwrap();
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(4)).await;
+            assert!(!file.exists(), "saved while tunnels were off");
+            assert!(bob.tunnel_peers().is_empty());
+        }
+        bob.set_tunnel_port(Some(b_port)).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    mover.abort();
+    bob.set_tunnel_port(None).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!file.exists());
+}
