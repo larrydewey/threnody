@@ -149,7 +149,7 @@ struct Ui {
     /// 1: /del refers to it.
     shown: std::cell::RefCell<(Option<PublicIdentity>, Vec<threnody_core::history::Entry>)>,
     #[cfg(all(feature = "ble", target_os = "linux"))]
-    ble_seen: std::sync::Arc<std::sync::Mutex<Vec<crate::ble::Found>>>,
+    ble_seen: std::sync::Arc<std::sync::Mutex<Vec<threnody_radio::ble::Found>>>,
     wifi_direct: bool,
     /// NetworkManager profiles of Wi-Fi Direct groups we joined.
     joined: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -350,7 +350,9 @@ pub async fn run(opts: Options) -> Result<()> {
     }
     #[cfg(all(feature = "ble", target_os = "linux"))]
     let _ble = if opts.ble {
-        match crate::ble::listen(&ui.node).await {
+        match threnody_radio::ble::listen(&ui.node, std::sync::Arc::new(|l| eprintln!("! {l}")))
+            .await
+        {
             Ok(l) => {
                 say!(
                     "Bluetooth LE: advertising, L2CAP psm {}; approved contacts nearby connect automatically",
@@ -1034,7 +1036,7 @@ impl Ui {
             self.scratch.clone(),
         );
         tokio::spawn(async move {
-            let r = crate::wifidirect::join(&offer, &scratch).await;
+            let r = threnody_radio::wifidirect::join(&offer, &scratch).await;
             joining.store(false, Ordering::SeqCst);
             match r {
                 Ok(name) => {
@@ -1062,7 +1064,7 @@ impl Ui {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         for n in names {
-            match crate::wifidirect::leave(&n).await {
+            match threnody_radio::wifidirect::leave(&n).await {
                 Ok(()) => say!("* left Wi-Fi Direct group ({n})"),
                 Err(e) => say!("! leaving {n}: {e:#}"),
             }
@@ -2437,7 +2439,7 @@ impl Ui {
                 let secs = secs.and_then(|s| s.parse().ok()).unwrap_or(8);
                 say!("* scanning Bluetooth LE for {secs}s…");
                 tokio::spawn(async move {
-                    match crate::ble::scan(secs).await {
+                    match threnody_radio::ble::scan(secs).await {
                         Ok(found) => {
                             if found.is_empty() {
                                 say!("* no Threnody devices nearby");
@@ -2488,7 +2490,7 @@ impl Ui {
                     f.psm
                 );
                 tokio::spawn(async move {
-                    if let Err(e) = crate::ble::connect(&node, &f, None).await {
+                    if let Err(e) = threnody_radio::ble::connect(&node, &f, None).await {
                         say!("! Bluetooth connect: {e:#}");
                     }
                 });

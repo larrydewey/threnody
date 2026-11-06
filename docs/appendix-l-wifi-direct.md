@@ -1,6 +1,6 @@
 # Appendix L: Wi-Fi Direct Link Upgrade (v1)
 
-Status: implemented in `threnody-net::direct` (messages), `apps/android` (hosting and joining groups) and `threnody-cli::wifidirect` (joining through NetworkManager). Fulfils spec §7.2's Wi-Fi Direct transport.
+Status: implemented in `threnody-net::direct` (messages), `apps/android` (hosting and joining groups) and `threnody-radio::wifidirect` (joining through NetworkManager). Fulfils spec §7.2's Wi-Fi Direct transport.
 
 ## Model
 

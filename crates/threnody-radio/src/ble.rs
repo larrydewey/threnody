@@ -16,6 +16,8 @@ use threnody_core::discovery::{EPOCH_SECS, beacon_port};
 use threnody_net::Node;
 use threnody_net::discovery::BLE_SERVICE_UUID;
 
+use crate::Log;
+
 /// A Threnody device seen over Bluetooth LE.
 #[derive(Clone, Debug)]
 pub struct Found {
@@ -262,8 +264,9 @@ impl Drop for Listening {
 
 /// Listens on an LE L2CAP channel, advertises its PSM inside a private
 /// beacon under the Threnody UUID, accepts sessions on it, and dials
-/// approved contacts whose beacons we hear.
-pub async fn listen(node: &Node) -> Result<Listening> {
+/// approved contacts whose beacons we hear. Trouble in the background
+/// tasks goes to `log`.
+pub async fn listen(node: &Node, log: Log) -> Result<Listening> {
     let session = bluer::Session::new().await.context("connecting to BlueZ")?;
     let adapter = session
         .default_adapter()
@@ -291,7 +294,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
         .context("starting the BLE advertisement")?;
 
     let mut tasks = Vec::new();
-    let (n, a) = (node.clone(), adapter.clone());
+    let (n, a, l) = (node.clone(), adapter.clone(), log.clone());
     tasks.push(tokio::spawn(async move {
         let _session = session;
         let mut _advertising = first;
@@ -300,7 +303,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
             // Register the new beacon before dropping the old one.
             match a.advertise(advert(&n)).await {
                 Ok(h) => _advertising = h,
-                Err(e) => eprintln!("! Bluetooth advert refresh: {e}"),
+                Err(e) => l(format!("Bluetooth advert refresh: {e}")),
             }
         }
     }));
@@ -332,7 +335,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
     // Scanning can fail to start (BlueZ may still be finishing a previous
     // scan, say after a restart) or stop; keep trying, backing off.
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
-    let (n, scan_adapter) = (node.clone(), adapter.clone());
+    let (n, scan_adapter, log) = (node.clone(), adapter.clone(), log);
     tasks.push(tokio::spawn(async move {
         let adapter = scan_adapter;
         let mut wait = Duration::from_secs(2);
@@ -342,7 +345,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
         loop {
             let started = std::time::Instant::now();
             let r = tokio::select! {
-                r = auto_dial(&n, &adapter, uuid) => r,
+                r = auto_dial(&n, &adapter, uuid, &log) => r,
                 // Dropping the scan stops discovery cleanly.
                 _ = stopped.wait_for(|s| *s) => return,
             };
@@ -353,7 +356,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
             }
             match r {
                 Err(e) if !failing => {
-                    eprintln!("! Bluetooth scanning stopped ({e:#}); retrying");
+                    log(format!("Bluetooth scanning stopped ({e:#}); retrying"));
                     failing = true;
                     failures = 1;
                 }
@@ -366,7 +369,7 @@ pub async fn listen(node: &Node) -> Result<Listening> {
                     if stuck && failures == 3 {
                         let recent = reset_at.is_some_and(|t| t.elapsed() < RESET_EVERY);
                         if !recent && only_ours_connected(&adapter).await {
-                            eprintln!("! Bluetooth controller stuck scanning; resetting it");
+                            log("Bluetooth controller stuck scanning; resetting it".into());
                             reset_at = Some(std::time::Instant::now());
                             power_cycle(&adapter).await;
                             wait = Duration::from_secs(2);
@@ -376,9 +379,10 @@ pub async fn listen(node: &Node) -> Result<Listening> {
                     // A reset would drop the user's other devices, so only
                     // say how.
                     if failures == 5 {
-                        eprintln!(
-                            "! Bluetooth still can't scan; contacts can still reach this laptop. \
+                        log(
+                            "Bluetooth still can't scan; contacts can still reach this computer. \
                              If it persists: bluetoothctl power off && bluetoothctl power on"
+                                .into(),
                         );
                     }
                 }
@@ -452,7 +456,12 @@ const RESCAN: Duration = Duration::from_secs(30);
 
 /// Scans continuously; dials approved contacts recognised from their
 /// beacons (the smaller key dials, as on the LAN).
-async fn auto_dial(node: &Node, adapter: &bluer::Adapter, uuid: bluer::Uuid) -> Result<()> {
+async fn auto_dial(
+    node: &Node,
+    adapter: &bluer::Adapter,
+    uuid: bluer::Uuid,
+    log: &Log,
+) -> Result<()> {
     // No duplicate reports: to deliver them, the kernel restarts the scan
     // on its own every few seconds, and on a MediaTek controller a restart
     // racing with this process exiting left the controller scanning
@@ -514,10 +523,13 @@ async fn auto_dial(node: &Node, adapter: &bluer::Adapter, uuid: bluer::Uuid) -> 
                 rssi: None,
                 name: None,
             };
-            let node = node.clone();
+            let (node, log) = (node.clone(), log.clone());
             tokio::spawn(async move {
                 if let Err(e) = connect(&node, &f, Some(peer.fingerprint())).await {
-                    eprintln!("! Bluetooth auto-connect to {}: {e:#}", peer.fingerprint());
+                    log(format!(
+                        "Bluetooth auto-connect to {}: {e:#}",
+                        peer.fingerprint()
+                    ));
                 }
             });
         }
@@ -525,5 +537,42 @@ async fn auto_dial(node: &Node, adapter: &bluer::Adapter, uuid: bluer::Uuid) -> 
         // the next start.
         drop(events);
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn sdu_limit_caps_writes() {
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let mut a = SduLimit(a);
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let n = a.write(&data).await.unwrap();
+        assert!(n <= MAX_SDU, "{n}");
+        a.write_all(&data[n..]).await.unwrap();
+        let mut got = vec![0; data.len()];
+        b.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn advert_psm_reads_the_beacon_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = threnody_core::store::Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _g = rt.enter();
+        let (node, _rx) = Node::new(threnody_net::NodeConfig {
+            home,
+            identity,
+            policy: threnody_net::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        assert_eq!(advert_psm(&node.ble_beacon(0x0081)), Some(0x0081));
     }
 }
