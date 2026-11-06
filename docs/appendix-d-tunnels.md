@@ -56,7 +56,7 @@ The node reads and writes whole IPv6 packets on that interface and WireGuard dat
 - A packet to the overlay goes to the peer that owns its destination address.
 - A decrypted packet is delivered only if its source is the sending peer's own overlay address, the same rule as `AllowedIPs`.
 - Peers follow the node's tunnel state, checked every second. A new session's PSK starts a fresh WireGuard session, and revoking approval removes the peer.
-- Authenticated packets update the peer's endpoint, as WireGuard roaming does.
+- Packets authenticated by the peer's keys (handshakes and data, not cookie replies, which someone on the path who knows the peer's public key could forge) update the peer's endpoint, as WireGuard roaming does.
 
 Android runs one VPN at a time, so turning tunnels on displaces any other VPN app, which is why the setting is opt-in. If another VPN takes the slot, tunnels turn off.
 

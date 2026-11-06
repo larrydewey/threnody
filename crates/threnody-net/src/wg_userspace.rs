@@ -302,13 +302,22 @@ async fn receive(
             reply(node, udp, id, peer, from, &p).await;
         }
     }
-    if let Some(from) = from {
+    if let Some(from) = from.filter(|_| authenticates_sender(datagram)) {
         // Authenticated over UDP: the direct path works, and this is
         // where the peer is now.
         peer.endpoint = from;
         peer.direct_at = Some(Instant::now());
     }
     true
+}
+
+/// Whether a datagram, once `decapsulate` accepted it, proves the sender
+/// holds the peer's keys: handshake initiation (1), response (2) and
+/// transport data (4). A cookie reply (3) does not: it is sealed under a
+/// key from the peer's public key, so anyone on the path who knows that
+/// key could forge one, and WireGuard roams only on authenticated packets.
+fn authenticates_sender(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(1 | 2 | 4))
 }
 
 /// Answers on the path a packet came by: back to its UDP source, or as
@@ -397,5 +406,20 @@ impl TunIo for threnody_tun::FdTun {
 
     fn write(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
         threnody_tun::FdTun::write(self, packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticates_sender_only_for_key_bound_packets() {
+        for t in [1u8, 2, 4] {
+            assert!(authenticates_sender(&[t, 0, 0, 0]), "type {t}");
+        }
+        assert!(!authenticates_sender(&[3, 0, 0, 0]), "cookie reply");
+        assert!(!authenticates_sender(&[0, 0, 0, 0]));
+        assert!(!authenticates_sender(&[]));
     }
 }
