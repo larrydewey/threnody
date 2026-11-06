@@ -280,6 +280,13 @@ impl Home {
         }
     }
 
+    /// Deletes a state file, overwriting it first ([`secure_delete`]); no
+    /// error if absent. Only the current file is overwritten: versions it
+    /// replaced were unlinked, still encrypted under the identity's key.
+    pub fn secure_remove_state(&self, name: &str) -> Result<()> {
+        secure_delete(&self.state_path(name)?)
+    }
+
     /// Loads state written by [`Home::save_state`]; `Ok(None)` if absent.
     pub fn load_state(
         &self,
@@ -1618,6 +1625,19 @@ mod state_tests {
             "state must be bound to its name"
         );
         assert!(home.save_state(&a, "../x", b"").is_err());
+    }
+
+    #[test]
+    fn secure_remove_state_deletes_and_tolerates_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let a = Identity::generate();
+        home.save_state(&a, "tunnels", b"pairwise keys").unwrap();
+        home.secure_remove_state("tunnels").unwrap();
+        assert!(!dir.path().join("tunnels.state").exists());
+        assert!(home.load_state(&a, "tunnels").unwrap().is_none());
+        home.secure_remove_state("tunnels").unwrap();
+        assert!(home.secure_remove_state("../x").is_err());
     }
 }
 

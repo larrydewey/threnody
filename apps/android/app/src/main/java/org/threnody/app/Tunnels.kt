@@ -65,7 +65,8 @@ object Tunnels {
         Privacy.setTunnels(a, true)
         start(a, node)
         Toast.makeText(a, "Tunnels on: mutually approved contacts who turn them on too get one, " +
-            "at their overlay address", Toast.LENGTH_LONG).show()
+            "at their overlay address. They come back by themselves after a restart.",
+            Toast.LENGTH_LONG).show()
     }
 
     fun disable(ctx: Context, node: ThrenodyNode) {
@@ -73,15 +74,23 @@ object Tunnels {
         ctx.startService(Intent(ctx, ThrenodyVpn::class.java).setAction(ThrenodyVpn.ACTION_STOP))
         node.tunnelStopDevice()
         node.setTunnelPort(null)
-        Toast.makeText(ctx, "Tunnels off", Toast.LENGTH_SHORT).show()
+        Toast.makeText(ctx, "Tunnels off; their keys are deleted from this phone", Toast.LENGTH_SHORT).show()
     }
 
-    /** At startup: brings tunnels back if they were on and consent still holds. */
+    /**
+     * At startup: brings tunnels back, with the peers the node kept from
+     * the last run, if they were on and consent still holds. When they are
+     * off, deletes any tunnel keys a run killed mid-toggle left on disk.
+     */
     fun resume(ctx: Context, node: ThrenodyNode) {
-        if (!Privacy.tunnels(ctx)) return
+        if (!Privacy.tunnels(ctx)) {
+            node.setTunnelPort(null)
+            return
+        }
         if (VpnService.prepare(ctx) != null) {
             // Consent was taken away (another VPN app, or the user).
             Privacy.setTunnels(ctx, false)
+            node.setTunnelPort(null)
             Threnody.say("* tunnels off: VPN permission was withdrawn")
             return
         }

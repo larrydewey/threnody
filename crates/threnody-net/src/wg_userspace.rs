@@ -280,7 +280,9 @@ async fn receive(
     dst: &mut [u8],
 ) -> bool {
     let mut flush = false;
-    match peer.tunn.decapsulate(from.map(|f| f.ip()), datagram, dst) {
+    let res = peer.tunn.decapsulate(from.map(|f| f.ip()), datagram, dst);
+    let fresh = proves_sender(datagram, &res);
+    match res {
         TunnResult::Done => {}
         TunnResult::Err(_) => return true,
         TunnResult::WriteToNetwork(p) => {
@@ -302,13 +304,41 @@ async fn receive(
             reply(node, udp, id, peer, from, &p).await;
         }
     }
-    if let Some(from) = from {
-        // Authenticated over UDP: the direct path works, and this is
-        // where the peer is now.
-        peer.endpoint = from;
-        peer.direct_at = Some(Instant::now());
+    if let Some(moved) = peer.roam(from, fresh) {
+        node.tunnel_endpoint_seen(&id, &peer.wg_public, moved);
     }
     true
+}
+
+impl Peer {
+    /// Roams to `from` (WireGuard's endpoint update) when a packet that
+    /// came over UDP from there `fresh`ly proved the sender (see
+    /// `proves_sender`): that path works, and it is where the peer is now.
+    /// Returns the new endpoint when it moved, for the node to remember.
+    fn roam(&mut self, from: Option<SocketAddr>, fresh: bool) -> Option<SocketAddr> {
+        let from = from.filter(|_| fresh)?;
+        self.direct_at = Some(Instant::now());
+        (std::mem::replace(&mut self.endpoint, from) != from).then_some(from)
+    }
+}
+
+/// Whether `datagram`, given what `decapsulate` made of it (`res`), proves
+/// that its sender holds this session's keys now: a handshake response to
+/// our own initiation (2) or transport data that decrypted (4). Both are
+/// bound to our ephemeral key or the session's counters, so none can be
+/// replayed. Not proof: anything refused; a cookie reply (3), which anyone
+/// who knows the peer's public key can forge; a handshake that drew a
+/// cookie reply because we are under load (its MAC1 checked, nothing
+/// authenticated); and a handshake initiation (1), which a new `Tunn` (a
+/// new session, or restored tunnels) takes even when it is a replay, since
+/// it has no timestamp to compare. The answer to an initiation goes back to
+/// its source anyway (`reply`), and the data that follows proves the path.
+fn proves_sender(datagram: &[u8], res: &TunnResult) -> bool {
+    match res {
+        TunnResult::Err(_) => false,
+        TunnResult::WriteToNetwork(p) if p.first() == Some(&3) => false,
+        _ => matches!(datagram.first(), Some(2 | 4)),
+    }
 }
 
 /// Answers on the path a packet came by: back to its UDP source, or as
@@ -397,5 +427,112 @@ impl TunIo for threnody_tun::FdTun {
 
     fn write(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
         threnody_tun::FdTun::write(self, packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret(b: u8) -> StaticSecret {
+        StaticSecret::from([b; 32])
+    }
+
+    /// Our peer entry for B (whose key `b` makes), and B's own `Tunn`.
+    fn peer_and_tunn() -> (Peer, Tunn) {
+        let (a, b) = (secret(1), secret(2));
+        let psk = [9u8; 32];
+        let ours = Tunn::new(a.clone(), PublicKey::from(&b), Some(psk), None, 1, None);
+        let theirs = Tunn::new(b.clone(), PublicKey::from(&a), Some(psk), None, 2, None);
+        let endpoint: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let peer = Peer {
+            tunn: ours,
+            index: 1,
+            wg_public: *PublicKey::from(&b).as_bytes(),
+            psk,
+            overlay: Ipv6Addr::LOCALHOST,
+            endpoint,
+            offered: endpoint,
+            direct_at: None,
+        };
+        (peer, theirs)
+    }
+
+    #[test]
+    fn replayed_initiations_never_move_the_endpoint() {
+        let spoofed: SocketAddr = "198.51.100.7:4444".parse().unwrap();
+        let mut buf = [0u8; 256];
+        let mut dst = vec![0u8; BUF];
+        let (mut peer, mut theirs) = peer_and_tunn();
+        let TunnResult::WriteToNetwork(init) = theirs.format_handshake_initiation(&mut buf, false)
+        else {
+            panic!("no initiation");
+        };
+        let init = init.to_vec();
+        // A new Tunn (restored tunnels) takes the first copy, and later
+        // ones draw cookie replies once the rate limiter is under load:
+        // none of them is proof, so nothing roams and nothing is saved.
+        let mut cookies = 0;
+        for _ in 0..16 {
+            let res = peer.tunn.decapsulate(Some(spoofed.ip()), &init, &mut dst);
+            if matches!(&res, TunnResult::WriteToNetwork(p) if p.first() == Some(&3)) {
+                cookies += 1;
+            }
+            let fresh = proves_sender(&init, &res);
+            assert!(!fresh);
+            assert_eq!(peer.roam(Some(spoofed), fresh), None);
+        }
+        assert!(cookies > 0, "the rate limiter never answered with a cookie");
+        assert_eq!(peer.endpoint, peer.offered);
+        assert!(peer.direct_at.is_none());
+    }
+
+    #[test]
+    fn a_response_or_data_moves_the_endpoint() {
+        let moved: SocketAddr = "203.0.113.5:6000".parse().unwrap();
+        let mut buf = [0u8; 256];
+        let mut dst = vec![0u8; BUF];
+        let mut dst2 = vec![0u8; BUF];
+        let (mut peer, mut theirs) = peer_and_tunn();
+        // We initiate; B's response comes from a new address.
+        let TunnResult::WriteToNetwork(init) =
+            peer.tunn.format_handshake_initiation(&mut buf, false)
+        else {
+            panic!("no initiation");
+        };
+        let init = init.to_vec();
+        let TunnResult::WriteToNetwork(resp) = theirs.decapsulate(None, &init, &mut dst2) else {
+            panic!("no response");
+        };
+        let resp = resp.to_vec();
+        let res = peer.tunn.decapsulate(Some(moved.ip()), &resp, &mut dst);
+        let fresh = proves_sender(&resp, &res);
+        assert!(fresh);
+        assert_eq!(peer.roam(Some(moved), fresh), Some(moved));
+        assert!(peer.direct());
+        // Again from there: no move to report. Over the session: no roam.
+        assert_eq!(peer.roam(Some(moved), true), None);
+        assert_eq!(peer.roam(None, true), None);
+        assert_eq!(peer.endpoint, moved);
+    }
+
+    #[test]
+    fn only_fresh_packets_prove_the_sender() {
+        let cookie = [3u8, 0, 0, 0];
+        for t in [2u8, 4] {
+            assert!(proves_sender(&[t, 0, 0, 0], &TunnResult::Done), "type {t}");
+        }
+        let mut c = cookie;
+        assert!(!proves_sender(
+            &[2, 0, 0, 0],
+            &TunnResult::WriteToNetwork(&mut c)
+        ));
+        assert!(!proves_sender(&[1, 0, 0, 0], &TunnResult::Done));
+        assert!(!proves_sender(&cookie, &TunnResult::Done));
+        assert!(!proves_sender(
+            &[4, 0, 0, 0],
+            &TunnResult::Err(boringtun::noise::errors::WireGuardError::InvalidCounter)
+        ));
+        assert!(!proves_sender(&[], &TunnResult::Done));
     }
 }

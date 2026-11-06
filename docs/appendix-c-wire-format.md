@@ -48,7 +48,7 @@ File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms,
                                                                        ; album id, clip duration (ms)
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
-TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D)
+TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D); may repeat within a session
 Group    = { 0 => 6, 2 => bstr .cbor GroupWire }          ; Appendix F
 Relay    = { 0 => 7, 2 => bstr .cbor RelayMsg }           ; Appendix G
 Prekeys  = { 0 => 8, 2 => bstr .cbor PrekeyBundle }       ; Appendix H
@@ -305,6 +305,7 @@ A backup leaves out:
 - **Relay tokens** (`relay-wallet`, Appendix P), each of which can be spent once.
 - **Anonymous identities** (Appendix M). A backup would link them to the main identity.
 - **Scheduled messages** (`scheduled`). A backup restored later must not send old messages, or send them a second time while the old device still runs. Restoring drops any that are pending on the device restored onto.
+- **Saved tunnel peers** (`tunnels`, Appendix D, *Persistence*). Their PSKs come from sessions with this device, so they never leave it.
 - **Received files' contents.** History keeps only where the app saved them.
 
 **Restoring** replaces the identity, contacts, state and personas in a data directory. The backup is opened and checked first, so a wrong passphrase or a damaged file changes nothing. The restored identity is sealed the way a new one would be (the keyring, a passphrase, or the Android Keystore). Apps can't stop their node while they run, so they *stage* a restore in `<data dir>.restore` and restart. The staged files replace the old ones before the node next opens. The user's other files in the data directory, such as downloads, stay.

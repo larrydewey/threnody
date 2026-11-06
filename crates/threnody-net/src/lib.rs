@@ -34,6 +34,7 @@ mod recover;
 pub mod relay;
 pub mod schedule;
 pub mod sync;
+mod tunnels;
 pub mod volunteer;
 #[cfg(feature = "boringtun")]
 pub mod wg_userspace;

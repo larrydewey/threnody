@@ -84,9 +84,27 @@ pub fn has_endpoint(endpoint: &SocketAddr) -> bool {
 #[derive(Clone)]
 pub struct TunnelPeer {
     pub wg_public: [u8; 32],
+    /// The endpoint the node last gave: from the peer's offer, or saved
+    /// by an earlier run (Appendix D, *Persistence*).
     pub endpoint: SocketAddr,
     pub overlay: Ipv6Addr,
     pub psk: Secret,
+    /// When `psk` was exported from a session (ms); restored peers keep theirs.
+    pub made_ms: u64,
+    /// Where packets authenticated by this peer's key last came from over
+    /// UDP (userspace device only), when that differs from `endpoint`.
+    pub seen: Option<SocketAddr>,
+}
+
+/// What became of a tunnel offer (see `Shared::add_tunnel_peer`).
+enum Offered {
+    /// Tunnels are off.
+    Off,
+    /// Its key is ours or another peer's.
+    Refused,
+    /// The same key, PSK and endpoint as we hold: nothing to do.
+    Same,
+    Changed(TunnelPeer),
 }
 
 /// How something went when no circuit could hide it (see
@@ -148,8 +166,9 @@ pub enum Event {
         addr: SocketAddr,
         reason: String,
     },
-    /// A mutually approved peer offered a WireGuard tunnel. `psk` is fresh
-    /// for this session; reapply it whenever this event repeats.
+    /// A mutually approved peer offered a WireGuard tunnel. `psk` is from
+    /// this session, or from the last one when a repeated offer only moves
+    /// the endpoint; reapply it whenever this event repeats.
     TunnelUp {
         peer: PublicIdentity,
         wg_public: [u8; 32],
@@ -536,7 +555,7 @@ struct SessionHandle {
 }
 
 pub(crate) struct Shared {
-    identity: Identity,
+    pub(crate) identity: Identity,
     pub(crate) home: Home,
     pub(crate) contacts: Mutex<Contacts>,
     sessions: Mutex<HashMap<PublicIdentity, SessionHandle>>,
@@ -555,9 +574,17 @@ pub(crate) struct Shared {
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
     pub(crate) default_timer: std::sync::atomic::AtomicU32,
-    tunnel: Mutex<Option<(u16, [u8; 32])>>,
+    /// Our tunnel port and WireGuard public key, while tunnels are on.
+    pub(crate) tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
-    tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    pub(crate) tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    /// Held around turning tunnels off and each read or write of the
+    /// saved peers, so a save can't bring the file back once tunnels are
+    /// off (see `tunnels`).
+    pub(crate) tunnel_io: Mutex<()>,
+    /// When endpoints the userspace device saw were last saved (ms).
+    #[cfg(feature = "boringtun")]
+    pub(crate) tunnel_seen_saved_ms: AtomicU64,
     /// When each peer's last Wi-Fi Direct request and offer were taken
     /// (see `direct`), to take at most one of each per interval.
     pub(crate) direct_taken: Mutex<HashMap<(PublicIdentity, bool), std::time::Instant>>,
@@ -659,9 +686,12 @@ impl Shared {
             .is_some_and(|c| c.mutually_approved())
     }
 
-    fn tunnel_down(&self, peer: &PublicIdentity) {
+    pub(crate) fn tunnel_down(&self, peer: &PublicIdentity) {
         if lock(&self.tunnel).is_some() {
             let removed = lock(&self.tunnel_peers).remove(peer);
+            if removed.is_some() {
+                self.save_tunnels();
+            }
             self.emit(Event::TunnelDown {
                 peer: *peer,
                 wg_public: removed.map(|tp| tp.wg_public),
@@ -687,21 +717,50 @@ impl Shared {
     /// Records `peer`'s tunnel, unless its WireGuard key is ours or
     /// already another peer's. WireGuard knows peers by key, so a contact
     /// offering someone else's key would take over that peer's entry (and,
-    /// once revoked, remove it). The first to hold a key keeps it. Returns
-    /// whether it was recorded.
-    fn add_tunnel_peer(&self, peer: PublicIdentity, tp: TunnelPeer) -> bool {
-        if lock(&self.tunnel).is_some_and(|(_, ours)| ours == tp.wg_public) {
-            return false;
-        }
+    /// once revoked, remove it). The first to hold a key keeps it.
+    ///
+    /// An offer repeated within a session (after the peer's network or
+    /// port changed) keeps the PSK's age; one identical to what we hold
+    /// changes nothing.
+    fn add_tunnel_peer(
+        &self,
+        peer: PublicIdentity,
+        wg_public: [u8; 32],
+        endpoint: SocketAddr,
+        psk: Secret,
+    ) -> Offered {
         let mut peers = lock(&self.tunnel_peers);
+        // Checked under `tunnel_peers`, which turning tunnels off clears
+        // after `tunnel`: an offer racing with that can't leave a peer.
+        let Some((_, ours)) = *lock(&self.tunnel) else {
+            return Offered::Off;
+        };
+        if ours == wg_public {
+            return Offered::Refused;
+        }
         if peers
             .iter()
-            .any(|(id, p)| *id != peer && p.wg_public == tp.wg_public)
+            .any(|(id, p)| *id != peer && p.wg_public == wg_public)
         {
-            return false;
+            return Offered::Refused;
         }
-        peers.insert(peer, tp);
-        true
+        let old = peers
+            .get(&peer)
+            .filter(|o| o.wg_public == wg_public && *o.psk.0 == *psk.0);
+        if old.is_some_and(|o| o.endpoint == endpoint) {
+            return Offered::Same;
+        }
+        let tp = TunnelPeer {
+            wg_public,
+            endpoint,
+            overlay: overlay_addr(&peer),
+            made_ms: old.map_or_else(now_ms, |o| o.made_ms),
+            // The device starts again from the offered endpoint.
+            seen: None,
+            psk,
+        };
+        peers.insert(peer, tp.clone());
+        Offered::Changed(tp)
     }
 
     pub(crate) fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
@@ -876,6 +935,9 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
+            tunnel_io: Mutex::new(()),
+            #[cfg(feature = "boringtun")]
+            tunnel_seen_saved_ms: AtomicU64::new(0),
             direct_taken: Mutex::new(HashMap::new()),
             tunnel_inbound: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
@@ -950,6 +1012,7 @@ impl Node {
         node.start_directory_upkeep();
         node.load_push();
         node.resume_placements();
+        node.shared.restore_tunnels();
         Ok((node, rx))
     }
 
@@ -1054,20 +1117,21 @@ impl Node {
             .collect()
     }
 
-    /// Sets the WireGuard tunnel port. Changing this restarts tunnel state.
+    /// Sets the WireGuard tunnel port. Turning tunnels on restores peers
+    /// saved by an earlier run (Appendix D, *Persistence*). Turning them
+    /// off (`None`, even when already off) forgets every peer and deletes
+    /// the saved ones. Changing the port keeps peers and offers the new
+    /// one on every direct session.
     pub fn set_tunnel_port(&self, port: Option<u16>) -> Result<()> {
         let new_tunnel = port.map(|p| (p, *WgKeys::derive(&self.shared.identity).public()));
-        *lock(&self.shared.tunnel) = new_tunnel;
-        // Clear existing tunnel peers since port changed
-        lock(&self.shared.tunnel_peers).clear();
-        // Offer at once on direct sessions with approved contacts, rather
-        // than when each session next wakes; they answer with theirs.
-        if let Some((port, wg_public)) = new_tunnel {
-            for s in self.sessions() {
-                if s.via.is_none() && self.shared.mutual(&s.peer) {
-                    let _ = self.send(&s.peer, AppMessage::TunnelOffer { wg_public, port });
-                }
+        let was = self.shared.set_tunnel(new_tunnel);
+        if new_tunnel.is_some() {
+            if was.is_none() {
+                self.shared.restore_tunnels();
             }
+            // Peers stay valid across a port change (their PSK doesn't
+            // depend on it); the offer tells them our new port.
+            self.reoffer_tunnels();
         }
         Ok(())
     }
@@ -1867,6 +1931,9 @@ impl Node {
         if let Some(conn) = &datagrams {
             self.read_datagrams(peer, conn.clone());
         }
+        // This session's own connection: `datagrams_to` would give a newer
+        // session's while this one lingers after being replaced.
+        let conn = datagrams.clone();
         let old = lock(&self.shared.sessions).insert(
             peer,
             SessionHandle {
@@ -1912,7 +1979,7 @@ impl Node {
         let started = tokio::time::Instant::now();
         tokio::spawn(async move {
             let result = run_session(
-                &node, stream, chan, addr, via, over, rx, outbound, stranger, heard_ms,
+                &node, stream, chan, addr, via, over, conn, rx, outbound, stranger, heard_ms,
             )
             .await;
             // Closed on purpose (either side) is not a loss to repair.
@@ -1973,6 +2040,7 @@ async fn run_session<S>(
     addr: SocketAddr,
     via: Option<PublicIdentity>,
     over: Over,
+    conn: Option<quinn::Connection>,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
     outbound: bool,
     mut stranger_pass: Option<StrangerPass>,
@@ -2390,21 +2458,29 @@ where
                             // devices, offered on direct sessions only: the
                             // address of a relayed one is the relay's.
                             if via.is_none() && lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
-                                let tp = TunnelPeer {
-                                    wg_public,
-                                    endpoint: shared.tunnel_endpoint(&peer, addr, port),
-                                    overlay: overlay_addr(&peer),
-                                    psk: Secret(chan.export(PSK_CONTEXT)),
+                                // This session's current address: a QUIC
+                                // client that moves migrates its connection
+                                // (quinn updates `remote_address`), and a
+                                // repeated offer then moves the endpoint.
+                                let from = conn
+                                    .as_ref()
+                                    .map_or(addr, |c| crate::quic::canonical(c.remote_address()));
+                                let endpoint = shared.tunnel_endpoint(&peer, from, port);
+                                let psk = Secret(chan.export(PSK_CONTEXT));
+                                let changed = match shared.add_tunnel_peer(peer, wg_public, endpoint, psk) {
+                                    Offered::Refused => {
+                                        shared.emit(Event::ReachNote {
+                                            note: format!(
+                                                "tunnel offer from {} refused: its key is not its own",
+                                                peer.fingerprint()
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                    Offered::Off => continue,
+                                    Offered::Same => None,
+                                    Offered::Changed(tp) => Some(tp),
                                 };
-                                if !shared.add_tunnel_peer(peer, tp.clone()) {
-                                    shared.emit(Event::ReachNote {
-                                        note: format!(
-                                            "tunnel offer from {} refused: its key is not its own",
-                                            peer.fingerprint()
-                                        ),
-                                    });
-                                    continue;
-                                }
                                 // They may have offered while our tunnels
                                 // were off, and so ignored ours: answer
                                 // their first offer with ours.
@@ -2412,13 +2488,16 @@ where
                                     took_offer = true;
                                     offered = false;
                                 }
-                                shared.emit(Event::TunnelUp {
-                                    peer,
-                                    wg_public: tp.wg_public,
-                                    endpoint: tp.endpoint,
-                                    overlay: tp.overlay,
-                                    psk: tp.psk,
-                                });
+                                if let Some(tp) = changed {
+                                    shared.save_tunnels();
+                                    shared.emit(Event::TunnelUp {
+                                        peer,
+                                        wg_public: tp.wg_public,
+                                        endpoint: tp.endpoint,
+                                        overlay: tp.overlay,
+                                        psk: tp.psk,
+                                    });
+                                }
                             }
                         }
                         AppMessage::Paths(payload) => {

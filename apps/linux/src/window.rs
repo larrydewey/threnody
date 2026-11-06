@@ -2945,7 +2945,8 @@ impl App {
             .description(format!(
                 "Each mutually approved contact who turns tunnels on too is reachable at their \
                  overlay address, for apps like ssh. Threnody keeps {} current; bring it up \
-                 with “sudo wg-quick up {}”.",
+                 with “sudo wg-quick up {}”. Tunnels come back by themselves after a restart; \
+                 turning this off deletes their keys from this computer.",
                 conf.display(),
                 conf.display()
             ))

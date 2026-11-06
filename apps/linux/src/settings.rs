@@ -17,7 +17,8 @@ pub const VOLUNTEERS: &str = "use_volunteers";
 /// a server) the main identity keeps a session with. None unless chosen.
 pub const ANCHOR: &str = "always_on_relay";
 /// WireGuard tunnels to mutually approved contacts: off unless chosen,
-/// since bringing the interface up needs root.
+/// since bringing the interface up needs root. Peers are kept, encrypted,
+/// across restarts while on.
 pub const TUNNELS: &str = "wireguard_tunnels";
 /// A handle others can type to find us (Appendix S): its name and
 /// version. None unless chosen.
