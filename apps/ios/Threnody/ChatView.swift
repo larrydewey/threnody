@@ -151,6 +151,11 @@ struct ChatView: View {
 
     private func appear() async {
         store.visibleChat = devices
+        // Not connected: look for them across the internet now.
+        if let n = store.node {
+            let d = device
+            Task.detached { try? n.seek(peer: d) }
+        }
         if let n = store.node, text.isEmpty {
             let d = device
             text = (try? await offMain { try n.draft(peer: d) }) ?? ""

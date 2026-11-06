@@ -17,6 +17,8 @@ A ─anonymous link─▶ V1 ─anonymous link─▶ V2 ─anonymous link─▶ 
 
 Personas can be clients but never relays or directories, since both publish an identity with an address.
 
+Front ends: the CLI volunteers with `--volunteer-relay` and runs a directory with `--serve-directory`. The Linux desktop app does both from Preferences → Volunteer relays. Both review relays before listing them unless the operator turns review off (`--no-review-relays`, or the switch in the app). Volunteering is refused up front when an address breaks the descriptor rule below (1–8 `host:port`s, each at most 64 bytes, no whitespace). Stopping a directory deletes its state (`directory-server`), so it doesn't resume at the next start; its clients are then told "not a directory", as for an offline one, and keep their tokens until they expire.
+
 ## Anonymous links
 
 A link to a relay or directory isn't a contact session. Its initiator's first frame is the bytes `threnody anonymous link v1` instead of the first handshake message. After that, the usual handshake (Appendix A) and an encrypted session run, with the node's cover traffic. Neither side becomes the other's contact, and the app hears nothing about it. Only `AppMessage::Onion` (kind 10) and `AppMessage::Directory` (kind 22) are processed on such a link; anything else is ignored.

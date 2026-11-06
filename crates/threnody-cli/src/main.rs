@@ -3,14 +3,11 @@
 #[macro_use]
 mod out;
 
-#[cfg(all(feature = "ble", target_os = "linux"))]
-mod ble;
 mod chat;
 mod groups;
 mod keyring;
 mod target;
 mod tunnel;
-mod wifidirect;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;

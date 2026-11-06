@@ -38,6 +38,18 @@ pub const GIPHY_KEY: &str = "giphy_api_key";
 pub const LOCK_OFFERED: &str = "lock_offered";
 /// Which conversations the list shows: "all", "chats" or "groups".
 pub const LIST_TAB: &str = "list_tab";
+/// Bluetooth LE (advertising a private beacon, dialing contacts nearby)
+/// and joining contacts' Wi-Fi Direct groups: off unless chosen. They
+/// show this computer's presence on radios; they aren't protections.
+pub const BLUETOOTH: &str = "bluetooth";
+pub const WIFI_DIRECT: &str = "wifi_direct";
+/// Volunteering as a relay at these public addresses, and running a
+/// relay directory at this one: none unless chosen.
+pub const VOLUNTEER_ADDRS: &str = "volunteer_addrs";
+pub const DIRECTORY_ADDR: &str = "directory_addr";
+/// The directory reviews relays before listing them (a protection
+/// against Sybil relays, so on unless turned off).
+pub const DIRECTORY_REVIEW: &str = "directory_review";
 
 /// Cover interval on unmetered networks, and on metered ones.
 pub const COVER_UNMETERED_MS: u32 = 2_000;
@@ -71,8 +83,12 @@ pub struct Settings {
 impl Settings {
     pub fn load() -> Self {
         let path = config_dir().join("desktop.conf");
-        let values = std::fs::read_to_string(&path)
-            .unwrap_or_default()
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        Self::parse(path, &text)
+    }
+
+    fn parse(path: PathBuf, text: &str) -> Self {
+        let values = text
             .lines()
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
@@ -198,5 +214,21 @@ mod tests {
         s.set_text(HANDLE_NAME, "me");
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nearby_and_roles_default_off_review_on() {
+        let s = Settings::parse(PathBuf::from("/nonexistent/desktop.conf"), "");
+        assert!(!s.opted_in(BLUETOOTH));
+        assert!(!s.opted_in(WIFI_DIRECT));
+        assert_eq!(s.text(VOLUNTEER_ADDRS), None);
+        assert_eq!(s.text(DIRECTORY_ADDR), None);
+        assert!(s.flag(DIRECTORY_REVIEW));
+        let s = Settings::parse(
+            PathBuf::from("/nonexistent/desktop.conf"),
+            "bluetooth=true\n",
+        );
+        assert!(s.opted_in(BLUETOOTH));
+        assert!(!s.opted_in(WIFI_DIRECT));
     }
 }

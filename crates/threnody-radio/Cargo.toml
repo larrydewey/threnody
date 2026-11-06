@@ -1,0 +1,30 @@
+[package]
+name = "threnody-radio"
+description = "Linux radio transports for Threnody: Bluetooth LE through BlueZ, Wi-Fi Direct through NetworkManager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["ble"]
+# Bluetooth LE transport via BlueZ (Linux only).
+ble = ["dep:bluer", "dep:futures-util"]
+
+[dependencies]
+threnody-core.workspace = true
+threnody-net.workspace = true
+tokio = { workspace = true, features = ["process"] }
+anyhow.workspace = true
+blake3.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

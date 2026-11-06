@@ -69,6 +69,8 @@ pub struct App {
     call: Rc<CallBar>,
     /// App lock: the lock page in front of everything.
     pub lock: Rc<crate::lock::Lock>,
+    /// Kept so its power-saver signal keeps coming.
+    power: RefCell<Option<gio::PowerProfileMonitor>>,
 }
 
 impl App {
@@ -270,6 +272,7 @@ impl App {
             log: RefCell::new(None),
             call,
             lock,
+            power: RefCell::new(None),
         });
         this.actions();
         crate::lock::install(&this);
@@ -1464,26 +1467,22 @@ impl App {
             | NodeEvent::GroupOutOfStep { group }
             | NodeEvent::GroupUpgradePending { group, .. }
             | NodeEvent::GroupLeft { group } => (Some(group.clone()), None),
-            NodeEvent::CredentialOffered { offer } => {
-                self.credential_offer(persona.clone(), offer.clone());
-                (
-                    Some(offer.peer.clone()),
-                    Some((
-                        self.title_of(persona.as_deref(), &offer.peer),
-                        "Offers you a credential".into(),
-                    )),
-                )
-            }
-            NodeEvent::CredentialAsked { ask } => {
-                self.credential_ask(persona.clone(), ask.clone());
-                (
-                    Some(ask.peer.clone()),
-                    Some((
-                        self.title_of(persona.as_deref(), &ask.peer),
-                        "Asks you to prove something".into(),
-                    )),
-                )
-            }
+            // Shown in the contact's chat, with Review (no modal: a contact
+            // mustn't be able to push dialogs onto the screen).
+            NodeEvent::CredentialOffered { offer } => (
+                Some(offer.peer.clone()),
+                Some((
+                    self.title_of(persona.as_deref(), &offer.peer),
+                    "Offers you a credential".into(),
+                )),
+            ),
+            NodeEvent::CredentialAsked { ask } => (
+                Some(ask.peer.clone()),
+                Some((
+                    self.title_of(persona.as_deref(), &ask.peer),
+                    "Asks you to prove something".into(),
+                )),
+            ),
             NodeEvent::CredentialReceived { peer, schema } => {
                 self.toast(&format!(
                     "Got a credential ({schema}) from {}",
@@ -1991,8 +1990,9 @@ impl App {
         self.window.connect_is_active_notify(move |w| {
             if let Some(this) = weak.upgrade() {
                 // Contacts' records are polled at the foreground rate
-                // whether or not the window has focus: a desktop runs on
-                // mains power, and a contact's punch only lasts minutes.
+                // whether or not the window has focus (a contact's punch
+                // only lasts minutes); hidden, too, unless the network is
+                // metered or power saver is on (`Core::update_foreground`).
                 let on = w.is_active();
                 this.update_watching();
                 if on && let Some(c) = this.chat.borrow().as_ref() {
@@ -2006,6 +2006,13 @@ impl App {
             if let Some(this) = weak.upgrade() {
                 this.update_watching();
             }
+        });
+        let core = self.core.clone();
+        self.window.connect_visible_notify(move |w| {
+            // Noted here, in signal order; applied off the GTK thread.
+            core.set_window_visible(w.is_visible());
+            let core = core.clone();
+            ui::bg_quiet(move || core.update_foreground());
         });
         // Closing the window keeps the node running for messages, unless
         // the user turned that off.
@@ -2030,6 +2037,18 @@ impl App {
     }
 
     fn watch_network(self: &Rc<Self>) {
+        // Power saver slows polling while the window is hidden.
+        let ppm = gio::PowerProfileMonitor::get_default();
+        let core = self.core.clone();
+        core.set_power_saver(ppm.is_power_saver_enabled());
+        ui::bg_quiet(move || core.update_foreground());
+        let core = self.core.clone();
+        ppm.connect_power_saver_enabled_notify(move |m| {
+            core.set_power_saver(m.is_power_saver_enabled());
+            let core = core.clone();
+            ui::bg_quiet(move || core.update_foreground());
+        });
+        *self.power.borrow_mut() = Some(ppm);
         let monitor = gio::NetworkMonitor::default();
         let core = self.core.clone();
         let metered = monitor.is_network_metered();
@@ -2899,6 +2918,7 @@ impl App {
             "Strangers in the public DHT see this computer's IP address, not who you talk to",
         );
         page.add(&privacy);
+        page.add(&self.nearby_group());
 
         let relays = adw::PreferencesGroup::builder()
             .title("Volunteer relays")
@@ -2930,6 +2950,33 @@ impl App {
             }
         });
         relays.add(&dirs);
+        // Serving strangers: the main identity only, off until chosen.
+        let volunteer = adw::ActionRow::builder()
+            .title("Volunteer as a relay")
+            .subtitle(self.volunteer_state())
+            .activatable(true)
+            .build();
+        volunteer.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let weak = Rc::downgrade(self);
+        volunteer.connect_activated(move |row| {
+            if let Some(t) = weak.upgrade() {
+                t.volunteer_dialog(row);
+            }
+        });
+        relays.add(&volunteer);
+        let serve = adw::ActionRow::builder()
+            .title("Run a relay directory")
+            .subtitle(self.directory_state())
+            .activatable(true)
+            .build();
+        serve.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let weak = Rc::downgrade(self);
+        serve.connect_activated(move |row| {
+            if let Some(t) = weak.upgrade() {
+                t.directory_server_dialog(row);
+            }
+        });
+        relays.add(&serve);
         page.add(&relays);
 
         // A handle people can type to find us (Appendix S).
@@ -3216,6 +3263,77 @@ impl App {
         d.present(Some(&self.window));
     }
 
+    /// Bluetooth and Wi-Fi Direct, for the main identity: off until
+    /// chosen (they show this computer's presence on radios), and applied
+    /// off the GTK thread, since starting Bluetooth can take seconds.
+    fn nearby_group(self: &Rc<Self>) -> adw::PreferencesGroup {
+        let nearby = adw::PreferencesGroup::builder()
+            .title("Nearby")
+            .description("Off until you switch them on. Anonymous identities never use them.")
+            .build();
+        const BT_SUB: &str = "Advertise a private beacon only approved contacts recognise, \
+                              and connect to them nearby without a network";
+        let bt = adw::SwitchRow::builder()
+            .title("Bluetooth")
+            .subtitle(BT_SUB)
+            .active(self.core.settings().opted_in(settings::BLUETOOTH))
+            .build();
+        let wd = adw::SwitchRow::builder()
+            .title("Join Wi-Fi Direct links")
+            .subtitle(
+                "When a nearby approved contact offers a faster link you asked for, this \
+                 computer's Wi-Fi leaves its network to join it, through NetworkManager, and \
+                 returns when the link ends",
+            )
+            .active(self.core.settings().opted_in(settings::WIFI_DIRECT))
+            .build();
+        // The subtitle says how Bluetooth is once a start or stop is done.
+        let state = {
+            let bt = bt.downgrade();
+            move |(running, error): (bool, Option<String>)| {
+                let Some(bt) = bt.upgrade() else { return };
+                bt.set_subtitle(&match (bt.is_active(), running, error) {
+                    (false, _, _) => BT_SUB.to_owned(),
+                    (true, true, _) => "On".to_owned(),
+                    // BlueZ errors are text, not markup.
+                    (true, false, Some(e)) => {
+                        format!("Couldn't start: {}", glib::markup_escape_text(&e))
+                    }
+                    (true, false, None) => "Starting…".to_owned(),
+                });
+            }
+        };
+        let apply = {
+            let core = self.core.clone();
+            move |state: Box<dyn FnOnce((bool, Option<String>))>| {
+                let core = core.clone();
+                bg(
+                    move || {
+                        core.apply_radio();
+                        (core.main.bluetooth_running(), core.main.bluetooth_error())
+                    },
+                    state,
+                );
+            }
+        };
+        {
+            let main = self.core.main.clone();
+            state((main.bluetooth_running(), main.bluetooth_error()));
+        }
+        for (row, key) in [(&bt, settings::BLUETOOTH), (&wd, settings::WIFI_DIRECT)] {
+            let (core, apply, state) = (self.core.clone(), apply.clone(), state.clone());
+            row.connect_active_notify(move |r| {
+                core.settings().set_flag(key, r.is_active());
+                if key == settings::BLUETOOTH {
+                    state((false, None));
+                }
+                apply(Box::new(state.clone()));
+            });
+            nearby.add(row);
+        }
+        nearby
+    }
+
     fn diagnostics(self: &Rc<Self>) {
         let d = adw::Dialog::builder()
             .title("Diagnostics")
@@ -3255,6 +3373,7 @@ impl App {
         }
         let reach = ui::label("", &["caption", "dim-label"]);
         info.append(&reach);
+        info.append(&self.radio_tools());
         let c = core.clone();
         let r = reach.clone();
         bg(
@@ -3315,6 +3434,117 @@ impl App {
             }
         });
         d.present(Some(&self.window));
+    }
+
+    /// Diagnostics' Bluetooth and Wi-Fi Direct tools (main identity), as
+    /// Android's log screen and the CLI's `/ble` have: a status line, a
+    /// scan with Connect per device found, and Leave Wi-Fi Direct.
+    fn radio_tools(self: &Rc<Self>) -> gtk::Box {
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let main = &self.core.main;
+        let status = ui::label(
+            &match (main.bluetooth_running(), main.bluetooth_error()) {
+                (true, _) => "Bluetooth: on".to_owned(),
+                (false, Some(e)) if self.core.settings().opted_in(settings::BLUETOOTH) => {
+                    format!("Bluetooth: {e}")
+                }
+                _ => "Bluetooth: off".to_owned(),
+            },
+            &["caption", "dim-label"],
+        );
+        status.set_halign(gtk::Align::Start);
+        b.append(&status);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let scan = gtk::Button::with_label("Scan Bluetooth");
+        let leave = gtk::Button::with_label("Leave Wi-Fi Direct");
+        buttons.append(&scan);
+        buttons.append(&leave);
+        b.append(&buttons);
+        let found = gtk::ListBox::new();
+        found.add_css_class("boxed-list");
+        found.set_selection_mode(gtk::SelectionMode::None);
+        found.set_visible(false);
+        b.append(&found);
+
+        let weak = Rc::downgrade(self);
+        let list = found.clone();
+        scan.connect_clicked(move |btn| {
+            let Some(this) = weak.upgrade() else { return };
+            btn.set_sensitive(false);
+            btn.set_label("Scanning…");
+            let (core, weak, list, btn) = (
+                this.core.clone(),
+                Rc::downgrade(&this),
+                list.clone(),
+                btn.clone(),
+            );
+            bg(
+                move || core.main.bluetooth_scan(8),
+                move |r| {
+                    btn.set_sensitive(true);
+                    btn.set_label("Scan Bluetooth");
+                    let Some(this) = weak.upgrade() else { return };
+                    while let Some(child) = list.first_child() {
+                        list.remove(&child);
+                    }
+                    let devices = match r {
+                        Ok(d) => d,
+                        Err(e) => {
+                            this.toast(&format!("Couldn't scan: {e}"));
+                            return;
+                        }
+                    };
+                    if devices.is_empty() {
+                        this.toast("No Threnody devices nearby");
+                    }
+                    list.set_visible(!devices.is_empty());
+                    for dev in devices {
+                        // Any nearby device picks its advertised name.
+                        let row = adw::ActionRow::builder()
+                            .title(glib::markup_escape_text(&dev.address))
+                            .subtitle(glib::markup_escape_text(&format!(
+                                "psm {} · rssi {} · {}",
+                                dev.psm,
+                                dev.rssi.map_or("?".into(), |r| r.to_string()),
+                                dev.name.as_deref().unwrap_or("-")
+                            )))
+                            .build();
+                        let connect = gtk::Button::with_label("Connect");
+                        connect.set_valign(gtk::Align::Center);
+                        let weak = Rc::downgrade(&this);
+                        connect.connect_clicked(move |_| {
+                            let Some(this) = weak.upgrade() else { return };
+                            let (a, r, psm) = (dev.address.clone(), dev.random, dev.psm);
+                            this.run(
+                                None,
+                                "connect over Bluetooth",
+                                move |n| n.bluetooth_connect(a, r, psm).map(|_| ()),
+                                Some("Connected".into()),
+                            );
+                        });
+                        row.add_suffix(&connect);
+                        list.append(&row);
+                    }
+                },
+            );
+        });
+        let weak = Rc::downgrade(self);
+        leave.connect_clicked(move |_| {
+            let Some(this) = weak.upgrade() else { return };
+            let (core, weak) = (this.core.clone(), Rc::downgrade(&this));
+            bg(
+                move || core.main.leave_wifi_direct(),
+                move |n| {
+                    if let Some(t) = weak.upgrade() {
+                        t.toast(&match n {
+                            0 => "No Wi-Fi Direct group joined".to_owned(),
+                            n => format!("Left {n} Wi-Fi Direct group(s)"),
+                        });
+                    }
+                },
+            );
+        });
+        b
     }
 
     fn about(self: &Rc<Self>) {
@@ -3419,6 +3649,330 @@ impl App {
         d.present(Some(&self.window));
     }
 
+    // ----- Volunteering and running a directory -----
+
+    /// As markup, for a row's subtitle: the note can quote a directory's
+    /// reason for refusing.
+    fn volunteer_state(&self) -> String {
+        glib::markup_escape_text(&self.volunteer_text()).to_string()
+    }
+
+    fn volunteer_text(&self) -> String {
+        let main = &self.core.main;
+        let saved = self
+            .core
+            .settings()
+            .text(settings::VOLUNTEER_ADDRS)
+            .map(str::to_owned);
+        match (main.volunteering(), saved, self.core.volunteer_note()) {
+            (true, _, Some(note)) => note,
+            (true, Some(a), None) => format!("On at {}", a.replace(',', ", ")),
+            (true, None, None) => "On".into(),
+            (false, ..) => "Off".into(),
+        }
+    }
+
+    /// As markup, for a row's subtitle.
+    fn directory_state(&self) -> String {
+        glib::markup_escape_text(&self.directory_text()).to_string()
+    }
+
+    fn directory_text(&self) -> String {
+        if !self.core.main.serving_directory() {
+            return "Off".into();
+        }
+        let relays = self.core.main.directory_relays().len();
+        match self.core.settings().text(settings::DIRECTORY_ADDR) {
+            Some(a) => format!("Serving at {a} · {relays} relays"),
+            None => format!("Serving · {relays} relays"),
+        }
+    }
+
+    /// Fills `entry` with the saved addresses, else with a suggestion from
+    /// reachability (fetched off the GTK thread).
+    fn prefill_address(&self, entry: &adw::EntryRow, saved: Option<String>) {
+        if let Some(a) = saved {
+            entry.set_text(&a.replace(',', ", "));
+            return;
+        }
+        let (core, entry) = (self.core.clone(), entry.downgrade());
+        bg(
+            move || core.suggested_public_addr(),
+            move |a| {
+                if let (Some(e), Some(a)) = (entry.upgrade(), a)
+                    && e.text().is_empty()
+                {
+                    e.set_text(&a);
+                }
+            },
+        );
+    }
+
+    fn volunteer_dialog(self: &Rc<Self>, row: &adw::ActionRow) {
+        let d = adw::Dialog::builder()
+            .title("Volunteer as a relay")
+            .content_width(560)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .description(format!(
+                "Strangers' onion circuits pass through this computer, paid with anonymous \
+                 tokens. Directories you subscribe to list this computer's identity with this \
+                 address. Needs a public address that reaches port {}, TCP and UDP.",
+                self.core.port
+            ))
+            .build();
+        let entry = adw::EntryRow::builder()
+            .title("Public address (host:port, comma-separated)")
+            .build();
+        let saved = self
+            .core
+            .settings()
+            .text(settings::VOLUNTEER_ADDRS)
+            .map(str::to_owned);
+        self.prefill_address(&entry, saved);
+        group.add(&entry);
+        if self.core.main.directories().is_empty() {
+            group.add(
+                &adw::ActionRow::builder()
+                    .title("Subscribe to a directory to be listed")
+                    .subtitle("Preferences → Relay directories")
+                    .build(),
+            );
+        }
+        let state = adw::ActionRow::builder()
+            .title("Now")
+            .subtitle(self.volunteer_state())
+            .build();
+        group.add(&state);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.set_margin_top(12);
+        let stop = gtk::Button::with_label("Stop");
+        let start = gtk::Button::with_label("Start");
+        start.add_css_class("suggested-action");
+        stop.set_sensitive(self.core.main.volunteering());
+        buttons.append(&stop);
+        buttons.append(&start);
+        group.add(&buttons);
+        page.add(&group);
+
+        let done = {
+            let (weak, row, d) = (Rc::downgrade(self), row.clone(), d.clone());
+            move |r: Result<Vec<String>, String>| {
+                let Some(t) = weak.upgrade() else { return };
+                match r {
+                    Ok(a) if a.is_empty() => t.toast("Stopped volunteering"),
+                    Ok(_) => t.toast(
+                        "Volunteering; directories list this computer once it proves reachable",
+                    ),
+                    Err(e) => {
+                        t.toast(&format!("Couldn't volunteer: {e}"));
+                        return;
+                    }
+                }
+                row.set_subtitle(&t.volunteer_state());
+                d.close();
+            }
+        };
+        let (core, e, done2) = (self.core.clone(), entry.clone(), done.clone());
+        start.connect_clicked(move |_| {
+            let (core, text) = (core.clone(), e.text().to_string());
+            bg(move || core.set_volunteer(Some(&text)), done2.clone());
+        });
+        let core = self.core.clone();
+        stop.connect_clicked(move |_| {
+            let core = core.clone();
+            bg(move || core.set_volunteer(None), done.clone());
+        });
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&page));
+        d.set_child(Some(&view));
+        d.present(Some(&self.window));
+    }
+
+    fn directory_server_dialog(self: &Rc<Self>, row: &adw::ActionRow) {
+        let d = adw::Dialog::builder()
+            .title("Run a relay directory")
+            .content_width(600)
+            .content_height(560)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .description(
+                "List volunteer relays that register and prove reachable, and give out anonymous \
+                 tokens to pay them. The link you share names this identity and this address.",
+            )
+            .build();
+        let entry = adw::EntryRow::builder()
+            .title("Public address (host:port)")
+            .build();
+        let saved = self
+            .core
+            .settings()
+            .text(settings::DIRECTORY_ADDR)
+            .map(str::to_owned);
+        self.prefill_address(&entry, saved);
+        group.add(&entry);
+        let review = adw::SwitchRow::builder()
+            .title("Review relays before listing them")
+            .subtitle("Protects your users against someone registering many relays at once")
+            .active(self.core.settings().flag(settings::DIRECTORY_REVIEW))
+            .build();
+        group.add(&review);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.set_margin_top(12);
+        let serving = self.core.main.serving_directory();
+        let stop = gtk::Button::with_label("Stop");
+        let start = gtk::Button::with_label(if serving { "Apply" } else { "Start" });
+        start.add_css_class("suggested-action");
+        stop.set_sensitive(serving);
+        buttons.append(&stop);
+        buttons.append(&start);
+        group.add(&buttons);
+        page.add(&group);
+
+        if serving {
+            let link_group = adw::PreferencesGroup::builder().title("Link").build();
+            match self.core.directory_link() {
+                Some(link) => {
+                    let show = adw::ActionRow::builder()
+                        .title("Show link")
+                        .subtitle("Share it with people who should use your directory")
+                        .activatable(true)
+                        .build();
+                    show.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                    let weak = Rc::downgrade(self);
+                    show.connect_activated(move |_| {
+                        if let Some(t) = weak.upgrade() {
+                            ui::show_code(
+                                &t.window,
+                                "Relay directory",
+                                "Share this link with people who should use your directory.",
+                                &link,
+                                "",
+                                false,
+                            );
+                        }
+                    });
+                    link_group.add(&show);
+                }
+                None => link_group.add(
+                    &adw::ActionRow::builder()
+                        .title("Set its address above and apply to get its link")
+                        .build(),
+                ),
+            }
+            page.add(&link_group);
+            let relays = adw::PreferencesGroup::builder()
+                .title("Registered relays")
+                .description("Clients see only the listed ones.")
+                .build();
+            let list = self.core.main.directory_relays();
+            if list.is_empty() {
+                relays.add(&adw::ActionRow::builder().title("None yet").build());
+            }
+            for r in list {
+                let row = adw::ActionRow::builder()
+                    .title(core::short(&r.fingerprint))
+                    // Relays register their own addresses.
+                    .subtitle(glib::markup_escape_text(&format!(
+                        "{} · until {}",
+                        r.addrs.join(", "),
+                        ui::time_label(r.expires_ms)
+                    )))
+                    .build();
+                let listed = gtk::Switch::builder()
+                    .active(r.listed)
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Listed")
+                    .build();
+                let (weak, fp) = (Rc::downgrade(self), r.fingerprint.clone());
+                listed.connect_state_set(move |_, on| {
+                    if let Some(t) = weak.upgrade() {
+                        let fp = fp.clone();
+                        t.run(
+                            None,
+                            "change the listing",
+                            move |n| n.set_relay_listed(fp, on).map(|_| ()),
+                            None,
+                        );
+                    }
+                    glib::Propagation::Proceed
+                });
+                row.add_suffix(&listed);
+                relays.add(&row);
+            }
+            page.add(&relays);
+        }
+
+        let (weak, e, sw, row2, d2) = (
+            Rc::downgrade(self),
+            entry.clone(),
+            review.clone(),
+            row.clone(),
+            d.clone(),
+        );
+        start.connect_clicked(move |_| {
+            let Some(t) = weak.upgrade() else { return };
+            let (core, addr, on) = (t.core.clone(), e.text().to_string(), sw.is_active());
+            let (weak, row, d) = (Rc::downgrade(&t), row2.clone(), d2.clone());
+            bg(
+                move || core.serve_directory(&addr, on),
+                move |r| {
+                    let Some(t) = weak.upgrade() else { return };
+                    match r {
+                        Ok(_) => {
+                            row.set_subtitle(&t.directory_state());
+                            d.close();
+                            // Open again, now with its link and relays.
+                            t.directory_server_dialog(&row);
+                        }
+                        Err(e) => t.toast(&format!("Couldn't run the directory: {e}")),
+                    }
+                },
+            );
+        });
+        let (weak, row, d2) = (Rc::downgrade(self), row.clone(), d.clone());
+        stop.connect_clicked(move |_| {
+            let Some(t) = weak.upgrade() else { return };
+            let (row, d) = (row.clone(), d2.clone());
+            ui::confirm(
+                &t.window,
+                "Stop the directory?",
+                "Its clients can't refresh from it any more, and it doesn't start again. \
+                 Relays that registered are forgotten.",
+                "Stop",
+                true,
+                {
+                    let weak = Rc::downgrade(&t);
+                    move || {
+                        let Some(t) = weak.upgrade() else { return };
+                        let (core, weak, row, d) =
+                            (t.core.clone(), Rc::downgrade(&t), row.clone(), d.clone());
+                        bg(
+                            move || core.stop_directory(),
+                            move |()| {
+                                if let Some(t) = weak.upgrade() {
+                                    row.set_subtitle(&t.directory_state());
+                                    t.toast("Stopped the relay directory");
+                                }
+                                d.close();
+                            },
+                        );
+                    }
+                },
+            );
+        });
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&page));
+        d.set_child(Some(&view));
+        d.present(Some(&self.window));
+    }
+
     fn credentials(self: &Rc<Self>) {
         let core = self.core.clone();
         let weak = Rc::downgrade(self);
@@ -3476,7 +4030,8 @@ impl App {
         );
     }
 
-    fn credential_offer(
+    /// Reviews a credential offer: Later (also Escape) leaves it waiting.
+    pub(crate) fn credential_offer(
         self: &Rc<Self>,
         persona: Option<String>,
         offer: threnody_ffi::CredentialOfferRecord,
@@ -3496,7 +4051,11 @@ impl App {
                 offer.schema,
                 attrs.join("\n")
             ),
-            &[("decline", "Decline"), ("accept", "Accept")],
+            &[
+                ("later", "Later"),
+                ("decline", "Decline"),
+                ("accept", "Accept"),
+            ],
         );
         d.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
         let weak = Rc::downgrade(self);
@@ -3510,7 +4069,7 @@ impl App {
                     move |n| n.accept_credential_offer(id),
                     None,
                 );
-            } else {
+            } else if r == "decline" {
                 this.run(
                     persona.clone(),
                     "decline",
@@ -3522,7 +4081,9 @@ impl App {
         d.present(Some(&self.window));
     }
 
-    fn credential_ask(
+    /// Reviews a request to prove something: Later (also Escape) leaves
+    /// it waiting, and tells the contact nothing.
+    pub(crate) fn credential_ask(
         self: &Rc<Self>,
         persona: Option<String>,
         ask: threnody_ffi::CredentialAskRecord,
@@ -3540,11 +4101,21 @@ impl App {
             let d = ui::alert(
                 &format!("{who} asks for a credential ({})", ask.schema),
                 "You don't hold one.",
-                &[("decline", "Decline")],
+                &[("later", "Later"), ("decline", "Decline")],
             );
-            let id = ask.id;
-            d.connect_response(None, move |_, _| {
-                let _ = node.decline_credential(id);
+            // Enter mustn't answer for the user.
+            d.set_default_response(Some("later"));
+            let (id, weak) = (ask.id, Rc::downgrade(self));
+            d.connect_response(None, move |_, r| {
+                let Some(this) = weak.upgrade() else { return };
+                if r == "decline" {
+                    this.run(
+                        persona.clone(),
+                        "decline",
+                        move |n| n.decline_credential(id),
+                        None,
+                    );
+                }
             });
             d.present(Some(&self.window));
             return;
@@ -3555,7 +4126,11 @@ impl App {
                 "From your {} credential. Choose what to show; nothing else is revealed.",
                 ask.schema
             ),
-            &[("decline", "Decline"), ("present", "Prove")],
+            &[
+                ("later", "Later"),
+                ("decline", "Decline"),
+                ("present", "Prove"),
+            ],
         );
         d.set_response_appearance("present", adw::ResponseAppearance::Suggested);
         let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -3590,13 +4165,15 @@ impl App {
         d.connect_response(None, move |_, r| {
             let Some(this) = weak.upgrade() else { return };
             let id = ask.id;
-            if r != "present" {
+            if r == "decline" {
                 this.run(
                     persona.clone(),
                     "decline",
                     move |n| n.decline_credential(id),
                     None,
                 );
+            }
+            if r != "present" {
                 return;
             }
             let cred = matching[pick.selected() as usize].id;
