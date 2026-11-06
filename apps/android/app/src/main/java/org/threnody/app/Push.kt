@@ -178,11 +178,15 @@ object Push {
     /**
      * Sleeps if nothing needs the node: shuts every node down and ends the
      * process, so nothing runs until the next wake-up or the user opens
-     * the app. Never during a call, a wake-up, or with WireGuard tunnels on.
+     * the app. Never during a call, a wake-up, a scheduled send, or with
+     * WireGuard tunnels on.
      */
     @Synchronized
     fun sleepIfIdle(ctx: Context) {
-        if (!active(ctx) || Threnody.visible > 0 || waking || Calls.current != null || Privacy.tunnels(ctx)) return
+        if (!active(ctx) || Threnody.visible > 0 || waking || Scheduled.sending || Calls.current != null ||
+            Privacy.tunnels(ctx)) return
+        // Scheduled messages still wake the phone to go out.
+        Scheduled.arm(ctx)
         Threnody.say("* push: sleeping until woken")
         ctx.stopService(Intent(ctx, ThrenodyService::class.java))
         for (id in Threnody.personaIds()) Threnody.personaNode(id)?.shutdown()

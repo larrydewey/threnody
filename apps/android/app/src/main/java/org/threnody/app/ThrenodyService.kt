@@ -28,6 +28,12 @@ class ThrenodyService : Service() {
             wake()
             return START_NOT_STICKY
         }
+        // Woken by pushes, the app sleeps: send what's due, then sleep again.
+        // Otherwise the node runs on, and sends scheduled messages itself.
+        if (intent?.action == ACTION_SCHEDULED && Push.active(this)) {
+            scheduledWake()
+            return START_NOT_STICKY
+        }
         foreground(intent?.action == ACTION_CALL || Calls.current != null)
         // Restarted by the system without the Activity: bring the node up here.
         Thread { Threnody.start(applicationContext) }.start()
@@ -36,11 +42,22 @@ class ThrenodyService : Service() {
     }
 
     /** Woken by a push: sync, then sleep again unless the app came up meanwhile. */
-    private fun wake() {
+    private fun wake() = briefly("Checking for messages") { Push.sync(applicationContext) }
+
+    /** Woken by the scheduled-message alarm, with push wake-ups on. */
+    private fun scheduledWake() = briefly("Sending scheduled messages") {
+        Scheduled.sendDue(applicationContext, Scheduled.SERVICE_BUDGET_MS)
+    }
+
+    /**
+     * Runs [work] in the foreground under a brief notification saying
+     * [title], then sleeps again unless the app came up meanwhile.
+     */
+    private fun briefly(title: String, work: () -> Unit) {
         channels(this)
         val n = Notification.Builder(this, CHANNEL_WAKE)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Checking for messages")
+            .setContentTitle(title)
             .setContentIntent(openApp(this))
             .build()
         try {
@@ -53,7 +70,7 @@ class ThrenodyService : Service() {
             Threnody.say("! wake: foreground refused (${e.message})")
         }
         Thread {
-            Push.sync(applicationContext)
+            work()
             if (Threnody.visible > 0 || Calls.current != null) {
                 // In use now: in front no service is needed; in a call, the call's.
                 android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -116,6 +133,8 @@ class ThrenodyService : Service() {
         private const val ACTION_CALL = "org.threnody.app.IN_CALL"
         /** Started by a UnifiedPush wake-up ([Push]). */
         const val ACTION_WAKE = "org.threnody.app.WAKE"
+        /** Started by the scheduled-message alarm or at boot ([Scheduled]). */
+        const val ACTION_SCHEDULED = "org.threnody.app.SCHEDULED"
         @Volatile private var running: ThrenodyService? = null
 
         /**
@@ -146,6 +165,22 @@ class ThrenodyService : Service() {
                 .putExtra(ChatActivity.DEVICE, device)
                 .putExtra(ChatActivity.PERSONA, persona)
             post(ctx, notificationKey(key, persona), titled(from, persona), if (disappearing) NEW else text, open)
+        }
+
+        /**
+         * A scheduled message to the chat [key] wasn't sent, and why (never
+         * its text). Its own notification, so it neither replaces nor is
+         * replaced by the chat's messages.
+         */
+        fun notifyScheduledFailed(
+            ctx: Context, key: String, device: String?, group: String?, title: String, reason: String,
+            persona: String? = null,
+        ) {
+            val open = Intent(ctx, ChatActivity::class.java).putExtra(ChatActivity.PERSONA, persona)
+            if (group != null) open.putExtra(ChatActivity.GROUP, group)
+            else open.putExtra(ChatActivity.KEY, key).putExtra(ChatActivity.DEVICE, device)
+            post(ctx, "scheduled:" + notificationKey(key, persona), titled(title, persona),
+                "Scheduled message not sent: $reason", open)
         }
 
         /** About this device's account (it was removed from it); opens the app. */
