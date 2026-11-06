@@ -321,6 +321,13 @@ pub async fn run(opts: Options) -> Result<()> {
         scratch: opts_dir,
         main_identity: opts.main_identity,
     };
+    {
+        // What waited at shutdown: the coordinator's stored proposals,
+        // roles waiting on an upgrade, upgrades of our own leaf.
+        let node = ui.node.clone();
+        let name = |p: &PublicIdentity| name_of(&node, p);
+        ui.groups.resume(&ui.node, &name);
+    }
     if let (Some(port), Some(tcp)) = (opts.discover, listen_addr) {
         let cfg = DiscoveryConfig {
             bind: std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),

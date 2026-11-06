@@ -32,8 +32,12 @@ import android.widget.Toast
 import java.util.Date
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileOptions
+import uniffi.threnody_ffi.GroupBanner
 import uniffi.threnody_ffi.GroupInfo
 import uniffi.threnody_ffi.GroupInvite
+import uniffi.threnody_ffi.GroupMemberAction
+import uniffi.threnody_ffi.GroupMemberRow
+import uniffi.threnody_ffi.MemberRole
 import uniffi.threnody_ffi.MentionInfo
 import uniffi.threnody_ffi.NotifyLevel
 import uniffi.threnody_ffi.QuoteInfo
@@ -710,6 +714,9 @@ class ChatActivity : Activity() {
                 is NodeEvent.CredentialFailed -> runOnUiThread {
                     Toast.makeText(this, "Credential: ${e.reason}", Toast.LENGTH_LONG).show()
                 }
+                is NodeEvent.GroupMembersChanged -> memberNotice(e)?.let { text ->
+                    runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
+                }
                 else -> {}
             }
             refreshSoon()
@@ -745,6 +752,10 @@ class ChatActivity : Activity() {
                 is NodeEvent.GroupMessage -> e.group == g
                 is NodeEvent.GroupFile -> e.group == g
                 is NodeEvent.GroupMembersChanged -> e.group == g
+                is NodeEvent.GroupRoleChanged -> e.group == g
+                is NodeEvent.GroupChangeFailed -> e.group == g
+                is NodeEvent.GroupOutOfStep -> e.group == g
+                is NodeEvent.GroupUpgradePending -> e.group == g
                 is NodeEvent.GroupJoined -> e.group == g
                 is NodeEvent.GroupLeft -> e.group == g
                 is NodeEvent.Delivered -> e.group == g
@@ -1028,11 +1039,63 @@ class ChatActivity : Activity() {
         bar.title.text = g.name
         bar.subtitle.text = listOfNotNull(
             members(g.members.size),
-            if (g.owned) "you're the owner" else null,
+            when (g.myRole) {
+                MemberRole.OWNER -> "you're the owner"
+                MemberRole.ADMIN -> "you're an admin"
+                else -> null
+            },
         ).joinToString(" · ")
-        if (g.owned && g.members.size == 1) {
-            banner("Only you are in this group. Invite contacts to it.", "Invite" to { inviteToGroup() })
+        if (g.updateNeeded) {
+            banner("This group's roles come from a newer Threnody. Update to change them here.", warning = true)
         }
+        when (val b = g.banner) {
+            is GroupBanner.OutOfStep -> banner(
+                "This device fell out of step with the group. Asking the others to bring it back…", warning = true)
+            is GroupBanner.CanClaim -> banner(
+                "${Threnody.nameOf(node, b.owner)} hasn't been seen in this group for 14 days. You're next in line.",
+                "Take over as owner" to { claimGroup() },
+            )
+            is GroupBanner.PendingChanges -> {
+                val text = "${b.count} ${if (b.count == 1u) "change is" else "changes are"} waiting for " +
+                    "${Threnody.nameOf(node, b.coordinator)} to come online."
+                if (g.myRole == MemberRole.OWNER) {
+                    banner(text, "Apply from this device" to {
+                        Threading.background { run("apply the changes") { node.takeOverGroup(g.id) } }
+                    })
+                } else banner(text)
+            }
+            is GroupBanner.UpgradePending -> banner(
+                "Admins can be added once ${b.outdated.joinToString(", ") { Threnody.nameOf(node, it) }} " +
+                    "update Threnody.")
+            is GroupBanner.OnlyYou -> if (g.myRole != MemberRole.MEMBER) {
+                banner("Only you are in this group. Invite contacts to it.", "Invite" to { inviteToGroup() })
+            } else banner("Only you are in this group.")
+            null -> {}
+        }
+    }
+
+    /** "Carol was added by Bob", for a change someone else made. */
+    private fun memberNotice(e: NodeEvent.GroupMembersChanged): String? {
+        val by = e.by ?: return null
+        val me = try { node.deviceFingerprint() } catch (_: Exception) { return null }
+        if (by == me) return null
+        val who = (e.added + e.removed).firstOrNull() ?: return null
+        if (who == by) return null
+        val name = Threnody.nameOf(node, who)
+        val byName = Threnody.nameOf(node, by)
+        return if (e.added.isNotEmpty()) "$name was added by $byName" else "$name was removed by $byName"
+    }
+
+    private fun claimGroup() {
+        val g = info ?: return
+        SecureBuilder(this)
+            .setTitle("Take over ${g.name}?")
+            .setMessage("You become its owner. The old owner becomes an admin, and this can't be undone.")
+            .setPositiveButton("Take over") { _, _ ->
+                Threading.background { run("take over") { node.claimGroupOwnership(g.id) } }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun clearBanner() {
@@ -2552,53 +2615,105 @@ class ChatActivity : Activity() {
         PopupMenu(this, anchor).apply {
             menu.add("Media, files and links").setOnMenuItemClickListener { media(g.name); true }
             menu.add("Members").setOnMenuItemClickListener { members(); true }
-            if (g.owned) menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
+            if (g.myRole != MemberRole.MEMBER) {
+                menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
+            }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
             menu.add("Clear chat…").setOnMenuItemClickListener {
                 Chats.clear(this@ChatActivity, node, g.name, null, g.id) { refresh() }
                 true
             }
-            menu.add(if (g.owned) "Delete group" else "Leave group").setOnMenuItemClickListener { leaveGroup(); true }
+            if (g.owned) menu.add("Delete group").setOnMenuItemClickListener { deleteGroup(); true }
+            menu.add("Leave group").setOnMenuItemClickListener { leaveGroup(); true }
             show()
         }
     }
 
-    /** The members, by name; the owner can remove them. */
+    /** The members, one row per account, with what we may do to each. */
     private fun members() {
         val g = info ?: return
         Threading.background {
-            // One row per account: a contact's devices are invited and removed together.
-            val contacts = node.contacts()
-            val me = node.deviceFingerprint()
-        myDevice = me
-            val rows = g.members.groupBy { fp -> if (fp == me) me else Threnody.key(contacts, fp) }
-                .map { (_, devices) -> devices.first() }
-            val labels = rows.map { fp ->
-                Threnody.nameOf(node, fp) + if (fp == g.owner) " (owner)" else ""
+            val rows = try { node.groupMemberRows(g.id) } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this, "Couldn't list members: ${e.message}", Toast.LENGTH_LONG).show() }
+                return@background
+            }
+            val labels = rows.map { r ->
+                val name = if (r.isMe) "You" else Threnody.nameOf(node, r.fingerprint)
+                name + when (r.role) {
+                    MemberRole.OWNER -> " (owner)"
+                    MemberRole.ADMIN -> " (admin)"
+                    else -> ""
+                } + if (r.successor) " (successor)" else ""
             }
             runOnUiThread {
-                val d = SecureBuilder(this)
+                SecureBuilder(this)
                     .setTitle(members(g.members.size))
+                    .setItems(labels.toTypedArray()) { _, i -> if (rows[i].actions.isNotEmpty()) memberActions(rows[i], labels[i]) }
                     .setNegativeButton("Close", null)
-                if (g.owned) {
-                    d.setItems(labels.toTypedArray()) { _, i ->
-                        if (rows[i] != me) removeMember(rows[i], labels[i])
-                    }
-                } else {
-                    d.setItems(labels.toTypedArray(), null)
-                }
-                d.show()
+                    .show()
             }
         }
     }
 
-    private fun removeMember(fp: String, name: String) {
-        val g = group ?: return
+    private fun actionLabel(a: GroupMemberAction): String = when (a) {
+        GroupMemberAction.MAKE_ADMIN -> "Make admin"
+        GroupMemberAction.REMOVE_ADMIN -> "Remove as admin"
+        GroupMemberAction.MAKE_SUCCESSOR -> "Make successor"
+        GroupMemberAction.NO_LONGER_SUCCESSOR -> "No longer successor"
+        GroupMemberAction.MAKE_OWNER -> "Make owner"
+        GroupMemberAction.USE_AS_COORDINATOR -> "Apply changes from this device"
+        GroupMemberAction.REMOVE -> "Remove from group"
+        GroupMemberAction.REMOVE_THIS_DEVICE -> "Remove the lost coordinating device"
+        GroupMemberAction.STEP_DOWN -> "Step down as admin"
+    }
+
+    /** What a confirm says before each action. */
+    private fun actionConfirm(a: GroupMemberAction, name: String, group: String): String = when (a) {
+        GroupMemberAction.MAKE_ADMIN -> "$name can invite and remove members and pin messages. " +
+            "Members will see which devices are yours and $name's."
+        GroupMemberAction.REMOVE_ADMIN -> "$name stays in $group as a member."
+        GroupMemberAction.MAKE_SUCCESSOR -> "If you're not seen in $group for 14 days, $name may take it over."
+        GroupMemberAction.NO_LONGER_SUCCESSOR -> "Nobody will be able to take $group over if you disappear."
+        GroupMemberAction.MAKE_OWNER -> "$name owns $group from now on. You become an admin and can't undo this."
+        GroupMemberAction.USE_AS_COORDINATOR -> "Changes to $group are applied from this device from now on."
+        GroupMemberAction.REMOVE -> "They stop receiving new messages in $group. They can be invited again later."
+        GroupMemberAction.REMOVE_THIS_DEVICE -> "This device takes over applying changes and removes your lost " +
+            "device from $group."
+        GroupMemberAction.STEP_DOWN -> "You stay in $group as a member."
+    }
+
+    private fun memberActions(r: GroupMemberRow, label: String) {
+        val g = info ?: return
+        val name = if (r.isMe) "You" else Threnody.nameOf(node, r.fingerprint)
         SecureBuilder(this)
-            .setTitle("Remove $name?")
-            .setMessage("They stop receiving new messages in ${info?.name}. You can invite them again later.")
-            .setPositiveButton("Remove") { _, _ -> Threading.background { run("remove") { node.removeFromGroup(g, fp) } } }
-            .setNegativeButton("Cancel", null)
+            .setTitle(label)
+            .setItems(r.actions.map { actionLabel(it) }.toTypedArray()) { _, i ->
+                val a = r.actions[i]
+                SecureBuilder(this)
+                    .setTitle(actionLabel(a) + "?")
+                    .setMessage(actionConfirm(a, name, g.name))
+                    .setPositiveButton(actionLabel(a)) { _, _ ->
+                        Threading.background {
+                            run(actionLabel(a).lowercase()) {
+                                when (a) {
+                                    GroupMemberAction.MAKE_ADMIN -> node.promoteInGroup(g.id, r.fingerprint)
+                                    GroupMemberAction.REMOVE_ADMIN, GroupMemberAction.STEP_DOWN ->
+                                        node.demoteInGroup(g.id, r.fingerprint)
+                                    GroupMemberAction.MAKE_SUCCESSOR -> node.setGroupSuccessor(g.id, r.fingerprint)
+                                    GroupMemberAction.NO_LONGER_SUCCESSOR -> node.setGroupSuccessor(g.id, null)
+                                    GroupMemberAction.MAKE_OWNER -> node.transferGroupOwnership(g.id, r.fingerprint)
+                                    GroupMemberAction.USE_AS_COORDINATOR ->
+                                        node.useAsCoordinator(g.id, node.deviceFingerprint())
+                                    GroupMemberAction.REMOVE -> node.removeFromGroup(g.id, r.fingerprint)
+                                    GroupMemberAction.REMOVE_THIS_DEVICE -> node.removeLostCoordinator(g.id)
+                                }
+                            }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            .setNegativeButton("Close", null)
             .show()
     }
 
@@ -2633,15 +2748,77 @@ class ChatActivity : Activity() {
 
     private fun leaveGroup() {
         val g = info ?: return
+        Threading.background {
+            // The last owner account, with others in the group: hand it over first.
+            val rows = try { node.groupMemberRows(g.id) } catch (_: Exception) { emptyList() }
+            val lastOwner = g.owned && rows.none { !it.isMe && it.role == MemberRole.OWNER } &&
+                rows.any { !it.isMe }
+            runOnUiThread {
+                if (lastOwner) {
+                    chooseNewOwner(g)
+                    return@runOnUiThread
+                }
+                SecureBuilder(this)
+                    .setTitle("Leave ${g.name}?")
+                    .setMessage("You stop receiving its messages. Its history stays on your devices; " +
+                        "it can invite you again.")
+                    .setPositiveButton("Leave") { _, _ ->
+                        Threading.background {
+                            run("leave") { node.leaveGroup(g.id) }
+                            runOnUiThread { finish() }
+                        }
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    /** The last owner leaving: someone else owns the group first. */
+    private fun chooseNewOwner(g: GroupInfo) {
+        Threading.background {
+            val rows = try { node.groupMemberRows(g.id).filter { !it.isMe } } catch (_: Exception) { emptyList() }
+            // Admins first.
+            val sorted = rows.sortedBy { if (it.role == MemberRole.ADMIN) 0 else 1 }
+            val labels = sorted.map { Threnody.nameOf(node, it.fingerprint) + if (it.role == MemberRole.ADMIN) " (admin)" else "" }
+            runOnUiThread {
+                SecureBuilder(this)
+                    .setTitle("Choose a new owner first")
+                    .setItems(labels.toTypedArray()) { _, i ->
+                        val r = sorted[i]
+                        SecureBuilder(this)
+                            .setTitle("Make ${labels[i]} the owner and leave?")
+                            .setMessage("${g.name} goes on without you. This can't be undone.")
+                            .setPositiveButton("Leave") { _, _ ->
+                                Threading.background {
+                                    // Nothing changes if it can't go through
+                                    // yet (members still to update, say).
+                                    var done = false
+                                    run("hand over the group") {
+                                        node.transferGroupOwnershipAndLeave(g.id, r.fingerprint)
+                                        done = true
+                                    }
+                                    if (done) runOnUiThread { finish() }
+                                }
+                            }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                    }
+                    .setNeutralButton("Delete instead") { _, _ -> deleteGroup() }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun deleteGroup() {
+        val g = info ?: return
         SecureBuilder(this)
-            .setTitle(if (g.owned) "Delete ${g.name}?" else "Leave ${g.name}?")
-            .setMessage(
-                if (g.owned) "Everyone is removed and the group ends. Its history stays on your devices."
-                else "You stop receiving its messages. Its history stays on your devices; the owner can invite you again.",
-            )
-            .setPositiveButton(if (g.owned) "Delete" else "Leave") { _, _ ->
+            .setTitle("Delete ${g.name}?")
+            .setMessage("Everyone is removed and the group ends. Its history stays on your devices.")
+            .setPositiveButton("Delete") { _, _ ->
                 Threading.background {
-                    run(if (g.owned) "delete the group" else "leave") { node.leaveGroup(g.id) }
+                    run("delete the group") { node.deleteGroup(g.id) }
                     runOnUiThread { finish() }
                 }
             }
