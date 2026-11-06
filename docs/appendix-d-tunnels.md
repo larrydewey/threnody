@@ -44,7 +44,7 @@ Offers travel inside the authenticated ratchet, so only the genuine peer can set
 - Adding `--wg-apply` also pushes every change to the running interface with `wg set`, with the PSK passed on stdin. This needs CAP_NET_ADMIN.
 - `threnody tunnel` shows this device's WireGuard public key, overlay address and overlay network.
 - The Linux app has the same as a *WireGuard tunnels* setting (off by default, main identity only). It keeps `<data dir>/wireguard/thr0.conf` current on port 51820, for `wg-quick` as above. After a restart the file holds the restored peers at once (*Persistence*), so `wg-quick up` works before any session; with the setting off, the app deletes it.
-- The CLI writes restored peers into its config at start too (`* N tunnel(s) restored from the last run`), and with `--wg-apply` also `wg set`s them; the config gets them even when that fails because the interface isn't up yet.
+- The CLI writes restored peers into its config at start too (`* N tunnel(s) restored from the last run`), and with `--wg-apply` also `wg set`s them; the config gets them even when that fails because the interface isn't up yet. A run without `--tunnel` deletes the saved peers, as turning tunnels off does in the apps; the config file, which `wg-quick` may still be using, stays.
 
 ### Userspace WireGuard (Android)
 
@@ -59,7 +59,7 @@ The node reads and writes whole IPv6 packets on that interface and WireGuard dat
 - A packet to the overlay goes to the peer that owns its destination address.
 - A decrypted packet is delivered only if its source is the sending peer's own overlay address, the same rule as `AllowedIPs`.
 - Peers follow the node's tunnel state, checked every second. A new session's PSK starts a fresh WireGuard session, and revoking approval removes the peer. Peers restored at start (*Persistence*) start a WireGuard session at once.
-- Packets authenticated by the peer's keys (handshakes and data, not cookie replies, which someone on the path who knows the peer's public key could forge) update the peer's endpoint, as WireGuard roaming does.
+- A packet over UDP that proves the peer holds this session's keys (a handshake response to our initiation, or data that decrypts) updates the peer's endpoint, as WireGuard roaming does. Neither can be replayed. A handshake initiation doesn't count: a new WireGuard session (a new PSK, or restored peers) has no timestamp to refuse an old, replayed one. Nor does a cookie reply, which anyone who knows the peer's public key can forge, or a handshake answered with a cookie reply because the device is under load. The answer to an initiation goes back to wherever it came from, and the data that follows moves the endpoint.
 
 Android runs one VPN at a time, so turning tunnels on displaces any other VPN app, which is why the setting is opt-in. If another VPN takes the slot, tunnels turn off.
 
@@ -84,12 +84,12 @@ SavedPeer = { 0 => bstr .size 32,             ; peer identity key
 ; unknown keys ignored (forward compatibility)
 ```
 
-When tunnels turn on (at start, or later), the node brings the saved peers back, so a contact's overlay address answers before, or without, a new session, as long as the contact still holds the same PSK. That includes contacts reached only through relays: a restored tunnel rides the relayed session (*Over the session*). A first tunnel with a contact still needs a direct session. The overlay address and our own WireGuard key are derived, not stored. The endpoint saved is the last one the peer's authenticated packets came from (userspace device), else the offered one.
+When tunnels turn on (at start, or later), the node brings the saved peers back, so a contact's overlay address answers before, or without, a new session, as long as the contact still holds the same PSK. That includes contacts reached only through relays: a restored tunnel rides the relayed session (*Over the session*). A first tunnel with a contact still needs a direct session. The overlay address and our own WireGuard key are derived, not stored. The endpoint saved is the last one the userspace device roamed to (*Userspace WireGuard*: only on packets that can't be replayed), else the offered one.
 
-- **Kept.** Only peers of contacts that are mutually approved now, whose PSK is at most 7 days old. A new session replaces the PSK on both sides; an older one is neither restored nor written back.
+- **Kept.** Only peers of contacts that are mutually approved now, whose PSK is at most 7 days old. A new session replaces the PSK on both sides; an older one is neither restored nor written back, and a node that runs on without a tunnel change drops it from the file within a minute of it ageing out (the tunnel itself keeps working).
 - **Written** when an offer brings a new key, PSK or endpoint, when a peer goes, after a restore (which prunes the file), and when the userspace device learns a new endpoint (at most every 30 s).
 - **Pruned.** A peer that stops being mutually approved for any reason (revoked, blocked, deleted, a device that left its account, or any of these on another of our devices) leaves memory and disk at once.
-- **Deleted**, overwritten first, when tunnels turn off (including when the Android and Linux apps find them off at start), when the last peer goes, and when the file can't be opened or decoded. Only the current file is overwritten: earlier versions were replaced by a rename, so their blocks were only unlinked, still encrypted.
+- **Deleted**, overwritten first, when tunnels turn off (including when the Android and Linux apps find them off at start, and a CLI run without `--tunnel`), when the last peer goes, and when the file can't be opened or decoded. Only the current file is overwritten: earlier versions were replaced by a rename, so their blocks were only unlinked, still encrypted.
 - **Never** in backups (Appendix C, *Backups*), in anonymous identities' homes, or synced to our other devices.
 
 The PSK is the post-quantum half of the tunnel, and until now it lived only in memory. Using a saved one takes the device's storage, the identity seed (sealed by a passphrase or the keyring where the user chose one) and a quantum computer for the recorded X25519 handshakes: the protection other session exports kept at rest (recovery slots, discovery keys) already have. There is no separate switch: persistence happens only while the user's tunnels are on, and turning them off deletes it.

@@ -135,9 +135,14 @@ impl SavedPeer {
     /// future (the clock moved back) counts as fresh only up to
     /// [`KEEP_FOR_MS`] ahead.
     pub fn fresh(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.made_ms) <= KEEP_FOR_MS
-            && self.made_ms <= now_ms.saturating_add(KEEP_FOR_MS)
+        fresh(self.made_ms, now_ms)
     }
+}
+
+/// Whether a PSK made at `made_ms` may still be kept at `now_ms` (see
+/// [`SavedPeer::fresh`]).
+pub fn fresh(made_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(made_ms) <= KEEP_FOR_MS && made_ms <= now_ms.saturating_add(KEEP_FOR_MS)
 }
 
 /// Encodes saved tunnel peers for `Home::save_state`:

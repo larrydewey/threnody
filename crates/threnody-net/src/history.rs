@@ -1417,6 +1417,7 @@ impl Node {
                         node.shared.home.sweep_history(node.identity_ref(), now_ms());
                         node.seal_expired_unacked(now_ms());
                         node.sweep_mailbox(now_ms());
+                        node.shared.expire_saved_tunnels(now_ms());
                     }
                     () = &mut closed => break,
                 }

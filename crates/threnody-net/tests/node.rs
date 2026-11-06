@@ -606,6 +606,36 @@ async fn tunnel_peers_are_saved_encrypted() {
     assert_eq!(saved[0].wg_public, alice.tunnel_peers_full()[0].wg_public);
 }
 
+/// A node that runs on without a tunnel change still drops a saved PSK
+/// once it is older than `KEEP_FOR_MS` (the history sweep), while the
+/// tunnel itself keeps working.
+#[tokio::test]
+async fn saved_tunnels_expire_while_the_node_runs() {
+    use threnody_core::tunnel::KEEP_FOR_MS;
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    let up = |e: &Event| matches!(e, Event::TunnelUp { .. });
+    next(&mut arx, up).await;
+    next(&mut brx, up).await;
+    // Each side's answering offer has landed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let saved = dir.path().join("alice").join("tunnels.state");
+    assert!(saved.exists());
+    let made = alice.tunnel_peers_full()[0].made_ms;
+    alice.expire_saved_tunnels_at(made + KEEP_FOR_MS);
+    assert!(saved.exists(), "expired too early");
+    alice.expire_saved_tunnels_at(made + KEEP_FOR_MS + 1);
+    assert!(!saved.exists());
+    assert_eq!(alice.tunnel_peers(), vec![bob_id]);
+}
+
 /// An anonymous identity keeps nothing of its tunnels on disk.
 #[tokio::test]
 async fn personas_never_save_tunnels() {

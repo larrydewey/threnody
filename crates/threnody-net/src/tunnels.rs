@@ -42,6 +42,10 @@ impl Shared {
     /// file when none are left. Does nothing when tunnels are off, or for
     /// a persona.
     pub(crate) fn save_tunnels(&self) {
+        self.save_tunnels_at(now_ms());
+    }
+
+    fn save_tunnels_at(&self, now: u64) {
         if self.persona {
             return;
         }
@@ -53,7 +57,6 @@ impl Shared {
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
-        let now = now_ms();
         let saved: Vec<SavedPeer> = peers
             .into_iter()
             .filter(|(p, _)| self.mutual(p))
@@ -129,6 +132,36 @@ impl Shared {
         self.save_tunnels();
     }
 
+    /// Writes the saved peers back without those whose PSK aged past
+    /// `KEEP_FOR_MS` by `now`, so the bound holds on a node that runs for
+    /// weeks without a tunnel change (the history sweep calls this each
+    /// minute). Reads the file only while a peer in memory is that old: the
+    /// file holds no peer that memory doesn't.
+    pub(crate) fn expire_saved_tunnels(&self, now: u64) {
+        if self.persona || lock(&self.tunnel).is_none() {
+            return;
+        }
+        if !lock(&self.tunnel_peers)
+            .values()
+            .any(|tp| !tunnel::fresh(tp.made_ms, now))
+        {
+            return;
+        }
+        let stale = {
+            let _io = lock(&self.tunnel_io);
+            match self.home.load_state(&self.identity, STATE) {
+                Ok(Some(b)) => {
+                    tunnel::decode_saved(&b).map_or(true, |s| s.iter().any(|p| !p.fresh(now)))
+                }
+                Ok(None) => false,
+                Err(_) => true,
+            }
+        };
+        if stale {
+            self.save_tunnels_at(now);
+        }
+    }
+
     /// Overwrites and deletes the saved peers. The caller holds `tunnel_io`.
     fn remove_saved_tunnels(&self) {
         if let Err(e) = self.home.secure_remove_state(STATE) {
@@ -196,5 +229,14 @@ impl Node {
         {
             self.shared.save_tunnels();
         }
+    }
+}
+
+impl Node {
+    /// Tests only: what the history sweep does each minute, at `now_ms`
+    /// (see `Shared::expire_saved_tunnels`).
+    #[doc(hidden)]
+    pub fn expire_saved_tunnels_at(&self, now_ms: u64) {
+        self.shared.expire_saved_tunnels(now_ms);
     }
 }
