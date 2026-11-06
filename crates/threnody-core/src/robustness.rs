@@ -267,3 +267,72 @@ fn credential_and_directory_parsers_survive_mutated_input() {
         }
     }
 }
+
+/// What our own devices send each other about files and ticks (Appendix
+/// J): no mutation may panic a decoder, and what decodes keeps its limits.
+#[test]
+fn device_sync_parsers_survive_mutated_input() {
+    use crate::devsync::{
+        FileMissing, FilePart, FileRef, FileWant, MAX_TICK_DEVICES, PART, TICKS_PER_MESSAGE, Tick,
+        Ticks,
+    };
+
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed([13; 32]);
+    let file = FileRef {
+        device: [1; 32],
+        id: 2,
+        name: "photo.jpg".into(),
+        size: 3000,
+        at_ms: 4,
+    };
+    let file_bytes = file.encode().unwrap();
+    let want = FileWant {
+        request: 5,
+        file,
+        offset: 6,
+        hash: Some([7; 32]),
+    }
+    .encode()
+    .unwrap();
+    let part = FilePart {
+        request: 5,
+        offset: 0,
+        total: 3000,
+        hash: [7; 32],
+        data: vec![8; 1000],
+    }
+    .encode()
+    .unwrap();
+    let missing = FileMissing { request: 5 }.encode().unwrap();
+    let ticks = Ticks(vec![
+        Tick {
+            id: 1,
+            device: [2; 32],
+            delivered: true,
+            read_ms: 3,
+            recipients: 4,
+            delivered_to: vec![[5; 32], [6; 32]],
+        },
+        Tick {
+            id: 9,
+            device: [2; 32],
+            ..Tick::default()
+        },
+    ])
+    .encode()
+    .unwrap();
+
+    for _ in 0..ITERATIONS {
+        let _ = FileRef::decode(&mutate(&mut rng, &file_bytes));
+        let _ = FileWant::decode(&mutate(&mut rng, &want));
+        let _ = FileMissing::decode(&mutate(&mut rng, &missing));
+        if let Ok(p) = FilePart::decode(&mutate(&mut rng, &part)) {
+            assert!(p.data.len() <= PART);
+            assert!(p.offset + p.data.len() as u64 <= p.total);
+        }
+        if let Ok(t) = Ticks::decode(&mutate(&mut rng, &ticks)) {
+            assert!(t.0.len() <= TICKS_PER_MESSAGE);
+            assert!(t.0.iter().all(|t| t.delivered_to.len() <= MAX_TICK_DEVICES));
+        }
+    }
+}
