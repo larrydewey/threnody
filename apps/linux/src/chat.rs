@@ -639,8 +639,26 @@ impl ChatView {
 
         this.update(conv);
         this.reload();
+        this.seek();
         this.input.grab_focus();
         this
+    }
+
+    /// A contact's chat opened: look for them across the internet now,
+    /// in case they aren't connected (as Android does).
+    fn seek(&self) {
+        if self.group().is_some() || self.is_note() {
+            return;
+        }
+        let (Some(app), Some(node)) = (self.app.upgrade(), self.node()) else {
+            return;
+        };
+        let (core, device) = (app.core.clone(), self.device());
+        ui::bg_quiet(move || {
+            if let Err(e) = node.seek(device) {
+                core.say(format!("! seek: {e}"));
+            }
+        });
     }
 
     pub fn widget(&self) -> &adw::ToolbarView {
