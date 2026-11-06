@@ -11,8 +11,8 @@ use threnody_groups::node::{Invite, Update};
 use threnody_net::history::OutgoingFile;
 
 use crate::{
-    FileOptions, HistoryEntry, MentionInfo, NodeEvent, NotifyLevel, Result, ThrenodyNode, fail, fp,
-    history_entries,
+    FileFetch, FileOptions, HistoryEntry, MentionInfo, NodeEvent, NotifyLevel, Result,
+    ThrenodyNode, entry_at, fail, fp, history_entries,
 };
 
 /// A group this device belongs to.
@@ -413,6 +413,17 @@ impl ThrenodyNode {
         };
         self.group_node()
             .send_file(&self.node, &g, file)
+            .map_err(fail)
+    }
+
+    /// Gets the contents of the file `device` sent at `at_ms` in `group`
+    /// from another of our devices (see `fetch_file`).
+    pub fn fetch_group_file(&self, group: String, at_ms: u64, device: String) -> Result<FileFetch> {
+        let g = self.group_id(&group)?;
+        let _guard = self.rt.enter();
+        self.node
+            .fetch_file(ConversationId::Group(g), entry_at(at_ms, &device))
+            .map(Into::into)
             .map_err(fail)
     }
 
