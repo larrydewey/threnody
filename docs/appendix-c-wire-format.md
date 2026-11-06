@@ -180,6 +180,17 @@ Authentication does not make a peer trusted: anyone can make an identity, and no
 
 All local state other than the identity file is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers the contact book (`contacts.state`, a `ContactsFile` below), groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (one `hist-<name>` file per conversation, named as below). Message history keeps at most 10,000 entries per conversation. A conversation's timer (key 1) is absent until chosen, in which case it follows the node's default (off unless the user chooses one). 0 means *off* on purpose, and any other value is seconds. A peer that turns its timer off on purpose sends messages without `expires_in_s` and with flag 16 in `Text` key 6 (`TIMER_OFF`), and the other side records that as 0. A message with neither, from a peer whose `Hello` has bit 65536, means it never chose a timer: the receiver keeps its own and applies it to that message too, and the peer adopts it from the receiver's next message. The bits of each contact's latest `Hello` are saved with the contact (key 20), so this holds for messages that arrive before any session, such as mailbox deliveries after a restart. Without that bit (an older peer, or one never heard from directly) it is taken as off, as older peers intend. Older receivers ignore the flag and read no timer, as before it. A file transfer is stored as an entry whose text is its caption (usually empty) and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location, ? 3 => sensitive, ? 4 => album, ? 5 => [video bool, duration_ms uint] }`, key 5 marking a voice or video message). Outgoing entries may have a local id (key 7) and a delivered flag (key 8, see *Acknowledgements*). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute. The same sweep finds disappearing texts that expired here while still waiting for their recipient's acknowledgement (`unacked`), and replaces each with a copy sealed to the recipient (Appendix H), which goes out as a mailbox `deliver` from the sender itself. The recipient still gets it, and its timer still starts there, but the sender keeps nothing it could read back. Without prekeys for the recipient the waiting copy is dropped.
 
+History key 14 on an outgoing entry is when the recipient displayed it (see *Typing and read receipts*). On an incoming entry it is when we reported it read, so each message is reported once. Receipts that still have to reach their sender's device are kept in `receipts-out`, with the read-receipt switch and when that state was first created (Appendix H, *Receipts*):
+
+```
+receipts-out = 1 || flags (1: read receipts off) || created_ms (u64 BE)
+               || n (u16 BE) || n × (device (32) || last sealed receipt ms (u64 BE))
+               || *(device (32) || batch since ms (u64 BE) || due ms (u64 BE)
+                    || nd (u16 BE) || nr (u16 BE) || nd × delivered id (u64 BE) || nr × read id (u64 BE))
+```
+
+A damaged tail is skipped; an unreadable file is started afresh, with read receipts on.
+
 A history file's name is keyed, so a listing of the data directory shows neither whom the user talks to nor which groups they are in:
 
 ```

@@ -568,6 +568,12 @@ pub(crate) struct Shared {
     pub(crate) delivery: Mutex<Delivery>,
     /// What each peer's latest `Hello` said it supports.
     pub(crate) peer_features: Mutex<HashMap<PublicIdentity, u64>>,
+    /// Delivery and read receipts waiting for their devices, and the
+    /// read-receipt switch (see `receipts`).
+    pub(crate) receipts: Mutex<crate::receipts::Outbox>,
+    /// How long a receipt waits before it is sealed: a random time in
+    /// this window (ms); tests shorten it.
+    pub(crate) receipt_delay: Mutex<(u64, u64)>,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
     /// Folders, pinned and archived chats (see `folders`).
@@ -683,6 +689,16 @@ impl Shared {
         if let Err(e) = r {
             eprintln!("threnody: failed to save {name}: {e}");
         }
+    }
+
+    /// Runs `f` on the waiting receipts and saves what it changed.
+    pub(crate) fn receipts<R>(&self, f: impl FnOnce(&mut crate::receipts::Outbox) -> R) -> R {
+        let mut o = lock(&self.receipts);
+        let r = f(&mut o);
+        if std::mem::take(&mut o.dirty) {
+            self.save_state(crate::receipts::STATE, Ok(o.encode()));
+        }
+        r
     }
 
     /// Runs `f` on the acknowledgement state and saves what it changed.
@@ -805,6 +821,13 @@ impl Node {
             };
             Delivery::load(&load("unacked"), &load("delivered-ids"))
         };
+        let receipts = cfg
+            .home
+            .load_state(&cfg.identity, crate::receipts::STATE)
+            .ok()
+            .flatten()
+            .and_then(|b| crate::receipts::Outbox::load(&b))
+            .unwrap_or_else(|| crate::receipts::Outbox::new(now_ms()));
         let (tx, rx) = mpsc::unbounded_channel();
         let tunnel = cfg
             .tunnel_port
@@ -844,6 +867,11 @@ impl Node {
             folders: Mutex::new(folders),
             lists: Mutex::new(lists),
             peer_features: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(receipts),
+            receipt_delay: Mutex::new((
+                crate::receipts::MIN_DELAY_MS,
+                crate::receipts::MAX_DELAY_MS,
+            )),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
             recover: crate::recover::RecoverState::new(),
@@ -881,6 +909,8 @@ impl Node {
             .filter(|p| node.is_accepted(p))
             .collect();
         node.shared.delivery(|d| d.mark_contacts(&contacts));
+        // A fresh outbox is saved at once, so when it began stays put.
+        node.shared.receipts(|_| ());
         node.start_history_sweep();
         node.load_recovery();
         node.load_volunteer();
