@@ -2504,6 +2504,11 @@ impl Groups {
             if done {
                 return false;
             }
+            // Roles waiting for every member to upgrade aren't being
+            // passed over: no count.
+            if !has_roster {
+                return true;
+            }
             i.attempts += 1;
             if i.attempts > MAX_INTENT_ATTEMPTS {
                 failed.push("the coordinator didn't take it");
