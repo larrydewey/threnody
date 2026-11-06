@@ -201,7 +201,8 @@ Contact = {
   ? 16 => bstr .size 32, ; the identity a persona revealed to us (Appendix M)
   ? 17 => tstr,          ; the invite link that came with the reveal
   ? 18 => uint,          ; conversation cleared at (ms)
-  ? 19 => uint,          ; feature bits of their latest Hello (absent = 0)
+  ? 19 => bool,          ; their latest Hello had bit 32768 (timed probes, Appendix N); absent = false
+  ? 20 => uint,          ; feature bits of their latest Hello (absent = 0)
 }
 ```
 
