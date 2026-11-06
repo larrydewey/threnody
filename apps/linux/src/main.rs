@@ -13,6 +13,7 @@ mod folders;
 mod gifs;
 mod keyring;
 mod lists;
+mod schedule;
 mod settings;
 mod ui;
 mod window;
@@ -76,7 +77,11 @@ fn main() -> glib::ExitCode {
 fn app_actions(app: &adw::Application) {
     let quit = gio::SimpleAction::new("quit", None);
     let a = app.clone();
-    quit.connect_activate(move |_, _| a.quit());
+    // Asks first if scheduled messages would then not be sent.
+    quit.connect_activate(move |_, _| match APP.with_borrow(Clone::clone) {
+        Some(app) => app.confirm_quit(),
+        None => a.quit(),
+    });
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
     app.set_accels_for_action("window.close", &["<Ctrl>w"]);
