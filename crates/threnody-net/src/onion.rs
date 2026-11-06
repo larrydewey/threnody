@@ -929,10 +929,21 @@ impl Node {
         dest: Fingerprint,
         min_relays: usize,
     ) -> Result<PublicIdentity> {
+        self.connect_onion_since(dest, min_relays, 0).await
+    }
+
+    /// [`Node::connect_onion`], starting only on first hops begun or
+    /// heard from after `since_ms` (see [`Node::first_hop_peers`]).
+    pub(crate) async fn connect_onion_since(
+        &self,
+        dest: Fingerprint,
+        min_relays: usize,
+        since_ms: u64,
+    ) -> Result<PublicIdentity> {
         if dest == self.identity().fingerprint() {
             return Err(NetError::NoRoute("ourselves".into()));
         }
-        for (first, path) in self.onion_paths(dest, &[], min_relays) {
+        for (first, path) in self.onion_paths_since(dest, &[], min_relays, since_ms) {
             if let Ok(peer) = self
                 .try_onion_path(&OnionRoute::contacts(first, &path))
                 .await
@@ -954,16 +965,27 @@ impl Node {
         avoid: &[Fingerprint],
         min_relays: usize,
     ) -> Vec<(PublicIdentity, Vec<Fingerprint>)> {
+        self.onion_paths_since(dest, avoid, min_relays, 0)
+    }
+
+    /// [`Node::onion_paths`] whose first hops were begun or heard from
+    /// after `since_ms`, most recently heard from first.
+    pub(crate) fn onion_paths_since(
+        &self,
+        dest: Fingerprint,
+        avoid: &[Fingerprint],
+        min_relays: usize,
+        since_ms: u64,
+    ) -> Vec<(PublicIdentity, Vec<Fingerprint>)> {
         let me = self.identity();
         let ok = |p: &PublicIdentity| {
             let fp = p.fingerprint();
             fp != dest && !avoid.contains(&fp) && *p != me
         };
         let firsts: Vec<PublicIdentity> = self
-            .sessions()
+            .first_hop_peers(since_ms)
             .into_iter()
-            .filter(|s| s.via.is_none() && ok(&s.peer) && self.shared.mutual(&s.peer))
-            .map(|s| s.peer)
+            .filter(|p| ok(p))
             .collect();
         let middles: Vec<PublicIdentity> = self
             .contacts()

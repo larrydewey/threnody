@@ -32,6 +32,7 @@ use tokio::task::JoinSet;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 use crate::quic::canonical;
+use crate::relay::Hidden;
 
 /// DHT nodes that report the address they see us at (libtorrent's do).
 /// Some nodes from the routing table are pinged as well.
@@ -256,9 +257,9 @@ pub(crate) struct ReachState {
     /// be dead without our knowing yet, so it is no first hop for a
     /// background onion circuit (see `Node::reconnect_hidden`).
     pub(crate) changed_ms: AtomicU64,
-    /// The contact a background reconnection dials directly, to bring up
-    /// a first hop for the others, and since when.
-    pub(crate) first_hop: Mutex<Option<(PublicIdentity, Instant)>>,
+    /// When background reconnections now dialing directly, to bring up
+    /// a first hop for the others, took their turns.
+    pub(crate) first_hop: crate::relay::FirstHopClaims,
 }
 
 impl ReachState {
@@ -277,7 +278,7 @@ impl ReachState {
             anchor_kick: Notify::new(),
             handles: Default::default(),
             changed_ms: AtomicU64::new(0),
-            first_hop: Mutex::new(None),
+            first_hop: Default::default(),
         }
     }
 }
@@ -1228,8 +1229,16 @@ impl Node {
         let hide = urge != Urge::Upgrade && !stranger;
         let node = self.clone();
         tokio::spawn(async move {
-            let ok = (hide && node.reconnect_hidden(&peer, 0).await)
-                || node.run_punch(peer, &punch).await;
+            let hidden = if hide {
+                node.reconnect_hidden(&peer, 0, true).await
+            } else {
+                Hidden::Direct(None)
+            };
+            let ok = match hidden {
+                Hidden::Up => true,
+                // A turn to bring up a first hop lasts the punch.
+                Hidden::Direct(_claim) => node.run_punch(peer, &punch).await,
+            };
             let mut inner = lock(&node.rdv().inner);
             inner.punches.remove(&peer);
             if ok {

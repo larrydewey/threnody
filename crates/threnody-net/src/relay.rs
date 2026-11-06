@@ -219,13 +219,45 @@ pub(crate) const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::
 const VOLUNTEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// A background reconnection with no first hop for its circuit dials
 /// directly, to bring one up for the others; the others leave it this
-/// long before one of them tries instead.
+/// long (or until its dial is over) before one of them tries instead.
 const FIRST_HOP_CLAIM: Duration = Duration::from_secs(5);
+/// At most this many such direct dials at once (an offline contact's
+/// mustn't hold up the rest)...
+const FIRST_HOP_CLAIMS: usize = 2;
+/// ...each this long after the last: one that answers by then gives the
+/// others their first hop, and no second contact is dialed in the open.
+const FIRST_HOP_STAGGER: Duration = Duration::from_secs(1);
 /// The longest a background reconnection waits for a first hop before
 /// dialing directly anyway.
 const FIRST_HOP_WAIT: Duration = Duration::from_secs(30);
 /// How often a waiting one looks again.
 const FIRST_HOP_POLL: Duration = Duration::from_millis(200);
+
+/// How [`Node::reconnect_hidden`] went.
+pub(crate) enum Hidden {
+    /// A session with the peer is up (through a circuit, or it came up
+    /// another way meanwhile).
+    Up,
+    /// Go direct; with the turn to bring up a first hop for the others,
+    /// held until the direct dial is over.
+    Direct(Option<FirstHopClaim>),
+}
+
+/// A turn to dial directly as a first hop (see [`Node::claim_first_hop`]),
+/// given back on drop.
+pub(crate) struct FirstHopClaim {
+    claims: FirstHopClaims,
+    at: Instant,
+}
+
+/// When the turns now running were taken (see [`Node::claim_first_hop`]).
+pub(crate) type FirstHopClaims = std::sync::Arc<std::sync::Mutex<Vec<Instant>>>;
+
+impl Drop for FirstHopClaim {
+    fn drop(&mut self) {
+        lock(&self.claims).retain(|t| *t != self.at);
+    }
+}
 
 impl Node {
     fn relay_send(&self, to: &PublicIdentity, msg: &RelayMsg) -> bool {
@@ -581,15 +613,12 @@ impl Node {
     }
 
     /// Whether we have a live direct session with a mutually approved
-    /// neighbour other than `dest`, begun at or after `since_ms` or over
-    /// a radio link (which a change of network leaves alone).
+    /// neighbour other than `dest`, begun or heard from after `since_ms`
+    /// or over a radio link (see [`Node::first_hop_peers`]).
     fn first_hops(&self, dest: Fingerprint, since_ms: u64) -> bool {
-        self.sessions().into_iter().any(|s| {
-            s.via.is_none()
-                && s.peer.fingerprint() != dest
-                && (s.since_ms >= since_ms || s.addr.ip().is_unspecified())
-                && self.shared.mutual(&s.peer)
-        })
+        self.first_hop_peers(since_ms)
+            .iter()
+            .any(|p| p.fingerprint() != dest)
     }
 
     /// Whether we have the two mutually approved contacts besides `dest`
@@ -606,19 +635,30 @@ impl Node {
 
     /// Onion first for background reconnections (Appendix I, *Background
     /// reconnection*): reaches mutually approved `peer` through an onion
-    /// circuit when onion routing is on and one can be built. True once a
-    /// session with `peer` begun at or after `since_ms` is up; false when
-    /// the caller should go direct. When the circuit lacks only a first
-    /// hop (none since the network last changed, say, or just after
-    /// start-up), one reconnection at a time goes direct to bring one up,
-    /// and the others wait for it, at most [`FIRST_HOP_WAIT`].
-    pub(crate) async fn reconnect_hidden(&self, peer: &PublicIdentity, since_ms: u64) -> bool {
+    /// circuit when onion routing is on and one can be built, starting
+    /// only on first hops begun or heard from since the network last
+    /// changed. [`Hidden::Up`] once a session with `peer` begun at or
+    /// after `since_ms` is up; else the caller goes direct.
+    ///
+    /// When the circuit lacks only a first hop (none since the network
+    /// last changed, say, or just after start-up), a reconnection that
+    /// gets [`Node::claim_first_hop`]'s turn goes direct at once to bring
+    /// one up, and returns the claim to hold while it dials. The others
+    /// wait for a first hop, or a turn, at most [`FIRST_HOP_WAIT`]; with
+    /// `wait` false (a LAN contact, itself the quickest first hop) none
+    /// do.
+    pub(crate) async fn reconnect_hidden(
+        &self,
+        peer: &PublicIdentity,
+        since_ms: u64,
+        wait: bool,
+    ) -> Hidden {
         let fp = peer.fingerprint();
         // A call with `peer` runs now: it needs its path back at once,
         // and datagrams for its media, so it goes as before.
         let calling = self.call().is_some_and(|c| c.peer == *peer);
         if !self.prefer_onion() || !self.shared.mutual(peer) || calling || !self.onion_relays(fp) {
-            return false;
+            return Hidden::Direct(None);
         }
         let up = || {
             self.sessions()
@@ -628,51 +668,83 @@ impl Node {
         let start = Instant::now();
         loop {
             if up() {
-                return true;
+                return Hidden::Up;
             }
             let fresh = self.rdv().changed_ms.load(Ordering::Relaxed);
             if self.first_hops(fp, fresh) {
                 if let Ok(Ok(_)) =
-                    tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
+                    tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion_since(fp, 2, fresh))
+                        .await
                 {
-                    return true;
+                    return Hidden::Up;
                 }
                 self.emit(Event::ReachNote {
                     note: format!("no onion circuit to {fp}: reconnecting directly"),
                 });
-                return up();
+                return if up() {
+                    Hidden::Up
+                } else {
+                    Hidden::Direct(None)
+                };
             }
-            if start.elapsed() >= FIRST_HOP_WAIT || self.claim_first_hop(peer) {
-                return false;
+            if let Some(claim) = self.claim_first_hop() {
+                return Hidden::Direct(Some(claim));
+            }
+            if !wait || start.elapsed() >= FIRST_HOP_WAIT {
+                return Hidden::Direct(None);
             }
             tokio::select! {
                 () = tokio::time::sleep(FIRST_HOP_POLL) => {}
-                () = self.closed() => return false,
+                () = self.closed() => return Hidden::Direct(None),
             }
         }
     }
 
-    /// Takes the turn to dial `peer` directly as the first hop, unless
-    /// another contact has it (for [`FIRST_HOP_CLAIM`]).
-    fn claim_first_hop(&self, peer: &PublicIdentity) -> bool {
-        let mut c = lock(&self.rdv().first_hop);
-        if c.is_some_and(|(p, t)| p != *peer && t.elapsed() < FIRST_HOP_CLAIM) {
-            return false;
+    /// A turn to dial a contact directly as a first hop for the others'
+    /// circuits: at most [`FIRST_HOP_CLAIMS`] at once, each
+    /// [`FIRST_HOP_STAGGER`] after the last (most dials bring one up
+    /// sooner, and the next waiting one then goes through a circuit). A
+    /// turn ends when its holder drops it (its dial is over) or after
+    /// [`FIRST_HOP_CLAIM`].
+    fn claim_first_hop(&self) -> Option<FirstHopClaim> {
+        let mut claims = lock(&self.rdv().first_hop);
+        claims.retain(|t| t.elapsed() < FIRST_HOP_CLAIM);
+        if claims.len() >= FIRST_HOP_CLAIMS
+            || claims.iter().any(|t| t.elapsed() < FIRST_HOP_STAGGER)
+        {
+            return None;
         }
-        *c = Some((*peer, Instant::now()));
-        true
+        let at = Instant::now();
+        claims.push(at);
+        Some(FirstHopClaim {
+            claims: self.rdv().first_hop.clone(),
+            at,
+        })
     }
 
     /// [`Node::reach_peer`] for reconnecting in the background (apps
     /// call it on start and when the network comes back): onion first as
     /// [`Node::reconnect_hidden`] says, then volunteer relays, a direct
-    /// dial and relay circuits.
+    /// dial and relay circuits. With a turn to bring up a first hop,
+    /// straight to the last known address first.
     pub async fn reconnect_peer(&self, peer: &PublicIdentity) -> Result<()> {
-        if self.connected(peer) || self.reconnect_hidden(peer, 0).await {
+        if self.connected(peer) {
             return Ok(());
         }
+        let claim = match self.reconnect_hidden(peer, 0, true).await {
+            Hidden::Up => return Ok(()),
+            Hidden::Direct(claim) => claim,
+        };
+        let fp = peer.fingerprint();
         let addr = self.contacts().get(peer).and_then(|c| c.last_addr.clone());
-        self.reach_with(addr.as_deref(), Some(peer.fingerprint()), false)
+        if let (Some(_), Some(a)) = (&claim, &addr)
+            && let Ok(p) = self.connect(a, Some(fp)).await
+        {
+            self.fell_back(p, FallbackPath::Direct);
+            return Ok(());
+        }
+        drop(claim);
+        self.reach_with(addr.as_deref(), Some(fp), false)
             .await
             .map(|_| ())
     }

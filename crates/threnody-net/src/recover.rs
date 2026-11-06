@@ -40,6 +40,7 @@ use crate::quic::{Quic, canonical};
 use crate::reach::{
     ReachConfig, Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply, probes_for,
 };
+use crate::relay::Hidden;
 
 /// How long the side that didn't move keeps trying after losing a session.
 pub(crate) const RECOVER_FOR: Duration = Duration::from_secs(60);
@@ -596,7 +597,9 @@ impl Node {
                 // first peer back gives the others their first hop); else
                 // straight through the standby hole.
                 tokio::spawn(async move {
-                    if !node.reconnect_hidden(&peer, changed).await {
+                    if let Hidden::Direct(_claim) =
+                        node.reconnect_hidden(&peer, changed, true).await
+                    {
                         node.dial_through(&quic, peer, &targets).await;
                     }
                 });

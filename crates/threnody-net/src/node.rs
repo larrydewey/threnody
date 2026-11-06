@@ -476,6 +476,9 @@ struct SessionHandle {
     info: SessionInfo,
     /// The QUIC connection under a QUIC session, for call media datagrams.
     datagrams: Option<quinn::Connection>,
+    /// When a frame last came in (ms), to tell a live session from one a
+    /// network change may have left dead (see [`Node::first_hop_peers`]).
+    heard_ms: Arc<AtomicU64>,
 }
 
 pub(crate) struct Shared {
@@ -1569,6 +1572,27 @@ impl Node {
         lock(&self.shared.sessions).remove(peer).is_some()
     }
 
+    /// Peers of the direct sessions a circuit can start on (mutually
+    /// approved), most recently heard from first. With `since_ms`, only
+    /// sessions begun or heard from after it, or over a radio link (which
+    /// a change of network leaves alone): an older one may be dead
+    /// without our knowing yet.
+    pub(crate) fn first_hop_peers(&self, since_ms: u64) -> Vec<PublicIdentity> {
+        let mut firsts: Vec<(u64, PublicIdentity)> = lock(&self.shared.sessions)
+            .values()
+            .filter_map(|h| {
+                let s = &h.info;
+                let heard = h.heard_ms.load(Ordering::Relaxed);
+                let live =
+                    s.since_ms >= since_ms || heard > since_ms || s.addr.ip().is_unspecified();
+                (s.via.is_none() && live).then_some((heard, s.peer))
+            })
+            .collect();
+        firsts.retain(|(_, p)| self.shared.mutual(p));
+        firsts.sort_by_key(|f| std::cmp::Reverse(f.0));
+        firsts.into_iter().map(|(_, p)| p).collect()
+    }
+
     pub fn sessions(&self) -> Vec<SessionInfo> {
         lock(&self.shared.sessions)
             .values()
@@ -1668,12 +1692,14 @@ impl Node {
             self.shared.save_contacts(&contacts);
             is_new
         };
+        let since_ms = now_ms();
+        let heard_ms = Arc::new(AtomicU64::new(since_ms));
         let info = SessionInfo {
             peer,
             addr,
             suite: chan.suite(),
             transport,
-            since_ms: now_ms(),
+            since_ms,
             outbound,
             via,
             session_id: *chan.session_id(),
@@ -1700,6 +1726,7 @@ impl Node {
                 tx,
                 info,
                 datagrams,
+                heard_ms: heard_ms.clone(),
             },
         );
         self.shared.emit(Event::ReachNote {
@@ -1736,8 +1763,10 @@ impl Node {
         let node = self.clone();
         let started = tokio::time::Instant::now();
         tokio::spawn(async move {
-            let result =
-                run_session(&node, stream, chan, addr, via, over, rx, outbound, stranger).await;
+            let result = run_session(
+                &node, stream, chan, addr, via, over, rx, outbound, stranger, heard_ms,
+            )
+            .await;
             // Closed on purpose (either side) is not a loss to repair.
             let failed = result.is_err();
             let reason = match result {
@@ -1799,6 +1828,7 @@ async fn run_session<S>(
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
     outbound: bool,
     mut stranger_pass: Option<Pass>,
+    heard_ms: Arc<AtomicU64>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2062,6 +2092,7 @@ where
                 }
                 frame = inbox.recv() => {
                     last_rx = tokio::time::Instant::now();
+                    heard_ms.store(now_ms(), Ordering::Relaxed);
                     let frame = match frame {
                         Some(Ok(f)) => f,
                         Some(Err(NetError::Closed)) | None => return Ok(()),
