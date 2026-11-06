@@ -154,7 +154,7 @@ impl Home {
             self.state_path(name)?;
         }
 
-        self.wipe()?;
+        self.remove_identity_files()?;
         // The identity first, so an interrupted restore still opens, and
         // restoring again starts over.
         let identity = &opened.restored.identity;
@@ -181,36 +181,13 @@ impl Home {
         passphrase: &str,
         seal: Option<&[u8]>,
     ) -> Result<Restored> {
-        let staging = Home::new(staging_dir(self.dir())?);
+        let staging = self.child(staging_dir(self.dir())?);
         if staging.dir().exists() {
             fs::remove_dir_all(staging.dir())?;
         }
         let restored = staging.restore_backup(backup, passphrase, seal)?;
-        fs::write(staging.dir().join(READY), b"")?;
+        staging.write(&staging.dir().join(READY), b"")?;
         Ok(restored)
-    }
-
-    /// Removes the identity (first: without it the rest is unreadable),
-    /// contacts, state files and personas. Other files, such as
-    /// downloads, stay. No node may have this home open.
-    pub fn wipe(&self) -> Result<()> {
-        if !self.dir().exists() {
-            return Ok(());
-        }
-        let remove = |p: &std::path::Path| match fs::remove_file(p) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-        remove(&self.identity_path())?;
-        remove(&self.contacts_path())?;
-        for name in self.state_names()? {
-            remove(&self.state_path(&name)?)?;
-        }
-        let personas = self.dir().join("personas");
-        if personas.exists() {
-            fs::remove_dir_all(personas)?;
-        }
-        Ok(())
     }
 }
 
@@ -231,14 +208,14 @@ pub fn staging_dir(home: &Path) -> Result<PathBuf> {
 /// running there. Returns whether it restored. An interrupted run is
 /// finished by the next one; an interrupted staging is discarded.
 pub fn apply_staged_restore(home: &Home) -> Result<bool> {
-    let staging = Home::new(staging_dir(home.dir())?);
+    let staging = home.child(staging_dir(home.dir())?);
     if !staging.dir().join(READY).exists() {
         if staging.dir().exists() {
             fs::remove_dir_all(staging.dir())?;
         }
         return Ok(false);
     }
-    home.wipe()?;
+    home.remove_identity_files()?;
     // The identity first, as in `restore_backup`.
     home.write_identity_file(&fs::read(staging.identity_path())?)?;
     // Only a restore staged before contacts were encrypted has this.
@@ -466,6 +443,34 @@ mod tests {
         assert!(home.dir().join("downloads/photo.jpg").exists());
         assert!(!staging_dir(home.dir()).unwrap().exists());
         assert!(!apply_staged_restore(&home).unwrap(), "applied once");
+    }
+
+    #[test]
+    fn a_restore_keeps_the_app_lock() {
+        use crate::applock::{LockPolicy, SecretKind, Verdict};
+        let (a, b) = (temp(), temp());
+        let old = Home::new(a.path());
+        let id = old.create_identity(None).unwrap();
+        let backup = old.export_backup_with(&id, PW, FAST).unwrap();
+
+        let home = Home::new(b.path().join("threnody"));
+        home.create_identity(None).unwrap();
+        home.set_app_lock_with(
+            Some(b"p"),
+            None,
+            Some(("2468", SecretKind::Digits)),
+            LockPolicy::DEFAULT,
+            FAST,
+        )
+        .unwrap();
+        home.restore_backup(&backup, PW, None).unwrap();
+        assert!(home.app_lock_enabled());
+        home.stage_restore(&backup, PW, None).unwrap();
+        assert!(apply_staged_restore(&home).unwrap());
+        assert_eq!(
+            home.check_lock(Some(b"p"), "2468", 1).unwrap(),
+            Verdict::Unlock
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! wire format and local persistence. Transports live in `threnody-net`.
 
 pub mod account;
+pub mod applock;
 pub mod backup;
 pub mod call;
 pub mod cbor;
@@ -40,6 +41,7 @@ pub mod tap;
 pub mod tunnel;
 #[cfg(test)]
 mod vectors;
+pub mod wipe;
 pub mod wire;
 
 pub use channel::SecureChannel;

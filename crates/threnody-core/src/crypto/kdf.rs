@@ -50,6 +50,7 @@ pub mod label {
     pub const HISTORY_FILE_NAME: &str = "threnody v1 2026-11-05 history file name";
     pub const TAP_TRANSCRIPT: &str = "threnody v1 2026-11-05 nfc tap transcript";
     pub const TAP_KEYS: &str = "threnody v1 2026-11-05 nfc tap keys";
+    pub const APP_LOCK_KEY: &str = "threnody v1 2026-11-05 app lock file key";
 }
 
 /// Fills `out` from the KDF.

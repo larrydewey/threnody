@@ -423,7 +423,7 @@ impl GroupNode {
             left: decode_left(&load(LEFT)),
             stranger_invited: None,
             owner_seen: decode_owner_seen(&load(OWNER_SEEN)),
-            home: Home::new(home.dir()),
+            home: home.reopen(),
             identity: Identity::from_seed(&identity.seed()),
         })
     }

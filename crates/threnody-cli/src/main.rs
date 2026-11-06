@@ -635,7 +635,7 @@ fn main() -> Result<()> {
             let _lock = no_node_running(&home)?;
             // What the old identity kept is sealed under its seed and
             // names its contacts: none of it belongs to the new one.
-            home.wipe()?;
+            home.remove_identity_files()?;
             let pw = identity_seal(&home, passphrase, no_keyring)?;
             let id = home.create_identity(pw.as_ref().map(|p| p.as_bytes()))?;
             println!("Created identity in {}", home.dir().display());

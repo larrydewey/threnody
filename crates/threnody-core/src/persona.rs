@@ -242,7 +242,7 @@ impl<'a> Personas<'a> {
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(Error::Malformed("persona id"));
         }
-        Ok(Home::new(self.root().join(id)))
+        Ok(self.main.child(self.root().join(id)))
     }
 
     /// Makes a new persona with a fresh identity, sealed with `passphrase`
@@ -314,8 +314,7 @@ impl<'a> Personas<'a> {
 
 /// Marks `home` as a persona's.
 fn mark(home: &Home) -> Result<()> {
-    std::fs::write(home.dir().join(MARKER), b"")?;
-    Ok(())
+    home.write(&home.dir().join(MARKER), b"")
 }
 
 /// Whether `home` belongs to a persona.
