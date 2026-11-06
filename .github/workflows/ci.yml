@@ -32,7 +32,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Linux build dependencies (BlueZ, GTK 4, libadwaita)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libpcsclite-dev
       # libwebrtc's hermetic libc++ needs clang 21+; ubuntu-24.04 ships 18.
       - name: clang 21 (threnody-media links libwebrtc)
         run: |
@@ -54,7 +54,7 @@ jobs:
         with:
           toolchain: stable
       - name: Linux build dependencies (BlueZ, GTK 4, libadwaita)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libpcsclite-dev
       # libwebrtc's hermetic libc++ needs clang 21+; ubuntu-24.04 ships 18.
       - name: clang 21 (threnody-media links libwebrtc)
         run: |

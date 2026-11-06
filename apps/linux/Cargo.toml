@@ -12,7 +12,11 @@ name = "threnody-desktop"
 path = "src/main.rs"
 
 [features]
+default = ["nfc"]
 boringtun = ["threnody-ffi/boringtun"]
+# Tapping a phone on a PC/SC NFC reader to add a contact (Appendix T).
+# Links libpcsclite; pcscd is needed only to use a reader.
+nfc = ["dep:pcsc"]
 
 [dependencies]
 threnody-ffi = { path = "../../crates/threnody-ffi", features = ["boringtun", "calls"] }
@@ -28,6 +32,7 @@ gstreamer-app = "0.25.2"
 # GIF search (GIPHY), as threnody-core fetches link previews.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 serde_json = "1"
+pcsc = { version = "2", optional = true }
 
 [lints]
 workspace = true

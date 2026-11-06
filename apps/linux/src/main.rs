@@ -13,6 +13,8 @@ mod folders;
 mod gifs;
 mod keyring;
 mod lists;
+#[cfg(feature = "nfc")]
+mod nfc;
 mod schedule;
 mod settings;
 mod ui;
