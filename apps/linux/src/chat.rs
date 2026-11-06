@@ -2760,7 +2760,12 @@ impl ChatView {
                     "gif-{}.gif",
                     if id.is_empty() { "giphy".into() } else { id }
                 );
-                core.keep(persona.as_deref(), &name, &bytes, false)
+                let how = core::Keep {
+                    clip: false,
+                    sensitive: false,
+                    disappears: false,
+                };
+                core.keep(persona.as_deref(), &name, &bytes, how)
                     .ok_or_else(|| "couldn't save it".to_owned())
             },
             move |kept: Result<String, String>| {
@@ -3861,7 +3866,9 @@ const MAX_PIXELS: i64 = 100_000_000;
 const MAX_SIDE: i32 = 4096;
 
 /// An image the node can't strip, re-encoded as JPEG (which then carries
-/// no metadata): the name and bytes to send. Others pass through.
+/// no metadata): the name and bytes to send. Others pass through. Its
+/// content decides as well as its name, so a HEIC called "photo.jpg" is
+/// converted too.
 fn prepare(
     path: &std::path::Path,
     name: String,
@@ -3871,7 +3878,7 @@ fn prepare(
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if !CONVERT.contains(&ext.as_str()) {
+    if !CONVERT.contains(&ext.as_str()) && !threnody_core::media::needs_converting(&data) {
         return Ok((name, data));
     }
     let unreadable =
@@ -3947,8 +3954,15 @@ mod tests {
         p.fill(0x3366_99ff);
         p.savev(&tiff, "tiff", &[]).unwrap();
         let data = std::fs::read(&tiff).unwrap();
-        let (name, out) = prepare(&tiff, "scan.tiff".into(), data).unwrap();
+        let (name, out) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
         assert_eq!(name, "scan.jpg");
+        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
+
+        // Whatever it is called.
+        let misnamed = dir.join("misnamed.jpg");
+        std::fs::copy(&tiff, &misnamed).unwrap();
+        let (name, out) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
+        assert_eq!(name, "misnamed.jpg");
         assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
 
         // Formats the node strips itself pass through untouched.

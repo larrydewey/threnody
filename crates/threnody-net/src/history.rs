@@ -920,12 +920,21 @@ impl Node {
     }
 
     /// Makes file contents ready to send: images lose their metadata
-    /// unless that is switched off, and the size limit is checked.
+    /// unless that is switched off, and the size limit is checked. A photo
+    /// whose metadata can't be removed (HEIC, AVIF, TIFF) is refused rather
+    /// than sent with it; apps convert those to JPEG first.
     pub fn prepare_file(&self, data: Vec<u8>) -> Result<Vec<u8>> {
+        use threnody_core::media::{Stripped, needs_converting, strip};
         let data = if self.strip_metadata() {
-            match threnody_core::media::strip(data)? {
-                threnody_core::media::Stripped::Image(d)
-                | threnody_core::media::Stripped::Unsupported(d) => d,
+            match strip(data)? {
+                Stripped::Unsupported(d) if needs_converting(&d) => {
+                    return Err(NetError::NotAllowed(
+                        "this photo's location and camera details can't be removed: \
+                         send it as a JPEG, or turn metadata removal off"
+                            .into(),
+                    ));
+                }
+                Stripped::Image(d) | Stripped::Unsupported(d) => d,
             }
         } else {
             data

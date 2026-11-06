@@ -1,5 +1,6 @@
 //! URL preview functionality: fetches Open Graph meta tags from URLs.
 
+use std::io::Read;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -29,6 +30,10 @@ pub struct UrlPreview {
 
 /// Fetches and parses a URL preview from the given URL.
 /// Returns None if the URL cannot be fetched or has no preview data.
+///
+/// The request goes straight from this device, not through onion routes, so
+/// the site sees its address. An app should only fetch a link the user chose
+/// to preview, never one a contact sent on its own.
 pub fn fetch_preview(url: &str) -> Option<UrlPreview> {
     // Validate URL
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -58,15 +63,15 @@ pub fn fetch_preview(url: &str) -> Option<UrlPreview> {
         return None;
     }
 
-    // Read body with size limit
-    let body = response
-        .bytes()
-        .ok()?
-        .iter()
-        .take(MAX_RESPONSE_SIZE)
-        .cloned()
-        .collect::<Vec<_>>();
-    let body = String::from_utf8(body).ok()?;
+    // Read the body only up to the limit: a page that never ends is cut
+    // there rather than held whole in memory. The cut can split a character,
+    // so the text is read leniently.
+    let mut body = Vec::new();
+    response
+        .take(MAX_RESPONSE_SIZE as u64)
+        .read_to_end(&mut body)
+        .ok()?;
+    let body = String::from_utf8_lossy(&body);
 
     // Parse HTML
     let document = Html::parse_document(&body);
@@ -136,5 +141,29 @@ mod tests {
     fn test_fetch_preview_invalid_url() {
         assert!(fetch_preview("not-a-url").is_none());
         assert!(fetch_preview("ftp://example.com").is_none());
+    }
+
+    /// A page that never stops sending is read only up to the limit, and a
+    /// character cut in two at the limit doesn't lose the preview.
+    #[test]
+    fn endless_page_is_cut_at_the_limit() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = server.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<title>Endless</title>";
+            let _ = s.write_all(head.as_bytes());
+            // An odd offset makes the cut fall inside a two-byte character.
+            let _ = s.write_all(b"x");
+            let chunk = "\u{e9}".repeat(32 * 1024);
+            while s.write_all(chunk.as_bytes()).is_ok() {}
+        });
+        let started = std::time::Instant::now();
+        let p = fetch_preview(&format!("http://{addr}/")).expect("a preview");
+        assert_eq!(p.title.as_deref(), Some("Endless"));
+        assert!(started.elapsed() < PREVIEW_TIMEOUT);
     }
 }

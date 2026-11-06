@@ -111,8 +111,11 @@ impl DirectMsg {
 impl Node {
     /// Whether `peer` is mutually approved and connected directly (not
     /// through relays), i.e. nearby and trusted with our link credentials.
+    /// Never for an anonymous identity (Appendix M): a group would show a
+    /// nearby contact the phone, and the main identity listening on it.
     fn direct_neighbour(&self, peer: &PublicIdentity) -> bool {
-        self.shared.mutual(peer)
+        !self.shared.persona
+            && self.shared.mutual(peer)
             && self
                 .sessions()
                 .iter()
@@ -124,7 +127,9 @@ impl Node {
     pub fn offer_wifi_direct(&self, peer: &PublicIdentity, offer: DirectOffer) -> Result<()> {
         if !self.direct_neighbour(peer) {
             return Err(NetError::NoRoute(
-                "Wi-Fi Direct needs a direct session with a mutually approved contact".into(),
+                "Wi-Fi Direct needs a direct session with a mutually approved contact, \
+                 and isn't for an anonymous identity"
+                    .into(),
             ));
         }
         let m = DirectMsg::Offer(offer).encode()?;
@@ -137,7 +142,9 @@ impl Node {
     pub fn request_wifi_direct(&self, peer: &PublicIdentity) -> Result<()> {
         if !self.direct_neighbour(peer) {
             return Err(NetError::NoRoute(
-                "Wi-Fi Direct needs a direct session with a mutually approved contact".into(),
+                "Wi-Fi Direct needs a direct session with a mutually approved contact, \
+                 and isn't for an anonymous identity"
+                    .into(),
             ));
         }
         self.send(peer, AppMessage::Direct(DirectMsg::Request.encode()?))

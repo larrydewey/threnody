@@ -2184,7 +2184,8 @@ class ChatActivity : Activity() {
             if (persona != null && c != null) {
                 menu.add("Reveal who you are…").setOnMenuItemClickListener { reveal(c); true }
             }
-            if (c?.connected == true && c.approved) {
+            // Not for an anonymous identity: a group shows a nearby contact the phone.
+            if (persona == null && c?.connected == true && c.approved) {
                 menu.add("Faster link (Wi-Fi Direct)").setOnMenuItemClickListener { wifiDirect(); true }
             }
             if (c != null) {

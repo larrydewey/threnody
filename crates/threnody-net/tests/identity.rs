@@ -216,3 +216,54 @@ async fn the_main_node_manages_its_personas() {
     assert_eq!(main.node.burn_expired_personas().unwrap(), vec![info.id]);
     assert!(!home.exists() && main.node.personas().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_persona_takes_no_part_in_wifi_direct() {
+    use threnody_net::DirectOffer;
+    let dir = tempfile::tempdir().unwrap();
+    let main_home = Home::new(dir.path().join("me"));
+    let me = main_home.create_identity(None).unwrap();
+    let (_, home, pid) = Personas::new(&main_home, &me)
+        .create("market", None, None, 0)
+        .unwrap();
+    let mut p = run(home, pid).await;
+    let mut b = spawn(&dir, "b").await;
+    let bid = p.node.connect(&b.addr, None).await.unwrap();
+    next(&mut b.rx, |e| matches!(e, Event::Connected { .. })).await;
+    let pkey = p.node.identity();
+    p.node.accept_contact(&bid);
+    b.node.accept_contact(&pkey);
+    p.node.set_approval(&bid, true).unwrap();
+    b.node.set_approval(&pkey, true).unwrap();
+    for rx in [&mut p.rx, &mut b.rx] {
+        next(rx, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    let offer = DirectOffer {
+        ssid: "DIRECT-th-test".into(),
+        passphrase: "a long passphrase".into(),
+        addr: "192.168.49.1:7450".into(),
+    };
+
+    // A persona neither asks for a group nor offers one: either would
+    // show a nearby contact the phone, and its main identity's listener.
+    assert!(p.node.request_wifi_direct(&bid).is_err());
+    assert!(p.node.offer_wifi_direct(&bid, offer.clone()).is_err());
+
+    // A contact's request or offer goes no further than its node.
+    b.node.request_wifi_direct(&pkey).unwrap();
+    b.node.offer_wifi_direct(&pkey, offer).unwrap();
+    b.node.send_text(&pkey, "after").unwrap();
+    let e = next(&mut p.rx, |e| {
+        matches!(
+            e,
+            Event::WifiDirectRequested { .. }
+                | Event::WifiDirectOffer { .. }
+                | Event::Message { .. }
+        )
+    })
+    .await;
+    assert!(matches!(e, Event::Message { .. }), "{e:?}");
+}

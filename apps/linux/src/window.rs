@@ -1594,7 +1594,13 @@ impl App {
                         | NodeEvent::GroupInvited { quiet: true, .. }
                 );
                 if !quiet {
-                    self.notify(&chat, &title, &body);
+                    // A disappearing message's text would outlive it there.
+                    let body = if self.disappears(persona.as_deref(), &event) {
+                        "New message"
+                    } else {
+                        &body
+                    };
+                    self.notify(&chat, &title, body);
                 }
             }
         }
@@ -1658,6 +1664,27 @@ impl App {
         };
         n.set_priority(gio::NotificationPriority::Urgent);
         self.app.send_notification(Some("call"), &n);
+    }
+
+    /// Whether the message an event brought disappears, so its text stays
+    /// out of the notification. If it can't be told, it is taken to.
+    fn disappears(&self, persona: Option<&str>, event: &NodeEvent) -> bool {
+        let Ok(node) = self.core.node(persona) else {
+            return true;
+        };
+        let newest = match event {
+            NodeEvent::Message { peer, .. } | NodeEvent::File { peer, .. } => {
+                node.history(peer.clone(), 1)
+            }
+            NodeEvent::GroupMessage { group, .. } | NodeEvent::GroupFile { group, .. } => {
+                node.group_history(group.clone(), 1)
+            }
+            _ => return false,
+        };
+        newest
+            .ok()
+            .and_then(|mut h| h.pop())
+            .is_none_or(|e| e.disappearing)
     }
 
     fn notify(&self, chat: &ChatRef, title: &str, body: &str) {

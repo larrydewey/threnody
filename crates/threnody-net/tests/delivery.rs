@@ -384,6 +384,16 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     assert!(data.ends_with(&[0x12, 0x34, 0xFF, 0xD9]));
     assert!(sensitive && caption == "the view" && album == 5);
     assert_eq!(last(&alice).text, "the view");
+    // A photo format the node can't strip isn't sent with its metadata,
+    // whatever its name says: apps convert it to JPEG first.
+    let mut heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic".to_vec();
+    heic.extend(b"Exif\0\0GPS 51.5N");
+    let heic_file = threnody_net::history::OutgoingFile {
+        name: "IMG.jpg".into(),
+        data: heic.clone(),
+        ..Default::default()
+    };
+    assert!(alice.send_file(&b, heic_file).is_err());
     // Switched off, it goes as it is.
     alice.set_strip_metadata(false);
     send_photo(photo.clone());

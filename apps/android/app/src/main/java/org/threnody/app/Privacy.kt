@@ -14,7 +14,10 @@ import android.view.WindowManager
  * - onion first: contacts are reached through two-relay onion circuits
  *   when approved relays allow (spec §9 layer 2);
  * - photo metadata: location, camera and times are removed from images
- *   before they are sent.
+ *   before they are sent;
+ * - private notifications: a notification says only "New message", not
+ *   who it is from or what it says, wherever it shows (the shade, banners,
+ *   watches and apps allowed to read notifications).
  *
  * One connectivity setting, also on unless turned off: reaching contacts
  * across the internet (Appendix N). Its cost is that strangers in the
@@ -37,6 +40,7 @@ object Privacy {
     private const val GIPHY = "giphy_search"
     private const val ANCHOR = "always_on_relay"
     private const val TUNNELS = "wireguard_tunnels"
+    private const val NOTIFY_PRIVATE = "private_notifications"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -66,6 +70,10 @@ object Privacy {
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
     fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
+    fun privateNotifications(ctx: Context) = prefs(ctx).getBoolean(NOTIFY_PRIVATE, true)
+
+    fun setPrivateNotifications(ctx: Context, on: Boolean) =
+        prefs(ctx).edit().putBoolean(NOTIFY_PRIVATE, on).apply()
     fun reachInternet(ctx: Context) = prefs(ctx).getBoolean(REACH, true)
     /** Route through volunteer relays from subscribed directories (Appendix P). */
     fun useVolunteers(ctx: Context) = prefs(ctx).getBoolean(VOLUNTEERS, true)
