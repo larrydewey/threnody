@@ -934,7 +934,8 @@ fn history_entries(
                 clip: f.clip.map(Into::into),
             }),
             delivered: e.delivered,
-            read: e.read_ms != 0,
+            // On incoming entries `read_ms` records that we reported it.
+            read: e.outgoing && e.read_ms != 0,
             id: e.message_id(),
             edited: e.edited_ms != 0,
             recipients: e.recipients,

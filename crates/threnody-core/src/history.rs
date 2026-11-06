@@ -127,8 +127,9 @@ pub struct Entry {
     /// An outgoing message the recipient acknowledged (Appendix C); for a
     /// group, every recipient.
     pub delivered: bool,
-    /// When the recipient displayed this message (0 = not yet). Only
-    /// meaningful on outgoing entries.
+    /// For outgoing entries: when the recipient displayed it (0 = not
+    /// yet). For incoming ones: when we reported it read (0 = not
+    /// reported), so it is reported once.
     pub read_ms: u64,
     /// For outgoing group messages: how many members it went to, and the
     /// devices that acknowledged it so far.
@@ -1519,7 +1520,9 @@ impl Home {
     }
 
     /// Marks the entries `pick` chooses as read at `now_ms`; returns how
-    /// many changed. Only our outgoing entries are meant to get this.
+    /// many changed. Outgoing entries: the recipient displayed them.
+    /// Incoming ones: we reported them read. Entries already marked keep
+    /// their time.
     pub fn mark_read_entries(
         &self,
         identity: &Identity,
@@ -2049,6 +2052,32 @@ mod tests {
         e.poll = Some(p);
         let h = History::transcript(vec![e]);
         assert_eq!(History::decode(&h.encode().unwrap()).unwrap(), h);
+    }
+
+    #[test]
+    fn read_ms_marks_reported_incoming_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([3; 32]);
+        let incoming = Entry {
+            remote_id: 41,
+            ..entry(1, "from them", None)
+        };
+        let outgoing = Entry {
+            local_id: 42,
+            ..entry(2, "from us", None)
+        };
+        assert!(!incoming.outgoing && outgoing.outgoing);
+        home.append_history(&id, c, incoming, 1).unwrap();
+        home.append_history(&id, c, outgoing, 2).unwrap();
+        let reported = |e: &Entry| !e.outgoing && e.remote_id == 41;
+        assert_eq!(home.mark_read_entries(&id, c, 10, reported).unwrap(), 1);
+        // Once only: a second report changes nothing and keeps the time.
+        assert_eq!(home.mark_read_entries(&id, c, 20, reported).unwrap(), 0);
+        let h = home.load_history(&id, c, 30).unwrap();
+        let read: Vec<u64> = h.entries().iter().map(|e| e.read_ms).collect();
+        assert_eq!(read, [10, 0], "survives a save and load; ours untouched");
     }
 }
 
