@@ -16,7 +16,7 @@ Threnody is a private messenger that works without a company in the middle. Ther
 - **Post-quantum encryption.** Connections, messages and groups use hybrid encryption (X25519 with ML-KEM-768), designed to resist attacks by future quantum computers as well as today's. The core protocols have machine-checked proofs (Tamarin).
 - **No phone number, no email.** Your identity is a key on your device. You add contacts with a QR code or link (which finds you on mobile data and IPv6-only networks too), or, if you choose to make one, a short handle like `larry-7K3M-QX9P` that people can type. You can compare safety numbers to be sure it's them.
 - **Anonymous identities.** Make a separate identity for one conversation, with its own keys, contacts and history. Nothing links it to you unless you choose to reveal it, and it can delete itself after a day, a week or four weeks.
-- **Voice and video calls** between two people, carried inside the same encrypted connection.
+- **Voice and video calls** between two people, and group calls of up to eight in a group, carried inside the same encrypted connections. A call rings every device of your contact's account.
 - **Groups** using MLS, with no server. Members who can't reach each other directly pass messages through a member who can.
 - **Several devices, one account.** Link a laptop to your phone with a one-time code. Devices are equal: any of them can add or remove the others, and they share your contacts and history.
 - **WireGuard tunnels.** Approved contacts can get private network tunnels between their devices, with keys from the post-quantum session.
@@ -153,7 +153,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix N: reaching contacts across the internet](docs/appendix-n-internet-reachability.md) (0.3.0)
 - [Appendix O: zero-knowledge credentials](docs/appendix-o-credentials.md) (0.4.0)
 - [Appendix P: volunteer relays and directories](docs/appendix-p-volunteer-relays.md) (0.4.0)
-- [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (voice and video between two people; group calls not yet)
+- [Appendix Q: voice and video calls](docs/appendix-q-calls.md) (voice and video between two people, and group calls of up to eight)
 - [Appendix R: waking a sleeping device with UnifiedPush](docs/appendix-r-push.md) (opt-in)
 - [Appendix S: handles](docs/appendix-s-handles.md)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`

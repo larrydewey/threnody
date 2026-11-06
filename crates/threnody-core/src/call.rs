@@ -28,6 +28,13 @@
 //!                                      stream (1) || len (2) || payload || 0^pad)
 //! ```
 //!
+//! A group call (up to [`MAX_GROUP_CALL`] devices) is a leg like this
+//! between every two participants, keyed from the call's secret
+//! ([`MediaKeys::for_leg`]); its signalling ([`GroupCallMsg`]) goes in
+//! group messages. A pair without a session of its own sends its packets
+//! through a participant that has sessions with both, wrapped as
+//! `0^8 || device (32) || packet` (call id 0 is never a call's).
+//!
 //! `seq` counts up from 0 in each direction, so a nonce is never reused;
 //! a receiver drops anything it has seen or that is too old for its
 //! replay window. The plaintext is padded to a multiple of
@@ -54,6 +61,8 @@ pub const MAX_REACTION: usize = 32;
 pub const PAD_TO: usize = 32;
 /// Bytes a sealed packet adds before padding: call, seq, stream, length, tag.
 pub const OVERHEAD: usize = 8 + 8 + 1 + 2 + 16;
+/// Most devices in one group call.
+pub const MAX_GROUP_CALL: usize = 8;
 /// Packets this far behind the newest one received are dropped as stale.
 const REPLAY_WINDOW: u64 = 1024;
 const SUITE: Suite = Suite::ChaCha20Poly1305;
@@ -284,6 +293,216 @@ pub fn valid_reaction(emoji: &str) -> bool {
         && !emoji.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
+/// Group call signalling, in a group message (Appendix Q, *Group calls*):
+///
+/// ```text
+/// GroupCallMsg = { 0: op, 1: call uint, ? 2: device bstr(32), ? 3: flags uint,
+///                  ? 4: data bstr, ? 5: secret bstr(32), ? 6: links [* bstr(32)] }
+/// op: 1 start (flags, secret), 2 join (flags, links), 3 leave,
+///     4 leg (device = to, data), 6 update (flags, links)
+/// flags: 1 = video
+/// ```
+///
+/// `links` are the participants the sender has a session with: any of
+/// them can pass on a leg the sender can't carry itself.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GroupCallMsg {
+    /// The sender started call `call`. `secret` keys its legs
+    /// ([`MediaKeys::for_leg`]): it goes only inside the group's
+    /// encryption, and isn't tied to the group's epoch, so members at
+    /// another epoch still agree on it.
+    Start {
+        call: u64,
+        video: bool,
+        secret: [u8; 32],
+    },
+    /// The sender is in the call (it joined, or answers someone who just
+    /// joined), with sessions to `links`.
+    Join {
+        call: u64,
+        video: bool,
+        links: Vec<[u8; 32]>,
+    },
+    Leave {
+        call: u64,
+    },
+    /// Media-layer signalling for the leg between the sender and `to`, at
+    /// most [`MAX_SIGNAL`] bytes. Other members ignore it.
+    Leg {
+        call: u64,
+        to: [u8; 32],
+        data: Vec<u8>,
+    },
+    /// The sender's video, or its sessions with other participants,
+    /// changed.
+    Update {
+        call: u64,
+        video: bool,
+        links: Vec<[u8; 32]>,
+    },
+}
+
+impl std::fmt::Debug for GroupCallMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never log the secret, nor the leg's session descriptions.
+        match self {
+            Self::Start { call, video, .. } => write!(f, "Start({call:x}, video={video})"),
+            Self::Join { call, video, links } => {
+                write!(f, "Join({call:x}, video={video}, {} links)", links.len())
+            }
+            Self::Leave { call } => write!(f, "Leave({call:x})"),
+            Self::Leg { call, data, .. } => write!(f, "Leg({call:x}, {} bytes)", data.len()),
+            Self::Update { call, video, links } => {
+                write!(f, "Update({call:x}, video={video}, {} links)", links.len())
+            }
+        }
+    }
+}
+
+impl GroupCallMsg {
+    pub fn call(&self) -> u64 {
+        match self {
+            Self::Start { call, .. }
+            | Self::Join { call, .. }
+            | Self::Leave { call }
+            | Self::Leg { call, .. }
+            | Self::Update { call, .. } => *call,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let flags = |video: bool| if video { FLAG_VIDEO } else { 0 };
+        let size = match self {
+            Self::Leg { data, .. } => data.len() + 80,
+            Self::Join { links, .. } | Self::Update { links, .. } => links.len() * 34 + 80,
+            _ => 80,
+        };
+        let put_links = |e: &mut const_cbor::Encoder<'_>, links: &[[u8; 32]]| {
+            e.u8(6)?.array_len(links.len())?;
+            for l in links {
+                e.bytes(l)?;
+            }
+            Ok::<_, const_cbor::Error>(())
+        };
+        cbor::to_vec(size, |e| {
+            match self {
+                Self::Start {
+                    call,
+                    video,
+                    secret,
+                } => {
+                    e.map_len(4)?.u8(0)?.u8(1)?.u8(1)?.u64(*call)?;
+                    e.u8(3)?.u64(flags(*video))?;
+                    e.u8(5)?.bytes(secret)?;
+                }
+                Self::Join { call, video, links } => {
+                    e.map_len(4)?.u8(0)?.u8(2)?.u8(1)?.u64(*call)?;
+                    e.u8(3)?.u64(flags(*video))?;
+                    put_links(e, links)?;
+                }
+                Self::Leave { call } => {
+                    e.map_len(2)?.u8(0)?.u8(3)?.u8(1)?.u64(*call)?;
+                }
+                Self::Leg { call, to, data } => {
+                    e.map_len(4)?.u8(0)?.u8(4)?.u8(1)?.u64(*call)?;
+                    e.u8(2)?.bytes(to)?.u8(4)?.bytes(data)?;
+                }
+                Self::Update { call, video, links } => {
+                    e.map_len(4)?.u8(0)?.u8(6)?.u8(1)?.u64(*call)?;
+                    e.u8(3)?.u64(flags(*video))?;
+                    put_links(e, links)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        let mut dec = Decoder::new(b);
+        let (mut op, mut call, mut device, mut flags, mut data) = (None, None, None, 0, None);
+        let (mut secret, mut links) = (None, Vec::new());
+        read_map(&mut dec, |k, d| {
+            match k {
+                0 => op = Some(d.u8()?),
+                1 => call = Some(d.u64()?),
+                2 => device = Some(fixed_bytes::<32>(d)?),
+                3 => flags = d.u64()?,
+                4 => data = Some(d.bytes()?.to_vec()),
+                5 => secret = Some(fixed_bytes::<32>(d)?),
+                6 => {
+                    for _ in 0..d.array_len()? {
+                        let l = fixed_bytes::<32>(d)?;
+                        if links.len() < MAX_GROUP_CALL {
+                            links.push(l);
+                        }
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        let call = required(call, "call id")?;
+        if call == 0 {
+            return Err(Error::Malformed("call id"));
+        }
+        let video = flags & FLAG_VIDEO != 0;
+        let device = || required(device, "group call device");
+        Ok(match required(op, "group call op")? {
+            1 => Self::Start {
+                call,
+                video,
+                secret: required(secret, "group call secret")?,
+            },
+            2 => Self::Join { call, video, links },
+            3 => Self::Leave { call },
+            4 => {
+                let data = required(data, "group call leg")?;
+                if data.len() > MAX_SIGNAL {
+                    return Err(Error::Malformed("group call leg too large"));
+                }
+                Self::Leg {
+                    call,
+                    to: device()?,
+                    data,
+                }
+            }
+            6 => Self::Update { call, video, links },
+            _ => return Err(Error::Malformed("group call op")),
+        })
+    }
+}
+
+/// The id of the leg between devices `a` and `b` in group call `call`:
+/// the same whichever side asks, never 0, and unlike any other leg's.
+pub fn leg_id(call: u64, a: &[u8; 32], b: &[u8; 32]) -> u64 {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let id = u64::from_be_bytes(kdf::derive(
+        label::GROUP_CALL_LEG_ID,
+        &[&call.to_be_bytes(), lo, hi],
+    ));
+    id.max(1)
+}
+
+/// Wraps a sealed packet for the hub to pass to (or from) `device`.
+pub fn wrap_relayed(device: &[u8; 32], packet: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40 + packet.len());
+    out.extend_from_slice(&[0; 8]);
+    out.extend_from_slice(device);
+    out.extend_from_slice(packet);
+    out
+}
+
+/// The device and packet inside a relayed wrapper; `None` for an
+/// ordinary packet.
+pub fn unwrap_relayed(packet: &[u8]) -> Option<([u8; 32], &[u8])> {
+    if call_of(packet)? != 0 {
+        return None;
+    }
+    let device: [u8; 32] = packet.get(8..40)?.try_into().ok()?;
+    Some((device, &packet[40..]))
+}
+
 /// The call id a sealed packet is for, to find its keys.
 pub fn call_of(packet: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(packet.get(..8)?.try_into().ok()?))
@@ -324,6 +543,18 @@ impl MediaKeys {
             newest: None,
             seen: [0; (REPLAY_WINDOW / 64) as usize],
         }
+    }
+
+    /// Keys for the leg between us (`me`) and `peer` in group call
+    /// `call`, from the group's exporter secret for the call (`base`).
+    /// The side with the smaller key counts as the caller.
+    pub fn for_leg(base: &[u8; 32], call: u64, me: &[u8; 32], peer: &[u8; 32]) -> Self {
+        let (lo, hi) = if me <= peer { (me, peer) } else { (peer, me) };
+        let secret: Zeroizing<[u8; 32]> = Zeroizing::new(kdf::derive(
+            label::GROUP_CALL_LEG,
+            &[base, &call.to_be_bytes(), lo, hi],
+        ));
+        Self::new(leg_id(call, me, peer), &secret, &secret, me < peer)
     }
 
     pub fn call(&self) -> u64 {
@@ -527,6 +758,73 @@ mod tests {
                 reason: HangupReason::Ended
             }
         );
+    }
+
+    #[test]
+    fn group_call_signalling_round_trips() {
+        let msgs = [
+            GroupCallMsg::Start {
+                call: 5,
+                video: true,
+                secret: [4; 32],
+            },
+            GroupCallMsg::Join {
+                call: 5,
+                video: false,
+                links: vec![[1; 32], [6; 32]],
+            },
+            GroupCallMsg::Join {
+                call: 5,
+                video: true,
+                links: vec![],
+            },
+            GroupCallMsg::Leave { call: 5 },
+            GroupCallMsg::Leg {
+                call: 5,
+                to: [2; 32],
+                data: b"o v=0".to_vec(),
+            },
+            GroupCallMsg::Update {
+                call: 5,
+                video: true,
+                links: vec![[3; 32]],
+            },
+        ];
+        for m in msgs {
+            assert_eq!(GroupCallMsg::decode(&m.encode().unwrap()).unwrap(), m);
+            assert_eq!(m.call(), 5);
+        }
+        let big = GroupCallMsg::Leg {
+            call: 1,
+            to: [0; 32],
+            data: vec![0; MAX_SIGNAL + 1],
+        };
+        assert!(GroupCallMsg::decode(&big.encode().unwrap()).is_err());
+        assert!(GroupCallMsg::decode(&GroupCallMsg::Leave { call: 0 }.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn group_call_legs_pair_up_and_differ() {
+        let (a, b, c) = ([1; 32], [2; 32], [3; 32]);
+        let base = [9; 32];
+        assert_eq!(leg_id(7, &a, &b), leg_id(7, &b, &a));
+        assert_ne!(leg_id(7, &a, &b), leg_id(7, &a, &c));
+        assert_ne!(leg_id(7, &a, &b), leg_id(8, &a, &b));
+        let mut ab = MediaKeys::for_leg(&base, 7, &a, &b);
+        let mut ba = MediaKeys::for_leg(&base, 7, &b, &a);
+        assert_eq!(ab.call(), leg_id(7, &a, &b));
+        let p = ab.seal(0, b"hi").unwrap();
+        assert_eq!(ba.open(&p).unwrap(), (0, b"hi".to_vec()));
+        assert_eq!(ab.open(&ba.seal(0, b"yo").unwrap()).unwrap().1, b"yo");
+        // Another leg, or another call's base, can't open it.
+        let mut ac = MediaKeys::for_leg(&base, 7, &c, &a);
+        assert!(ac.open(&ab.seal(0, b"x").unwrap()).is_err());
+        let mut other = MediaKeys::for_leg(&[8; 32], 7, &b, &a);
+        assert!(other.open(&ab.seal(0, b"x").unwrap()).is_err());
+        // The hub's wrapper.
+        let w = wrap_relayed(&c, &p);
+        assert_eq!(unwrap_relayed(&w), Some((c, &p[..])));
+        assert_eq!(unwrap_relayed(&p), None);
     }
 
     fn pair() -> (MediaKeys, MediaKeys) {

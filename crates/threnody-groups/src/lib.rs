@@ -63,6 +63,9 @@ pub enum GroupError {
     /// image whose metadata couldn't be removed).
     #[error("{0}")]
     File(String),
+    /// A group call couldn't start or be joined (already in a call, say).
+    #[error("{0}")]
+    Call(String),
 }
 
 fn mls<E: std::fmt::Debug>(e: E) -> GroupError {
@@ -189,6 +192,12 @@ pub enum GroupEvent {
         group: GroupId,
         from: PublicIdentity,
         list: Vec<u8>,
+    },
+    /// Group call signalling (`threnody_core::call::GroupCallMsg`).
+    Call {
+        group: GroupId,
+        from: PublicIdentity,
+        msg: Vec<u8>,
     },
 }
 
@@ -1188,6 +1197,11 @@ impl Groups {
                         group,
                         from: sender,
                         list,
+                    },
+                    Content::Call(msg) => GroupEvent::Call {
+                        group,
+                        from: sender,
+                        msg,
                     },
                 });
             }

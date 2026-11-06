@@ -60,6 +60,10 @@ fn invite(i: &Invite) -> GroupInvite {
 
 fn event(u: Update) -> NodeEvent {
     match u {
+        // Routed to the call's media before this (`split_legs`).
+        Update::CallLeg { call, .. } => NodeEvent::Other {
+            description: format!("group call {call:x}: leg signalling"),
+        },
         Update::Joined { group, name, owner } => NodeEvent::GroupJoined {
             group: hex(&group),
             name,
@@ -155,6 +159,7 @@ impl ThrenodyNode {
     pub(crate) fn group_incoming(&self, from: PublicIdentity, payload: &[u8]) {
         let _guard = self.rt.enter();
         let r = self.group_node().incoming(&self.node, from, payload);
+        let r = r.map(|u| self.split_legs(u));
         let mut q = self.queued();
         match r {
             Ok(updates) => q.extend(updates.into_iter().map(event)),
@@ -185,7 +190,23 @@ impl ThrenodyNode {
     }
 
     fn queue_updates(&self, updates: Vec<Update>) {
+        let updates = self.split_legs(updates);
         self.queued().extend(updates.into_iter().map(event));
+    }
+
+    /// Hands group call leg signalling to the call's media (never the app
+    /// or its logs) and returns the rest.
+    fn split_legs(&self, updates: Vec<Update>) -> Vec<Update> {
+        updates
+            .into_iter()
+            .filter_map(|u| match u {
+                Update::CallLeg { call, from, data } => {
+                    self.group_leg_signal(call, from, data);
+                    None
+                }
+                u => Some(u),
+            })
+            .collect()
     }
 
     /// A group (or invitation) by hex id prefix.

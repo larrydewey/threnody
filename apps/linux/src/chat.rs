@@ -166,8 +166,8 @@ impl ChatView {
             .sync_create()
             .build();
         header.pack_end(&find);
-        // Calls are with contacts (not groups, yet): voice, or video.
-        if conv.group.is_none() && conv.invite.is_none() {
+        // Calls, with a contact or a group: voice, or video.
+        if conv.invite.is_none() {
             for (icon, tip, video) in [
                 ("camera-video-symbolic", "Video call", true),
                 ("call-start-symbolic", "Call", false),
@@ -178,7 +178,11 @@ impl ChatView {
                 let c = conv.clone();
                 call.connect_clicked(move |_| {
                     if let Some(app) = weak_app.upgrade() {
-                        app.start_call(&c, video);
+                        if c.group.is_some() {
+                            app.start_group_call(&c, video);
+                        } else {
+                            app.start_call(&c, video);
+                        }
                     }
                 });
                 header.pack_end(&call);

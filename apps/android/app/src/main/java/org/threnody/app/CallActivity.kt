@@ -27,19 +27,26 @@ import java.nio.ByteBuffer
  * the screen, ours in the corner), and the controls: answer (voice or
  * video) or decline while it rings here; mute, camera, speaker and hang up
  * after. Shown over the lock screen for an incoming call. The camera runs
- * only while this screen is open.
+ * only while this screen is open. A group call shows a tile for each other
+ * participant (their video, or their name) instead of one full picture.
  */
 class CallActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var who: TextView
     private lateinit var ringingRow: LinearLayout
     private lateinit var activeRow: LinearLayout
+    private lateinit var answer: ImageButton
     private lateinit var answerVideo: ImageButton
     private lateinit var mute: ImageButton
     private lateinit var camera: ImageButton
     private lateinit var speaker: ImageButton
     private lateinit var flip: ImageButton
     private lateinit var remote: ImageView
+    /** A group call's participants, a tile each. */
+    private lateinit var tiles: android.widget.GridLayout
+    private val tileViews = mutableMapOf<String, ImageView>()
+    /** Whether each tile's participant sent video at the last refresh. */
+    private val tileVideo = mutableMapOf<String, Boolean>()
     private lateinit var local: TextureView
     private var unlisten: (() -> Unit)? = null
     private var unlistenReactions: (() -> Unit)? = null
@@ -104,9 +111,10 @@ class CallActivity : Activity() {
             })
         }
         answerVideo = round(R.drawable.ic_videocam, "Answer with video", green, white) { Calls.answer(this, video = true) }
+        answer = round(R.drawable.ic_call, "Answer", green, white) { Calls.answer(this) }
         ringingRow = row(
             round(R.drawable.ic_call_end, "Decline", red, white) { Calls.hangUp(this) },
-            round(R.drawable.ic_call, "Answer", green, white) { Calls.answer(this) },
+            answer,
             answerVideo,
         )
         val idle = getColor(R.color.surface_container)
@@ -162,6 +170,11 @@ class CallActivity : Activity() {
             }
         }
 
+        tiles = android.widget.GridLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+        }
+
         floats = FrameLayout(this)
         val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         picks = android.widget.HorizontalScrollView(this).apply {
@@ -212,6 +225,7 @@ class CallActivity : Activity() {
         val frame = FrameLayout(this).apply {
             setBackgroundColor(color(R.color.background))
             addView(remote, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(tiles, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(floats, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(local, FrameLayout.LayoutParams(dp(108), dp(144), Gravity.TOP or Gravity.END).apply {
@@ -292,16 +306,27 @@ class CallActivity : Activity() {
                     since = SystemClock.elapsedRealtime()
                 }
                 val c = Calls.current ?: break
-                val f = try { c.node.nextVideoFrame(250u) } catch (_: Exception) { null } ?: continue
-                val (w, h) = f.width.toInt() to f.height.toInt()
+                // A group call's frames come from each participant in turn.
+                val (f, from) = if (c.group != null) {
+                    val g = try { c.node.nextGroupVideoFrame(250u) } catch (_: Exception) { null } ?: continue
+                    Triple(g.width, g.height, g.rotation) to (g.rgba to g.device)
+                } else {
+                    val v = try { c.node.nextVideoFrame(250u) } catch (_: Exception) { null } ?: continue
+                    Triple(v.width, v.height, v.rotation) to (v.rgba to null)
+                }
+                val (width, height, rotation) = f
+                val (rgba, device) = from
+                val (w, h) = width.toInt() to height.toInt()
                 val b = bitmap?.takeIf { it.width == w && it.height == h }
                     ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { bitmap = it }
                 // ARGB_8888 is R, G, B, A in memory, as the frame is.
-                b.copyPixelsFromBuffer(ByteBuffer.wrap(f.rgba))
-                val shown = if (f.rotation == 0u) b.copy(Bitmap.Config.ARGB_8888, false)
-                else Bitmap.createBitmap(b, 0, 0, w, h, Matrix().apply { postRotate(f.rotation.toFloat()) }, true)
+                b.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
+                val shown = if (rotation == 0u) b.copy(Bitmap.Config.ARGB_8888, false)
+                else Bitmap.createBitmap(b, 0, 0, w, h, Matrix().apply { postRotate(rotation.toFloat()) }, true)
                 count++
-                runOnUiThread { remote.setImageBitmap(shown) }
+                runOnUiThread {
+                    if (device == null) remote.setImageBitmap(shown) else tileViews[device]?.setImageBitmap(shown)
+                }
             }
         }.apply { name = "call-video"; isDaemon = true }.start()
     }
@@ -321,23 +346,32 @@ class CallActivity : Activity() {
             return
         }
         who.text = c.title
+        val group = c.group != null
         status.text = when (c.state) {
             "reaching" -> "Reaching ${c.title}…"
-            "calling" -> if (c.video) "Video calling…" else "Calling…"
+            "calling" -> if (group) "Waiting for others to join…" else if (c.video) "Video calling…" else "Calling…"
             "ringing" -> "Ringing…"
-            "incoming" -> if (c.peerVideo) "Incoming video call" else "Incoming voice call"
+            "incoming" -> if (group) {
+                "Group call from ${c.members.keys.firstOrNull()?.let { Threnody.nameOf(c.node, it) } ?: "a member"}"
+            } else if (c.peerVideo) "Incoming video call" else "Incoming voice call"
             "connecting" -> "Connecting…"
             "interrupted" -> "Reconnecting…"
-            else -> duration(SystemClock.elapsedRealtime() - c.since)
+            else -> duration(SystemClock.elapsedRealtime() - c.since) +
+                if (group) " · ${c.members.size + 1} people" else ""
         }
         val ringing = c.state == "incoming"
         ringingRow.visibility = if (ringing) View.VISIBLE else View.GONE
-        answerVideo.visibility = if (c.peerVideo) View.VISIBLE else View.GONE
+        // Joining a group call, either way is fine.
+        answerVideo.visibility = if (c.peerVideo || group) View.VISIBLE else View.GONE
+        answerVideo.contentDescription = if (group) "Join with video" else "Answer with video"
+        answer.contentDescription = if (group) "Join" else "Answer"
         activeRow.visibility = if (ringing) View.GONE else View.VISIBLE
         val talking = c.state == "connected" || c.state == "interrupted"
-        reactions.visibility = if (talking) View.VISIBLE else View.GONE
-        if (!talking) picks.visibility = View.GONE
-        remote.visibility = if (c.peerVideo && !ringing) View.VISIBLE else View.GONE
+        // Reactions are for calls with one contact.
+        reactions.visibility = if (talking && !group) View.VISIBLE else View.GONE
+        if (!talking || group) picks.visibility = View.GONE
+        remote.visibility = if (c.peerVideo && !ringing && !group) View.VISIBLE else View.GONE
+        showTiles(c, group && !ringing)
         local.visibility = if (c.video && !ringing) View.VISIBLE else View.GONE
         flip.visibility = if (c.video && !ringing && CallCamera.canSwitch(this)) View.VISIBLE else View.GONE
         mute.alpha = if (c.muted) 1f else 0.6f
@@ -346,6 +380,60 @@ class CallActivity : Activity() {
         camera.contentDescription = if (c.video) "Turn camera off" else "Turn camera on"
         speaker.alpha = if (c.speaker) 1f else 0.6f
         cameraIfWanted()
+    }
+
+    /**
+     * A group call's participants as a grid: their video when they send it,
+     * else their name. Rebuilt only when who's there changes.
+     */
+    private fun showTiles(c: Calls.Call, visible: Boolean) {
+        tiles.visibility = if (visible && c.members.isNotEmpty()) View.VISIBLE else View.GONE
+        if (!visible) return
+        val who = c.members.keys.sorted()
+        if (who != tileViews.keys.sorted()) {
+            tiles.removeAllViews()
+            tileViews.clear()
+            tileVideo.clear()
+            // Upright, two people stack (each tile keeps a camera's shape);
+            // sideways, they sit side by side. More make a grid.
+            val upright = resources.configuration.orientation ==
+                android.content.res.Configuration.ORIENTATION_PORTRAIT
+            tiles.columnCount = when {
+                who.size <= 1 -> 1
+                who.size == 2 -> if (upright) 1 else 2
+                who.size <= 4 -> 2
+                else -> if (upright) 2 else 3
+            }
+            for (d in who) {
+                val picture = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                val name = label(Threnody.nameOf(c.node, d), Design.typeSubtitle, R.color.text).apply {
+                    setShadowLayer(4f, 0f, 1f, Color.BLACK)
+                }
+                val tile = FrameLayout(this).apply {
+                    setBackgroundColor(Color.rgb(24, 24, 24))
+                    addView(picture, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+                    addView(name, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply {
+                        setMargins(dp(Design.sm), dp(Design.sm), dp(Design.sm), dp(Design.sm))
+                    })
+                }
+                tiles.addView(tile, android.widget.GridLayout.LayoutParams(
+                    android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED, 1f),
+                    android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED, 1f),
+                ).apply {
+                    width = 0
+                    height = 0
+                    setMargins(1, 1, 1, 1)
+                })
+                tileViews[d] = picture
+            }
+        }
+        // When someone turns their video off, their tile goes back to just
+        // the name (only then: clearing on every refresh made pictures flicker).
+        for ((d, picture) in tileViews) {
+            val sends = c.members[d] == true
+            if (tileVideo[d] == true && !sends) picture.setImageDrawable(null)
+            tileVideo[d] = sends
+        }
     }
 
     /** The row of emoji to send: recent ones first, then the usual; ＋ opens them all. */

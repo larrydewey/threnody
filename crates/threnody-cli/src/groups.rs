@@ -202,6 +202,8 @@ impl GroupUi {
                     self.groups
                         .record_file(node, &group, &from, note, &caption, id);
                 }
+                // The command line takes no calls.
+                Update::CallLeg { .. } => {}
                 Update::Reacted { group, from } => {
                     say!("[{}] * {} reacted", self.label(&group), name(&from));
                 }

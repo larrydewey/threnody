@@ -7,6 +7,11 @@
 //! size and brightness, nothing more). It sends silence and plays
 //! nothing unless `BOT_MIC=1`: a bot's speaker echoes into its microphone.
 //! It sends back every reaction it gets, so both float on the app's screen.
+//! It also takes group invitations and joins every group call that rings,
+//! and logs whose video reaches it there. `BOT_CONNECT=<invite>` dials
+//! another node at start. With `BOT_HOST=<n>`, once `n` peers are
+//! connected it makes a group of them, and with `BOT_HOST_CALL=1` it then
+//! starts a group call in it.
 //!
 //! ```sh
 //! cargo run -p threnody-ffi --features calls --example call_bot -- <home> [port] [seconds]
@@ -38,8 +43,33 @@ fn main() {
         bars(node.clone());
         watch(node.clone());
     }
+    if let Ok(invite) = std::env::var("BOT_CONNECT") {
+        match node.connect(invite) {
+            Ok(peer) => println!("connected to {peer}"),
+            Err(e) => println!("connect failed: {e}"),
+        }
+    }
+    let host: Option<usize> = std::env::var("BOT_HOST")
+        .ok()
+        .map(|n| n.parse().expect("BOT_HOST"));
+    let mut peers: Vec<String> = Vec::new();
+    let mut group: Option<String> = None;
     let mut answered: Option<(u64, Instant)> = None;
     loop {
+        if let (Some(n), None) = (host, &group)
+            && peers.len() >= n
+        {
+            // Give their Hellos a moment, then gather them.
+            std::thread::sleep(Duration::from_secs(2));
+            let g = node.create_group("bots".into()).expect("group");
+            for p in &peers {
+                match node.invite_to_group(g.clone(), p.clone()) {
+                    Ok(()) => println!("invited {p} to {g}"),
+                    Err(e) => println!("invite {p} failed: {e}"),
+                }
+            }
+            group = Some(g);
+        }
         if let Some((id, at)) = answered
             && at.elapsed() > talk
         {
@@ -54,6 +84,9 @@ fn main() {
             NodeEvent::Connected { peer, .. } => {
                 println!("connected: {peer}");
                 let _ = node.accept_contact(peer.clone());
+                if !peers.contains(&peer) {
+                    peers.push(peer.clone());
+                }
                 if calls_out {
                     // Give the peer's Hello (and its call support) a moment.
                     std::thread::sleep(Duration::from_secs(2));
@@ -97,6 +130,59 @@ fn main() {
                 println!("call {call:x} ended: {reason} (by us: {by_us})");
                 answered = None;
             }
+            NodeEvent::GroupInvited { group, from, .. } => {
+                println!("group {group} invitation from {from}: accepting");
+                if let Err(e) = node.accept_group_invite(group) {
+                    println!("accept failed: {e}");
+                }
+            }
+            NodeEvent::GroupCallRinging { group, call, from } => {
+                println!("group call {call:x} in {group} from {from}: joining");
+                if let Err(e) = node.join_group_call(call, video) {
+                    println!("join failed: {e}");
+                }
+            }
+            NodeEvent::GroupCallMember {
+                call,
+                device,
+                joined,
+                ..
+            } => {
+                println!(
+                    "group call {call:x}: {device} {}",
+                    if joined { "joined" } else { "left" }
+                );
+                // Alone in it: leave, so the next call rings.
+                if !joined
+                    && node
+                        .current_group_call()
+                        .is_some_and(|c| c.participants.is_empty())
+                {
+                    println!("group call {call:x}: alone, leaving");
+                    node.leave_group_call();
+                }
+            }
+            NodeEvent::GroupCallEnded { call, .. } => println!("group call {call:x} ended"),
+            NodeEvent::GroupMembersChanged {
+                group: g, added, ..
+            } => {
+                println!("group {g}: added {added:?}");
+                let all = node
+                    .groups()
+                    .into_iter()
+                    .find(|i| i.id == g)
+                    .is_some_and(|i| i.members.len() > peers.len());
+                if all
+                    && group.as_deref() == Some(g.as_str())
+                    && std::env::var_os("BOT_HOST_CALL").is_some()
+                    && node.current_group_call().is_none()
+                {
+                    match node.start_group_call(g, video) {
+                        Ok(id) => println!("started group call {id:x}"),
+                        Err(e) => println!("group call failed: {e}"),
+                    }
+                }
+            }
             NodeEvent::Disconnected { peer, reason } => println!("disconnected: {peer} ({reason})"),
             _ => {}
         }
@@ -134,7 +220,22 @@ fn bars(node: std::sync::Arc<ThrenodyNode>) {
 fn watch(node: std::sync::Arc<ThrenodyNode>) {
     std::thread::spawn(move || {
         let (mut n, mut last, mut at) = (0u32, None, Instant::now());
+        let mut from: std::collections::BTreeMap<String, u32> = Default::default();
         loop {
+            if node.current_group_call().is_some_and(|c| c.joined) {
+                if let Some(f) = node.next_group_video_frame(250) {
+                    *from.entry(f.device).or_default() += 1;
+                }
+                if at.elapsed() >= Duration::from_secs(2) {
+                    println!("group video in, frames by device: {from:?}");
+                    if let Some(c) = node.current_group_call() {
+                        let who: Vec<_> = c.participants.iter().map(|p| &p.device[..9]).collect();
+                        println!("group call: hub {}, others {who:?}", &c.hub[..9]);
+                    }
+                    (from, at) = (Default::default(), Instant::now());
+                }
+                continue;
+            }
             if let Some(f) = node.next_video_frame(250) {
                 n += 1;
                 let luma: u64 = f

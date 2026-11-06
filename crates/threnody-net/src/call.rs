@@ -238,6 +238,9 @@ impl Node {
         if offered.is_empty() {
             return Err(NetError::NotAllowed("their app can't take calls".into()));
         }
+        if self.in_group_call() {
+            return Err(NetError::NotAllowed("already in a call".into()));
+        }
         let mut calls = lock(&self.shared.calls);
         if calls.current.is_some() {
             return Err(NetError::NotAllowed("already in a call".into()));
@@ -462,7 +465,7 @@ impl Node {
     /// as datagrams. The new session replaces the TCP one; the call, whose
     /// keys aren't the session's, carries on. Only the dialer does this, so
     /// the two sides never race.
-    fn upgrade_for_media(&self, peer: PublicIdentity) {
+    pub(crate) fn upgrade_for_media(&self, peer: PublicIdentity) {
         let Some(s) = self
             .sessions()
             .into_iter()
@@ -560,6 +563,8 @@ impl Node {
                         call: id,
                         data,
                     });
+                } else {
+                    self.on_leg_signal(peer, id, data);
                 }
             }
             CallMsg::Reaction { emoji, .. } => {
@@ -608,6 +613,9 @@ impl Node {
         if !self.is_accepted(&peer) {
             // A message request: don't ring, and don't say whether we're here.
             return;
+        }
+        if self.in_group_call() {
+            return reply(HangupReason::Busy);
         }
         let mut calls = lock(&self.shared.calls);
         match &calls.current {
@@ -674,6 +682,9 @@ impl Node {
 
     /// A sealed media packet from `peer`, by datagram or in the stream.
     pub(crate) fn on_media(&self, peer: PublicIdentity, packet: &[u8]) {
+        if self.on_group_media(peer, packet) {
+            return;
+        }
         let mut calls = lock(&self.shared.calls);
         let Some(c) = calls
             .current

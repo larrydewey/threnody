@@ -1,6 +1,6 @@
 # Appendix Q: Voice and Video Calls (v1)
 
-Status: signalling, media keys and transport implemented in `threnody-core::call` and `threnody-net::call`. Media (WebRTC) is in `threnody-media`; the FFI, the Linux app and the Android app use it. Voice and video between two people; group calls are not done yet.
+Status: signalling, media keys and transport implemented in `threnody-core::call` and `threnody-net::call`. Media (WebRTC) is in `threnody-media`; the FFI, the Linux app and the Android app use it. Voice and video between two people, and group calls of up to eight devices (`threnody-net::groupcall`, signalled through `threnody-groups`).
 
 ## Overview
 
@@ -87,6 +87,49 @@ Every call negotiates an audio and a video track from the start, on both sides. 
 
 Inside, WebRTC still runs DTLS-SRTP. Its certificate fingerprints travel only in the end-to-end signalling, so they are authenticated.
 
+## Group calls
+
+A group call is a call among up to eight devices (`MAX_GROUP_CALL`) that belong to one MLS group (Appendix F). Every two participants share a **leg**: a WebRTC session of its own, sealed and carried exactly like a two-person call's media. A pair without a session of its own sends its leg through a participant that has sessions with both.
+
+### Signalling
+
+Group call messages travel as group content kind 9 (Appendix F), inside the group's MLS encryption, so they are authenticated as coming from that member:
+
+```
+GroupCallMsg = { 0: op, 1: call uint, ? 2: device bstr(32), ? 3: flags uint,
+                 ? 4: data bstr, ? 5: secret bstr(32), ? 6: links [* bstr(32)] }
+op: 1 start (flags, secret), 2 join (flags, links), 3 leave,
+    4 leg (device = to, data ≤ 64 KiB), 6 update (flags, links)
+flags: 1 = video
+```
+
+- **Start.** The starter picks a random non-zero call id and a fresh 32-byte call secret. It rings every other member's devices, except the starter's own other devices. The call secret goes only inside the group's encryption and isn't tied to the group's epoch, so members at different epochs still agree on it.
+- **Join and leave.** These keep everyone's roster. A member who sees a join from someone new, while in the call itself, answers with its own `join` to that member alone. A joiner therefore learns everyone already in the call, even when someone's join reached it before the call's start did. A call rings for 60 s, then stops ringing (the call goes on). With no session to a member, call messages go through another member that has one (Appendix F forwarding), but they are never held or sealed for later, since a call can't wait.
+- **Links.** `join` and `update` carry the sender's **links**: the participants it has a live session with. A participant sends an `update` whenever its links change. Links say who can carry a leg for whom.
+- **Leg signalling.** Session descriptions and ICE candidates for the leg between A and B go over A and B's own ratchet when they have a session (`CallMsg::Signal` under the leg's id). Otherwise they go in a group message addressed to B alone (op 4). Either way they never pass through a relay as anything it could change, so no relay can stand in the middle of a leg's DTLS.
+- **The hub.** The participant linked to the most others (ties: the smaller key) is shown as the call's hub. It carries the most legs, but nothing depends on agreeing who it is.
+- **Busy.** One-to-one and group calls exclude each other: an offer during a group call gets `busy`, and a group call doesn't ring during a one-to-one call.
+
+### Legs
+
+```
+leg id   = first 8 bytes of KDF("group call leg id", call id, min(key_A, key_B), max(key_A, key_B)), never 0
+leg keys = MediaKeys(leg id, s, s, caller = A < B),
+           s = KDF("group call leg", call secret, call id, min(key_A, key_B), max(key_A, key_B))
+```
+
+The device with the smaller key makes the WebRTC offer, and counts as the leg's caller for its direction keys. Packets use the format above, with the leg id where a call id goes.
+
+A pair without a session sends its packets to a participant R that it reaches and that is linked to the other end (the hub first), wrapped as `0^8 || device (32) || packet`. Call id 0 is never a call's, so older peers drop it. R passes a wrapped packet on, rewrapped with the sender's key, only when both ends are current participants and the packet's id is the id of the leg between them. The receiver opens a wrapped packet only when its id is the id of its own leg with the device named. Every participant can derive every leg's transport keys. What keeps the media of other legs from them, relays included, is the DTLS-SRTP inside each leg, whose fingerprints travel only in authenticated signalling.
+
+### Media
+
+- A leg over a direct TCP session that we dialed moves to QUIC, as a two-person call does (*Moving to QUIC* above), so its media goes as datagrams.
+- One WebRTC session runs per leg. They share the microphone (the platform audio device is reference-counted) and one camera source, so each camera frame feeds every leg.
+- Each participant uploads one stream per other participant, so the video uplink is divided among the legs: 700 kbit/s for one leg, down to 150 kbit/s each.
+- A leg with no media for 30 s drops that participant from our view of the call. They come back by joining again.
+- Apps get each participant's newest frame (`next_group_video_frame`) and show a tile per participant. Reactions are only for calls with one contact.
+
 ## Platforms
 
 `threnody-media` uses LiveKit's `libwebrtc` crate (Apache-2.0), which ships prebuilt WebRTC for Linux, macOS, Windows, iOS and Android.
@@ -102,9 +145,9 @@ Inside, WebRTC still runs DTLS-SRTP. Its certificate fingerprints travel only in
 
 ## Not yet
 
-- Video: switching cameras, screen sharing, hardware-texture rendering (frames are copied as RGBA), and a frame size limited to the path's QUIC datagrams before path MTU discovery.
+- Video: screen sharing, hardware-texture rendering (frames are copied as RGBA), and a frame size limited to the path's QUIC datagrams before path MTU discovery.
 - Android: Telecom integration (`ConnectionService`: car audio, other calls, headset buttons).
-- Group calls.
+- Group calls: mixing or forwarding one upload for everyone (an SFU with frame encryption), which needs RTP forwarding below WebRTC; and calls bigger than eight. Group calls on iOS, which has no calls yet.
 - Media over onion circuits.
 - A Tamarin model of the call key derivation.
 - Fuzzing `CallMsg`.

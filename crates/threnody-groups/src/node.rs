@@ -14,6 +14,7 @@
 //! A forwarder delivers the same way but never forwards again, so a
 //! message crosses at most one forwarding member.
 
+use threnody_core::call::GroupCallMsg;
 use threnody_core::history::{ConversationId, Entry, FileNote, MAX_POLL_QUESTION, Poll};
 use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::store::Home;
@@ -166,6 +167,14 @@ pub enum Update {
         from: PublicIdentity,
         pin: bool,
     },
+    /// Signalling for the media layer on our leg with `from` in group
+    /// call `call` (the node reports the same over sessions as
+    /// `Event::GroupLegSignal`).
+    CallLeg {
+        call: u64,
+        from: PublicIdentity,
+        data: Vec<u8>,
+    },
 }
 
 pub struct GroupNode {
@@ -186,6 +195,15 @@ pub struct GroupNode {
     stranger_invited: Option<std::time::Instant>,
     home: Home,
     identity: Identity,
+}
+
+/// Our links in group call `call`, as sent in `Join` and `Update` (to
+/// `everyone`, or to one member).
+fn links(node: &Node, call: u64, everyone: bool) -> Vec<[u8; 32]> {
+    node.group_call_links(call, everyone)
+        .iter()
+        .map(|p| *p.as_bytes())
+        .collect()
 }
 
 impl GroupNode {
@@ -549,6 +567,223 @@ impl GroupNode {
         let out = self.groups.send(group, &Content::ClosePoll { id })?;
         self.apply(node, out, true)?;
         Ok(true)
+    }
+
+    /// Starts a group call in `group`, ringing every other member.
+    /// Returns its id.
+    pub fn start_call(&mut self, node: &Node, group: &GroupId, video: bool) -> Result<u64> {
+        self.groups
+            .list()
+            .iter()
+            .find(|(g, ..)| g == group)
+            .ok_or(GroupError::UnknownGroup)?;
+        let call = loop {
+            let id = u64::from_be_bytes(threnody_core::crypto::random_bytes());
+            if id != 0 {
+                break id;
+            }
+        };
+        let secret = threnody_core::crypto::random_bytes::<32>();
+        node.start_group_call(*group, call, secret, video)
+            .map_err(|e| GroupError::Call(e.to_string()))?;
+        self.send_call(
+            node,
+            group,
+            &GroupCallMsg::Start {
+                call,
+                video,
+                secret,
+            },
+            None,
+        )?;
+        Ok(call)
+    }
+
+    /// Joins the group call ringing here.
+    pub fn join_call(&mut self, node: &Node, call: u64, video: bool) -> Result<()> {
+        let group = node
+            .group_call()
+            .filter(|c| c.call == call)
+            .ok_or(GroupError::Unexpected("no such call"))?
+            .group;
+        node.join_group_call(call, video)
+            .map_err(|e| GroupError::Call(e.to_string()))?;
+        let links = links(node, call, true);
+        self.send_call(
+            node,
+            &group,
+            &GroupCallMsg::Join { call, video, links },
+            None,
+        )
+    }
+
+    /// Leaves the group call (or stops it ringing here).
+    pub fn leave_call(&mut self, node: &Node, call: u64) {
+        let Some(c) = node.group_call().filter(|c| c.call == call) else {
+            return;
+        };
+        node.leave_group_call(call);
+        if c.joined {
+            let _ = self.send_call(node, &c.group, &GroupCallMsg::Leave { call }, None);
+        }
+    }
+
+    /// Turns our video in the group call on or off.
+    pub fn set_call_video(&mut self, node: &Node, call: u64, video: bool) -> Result<()> {
+        let group = node
+            .group_call()
+            .filter(|c| c.call == call && c.joined)
+            .ok_or(GroupError::Unexpected("no such call"))?
+            .group;
+        node.set_group_call_video_flag(call, video);
+        let links = links(node, call, true);
+        self.send_call(
+            node,
+            &group,
+            &GroupCallMsg::Update { call, video, links },
+            None,
+        )
+    }
+
+    /// Tells the call's participants which of them we have sessions with
+    /// now (on `Event::GroupCallLinks`), so they can relay through us.
+    pub fn announce_call_links(&mut self, node: &Node, call: u64) -> Result<()> {
+        let Some(c) = node.group_call().filter(|c| c.call == call && c.joined) else {
+            return Ok(());
+        };
+        let links = links(node, call, true);
+        let update = GroupCallMsg::Update {
+            call,
+            video: c.video,
+            links,
+        };
+        self.send_call(node, &c.group, &update, None)
+    }
+
+    /// Sends the media layer's signalling for our leg with `to`: over our
+    /// session with it if there is one, else in a group message to it.
+    pub fn send_call_leg(
+        &mut self,
+        node: &Node,
+        call: u64,
+        to: &PublicIdentity,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if node.send_leg_signal(call, to, data.clone()) {
+            return Ok(());
+        }
+        let group = node
+            .group_call()
+            .filter(|c| c.call == call && c.joined)
+            .ok_or(GroupError::Unexpected("no such call"))?
+            .group;
+        self.send_call(
+            node,
+            &group,
+            &GroupCallMsg::Leg {
+                call,
+                to: *to.as_bytes(),
+                data,
+            },
+            Some(to),
+        )
+    }
+
+    /// Sends call signalling in a group message: to every member, or to
+    /// `only` one. Live sessions only, directly or through a member that
+    /// can reach it: a call doesn't wait, so nothing is held or sealed
+    /// for later.
+    fn send_call(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        msg: &GroupCallMsg,
+        only: Option<&PublicIdentity>,
+    ) -> Result<()> {
+        let bytes = msg.encode().map_err(GroupError::from)?;
+        let out = self.groups.send(group, &Content::Call(bytes))?;
+        let _ = self.save();
+        for o in out.send {
+            if only.is_some_and(|p| *p != o.to) {
+                continue;
+            }
+            let GroupWire::Message { group, message } = o.wire else {
+                continue;
+            };
+            let direct = GroupWire::Message {
+                group,
+                message: message.clone(),
+            };
+            if let Ok(b) = direct.encode()
+                && node.send(&o.to, AppMessage::Group(b)).is_ok()
+            {
+                continue;
+            }
+            if let Some(via) = self.forwarder(node, &group, &o.to, &[]) {
+                let fwd = GroupWire::Forward {
+                    group,
+                    to: *o.to.as_bytes(),
+                    message,
+                    reference: 0,
+                };
+                if let Ok(b) = fwd.encode() {
+                    let _ = node.send(&via, AppMessage::Group(b));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Group call signalling from member `from` of `group`.
+    fn on_call(
+        &mut self,
+        node: &Node,
+        group: GroupId,
+        from: PublicIdentity,
+        msg: &[u8],
+    ) -> Option<Update> {
+        let msg = GroupCallMsg::decode(msg).ok()?;
+        let call = msg.call();
+        // Our own other devices' calls don't ring here.
+        let ours = node.is_own_device(&from);
+        let devices = |links: Vec<[u8; 32]>| -> Vec<PublicIdentity> {
+            links
+                .iter()
+                .filter_map(|l| PublicIdentity::from_bytes(l).ok())
+                .collect()
+        };
+        match msg {
+            GroupCallMsg::Start { video, secret, .. } if !ours => {
+                node.group_call_rang(group, call, from, secret, video);
+            }
+            GroupCallMsg::Start { .. } => {}
+            GroupCallMsg::Join { video, links, .. } => {
+                let new = node.group_call_joined(call, from, video, devices(links));
+                // A newcomer may have missed that we're in: say so, to it.
+                if let Some(c) = node
+                    .group_call()
+                    .filter(|c| new && c.call == call && c.joined)
+                {
+                    let join = GroupCallMsg::Join {
+                        call,
+                        video: c.video,
+                        links: self::links(node, call, false),
+                    };
+                    let _ = self.send_call(node, &group, &join, Some(&from));
+                }
+            }
+            GroupCallMsg::Leave { .. } => node.group_call_left(call, from),
+            GroupCallMsg::Update { video, links, .. } => {
+                node.group_call_update(call, from, video, devices(links));
+            }
+            GroupCallMsg::Leg { to, data, .. } => {
+                if to != *node.identity().as_bytes() {
+                    return None;
+                }
+                return Some(Update::CallLeg { call, from, data });
+            }
+        }
+        None
     }
 
     /// Sends a list to every member (see `Node::edit_list`).
@@ -1381,6 +1616,12 @@ impl GroupNode {
                     return;
                 }
                 Update::Voted { group, from }
+            }
+            GroupEvent::Call { group, from, msg } => {
+                if let Some(u) = self.on_call(node, group, from, &msg) {
+                    updates.push(u);
+                }
+                return;
             }
             GroupEvent::List { group, from, list } => {
                 // The node keeps it and tells the app (`Event::ListChanged`).

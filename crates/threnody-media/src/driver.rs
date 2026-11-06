@@ -103,6 +103,12 @@ impl Driver {
         self.devices.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Whether calls use the microphone and speaker (see
+    /// [`Driver::set_devices`]).
+    pub fn devices(&self) -> bool {
+        self.devices.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Starts `call`'s media, sending video from the start if `video`.
     pub fn start(&self, call: u64, video: bool) {
         let _ = self.tx.send(Cmd::Start(call, video));
@@ -137,24 +143,9 @@ impl Driver {
     /// upright. Returns false when there's no call or the size is wrong.
     pub fn send_video(&self, width: u32, height: u32, rotation: u32, i420: &[u8]) -> bool {
         let Some(m) = self.media() else { return false };
-        let (cw, ch) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
-        let luma = width as usize * height as usize;
-        if width == 0 || height == 0 || i420.len() < luma + 2 * cw * ch {
+        let Some(b) = i420_buffer(width, height, i420) else {
             return false;
-        }
-        let mut b = I420Buffer::new(width, height);
-        let (sy, su, sv) = b.strides();
-        let (y, u, v) = b.data_mut();
-        copy_plane(
-            &i420[..luma],
-            width as usize,
-            y,
-            sy as usize,
-            height as usize,
-        );
-        let (cu, cv) = i420[luma..].split_at(cw * ch);
-        copy_plane(cu, cw, u, su as usize, ch);
-        copy_plane(&cv[..cw * ch], cw, v, sv as usize, ch);
+        };
         m.send_video(&b, rotation);
         true
     }
@@ -180,6 +171,30 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A camera frame's I420 planes (`width × height` luma, then each chroma
+/// plane at half size) as WebRTC's buffer; `None` if the size is wrong.
+pub fn i420_buffer(width: u32, height: u32, i420: &[u8]) -> Option<I420Buffer> {
+    let (cw, ch) = (width.div_ceil(2) as usize, height.div_ceil(2) as usize);
+    let luma = width as usize * height as usize;
+    if width == 0 || height == 0 || i420.len() < luma + 2 * cw * ch {
+        return None;
+    }
+    let mut b = I420Buffer::new(width, height);
+    let (sy, su, sv) = b.strides();
+    let (y, u, v) = b.data_mut();
+    copy_plane(
+        &i420[..luma],
+        width as usize,
+        y,
+        sy as usize,
+        height as usize,
+    );
+    let (cu, cv) = i420[luma..].split_at(cw * ch);
+    copy_plane(cu, cw, u, su as usize, ch);
+    copy_plane(&cv[..cw * ch], cw, v, sv as usize, ch);
+    Some(b)
+}
+
 fn copy_plane(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usize, rows: usize) {
     for r in 0..rows {
         let n = src_stride.min(dst_stride);
@@ -189,7 +204,7 @@ fn copy_plane(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usize, 
 }
 
 /// A decoded frame as RGBA.
-fn pixels(f: &BoxVideoFrame) -> Frame {
+pub fn pixels(f: &BoxVideoFrame) -> Frame {
     let b = f.buffer.to_i420();
     let (w, h) = (b.width(), b.height());
     let (sy, su, sv) = b.strides();

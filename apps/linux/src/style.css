@@ -162,6 +162,15 @@ windowtitle.warning .subtitle {
     border-radius: 8px;
     border: 1px solid alpha(white, 0.4);
 }
+/* A group call: a dark tile per participant, their name on it. */
+.call-tile {
+    background-color: #181818;
+    min-height: 120px;
+}
+.call-tile-name {
+    color: white;
+    text-shadow: 0 1px 4px black;
+}
 
 .gif-button {
   font-weight: bold;
