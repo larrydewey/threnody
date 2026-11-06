@@ -37,7 +37,9 @@ pub use volunteer::{
 
 pub use calls::{CallRecord, CallStats, VideoFrame};
 pub use groupcalls::{GroupCallParticipant, GroupCallRecord, GroupVideoFrame};
-pub use groups::{GroupInfo, GroupInvite};
+pub use groups::{
+    GroupBanner, GroupInfo, GroupInvite, GroupMemberAction, GroupMemberRow, MemberRole,
+};
 use threnody_groups::node::GroupNode;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
