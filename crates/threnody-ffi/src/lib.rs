@@ -317,6 +317,15 @@ pub fn album_id() -> u64 {
     threnody_net::history::album_id()
 }
 
+/// Whether this build carries call media (the `calls` feature). Builds
+/// without it (the F-Droid build, iOS) hide call buttons, and their nodes
+/// leave `FEATURE_CALLS` out of `Hello`, so contacts don't ring them.
+/// Callable before any node is open.
+#[uniffi::export]
+pub fn calls_built_in() -> bool {
+    cfg!(feature = "calls")
+}
+
 /// Whether a file is a photo whose location and camera details the node
 /// can't remove (HEIC, AVIF, TIFF and camera raw), going by its first bytes
 /// (32 are enough) rather than its name. The app sends such a photo as
@@ -1321,6 +1330,9 @@ impl ThrenodyNode {
             })
             .map_err(fail)?
         };
+        if !calls_built_in() {
+            node.withhold_features(threnody_core::message::FEATURE_CALLS);
+        }
         let queued = Arc::new(Mutex::new(VecDeque::new()));
         let media = {
             let _guard = rt.enter();
@@ -2742,6 +2754,51 @@ mod tests {
     }
 
     #[test]
+    fn calls_bit_follows_the_build() {
+        use threnody_core::message::FEATURE_CALLS;
+        let dir = tempfile::tempdir().unwrap();
+        let me =
+            ThrenodyNode::open(dir.path().join("me").display().to_string(), None, None).unwrap();
+        assert_eq!(calls_built_in(), cfg!(feature = "calls"));
+        assert_eq!(
+            me.node.local_features() & FEATURE_CALLS != 0,
+            cfg!(feature = "calls")
+        );
+        assert_eq!(me.calls_supported(), calls_built_in());
+        // Personas are nodes of the same build: they follow it too.
+        let rec = me
+            .create_persona("p".into(), None, Some("pw".into()))
+            .unwrap();
+        let p = ThrenodyNode::open(rec.home.clone(), Some("pw".into()), None).unwrap();
+        assert_eq!(
+            p.node.local_features() & FEATURE_CALLS != 0,
+            cfg!(feature = "calls")
+        );
+    }
+
+    #[cfg(not(feature = "calls"))]
+    #[test]
+    fn no_calls_build_is_not_rung() {
+        use threnody_core::message::{FEATURE_ACKS, FEATURE_CALLS};
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap()
+        };
+        let (a, b) = (open("a"), open("b"));
+        let addr = b.listen("127.0.0.1:0".into()).unwrap();
+        a.connect(b.invite_link(addr)).unwrap();
+        wait(&b, |e| matches!(e, NodeEvent::Connected { .. }));
+        let (a_id, b_id) = (a.node.identity(), b.node.identity());
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !(b.node.supports(&a_id, FEATURE_ACKS) && a.node.supports(&b_id, FEATURE_ACKS)) {
+            assert!(std::time::Instant::now() < end, "both Hellos arrive");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!b.node.supports(&a_id, FEATURE_CALLS));
+        assert!(!a.node.supports(&b_id, FEATURE_CALLS));
+    }
+
+    #[test]
     fn personas_share_profiles_and_reveal_through_apps() {
         let dir = tempfile::tempdir().unwrap();
         let me =
@@ -3068,26 +3125,35 @@ mod tests {
         );
 
         // A call: ringing, answered, hung up; the app never sees the media
-        // layer's signalling.
+        // layer's signalling. Builds without calls aren't rung at all.
         bob.accept_contact(alice.device_fingerprint()).unwrap();
-        let id = alice.start_call(bob_fp.clone(), false).unwrap();
-        wait(
-            &bob,
-            |e| matches!(e, NodeEvent::CallIncoming { call, .. } if *call == id),
-        );
-        wait(&alice, |e| matches!(e, NodeEvent::CallRinging { .. }));
-        assert_eq!(bob.current_call().unwrap().phase, "incoming");
-        bob.answer_call(id, false).unwrap();
-        wait(&alice, |e| matches!(e, NodeEvent::CallStarted { .. }));
-        assert_eq!(alice.current_call().unwrap().phase, "active");
-        bob.hangup_call(id);
-        let NodeEvent::CallEnded { reason, by_us, .. } =
-            wait(&alice, |e| matches!(e, NodeEvent::CallEnded { .. }))
-        else {
-            unreachable!()
-        };
-        assert!(reason == "ended" && !by_us);
-        assert!(alice.current_call().is_none() && bob.current_call().is_none());
+        if cfg!(feature = "calls") {
+            let id = alice.start_call(bob_fp.clone(), false).unwrap();
+            wait(
+                &bob,
+                |e| matches!(e, NodeEvent::CallIncoming { call, .. } if *call == id),
+            );
+            wait(&alice, |e| matches!(e, NodeEvent::CallRinging { .. }));
+            assert_eq!(bob.current_call().unwrap().phase, "incoming");
+            bob.answer_call(id, false).unwrap();
+            wait(&alice, |e| matches!(e, NodeEvent::CallStarted { .. }));
+            assert_eq!(alice.current_call().unwrap().phase, "active");
+            bob.hangup_call(id);
+            let NodeEvent::CallEnded { reason, by_us, .. } =
+                wait(&alice, |e| matches!(e, NodeEvent::CallEnded { .. }))
+            else {
+                unreachable!()
+            };
+            assert!(reason == "ended" && !by_us);
+            assert!(alice.current_call().is_none() && bob.current_call().is_none());
+        } else {
+            let b_id = bob.node.identity();
+            assert!(
+                !alice
+                    .node
+                    .supports(&b_id, threnody_core::message::FEATURE_CALLS)
+            );
+        }
         let h = alice.history(bob_fp.clone(), 10).unwrap();
         assert_eq!(
             h.len(),

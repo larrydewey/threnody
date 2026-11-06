@@ -31,6 +31,11 @@ cargo clippy -p threnody-cli -p threnody-ffi --all-targets --locked
 step "Tests"
 cargo test --workspace --all-features --locked --no-fail-fast
 
+# Builds without calls (iOS, the F-Droid build) withhold the calls bit;
+# --all-features never compiles that path.
+step "Tests (threnody-ffi without calls)"
+cargo test -p threnody-ffi --locked --no-fail-fast
+
 # bindings job
 step "FFI bindings (Python test)"
 crates/threnody-ffi/bindings.sh

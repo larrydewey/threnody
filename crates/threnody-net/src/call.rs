@@ -614,6 +614,12 @@ impl Node {
             // A message request: don't ring, and don't say whether we're here.
             return;
         }
+        if self.local_features() & FEATURE_CALLS == 0 {
+            // This build can't take calls and said so in its Hello; only a
+            // caller that ignored that gets here. Declining would end the
+            // ringing on our other devices too, so stay quiet.
+            return;
+        }
         if self.in_group_call() {
             return reply(HangupReason::Busy);
         }
