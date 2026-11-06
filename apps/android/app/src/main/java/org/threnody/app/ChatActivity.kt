@@ -875,9 +875,9 @@ class ChatActivity : Activity() {
             (if (g != null) node.groupDisappearing(g) else node.disappearing(device)) != null
         } catch (_: Exception) { false }
         // Credential offers and requests from this contact, waiting for an answer.
-        val mine = c?.devices ?: listOf(device)
-        val offers = if (g == null && !note) node.credentialOffers().filter { it.peer in mine } else emptyList()
-        val asks = if (g == null && !note) node.credentialAsks().filter { it.peer in mine } else emptyList()
+        val pending = if (g == null && !note) try { node.pendingCredentials(device) } catch (_: Exception) { null } else null
+        val offers = pending?.offers.orEmpty()
+        val asks = pending?.asks.orEmpty()
         runOnUiThread {
             // A newer refresh will draw instead.
             if (gen != refreshGen.get()) return@runOnUiThread

@@ -1460,26 +1460,22 @@ impl App {
             | NodeEvent::GroupOutOfStep { group }
             | NodeEvent::GroupUpgradePending { group, .. }
             | NodeEvent::GroupLeft { group } => (Some(group.clone()), None),
-            NodeEvent::CredentialOffered { offer } => {
-                self.credential_offer(persona.clone(), offer.clone());
-                (
-                    Some(offer.peer.clone()),
-                    Some((
-                        self.title_of(persona.as_deref(), &offer.peer),
-                        "Offers you a credential".into(),
-                    )),
-                )
-            }
-            NodeEvent::CredentialAsked { ask } => {
-                self.credential_ask(persona.clone(), ask.clone());
-                (
-                    Some(ask.peer.clone()),
-                    Some((
-                        self.title_of(persona.as_deref(), &ask.peer),
-                        "Asks you to prove something".into(),
-                    )),
-                )
-            }
+            // Shown in the contact's chat, with Review (no modal: a contact
+            // mustn't be able to push dialogs onto the screen).
+            NodeEvent::CredentialOffered { offer } => (
+                Some(offer.peer.clone()),
+                Some((
+                    self.title_of(persona.as_deref(), &offer.peer),
+                    "Offers you a credential".into(),
+                )),
+            ),
+            NodeEvent::CredentialAsked { ask } => (
+                Some(ask.peer.clone()),
+                Some((
+                    self.title_of(persona.as_deref(), &ask.peer),
+                    "Asks you to prove something".into(),
+                )),
+            ),
             NodeEvent::CredentialReceived { peer, schema } => {
                 self.toast(&format!(
                     "Got a credential ({schema}) from {}",
@@ -3458,7 +3454,8 @@ impl App {
         );
     }
 
-    fn credential_offer(
+    /// Reviews a credential offer: Later (also Escape) leaves it waiting.
+    pub(crate) fn credential_offer(
         self: &Rc<Self>,
         persona: Option<String>,
         offer: threnody_ffi::CredentialOfferRecord,
@@ -3478,7 +3475,11 @@ impl App {
                 offer.schema,
                 attrs.join("\n")
             ),
-            &[("decline", "Decline"), ("accept", "Accept")],
+            &[
+                ("later", "Later"),
+                ("decline", "Decline"),
+                ("accept", "Accept"),
+            ],
         );
         d.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
         let weak = Rc::downgrade(self);
@@ -3492,7 +3493,7 @@ impl App {
                     move |n| n.accept_credential_offer(id),
                     None,
                 );
-            } else {
+            } else if r == "decline" {
                 this.run(
                     persona.clone(),
                     "decline",
@@ -3504,7 +3505,9 @@ impl App {
         d.present(Some(&self.window));
     }
 
-    fn credential_ask(
+    /// Reviews a request to prove something: Later (also Escape) leaves
+    /// it waiting, and tells the contact nothing.
+    pub(crate) fn credential_ask(
         self: &Rc<Self>,
         persona: Option<String>,
         ask: threnody_ffi::CredentialAskRecord,
@@ -3522,11 +3525,21 @@ impl App {
             let d = ui::alert(
                 &format!("{who} asks for a credential ({})", ask.schema),
                 "You don't hold one.",
-                &[("decline", "Decline")],
+                &[("later", "Later"), ("decline", "Decline")],
             );
-            let id = ask.id;
-            d.connect_response(None, move |_, _| {
-                let _ = node.decline_credential(id);
+            // Enter mustn't answer for the user.
+            d.set_default_response(Some("later"));
+            let (id, weak) = (ask.id, Rc::downgrade(self));
+            d.connect_response(None, move |_, r| {
+                let Some(this) = weak.upgrade() else { return };
+                if r == "decline" {
+                    this.run(
+                        persona.clone(),
+                        "decline",
+                        move |n| n.decline_credential(id),
+                        None,
+                    );
+                }
             });
             d.present(Some(&self.window));
             return;
@@ -3537,7 +3550,11 @@ impl App {
                 "From your {} credential. Choose what to show; nothing else is revealed.",
                 ask.schema
             ),
-            &[("decline", "Decline"), ("present", "Prove")],
+            &[
+                ("later", "Later"),
+                ("decline", "Decline"),
+                ("present", "Prove"),
+            ],
         );
         d.set_response_appearance("present", adw::ResponseAppearance::Suggested);
         let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -3572,13 +3589,15 @@ impl App {
         d.connect_response(None, move |_, r| {
             let Some(this) = weak.upgrade() else { return };
             let id = ask.id;
-            if r != "present" {
+            if r == "decline" {
                 this.run(
                     persona.clone(),
                     "decline",
                     move |n| n.decline_credential(id),
                     None,
                 );
+            }
+            if r != "present" {
                 return;
             }
             let cred = matching[pick.selected() as usize].id;
