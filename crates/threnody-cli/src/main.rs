@@ -483,21 +483,27 @@ fn backup_passphrase(new: bool) -> Result<zeroize_string::Secret> {
     )?))
 }
 
-/// Fails if a node has `home` open: the desktop app (its lock) or
-/// `run --daemon` (its control socket). Holds the app's lock until dropped.
-fn no_node_running(home: &Home) -> Result<std::fs::File> {
+/// Fails if a node has `home` open, else keeps any from opening it until
+/// the returned lock is dropped. Every node holds `desktop.lock` (named
+/// for the desktop app, which took it first) while it runs: `run`, with
+/// or without `--daemon`, and the desktop app. A daemon from before that
+/// only had its control socket, so that is tried too.
+pub fn no_node_running(home: &Home) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
         let path = chat::control_path(home);
         if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            bail!("a node is running here ({}); stop it first", path.display());
+            bail!(
+                "a node is already running here ({}); stop it first",
+                path.display()
+            );
         }
     }
     std::fs::create_dir_all(home.dir())?;
     let f = std::fs::File::create(home.dir().join("desktop.lock"))?;
     if f.try_lock().is_err() {
         bail!(
-            "Threnody is running with {}; quit it first",
+            "a node is already running with {} (threnody run, or the app); stop it first",
             home.dir().display()
         );
     }
@@ -854,6 +860,7 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Forget { peer } => {
+            let _lock = contacts_editable(&home)?;
             let id = load_identity(&home)?;
             let mut contacts = home.load_contacts(&id)?;
             let c = find_contact(&contacts, &peer)?;
@@ -904,6 +911,9 @@ fn main() -> Result<()> {
             directory_threshold,
             daemon,
         } => {
+            // Two nodes with one identity would overwrite each other's
+            // sessions, prekeys and contacts.
+            let _lock = no_node_running(&home)?;
             let identity = load_identity(&home)?;
             let persona = main_identity.is_some();
             if persona && (!volunteer_relay.is_empty() || serve_directory.is_some()) {
@@ -1121,12 +1131,22 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
     Ok(())
 }
 
+/// [`no_node_running`]; a running node keeps contacts in memory and
+/// would write over the change, so it has to make it.
+fn contacts_editable(home: &Home) -> Result<std::fs::File> {
+    no_node_running(home).map_err(|e| {
+        anyhow::anyhow!("{e}, or make the change through it (threnody ctl, or the app)")
+    })
+}
+
 fn edit_contact(
     home: &Home,
     identity: &Identity,
     peer: &str,
     f: impl FnOnce(&mut Contact),
 ) -> Result<()> {
+    // A running node keeps contacts in memory and would write over this.
+    let _lock = contacts_editable(home)?;
     let mut contacts = home.load_contacts(identity)?;
     let key = find_contact(&contacts, peer)?.key;
     if let Some(c) = contacts.get_mut(&key) {

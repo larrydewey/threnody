@@ -27,8 +27,18 @@ struct Daemon {
 
 impl Daemon {
     fn start(home: &Path, extra: &[&str]) -> Self {
+        Self::start_at(home, extra, None)
+    }
+
+    /// With its control socket at `control` (`$THRENODY_CONTROL`).
+    fn start_at(home: &Path, extra: &[&str], control: Option<&Path>) -> Self {
         let log = home.with_extension("log");
-        let child = Command::new(BIN)
+        let mut cmd = Command::new(BIN);
+        cmd.env_remove("THRENODY_CONTROL");
+        if let Some(c) = control {
+            cmd.env("THRENODY_CONTROL", c);
+        }
+        let child = cmd
             .arg("--home")
             .arg(home)
             .args([
@@ -41,7 +51,6 @@ impl Daemon {
                 "--no-cover",
             ])
             .args(extra)
-            .env_remove("THRENODY_CONTROL")
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&log).unwrap())
             .stderr(Stdio::inherit())
@@ -150,4 +159,40 @@ fn ctl_without_a_service_says_so() {
     let out = threnody(dir.path(), &["ctl", "/peers"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no node running as a service"));
+}
+
+#[test]
+fn nothing_else_writes_to_a_data_directory_a_node_has_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    init(&a);
+    // Its socket elsewhere, so only the lock tells others it runs.
+    let node = Daemon::start_at(&a, &[], Some(&dir.path().join("a.sock")));
+    node.wait_for("Running as a service");
+
+    let refused = |args: &[&str]| {
+        let out = threnody(&a, args);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{args:?} ran: {err}");
+        assert!(err.contains("already running"), "{args:?}: {err}");
+    };
+    // It would write its own contacts over these.
+    refused(&["revoke", "bob"]);
+    refused(&["approve", "bob"]);
+    refused(&["name", "bob", "robert"]);
+    refused(&["forget", "bob"]);
+    refused(&["restore", "--force", "--no-keyring", "some.backup"]);
+    // A second node, interactive or not.
+    refused(&[
+        "run",
+        "--listen",
+        "127.0.0.1:0",
+        "--no-discover",
+        "--no-rendezvous",
+    ]);
+
+    drop(node);
+    let out = threnody(&a, &["revoke", "bob"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no contact matches"), "{err}");
 }
