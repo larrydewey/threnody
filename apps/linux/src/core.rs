@@ -196,6 +196,13 @@ pub struct Core {
     log: Mutex<String>,
     ui: async_channel::Sender<UiEvent>,
     metered: AtomicBool,
+    /// The window is shown (not hidden by "Keep running when closed").
+    visible: AtomicBool,
+    /// The system's power saver is on.
+    power_saver: AtomicBool,
+    /// Whether the nodes poll contacts at the foreground rate (as they
+    /// start).
+    foreground: AtomicBool,
     redialing: Mutex<HashSet<Option<String>>>,
     /// The conversation on screen while the window is focused; its
     /// messages don't notify.
@@ -243,6 +250,9 @@ impl Core {
             log: Mutex::new(String::new()),
             ui,
             metered: AtomicBool::new(false),
+            visible: AtomicBool::new(true),
+            power_saver: AtomicBool::new(false),
+            foreground: AtomicBool::new(true),
             redialing: Mutex::new(HashSet::new()),
             watching: Mutex::new(None),
             _lock: lock_file,
@@ -331,6 +341,46 @@ impl Core {
                 self.cover_ms().map_or("—".into(), |ms| format!("{ms} ms"))
             ));
         }
+        self.update_foreground();
+    }
+
+    // ----- Foreground -----
+
+    /// The window was shown or hidden.
+    pub fn set_window_visible(&self, on: bool) {
+        self.visible.store(on, Ordering::Relaxed);
+        self.update_foreground();
+    }
+
+    /// The system's power saver was turned on or off.
+    pub fn set_power_saver(&self, on: bool) {
+        self.power_saver.store(on, Ordering::Relaxed);
+        self.update_foreground();
+    }
+
+    /// Polls contacts at the foreground rate unless the window is hidden
+    /// and the network is metered or power saver is on.
+    fn update_foreground(&self) {
+        let on = foreground_wanted(
+            self.visible.load(Ordering::Relaxed),
+            self.metered.load(Ordering::Relaxed),
+            self.power_saver.load(Ordering::Relaxed),
+        );
+        if self.foreground.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        self.main.set_foreground(on);
+        let personas: Vec<Node> = lock(&self.personas)
+            .values()
+            .map(|p| p.node.clone())
+            .collect();
+        for p in personas {
+            p.set_foreground(on);
+        }
+        self.say(format!(
+            "* polling contacts at the {} rate",
+            if on { "foreground" } else { "background" }
+        ));
     }
 
     fn cover_ms(&self) -> Option<u32> {
@@ -717,6 +767,7 @@ impl Core {
         let key = format!("port_{}", rec.id);
         let want = self.settings().number(&key).unwrap_or(0);
         self.apply_privacy_to(&node, true);
+        node.set_foreground(self.foreground.load(Ordering::Relaxed));
         let addr = node
             .listen(format!("0.0.0.0:{want}"))
             .or_else(|_| node.listen("0.0.0.0:0".into()))
@@ -1349,6 +1400,14 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
     out
 }
 
+/// Whether contacts are polled at the foreground rate: always while the
+/// window is shown; hidden, unless the network is metered or power saver
+/// is on (a desktop on mains power and an unmetered network keeps it, as
+/// a contact's punch only lasts minutes).
+pub fn foreground_wanted(visible: bool, metered: bool, power_saver: bool) -> bool {
+    visible || !(metered || power_saver)
+}
+
 pub fn short(fp: &str) -> String {
     fp.chars().take(9).collect()
 }
@@ -1682,5 +1741,15 @@ mod tests {
             description: "radio: hello".into(),
         };
         assert_eq!(describe(&other), "radio: hello");
+    }
+
+    #[test]
+    fn foreground_when_shown_or_unconstrained() {
+        for metered in [false, true] {
+            for saver in [false, true] {
+                assert!(foreground_wanted(true, metered, saver));
+                assert_eq!(foreground_wanted(false, metered, saver), !metered && !saver);
+            }
+        }
     }
 }

@@ -67,6 +67,8 @@ pub struct App {
     log: RefCell<Option<gtk::TextBuffer>>,
     /// The current call, across the top of the window.
     call: Rc<CallBar>,
+    /// Kept so its power-saver signal keeps coming.
+    power: RefCell<Option<gio::PowerProfileMonitor>>,
 }
 
 impl App {
@@ -264,6 +266,7 @@ impl App {
             rebuilding: Cell::new(false),
             log: RefCell::new(None),
             call,
+            power: RefCell::new(None),
         });
         this.actions();
         this.watch(events);
@@ -1962,8 +1965,9 @@ impl App {
         self.window.connect_is_active_notify(move |w| {
             if let Some(this) = weak.upgrade() {
                 // Contacts' records are polled at the foreground rate
-                // whether or not the window has focus: a desktop runs on
-                // mains power, and a contact's punch only lasts minutes.
+                // whether or not the window has focus (a contact's punch
+                // only lasts minutes); hidden, too, unless the network is
+                // metered or power saver is on (`Core::update_foreground`).
                 let on = w.is_active();
                 this.update_watching();
                 if on && let Some(c) = this.chat.borrow().as_ref() {
@@ -1977,6 +1981,11 @@ impl App {
             if let Some(this) = weak.upgrade() {
                 this.update_watching();
             }
+        });
+        let core = self.core.clone();
+        self.window.connect_visible_notify(move |w| {
+            let (core, on) = (core.clone(), w.is_visible());
+            ui::bg_quiet(move || core.set_window_visible(on));
         });
         // Closing the window keeps the node running for messages, unless
         // the user turned that off.
@@ -2001,6 +2010,17 @@ impl App {
     }
 
     fn watch_network(self: &Rc<Self>) {
+        // Power saver slows polling while the window is hidden.
+        let ppm = gio::PowerProfileMonitor::get_default();
+        let core = self.core.clone();
+        let saver = ppm.is_power_saver_enabled();
+        ui::bg_quiet(move || core.set_power_saver(saver));
+        let core = self.core.clone();
+        ppm.connect_power_saver_enabled_notify(move |m| {
+            let (core, on) = (core.clone(), m.is_power_saver_enabled());
+            ui::bg_quiet(move || core.set_power_saver(on));
+        });
+        *self.power.borrow_mut() = Some(ppm);
         let monitor = gio::NetworkMonitor::default();
         let core = self.core.clone();
         let metered = monitor.is_network_metered();
