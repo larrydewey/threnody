@@ -220,6 +220,11 @@ pub enum Event {
         from: PublicIdentity,
         added: usize,
     },
+    /// Our own device `from` updated ticks or a file in existing history
+    /// entries: reload.
+    DeviceSync {
+        from: PublicIdentity,
+    },
     /// `peer` (or one of our devices) pinned (or unpinned) message `id`.
     Pinned {
         peer: PublicIdentity,

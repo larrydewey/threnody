@@ -9,7 +9,17 @@
 //! op 5 contact-sync { 1: contact snapshot }                      own devices only
 //! op 6 link-refused {}                                           existing -> new
 //! op 7 sibling-bundle { 1: shared prekey bundle }                own devices only
+//! op 8 transcript   { 1: conversation, 2: history }              own devices only
+//! op 9 folders      { 1: folders record }                        own devices only
+//! op 10 list        { 1: list }                                  own devices only
+//! op 11 file-want   { 1: conversation, 2: Want }                 own devices only
+//! op 12 file-part   { 2: Part }                                  own devices only
+//! op 13 file-missing { 2: Missing }                              own devices only
+//! op 14 ticks       { 1: conversation, 2: Ticks }                own devices only
 //! ```
+//!
+//! Ops 11-14 go only to devices whose `Hello` has `FEATURE_DEVICE_SYNC`
+//! (see `filesync` and `sync`).
 
 use std::time::{Duration, Instant};
 
@@ -29,6 +39,7 @@ use crate::node::{Event, Node, lock};
 pub const LINK_CODE_TTL: Duration = Duration::from_secs(600);
 const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum AccountMsg {
     Chain(Vec<u8>),
     LinkRequest {
@@ -54,6 +65,55 @@ enum AccountMsg {
     Folders(Vec<u8>),
     /// A list, with whom it's shared, or that it's deleted (see `lists`).
     List(Vec<u8>),
+    /// Asks for a file's contents (see `filesync`).
+    FileWant {
+        conversation: Vec<u8>,
+        want: Vec<u8>,
+    },
+    /// Part of a file's contents.
+    FilePart(Vec<u8>),
+    /// The file asked for isn't here.
+    FileMissing(Vec<u8>),
+    /// Delivery and read ticks for one conversation (see `sync`).
+    Ticks {
+        conversation: Vec<u8>,
+        ticks: Vec<u8>,
+    },
+}
+
+/// An `AppMessage` asking our other device for a file.
+pub(crate) fn file_want_message(conversation: Vec<u8>, want: Vec<u8>) -> Option<AppMessage> {
+    AccountMsg::FileWant { conversation, want }
+        .encode()
+        .ok()
+        .map(AppMessage::Account)
+}
+
+/// An `AppMessage` carrying part of a file.
+pub(crate) fn file_part_message(part: Vec<u8>) -> Option<AppMessage> {
+    AccountMsg::FilePart(part)
+        .encode()
+        .ok()
+        .map(AppMessage::Account)
+}
+
+/// An `AppMessage` saying a file isn't here.
+pub(crate) fn file_missing_message(body: Vec<u8>) -> Option<AppMessage> {
+    AccountMsg::FileMissing(body)
+        .encode()
+        .ok()
+        .map(AppMessage::Account)
+}
+
+/// An `AppMessage` carrying ticks for `conversation`.
+pub(crate) fn ticks_message(conversation: Vec<u8>, ticks: Vec<u8>) -> Option<AppMessage> {
+    AccountMsg::Ticks {
+        conversation,
+        ticks,
+    }
+    .encode()
+    .ok()
+    .map(AppMessage::Account)
 }
 
 /// An `AppMessage` carrying a list for our other devices.
@@ -87,6 +147,8 @@ impl AccountMsg {
     fn encode(&self) -> threnody_core::Result<Vec<u8>> {
         let hint = match self {
             Self::Transcript { history, .. } => history.len() + 64,
+            Self::FilePart(p) => p.len() + 64,
+            Self::Ticks { ticks, .. } => ticks.len() + 96,
             _ => 4096,
         };
         cbor::to_vec(hint, |e| {
@@ -126,6 +188,23 @@ impl AccountMsg {
                 } => {
                     e.map_len(3)?.u8(0)?.u8(8)?.u8(1)?.bytes(conversation)?;
                     e.u8(2)?.bytes(history)?;
+                }
+                Self::FileWant { conversation, want } => {
+                    e.map_len(3)?.u8(0)?.u8(11)?.u8(1)?.bytes(conversation)?;
+                    e.u8(2)?.bytes(want)?;
+                }
+                Self::FilePart(p) => {
+                    e.map_len(2)?.u8(0)?.u8(12)?.u8(2)?.bytes(p)?;
+                }
+                Self::FileMissing(m) => {
+                    e.map_len(2)?.u8(0)?.u8(13)?.u8(2)?.bytes(m)?;
+                }
+                Self::Ticks {
+                    conversation,
+                    ticks,
+                } => {
+                    e.map_len(3)?.u8(0)?.u8(14)?.u8(1)?.bytes(conversation)?;
+                    e.u8(2)?.bytes(ticks)?;
                 }
             }
             Ok(())
@@ -169,6 +248,16 @@ impl AccountMsg {
             8 => Self::Transcript {
                 conversation: required(one, "conversation")?,
                 history: required(two, "history")?,
+            },
+            11 => Self::FileWant {
+                conversation: required(one, "conversation")?,
+                want: required(two, "want")?,
+            },
+            12 => Self::FilePart(required(two, "part")?),
+            13 => Self::FileMissing(required(two, "missing")?),
+            14 => Self::Ticks {
+                conversation: required(one, "conversation")?,
+                ticks: required(two, "ticks")?,
             },
             other => return Err(threnody_core::Error::UnexpectedType(u64::from(other))),
         })
@@ -351,6 +440,15 @@ impl Node {
             } => self.on_transcript(from, &conversation, &history),
             AccountMsg::Folders(f) => self.on_folders(from, &f),
             AccountMsg::List(l) => self.on_list_sync(from, &l),
+            AccountMsg::FileWant { conversation, want } => {
+                self.on_file_want(from, &conversation, &want);
+            }
+            AccountMsg::FilePart(p) => self.on_file_part(from, &p),
+            AccountMsg::FileMissing(m) => self.on_file_missing(from, &m),
+            AccountMsg::Ticks {
+                conversation,
+                ticks,
+            } => self.on_ticks(from, &conversation, &ticks),
             AccountMsg::LinkRefused => {
                 let mut st = lock(&self.shared.linking);
                 if st.joining.as_ref().is_some_and(|(e, _)| *e == from)
@@ -953,6 +1051,30 @@ mod tests {
     use threnody_core::Identity;
     use threnody_core::account::Action;
     use threnody_core::store::Home;
+
+    #[test]
+    fn device_sync_ops_round_trip() {
+        for m in [
+            AccountMsg::FileWant {
+                conversation: vec![0; 33],
+                want: vec![1, 2],
+            },
+            AccountMsg::FilePart(vec![3; 1000]),
+            AccountMsg::FileMissing(vec![4]),
+            AccountMsg::Ticks {
+                conversation: vec![1; 17],
+                ticks: vec![5, 6],
+            },
+        ] {
+            assert_eq!(AccountMsg::decode(&m.encode().unwrap()).unwrap(), m);
+        }
+        let unknown = cbor::to_vec(16, |e| {
+            e.map_len(1)?.u8(0)?.u8(99)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(AccountMsg::decode(&unknown).is_err());
+    }
 
     fn add(chain: &mut AccountChain, by: &Identity, new: &Identity) {
         let mut link = chain.propose(Action::Add {

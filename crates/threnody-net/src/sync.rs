@@ -172,6 +172,26 @@ impl Node {
     }
 }
 
+// Device sync handlers (Appendix J, *Files* and *Ticks*); filled in by
+// the following changes.
+impl Node {
+    pub(crate) fn on_file_want(&self, from: PublicIdentity, _conv: &[u8], want: &[u8]) {
+        let _ = (from, threnody_core::devsync::FileWant::decode(want));
+    }
+
+    pub(crate) fn on_file_part(&self, from: PublicIdentity, part: &[u8]) {
+        let _ = (from, threnody_core::devsync::FilePart::decode(part));
+    }
+
+    pub(crate) fn on_file_missing(&self, from: PublicIdentity, body: &[u8]) {
+        let _ = (from, threnody_core::devsync::FileMissing::decode(body));
+    }
+
+    pub(crate) fn on_ticks(&self, from: PublicIdentity, _conv: &[u8], ticks: &[u8]) {
+        let _ = (from, threnody_core::devsync::Ticks::decode(ticks));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

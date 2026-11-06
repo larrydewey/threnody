@@ -110,6 +110,9 @@ pub const FEATURE_TIMER_OFF: u64 = 65536;
 /// The peer understands `AppMessage::Receipt` (delivery and read receipts,
 /// live or sealed through mailboxes, Appendix H).
 pub const FEATURE_RECEIPTS: u64 = 131072;
+/// The peer understands account messages 11-14: file fetches between our
+/// own devices and tick sync (Appendix J, *Files* and *Ticks*).
+pub const FEATURE_DEVICE_SYNC: u64 = 262144;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -127,7 +130,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_PUSH
     | FEATURE_TIMED_PROBES
     | FEATURE_TIMER_OFF
-    | FEATURE_RECEIPTS;
+    | FEATURE_RECEIPTS
+    | FEATURE_DEVICE_SYNC;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -963,6 +967,38 @@ pub fn unpad(mut msg: Vec<u8>) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_bits_are_distinct_powers_of_two() {
+        let bits = [
+            FEATURE_ACKS,
+            FEATURE_DELETE,
+            FEATURE_EDIT,
+            FEATURE_IDENTITY,
+            FEATURE_REACT,
+            FEATURE_OBSERVED,
+            FEATURE_PATHS,
+            FEATURE_CREDENTIALS,
+            FEATURE_TYPING,
+            FEATURE_READ,
+            FEATURE_CALLS,
+            FEATURE_PIN,
+            FEATURE_LISTS,
+            FEATURE_TUNNEL,
+            FEATURE_PUSH,
+            FEATURE_TIMED_PROBES,
+            FEATURE_TIMER_OFF,
+            FEATURE_RECEIPTS,
+            FEATURE_DEVICE_SYNC,
+        ];
+        let mut all = 0;
+        for b in bits {
+            assert!(b.is_power_of_two(), "{b} is not a single bit");
+            assert_eq!(all & b, 0, "{b} is used twice");
+            all |= b;
+        }
+        assert_eq!(all, FEATURES, "every bit is advertised, and only those");
+    }
 
     #[test]
     fn quotes_are_cut_short_and_need_a_sender() {

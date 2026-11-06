@@ -722,6 +722,8 @@ pub enum NodeEvent {
         invite: Option<String>,
     },
     /// Our own device `from` shared history; reload conversations.
+    /// `added`: entries new here; 0 when existing ones changed (ticks, or
+    /// a file arrived).
     HistorySynced {
         from: String,
         added: u32,
@@ -1124,6 +1126,10 @@ fn convert(e: Event) -> NodeEvent {
         Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
             from: fp(&from),
             added: u32::try_from(added).unwrap_or(u32::MAX),
+        },
+        Event::DeviceSync { from } => NodeEvent::HistorySynced {
+            from: fp(&from),
+            added: 0,
         },
         Event::Delivered { peer, group, .. } => NodeEvent::Delivered {
             peer: fp(&peer),
