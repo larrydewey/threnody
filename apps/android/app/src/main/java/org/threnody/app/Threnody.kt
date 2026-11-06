@@ -555,11 +555,12 @@ object Threnody {
     }
 
     /**
-     * Quiet notices for chats, by device: onion routing couldn't hide a
-     * session with it or a message left for it (`NodeEvent.Fallback`).
-     * Shown in the chat until dismissed there.
+     * Quiet notices for chats, by the identity that heard them (null: the
+     * main one, else a persona) and the device: onion routing couldn't
+     * hide a session with it or a message left for it (`NodeEvent.Fallback`).
+     * Shown in that identity's chat until dismissed there.
      */
-    val notices = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val notices = java.util.concurrent.ConcurrentHashMap<Pair<String?, String>, String>()
 
     /** Subscribes to node events (called on the event thread); returns an unsubscriber. */
     fun subscribe(l: (NodeEvent) -> Unit): () -> Unit {
@@ -810,7 +811,7 @@ object Threnody {
                 // The tunnel's preshared key stays out of the log.
                 is NodeEvent.TunnelUp -> say("* tunnel up with ${short(e.peer)} at ${e.endpoint}")
                 is NodeEvent.Fallback -> {
-                    notices[e.peer] = e.notice
+                    notices[persona to e.peer] = e.notice
                     say("* ${short(e.peer)}: ${e.notice}")
                 }
                 else -> say("· $e")

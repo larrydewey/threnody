@@ -54,10 +54,12 @@ pub struct App {
     lists: RefCell<Option<Rc<crate::lists::ListsWindow>>>,
     folder_chats: RefCell<HashMap<u64, HashSet<String>>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
-    /// Quiet notices for chats, by device: onion routing couldn't hide a
-    /// session with it or a message left for it (`NodeEvent::Fallback`).
-    /// Shown in the chat until dismissed there.
-    pub notices: RefCell<HashMap<String, String>>,
+    /// Quiet notices for chats, by the identity that heard them (`None`:
+    /// the main one, else a persona) and the device: onion routing
+    /// couldn't hide a session with it or a message left for it
+    /// (`NodeEvent::Fallback`). Shown in that identity's chat until
+    /// dismissed there.
+    pub notices: RefCell<HashMap<(Option<String>, String), String>>,
     chat: RefCell<Option<Rc<ChatView>>>,
     refresh_pending: Cell<bool>,
     /// Ignore selection changes while the list is rebuilt.
@@ -1396,7 +1398,7 @@ impl App {
             NodeEvent::Fallback { peer, notice } => {
                 self.notices
                     .borrow_mut()
-                    .insert(peer.clone(), notice.clone());
+                    .insert((persona.clone(), peer.clone()), notice.clone());
                 (Some(peer.clone()), None)
             }
             NodeEvent::Typing { peer, active } => {

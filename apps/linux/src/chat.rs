@@ -995,7 +995,7 @@ impl ChatView {
                 let notices = a.notices.borrow();
                 std::iter::once(&c.device)
                     .chain(&c.devices)
-                    .find_map(|d| notices.get(d).cloned())
+                    .find_map(|d| notices.get(&(c.chat.persona.clone(), d.clone())).cloned())
             });
             if let Some(n) = notice {
                 self.show_banner(&n, false, &[("OK", Self::dismiss_notice as Action)]);
@@ -1016,7 +1016,7 @@ impl ChatView {
         if let Some(app) = self.app.upgrade() {
             let mut notices = app.notices.borrow_mut();
             for d in std::iter::once(&c.device).chain(&c.devices) {
-                notices.remove(d);
+                notices.remove(&(c.chat.persona.clone(), d.clone()));
             }
         }
         self.header();

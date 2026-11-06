@@ -948,9 +948,9 @@ class ChatActivity : Activity() {
         // Onion routing couldn't hide the last session or deposit: say so
         // quietly until dismissed.
         val devices = listOf(device) + c.devices
-        devices.firstNotNullOfOrNull { Threnody.notices[it] }?.let { notice ->
+        devices.firstNotNullOfOrNull { Threnody.notices[persona to it] }?.let { notice ->
             banner(notice, "OK" to {
-                devices.forEach { Threnody.notices.remove(it) }
+                devices.forEach { Threnody.notices.remove(persona to it) }
                 refreshSoon()
             })
         }
