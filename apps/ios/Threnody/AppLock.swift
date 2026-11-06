@@ -68,6 +68,11 @@ final class AppLock: ObservableObject {
         unreadable = false
         retryAt = s.retryAtMs
         clock.setPolicy(biometric: s.biometric, awaySecs: s.awaySecs, idleSecs: s.idleSecs)
+        // Turned off, on, or changed in front: the idle time counts from now.
+        if !s.enabled || !clock.isLocked() {
+            clock.unlocked(nowMs: Self.now())
+            locked = false
+        }
     }
 
     /// The scene left (`.background`) or came back (`.active`). Face ID and

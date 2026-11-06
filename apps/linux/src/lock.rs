@@ -198,6 +198,10 @@ impl Lock {
     fn apply(self: &Rc<Self>, s: LockSettings) {
         self.unreadable.set(false);
         self.clock.set_policy(s.biometric, s.away_secs, s.idle_secs);
+        // Turned on or changed in front: the idle time counts from now.
+        if !self.clock.is_locked() {
+            self.clock.unlocked(now());
+        }
         let kind = s.kind;
         self.entry
             .set_placeholder_text(Some(if kind == Some(LockKind::Passphrase) {

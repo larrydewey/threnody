@@ -90,6 +90,9 @@ object AppLock {
         settings = s
         unreadable = false
         clock.setPolicy(s.biometric, s.awaySecs, s.idleSecs)
+        // Turned off: nothing stays locked. Turned on or changed in front:
+        // the idle time counts from now.
+        if (!s.enabled || !clock.isLocked()) clock.unlocked(now())
     }
 
     /** The app is about to open its own picker or camera: a few minutes' grace. */
@@ -143,7 +146,8 @@ object AppLock {
     private val tick = object : Runnable {
         override fun run() {
             if (started == 0) return
-            if (clock.tick(now())) resumed?.let(::showLock)
+            val a = resumed
+            if (a != null && enabled(a) && clock.tick(now())) showLock(a)
             main.postDelayed(this, TICK_MS)
         }
     }
@@ -170,20 +174,22 @@ object AppLock {
 
         override fun onActivityStarted(a: Activity) {
             started++
+            // App lock off: the clock isn't consulted (the tick checks again).
+            val on = enabled(a)
             if (started == 1) {
-                clock.returned(now())
+                if (on) clock.returned(now())
                 main.removeCallbacks(tick)
                 main.postDelayed(tick, TICK_MS)
             }
             // Before its first frame: an activity made while locked (a
             // notification tap, a link) must not show content.
-            if (clock.isLocked() && !isExempt(a)) hide(a)
+            if (on && clock.isLocked() && !isExempt(a)) hide(a)
         }
 
         override fun onActivityResumed(a: Activity) {
             resumed = a
             if (isExempt(a)) return
-            if (clock.tick(now())) showLock(a)
+            if (enabled(a) && clock.tick(now())) showLock(a)
             else a.window?.decorView?.visibility = View.VISIBLE
         }
 
@@ -195,6 +201,10 @@ object AppLock {
             started--
             if (started > 0) return
             main.removeCallbacks(tick)
+            if (!enabled(a)) {
+                expecting = false
+                return
+            }
             if (expecting) clock.leftExpectingReturn(now()) else clock.left(now())
             expecting = false
             // Recents shows nothing either (FLAG_SECURE covers the rest).
