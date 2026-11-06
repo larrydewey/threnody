@@ -198,7 +198,7 @@ impl PushState {
 }
 
 /// A uniform random number in `[0, 1)`.
-fn unit() -> f64 {
+pub(crate) fn unit() -> f64 {
     let r = u64::from_le_bytes(threnody_core::crypto::random_bytes());
     (r >> 11) as f64 / (1u64 << 53) as f64
 }

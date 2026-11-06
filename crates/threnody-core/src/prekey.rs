@@ -557,6 +557,13 @@ impl BundleBook {
             .is_some_and(|b| b.expiry_ms > now_ms)
     }
 
+    /// How many one-time prekeys of `peer`'s are left to seal with.
+    pub fn opks_left(&self, peer: &PublicIdentity) -> usize {
+        self.bundles
+            .get(peer.as_bytes())
+            .map_or(0, |b| b.opks.len())
+    }
+
     /// Forgets `peer`'s bundle (a device removed from its account).
     /// Returns true if there was one.
     pub fn remove(&mut self, peer: &PublicIdentity) -> bool {

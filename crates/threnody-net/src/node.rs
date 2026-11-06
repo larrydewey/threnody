@@ -568,6 +568,12 @@ pub(crate) struct Shared {
     pub(crate) delivery: Mutex<Delivery>,
     /// What each peer's latest `Hello` said it supports.
     pub(crate) peer_features: Mutex<HashMap<PublicIdentity, u64>>,
+    /// Delivery and read receipts waiting for their devices, and the
+    /// read-receipt switch (see `receipts`).
+    pub(crate) receipts: Mutex<crate::receipts::Outbox>,
+    /// How long a receipt waits before it is sealed: a random time in
+    /// this window (ms); tests shorten it.
+    pub(crate) receipt_delay: Mutex<(u64, u64)>,
     /// Feature bits this node puts in its contact sessions' `Hello`
     /// (`FEATURES` less any withheld with [`Node::withhold_features`]).
     features: AtomicU64,
@@ -686,6 +692,16 @@ impl Shared {
         if let Err(e) = r {
             eprintln!("threnody: failed to save {name}: {e}");
         }
+    }
+
+    /// Runs `f` on the waiting receipts and saves what it changed.
+    pub(crate) fn receipts<R>(&self, f: impl FnOnce(&mut crate::receipts::Outbox) -> R) -> R {
+        let mut o = lock(&self.receipts);
+        let r = f(&mut o);
+        if std::mem::take(&mut o.dirty) {
+            self.save_state(crate::receipts::STATE, Ok(o.encode()));
+        }
+        r
     }
 
     /// Runs `f` on the acknowledgement state and saves what it changed.
@@ -808,6 +824,13 @@ impl Node {
             };
             Delivery::load(&load("unacked"), &load("delivered-ids"))
         };
+        let receipts = cfg
+            .home
+            .load_state(&cfg.identity, crate::receipts::STATE)
+            .ok()
+            .flatten()
+            .and_then(|b| crate::receipts::Outbox::load(&b))
+            .unwrap_or_else(|| crate::receipts::Outbox::new(now_ms()));
         let (tx, rx) = mpsc::unbounded_channel();
         let tunnel = cfg
             .tunnel_port
@@ -847,6 +870,11 @@ impl Node {
             folders: Mutex::new(folders),
             lists: Mutex::new(lists),
             peer_features: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(receipts),
+            receipt_delay: Mutex::new((
+                crate::receipts::MIN_DELAY_MS,
+                crate::receipts::MAX_DELAY_MS,
+            )),
             features: AtomicU64::new(FEATURES),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
@@ -885,7 +913,10 @@ impl Node {
             .filter(|p| node.is_accepted(p))
             .collect();
         node.shared.delivery(|d| d.mark_contacts(&contacts));
+        // A fresh outbox is saved at once, so when it began stays put.
+        node.shared.receipts(|_| ());
         node.start_history_sweep();
+        node.start_receipt_flush();
         node.load_recovery();
         node.load_volunteer();
         node.load_credentials();
@@ -2149,7 +2180,7 @@ where
             if ticker.is_none() && chan.can_send() {
                 let mut waiting = VecDeque::new();
                 while let Some(m) = pending.pop_front() {
-                    match ready(shared, &peer, m, peer_acks) {
+                    match ready(node, &peer, m, peer_acks) {
                         Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
                         Ok(None) => {}
                         Err(m) => waiting.push_back(m),
@@ -2228,6 +2259,9 @@ where
                             }
                         }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        // Receipts waiting for it, by what it says it takes
+                        // now: after `peer_acks`, so tracked ones can go.
+                        pending.extend(node.receipts_for(&peer, features));
                         // Remembered across restarts: probes matter most
                         // when there is no session to ask in.
                         let timed = features & FEATURE_TIMED_PROBES != 0;
@@ -2374,6 +2408,7 @@ where
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
                         AppMessage::Push(payload) => node.on_push(peer, &payload),
+                        AppMessage::Receipt(payload) => node.on_receipt(&peer, &payload),
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}
@@ -2454,7 +2489,7 @@ where
                     // Calls can't hide behind cover traffic (their media
                     // shows anyway), and a call can't wait for ticks.
                     Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
-                        match ready(shared, &peer, m, peer_acks) {
+                        match ready(node, &peer, m, peer_acks) {
                             Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
                             Ok(None) => {}
                             Err(m) => pending.push_back(m),
@@ -2512,7 +2547,7 @@ where
                         let mut m = AppMessage::Cover;
                         for _ in 0..pending.len() {
                             let Some(next) = pending.pop_front() else { break };
-                            match ready(shared, &peer, next, peer_acks) {
+                            match ready(node, &peer, next, peer_acks) {
                                 Ok(Some(r)) => {
                                     m = r;
                                     break;
@@ -2578,19 +2613,31 @@ fn urgent(m: &AppMessage) -> bool {
 /// One the peer can't read (a change held before we knew its features) is
 /// dropped: `Ok(None)`.
 fn ready(
-    shared: &Shared,
+    node: &Node,
     peer: &PublicIdentity,
     m: AppMessage,
     peer_acks: Option<bool>,
 ) -> std::result::Result<Option<AppMessage>, AppMessage> {
+    let shared = &*node.shared;
     match (m, peer_acks) {
         (m @ AppMessage::Tracked { .. }, None) => Err(m),
         (AppMessage::Tracked { id, inner }, Some(acks)) => {
+            let features = lock(&shared.peer_features).get(peer).copied();
+            // A receipt as the switch and this session's `Hello` now allow.
+            let inner = match *inner {
+                AppMessage::Receipt(b) => {
+                    match node.receipt_ready(peer, features.unwrap_or(0), b) {
+                        Ok(b) => Box::new(AppMessage::Receipt(b)),
+                        Err(instead) => {
+                            shared.delivery(|d| d.forget(peer, id));
+                            return Ok(instead);
+                        }
+                    }
+                }
+                inner => Box::new(inner),
+            };
             let feature = needs(&inner);
-            let readable = feature == 0
-                || lock(&shared.peer_features)
-                    .get(peer)
-                    .is_some_and(|f| f & feature != 0);
+            let readable = feature == 0 || features.is_some_and(|f| f & feature != 0);
             if !readable {
                 shared.delivery(|d| d.forget(peer, id));
                 return Ok(None);
@@ -2841,4 +2888,129 @@ fn device_name() -> String {
         .map(|h| h.trim().to_owned())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "device".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use threnody_core::message::FEATURE_RECEIPTS;
+
+    fn test_node() -> (tempfile::TempDir, Node) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        (dir, node)
+    }
+
+    fn receipt(delivered: &[u64], read: &[u64]) -> AppMessage {
+        let b = threnody_core::receipt::Receipt {
+            delivered: delivered.to_vec(),
+            read: read.to_vec(),
+        }
+        .encode()
+        .unwrap();
+        AppMessage::Receipt(b)
+    }
+
+    #[test]
+    fn ready_drops_receipts_for_a_peer_without_the_bit() {
+        let (_dir, node) = test_node();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        let track = |m| shared.delivery(|d| d.track(&p, m, Tag::NONE));
+        let text = || AppMessage::Text {
+            sent_ms: 0,
+            body: "hi".into(),
+            expires_in_s: None,
+            id: 3,
+            quote: None,
+            forwarded: false,
+        };
+
+        // A peer whose fresh Hello lacks the bit (an older build, say):
+        // the receipt left from an earlier session goes, unsent.
+        lock(&shared.peer_features).insert(p, FEATURES & !FEATURE_RECEIPTS);
+        assert!(matches!(
+            ready(&node, &p, track(receipt(&[1], &[])), Some(true)),
+            Ok(None)
+        ));
+        assert_eq!(node.unacked(&p), 0);
+        let t = track(text());
+        assert_eq!(ready(&node, &p, t.clone(), Some(true)), Ok(Some(t)));
+        shared.delivery(|d| d.forget_peer(&p));
+
+        // With the bit, it goes.
+        lock(&shared.peer_features).insert(p, FEATURES);
+        let r = track(receipt(&[1], &[]));
+        assert_eq!(ready(&node, &p, r.clone(), Some(true)), Ok(Some(r)));
+        assert_eq!(node.unacked(&p), 1);
+    }
+
+    #[test]
+    fn a_receipt_for_a_downgraded_peer_keeps_its_reads() {
+        // Queued as a Receipt by the bits of an earlier session; this
+        // session's Hello has `Read` only: the reads go as a `Read`.
+        let (_dir, node) = test_node();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        let m = shared.delivery(|d| d.track(&p, receipt(&[1], &[2, 3]), Tag::NONE));
+        lock(&shared.peer_features).insert(p, FEATURES & !FEATURE_RECEIPTS);
+        let Ok(Some(AppMessage::Read { ids, .. })) = ready(&node, &p, m, Some(true)) else {
+            panic!("expected a Read");
+        };
+        assert_eq!(ids, [2, 3]);
+        assert_eq!(node.unacked(&p), 0, "not tracked any more");
+    }
+
+    #[test]
+    fn reads_off_leave_tracked_receipts_with_deliveries_only() {
+        let (_dir, node) = test_node();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        lock(&shared.peer_features).insert(p, FEATURES);
+        let both = shared.delivery(|d| d.track(&p, receipt(&[1], &[2]), Tag::NONE));
+        let read = shared.delivery(|d| d.track(&p, receipt(&[], &[4]), Tag::NONE));
+
+        // Switched off while one is in a session's queue: what goes then
+        // has no reads (read implies delivered).
+        shared.receipts(|o| o.reads_on = false);
+        assert_eq!(
+            ready(&node, &p, both.clone(), Some(true)),
+            Ok(Some(AppMessage::Tracked {
+                id: tracked_id(&both),
+                inner: Box::new(receipt(&[1, 2], &[])),
+            }))
+        );
+
+        // Switched off properly: what waits for the next session is
+        // rewritten too, so a later switch back on can't send it.
+        shared.receipts(|o| o.reads_on = true);
+        node.set_send_read_receipts(false);
+        node.set_send_read_receipts(true);
+        let resent = shared.delivery(|d| d.resend(&p));
+        let inner: Vec<AppMessage> = resent
+            .into_iter()
+            .map(|m| match m {
+                AppMessage::Tracked { inner, .. } => *inner,
+                m => m,
+            })
+            .collect();
+        assert_eq!(inner, [receipt(&[1, 2], &[]), receipt(&[4], &[])]);
+        let _ = read;
+    }
+
+    fn tracked_id(m: &AppMessage) -> u64 {
+        match m {
+            AppMessage::Tracked { id, .. } => *id,
+            _ => 0,
+        }
+    }
 }
