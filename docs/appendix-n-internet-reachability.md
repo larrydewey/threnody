@@ -164,7 +164,7 @@ An app starting after a long time away is found at the contact's next read of it
 | Who | Learns |
 |---|---|
 | A passive network observer | UDP traffic to some IP addresses, like any QUIC or BitTorrent traffic. Not who the devices are. |
-| DHT nodes | That this IP address stores and fetches small values under random-looking, hourly-changing keys. Not identities, contacts, or how many contacts (records are padded and keys don't link). |
+| DHT nodes | That this IP address stores and fetches small values under random-looking, hourly-changing keys. Not identities, contacts, or how many contacts (records are padded and keys don't link). A recovery slot (section 5) is the exception: its key is per session, not per hour, so the moves a device makes before the contact reconnects (within a day) are written under one key, and a node near it can tie those addresses together. |
 | A contact | Our current public addresses. They learn this anyway once a direct session exists. |
 | Anyone else | Nothing. Without `D(A,B)` they can neither find nor decrypt our records, nor recognise our probes. |
 
