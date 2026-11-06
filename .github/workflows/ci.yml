@@ -109,11 +109,37 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
         run: apps/android/build.sh --emulator
+      # Before the F-Droid build below, which overwrites the debug APK.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: threnody-android-debug
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
+      - name: F-Droid build (no calls)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          # Nothing in the no-calls Android tree may pull in WebRTC. (Checked
+          # on files: under pipefail, `grep -q` on a pipe can pass a match.)
+          out="$RUNNER_TEMP/nocalls"
+          mkdir -p "$out"
+          cargo tree --locked -p threnody-ffi --features boringtun --target aarch64-linux-android \
+              -e normal,build > "$out/tree.txt"
+          if grep -i 'webrtc\|livekit' "$out/tree.txt"; then
+              echo "::error::WebRTC in the no-calls dependency tree"; exit 1
+          fi
+          apps/android/build.sh --no-calls
+          apk=apps/android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -q -o "$apk" 'lib/*' 'classes*.dex' -d "$out/apk"
+          # WebRTC links statically into libthrenody_ffi.so (no separate .so to
+          # look for), so check its JNI symbols and the jar's classes instead.
+          test -s "$out/apk/lib/arm64-v8a/libthrenody_ffi.so"
+          if grep -aq 'Java_livekit_org_webrtc_' "$out/apk/lib/arm64-v8a/libthrenody_ffi.so"; then
+              echo "::error::WebRTC in the no-calls native library"; exit 1
+          fi
+          if grep -aq 'Llivekit/org/webrtc/PeerConnectionFactory;' "$out"/apk/classes*.dex; then
+              echo "::error::libwebrtc.jar classes in the no-calls APK"; exit 1
+          fi
 
   ios:
     name: iOS app

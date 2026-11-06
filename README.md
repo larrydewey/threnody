@@ -204,7 +204,7 @@ crates/threnody-ffi/bindings.sh    # generate bindings, run the Python binding t
 
 ### CI and releases
 
-Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, an Android build, an iOS simulator build and a dependency advisory check (`.github/workflows/ci.yml`). It also builds and tests on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
+Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, Android builds with and without calls (the second as F-Droid builds it), an iOS simulator build and a dependency advisory check (`.github/workflows/ci.yml`). It also builds and tests on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
 
 To release, bump `version` in the workspace `Cargo.toml`, then push a matching tag:
 

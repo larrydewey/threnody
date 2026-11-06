@@ -56,6 +56,8 @@ else
         rustup target list --installed | grep -qx "$t" || rustup target add "$t"
     done
     apps/android/build.sh --emulator
+    step "Android build without calls (as F-Droid builds it)"
+    apps/android/build.sh --no-calls
 fi
 
 # audit job

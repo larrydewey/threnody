@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Builds the Threnody Android app and optionally installs it.
-#   apps/android/build.sh [--emulator] [--release] [--install] [--native-only]
+#   apps/android/build.sh [--emulator] [--release] [--install] [--native-only] [--no-calls]
 # Phones need arm64-v8a; --emulator also builds x86_64 for the emulator.
 # --release builds the release APK, signed if THRENODY_KEYSTORE (and its
 # passwords) are set, as in CI; otherwise the debug APK is built.
 # --native-only stops before Gradle (the F-Droid recipe runs its own).
+# --no-calls builds without calls (no WebRTC, nothing prebuilt): the F-Droid build.
 # Needs: Android SDK + NDK (ANDROID_HOME, default ~/Android/Sdk), JDK 17/21
 # (JAVA_HOME) and the aarch64-linux-android Rust target. Gradle comes from the wrapper.
 set -euo pipefail
@@ -17,6 +18,7 @@ ndk="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 install=0
 release=0
 native_only=0
+calls=1
 abis=(arm64-v8a)
 for arg in "$@"; do
     case "$arg" in
@@ -24,6 +26,7 @@ for arg in "$@"; do
         --emulator) abis+=(x86_64) ;;
         --release) release=1 ;;
         --native-only) native_only=1 ;;
+        --no-calls) calls=0 ;;
         *) echo "unknown option $arg" >&2; exit 2 ;;
     esac
 done
@@ -36,6 +39,8 @@ rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 remap="--remap-path-prefix=$root=. --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rustup_home=/rustup"
 cmap="-ffile-prefix-map=$root=. -ffile-prefix-map=$cargo_home=/cargo"
 rm -rf "$here/app/src/main/jniLibs"
+features=boringtun
+(( calls )) && features+=,calls
 for abi in "${abis[@]}"; do
     case "$abi" in
         arm64-v8a) triple=aarch64-linux-android ;;
@@ -48,15 +53,17 @@ for abi in "${abis[@]}"; do
     export "AR_${var}=$ndk/llvm-ar"
     export "CARGO_TARGET_${var^^}_RUSTFLAGS=$remap"
     export "CFLAGS_${var}=$cmap" "CXXFLAGS_${var}=$cmap"
-    cargo build -q --locked --release -p threnody-ffi --target "$triple" --features boringtun,calls
+    cargo build -q --locked --release -p threnody-ffi --target "$triple" --features "$features"
     mkdir -p "$here/app/src/main/jniLibs/$abi"
     cp "target/$triple/release/libthrenody_ffi.so" "$here/app/src/main/jniLibs/$abi/"
 done
 # WebRTC's Java half (audio devices), from the prebuilt the build fetched.
-jar="$(find target -path '*-release/libwebrtc.jar' -print -quit)"
-[[ -n "$jar" ]] || { echo "libwebrtc.jar not found under target/" >&2; exit 1; }
-mkdir -p "$here/app/libs"
-cp "$jar" "$here/app/libs/libwebrtc.jar"
+if (( calls )); then
+    jar="$(find target -path '*-release/libwebrtc.jar' -print -quit)"
+    [[ -n "$jar" ]] || { echo "libwebrtc.jar not found under target/" >&2; exit 1; }
+    mkdir -p "$here/app/libs"
+    cp "$jar" "$here/app/libs/libwebrtc.jar"
+fi
 cargo build -q --locked -p threnody-ffi --features boringtun
 cargo run -q --locked -p threnody-ffi --features bindgen --bin uniffi-bindgen -- generate \
     --library target/debug/libthrenody_ffi.so --language kotlin --no-format \
@@ -65,12 +72,14 @@ cargo run -q --locked -p threnody-ffi --features bindgen --bin uniffi-bindgen --
 
 cd "$here"
 echo "sdk.dir=$sdk" > local.properties
+gradle_props=()
+(( calls )) || gradle_props=(-Pthrenody.calls=false)
 # The wrapper pins the Gradle version the Android plugin needs.
 if (( release )); then
-    ./gradlew -q assembleRelease
+    ./gradlew -q "${gradle_props[@]}" assembleRelease
     apk="$(ls "$here"/app/build/outputs/apk/release/app-release*.apk | head -1)"
 else
-    ./gradlew -q assembleDebug
+    ./gradlew -q "${gradle_props[@]}" assembleDebug
     apk="$here/app/build/outputs/apk/debug/app-debug.apk"
 fi
 echo "built $apk"

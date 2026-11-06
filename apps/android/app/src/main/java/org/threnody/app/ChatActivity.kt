@@ -188,9 +188,12 @@ class ChatActivity : Activity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         bar = TopBar(this) { finish() }.apply {
             title.text = if (group != null) "Group" else Threnody.short(device)
-            action(R.drawable.ic_videocam, if (group != null) "Group video call" else "Video call") { call(video = true) }
-            action(R.drawable.ic_call, if (group != null) "Group call" else "Call") { call() }
-            callButtons = (childCount - 2 until childCount).map { getChildAt(it) }
+            // Builds without calls (the F-Droid build) have no call buttons.
+            if (uniffi.threnody_ffi.callsBuiltIn()) {
+                action(R.drawable.ic_videocam, if (group != null) "Group video call" else "Video call") { call(video = true) }
+                action(R.drawable.ic_call, if (group != null) "Group call" else "Call") { call() }
+                callButtons = (childCount - 2 until childCount).map { getChildAt(it) }
+            }
             action(R.drawable.ic_search, "Search this chat") { search.open() }
             action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
         }

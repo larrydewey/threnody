@@ -2,6 +2,10 @@ plugins {
     id("com.android.application")
 }
 
+// Calls need LiveKit's prebuilt WebRTC; `-Pthrenody.calls=false` (the
+// F-Droid build, `build.sh --no-calls`) builds without them.
+val calls = (findProperty("threnody.calls") as String?)?.toBooleanStrict() ?: true
+
 android {
     namespace = "org.threnody.app"
     compileSdk = 36
@@ -53,6 +57,13 @@ android {
     }
 }
 
+// Without calls, a stand-in for the one WebRTC class Calls.kt names.
+androidComponents {
+    onVariants { variant ->
+        if (!calls) variant.sources.kotlin?.addStaticSourceDirectory("src/nocalls/java")
+    }
+}
+
 dependencies {
     // UniFFI's Kotlin bindings call into libthrenody_ffi.so through JNA.
     implementation("net.java.dev.jna:jna:5.19.1@aar")
@@ -65,7 +76,7 @@ dependencies {
     implementation("org.unifiedpush.android:connector:3.3.5")
     // WebRTC's Java half for calls (audio devices), from LiveKit's prebuilt
     // WebRTC; build.sh copies it here.
-    implementation(files("libs/libwebrtc.jar"))
+    if (calls) implementation(files("libs/libwebrtc.jar"))
 }
 
 /** The `[workspace.package]` version in the repository's Cargo.toml. */
