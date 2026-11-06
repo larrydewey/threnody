@@ -47,7 +47,7 @@ File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms,
                                                                        ; album id, clip duration (ms)
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
-TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D)
+TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D); may repeat within a session
 Group    = { 0 => 6, 2 => bstr .cbor GroupWire }          ; Appendix F
 Relay    = { 0 => 7, 2 => bstr .cbor RelayMsg }           ; Appendix G
 Prekeys  = { 0 => 8, 2 => bstr .cbor PrekeyBundle }       ; Appendix H
