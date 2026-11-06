@@ -153,28 +153,37 @@ impl Home {
 
     /// Loads the contact book, kept encrypted like any state (the
     /// `contacts` state file). A home from before that keeps it in plain
-    /// `contacts.cbor`: that is read, encrypted and deleted.
+    /// `contacts.cbor`: that is read, encrypted and deleted. When both are
+    /// there (an older version ran here after the upgrade and wrote what
+    /// it learned to `contacts.cbor`), the plain one is merged in first
+    /// ([`Contacts::merge_older`]), so nothing it learned is lost.
     pub fn load_contacts(&self, identity: &Identity) -> Result<Contacts> {
         let (contacts, legacy) = self.read_contacts(identity)?;
         if legacy {
             self.save_contacts(identity, &contacts)?;
-        } else {
-            secure_delete(&self.contacts_path())?;
         }
         Ok(contacts)
     }
 
-    /// The contact book, and whether it came from plain `contacts.cbor`.
-    /// Writes nothing.
+    /// The contact book, with any plain `contacts.cbor` merged in, and
+    /// whether there was one. Writes nothing.
     pub(crate) fn read_contacts(&self, identity: &Identity) -> Result<(Contacts, bool)> {
-        if let Some(b) = self.load_state(identity, CONTACTS_STATE)? {
-            return Ok((Contacts::decode(&b)?, false));
-        }
-        match fs::read(self.contacts_path()) {
-            Ok(b) => Ok((Contacts::decode(&b)?, true)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Contacts::default(), false)),
-            Err(e) => Err(e.into()),
-        }
+        let state = self.load_state(identity, CONTACTS_STATE)?;
+        let plain = match fs::read(self.contacts_path()) {
+            Ok(b) => Some(Contacts::decode(&b)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(match (state, plain) {
+            (Some(b), Some(plain)) => {
+                let mut c = Contacts::decode(&b)?;
+                c.merge_older(plain, crate::now_ms());
+                (c, true)
+            }
+            (Some(b), None) => (Contacts::decode(&b)?, false),
+            (None, Some(plain)) => (plain, true),
+            (None, None) => (Contacts::default(), false),
+        })
     }
 
     /// Stores the contact book encrypted (see [`Home::save_state`]).
@@ -714,6 +723,106 @@ impl Contacts {
         Ok(changed)
     }
 
+    /// Merges the contact book an older version wrote to plain
+    /// `contacts.cbor` on this device after the upgrade (it can't read the
+    /// `contacts` state file, so it starts from nothing). Contacts only it
+    /// knows are added as they are; for one known to both, approval,
+    /// verification, blocking and the name are taken from whichever
+    /// changed approval last (`approval_changed_ms`), the latest sighting
+    /// wins, and anything else this book lacks is filled in. Deletions made
+    /// there are kept. Returns true if anything changed.
+    pub fn merge_older(&mut self, plain: Contacts, now_ms: u64) -> bool {
+        let mut changed = false;
+        for (k, t) in plain.forgotten {
+            if self.forgotten_at(&k).is_none_or(|ours| ours < t) {
+                self.note_forgotten(k, t);
+                changed = true;
+            }
+        }
+        self.prune_forgotten(now_ms);
+        let before = self.list.len();
+        let gone: Vec<PublicIdentity> = self
+            .list
+            .iter()
+            .filter(|c| self.deleted(&c.key, c.first_seen_ms))
+            .map(|c| c.key)
+            .collect();
+        self.list.retain(|c| !gone.contains(&c.key));
+        changed |= self.list.len() != before;
+        for o in plain.list {
+            if self.deleted(&o.key, o.first_seen_ms) {
+                continue;
+            }
+            let Some(c) = self.get_mut(&o.key) else {
+                // Added while the older version ran.
+                self.list.push(o);
+                changed = true;
+                continue;
+            };
+            let was = c.clone();
+            if o.approval_changed_ms > c.approval_changed_ms {
+                c.local_approved = o.local_approved;
+                c.verified = o.verified;
+                c.blocked = o.blocked;
+                c.accepted = o.accepted;
+                c.approval_changed_ms = o.approval_changed_ms;
+                if o.petname.is_some() {
+                    c.petname = o.petname.clone();
+                }
+                if !c.local_approved {
+                    c.clear_discovery_keys();
+                }
+            } else if o.accepted && !c.accepted && !c.blocked {
+                c.accepted = true;
+            }
+            // The latest session's view of the peer.
+            if o.last_seen_ms > c.last_seen_ms {
+                c.last_seen_ms = o.last_seen_ms;
+                if o.last_addr.is_some() {
+                    c.last_addr = o.last_addr.clone();
+                }
+                c.remote_approved = o.remote_approved;
+                c.features = o.features;
+                c.timed_probes = o.timed_probes;
+                if c.local_approved
+                    && let Some(k) = o.discovery_key
+                {
+                    c.set_discovery_key(k);
+                }
+            }
+            c.first_seen_ms = c.first_seen_ms.min(o.first_seen_ms);
+            c.cleared_ms = c.cleared_ms.max(o.cleared_ms);
+            // Gaps.
+            if c.petname.is_none() {
+                c.petname = o.petname;
+            }
+            if c.last_addr.is_none() {
+                c.last_addr = o.last_addr;
+            }
+            if c.account.is_none() {
+                c.account = o.account;
+            }
+            if c.discovery_key.is_none() && c.local_approved && o.discovery_key.is_some() {
+                c.discovery_key = o.discovery_key;
+                c.discovery_older = o.discovery_older;
+            }
+            if c.profile.is_empty() {
+                c.profile = o.profile;
+            }
+            if c.shares.is_empty() {
+                c.shares = o.shares;
+            }
+            if c.revealed.is_none() {
+                c.revealed = o.revealed;
+            }
+            if c.features == 0 {
+                c.features = o.features;
+            }
+            changed |= *c != was;
+        }
+        changed
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         cbor::to_vec(
             64 + self.list.len() * 160 + self.forgotten.len() * 48,
@@ -1012,6 +1121,98 @@ mod contacts_at_rest_tests {
         assert!(!home.contacts_path().exists());
         assert!(home.load_state(&id, CONTACTS_STATE).unwrap().is_some());
         assert_eq!(home.load_contacts(&id).unwrap(), c);
+    }
+
+    /// An older version, run on a home after an upgrade, can't read
+    /// `contacts.state` and writes a fresh `contacts.cbor` of what it
+    /// learns. Coming back, both are there: nothing it learned is lost.
+    #[test]
+    fn contacts_an_older_version_added_survive_the_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(None).unwrap();
+        let (bob, dave) = (Identity::generate().public(), Identity::generate().public());
+        let mut c = Contacts::default();
+        c.observe(bob, Some("127.0.0.1:1".into()), 5);
+        let b = c.get_mut(&bob).unwrap();
+        b.petname = Some("bob".into());
+        b.local_approved = true;
+        b.approval_changed_ms = 10;
+        home.save_contacts(&id, &c).unwrap();
+
+        // The older version: bob comes back unnamed and unapproved (trust
+        // on first use), dave is new, named and approved.
+        let mut old = Contacts::default();
+        old.observe(bob, Some("127.0.0.1:2".into()), 50);
+        old.observe(dave, Some("127.0.0.1:3".into()), 60);
+        let d = old.get_mut(&dave).unwrap();
+        d.petname = Some("dave".into());
+        d.local_approved = true;
+        d.approval_changed_ms = 61;
+        home.write_contacts_file(&old.encode().unwrap()).unwrap();
+
+        let merged = home.load_contacts(&id).unwrap();
+        let d = merged.get(&dave).expect("dave, added by the older version");
+        assert_eq!(d.petname.as_deref(), Some("dave"));
+        assert!(d.local_approved);
+        let b = merged.get(&bob).unwrap();
+        assert_eq!(b.petname.as_deref(), Some("bob"), "older name kept");
+        assert!(b.local_approved, "the newer approval wins");
+        assert_eq!(
+            b.last_addr.as_deref(),
+            Some("127.0.0.1:2"),
+            "latest sighting"
+        );
+        assert_eq!(b.last_seen_ms, 50);
+        assert!(!home.contacts_path().exists(), "plain file gone");
+        assert_eq!(home.load_contacts(&id).unwrap(), merged, "and stored");
+    }
+
+    #[test]
+    fn merging_an_older_book_takes_the_newer_approval_and_fills_gaps() {
+        let (bob, carol, eve) = (
+            Identity::generate().public(),
+            Identity::generate().public(),
+            Identity::generate().public(),
+        );
+        let mut state = Contacts::default();
+        for k in [bob, carol, eve] {
+            state.observe(k, None, 1);
+        }
+        let b = state.get_mut(&bob).unwrap();
+        b.petname = Some("bob".into());
+        b.local_approved = true;
+        b.verified = true;
+        b.approval_changed_ms = 10;
+        state.get_mut(&carol).unwrap().approval_changed_ms = 10;
+
+        let mut plain = Contacts::default();
+        plain.observe(bob, None, 2);
+        plain.observe(carol, Some("carol.example:1".into()), 2);
+        let b = plain.get_mut(&bob).unwrap();
+        b.petname = Some("bob-old".into());
+        b.blocked = true;
+        b.accepted = false;
+        b.approval_changed_ms = 20; // blocked later, under the older version
+        let c = plain.get_mut(&carol).unwrap();
+        c.petname = Some("carol".into());
+        c.local_approved = true;
+        c.approval_changed_ms = 5; // older than the state's
+        c.account = Some(AccountId([4; 32]));
+        // Deleted under the older version.
+        plain.forget(&eve, 30);
+
+        assert!(state.merge_older(plain.clone(), 40));
+        let b = state.get(&bob).unwrap();
+        assert!(b.blocked && !b.local_approved && !b.verified && !b.accepted);
+        assert_eq!(b.petname.as_deref(), Some("bob-old"), "newer name");
+        let c = state.get(&carol).unwrap();
+        assert!(!c.local_approved, "older approval loses");
+        assert_eq!(c.petname.as_deref(), Some("carol"), "gap filled");
+        assert_eq!(c.last_addr.as_deref(), Some("carol.example:1"));
+        assert_eq!(c.account, Some(AccountId([4; 32])));
+        assert!(state.get(&eve).is_none(), "deletion kept");
+        assert!(!state.merge_older(plain, 40), "idempotent");
     }
 }
 
