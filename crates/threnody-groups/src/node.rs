@@ -478,6 +478,20 @@ impl GroupNode {
         extras: Extras,
     ) -> Result<()> {
         let id = threnody_net::history::local_id();
+        self.send_text_with_id(node, group, text, extras, id)
+    }
+
+    /// [`Self::send_text_with`], recorded (and sent) under `id`: a
+    /// scheduled message keeps the id it was scheduled with, so it is
+    /// never sent twice.
+    pub fn send_text_with_id(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        text: &str,
+        extras: Extras,
+        id: u64,
+    ) -> Result<()> {
         let content = Content::Text {
             text: text.to_owned(),
             id,
