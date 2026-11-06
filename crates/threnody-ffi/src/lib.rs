@@ -3867,6 +3867,13 @@ mod tests {
             ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
         let bob =
             ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        // Without cover traffic Bob's "stuck" text is written at once, so
+        // his writer hangs right away, and Alice's lease (a heartbeat of
+        // 10 s) outlasts the test: with the 2 s default it ended the
+        // session first on a slow machine.
+        for n in [&alice, &bob] {
+            n.set_cover_traffic(None);
+        }
         let (_release_a, ra) = channel();
         let (release_b, rb) = channel();
         let (to_bob, to_alice) = (
@@ -3900,11 +3907,11 @@ mod tests {
             &alice,
             |e| matches!(e, NodeEvent::Message { text, .. } if text == "hi"),
         );
-        // Bob's writes now hang; his cover traffic soon runs into that.
+        // Bob's writes now hang, starting with this one.
         to_alice.stall.store(true, Ordering::SeqCst);
         bob.send_text(alice.device_fingerprint(), "stuck".into())
             .unwrap();
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(1));
         alice
             .send_text(bob.device_fingerprint(), "still heard".into())
             .unwrap();
