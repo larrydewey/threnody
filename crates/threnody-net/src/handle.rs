@@ -33,7 +33,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::error::{NetError, Result};
-use crate::node::{Event, Node, lock};
+use crate::node::{Event, FallbackPath, Node, lock};
 use crate::reach::{ReachConfig, Urge, get_latest};
 
 /// Knocks older than this are ignored: the finder has stopped punching.
@@ -312,9 +312,14 @@ impl Node {
         if let Some(p) = self.reach_hidden(first, fp).await {
             return Ok(p);
         }
+        // From here on, whoever made the link sees our address (or a
+        // relay sees both of us).
         let mut mismatch = None;
         let mut last = match self.dial_any(&link.addrs, fp).await {
-            Ok(p) => return Ok(p),
+            Ok(p) => {
+                self.fell_back(p, FallbackPath::Direct);
+                return Ok(p);
+            }
             Err(e @ NetError::IdentityMismatch { .. }) => {
                 // A private address can be someone else's on another
                 // network; worth saying only if nothing else works.
@@ -327,12 +332,18 @@ impl Node {
             && self.reach_enabled()
         {
             match self.find_invite(key, fp).await {
-                Ok(p) => return Ok(p),
+                Ok(p) => {
+                    self.fell_back(p, FallbackPath::Direct);
+                    return Ok(p);
+                }
                 Err(e) => last = Some(e),
             }
         }
         match self.connect_relayed(fp).await {
-            Ok(p) => Ok(p),
+            Ok(p) => {
+                self.fell_back(p, FallbackPath::Relayed);
+                Ok(p)
+            }
             Err(e) => Err(mismatch.or(last).unwrap_or(e)),
         }
     }

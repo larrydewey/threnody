@@ -13,7 +13,7 @@ use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::error::{NetError, Result};
-use crate::node::{Event, Node, lock};
+use crate::node::{Event, FallbackPath, Node, lock};
 
 /// Per-recipient limits for held messages.
 pub const MAX_HELD_MESSAGES: usize = 100;
@@ -264,18 +264,29 @@ impl Node {
                             status,
                             anonymous: true,
                         }),
-                        // Every circuit failed: deliver it rather than lose it.
+                        // Every circuit failed: deliver it rather than lose
+                        // it, and say so.
                         Err(_) => {
-                            node.mailbox_send(&m, &deposit);
+                            if node.mailbox_send(&m, &deposit) {
+                                node.fell_back(dest, FallbackPath::Deposit { mailbox: m });
+                            }
                         }
                     }
                 });
             }
             return Ok(hidden.len());
         }
+        // No circuit reaches any mailbox (with onion routing on, the app
+        // hears so: each mailbox learns who writes to `dest`).
         let n = mailboxes
             .iter()
-            .filter(|m| self.mailbox_send(m, &deposit))
+            .filter(|m| {
+                let sent = self.mailbox_send(m, &deposit);
+                if sent {
+                    self.fell_back(*dest, FallbackPath::Deposit { mailbox: **m });
+                }
+                sent
+            })
             .count();
         if n == 0 {
             return Err(NetError::NoRoute(format!(

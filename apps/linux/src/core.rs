@@ -1053,6 +1053,9 @@ impl Core {
                             self.write_wireguard_conf();
                         }
                     }
+                    NodeEvent::Fallback { peer, notice } => {
+                        self.say(format!("* {}: {notice}", short(peer)));
+                    }
                     other => self.say(format!("· {other:?}")),
                 }
                 e

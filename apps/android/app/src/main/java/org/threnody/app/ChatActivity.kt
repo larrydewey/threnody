@@ -734,6 +734,7 @@ class ChatActivity : Activity() {
             is NodeEvent.Pinned -> if (e.group == null) e.peer else return false
             is NodeEvent.IdentityRevealed -> e.peer
             is NodeEvent.Typing -> e.peer
+            is NodeEvent.Fallback -> e.peer
             is NodeEvent.Read -> e.peer
             is NodeEvent.CredentialOffered -> e.offer.peer
             is NodeEvent.CredentialAsked -> e.ask.peer
@@ -937,6 +938,15 @@ class ChatActivity : Activity() {
                 "Compare" to { safety() },
                 warning = true,
             )
+        }
+        // Onion routing couldn't hide the last session or deposit: say so
+        // quietly until dismissed.
+        val devices = listOf(device) + c.devices
+        devices.firstNotNullOfOrNull { Threnody.notices[it] }?.let { notice ->
+            banner(notice, "OK" to {
+                devices.forEach { Threnody.notices.remove(it) }
+                refreshSoon()
+            })
         }
     }
 

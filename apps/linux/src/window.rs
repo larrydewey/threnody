@@ -54,6 +54,10 @@ pub struct App {
     lists: RefCell<Option<Rc<crate::lists::ListsWindow>>>,
     folder_chats: RefCell<HashMap<u64, HashSet<String>>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
+    /// Quiet notices for chats, by device: onion routing couldn't hide a
+    /// session with it or a message left for it (`NodeEvent::Fallback`).
+    /// Shown in the chat until dismissed there.
+    pub notices: RefCell<HashMap<String, String>>,
     chat: RefCell<Option<Rc<ChatView>>>,
     refresh_pending: Cell<bool>,
     /// Ignore selection changes while the list is rebuilt.
@@ -252,6 +256,7 @@ impl App {
             lists: RefCell::new(None),
             folder_chats: RefCell::new(HashMap::new()),
             unread: RefCell::new(HashMap::new()),
+            notices: RefCell::new(HashMap::new()),
             chat: RefCell::new(None),
             refresh_pending: Cell::new(false),
             rebuilding: Cell::new(false),
@@ -1372,6 +1377,12 @@ impl App {
             | NodeEvent::Reacted { peer, group }
             | NodeEvent::Pinned { peer, group, .. } => {
                 (Some(group.clone().unwrap_or_else(|| peer.clone())), None)
+            }
+            NodeEvent::Fallback { peer, notice } => {
+                self.notices
+                    .borrow_mut()
+                    .insert(peer.clone(), notice.clone());
+                (Some(peer.clone()), None)
             }
             NodeEvent::Typing { peer, active } => {
                 if let Some(chat) = self.chat.borrow().as_ref() {

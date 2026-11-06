@@ -87,6 +87,36 @@ pub struct TunnelPeer {
     pub psk: Secret,
 }
 
+/// How something went when no circuit could hide it (see
+/// [`Event::Fallback`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPath {
+    /// A session dialed straight to the peer: it sees our address, and
+    /// anyone watching our network sees that we talk.
+    Direct,
+    /// A session through a relay circuit (Appendix G): the relays know
+    /// both ends.
+    Relayed,
+    /// A sealed message for the peer, left with `mailbox` directly: the
+    /// mailbox learns that we write to the peer.
+    Deposit { mailbox: PublicIdentity },
+}
+
+impl FallbackPath {
+    /// A short notice for the chat with the peer.
+    pub fn notice(&self) -> &'static str {
+        match self {
+            Self::Direct => "Sent directly: no relay circuit was available",
+            Self::Relayed => {
+                "Sent through a relay that can see both of you: no onion circuit was available"
+            }
+            Self::Deposit { .. } => {
+                "Left with a mailbox directly: no relay circuit reached it, so it knows who sent it"
+            }
+        }
+    }
+}
+
 /// Something the user interface should know about.
 #[derive(Debug)]
 pub enum Event {
@@ -308,6 +338,14 @@ pub enum Event {
         /// Left over an onion circuit, so the mailbox didn't learn who
         /// sent it.
         anonymous: bool,
+    },
+    /// Onion routing is on, but no onion or volunteer circuit could be
+    /// used, so we reached `peer` (or left a message for it) in the open
+    /// instead (Appendix I, *Fallback*). Apps show a quiet notice in the
+    /// chat with `peer`.
+    Fallback {
+        peer: PublicIdentity,
+        path: FallbackPath,
     },
     /// An automatic dial (e.g. after discovery) failed.
     DialFailed {

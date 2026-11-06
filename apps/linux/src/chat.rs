@@ -989,6 +989,17 @@ impl ChatView {
                     &[("Compare", Self::safety as Action)],
                 );
             }
+            // Onion routing couldn't hide the last session or deposit:
+            // say so quietly until dismissed.
+            let notice = app.as_ref().and_then(|a| {
+                let notices = a.notices.borrow();
+                std::iter::once(&c.device)
+                    .chain(&c.devices)
+                    .find_map(|d| notices.get(d).cloned())
+            });
+            if let Some(n) = notice {
+                self.show_banner(&n, false, &[("OK", Self::dismiss_notice as Action)]);
+            }
         }
         if c.verified || c.group.is_some() {
             self.title.remove_css_class("warning");
@@ -998,6 +1009,17 @@ impl ChatView {
         self.composer.set_sensitive(can_send);
         self.composer.set_visible(can_send);
         self.build_menu();
+    }
+
+    fn dismiss_notice(self: &Rc<Self>) {
+        let c = self.conv.borrow().clone();
+        if let Some(app) = self.app.upgrade() {
+            let mut notices = app.notices.borrow_mut();
+            for d in std::iter::once(&c.device).chain(&c.devices) {
+                notices.remove(d);
+            }
+        }
+        self.header();
     }
 
     fn show_banner(self: &Rc<Self>, text: &str, warning: bool, buttons: &[(&str, Action)]) {
