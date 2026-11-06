@@ -2,7 +2,7 @@
 import sys
 import tempfile
 
-from threnody_ffi import NodeEvent, ThrenodyNode
+from threnody_ffi import LinkKind, NodeEvent, ThrenodyNode, classify_link
 
 
 def wait(node, kind, timeout_s=20):
@@ -21,6 +21,8 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
     addr = bob.listen("127.0.0.1:0")
     bob_fp = alice.connect(bob.invite_link(addr))
     assert bob_fp == bob.device_fingerprint()
+    assert classify_link(bob.invite_link(addr)).kind == LinkKind.INVITE
+    assert classify_link("hello") is None
     wait(bob, NodeEvent.CONNECTED)
     # Bob wants Alice's messages; otherwise they'd arrive as requests.
     bob.accept_contact(alice.device_fingerprint())

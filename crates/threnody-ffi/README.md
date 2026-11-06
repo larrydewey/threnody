@@ -21,6 +21,7 @@ The API is small and **blocking**. Each node owns a Tokio runtime, so call it fr
 | `reconnect()` | Dials mutually approved contacts that aren't connected. Call it on start and when the network returns. |
 | `create_group`, `groups()`, `invite_to_group`, `remove_from_group`, `send_group_text`, `group_history` | MLS groups (Appendix F). Invitations from mutually approved contacts are accepted automatically. Others arrive as `GroupInvited` and wait for `accept_group_invite` or `decline_group_invite`. |
 | `qr_matrix(text)` | A QR code for an invite or link code, for the app to draw. |
+| `classify_link(text)` | Whether text is exactly one invite, device link code or directory link, and which; for routing clicked, scanned and copied links. |
 | `create_link_code(addr)`, `link_with(code)` | Add a device to the account. |
 | `next_event(timeout_ms)` | Drains `NodeEvent`s: `Connected`, `Message`, `File`, `ApprovalChanged`, `AccountChanged`, `GroupMessage`, `GroupInvited`, … Group traffic is processed inside this call, so keep calling it. |
 | `shutdown()` | Stops the node. |

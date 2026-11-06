@@ -572,7 +572,8 @@ pub struct LinkCode {
     pub secret: [u8; 16],
 }
 
-const LINK_SCHEME: &str = "threnody-link://";
+/// How a link code starts.
+pub const LINK_SCHEME: &str = "threnody-link://";
 
 impl LinkCode {
     pub fn new(device: Fingerprint, addr: String) -> Self {
