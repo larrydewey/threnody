@@ -63,7 +63,10 @@ fn descriptor_digest(
     derive(label::SIG_RELAY_DESCRIPTOR, &parts)
 }
 
-fn check_addrs(addrs: &[String]) -> Result<()> {
+/// The rule relay addresses follow wherever they appear: 1 to
+/// [`MAX_ADDRS`] of them, each non-empty, at most [`MAX_ADDR_LEN`] bytes,
+/// without whitespace or control characters.
+pub fn check_relay_addrs(addrs: &[String]) -> Result<()> {
     if addrs.is_empty()
         || addrs.len() > MAX_ADDRS
         || addrs.iter().any(|a| {
@@ -79,7 +82,7 @@ fn check_addrs(addrs: &[String]) -> Result<()> {
 
 impl RelayDescriptor {
     pub fn new(identity: &Identity, addrs: Vec<String>, now_ms: u64, life_ms: u64) -> Result<Self> {
-        check_addrs(&addrs)?;
+        check_relay_addrs(&addrs)?;
         let expires_ms = now_ms + life_ms.min(MAX_DESCRIPTOR_LIFE_MS);
         let sig = identity.sign(&descriptor_digest(
             &identity.public(),
@@ -98,7 +101,7 @@ impl RelayDescriptor {
 
     /// Checks the signature and the times (not whether it has expired yet).
     pub fn verify(&self) -> Result<()> {
-        check_addrs(&self.addrs)?;
+        check_relay_addrs(&self.addrs)?;
         if self.expires_ms <= self.published_ms
             || self.expires_ms - self.published_ms > MAX_DESCRIPTOR_LIFE_MS
         {
@@ -646,7 +649,7 @@ impl FromStr for DirectoryLink {
         let (id, addr) = rest
             .split_once('@')
             .ok_or(Error::Malformed("directory link"))?;
-        check_addrs(&[addr.to_owned()])?;
+        check_relay_addrs(&[addr.to_owned()])?;
         Ok(Self {
             issuer: unbase32::<32>(id)?,
             addr: addr.to_owned(),
@@ -785,5 +788,21 @@ mod tests {
         );
         let all: Vec<u8> = (0..32).collect();
         assert_eq!(unbase32::<32>(&base32(&all)).unwrap().to_vec(), all);
+    }
+
+    #[test]
+    fn relay_address_rules() {
+        let ok =
+            |a: &[&str]| check_relay_addrs(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(ok(&["relay.example.org:7450"]).is_ok());
+        let eight: Vec<String> = (0..8).map(|i| format!("r{i}.example:7450")).collect();
+        assert!(check_relay_addrs(&eight).is_ok());
+        let nine: Vec<String> = (0..9).map(|i| format!("r{i}.example:7450")).collect();
+        assert!(check_relay_addrs(&nine).is_err());
+        assert!(ok(&[]).is_err());
+        assert!(ok(&[""]).is_err());
+        assert!(ok(&[&"a".repeat(65)]).is_err());
+        assert!(ok(&["a b:1"]).is_err());
+        assert!(ok(&["a\n:1"]).is_err());
     }
 }

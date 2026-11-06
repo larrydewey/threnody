@@ -25,6 +25,9 @@ bindgen = ["uniffi/cli"]
 boringtun = ["threnody-net/boringtun", "dep:threnody-tun"]
 # Call audio through WebRTC (prebuilt native libraries per platform).
 calls = ["dep:threnody-media"]
+# Bluetooth LE (BlueZ) and Wi-Fi Direct (NetworkManager) on Linux, for
+# desktop apps; Android and iOS bridge their own radios.
+radio = ["dep:threnody-radio"]
 
 [dependencies]
 threnody-core.workspace = true
@@ -37,6 +40,9 @@ threnody-groups = { workspace = true, features = ["node"] }
 uniffi = "0.32"
 rqrr = { version = "0.11.0", default-features = false }
 threnody-media = { path = "../threnody-media", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+threnody-radio = { workspace = true, optional = true, features = ["ble"] }
 
 [dev-dependencies]
 tempfile.workspace = true

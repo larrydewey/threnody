@@ -1049,8 +1049,12 @@ async fn wifi_direct_offers_only_between_approved_neighbours() {
     assert_eq!((peer, got), (bob_id, offer.clone()));
 
     // Bad offers are refused before they leave.
-    let mut bad = offer;
+    let mut bad = offer.clone();
     bad.passphrase = "short".into();
+    assert!(bob.offer_wifi_direct(&alice.identity(), bad).is_err());
+    // So are passphrases that aren't printable ASCII.
+    let mut bad = offer;
+    bad.passphrase = "a long passphrase\nmode=ap".into();
     assert!(bob.offer_wifi_direct(&alice.identity(), bad).is_err());
 }
 

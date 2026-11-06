@@ -196,6 +196,61 @@ async fn directories_review_relays_when_asked() {
 }
 
 #[tokio::test]
+async fn a_stopped_directory_stays_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = spawn(&dir, "directory").await;
+    let link = d.node.serve_directory(&d.addr, true).unwrap();
+    let mut v = spawn(&dir, "v").await;
+    v.node.subscribe_directory(&link).await.unwrap();
+    v.node.set_volunteer(Some(vec![v.addr.clone()])).unwrap();
+    next(
+        &mut v.rx,
+        |e| matches!(e, Event::VolunteerNote { note } if note.contains("review")),
+    )
+    .await;
+    // Saves the directory's state.
+    assert!(
+        d.node
+            .set_relay_listed(&v.node.identity().fingerprint(), true)
+    );
+    assert!(d.node.stop_serving_directory());
+    assert!(!d.node.serving_directory());
+    assert!(d.node.directory_relays().is_empty());
+    assert!(!d.node.stop_serving_directory(), "already stopped");
+    // A client is told it isn't a directory.
+    let a = spawn(&dir, "client").await;
+    assert!(a.node.subscribe_directory(&link).await.is_err());
+
+    // Nor does it come back at the next start.
+    d.node.shutdown();
+    drop(d);
+    let home = Home::new(dir.path().join("directory"));
+    let identity = home.load_identity(None).unwrap();
+    let (again, _rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    assert!(!again.serving_directory());
+}
+
+#[tokio::test]
+async fn volunteering_refuses_malformed_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = spawn(&dir, "v").await;
+    let nine: Vec<String> = (0..9).map(|i| format!("r{i}.example:7450")).collect();
+    for bad in [vec![], vec!["a b:1".to_string()], nine] {
+        assert!(v.node.set_volunteer(Some(bad.clone())).is_err(), "{bad:?}");
+        assert!(!v.node.volunteering());
+    }
+    v.node.set_volunteer(Some(vec![v.addr.clone()])).unwrap();
+    assert!(v.node.volunteering());
+}
+
+#[tokio::test]
 async fn a_link_pinning_another_directory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let d = spawn(&dir, "directory").await;

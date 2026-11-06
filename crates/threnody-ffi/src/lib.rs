@@ -28,6 +28,8 @@ mod groupcalls;
 mod groups;
 mod persona;
 mod push;
+#[cfg(all(feature = "radio", target_os = "linux"))]
+mod radio;
 pub use push::{PushEndpoint, WakeReport};
 mod schedule;
 pub use schedule::{ScheduleFailure, ScheduledInfo};
@@ -37,6 +39,7 @@ mod volunteer;
 pub use persona::{PersonaRecord, ProfileAttr};
 pub use volunteer::{
     CredentialAskRecord, CredentialOfferRecord, CredentialRecord, DirectoryRecord,
+    DirectoryRelayRecord, PendingCredentials, relay_addrs,
 };
 
 pub use calls::{CallRecord, CallStats, VideoFrame};
@@ -1002,6 +1005,18 @@ pub struct ThrenodyNode {
     /// Userspace WireGuard on a TUN descriptor (`tunnel_start_device`).
     #[cfg(all(feature = "boringtun", unix))]
     tunnel_device: Mutex<Option<threnody_net::WgDevice>>,
+    /// Bluetooth LE and Wi-Fi Direct (see `radio`).
+    #[cfg(all(feature = "radio", target_os = "linux"))]
+    radio: radio::Radio,
+}
+
+/// Radio state holds D-Bus objects that must go while the runtime (the
+/// first field, so dropped first) still exists.
+#[cfg(all(feature = "radio", target_os = "linux"))]
+impl Drop for ThrenodyNode {
+    fn drop(&mut self) {
+        self.radio_drop();
+    }
 }
 
 /// Groups an entry's reactions by emoji; `me` is our reactor id.
@@ -1467,6 +1482,14 @@ impl ThrenodyNode {
         self.node.history(conv).map(|h| h.draft).unwrap_or_default()
     }
 
+    /// Every device of `p`'s account, or just `p` without one.
+    pub(crate) fn account_devices(&self, p: &PublicIdentity) -> Vec<PublicIdentity> {
+        match self.node.account_of(p) {
+            Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
+            None => vec![*p],
+        }
+    }
+
     pub(crate) fn resolve(&self, peer: &str) -> Result<PublicIdentity> {
         match self.node.contacts().find(peer) {
             Lookup::Found(c) => Ok(c.key),
@@ -1488,6 +1511,8 @@ impl ThrenodyNode {
         passphrase: Option<String>,
         tunnel_port: Option<u16>,
     ) -> Result<Arc<Self>> {
+        #[cfg(all(feature = "radio", target_os = "linux"))]
+        let scratch = std::path::PathBuf::from(&home);
         let home = Home::new(home);
         let pw = passphrase.as_deref().map(str::as_bytes);
         let identity = if home.has_identity() {
@@ -1545,6 +1570,8 @@ impl ThrenodyNode {
                 }
             });
         }
+        #[cfg(all(feature = "radio", target_os = "linux"))]
+        let me = node.identity();
         let this = Arc::new(Self {
             rt,
             node,
@@ -1559,6 +1586,8 @@ impl ThrenodyNode {
             media,
             #[cfg(all(feature = "boringtun", unix))]
             tunnel_device: Mutex::new(None),
+            #[cfg(all(feature = "radio", target_os = "linux"))]
+            radio: radio::Radio::new(scratch, &me),
         });
         this.queue_group_updates(resumed);
         Ok(this)
@@ -1860,11 +1889,7 @@ PersistentKeepalive = 25\n",
     /// internet now.
     pub fn seek(&self, peer: String) -> Result<()> {
         let p = self.resolve(&peer)?;
-        let devices: Vec<PublicIdentity> = match self.node.account_of(&p) {
-            Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
-            None => vec![p],
-        };
-        for d in &devices {
+        for d in &self.account_devices(&p) {
             self.node.seek(d);
         }
         Ok(())
@@ -2886,8 +2911,11 @@ impl ThrenodyNode {
 
 #[uniffi::export]
 impl ThrenodyNode {
-    /// Stops listening and closes every session.
+    /// Stops listening and closes every session (and, on Linux, stops
+    /// Bluetooth and leaves Wi-Fi Direct groups).
     pub fn shutdown(&self) {
+        #[cfg(all(feature = "radio", target_os = "linux"))]
+        self.radio_shutdown();
         self.node.shutdown();
     }
 }
@@ -5056,5 +5084,128 @@ mod tests {
         ] {
             assert!(text.contains(&hex), "{file} doesn't name AID {hex}");
         }
+    }
+
+    #[test]
+    fn pending_credentials_are_listed_per_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap()
+        };
+        let (a, b, c) = (open("a"), open("b"), open("c"));
+        let addr = b.listen("127.0.0.1:0".into()).unwrap();
+        let b_fp = a.connect(b.invite_link(addr.clone())).unwrap();
+        c.connect(b.invite_link(addr)).unwrap();
+        let (a_fp, c_fp) = (a.device_fingerprint(), c.device_fingerprint());
+        for _ in 0..2 {
+            wait(&b, |e| matches!(e, NodeEvent::Connected { .. }));
+        }
+        b.accept_contact(a_fp.clone()).unwrap();
+        b.accept_contact(c_fp.clone()).unwrap();
+        // Features are exchanged in the first messages.
+        let attrs = vec![ProfileAttr {
+            key: "name".into(),
+            value: "Ada".into(),
+        }];
+        let mut offered = None;
+        for _ in 0..200 {
+            if let Ok(id) =
+                a.offer_credential(b_fp.clone(), "club/member".into(), attrs.clone(), 30)
+            {
+                offered = Some(id);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(offered.is_some(), "credentials never supported");
+        a.ask_credential(b_fp.clone(), "club/member".into(), vec!["name".into()])
+            .unwrap();
+        let (mut got_offer, mut got_ask) = (false, false);
+        for _ in 0..300 {
+            match b.next_event(100) {
+                Some(NodeEvent::CredentialOffered { .. }) => got_offer = true,
+                Some(NodeEvent::CredentialAsked { .. }) => got_ask = true,
+                _ => {}
+            }
+            if got_offer && got_ask {
+                break;
+            }
+        }
+        assert!(got_offer && got_ask);
+
+        let p = b.pending_credentials(a_fp.clone()).unwrap();
+        assert_eq!((p.offers.len(), p.asks.len()), (1, 1));
+        assert_eq!(p.offers[0].peer, a_fp);
+        assert_eq!(p.asks[0].peer, a_fp);
+        let none = b.pending_credentials(c_fp).unwrap();
+        assert!(none.offers.is_empty() && none.asks.is_empty());
+
+        b.decline_credential(p.offers[0].id).unwrap();
+        b.decline_credential(p.asks[0].id).unwrap();
+        let p = b.pending_credentials(a_fp).unwrap();
+        assert!(p.offers.is_empty() && p.asks.is_empty());
+        assert!(b.pending_credentials("UNKNOWN".into()).is_err());
+    }
+
+    #[test]
+    fn relay_addrs_parse_lists() {
+        assert_eq!(
+            relay_addrs("a.example:7450, b.example:1  [::1]:9".into()).unwrap(),
+            vec!["a.example:7450", "b.example:1", "[::1]:9"]
+        );
+        for bad in [
+            "a.example",
+            "a.example:0",
+            "a.example:70000",
+            ":7450",
+            "::1:7450",
+            "[]:1",
+            "",
+            " , ",
+        ] {
+            assert!(relay_addrs(bad.into()).is_err(), "{bad:?}");
+        }
+        let nine: Vec<String> = (0..9).map(|i| format!("r{i}.example:7450")).collect();
+        assert!(relay_addrs(nine.join(",")).is_err());
+    }
+
+    #[test]
+    fn directories_are_served_and_stopped_through_the_ffi() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap()
+        };
+        let (me, other) = (open("me"), open("other"));
+        let link = me.serve_directory("127.0.0.1:7450".into(), true).unwrap();
+        assert!(link.starts_with("threnody-dir://"), "{link}");
+        assert!(me.serving_directory());
+        assert!(me.directory_relays().is_empty());
+        assert!(
+            !me.set_relay_listed(other.device_fingerprint(), true)
+                .unwrap()
+        );
+        assert!(me.set_relay_listed("garbage".into(), true).is_err());
+        assert!(me.serve_directory("no address".into(), true).is_err());
+        assert!(me.stop_serving_directory());
+        assert!(!me.serving_directory());
+
+        let rec = me
+            .create_persona("market".into(), None, Some("pw".into()))
+            .unwrap();
+        let p = ThrenodyNode::open(rec.home, Some("pw".into()), None).unwrap();
+        assert!(p.serve_directory("127.0.0.1:7451".into(), true).is_err());
+    }
+
+    #[test]
+    fn seek_reaches_every_device_of_the_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let b = ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let addr = b.listen("127.0.0.1:0".into()).unwrap();
+        let b_fp = a.connect(b.invite_link(addr)).unwrap();
+        a.seek(b_fp.clone()).unwrap();
+        assert!(a.seek("UNKNOWN".into()).is_err());
+        let p = a.resolve(&b_fp).unwrap();
+        assert_eq!(a.account_devices(&p), vec![p]);
     }
 }

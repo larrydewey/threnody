@@ -1,6 +1,6 @@
 # Appendix K: Bluetooth LE Transport (v1)
 
-Status: implemented on Linux (`threnody-cli::ble`, using BlueZ through `bluer`) and Android (`apps/android`, using platform L2CAP sockets bridged through `threnody-ffi`'s `ByteLink`). Fulfils spec §7.2's Bluetooth Low Energy transport.
+Status: implemented on Linux (`threnody-radio::ble`, using BlueZ through `bluer`; used by `threnody run --ble` and the desktop app, where Preferences → Nearby → Bluetooth is off until switched on) and Android (`apps/android`, using platform L2CAP sockets bridged through `threnody-ffi`'s `ByteLink`). Fulfils spec §7.2's Bluetooth Low Energy transport.
 
 ## Advertising
 
@@ -42,7 +42,7 @@ The Bluetooth channel itself is **insecure** at the Bluetooth layer (no pairing,
 
 - **Linux.** A non-blocking LE L2CAP `connect` can report success before the channel exists, after which writes fail with `ENOTCONN`. The client waits until the channel's send MTU is readable (about 0.8 s on the test hardware) before starting the handshake.
 - **Linux scanning.** Scans list only devices actually heard during the scan, because BlueZ also returns cached entries with stale PSMs.
-- **Linux listening.** `threnody run --ble` binds an LE L2CAP listener on a dynamic PSM and registers the advert with BlueZ's `LEAdvertisingManager1`. While an old LE link to a peer lingers (the peer's Bluetooth stack can hold it after the app has gone), some controllers stop sending the connectable advert. The next session works once that link is dropped.
+- **Linux listening.** `threnody run --ble`, or the desktop app's Bluetooth switch, binds an LE L2CAP listener on a dynamic PSM and registers the advert with BlueZ's `LEAdvertisingManager1`. While an old LE link to a peer lingers (the peer's Bluetooth stack can hold it after the app has gone), some controllers stop sending the connectable advert. The next session works once that link is dropped.
 - **Android.** `listenUsingInsecureL2capChannel()` (API 29+) and `BluetoothLeAdvertiser`, with the `BLUETOOTH_CONNECT` and `BLUETOOTH_ADVERTISE` runtime permissions. Each accepted socket is bridged into the node through `ByteLink` / `LinkHandle`.
 - **Linux scanning for contacts.** BlueZ discovery with duplicate data on reports each advert. Every device is checked at most every 5 s.
 - **Android dialing.** A `BluetoothLeScanner` scan filtered on the service-data UUID collects adverts (`BLUETOOTH_SCAN` with `neverForLocation`), and `createInsecureL2capChannel(psm)` opens the channel. Without `BLUETOOTH_SCAN` the app still listens and advertises, so contacts can reach it. LE connection setup sometimes fails with HCI status 0x3e ("connection failed to be established"), so the app makes up to three attempts.

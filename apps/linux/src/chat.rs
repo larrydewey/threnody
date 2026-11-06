@@ -28,6 +28,8 @@ const TYPING_AGAIN: std::time::Duration = std::time::Duration::from_secs(4);
 const PEER_TYPING: std::time::Duration = std::time::Duration::from_secs(8);
 /// A banner or menu action on the open chat.
 type Action = fn(&Rc<ChatView>);
+/// Opens the review of a pending credential offer or ask.
+type Review = Box<dyn Fn(&Rc<App>)>;
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 /// A message by its time and sending device, as search finds it.
 pub type Key = (u64, String);
@@ -42,6 +44,8 @@ pub struct ChatView {
     root: adw::ToolbarView,
     title: adw::WindowTitle,
     banner: gtk::Box,
+    /// Credential offers and asks from this contact, waiting for an answer.
+    cred_banner: gtk::Box,
     messages: gtk::Box,
     scroll: gtk::ScrolledWindow,
     stack: gtk::Stack,
@@ -213,6 +217,9 @@ impl ChatView {
         let banner = gtk::Box::new(gtk::Orientation::Vertical, 6);
         banner.add_css_class("chat-banner");
         banner.set_visible(false);
+        let cred_banner = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        cred_banner.add_css_class("chat-banner");
+        cred_banner.set_visible(false);
 
         let messages = gtk::Box::new(gtk::Orientation::Vertical, 2);
         messages.set_margin_start(12);
@@ -349,6 +356,7 @@ impl ChatView {
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&banner);
+        body.append(&cred_banner);
         let pin_bar = gtk::Button::new();
         pin_bar.add_css_class("flat");
         pin_bar.add_css_class("pin-bar");
@@ -392,6 +400,7 @@ impl ChatView {
             root,
             title,
             banner,
+            cred_banner,
             messages,
             scroll,
             stack,
@@ -649,8 +658,26 @@ impl ChatView {
 
         this.update(conv);
         this.reload();
+        this.seek();
         this.input.grab_focus();
         this
+    }
+
+    /// A contact's chat opened: look for them across the internet now,
+    /// in case they aren't connected (as Android does).
+    fn seek(&self) {
+        if self.group().is_some() || self.is_note() {
+            return;
+        }
+        let (Some(app), Some(node)) = (self.app.upgrade(), self.node()) else {
+            return;
+        };
+        let (core, device) = (app.core.clone(), self.device());
+        ui::bg_quiet(move || {
+            if let Err(e) = node.seek(device) {
+                core.say(format!("! seek: {e}"));
+            }
+        });
     }
 
     pub fn widget(&self) -> &adw::ToolbarView {
@@ -812,6 +839,51 @@ impl ChatView {
         if let Some(a) = self.app.upgrade() {
             a.toast(text);
         }
+    }
+
+    /// "Faster link": the contact (a phone nearby) hosts a Wi-Fi Direct
+    /// group and this computer joins it. Asks first while joining is off.
+    fn wifi_direct(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let go = {
+            let weak = self.weak_self.clone();
+            move || {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let c = t.conv.borrow().clone();
+                let core = app.core.clone();
+                let weak = t.weak_self.clone();
+                bg(
+                    move || core.faster_link(&c.devices, &c.device, &c.title),
+                    move |r| {
+                        let Some(t) = weak.upgrade() else { return };
+                        match r {
+                            Ok(m) => t.toast(&m),
+                            Err(e) => t.toast(&format!("Couldn't ask for Wi-Fi Direct: {e}")),
+                        }
+                    },
+                );
+            }
+        };
+        if app.core.settings().opted_in(settings::WIFI_DIRECT) {
+            go();
+            return;
+        }
+        let core = app.core.clone();
+        ui::confirm(
+            &app.window,
+            "Turn on Wi-Fi Direct?",
+            "Your contact creates a Wi-Fi Direct group and this computer's Wi-Fi joins it, \
+             leaving its network until the link ends. You can turn this off in Preferences.",
+            "Turn on",
+            false,
+            move || {
+                core.settings().set_flag(settings::WIFI_DIRECT, true);
+                go();
+            },
+        );
     }
 
     /// Tells the contact (not a group) we started or stopped typing: on a
@@ -1218,6 +1290,66 @@ impl ChatView {
         self.run("apply the changes", move |n| n.take_over_group(g), None);
     }
 
+    /// One line per credential offer or ask waiting here, each with
+    /// Review (as on Android). Later, in the review, leaves it waiting.
+    fn show_credentials(self: &Rc<Self>, pending: Option<threnody_ffi::PendingCredentials>) {
+        while let Some(child) = self.cred_banner.first_child() {
+            self.cred_banner.remove(&child);
+        }
+        let p = pending.unwrap_or(threnody_ffi::PendingCredentials {
+            offers: Vec::new(),
+            asks: Vec::new(),
+        });
+        self.cred_banner
+            .set_visible(!p.offers.is_empty() || !p.asks.is_empty());
+        let title = self.conv.borrow().title.clone();
+        let persona = self.persona();
+        let line = |text: String, review: Review| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let l = ui::label(&text, &[]);
+            l.set_hexpand(true);
+            row.append(&l);
+            let b = gtk::Button::with_label("Review");
+            b.add_css_class("suggested-action");
+            b.set_valign(gtk::Align::Center);
+            let weak = self.app.clone();
+            b.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    review(&app);
+                }
+            });
+            row.append(&b);
+            self.cred_banner.append(&row);
+        };
+        for o in p.offers {
+            let text = format!("{title} offers you a credential ({}).", o.schema);
+            let persona = persona.clone();
+            line(
+                text,
+                Box::new(move |app| app.credential_offer(persona.clone(), o.clone())),
+            );
+        }
+        for a in p.asks {
+            let text = if a.keys.is_empty() {
+                format!(
+                    "{title} asks you to prove you hold a credential ({}).",
+                    a.schema
+                )
+            } else {
+                format!(
+                    "{title} asks you to prove {} ({}).",
+                    a.keys.join(", "),
+                    a.schema
+                )
+            };
+            let persona = persona.clone();
+            line(
+                text,
+                Box::new(move |app| app.credential_ask(persona.clone(), a.clone())),
+            );
+        }
+    }
+
     fn show_banner(self: &Rc<Self>, text: &str, warning: bool, buttons: &[(&str, Action)]) {
         let l = ui::label(text, &[]);
         self.banner.append(&l);
@@ -1299,6 +1431,15 @@ impl ChatView {
             if c.chat.persona.is_some() {
                 add("Reveal who you are…", "reveal", Self::reveal);
             }
+            // Never for an anonymous identity: a group would show nearby
+            // devices who it is.
+            if c.connected && c.approved && c.chat.persona.is_none() {
+                add(
+                    "Faster link (Wi-Fi Direct)",
+                    "wifi-direct",
+                    Self::wifi_direct,
+                );
+            }
             add("Clear chat…", "clear", Self::clear);
             add("Delete contact…", "delete", Self::delete_contact);
         }
@@ -1361,10 +1502,14 @@ impl ChatView {
                         node.disappearing(device.clone()).is_ok_and(|t| t.is_some()),
                     ),
                 };
-                (n, entries, pins, may_pin, draft, scheduled, timer)
+                let pending = (group.is_none() && !note)
+                    .then(|| node.pending_credentials(device.clone()).ok())
+                    .flatten();
+                (n, entries, pins, may_pin, draft, scheduled, timer, pending)
             },
-            move |(n, entries, pins, may_pin, draft, scheduled, timer)| {
+            move |(n, entries, pins, may_pin, draft, scheduled, timer, pending)| {
                 let Some(t) = weak.upgrade() else { return };
+                t.show_credentials(pending);
                 // What we left unsent here last time.
                 if !t.loaded.get() && !draft.is_empty() {
                     let buf = t.input.buffer();
