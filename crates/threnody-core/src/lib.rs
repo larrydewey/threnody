@@ -11,6 +11,7 @@ pub mod cbor;
 pub mod channel;
 pub mod credential;
 pub mod crypto;
+pub mod devsync;
 pub mod directory;
 pub mod discovery;
 pub mod error;

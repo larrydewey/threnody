@@ -61,6 +61,10 @@ pub fn needs_converting(data: &[u8]) -> bool {
 /// Removes metadata from `data` if it is an image we understand. A
 /// damaged image of a supported kind is an error rather than being sent
 /// with its metadata.
+///
+/// [`as_sent`] relies on this being deterministic across versions;
+/// changing the output makes old outgoing photos unservable from the
+/// device that sent them.
 pub fn strip(data: Vec<u8>) -> Result<Stripped> {
     Ok(match kind(&data) {
         Some(Kind::Jpeg) => Stripped::Image(strip_jpeg(&data)?),
@@ -68,6 +72,32 @@ pub fn strip(data: Vec<u8>) -> Result<Stripped> {
         Some(Kind::Webp) => Stripped::Image(strip_webp(&data)?),
         None => Stripped::Unsupported(data),
     })
+}
+
+/// The bytes that were sent of a file now `raw` on disk, recorded as
+/// `size` bytes: the metadata-stripped form if that has the recorded size
+/// (an image stripped as it was sent), else `raw` if it has, else None
+/// (the file changed since). The stripped form is tried first, so a
+/// sender's original never leaves with metadata the sent copy didn't
+/// have.
+pub fn as_sent(raw: Vec<u8>, size: u64) -> Option<Vec<u8>> {
+    if kind(&raw).is_some()
+        && let Ok(Stripped::Image(s)) = strip(raw.clone())
+        && s.len() as u64 == size
+    {
+        return Some(s);
+    }
+    (raw.len() as u64 == size).then_some(raw)
+}
+
+/// Whether a file called `name` is a picture, by its extension (the
+/// apps show these inline).
+pub fn looks_like_image(name: &str) -> bool {
+    const IMAGES: [&str; 11] = [
+        "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "bmp", "tif", "tiff",
+    ];
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| IMAGES.iter().any(|i| ext.eq_ignore_ascii_case(i)))
 }
 
 const BAD: Error = Error::Malformed("image");
@@ -515,6 +545,43 @@ mod tests {
             b"",
         ] {
             assert!(!needs_converting(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn as_sent_prefers_stripped_then_raw() {
+        let original = jpeg(&exif(6, false));
+        let Stripped::Image(stripped) = strip(original.clone()).unwrap() else {
+            panic!()
+        };
+        assert!(stripped.len() < original.len());
+        // A photo sent stripped: its stripped size is recorded.
+        assert_eq!(
+            as_sent(original.clone(), stripped.len() as u64),
+            Some(stripped.clone())
+        );
+        // A note keeps the raw size.
+        assert_eq!(
+            as_sent(original.clone(), original.len() as u64),
+            Some(original.clone())
+        );
+        // Not an image: raw, if the size matches.
+        let doc = b"%PDF-1.7 whatever".to_vec();
+        assert_eq!(as_sent(doc.clone(), doc.len() as u64), Some(doc.clone()));
+        // Changed since: neither size matches.
+        assert_eq!(as_sent(original, 3), None);
+        assert_eq!(as_sent(doc, 3), None);
+    }
+
+    #[test]
+    fn image_names() {
+        for yes in [
+            "IMG.JPG", "a.heic", "x.gif", "s.tiff", "b.bmp", "c.webp", "d.Png",
+        ] {
+            assert!(looks_like_image(yes), "{yes}");
+        }
+        for no in ["doc.pdf", "jpg", "", "a.jpg.txt", "clip.mp4"] {
+            assert!(!looks_like_image(no), "{no}");
         }
     }
 }

@@ -31,6 +31,8 @@ import android.widget.TextView
 import android.widget.Toast
 import java.util.Date
 import uniffi.threnody_ffi.Clip
+import uniffi.threnody_ffi.FileFetch
+import uniffi.threnody_ffi.FileInfo
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupBanner
 import uniffi.threnody_ffi.GroupInfo
@@ -45,6 +47,7 @@ import uniffi.threnody_ffi.ScheduledInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
+import uniffi.threnody_ffi.TickMark
 
 /**
  * One conversation, with a contact (extras [KEY] and [DEVICE]) or a group
@@ -541,8 +544,9 @@ class ChatActivity : Activity() {
         val what = if (clip.video) "video message" else "voice message"
         val length = if (clip.durationMs > 0u) Clips.clock(clip.durationMs.toLong()) else ""
         if (location == null || (f.sensitive && !e.outgoing && mark(e) !in shownClips)) {
+            val head = "${if (clip.video) "🎥" else "🎤"} ${what.replaceFirstChar { it.uppercase() }}"
             val cover = label(
-                if (location == null) "${if (clip.video) "🎥" else "🎤"} ${what.replaceFirstChar { it.uppercase() }}\nnot on this device"
+                if (location == null) "$head\n${fetchText(f) ?: "not on this device"}"
                 else "🔒\nSensitive $what\nTap to play",
                 14f, R.color.on_cover,
             ).apply {
@@ -551,8 +555,9 @@ class ChatActivity : Activity() {
                 background = rounded(color(R.color.cover), dp(12).toFloat()).apply { setStroke(dp(1), color(R.color.cover_edge)) }
                 setPadding(dp(16), dp(16), dp(16), dp(16))
                 minWidth = dp(200)
-                contentDescription = if (location == null) "$what not available" else "Sensitive $what, tap to uncover"
+                contentDescription = if (location == null) "$what: ${fetchText(f) ?: "not available"}" else "Sensitive $what, tap to uncover"
             }
+            if (location == null) fetchable(cover, f, e) { "$head\n$it" }
             if (location != null) cover.setOnClickListener {
                 shownClips.add(mark(e))
                 val parent = cover.parent as? ViewGroup ?: return@setOnClickListener
@@ -846,7 +851,7 @@ class ChatActivity : Activity() {
         // On screen: what's here is read now.
         if (started) try { node.markSeen(if (note) "notes" else g ?: key) } catch (_: Exception) {}
         val items = history.map { Item(it) } + synchronized(pending) {
-            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null, forwarded = false, list = null), sending = true) }
+            pending.map { (text, quote) -> Item(HistoryEntry(atMs = ULong.MAX_VALUE, outgoing = true, device = me, text = text, disappearing = false, file = null, delivered = false, read = false, id = 0uL, edited = false, recipients = 0u, deliveredTo = 0u, reactions = emptyList(), quote = quote, mentions = emptyList(), poll = null, forwarded = false, list = null, tick = TickMark.None), sending = true) }
         }
         val names = if (g != null) history.map { it.device }.distinct().associateWith { Threnody.nameOf(node, it) } else emptyMap()
         val pinned = try {
@@ -1131,6 +1136,7 @@ class ChatActivity : Activity() {
         messages.removeAllViews()
         bubbles.clear()
         mentionRanges.clear()
+        fetchLabels.clear()
         onScreen = items.map { it.entry }
         texts.clear()
         voiceViews.clear()
@@ -1156,6 +1162,92 @@ class ChatActivity : Activity() {
     }
 
     /** Identifies a message across reloads and search results. */
+    /** Ticks from weakest to strongest, to show an album's weakest. */
+    private fun tickRank(t: TickMark) = when (t) {
+        is TickMark.None -> 0
+        is TickMark.Sent -> 1
+        is TickMark.Partial -> 2
+        is TickMark.Delivered -> 3
+        is TickMark.Read -> 4
+    }
+
+    /**
+     * What a file whose contents aren't on this device says about getting
+     * them from another of our devices; null when none can bring them
+     * (then it says, as ever, that it isn't here).
+     */
+    private fun fetchText(f: FileInfo): String? = fetchText(f.fetch)
+
+    private fun fetchText(s: FileFetch): String? = when (s) {
+        is FileFetch.NotHere -> null
+        is FileFetch.Idle -> "Tap to get from your other device"
+        is FileFetch.Waiting -> "Waiting for your other device…"
+        is FileFetch.Fetching -> "Downloading… ${if (s.total == 0uL) 100uL else s.received * 100uL / s.total}%"
+        is FileFetch.Unavailable -> "Not on your other devices"
+    }
+
+    /** Labels of files coming from our other devices, by entry, and how each words its state. */
+    private val fetchLabels = HashMap<String, Pair<TextView, (String) -> String>>()
+    private val fetchPoll = Handler(Looper.getMainLooper())
+
+    /**
+     * Makes `view` (a missing file's label) get the file from another of
+     * our devices on a tap, while it can, and keep its progress current.
+     */
+    private fun fetchable(view: TextView, f: FileInfo, e: HistoryEntry, word: (String) -> String) {
+        if (f.fetch is FileFetch.Idle || f.fetch is FileFetch.Unavailable) view.setOnClickListener { fetch(e) }
+        if (f.fetch is FileFetch.Waiting || f.fetch is FileFetch.Fetching) {
+            fetchLabels[mark(e)] = view to word
+            pollFetches()
+        }
+    }
+
+    /** Asks our other devices for `e`'s file. */
+    private fun fetch(e: HistoryEntry) {
+        val g = group
+        Threading.background {
+            try {
+                when {
+                    note -> node.fetchNoteFile(e.atMs, e.device)
+                    g != null -> node.fetchGroupFile(g, e.atMs, e.device)
+                    else -> node.fetchFile(device, e.atMs, e.device)
+                }
+            } catch (x: Exception) {
+                runOnUiThread { Toast.makeText(this, x.message ?: "Couldn't get that file", Toast.LENGTH_LONG).show() }
+            }
+            refresh()
+        }
+        pollFetches()
+    }
+
+    /**
+     * Updates download progress once a second while anything shown is
+     * coming or waiting (cheap: no history is read).
+     */
+    private fun pollFetches() {
+        if (fetchPoll.hasMessages(FETCH_POLL)) return
+        fetchPoll.sendMessageDelayed(android.os.Message.obtain(fetchPoll) {
+            Threading.background {
+                val now = try { node.fileFetches() } catch (_: Exception) { emptyList() }
+                runOnUiThread {
+                    val byEntry = now.associateBy { mark(it.atMs, it.device) }
+                    var coming = false
+                    var finished = false
+                    for ((k, v) in fetchLabels) {
+                        val p = byEntry[k]
+                        // Gone from the queue, or nobody has it: redrawn
+                        // as it now is (with its tap to try again).
+                        if (p == null || p.fetch is FileFetch.Unavailable) { finished = true; continue }
+                        fetchText(p.fetch)?.let { v.first.text = v.second(it) }
+                        if (p.fetch is FileFetch.Fetching || p.fetch is FileFetch.Waiting) coming = true
+                    }
+                    if (finished) refreshSoon()
+                    if (coming) pollFetches()
+                }
+            }
+        }.apply { what = FETCH_POLL }, 1000)
+    }
+
     private fun mark(e: HistoryEntry) = mark(e.atMs, e.device)
     private fun mark(atMs: ULong, device: String) = "$atMs/$device"
 
@@ -1347,7 +1439,7 @@ class ChatActivity : Activity() {
             }
         }
         if (f.sensitive || location == null) {
-            return label(if (location == null) "📷\nnot available" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
+            return label(if (location == null) "📷\n${fetchText(f) ?: "not available"}" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
                 gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
                 // Opaque and dark in either theme: covered, without glare.
@@ -1355,8 +1447,9 @@ class ChatActivity : Activity() {
                     setStroke(dp(1), color(R.color.cover_edge))
                 }
                 height = if (limit == width) width else dp(180)
-                contentDescription = if (location == null) "Photo not available" else "Sensitive photo, tap to view"
+                contentDescription = if (location == null) "Photo: ${fetchText(f) ?: "not available"}" else "Sensitive photo, tap to view"
                 setOnClickListener(open)
+                if (location == null) fetchable(this, f, e) { "📷\n$it" }
             }
         }
         val view = ImageView(this).apply {
@@ -1484,6 +1577,15 @@ class ChatActivity : Activity() {
                     val uri = f.location?.let(Uri::parse)
                     if (uri != null) setOnClickListener { open(uri) }
                 })
+                if (f.location == null) fetchText(f)?.let { t ->
+                    body.addView(TextView(this).apply {
+                        text = t
+                        textSize = 13f
+                        setTextColor(fg)
+                        alpha = 0.75f
+                        fetchable(this, f, r.entry) { it }
+                    })
+                }
             }
             if (e.text.isNotBlank()) {
                 body.addView(TextView(this).apply {
@@ -1497,16 +1599,21 @@ class ChatActivity : Activity() {
         }
         // One tick once sent, two once delivered: to a device of the
         // contact, or to every member of a group (with a count until then).
-        // An eye once the contact has read it.
-        // Sent from another of our devices: that device sees its ticks.
+        // An eye once the contact has read it. An album shows its weakest.
+        // Sent from another of our devices: its ticks as that device passed
+        // them on, never a lone "sent", which only that device knows.
         val elsewhere = outgoing && !item.sending && e.device != myDevice
+        val marks = when (val t = run.map { it.entry.tick }.minByOrNull(::tickRank) ?: e.tick) {
+            is TickMark.Read -> " 👁️"
+            is TickMark.Delivered -> " ✓✓"
+            is TickMark.Partial -> " ✓ ${t.delivered}/${t.recipients}"
+            is TickMark.Sent -> " ✓"
+            else -> ""
+        }
         val tick = when {
             !outgoing || item.sending -> ""
-            elsewhere -> " · from your other device"
-            run.all { it.entry.delivered } && e.read -> " 👁️"
-            run.all { it.entry.delivered } -> " ✓✓"
-            group != null && e.deliveredTo > 0u -> " ✓ ${e.deliveredTo}/${e.recipients}"
-            else -> " ✓"
+            elsewhere -> " · from your other device$marks"
+            else -> marks
         }
         reactionChips(e, fg)?.let { body.addView(it, matchWrap) }
         body.addView(TextView(this).apply {
@@ -2444,10 +2551,7 @@ class ChatActivity : Activity() {
     /** A received or sent file's bytes, from where it was kept. */
     private fun readFile(location: String?): ByteArray {
         val l = location ?: throw IllegalStateException("that file isn't on this device")
-        return if (l.startsWith("content:") || l.startsWith("file:")) {
-            contentResolver.openInputStream(Uri.parse(l))?.use { it.readBytes() }
-                ?: throw IllegalStateException("that file is gone")
-        } else java.io.File(l).readBytes()
+        return Media.read(this, l, Long.MAX_VALUE) ?: throw IllegalStateException("that file is gone")
     }
 
     /** Keeps what's in the compose field, encrypted, for next time. */
@@ -3041,10 +3145,12 @@ class ChatActivity : Activity() {
     }
 
     override fun onDestroy() {
+        fetchPoll.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
 
     companion object {
+        private const val FETCH_POLL = 1
         /** Longest quote snippet, as the node cuts it. */
         const val MAX_QUOTE_CHARS = 200
         /** Opens the notes to self. */

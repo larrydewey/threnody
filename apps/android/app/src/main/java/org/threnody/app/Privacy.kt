@@ -41,6 +41,7 @@ object Privacy {
     private const val ANCHOR = "always_on_relay"
     private const val TUNNELS = "wireguard_tunnels"
     private const val NOTIFY_PRIVATE = "private_notifications"
+    private const val AUTO_FETCH = "fetch_from_own_devices"
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
@@ -70,6 +71,12 @@ object Privacy {
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
     fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
+    /**
+     * Photos and voice and video messages from our other devices download
+     * by themselves (not sensitive or disappearing ones, at most 30 days
+     * old), on unmetered networks only. On unless turned off.
+     */
+    fun autoFetchFiles(ctx: Context) = prefs(ctx).getBoolean(AUTO_FETCH, true)
     fun privateNotifications(ctx: Context) = prefs(ctx).getBoolean(NOTIFY_PRIVATE, true)
 
     fun setPrivateNotifications(ctx: Context, on: Boolean) =
@@ -130,6 +137,11 @@ object Privacy {
 
     fun setStripMetadata(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(STRIP, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
+
+    fun setAutoFetchFiles(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(AUTO_FETCH, on).apply()
         Threnody.applyPrivacy(ctx)
     }
 
