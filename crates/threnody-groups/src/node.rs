@@ -1624,9 +1624,10 @@ impl GroupNode {
             let Ok(roster) = self.groups.roster(&group) else {
                 continue;
             };
-            let out = if gone.contains(&lead) && node.is_own_device(&lead) {
-                // Our own coordinating device was removed: one of us takes
-                // over, the same one on every device.
+            let out = if gone.contains(&lead) && roster.role(&me) == MemberRole::Owner {
+                // The coordinating device of our account was removed (it's
+                // no longer "ours" now): one of us takes over, the same one
+                // on every device.
                 let next = roster
                     .owners
                     .iter()
@@ -2807,5 +2808,93 @@ mod tests {
             decode_expected(&[&[VERSION][..], &[3; 16]].concat()),
             [([3; 16], None)]
         );
+        // When each group's owner was last seen.
+        let seen = vec![([1; 16], 5), ([2; 16], u64::MAX)];
+        let b = encode_owner_seen(&seen);
+        assert_eq!(decode_owner_seen(&b), seen);
+        assert_eq!(decode_owner_seen(&b[..b.len() - 1]), seen[..1]);
+        assert!(decode_owner_seen(&[9, 1]).is_empty());
+    }
+
+    #[test]
+    fn claim_allowed_after_fourteen_days() {
+        let day = 24 * 60 * 60 * 1000;
+        assert!(!claim_allowed(None, 100 * day, SUCCESSION_SILENCE_MS));
+        assert!(!claim_allowed(Some(day), 14 * day, SUCCESSION_SILENCE_MS));
+        assert!(claim_allowed(Some(day), 15 * day, SUCCESSION_SILENCE_MS));
+        assert!(!claim_allowed(
+            Some(20 * day),
+            15 * day,
+            SUCCESSION_SILENCE_MS
+        ));
+    }
+
+    #[test]
+    fn member_actions_follow_roles() {
+        use MemberAction::*;
+        let mut p: Vec<PublicIdentity> = (0..6).map(|_| Identity::generate().public()).collect();
+        p.sort_by_key(|x| *x.as_bytes());
+        let (o1, o2, a1, a2, m, s) = (p[0], p[1], p[2], p[3], p[4], p[5]);
+        let mut r = Roster::legacy(o1);
+        r = r
+            .apply(&[
+                RosterChange::AddOwners(vec![o2]),
+                RosterChange::Promote(vec![a1, a2, s]),
+                RosterChange::Successor(vec![s]),
+            ])
+            .unwrap();
+        let ours = [o1, o2];
+        // The coordinator, owner.
+        assert_eq!(
+            member_actions(&r, &o1, &ours, &[m]),
+            [MakeAdmin, MakeOwner, Remove]
+        );
+        assert_eq!(
+            member_actions(&r, &o1, &ours, &[a1]),
+            [RemoveAdmin, MakeSuccessor, MakeOwner, Remove]
+        );
+        assert_eq!(
+            member_actions(&r, &o1, &ours, &[s]),
+            [RemoveAdmin, NoLongerSuccessor, MakeOwner, Remove]
+        );
+        assert!(member_actions(&r, &o1, &ours, &[o1, o2]).is_empty());
+        // Our other owner device, not coordinating.
+        assert_eq!(
+            member_actions(&r, &o2, &ours, &[o1, o2]),
+            [UseAsCoordinator, RemoveThisDevice]
+        );
+        // An admin.
+        assert_eq!(member_actions(&r, &a1, &[a1], &[m]), [Remove]);
+        assert!(member_actions(&r, &a1, &[a1], &[a2]).is_empty());
+        assert!(member_actions(&r, &a1, &[a1], &[o1, o2]).is_empty());
+        assert_eq!(member_actions(&r, &a1, &[a1], &[a1]), [StepDown]);
+        // A member.
+        for row in [&[o1, o2][..], &[a1], &[m], &[s]] {
+            assert!(member_actions(&r, &m, &[m], row).is_empty());
+        }
+    }
+
+    #[test]
+    fn banner_priority() {
+        let p = Identity::generate().public();
+        let all = banner(true, Some(p), Some((2, p)), &[p], true);
+        assert_eq!(all, Some(Banner::OutOfStep));
+        assert_eq!(
+            banner(false, Some(p), Some((2, p)), &[p], true),
+            Some(Banner::CanClaim { owner: p })
+        );
+        assert_eq!(
+            banner(false, None, Some((2, p)), &[p], true),
+            Some(Banner::PendingChanges {
+                count: 2,
+                coordinator: p
+            })
+        );
+        assert_eq!(
+            banner(false, None, Some((0, p)), &[p], true),
+            Some(Banner::UpgradePending { outdated: vec![p] })
+        );
+        assert_eq!(banner(false, None, None, &[], true), Some(Banner::OnlyYou));
+        assert_eq!(banner(false, None, None, &[], false), None);
     }
 }
