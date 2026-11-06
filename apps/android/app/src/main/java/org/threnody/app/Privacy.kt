@@ -44,7 +44,7 @@ object Privacy {
 
     /** Cover interval on Wi-Fi and other unmetered networks. */
     const val COVER_UNMETERED_MS = 2_000u
-    /** On metered (mobile) data: ~46 MB a day per connected contact. */
+    /** On metered (mobile) data: ~110 MB a day per connected contact. */
     const val COVER_METERED_MS = 10_000u
 
     @Volatile var metered = false

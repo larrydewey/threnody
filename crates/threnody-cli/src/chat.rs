@@ -1494,6 +1494,9 @@ impl Ui {
                     ),
                 }
             }
+            Event::Fallback { peer, path } => {
+                say!("* {}: {}", self.name(&peer), path.notice());
+            }
             Event::ApprovalChanged {
                 peer,
                 remote_approved,

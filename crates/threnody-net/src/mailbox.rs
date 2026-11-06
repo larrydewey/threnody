@@ -18,7 +18,7 @@ use threnody_core::{AppMessage, PublicIdentity, now_ms};
 use crate::delivery::Tag;
 use crate::error::{NetError, Result};
 use crate::history::Recorded;
-use crate::node::{Event, Node, Shared, lock};
+use crate::node::{Event, FallbackPath, Node, Shared, lock};
 
 /// Per-recipient limits for held messages.
 pub const MAX_HELD_MESSAGES: usize = 100;
@@ -596,11 +596,12 @@ impl Node {
                                 node.placement_answer(r, status);
                             }
                         }
-                        // Every circuit failed: deliver it rather than lose it.
+                        // Every circuit failed: deliver it rather than lose
+                        // it, and say so.
                         Err(_) => {
-                            if !node.deposit_direct(&m, &dest, &sealed, placement)
-                                && let Some(r) = placement
-                            {
+                            if node.deposit_direct(&m, &dest, &sealed, placement) {
+                                node.fell_back(dest, FallbackPath::Deposit { mailbox: m });
+                            } else if let Some(r) = placement {
                                 node.placement_answer(r, DepositStatus::Declined);
                             }
                         }
@@ -609,9 +610,12 @@ impl Node {
             }
             return Ok(hidden.len());
         }
+        // No circuit reaches any mailbox (with onion routing on, the app
+        // hears so: each mailbox learns who writes to `dest`).
         let mut n = 0;
         for m in &mailboxes {
             if self.deposit_direct(m, dest, &sealed, placement) {
+                self.fell_back(*dest, FallbackPath::Deposit { mailbox: *m });
                 n += 1;
             } else if let Some(r) = placement {
                 let p = lock(&self.shared.placements).unask(r);

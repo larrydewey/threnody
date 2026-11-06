@@ -158,6 +158,10 @@ Before encryption, an `AppMessage` is padded ISO/IEC 7816-4 style: a `0x80` byte
 - otherwise to the next power of two, up to 64 KiB,
 - beyond that, to the next multiple of 64 KiB.
 
+On a constant-rate link (cover traffic on, spec §9 layer 1), every frame the link's ticks send pads to at least 4096 bytes, the bucket an onion cell (`Onion`, a 2048-byte cell and its circuit header) already fills. This covers contact sessions and anonymous links (Appendix P), the session's setup messages, and its revocation on the way out. Cover, onion cells, relayed frames and short messages are then one size on the wire (6515 bytes with the length prefix), so an observer can't tell ticks that carry circuit traffic from idle ones. Before this, cover went in 256-byte buckets (a 2675-byte frame) and cells in 4096-byte ones, and a link showed when it carried a circuit. Messages bigger than 4096 bytes padded keep their own bucket. Urgent messages (call signalling and media, `Tunnel` packets) skip the ticks and aren't padded further: their timing shows anyway. Sessions without cover traffic, and sessions inside relay or onion circuits (whose links pad), use the buckets above.
+
+The receiver strips padding of any length, so this needs nothing from the peer: 0.17 nodes read these frames, and their own smaller cover frames are read as before. A link is uniform only when both ends pad this way.
+
 ## Stream framing (transport)
 
 On stream transports, each frame is prefixed with its length as a `u32` in big-endian byte order. The maximum is 16 MiB plus 4 KiB. Until the handshake has authenticated the peer, the maximum is 16 KiB: handshake messages and the anonymous-link marker are far smaller, and a receiver refuses a longer length prefix without reading the frame.

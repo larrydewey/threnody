@@ -7,7 +7,7 @@ use std::time::Duration;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, PublicIdentity};
 use threnody_net::mailbox::DepositStatus;
-use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
+use threnody_net::{AcceptPolicy, Event, FallbackPath, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
@@ -384,7 +384,46 @@ async fn deposits_are_direct_when_onion_routing_is_off() {
         )
     })
     .await;
+    // Onion routing off is the user's choice: nothing to warn about.
+    while let Ok(e) = a.rx.try_recv() {
+        assert!(!matches!(e, Event::Fallback { .. }), "{e:?}");
+    }
     let _ = (&mut r1.rx, &mut r2.rx);
+}
+
+#[tokio::test]
+async fn deposits_without_a_circuit_go_direct_and_say_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut b = spawn(&dir, "b").await;
+    let mut m = spawn(&dir, "m").await;
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut m).await;
+    link(&mut b, &mut m).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    a.node.disconnect(&bid);
+    m.node.disconnect(&bid);
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && m.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    // M is A's only live neighbour: no circuit can reach it, so the
+    // deposit goes straight to it, and the app hears so.
+    assert!(a.node.prefer_onion());
+    a.node.send_offline(&bid, &text("in the open")).unwrap();
+    let mid = m.node.identity();
+    next(&mut a.rx, |e| {
+        matches!(
+            e,
+            Event::Fallback {
+                peer,
+                path: FallbackPath::Deposit { mailbox },
+            } if *peer == bid && *mailbox == mid
+        )
+    })
+    .await;
 }
 
 /// A message with no timer that arrives through a mailbox after a restart,

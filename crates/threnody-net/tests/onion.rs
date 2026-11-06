@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use threnody_core::AppMessage;
 use threnody_core::store::Home;
-use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
+use threnody_net::{AcceptPolicy, Event, FallbackPath, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
@@ -238,7 +238,7 @@ async fn contacts_are_reached_through_onions_by_default() {
     };
     assert_eq!(transport(&a), Some("onion"));
 
-    // Turned off, it dials directly.
+    // Turned off, it dials directly, and that's no fallback.
     a.node.set_prefer_onion(false);
     a.node.disconnect(&cid);
     next(&mut c.rx, |e| matches!(e, Event::Disconnected { .. })).await;
@@ -247,6 +247,9 @@ async fn contacts_are_reached_through_onions_by_default() {
         .await
         .unwrap();
     assert_eq!(transport(&a), Some("tcp"));
+    while let Ok(e) = a.rx.try_recv() {
+        assert!(!matches!(e, Event::Fallback { .. }), "{e:?}");
+    }
 }
 
 #[tokio::test]
@@ -267,4 +270,10 @@ async fn without_relays_contacts_are_dialled_directly() {
         .find(|s| s.peer == cid)
         .unwrap();
     assert_eq!(s.transport, "tcp");
+    // Onion routing was wanted but impossible: the app hears so.
+    next(
+        &mut a.rx,
+        |e| matches!(e, Event::Fallback { peer, path: FallbackPath::Direct } if *peer == cid),
+    )
+    .await;
 }

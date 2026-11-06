@@ -16,7 +16,7 @@ The relay is an ordinary Threnody identity that is a mutually approved contact o
 - TCP and UDP port 7450 open to the internet, in the provider's firewall as well as the server's.
 - systemd 250 or newer, for encrypted credentials (any current distribution).
 
-Traffic: each connected phone sends a padded frame every 10 seconds in each direction (cover traffic), roughly 46 MB a day per phone. A relayed voice call adds about 25 MB an hour, and video a few hundred MB an hour.
+Traffic: each connected phone sends a padded frame every 10 seconds in each direction (cover traffic), roughly 110 MB a day per phone. A relayed voice call adds about 25 MB an hour, and video a few hundred MB an hour.
 
 ## 1. Install the binary
 

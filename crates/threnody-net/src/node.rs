@@ -13,7 +13,7 @@ use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::message::{
     FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURE_TIMED_PROBES, FEATURES,
-    MAX_ACK_IDS,
+    MAX_ACK_IDS, PAD_LINK,
 };
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
@@ -87,6 +87,36 @@ pub struct TunnelPeer {
     pub endpoint: SocketAddr,
     pub overlay: Ipv6Addr,
     pub psk: Secret,
+}
+
+/// How something went when no circuit could hide it (see
+/// [`Event::Fallback`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPath {
+    /// A session dialed straight to the peer: it sees our address, and
+    /// anyone watching our network sees that we talk.
+    Direct,
+    /// A session through a relay circuit (Appendix G): the relays know
+    /// both ends.
+    Relayed,
+    /// A sealed message for the peer, left with `mailbox` directly: the
+    /// mailbox learns that we write to the peer.
+    Deposit { mailbox: PublicIdentity },
+}
+
+impl FallbackPath {
+    /// A short notice for the chat with the peer.
+    pub fn notice(&self) -> &'static str {
+        match self {
+            Self::Direct => "Sent directly: no relay circuit was available",
+            Self::Relayed => {
+                "Sent through a relay that can see both of you: no onion circuit was available"
+            }
+            Self::Deposit { .. } => {
+                "Left with a mailbox directly: no relay circuit reached it, so it knows who sent it"
+            }
+        }
+    }
 }
 
 /// Something the user interface should know about.
@@ -310,6 +340,14 @@ pub enum Event {
         /// Left over an onion circuit, so the mailbox didn't learn who
         /// sent it.
         anonymous: bool,
+    },
+    /// Onion routing is on, but no onion or volunteer circuit could be
+    /// used, so we reached `peer` (or left a message for it) in the open
+    /// instead (Appendix I, *Fallback*). Apps show a quiet notice in the
+    /// chat with `peer`.
+    Fallback {
+        peer: PublicIdentity,
+        path: FallbackPath,
     },
     /// An automatic dial (e.g. after discovery) failed.
     DialFailed {
@@ -1838,7 +1876,7 @@ where
                     )
                 ) {
                     if let Some(m) = pending.pop_front() {
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
             }
@@ -2142,7 +2180,7 @@ where
                         let revoked = !lock(&shared.contacts).get(&peer).is_some_and(|c| c.local_approved);
                         if revoked && chan.can_send() {
                             for m in pending.iter().filter(|m| matches!(m, AppMessage::Approval { approved: false })) {
-                                let sealed = chan.seal(m)?;
+                                let sealed = seal_link(&mut chan, m, ticker.is_some())?;
                                 let _ = tokio::time::timeout(LAST_WORDS, write_frame(&mut wr, &sealed)).await;
                             }
                             // Close gently, reading until the peer closes too:
@@ -2167,7 +2205,9 @@ where
                     if paths_sent && shared.mutual(&peer) && node.supports(&peer, FEATURE_PATHS) {
                         if chan.can_send() {
                             if let Some(m) = node.paths_message(inner) {
-                                write_frame(&mut wr, &chan.seal(&m)?).await?;
+                                // Padded if either rate paces the link.
+                                let paced = ticker.is_some() || rate.borrow().is_some_and(|_| !inner);
+                                write_frame(&mut wr, &seal_link(&mut chan, &m, paced)?).await?;
                             }
                         } else {
                             paths_sent = false;
@@ -2191,7 +2231,7 @@ where
                                 Err(w) => pending.push_back(w),
                             }
                         }
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
             }
@@ -2218,6 +2258,19 @@ fn unack(pending: &mut VecDeque<AppMessage>, id: u64) {
         }
     }
     pending.retain(|m| !matches!(m, AppMessage::Ack(ids) if ids.is_empty()));
+}
+
+/// Seals `m` for a session or anonymous link. On a constant-rate link
+/// (`paced`) every frame pads to at least [`PAD_LINK`], the size of an
+/// onion cell's, so ticks carrying cells, messages or cover look the same
+/// (Appendix C, *Padding*). Urgent messages (calls, tunnel packets) are
+/// sealed plainly: they skip the ticks, so their size hides nothing.
+pub(crate) fn seal_link(chan: &mut SecureChannel, m: &AppMessage, paced: bool) -> Result<Vec<u8>> {
+    Ok(if paced {
+        chan.seal_padded(m, PAD_LINK)?
+    } else {
+        chan.seal(m)?
+    })
 }
 
 /// Call signalling and media, and tunnel packets: sent at once even under

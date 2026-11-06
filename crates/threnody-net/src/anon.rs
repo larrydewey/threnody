@@ -348,7 +348,7 @@ where
                 () = tick(&mut ticker) => {
                     if chan.can_send() {
                         let m = pending.pop().unwrap_or(AppMessage::Cover);
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &crate::node::seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
                 _ = idle_check.tick() => {

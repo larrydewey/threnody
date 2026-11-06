@@ -670,6 +670,13 @@ pub enum NodeEvent {
         peer: String,
         active: bool,
     },
+    /// Onion routing is on, but nothing could hide a session with `peer`,
+    /// or a message left for it, so it went in the open: show `notice`
+    /// quietly in the chat with `peer`.
+    Fallback {
+        peer: String,
+        notice: String,
+    },
     /// `peer` (a persona, to us) proved it is `identity`; `invite` reaches
     /// that identity. Also kept as `ContactInfo::revealed`.
     IdentityRevealed {
@@ -1131,6 +1138,10 @@ fn convert(e: Event) -> NodeEvent {
             call,
             reason: calls::reason(reason),
             by_us,
+        },
+        Event::Fallback { peer, path } => NodeEvent::Fallback {
+            peer: fp(&peer),
+            notice: path.notice().into(),
         },
         // Other messages (pins, reactions, lists, a file a contact sealed)
         // are applied by the node; the log gets their kind, never what
@@ -2151,7 +2162,7 @@ PersistentKeepalive = 25\n",
 
     /// Cover traffic (spec §9 layer 1): each session sends one padded frame
     /// every `interval_ms`, filler when idle, so timing shows nothing.
-    /// `None` turns it off. Each frame is about 2.7 kB. On by default.
+    /// `None` turns it off. Each frame is about 6.5 kB. On by default.
     pub fn set_cover_traffic(&self, interval_ms: Option<u32>) {
         self.node
             .set_constant_rate(interval_ms.map(|ms| Duration::from_millis(u64::from(ms.max(10)))));
@@ -2641,6 +2652,24 @@ mod tests {
         assert!(q.size >= 21);
         assert_eq!(q.dark.len(), (q.size * q.size) as usize);
         assert!(q.dark[0], "finder pattern corner is dark");
+    }
+
+    #[test]
+    fn going_in_the_open_reaches_the_app_as_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let b = ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let addr = b.listen("127.0.0.1:0".into()).unwrap();
+        // No relays to build a circuit from: the dial goes direct.
+        let b_fp = a.connect(b.invite_link(addr)).unwrap();
+        let e = wait(&a, |e| matches!(e, NodeEvent::Fallback { .. }));
+        assert_eq!(
+            e,
+            NodeEvent::Fallback {
+                peer: b_fp,
+                notice: "Sent directly: no relay circuit was available".into(),
+            }
+        );
     }
 
     #[test]

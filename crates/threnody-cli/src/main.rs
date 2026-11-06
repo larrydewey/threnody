@@ -34,8 +34,8 @@ enum KeyringAction {
     Status,
 }
 
-/// Cover-traffic interval unless told otherwise: one ~2.7 kB frame each
-/// way every 2 s per session, about 230 MB a day per connected contact.
+/// Cover-traffic interval unless told otherwise: one ~6.5 kB frame each
+/// way every 2 s per session, about 560 MB a day per connected contact.
 const DEFAULT_COVER_MS: u64 = 2000;
 
 #[derive(Parser)]
@@ -153,7 +153,7 @@ enum Cmd {
         policy: Policy,
         /// Send one padded frame per interval per session, with cover traffic
         /// when idle: hides when messages are sent, at a bandwidth cost
-        /// (each frame is about 2.7 kB). On by default.
+        /// (each frame is about 6.5 kB). On by default.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_COVER_MS, conflicts_with = "no_cover")]
         constant_rate_ms: u64,
         /// Turn cover traffic off (messages go out as soon as they're sent).
@@ -215,8 +215,18 @@ enum Cmd {
         /// relay tokens. Prints the link to share.
         #[arg(long, value_name = "HOST:PORT")]
         serve_directory: Option<String>,
-        /// With --serve-directory: list relays only after `/directory list`.
+        /// With --serve-directory: list relays as soon as they prove
+        /// reachable, without waiting for `/directory list <relay>`. Review
+        /// is on by default.
         #[arg(long, requires = "serve_directory")]
+        no_review_relays: bool,
+        /// Accepted for older service files and does nothing: relays wait
+        /// for review by default (see --no-review-relays).
+        #[arg(
+            long,
+            requires = "serve_directory",
+            conflicts_with = "no_review_relays"
+        )]
         review_relays: bool,
         /// Never route through volunteer relays, even with directories
         /// subscribed.
@@ -925,7 +935,8 @@ fn main() -> Result<()> {
             wifi_direct,
             volunteer_relay,
             serve_directory,
-            review_relays,
+            no_review_relays,
+            review_relays: _,
             no_volunteers,
             directory_threshold,
             daemon,
@@ -997,7 +1008,7 @@ fn main() -> Result<()> {
                     apply: wg_apply,
                 }),
                 volunteer_relay,
-                serve_directory: serve_directory.map(|a| (a, review_relays)),
+                serve_directory: directory_opts(serve_directory, no_review_relays),
                 use_volunteers: !no_volunteers,
                 directory_threshold,
                 control,
@@ -1217,6 +1228,13 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
     Ok(())
 }
 
+/// The directory to serve, and whether relays wait for the operator's
+/// review before they're listed: yes unless `--no-review-relays` (every
+/// protection is on until turned off).
+fn directory_opts(serve: Option<String>, no_review: bool) -> Option<(String, bool)> {
+    serve.map(|a| (a, !no_review))
+}
+
 /// [`no_node_running`]; a running node keeps contacts in memory and
 /// would write over the change, so it has to make it.
 fn contacts_editable(home: &Home) -> Result<std::fs::File> {
@@ -1253,5 +1271,49 @@ mod tests {
         assert_eq!(made_ago(now - 2 * 86_400_000, now), "2 days ago");
         assert_eq!(made_ago(now - 5_000, now), "under a minute ago");
         assert_eq!(made_ago(now + 5_000, now), "just now");
+    }
+
+    /// The directory options `args` give `threnody run`.
+    fn directory(args: &[&str]) -> Option<(String, bool)> {
+        let cli = Cli::try_parse_from(["threnody", "run"].iter().chain(args)).unwrap();
+        let Cmd::Run {
+            serve_directory,
+            no_review_relays,
+            ..
+        } = cli.cmd
+        else {
+            unreachable!()
+        };
+        directory_opts(serve_directory, no_review_relays)
+    }
+
+    #[test]
+    fn directories_review_relays_unless_told_not_to() {
+        let at = "dir.example.org:7450";
+        assert_eq!(directory(&[]), None);
+        assert_eq!(
+            directory(&["--serve-directory", at]),
+            Some((at.into(), true))
+        );
+        assert_eq!(
+            directory(&["--serve-directory", at, "--no-review-relays"]),
+            Some((at.into(), false))
+        );
+        // Older service files still start.
+        assert_eq!(
+            directory(&["--serve-directory", at, "--review-relays"]),
+            Some((at.into(), true))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "threnody",
+                "run",
+                "--serve-directory",
+                at,
+                "--review-relays",
+                "--no-review-relays"
+            ])
+            .is_err()
+        );
     }
 }

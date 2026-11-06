@@ -78,6 +78,10 @@ op: 1 create, 2 created, 3 cell, 4 destroy
 
 Nodes reach contacts through onion circuits first, by default (`Node::reach`, the CLI and the apps). That happens whenever a two-relay path could exist: a live, mutually approved neighbour, plus another approved contact. If building a circuit fails or takes over 10 s, the node tries volunteer relays when its subscribed directories offer a route and an address is known (Appendix P, for up to 60 s), then falls back to a direct dial, then to a relay circuit (Appendix G). `--no-onion`, or the app's toggle, turns this off. `/onion` still builds a circuit on demand.
 
+### Fallback
+
+Falling back is a privacy downgrade: a direct dial shows the contact our address and shows anyone watching our network whom we talk to, and a relay circuit's relays know both ends. An attacker can force it, for example as the only live first hop dropping our cells. So when onion routing is on and a contact (or an invite's maker) is reached in the open after hidden paths failed or weren't possible, the node emits `Event::Fallback { peer, path }`, with `path` `Direct` or `Relayed`. The same goes for mailbox deposits (Appendix H): each deposit left with a mailbox directly gives `Fallback` with `path` `Deposit { mailbox }`. With onion routing off, going direct is the user's choice and nothing is emitted. The FFI passes it on as `NodeEvent::Fallback { peer, notice }`, with a short notice such as "Sent directly: no relay circuit was available". The Android and Linux apps show it quietly in the chat with that contact, as a dismissable line above the messages, until it is dismissed. Notices are kept in memory only. The CLI prints them. There is no strict mode that refuses to fall back.
+
 ## Path selection
 
 A tries paths in this order:
@@ -90,5 +94,5 @@ If any extension fails, A destroys the circuit and tries the next path.
 ## Known limits
 
 - **Unauthenticated layers.** As in Tor's original design, the per-hop layers aren't individually authenticated. Tampering is detected end to end, because the inner session is AEAD. But colluding first and last hops could tag cells to confirm they are on the same circuit, and such hops can already link them by timing.
-- **No cover traffic inside circuits.** Link-level constant-rate mode (§9 layer 1) still applies to each hop.
+- **No cover traffic inside circuits.** Link-level constant-rate mode (§9 layer 1) still applies to each hop, and pads every frame of the link to an onion cell's size (Appendix C, *Padding*), so a link's ticks look the same whether or not they carry a cell.
 - **Contacts-only relays.** Without directories, A can only use relays that are its own contacts. Volunteer relays from subscribed directories (Appendix P) lift this.

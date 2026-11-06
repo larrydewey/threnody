@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
-use crate::node::{Node, lock};
+use crate::node::{Event, FallbackPath, Node, lock};
 
 /// Most relays a circuit may pass through.
 pub const MAX_TTL: u8 = 3;
@@ -488,13 +488,33 @@ impl Node {
             Some(a) => self.connect(a, pin).await,
             None => Err(NetError::NoRoute("no address".into())),
         };
+        // Only a contact we could have hidden from (we know who it is)
+        // falls back.
+        let fell_back = |p: PublicIdentity, path| {
+            if pin.is_some() {
+                self.fell_back(p, path);
+            }
+            p
+        };
         match (direct, pin) {
-            (Ok(p), _) => Ok(p),
+            (Ok(p), _) => Ok(fell_back(p, FallbackPath::Direct)),
             (Err(NetError::IdentityMismatch { expected, got }), _) => {
                 Err(NetError::IdentityMismatch { expected, got })
             }
-            (Err(_), Some(fp)) => self.connect_relayed(fp).await,
+            (Err(_), Some(fp)) => self
+                .connect_relayed(fp)
+                .await
+                .map(|p| fell_back(p, FallbackPath::Relayed)),
             (Err(e), None) => Err(e),
+        }
+    }
+
+    /// Tells the app that `peer` was reached in the open after hidden
+    /// paths failed, if we wanted them (with onion routing off, going
+    /// direct is the user's choice).
+    pub(crate) fn fell_back(&self, peer: PublicIdentity, path: FallbackPath) {
+        if self.prefer_onion() {
+            self.emit(Event::Fallback { peer, path });
         }
     }
 

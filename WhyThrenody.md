@@ -10,7 +10,7 @@ That is why Threnody exists.
 
 - **No central servers by design.** No phone numbers. No provider accounts. No company that can be subpoenaed, pressured, or compelled to keep logs of connection patterns. Offline messages are sealed to prekeys and held by mutual contacts. Relays (when needed) are peer-run or volunteer, paid with unlinkable tokens, and preferentially onion-routed so no single hop sees both ends. Direct paths are preferred; local mesh (Bluetooth LE → Wi-Fi Direct upgrade) is first-class.
 
-- **Metadata resistance is the default, not an afterthought.** Constant-rate padded frames + cover traffic, encrypted headers, onion circuits through two or more relays by preference, private discovery beacons that only mutually approved peers can recognize. The protocol is explicit about the threat model: casual observer, targeted attacker, and global adversary. Cover traffic has a real cost (~230 MB/day per connected contact at the default rate); the project does not pretend otherwise.
+- **Metadata resistance is the default, not an afterthought.** Constant-rate padded frames + cover traffic, encrypted headers, onion circuits through two or more relays by preference, private discovery beacons that only mutually approved peers can recognize. The protocol is explicit about the threat model: casual observer, targeted attacker, and global adversary. Cover traffic has a real cost (~560 MB/day per connected contact at the default rate); the project does not pretend otherwise.
 
 - **Post-quantum hybrid cryptography from day one.** X-Wing (X25519 + ML-KEM-768) handshake, post-quantum double ratchet with encrypted headers, MLS groups on an X-Wing ciphersuite. No “we’ll add PQ later” plan. Core pieces have Tamarin machine-checked proofs.
 
