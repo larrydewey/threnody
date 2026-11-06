@@ -402,6 +402,7 @@ impl Node {
                     for (k, conv) in left {
                         self.withdraw_approval(&k);
                         self.disconnect(&k);
+                        self.forget_peer(&k);
                         let _ = self.shared.home.delete_history(conv);
                     }
                     // Contacts revoked or blocked on our other device lose
@@ -427,6 +428,7 @@ impl Node {
                                     .find(|(b, _)| *b == k)
                                     .map_or_else(|| self.conversation_for(&k), |(_, c)| *c);
                                 self.disconnect(&k);
+                                self.forget_peer(&k);
                                 let _ = self.shared.home.delete_history(conv);
                             }
                         }
@@ -572,6 +574,7 @@ impl Node {
             }
         }
         self.disconnect(device);
+        self.forget_peer(device);
     }
 
     fn on_own_chain(&self, from: PublicIdentity, own: AccountChain, chain: AccountChain) {

@@ -28,6 +28,10 @@ pub const MAX_UNACKED: usize = 256;
 pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
 /// Delivered ids remembered per peer to drop resent copies.
 pub const RECENT_IDS: usize = 4096;
+/// And at most this many across all peers (strangers each add theirs):
+/// the peers heard from longest ago are forgotten first, strangers before
+/// accepted contacts.
+pub const MAX_DELIVERED_IDS: usize = 64 * 1024;
 /// Messages larger than this (files) are resent only within one run.
 pub const MAX_PERSISTED: usize = 64 * 1024;
 const VERSION: u8 = 4;
@@ -102,6 +106,11 @@ impl Tag {
 struct Recent {
     order: VecDeque<u64>,
     set: HashSet<u64>,
+    /// When we last delivered from this peer, in [`Delivery::clock`] ticks.
+    last: u64,
+    /// An accepted contact's: kept over strangers' when trimming. Not
+    /// saved; [`Delivery::mark_contacts`] sets it again after a restart.
+    contact: bool,
 }
 
 #[derive(Default)]
@@ -110,6 +119,13 @@ pub(crate) struct Delivery {
     /// local id to mark delivered on acknowledgement (0 = none).
     unacked: HashMap<PublicIdentity, VecDeque<(u64, AppMessage, usize, Tag)>>,
     delivered: HashMap<PublicIdentity, Recent>,
+    /// Ids whose message is being handled: neither delivered again nor
+    /// saved as delivered until it has been (see [`Delivery::delivered`]).
+    opening: HashSet<(PublicIdentity, u64)>,
+    /// Ids in `delivered`, all peers together.
+    delivered_ids: usize,
+    /// Orders deliveries between peers.
+    clock: u64,
     /// Changed since last saved.
     pub unacked_dirty: bool,
     pub delivered_dirty: bool,
@@ -146,7 +162,10 @@ impl Delivery {
                 rest = r;
                 let peer: [u8; 32] = head[..32].try_into().unwrap_or_default();
                 if let Ok(p) = PublicIdentity::from_bytes(&peer) {
+                    // Saved oldest peer first.
+                    d.clock += 1;
                     let recent = d.delivered.entry(p).or_default();
+                    recent.last = d.clock;
                     for id in ids
                         .as_chunks::<8>()
                         .0
@@ -155,11 +174,13 @@ impl Delivery {
                     {
                         if recent.set.insert(id) {
                             recent.order.push_back(id);
+                            d.delivered_ids += 1;
                         }
                     }
                 }
             }
         }
+        d.trim_delivered(None);
         d
     }
 
@@ -183,10 +204,14 @@ impl Delivery {
         out
     }
 
-    /// `VERSION || * ( peer (32) | count (u32 LE) | ids (u64 BE each) )`
+    /// `VERSION || * ( peer (32) | count (u32 LE) | ids (u64 BE each) )`,
+    /// the peer delivered from longest ago first.
     pub fn encode_delivered(&self) -> Vec<u8> {
-        let mut out = vec![VERSION];
-        for (p, r) in &self.delivered {
+        let mut out = Vec::with_capacity(1 + self.delivered.len() * 36 + self.delivered_ids * 8);
+        out.push(VERSION);
+        let mut peers: Vec<_> = self.delivered.iter().collect();
+        peers.sort_by_key(|(_, r)| r.last);
+        for (p, r) in peers {
             out.extend_from_slice(p.as_bytes());
             out.extend_from_slice(
                 &u32::try_from(r.order.len())
@@ -249,15 +274,19 @@ impl Delivery {
         })
     }
 
-    /// Drops what `peer` acknowledged; returns the tags that name entries.
-    pub fn acked(&mut self, peer: &PublicIdentity, ids: &[u64]) -> Vec<Tag> {
-        let mut tags = Vec::new();
+    /// Drops what `peer` acknowledged; returns the tags that name entries,
+    /// and the mailbox messages among it (a mailbox's copy can go now).
+    pub fn acked(&mut self, peer: &PublicIdentity, ids: &[u64]) -> (Vec<Tag>, Vec<Vec<u8>>) {
+        let (mut tags, mut mail) = (Vec::new(), Vec::new());
         if let Some(q) = self.unacked.get_mut(peer) {
             let before = q.len();
-            q.retain(|(id, _, _, tag)| {
+            q.retain_mut(|(id, m, _, tag)| {
                 let hit = ids.contains(id);
                 if hit && (tag.local_id != 0) {
                     tags.push(*tag);
+                }
+                if hit && let AppMessage::Mailbox(b) = m {
+                    mail.push(std::mem::take(b));
                 }
                 !hit
             });
@@ -266,12 +295,71 @@ impl Delivery {
                 self.unacked.remove(peer);
             }
         }
-        tags
+        (tags, mail)
+    }
+
+    /// Disappearing texts still waiting for their peer whose timer has run
+    /// out at our end (`now`): (peer, id, message).
+    pub fn expired(&self, now: u64) -> Vec<(PublicIdentity, u64, AppMessage)> {
+        let mut out = Vec::new();
+        for (p, q) in &self.unacked {
+            for (id, m, ..) in q {
+                if let AppMessage::Text {
+                    sent_ms,
+                    expires_in_s: Some(s),
+                    ..
+                } = m
+                    && sent_ms.saturating_add(u64::from(*s) * 1000) <= now
+                {
+                    out.push((*p, *id, m.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Swaps the message `id` waiting for `peer` for `m` (same id and tag),
+    /// or drops it with `None`.
+    pub fn replace(&mut self, peer: &PublicIdentity, id: u64, m: Option<AppMessage>) {
+        let Some(q) = self.unacked.get_mut(peer) else {
+            return;
+        };
+        let Some(i) = q.iter().position(|(x, ..)| *x == id) else {
+            return;
+        };
+        let old = q[i].2;
+        match m {
+            Some(m) => {
+                let len = m.encoded_len_hint();
+                q[i].1 = m;
+                q[i].2 = len;
+                self.unacked_dirty |= len <= MAX_PERSISTED || old <= MAX_PERSISTED;
+            }
+            None => {
+                q.remove(i);
+                self.unacked_dirty |= old <= MAX_PERSISTED;
+                if q.is_empty() {
+                    self.unacked.remove(peer);
+                }
+            }
+        }
     }
 
     /// The peer doesn't acknowledge: what was sent plain can't be tracked.
     pub fn forget(&mut self, peer: &PublicIdentity, id: u64) {
         self.acked(peer, &[id]);
+    }
+
+    /// Stops sending what `gone` picks out, to whichever peer.
+    pub fn drop_where(&mut self, mut gone: impl FnMut(&PublicIdentity, &AppMessage) -> bool) {
+        self.unacked.retain(|p, q| {
+            q.retain(|(_, m, len, _)| {
+                let drop = gone(p, m);
+                self.unacked_dirty |= drop && *len <= MAX_PERSISTED;
+                !drop
+            });
+            !q.is_empty()
+        });
     }
 
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
@@ -284,8 +372,9 @@ impl Delivery {
     /// sealed for its mailboxes, and carries no version, so a mailbox copy
     /// opened after the held one (and after newer changes) must be dropped
     /// rather than undo them. The change's digest is kept with the
-    /// delivered ids. Anything else is never "seen".
-    pub fn seen_change(&mut self, peer: &PublicIdentity, m: &AppMessage) -> bool {
+    /// delivered ids (`contact`: `peer` is one we accepted). Anything else
+    /// is never "seen".
+    pub fn seen_change(&mut self, peer: &PublicIdentity, m: &AppMessage, contact: bool) -> bool {
         if !matches!(
             m,
             AppMessage::Delete { .. }
@@ -300,32 +389,103 @@ impl Delivery {
         };
         let h = blake3::hash(&b);
         let digest = u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap_or_default());
-        !self.first_delivery(peer, digest)
+        if !self.first_delivery(peer, digest) {
+            return true;
+        }
+        self.delivered(peer, digest, contact);
+        false
     }
 
-    /// True the first time `id` arrives from `peer`.
+    /// True the first time `id` arrives from `peer`. It only counts as
+    /// delivered across a restart once [`Delivery::delivered`] says the
+    /// message was handled (saved to history, say): a crash in between
+    /// must take the sender's resend, not drop it as a duplicate.
     pub fn first_delivery(&mut self, peer: &PublicIdentity, id: u64) -> bool {
+        let seen = self
+            .delivered
+            .get(peer)
+            .is_some_and(|r| r.set.contains(&id));
+        !seen && self.opening.insert((*peer, id))
+    }
+
+    /// The message `id` from `peer`, which [`Delivery::first_delivery`]
+    /// let through, has been handled. `contact`: `peer` is one we accepted.
+    pub fn delivered(&mut self, peer: &PublicIdentity, id: u64, contact: bool) {
+        self.opening.remove(&(*peer, id));
+        self.clock += 1;
         let r = self.delivered.entry(*peer).or_default();
+        r.last = self.clock;
+        r.contact = contact;
         if !r.set.insert(id) {
-            return false;
+            return;
         }
         r.order.push_back(id);
+        self.delivered_ids += 1;
         self.delivered_dirty = true;
         if r.order.len() > RECENT_IDS
             && let Some(old) = r.order.pop_front()
         {
             r.set.remove(&old);
+            self.delivered_ids -= 1;
         }
-        true
+        self.trim_delivered(Some(peer));
+    }
+
+    /// Which of the peers we remember ids from are accepted contacts.
+    pub fn mark_contacts(&mut self, contacts: &HashSet<PublicIdentity>) {
+        for (p, r) in &mut self.delivered {
+            r.contact = contacts.contains(p);
+        }
+    }
+
+    /// Peers we remember delivered ids from.
+    pub fn delivered_from(&self) -> Vec<PublicIdentity> {
+        self.delivered.keys().copied().collect()
+    }
+
+    /// Forgets the peers delivered from longest ago (never `keep`), strangers
+    /// first, while there are more than [`MAX_DELIVERED_IDS`] ids: a flood
+    /// from throwaway identities can't wipe what contacts' resends need.
+    fn trim_delivered(&mut self, keep: Option<&PublicIdentity>) {
+        while self.delivered_ids > MAX_DELIVERED_IDS {
+            let Some(oldest) = self
+                .delivered
+                .iter()
+                .filter(|(p, _)| Some(*p) != keep)
+                .min_by_key(|(_, r)| (r.contact, r.last))
+                .map(|(p, _)| *p)
+            else {
+                return;
+            };
+            if let Some(r) = self.delivered.remove(&oldest) {
+                self.delivered_ids -= r.order.len();
+                self.delivered_dirty = true;
+            }
+        }
+    }
+
+    /// `peer` is gone (forgotten, blocked, removed from its account):
+    /// drops what we kept for it, sent or received.
+    pub fn forget_peer(&mut self, peer: &PublicIdentity) {
+        if let Some(q) = self.unacked.remove(peer) {
+            self.unacked_dirty |= q.iter().any(|(_, _, len, _)| *len <= MAX_PERSISTED);
+        }
+        if let Some(r) = self.delivered.remove(peer) {
+            self.delivered_ids -= r.order.len();
+            self.delivered_dirty = true;
+        }
+        self.opening.retain(|(p, _)| p != peer);
     }
 
     /// Takes back [`Delivery::first_delivery`] for `id`: it wasn't kept
     /// after all, so the copy the peer sends again counts as the first.
     pub fn undeliver(&mut self, peer: &PublicIdentity, id: u64) {
+        self.opening.remove(&(*peer, id));
         if let Some(r) = self.delivered.get_mut(peer)
             && r.set.remove(&id)
         {
             r.order.retain(|x| *x != id);
+            self.delivered_ids -= 1;
             self.delivered_dirty = true;
         }
     }
@@ -366,18 +526,26 @@ mod tests {
         assert_eq!(d.unacked(&p), 2);
         assert_eq!(d.resend(&p).len(), 2);
         assert_eq!(
-            d.acked(&p, &[id]),
+            d.acked(&p, &[id]).0,
             [Tag {
                 local_id: 5,
                 group: Some([7; 16]),
                 relay_for: Some([3; 32]),
             }]
         );
-        assert!(d.acked(&p, &[id]).is_empty(), "only once");
+        assert!(d.acked(&p, &[id]).0.is_empty(), "only once");
+        let AppMessage::Tracked { id, .. } = d.track(&p, AppMessage::Mailbox(vec![4]), Tag::NONE)
+        else {
+            panic!()
+        };
+        assert_eq!(d.acked(&p, &[id]), (vec![], vec![vec![4]]));
         assert_eq!(d.unacked(&p), 1);
         assert!(d.first_delivery(&p, 9) && !d.first_delivery(&p, 9));
+        d.delivered(&p, 9, true);
+        assert!(!d.first_delivery(&p, 9));
         for i in 0..RECENT_IDS as u64 {
             d.first_delivery(&p, 100 + i);
+            d.delivered(&p, 100 + i, true);
         }
         assert!(d.first_delivery(&p, 9), "old ids are forgotten");
     }
@@ -391,11 +559,11 @@ mod tests {
             id: 7,
             pin,
         };
-        assert!(!d.seen_change(&p, &pin(true)));
-        assert!(d.seen_change(&p, &pin(true)), "the same change again");
-        assert!(!d.seen_change(&p, &pin(false)), "a different change");
-        assert!(!d.seen_change(&q, &pin(true)), "from another peer");
-        assert!(!d.seen_change(&p, &text("a")) && !d.seen_change(&p, &text("a")));
+        assert!(!d.seen_change(&p, &pin(true), true));
+        assert!(d.seen_change(&p, &pin(true), true), "the same change again");
+        assert!(!d.seen_change(&p, &pin(false), true), "a different change");
+        assert!(!d.seen_change(&q, &pin(true), true), "from another peer");
+        assert!(!d.seen_change(&p, &text("a"), true) && !d.seen_change(&p, &text("a"), true));
     }
 
     #[test]
@@ -445,6 +613,7 @@ mod tests {
             Tag::NONE,
         );
         d.first_delivery(&p, 42);
+        d.delivered(&p, 42, true);
         assert!(d.unacked_dirty && d.delivered_dirty);
         let (u, del) = (d.encode_unacked(), d.encode_delivered());
         let mut again = Delivery::load(&u, &del);
@@ -465,6 +634,151 @@ mod tests {
         let cut = Delivery::load(&u[..u.len() - 1], &del[..del.len() - 1]);
         assert_eq!(cut.unacked(&p), 1);
         assert_eq!(Delivery::load(&[9], &[]).unacked(&p), 0);
+    }
+
+    #[test]
+    fn an_id_is_saved_as_delivered_only_once_handled() {
+        let p = Identity::generate().public();
+        let mut d = Delivery::default();
+        assert!(d.first_delivery(&p, 7));
+        assert!(!d.first_delivery(&p, 7), "a second copy while handling");
+        // A crash now: the saved state hasn't got the id, so the
+        // sender's resend is taken after the restart.
+        assert!(!d.delivered_dirty);
+        assert!(Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
+        d.delivered(&p, 7, true);
+        assert!(!Delivery::load(&[], &d.encode_delivered()).first_delivery(&p, 7));
+    }
+
+    #[test]
+    fn delivered_ids_are_bounded_across_peers_and_forgotten_with_them() {
+        let mut d = Delivery::default();
+        let peers: Vec<PublicIdentity> = (0..=MAX_DELIVERED_IDS / RECENT_IDS)
+            .map(|_| Identity::generate().public())
+            .collect();
+        for (n, p) in peers.iter().enumerate() {
+            for i in 0..RECENT_IDS as u64 {
+                let id = (n as u64) << 32 | i;
+                assert!(d.first_delivery(p, id));
+                d.delivered(p, id, false);
+            }
+        }
+        // The first peer, heard from longest ago, made room for the last.
+        assert_eq!(d.delivered.len(), peers.len() - 1);
+        assert!(d.first_delivery(&peers[0], 0));
+        let last = peers.last().unwrap();
+        assert!(!d.first_delivery(last, (peers.len() as u64 - 1) << 32));
+        // And the order survives a restart.
+        let again = Delivery::load(&[], &d.encode_delivered());
+        assert_eq!(again.delivered_ids, MAX_DELIVERED_IDS);
+        assert_eq!(
+            again
+                .delivered
+                .iter()
+                .min_by_key(|(_, r)| r.last)
+                .map(|(p, _)| p),
+            Some(&peers[1])
+        );
+
+        d.track(last, text("unsent"), Tag::NONE);
+        d.unacked_dirty = false;
+        d.delivered_dirty = false;
+        d.forget_peer(last);
+        assert!(d.unacked_dirty && d.delivered_dirty);
+        assert_eq!(d.unacked(last), 0);
+        assert!(d.first_delivery(last, (peers.len() as u64 - 1) << 32));
+    }
+
+    #[test]
+    fn strangers_ids_go_before_a_contacts() {
+        let mut d = Delivery::default();
+        let contact = Identity::generate().public();
+        for i in 0..RECENT_IDS as u64 {
+            d.first_delivery(&contact, i);
+            d.delivered(&contact, i, true);
+        }
+        // Throwaway identities send more than the cap between them, all
+        // after the contact last did.
+        let strangers: Vec<PublicIdentity> = (0..MAX_DELIVERED_IDS / RECENT_IDS)
+            .map(|_| Identity::generate().public())
+            .collect();
+        for (n, p) in strangers.iter().enumerate() {
+            for i in 0..RECENT_IDS as u64 {
+                let id = (n as u64 + 1) << 32 | i;
+                d.first_delivery(p, id);
+                d.delivered(p, id, false);
+            }
+        }
+        assert!(!d.first_delivery(&contact, 0), "the contact's ids stay");
+        assert!(d.first_delivery(&strangers[0], 1 << 32));
+        assert_eq!(d.delivered_ids, MAX_DELIVERED_IDS);
+
+        // After a restart the node says again who the contacts are.
+        let mut again = Delivery::load(&[], &d.encode_delivered());
+        assert!(again.delivered_from().contains(&contact));
+        again.mark_contacts(&HashSet::from([contact]));
+        let p = Identity::generate().public();
+        again.first_delivery(&p, 1);
+        again.delivered(&p, 1, false);
+        assert!(!again.first_delivery(&contact, 0));
+    }
+
+    #[test]
+    fn chosen_unacked_messages_can_be_dropped() {
+        let (p, q) = (Identity::generate().public(), Identity::generate().public());
+        let mut d = Delivery::default();
+        d.track(&p, text("keep"), Tag::NONE);
+        d.track(&p, text("drop"), Tag::NONE);
+        d.track(&q, text("drop"), Tag::NONE);
+        d.unacked_dirty = false;
+        d.drop_where(|peer, m| *peer == p && *m == text("drop"));
+        assert!(d.unacked_dirty);
+        assert_eq!((d.unacked(&p), d.unacked(&q)), (1, 1));
+        assert_eq!(
+            d.resend(&p),
+            vec![AppMessage::Tracked {
+                id: d.unacked[&p][0].0,
+                inner: Box::new(text("keep"))
+            }]
+        );
+    }
+
+    #[test]
+    fn expired_disappearing_texts_are_found_and_replaced() {
+        let p = Identity::generate().public();
+        let mut d = Delivery::default();
+        let gone = AppMessage::Text {
+            sent_ms: 1_000,
+            body: "secret".into(),
+            expires_in_s: Some(30),
+            id: 1,
+            quote: None,
+            forwarded: false,
+        };
+        let AppMessage::Tracked { id, .. } = d.track(&p, gone.clone(), Tag::NONE) else {
+            panic!()
+        };
+        d.track(&p, text("kept"), Tag::NONE);
+        assert!(d.expired(30_999).is_empty());
+        assert_eq!(d.expired(31_000), [(p, id, gone)]);
+        d.unacked_dirty = false;
+        d.replace(&p, id, Some(AppMessage::Mailbox(vec![9])));
+        assert!(d.unacked_dirty);
+        assert!(d.expired(u64::MAX).is_empty());
+        let saved = Delivery::load(&d.encode_unacked(), &[]);
+        assert!(!String::from_utf8_lossy(&d.encode_unacked()).contains("secret"));
+        assert_eq!(
+            saved.resend(&p),
+            [
+                AppMessage::Tracked {
+                    id,
+                    inner: Box::new(AppMessage::Mailbox(vec![9]))
+                },
+                d.resend(&p)[1].clone()
+            ]
+        );
+        d.replace(&p, id, None);
+        assert_eq!(d.unacked(&p), 1);
     }
 
     #[test]

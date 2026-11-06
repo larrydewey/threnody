@@ -1,7 +1,11 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use threnody_core::AppMessage;
 use threnody_core::store::Home;
+use threnody_core::{AppMessage, PublicIdentity};
 use threnody_net::mailbox::DepositStatus;
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -508,4 +512,429 @@ async fn a_mailbox_copy_of_a_change_does_not_undo_a_newer_one() {
     wait_for(|| r.node.held_messages() == 0).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(pinned(&b.node), 0, "a stale mailbox copy pinned it again");
+}
+
+/// Nothing from `rx` matching `pred` for a while.
+async fn quiet(rx: &mut UnboundedReceiver<Event>, pred: impl Fn(&Event) -> bool) -> bool {
+    timeout(Duration::from_millis(800), async {
+        loop {
+            match rx.recv().await {
+                Some(e) if pred(&e) => return,
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        }
+    })
+    .await
+    .is_err()
+}
+
+#[tokio::test]
+async fn a_blocked_contact_cannot_write_through_a_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+
+    // B blocks A, who still holds B's prekeys and seals through R.
+    b.node.block_contact(&aid);
+    wait_for(|| a.node.sessions().iter().all(|s| s.peer != bid)).await;
+    a.node.send_offline(&bid, &text("let me in")).unwrap();
+    next(&mut a.rx, |e| matches!(e, Event::DepositReceipt { .. })).await;
+    assert!(
+        quiet(&mut b.rx, |e| matches!(
+            e,
+            Event::OfflineMessage { .. }
+                | Event::MessageRequest { .. }
+                | Event::TimerChanged { .. }
+        ))
+        .await,
+        "a blocked contact's sealed message got through"
+    );
+    assert!(
+        b.node
+            .history(b.node.conversation_for(&aid))
+            .map_or(true, |h| h.entries().is_empty()),
+        "recorded in history"
+    );
+    let _ = &mut r.rx;
+}
+
+#[tokio::test]
+async fn a_mailbox_drops_what_it_holds_for_a_contact_it_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.send_offline(&bid, &text("for b")).unwrap();
+    wait_for(|| r.node.held_messages() == 1).await;
+    r.node.delete_conversation(&bid);
+    assert_eq!(r.node.held_messages(), 0);
+    let _ = (&mut a.rx, &mut r.rx);
+}
+
+#[tokio::test]
+async fn a_mailbox_keeps_a_large_message_until_the_recipient_acknowledges_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.set_prefer_onion(false);
+    let big = "x".repeat(90_000);
+    a.node.send_offline(&bid, &text(&big)).unwrap();
+    a.node.send_offline(&bid, &text("small")).unwrap();
+    wait_for(|| r.node.held_messages() == 2).await;
+
+    // B comes back; R delivers both, and lets the large one go only
+    // once B acknowledges it (a restart before then must not lose it).
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&r.addr, None).await.unwrap();
+    for want in [text(&big), text("small")] {
+        next(
+            &mut b2rx,
+            |e| matches!(e, Event::OfflineMessage { msg, .. } if *msg == want),
+        )
+        .await;
+    }
+    wait_for(|| r.node.held_messages() == 0).await;
+    let _ = (&mut a.rx, &mut r.rx);
+}
+
+#[tokio::test]
+async fn a_message_every_mailbox_declines_waits_for_the_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await; // r never approves b: it declines
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| a.node.sessions().iter().all(|s| s.peer != bid)).await;
+
+    let sent = a.node.send_text(&bid, "declined but not lost").unwrap();
+    assert_eq!(sent.sealed, 1);
+    next(&mut a.rx, |e| {
+        matches!(
+            e,
+            Event::DepositReceipt {
+                status: DepositStatus::Declined,
+                ..
+            }
+        )
+    })
+    .await;
+
+    // B comes back to A directly, and gets it.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&a.addr, None).await.unwrap();
+    next(&mut b2rx, |e| {
+        matches!(e, Event::Message { msg: AppMessage::Text { body, .. }, .. } if body == "declined but not lost")
+    })
+    .await;
+    let _ = &mut r.rx;
+}
+
+/// A TCP stream that stops passing on what we write once `cut` is set,
+/// or once more than `cut_after` bytes have come in: the link looks alive
+/// to us, but the other end hears nothing more.
+struct Cut {
+    inner: tokio::net::TcpStream,
+    read: usize,
+    cut_after: usize,
+    cut: Arc<AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for Cut {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.read += buf.filled().len() - before;
+        if self.read > self.cut_after {
+            self.cut.store(true, Ordering::SeqCst);
+        }
+        r
+    }
+}
+
+impl tokio::io::AsyncWrite for Cut {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.cut.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(buf.len()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// `x` connects to `addr` over a [`Cut`] stream; returns the switch.
+async fn connect_cut(x: &Node, addr: &str, cut_after: usize) -> (PublicIdentity, Arc<AtomicBool>) {
+    let cut = Arc::new(AtomicBool::new(false));
+    let stream = Cut {
+        inner: tokio::net::TcpStream::connect(addr).await.unwrap(),
+        read: 0,
+        cut_after,
+        cut: cut.clone(),
+    };
+    let peer = x
+        .connect_stream(stream, "tcp", addr.to_owned(), None)
+        .await
+        .unwrap();
+    (peer, cut)
+}
+
+/// [`link`], with `x`'s side of the link a [`Cut`] stream.
+async fn link_cut(x: &mut N, y: &mut N) -> Arc<AtomicBool> {
+    let (yid, cut) = connect_cut(&x.node, &y.addr, usize::MAX).await;
+    next(&mut y.rx, |e| matches!(e, Event::Connected { .. })).await;
+    x.node.set_approval(&yid, true).unwrap();
+    y.node.set_approval(&x.node.identity(), true).unwrap();
+    next(&mut x.rx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    next(&mut y.rx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+    cut
+}
+
+/// A, B and mailbox M, all linked, A's link to M a [`Cut`] one; B has
+/// gone away and A deposits directly.
+async fn stalled_mailbox(dir: &tempfile::TempDir) -> (N, N, N, Arc<AtomicBool>) {
+    let (mut a, mut b, mut m) = (
+        spawn(dir, "a").await,
+        spawn(dir, "b").await,
+        spawn(dir, "m").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut b, &mut m).await;
+    let cut = link_cut(&mut a, &mut m).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && m.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.set_prefer_onion(false);
+    (a, b, m, cut)
+}
+
+#[tokio::test]
+async fn a_deposit_whose_receipt_never_comes_is_withdrawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, b, m, cut) = stalled_mailbox(&dir).await;
+    let bid = b.node.identity();
+    a.node.set_receipt_wait(Duration::from_millis(300));
+    // M never hears of it: A's link to M has gone quiet.
+    cut.store(true, Ordering::SeqCst);
+    assert_eq!(a.node.send_text(&bid, "only once").unwrap().sealed, 1);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // M comes back. A's queue to it no longer has the deposit, as A now
+    // keeps the message for B itself.
+    m.node.shutdown();
+    let (m2, mut m2rx) = open(&dir, "m", false);
+    let maddr = m2.listen("127.0.0.1:0").await.unwrap().to_string();
+    a.node.connect(&maddr, None).await.unwrap();
+    a.node.send_offline(&bid, &text("probe")).unwrap();
+    next(&mut a.rx, |e| {
+        matches!(
+            e,
+            Event::DepositReceipt {
+                status: DepositStatus::Held,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(m2.held_messages(), 1, "only the probe");
+
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&a.addr, None).await.unwrap();
+    next(&mut b2rx, |e| {
+        matches!(e, Event::Message { msg: AppMessage::Text { body, .. }, .. } if body == "only once")
+    })
+    .await;
+    let _ = &mut m2rx;
+}
+
+#[tokio::test]
+async fn a_placement_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, _m, cut) = stalled_mailbox(&dir).await;
+    let bid = b.node.identity();
+    cut.store(true, Ordering::SeqCst);
+    assert_eq!(
+        a.node.send_text(&bid, "across a restart").unwrap().sealed,
+        1
+    );
+    // A stops before any receipt; nothing came of the deposit.
+    a.node.shutdown();
+
+    let (a2, _a2rx) = open(&dir, "a", false);
+    let addr = a2.listen("127.0.0.1:0").await.unwrap().to_string();
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&addr, None).await.unwrap();
+    next(&mut b2rx, |e| {
+        matches!(e, Event::Message { msg: AppMessage::Text { body, .. }, .. } if body == "across a restart")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_text_that_comes_twice_shows_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    a.node.set_prefer_onion(false);
+    let twice = AppMessage::Text {
+        sent_ms: 0,
+        body: "twice".into(),
+        expires_in_s: None,
+        id: 77,
+        quote: None,
+        forwarded: false,
+    };
+    a.node.send_offline(&bid, &twice).unwrap();
+    a.node.send_offline(&bid, &text("after")).unwrap();
+    wait_for(|| r.node.held_messages() == 2).await;
+
+    // B gets it from A directly first, then from the mailbox.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.connect(&a.addr, None).await.unwrap();
+    wait_for(|| a.node.sessions().iter().any(|s| s.peer == bid)).await;
+    a.node.send(&bid, twice.clone()).unwrap();
+    next(
+        &mut b2rx,
+        |e| matches!(e, Event::Message { msg, .. } if *msg == twice),
+    )
+    .await;
+    b2.connect(&r.addr, None).await.unwrap();
+    let mut shown = 0;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match b2rx.recv().await.unwrap() {
+                Event::OfflineMessage { msg, .. } if msg == text("after") => break,
+                Event::OfflineMessage { msg, .. } | Event::Message { msg, .. } if msg == twice => {
+                    shown += 1;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(shown, 0, "the mailbox's copy showed again");
+    let _ = &mut r.rx;
+}
+
+#[tokio::test]
+async fn a_large_message_survives_a_mailbox_restart_before_the_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let bid = b.node.identity();
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    b.node.shutdown();
+    wait_for(|| r.node.sessions().iter().all(|s| s.peer != bid)).await;
+    a.node.set_prefer_onion(false);
+    let big = text(&"x".repeat(90_000));
+    a.node.send_offline(&bid, &big).unwrap();
+    wait_for(|| r.node.held_messages() == 1).await;
+
+    // B gets it, but its acknowledgement never reaches R: the link goes
+    // quiet once most of the message is in.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    connect_cut(&b2, &r.addr, 60_000).await;
+    next(
+        &mut b2rx,
+        |e| matches!(e, Event::OfflineMessage { msg, .. } if *msg == big),
+    )
+    .await;
+    // R restarts: it still has the message, and B's next session takes
+    // it (as a copy B drops) and acknowledges it.
+    r.node.shutdown();
+    let (r2, _r2rx) = open(&dir, "r", false);
+    assert_eq!(r2.held_messages(), 1);
+    let raddr = r2.listen("127.0.0.1:0").await.unwrap().to_string();
+    wait_for(|| b2.sessions().iter().all(|s| s.peer != r.node.identity())).await;
+    b2.connect(&raddr, None).await.unwrap();
+    wait_for(|| r2.held_messages() == 0).await;
+    assert!(quiet(&mut b2rx, |e| matches!(e, Event::OfflineMessage { .. })).await);
+    let _ = (&mut a.rx, &mut r.rx);
 }

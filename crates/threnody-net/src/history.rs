@@ -65,6 +65,17 @@ pub fn album_id() -> u64 {
     local_id()
 }
 
+/// What [`Node::record_incoming`] did with a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// Recorded (or nothing to record): it shows.
+    New,
+    /// A copy of a text already recorded: it doesn't show again.
+    Duplicate,
+    /// It couldn't be stored (a full disk, no file descriptors left).
+    Failed,
+}
+
 impl Node {
     /// Whether we want `peer`'s messages: we accepted it, or another device
     /// of its account, or it's ours. Blocked peers never are.
@@ -699,6 +710,7 @@ impl Node {
         for d in devices {
             self.withdraw_approval(&d);
             self.disconnect(&d);
+            self.forget_peer(&d);
         }
         let _ = self.shared.home.delete_history(conv);
         self.unshare_lists_with(conv);
@@ -710,15 +722,20 @@ impl Node {
     pub fn delete_request(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
         let devices = self.mark_contacts(peer, |_| {});
+        let mut gone = Vec::new();
         self.update_contacts(|c| {
             for d in &devices {
                 if c.get(d).is_some_and(|x| !x.accepted) {
                     c.remove(d);
+                    gone.push(*d);
                 }
             }
         });
         for d in devices {
             self.disconnect(&d);
+        }
+        for d in &gone {
+            self.forget_peer(d);
         }
         let _ = self.shared.home.delete_history(conv);
     }
@@ -738,6 +755,7 @@ impl Node {
         for d in &devices {
             self.withdraw_approval(d);
             self.disconnect(d);
+            self.forget_peer(d);
         }
         let _ = self.shared.home.delete_history(conv);
         self.push_contact_sync();
@@ -883,7 +901,8 @@ impl Node {
             }
             // Try to reach it directly while the message waits.
             self.seek(d);
-            if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
+            // Should every mailbox decline it, it waits here after all.
+            if self.can_send_offline(d) && self.send_offline_or_hold(d, &msg, tag).is_ok() {
                 r.sealed += 1;
             } else {
                 self.hold(d, msg.clone(), tag);
@@ -1290,14 +1309,17 @@ impl Node {
     }
 
     /// Records an incoming text, adopting the sender's timer setting.
-    /// Records an incoming text in its conversation; false if it couldn't
-    /// be stored (other messages need nothing here).
+    /// Says what became of it: a copy of a text already recorded (one may
+    /// come both from its sender and from a mailbox, when the sender
+    /// stopped waiting for the mailbox's receipt) shouldn't show again, and
+    /// one that couldn't be stored shouldn't be acknowledged. Other
+    /// messages need nothing here.
     pub(crate) fn record_incoming(
         &self,
         from: &PublicIdentity,
         msg: &AppMessage,
         offline: bool,
-    ) -> bool {
+    ) -> Recorded {
         let AppMessage::Text {
             body,
             expires_in_s,
@@ -1307,15 +1329,25 @@ impl Node {
             ..
         } = msg
         else {
-            return true;
+            return Recorded::New;
         };
         let conv = self.conversation_for(from);
+        // Held until it is recorded, so two copies can't both pass.
+        let lock = threnody_core::history::history_lock();
+        if *id != 0
+            && self.history(conv).is_ok_and(|h| {
+                h.entries()
+                    .iter()
+                    .any(|e| !e.outgoing && e.device == *from.as_bytes() && e.remote_id == *id)
+            })
+        {
+            return Recorded::Duplicate;
+        }
         // `Some(0)`: turned off on purpose. No timer at all from a peer that
         // would have said so means it never chose one: ours stands, and
         // it adopts ours from our next message. From an older peer it may
         // mean either, and is taken as off, as such peers intend.
         let chosen = expires_in_s.is_some() || !self.known_to_support(from, FEATURE_TIMER_OFF);
-        let lock = threnody_core::history::history_lock();
         // A message with no timer of its own goes when ours says: in a
         // disappearing chat, it must not stay for good.
         let expiry = if chosen {
@@ -1334,8 +1366,7 @@ impl Node {
                 secs: expiry,
             });
         }
-        drop(lock);
-        self.record_with_id(
+        let stored = self.record_with_id(
             conv,
             *from.as_bytes(),
             false,
@@ -1348,10 +1379,18 @@ impl Node {
                 forwarded: *forwarded,
                 ..Extras::default()
             },
-        )
+        );
+        drop(lock);
+        if stored {
+            Recorded::New
+        } else {
+            Recorded::Failed
+        }
     }
 
-    /// Starts the background sweep of expired history.
+    /// Starts the background sweep of expired history (and of what is
+    /// left of it waiting for a peer), and of sealed messages we have held
+    /// too long for others.
     pub(crate) fn start_history_sweep(&self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -1365,6 +1404,8 @@ impl Node {
                 tokio::select! {
                     _ = tick.tick() => {
                         node.shared.home.sweep_history(node.identity_ref(), now_ms());
+                        node.seal_expired_unacked(now_ms());
+                        node.sweep_mailbox(now_ms());
                     }
                     () = &mut closed => break,
                 }

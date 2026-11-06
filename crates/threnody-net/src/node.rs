@@ -1,7 +1,7 @@
 //! A running Threnody node: listens, dials, runs one task per session,
 //! enforces the trust policy and keeps the contact book current.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -30,6 +30,7 @@ use crate::error::{NetError, Result};
 use crate::frame::{MAX_FRAME, read_body_metered, read_len, write_frame};
 use crate::gate::Source;
 use crate::handshake;
+use crate::history::Recorded;
 use crate::mailbox::MailboxStore;
 use crate::onion::OnionState;
 use crate::relay::RelayState;
@@ -469,6 +470,8 @@ pub(crate) struct Shared {
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
     pub(crate) mailbox: Mutex<MailboxStore>,
+    /// Our sealed messages waiting to hear whether a mailbox took them.
+    pub(crate) placements: Mutex<crate::mailbox::Placements>,
     pub(crate) onion: Mutex<OnionState>,
     pub(crate) account: Mutex<AccountChain>,
     pub(crate) accounts: Mutex<AccountBook>,
@@ -662,7 +665,14 @@ impl Node {
             None => AccountBook::default(),
         };
         let mailbox = match cfg.home.load_state(&cfg.identity, "mailbox")? {
-            Some(b) => MailboxStore::decode(&b)?,
+            Some(b) => {
+                let mut mb = MailboxStore::decode(&b)?;
+                if mb.prune(now) {
+                    cfg.home
+                        .save_state(&cfg.identity, "mailbox", &mb.encode()?)?;
+                }
+                mb
+            }
             None => MailboxStore::default(),
         };
         let folders = cfg
@@ -720,6 +730,7 @@ impl Node {
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
             mailbox: Mutex::new(mailbox),
+            placements: Mutex::default(),
             onion: Mutex::new(OnionState::default()),
             ble: Mutex::default(),
             account: Mutex::new(account),
@@ -755,12 +766,21 @@ impl Node {
         let node = Self {
             shared: Arc::new(shared),
         };
+        // Which peers' delivered ids to keep longest: not saved with them.
+        let contacts: HashSet<PublicIdentity> = node
+            .shared
+            .delivery(|d| d.delivered_from())
+            .into_iter()
+            .filter(|p| node.is_accepted(p))
+            .collect();
+        node.shared.delivery(|d| d.mark_contacts(&contacts));
         node.start_history_sweep();
         node.load_recovery();
         node.load_volunteer();
         node.load_credentials();
         node.start_directory_upkeep();
         node.load_push();
+        node.resume_placements();
         Ok((node, rx))
     }
 
@@ -1251,6 +1271,14 @@ impl Node {
         self.push_wake(peer);
     }
 
+    /// `peer` is gone (forgotten, blocked, or removed from its account):
+    /// drops what we kept for it.
+    pub(crate) fn forget_peer(&self, peer: &PublicIdentity) {
+        self.shared.delivery(|d| d.forget_peer(peer));
+        self.forget_push(peer);
+        self.forget_held(peer);
+    }
+
     /// The QUIC connection under the session with `peer`, if it has one.
     pub(crate) fn datagrams_to(&self, peer: &PublicIdentity) -> Option<quinn::Connection> {
         lock(&self.shared.sessions)
@@ -1376,6 +1404,8 @@ impl Node {
             self.send_chain(&[*peer]);
         } else {
             self.shared.tunnel_down(peer);
+            // No longer mutual: its wake-up endpoint goes (Appendix R).
+            self.forget_push(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });
         if !approved {
@@ -1887,8 +1917,9 @@ where
                             pending.push_back(AppMessage::Observed { addr });
                         }
                     }
-                    // The id of a tracked message delivered for the first time.
-                    let mut tracked = None;
+                    // The id of a tracked message delivered for the first
+                    // time, saved as delivered only once handled below.
+                    let mut handling = None;
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
                             // Acknowledge every copy (the last ack may have
@@ -1898,12 +1929,16 @@ where
                                 _ => pending.push_back(AppMessage::Ack(vec![id])),
                             }
                             let first = shared.delivery(|d| d.first_delivery(&peer, id));
-                            tracked = first.then_some(id);
+                            handling = first.then_some(id);
                             first.then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
-                            for tag in shared.delivery(|d| d.acked(&peer, &ids)) {
+                            let (tags, mail) = shared.delivery(|d| d.acked(&peer, &ids));
+                            for tag in tags {
                                 node.mark_delivered(&peer, tag);
+                            }
+                            for m in mail {
+                                shared.mail_delivered(&peer, &m);
                             }
                             None
                         }
@@ -1912,7 +1947,8 @@ where
                     let Some(msg) = msg else { continue };
                     // Remembered so a mailbox copy of it opened later is
                     // dropped (see `Delivery::seen_change`).
-                    shared.delivery(|d| d.seen_change(&peer, &msg));
+                    let contact = node.is_accepted(&peer);
+                    shared.delivery(|d| d.seen_change(&peer, &msg, contact));
                     match msg {
                         AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
@@ -2041,8 +2077,9 @@ where
                             }
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
-                            if !node.record_incoming(&peer, &msg, false)
-                                && let Some(id) = tracked
+                            let recorded = node.record_incoming(&peer, &msg, false);
+                            if recorded == Recorded::Failed
+                                && let Some(id) = handling
                             {
                                 // Not stored (a full disk, no file descriptors
                                 // left): unacknowledged, it stays with the
@@ -2051,12 +2088,20 @@ where
                                 shared.delivery(|d| d.undeliver(&peer, id));
                                 continue;
                             }
-                            if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
-                                shared.emit(Event::Message { peer, msg });
-                            } else {
-                                shared.emit(Event::MessageRequest { peer, msg });
+                            // A text already here (through a mailbox too)
+                            // doesn't show again.
+                            if recorded != Recorded::Duplicate {
+                                if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
+                                    shared.emit(Event::Message { peer, msg });
+                                } else {
+                                    shared.emit(Event::MessageRequest { peer, msg });
+                                }
                             }
                         }
+                    }
+                    if let Some(id) = handling {
+                        let contact = node.is_accepted(&peer);
+                        shared.delivery(|d| d.delivered(&peer, id, contact));
                     }
                 }
                 out = outbox.recv() => {
@@ -2205,6 +2250,10 @@ fn ready(
                 Ok(Some(AppMessage::Tracked { id, inner }))
             } else {
                 shared.delivery(|d| d.forget(peer, id));
+                // Sent plain is as delivered as it gets with this peer.
+                if let AppMessage::Mailbox(m) = &*inner {
+                    shared.mail_delivered(peer, m);
+                }
                 Ok(Some(*inner))
             }
         }
