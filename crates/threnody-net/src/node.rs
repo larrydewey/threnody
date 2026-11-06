@@ -250,6 +250,21 @@ pub enum Event {
     },
     /// This device was removed from its account.
     ThisDeviceRemoved,
+    /// Scheduled messages of a chat changed (added, edited, sent, failed
+    /// or dropped): `peer` is the device an item was scheduled to, or
+    /// `group` its group. Never carries text.
+    ScheduledChanged {
+        peer: Option<PublicIdentity>,
+        group: Option<[u8; 16]>,
+    },
+    /// A scheduled message couldn't be sent; it stays listed until the
+    /// user acts.
+    ScheduledFailed {
+        peer: Option<PublicIdentity>,
+        group: Option<[u8; 16]>,
+        id: u64,
+        reason: crate::schedule::Failure,
+    },
     /// A nearby approved peer created a Wi-Fi Direct group for us: join
     /// it, then connect to `offer.addr` pinning `peer`.
     WifiDirectOffer {
@@ -610,6 +625,8 @@ pub(crate) struct Shared {
     pub(crate) folders: Mutex<threnody_core::folders::Folders>,
     /// Lists (see `lists`).
     pub(crate) lists: Mutex<crate::lists::Lists>,
+    /// Scheduled messages (see `schedule`).
+    pub(crate) schedule: crate::schedule::ScheduleState,
     /// The QUIC endpoint, once listening (see `quic`).
     pub(crate) quic: Mutex<Option<Arc<crate::quic::Quic>>>,
     /// Reaching contacts across the internet (see `reach`).
@@ -866,6 +883,15 @@ impl Node {
                 .flatten()
                 .unwrap_or_default(),
         );
+        // Only loaded: nothing is sent before the app applies its settings
+        // (see `Node::start_scheduled_sending`).
+        let schedule = crate::schedule::Schedule::decode(
+            &cfg.home
+                .load_state(&cfg.identity, crate::schedule::STATE)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         let sync = crate::sync::SyncState::decode(
             &cfg.home
                 .load_state(&cfg.identity, "history-sync")
@@ -931,6 +957,7 @@ impl Node {
             sync: Mutex::new(sync),
             folders: Mutex::new(folders),
             lists: Mutex::new(lists),
+            schedule: crate::schedule::ScheduleState::new(schedule),
             peer_features: Mutex::new(HashMap::new()),
             receipts: Mutex::new(receipts),
             receipt_delay: Mutex::new((

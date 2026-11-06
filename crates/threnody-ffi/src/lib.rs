@@ -29,6 +29,8 @@ mod groups;
 mod persona;
 mod push;
 pub use push::{PushEndpoint, WakeReport};
+mod schedule;
+pub use schedule::{ScheduleFailure, ScheduledInfo};
 mod volunteer;
 pub use persona::{PersonaRecord, ProfileAttr};
 pub use volunteer::{
@@ -465,6 +467,21 @@ pub struct BleDial {
 /// Things the app should react to.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum NodeEvent {
+    /// Scheduled messages of a chat changed (added, edited, sent, failed
+    /// or dropped): reload its scheduled bar, and set the wake-up alarm
+    /// again (`next_scheduled_ms`). `peer` is the contact device an item
+    /// was scheduled to, `group` its group.
+    ScheduledChanged {
+        peer: Option<String>,
+        group: Option<String>,
+    },
+    /// A scheduled message wasn't sent (it stays listed): tell the user.
+    ScheduledFailed {
+        peer: Option<String>,
+        group: Option<String>,
+        id: u64,
+        reason: ScheduleFailure,
+    },
     /// `peer` is calling: `answer_call` or `hangup_call` (to decline).
     CallIncoming {
         peer: String,
@@ -1124,6 +1141,21 @@ fn convert(e: Event) -> NodeEvent {
         Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
             from: fp(&from),
             added: u32::try_from(added).unwrap_or(u32::MAX),
+        },
+        Event::ScheduledChanged { peer, group } => NodeEvent::ScheduledChanged {
+            peer: peer.as_ref().map(fp),
+            group: group.as_ref().map(groups::hex),
+        },
+        Event::ScheduledFailed {
+            peer,
+            group,
+            id,
+            reason,
+        } => NodeEvent::ScheduledFailed {
+            peer: peer.as_ref().map(fp),
+            group: group.as_ref().map(groups::hex),
+            id,
+            reason: reason.into(),
         },
         Event::Delivered { peer, group, .. } => NodeEvent::Delivered {
             peer: fp(&peer),
@@ -2594,6 +2626,10 @@ impl ThrenodyNode {
                             for (bytes, g) in self.node.take_list_forwards() {
                                 let _ = self.group_node().send_list(&self.node, &g, bytes);
                             }
+                        }
+                        // Due group items, handed over by the node.
+                        Event::ScheduledChanged { group: Some(_), .. } => {
+                            self.send_due_group_scheduled();
                         }
                         _ => {}
                     }
@@ -4078,5 +4114,287 @@ mod tests {
         let m = wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
         assert!(matches!(m, NodeEvent::Message { text, .. } if text == "still heard"));
         drop(release_b);
+    }
+
+    fn in_ms(ms: u64) -> u64 {
+        threnody_core::now_ms() + ms
+    }
+
+    /// Two nodes with cover traffic off (it would only slow these down),
+    /// connected and accepting each other: (alice, bob, alice's fp, bob's fp).
+    fn scheduling_pair(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<ThrenodyNode>, Arc<ThrenodyNode>, String, String) {
+        let open = |n: &str| {
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            node.set_cover_traffic(None);
+            node.set_call_devices(false);
+            node
+        };
+        let (alice, bob) = (open("a"), open("b"));
+        let addr = bob.listen("127.0.0.1:0".into()).unwrap();
+        let b_fp = alice.connect(bob.invite_link(addr)).unwrap();
+        let a_fp = alice.device_fingerprint();
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(a_fp.clone()).unwrap();
+        alice.accept_contact(b_fp.clone()).unwrap();
+        (alice, bob, a_fp, b_fp)
+    }
+
+    /// `scheduling_pair`, mutually approved, in a group Alice owns:
+    /// (alice, bob, bob's fp, group).
+    fn scheduling_group(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<ThrenodyNode>, Arc<ThrenodyNode>, String, String) {
+        let (alice, bob, a_fp, b_fp) = scheduling_pair(dir);
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp, true).unwrap();
+        let g = {
+            let mut all = Pump::new(&[&*alice, &*bob]);
+            all.until(1, |e| {
+                matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+            });
+            let g = alice.create_group("later".into()).unwrap();
+            alice.invite_to_group(g.clone(), b_fp.clone()).unwrap();
+            all.until(1, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+            all.settle();
+            g
+        };
+        (alice, bob, b_fp, g)
+    }
+
+    #[test]
+    fn scheduled_text_and_events_cross_the_ffi() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, a_fp, b_fp) = scheduling_pair(&dir);
+        alice.start_scheduled_sending();
+        alice.send_text(b_fp.clone(), "the plan".into()).unwrap();
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::Message { text, .. } if text == "the plan"),
+        );
+        let first = alice.history(b_fp.clone(), 10).unwrap()[0].clone();
+
+        let id = alice
+            .schedule_text(
+                b_fp.clone(),
+                "agreed".into(),
+                in_ms(1500),
+                Some(first.at_ms),
+                Some(a_fp.clone()),
+            )
+            .unwrap();
+        let listed = alice.scheduled(b_fp.clone()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].id, listed[0].text.as_str(), listed[0].failed),
+            (id, "agreed", None)
+        );
+        assert_eq!(listed[0].peer.as_deref(), Some(b_fp.as_str()));
+        assert_eq!(listed[0].quote.as_ref().map(|q| q.id), Some(first.id));
+        assert!(alice.next_scheduled_ms().is_some());
+        wait(
+            &alice,
+            |e| matches!(e, NodeEvent::ScheduledChanged { peer: Some(p), group: None } if *p == b_fp),
+        );
+
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::Message { text, .. } if text == "agreed"),
+        );
+        let got = bob.history(a_fp, 10).unwrap();
+        let got = got.last().unwrap();
+        assert_eq!(
+            got.quote.as_ref().map(|q| q.text.as_str()),
+            Some("the plan")
+        );
+        for _ in 0..50 {
+            if alice.next_scheduled_ms().is_none() && alice.all_scheduled().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(alice.next_scheduled_ms(), None);
+        assert!(alice.scheduled(b_fp).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduled_group_text_sends_through_the_event_pump() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, b_fp, g) = scheduling_group(&dir);
+        alice.start_scheduled_sending();
+        let mention = MentionInfo {
+            start: 0,
+            len: 4,
+            device: b_fp,
+            mine: false,
+        };
+        let id = alice
+            .schedule_group_text(
+                g.clone(),
+                "@Bob look".into(),
+                in_ms(1500),
+                None,
+                None,
+                vec![mention],
+            )
+            .unwrap();
+        assert_eq!(alice.group_scheduled(g[..8].into()).unwrap()[0].id, id);
+        let mut all = Pump::new(&[&*alice, &*bob]);
+        let m = all.until(1, |e| matches!(e, NodeEvent::GroupMessage { .. }));
+        assert!(
+            matches!(&m, NodeEvent::GroupMessage { text, mentioned: true, .. } if text == "@Bob look"),
+            "{m:?}"
+        );
+        let mine = alice.group_history(g.clone(), 10).unwrap();
+        assert_eq!(mine.last().unwrap().id, id);
+        assert!(alice.group_scheduled(g).unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_due_scheduled_sends_what_is_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, _, b_fp) = scheduling_pair(&dir);
+        // The gate stays closed: only run_due_scheduled sends.
+        alice
+            .schedule_text(b_fp, "woken".into(), in_ms(300), None, None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        for _ in 0..5 {
+            assert!(!matches!(
+                bob.next_event(100),
+                Some(NodeEvent::Message { .. })
+            ));
+        }
+        assert_eq!(alice.run_due_scheduled(10_000), 1);
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::Message { text, .. } if text == "woken"),
+        );
+        assert_eq!(alice.run_due_scheduled(10_000), 0);
+        assert!(alice.all_scheduled().is_empty());
+    }
+
+    #[test]
+    fn run_due_scheduled_out_of_time_leaves_the_send_going() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, _, b_fp) = scheduling_pair(&dir);
+        let b = alice.resolve(&b_fp).unwrap();
+        // Bob gone, his address silent: reaching him outlasts the budget.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap().to_string();
+        bob.shutdown();
+        for _ in 0..100 {
+            if alice.node.sessions().iter().all(|s| s.peer != b) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        alice
+            .node
+            .update_contacts(|c| c.get_mut(&b).unwrap().last_addr = Some(addr));
+        let id = alice
+            .schedule_text(b_fp.clone(), "eventually".into(), in_ms(200), None, None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        alice.run_due_scheduled(500);
+        // Still going, not abandoned half-way.
+        assert_eq!(alice.scheduled_sending(), 1);
+        assert!(alice.all_scheduled()[0].sending);
+        assert!(!alice.cancel_scheduled(id));
+        for _ in 0..300 {
+            if alice.scheduled_sending() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(alice.scheduled_sending(), 0);
+        // Sent (sealed or held for Bob), or failed for the user to retry:
+        // either way it ended.
+        assert!(alice.all_scheduled().iter().all(|s| !s.sending));
+        drop(silent);
+    }
+
+    #[test]
+    fn run_due_scheduled_sends_group_items_without_the_pump() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, _, g) = scheduling_group(&dir);
+        let id = alice
+            .schedule_group_text(
+                g.clone(),
+                "woken too".into(),
+                in_ms(300),
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        // Alice's events are never pumped.
+        assert_eq!(alice.run_due_scheduled(10_000), 1);
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::GroupMessage { text, .. } if text == "woken too"),
+        );
+        let mine = alice.group_history(g.clone(), 10).unwrap();
+        assert_eq!(mine.last().unwrap().id, id);
+        assert!(alice.group_scheduled(g).unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaving_a_group_drops_its_scheduled_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, _, g) = scheduling_group(&dir);
+        bob.start_scheduled_sending();
+        bob.schedule_group_text(g.clone(), "bye".into(), in_ms(1000), None, None, vec![])
+            .unwrap();
+        assert_eq!(bob.group_scheduled(g.clone()).unwrap().len(), 1);
+        bob.leave_group(g.clone()).unwrap();
+        assert!(bob.group_scheduled(g.clone()).unwrap().is_empty());
+        assert!(bob.all_scheduled().is_empty());
+        let mut all = Pump::new(&[&*alice, &*bob]);
+        for _ in 0..3 {
+            all.settle();
+        }
+        assert!(
+            alice
+                .group_history(g, 10)
+                .unwrap_or_default()
+                .iter()
+                .all(|e| e.text != "bye")
+        );
+    }
+
+    #[test]
+    fn removed_from_a_group_fails_at_fire_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, bob, b_fp, g) = scheduling_group(&dir);
+        bob.start_scheduled_sending();
+        let id = bob
+            .schedule_group_text(
+                g.clone(),
+                "still here?".into(),
+                in_ms(2000),
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+        alice.remove_from_group(g.clone(), b_fp).unwrap();
+        let mut all = Pump::new(&[&*alice, &*bob]);
+        all.until(1, |e| matches!(e, NodeEvent::GroupLeft { .. }));
+        let f = all.until(1, |e| matches!(e, NodeEvent::ScheduledFailed { .. }));
+        assert_eq!(
+            f,
+            NodeEvent::ScheduledFailed {
+                peer: None,
+                group: Some(g.clone()),
+                id,
+                reason: ScheduleFailure::Group,
+            }
+        );
+        let listed = bob.group_scheduled(g).unwrap();
+        assert_eq!(listed[0].failed, Some(ScheduleFailure::Group));
     }
 }
