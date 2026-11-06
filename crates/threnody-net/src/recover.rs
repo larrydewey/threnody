@@ -490,6 +490,11 @@ impl Node {
             .filter(|(p, pp)| self.shared.mutual(p) && pp.updated_ms >= recent)
             .map(|(p, pp)| (*p, pp.clone()))
             .collect();
+        // The standby path is part of internet reachability: with it off,
+        // nothing is dialed from the new network but what the user dials.
+        if !self.reach_enabled() {
+            return;
+        }
         let standby = lock(&self.rec().standby).as_ref().map(|s| s.quic.clone());
         if to_standby && let Some(quic) = standby {
             for (peer, pp) in &peers {
@@ -509,9 +514,6 @@ impl Node {
                 let (node, quic, peer) = (self.clone(), quic.clone(), *peer);
                 tokio::spawn(async move { node.dial_through(&quic, peer, &targets).await });
             }
-        }
-        if !self.reach_enabled() {
-            return;
         }
         self.network_changed();
         let node = self.clone();
@@ -643,7 +645,8 @@ impl Node {
 
     /// The socket from [`Node::standby_socket`] is bound to the standby
     /// network, whose global IPv6 addresses are `ipv6`. Opens a QUIC
-    /// endpoint on it and learns its outside address.
+    /// endpoint on it and, with internet reachability on, learns its
+    /// outside address.
     pub fn standby_bound(&self, ipv6: Vec<IpAddr>) -> Result<()> {
         let sock = lock(&self.rec().pending)
             .take()
@@ -725,13 +728,17 @@ impl Node {
     /// and tells peers when it changed (after a long idle gap the mobile
     /// network may hand out a new port).
     async fn learn_standby(&self) {
-        let Some(cfg) = self.reach_config() else {
+        // DHT pings from the mobile network are internet reachability too.
+        let Some(cfg) = self.reach_config().filter(|_| self.reach_enabled()) else {
             return;
         };
         let targets = self.reflectors(&cfg).await;
         let Some(quic) = lock(&self.rec().standby).as_ref().map(|s| s.quic.clone()) else {
             return;
         };
+        // A standby socket just bound isn't writable yet: the pings would
+        // all fail, and its address wait for the next keepalive round.
+        let _ = tokio::time::timeout(Duration::from_secs(1), quic.writable()).await;
         {
             let mut st = lock(&self.rec().standby);
             let Some(s) = st.as_mut() else { return };

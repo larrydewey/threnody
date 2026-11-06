@@ -345,6 +345,54 @@ async fn nothing_reaches_out_while_turned_off() {
     next(&mut arx, 5, router).await;
 }
 
+/// With reachability off, a standby network the platform binds sends
+/// nothing: no DHT pings to learn its outside address.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_standby_path_stays_quiet_while_turned_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let reflector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let main = alice.listen_quic("127.0.0.1:0").await.unwrap();
+    alice.set_reach(false);
+    alice
+        .start_reach(ReachConfig {
+            bootstrap: Some(vec!["127.0.0.1:1".into()]),
+            reflectors: vec![reflector.local_addr().unwrap().to_string()],
+            loopback: true,
+            ..ReachConfig::default()
+        })
+        .unwrap();
+    // Binds a standby socket; true once the reflector hears from it (not
+    // from the main socket, which pings it too while reachability is on).
+    let pinged = |alice: &Node| {
+        alice.standby_socket().unwrap();
+        alice.standby_bound(vec![]).unwrap();
+        let reflector = &reflector;
+        async move {
+            let mut buf = [0u8; 1500];
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let (_, from) = reflector.recv_from(&mut buf).await.unwrap();
+                    if from.port() != main.port() {
+                        return;
+                    }
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(
+        !pinged(&alice).await,
+        "pinged a DHT node from the standby network while off"
+    );
+    alice.network_switched(true);
+    // Turned on, it learns its standby address as before.
+    alice.set_reach(true);
+    assert!(pinged(&alice).await, "no DHT ping from the standby network");
+}
+
 /// Forwards UDP between a client and `server` until `cut` is set, then
 /// drops everything: a path that dies without a word, as Wi-Fi does.
 async fn udp_proxy(

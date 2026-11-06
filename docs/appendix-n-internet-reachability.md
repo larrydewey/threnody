@@ -185,7 +185,7 @@ An app starting after a long time away is found at the contact's next read of it
 
 ## Settings
 
-The feature has a toggle: *Reach contacts over the internet* in the app's menu, and `--no-rendezvous` in the CLI. It covers DHT rendezvous, hole punching, router port mapping, and the meeting places of handles and invite links (Appendix S). With it off, the node never joins the DHT, and invite links carry no key. QUIC itself stays on: it carries sessions to addresses the user dials.
+The feature has a toggle: *Reach contacts over the internet* in the app's menu, and `--no-rendezvous` in the CLI. It covers DHT rendezvous, hole punching, router port mapping, the standby path and fast recovery (section 5: no DHT pings from the standby socket, no dials through it), and the meeting places of handles and invite links (Appendix S). With it off, the node never joins the DHT, and invite links carry no key. QUIC itself stays on: it carries sessions to addresses the user dials.
 
 The CLI's `/status` and the app's Diagnostics screen show whether the node is in the DHT, its addresses, and whether its NAT looks symmetric. Events (`Addresses`, `Punching`, `PunchFailed`, and diagnostic `ReachNote`s for records published and found) go to the CLI output and the app's diagnostic log.
 
