@@ -370,6 +370,19 @@ pub fn install(app: &Rc<App>) {
         lock.reload();
     }
 
+    // A dialog that opens while locked (a prompt an event brought, say)
+    // closes at once: only the lock page's own may show.
+    let weak = Rc::downgrade(&lock);
+    app.window.connect_visible_dialog_notify(move |w| {
+        let Some(l) = weak.upgrade() else { return };
+        if l.is_locked()
+            && let Some(d) = w.visible_dialog()
+            && d.widget_name() != LOCK_DIALOG
+        {
+            d.force_close();
+        }
+    });
+
     let weak = Rc::downgrade(&lock);
     lock.entry.connect_activate(move |_| {
         if let Some(l) = weak.upgrade() {
@@ -972,6 +985,10 @@ pub fn danger_group(app: &Rc<App>) -> adw::PreferencesGroup {
     group
 }
 
+/// The name of the dialogs the lock page itself shows (erasing), which
+/// may show while locked.
+const LOCK_DIALOG: &str = "lock-dialog";
+
 /// The typed confirmation, then the erase.
 pub fn confirm_erase(app: &Rc<App>) {
     let d = ui::alert(
@@ -981,6 +998,7 @@ pub fn confirm_erase(app: &Rc<App>) {
          Your linked devices and your contacts are not told. It can't be undone.",
         &[("cancel", "Cancel"), ("erase", "Erase")],
     );
+    d.set_widget_name(LOCK_DIALOG);
     d.set_response_appearance("erase", adw::ResponseAppearance::Destructive);
     d.set_default_response(Some("cancel"));
     d.set_response_enabled("erase", false);
@@ -1051,6 +1069,7 @@ fn erase_failed(app: &Rc<App>, why: &str, erased: Option<Vec<String>>) {
         ),
         &[("restart", "Restart"), ("retry", "Try Again")],
     );
+    d.set_widget_name(LOCK_DIALOG);
     let a = app.clone();
     d.connect_response(None, move |_, r| {
         if r == "retry" {
