@@ -2180,6 +2180,7 @@ where
                             }
                         }
                         node.send_profile(&peer);
+                        node.offer_to_late_device(&peer);
                         if let Some(addr) = observed
                             && features & FEATURE_OBSERVED != 0
                         {

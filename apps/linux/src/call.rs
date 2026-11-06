@@ -723,6 +723,8 @@ impl CallBar {
         }
         self.widget.set_reveal_child(false);
         let what = match (reason, by_us) {
+            ("answered elsewhere", _) => "answered on another device",
+            ("declined elsewhere", _) => "declined on another device",
             ("declined", false) => "declined",
             ("busy", _) => "is busy",
             ("unanswered", false) => "didn't answer",

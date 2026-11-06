@@ -440,3 +440,146 @@ async fn calls_survive_a_dropped_session() {
         }
     }
 }
+
+/// A call rings every device of the callee's account, including one that
+/// connects while it rings. The first to answer takes it and the others
+/// stop ringing; a decline on one stops them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calls_ring_every_device_of_an_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice");
+    let (laptop, mut lrx) = node(&dir, "laptop");
+    let (phone, mut prx) = node(&dir, "phone");
+    let laptop_addr = laptop.listen("127.0.0.1:0").await.unwrap();
+    let phone_addr = phone.listen("127.0.0.1:0").await.unwrap();
+    let code = laptop.create_link_code(laptop_addr.to_string());
+    phone.link_with(&code).await.unwrap();
+    let a_id = alice.identity();
+    let (l_id, p_id) = (laptop.identity(), phone.identity());
+    for n in [&laptop, &phone] {
+        n.accept_contact(&a_id);
+    }
+    let calls_ok = |n: &Node, d: &threnody_core::PublicIdentity| n.supports(d, FEATURE_CALLS);
+    let until = |what: &'static str, cond: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // Alice reaches only the laptop and calls; the phone connects while it
+    // rings, and rings too.
+    alice.connect(&laptop_addr.to_string(), None).await.unwrap();
+    until("alice knows the account", &|| {
+        calls_ok(&alice, &l_id) && alice.account_of(&p_id).is_some()
+    });
+    let id = alice.start_call(&l_id, false).unwrap();
+    next(
+        &mut lrx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == id),
+    )
+    .await;
+    alice.connect(&phone_addr.to_string(), None).await.unwrap();
+    next(
+        &mut prx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == id),
+    )
+    .await;
+
+    // The phone answers: the call is with the phone, the laptop stops.
+    phone.answer_call(id, false).unwrap();
+    let Event::CallStarted { peer, .. } =
+        next(&mut arx, 10, |e| matches!(e, Event::CallStarted { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(peer, p_id);
+    let Event::CallEnded { reason, by_us, .. } = next(
+        &mut lrx,
+        10,
+        |e| matches!(e, Event::CallEnded { call, .. } if *call == id),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(reason == HangupReason::AnsweredElsewhere && !by_us);
+    assert!(laptop.call().is_none());
+    assert_eq!(alice.call().unwrap().peer, p_id);
+    alice.hangup_call(id);
+    next(
+        &mut prx,
+        10,
+        |e| matches!(e, Event::CallEnded { call, .. } if *call == id),
+    )
+    .await;
+
+    // Both ring again; the laptop declines, and the phone stops too.
+    until("phone takes calls", &|| calls_ok(&alice, &p_id));
+    let id = alice.start_call(&l_id, false).unwrap();
+    next(
+        &mut lrx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == id),
+    )
+    .await;
+    next(
+        &mut prx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == id),
+    )
+    .await;
+    laptop.hangup_call(id);
+    let Event::CallEnded { reason, .. } = next(
+        &mut arx,
+        10,
+        |e| matches!(e, Event::CallEnded { call, .. } if *call == id),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(reason, HangupReason::Declined);
+    let Event::CallEnded { reason, .. } = next(
+        &mut prx,
+        10,
+        |e| matches!(e, Event::CallEnded { call, .. } if *call == id),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(reason, HangupReason::DeclinedElsewhere);
+
+    // Busy on one device: the other still rings and can answer.
+    let (carol, _crx) = node(&dir, "carol");
+    laptop.accept_contact(&carol.identity());
+    carol.connect(&laptop_addr.to_string(), None).await.unwrap();
+    until("carol can call", &|| calls_ok(&carol, &l_id));
+    let busy = carol.start_call(&l_id, false).unwrap();
+    next(
+        &mut lrx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == busy),
+    )
+    .await;
+    let id = alice.start_call(&l_id, false).unwrap();
+    next(
+        &mut prx,
+        10,
+        |e| matches!(e, Event::CallIncoming { call, .. } if *call == id),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(alice.call().map(|c| c.phase), Some(CallPhase::Ringing));
+    phone.answer_call(id, false).unwrap();
+    next(
+        &mut arx,
+        10,
+        |e| matches!(e, Event::CallStarted { call, .. } if *call == id),
+    )
+    .await;
+}
