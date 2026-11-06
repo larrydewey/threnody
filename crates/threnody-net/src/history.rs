@@ -581,44 +581,115 @@ impl Node {
         }
     }
 
-    /// Tells `peer`'s account devices we've displayed the messages it
-    /// sent us with the sender-ids `ids` (their `remote_id`s in our
-    /// conversation). Live-only: never sealed or tracked.
+    /// Tells `peer`'s account we displayed the messages it sent us with
+    /// the sender-ids `ids` (their `remote_id`s in our conversation): live
+    /// to its connected devices, and to the device that sent each one, if
+    /// it isn't connected, by a receipt that waits for it or goes sealed
+    /// through mailboxes (see `receipts`). Each message is reported once
+    /// (its `read_ms` here records that). Nothing is sent with read
+    /// receipts off, or to someone we haven't accepted. Messages from
+    /// before this version first ran, or older than a mailbox keeps
+    /// anything, are reported live only. Fails with `NoRoute` when nothing
+    /// could go or wait, for the caller to try again later.
     pub fn report_read(&self, peer: &PublicIdentity, ids: &[u64]) -> Result<()> {
-        if ids.is_empty() {
+        if ids.is_empty()
+            || self.is_own_device(peer)
+            || !self.is_accepted(peer)
+            || !self.send_read_receipts()
+        {
             return Ok(());
         }
-        let conv = self.conversation_for(peer).to_bytes();
-        let devices: Vec<PublicIdentity> = match self.account_of(peer) {
-            Some(a) if !self.is_own_device(peer) => {
-                a.state().devices.iter().map(|(d, _)| *d).collect()
+        let conv = self.conversation_for(peer);
+        let now = now_ms();
+        let since = self.shared.receipts(|o| o.since_ms);
+        let wanted: HashSet<u64> = ids.iter().copied().filter(|i| *i != 0).collect();
+        // Which are already reported, and which may wait for their device.
+        let mut reported = HashSet::new();
+        let mut queueable: Vec<(PublicIdentity, u64)> = Vec::new();
+        if let Ok(h) = self.history(conv) {
+            for e in h
+                .entries()
+                .iter()
+                .filter(|e| !e.outgoing && wanted.contains(&e.remote_id))
+            {
+                if e.read_ms != 0 {
+                    reported.insert(e.remote_id);
+                } else if e.at_ms >= since
+                    && now.saturating_sub(e.at_ms) < crate::receipts::MAX_AGE_MS
+                    && let Ok(d) = PublicIdentity::from_bytes(&e.device)
+                {
+                    queueable.push((d, e.remote_id));
+                }
             }
-            _ => vec![*peer],
+        }
+        let mut seen = HashSet::new();
+        let fresh: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|i| wanted.contains(i) && !reported.contains(i) && seen.insert(*i))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let conv_bytes = conv.to_bytes();
+        let devices: Vec<PublicIdentity> = match self.account_of(peer) {
+            Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
+            None => vec![*peer],
         };
-        let mut reached = false;
+        let mut reached = HashSet::new();
         for d in &devices {
             // At most 512 ids a message: the receiver refuses more, and
             // that ends the session.
-            if self.supports(d, FEATURE_RECEIPTS) {
-                let sent = read_messages(FEATURE_RECEIPTS, &conv, ids)
+            let sent = if self.supports(d, FEATURE_RECEIPTS) {
+                read_messages(FEATURE_RECEIPTS, &conv_bytes, &fresh)
                     .into_iter()
-                    .all(|m| self.send_tracked(d, m).is_ok());
-                reached |= sent;
+                    .all(|m| self.send_tracked(d, m).is_ok())
             } else if self.supports(d, FEATURE_READ) {
-                let sent = read_messages(FEATURE_READ, &conv, ids)
+                read_messages(FEATURE_READ, &conv_bytes, &fresh)
                     .into_iter()
-                    .all(|m| self.send(d, m).is_ok());
-                reached |= sent;
+                    .all(|m| self.send(d, m).is_ok())
+            } else {
+                false
+            };
+            if sent {
+                reached.insert(*d);
             }
         }
-        if reached {
-            Ok(())
+        let mut done: HashSet<u64> = if reached.is_empty() {
+            HashSet::new()
         } else {
-            Err(NetError::NoRoute(format!(
+            fresh.iter().copied().collect()
+        };
+        // The device that sent each message, if it wasn't reached, gets
+        // a receipt that waits for it.
+        let mut by_device: Vec<(PublicIdentity, Vec<u64>)> = Vec::new();
+        for (d, id) in queueable {
+            if reached.contains(&d) || !fresh.contains(&id) {
+                continue;
+            }
+            match by_device.iter_mut().find(|(x, _)| *x == d) {
+                Some((_, v)) => v.push(id),
+                None => by_device.push((d, vec![id])),
+            }
+        }
+        for (d, these) in by_device {
+            if self.queue_receipt(&d, &[], &these) {
+                done.extend(these);
+            }
+        }
+        if done.is_empty() {
+            return Err(NetError::NoRoute(format!(
                 "{} (no session with a read-receipt-capable peer)",
                 peer.fingerprint()
-            )))
+            )));
         }
+        let _ = self
+            .shared
+            .home
+            .mark_read_entries(self.identity_ref(), conv, now, |e| {
+                !e.outgoing && done.contains(&e.remote_id)
+            });
+        Ok(())
     }
 
     /// Handles a `Read` from `from`: it displayed our outgoing messages

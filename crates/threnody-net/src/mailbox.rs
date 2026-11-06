@@ -512,6 +512,22 @@ impl Node {
         lock(&self.shared.bundles).has(peer, now_ms()) && !self.is_revoked(peer)
     }
 
+    /// Tests only: how many of `peer`'s one-time prekeys we have left.
+    #[doc(hidden)]
+    pub fn opks_for(&self, peer: &PublicIdentity) -> usize {
+        lock(&self.shared.bundles).opks_left(peer)
+    }
+
+    /// The neighbours that could hold a sealed message for `dest`: live
+    /// direct sessions with mutually approved contacts other than `dest`.
+    pub(crate) fn mailbox_neighbours(&self, dest: &PublicIdentity) -> Vec<PublicIdentity> {
+        self.sessions()
+            .into_iter()
+            .filter(|s| s.via.is_none() && s.peer != *dest && self.shared.mutual(&s.peer))
+            .map(|s| s.peer)
+            .collect()
+    }
+
     /// Seals `msg` for `dest` and offers it to every live, mutually
     /// approved neighbour. Returns how many were asked; each answers with
     /// [`Event::DepositReceipt`].
@@ -545,12 +561,7 @@ impl Node {
             self.shared.persist_bundles(&book);
             sealed
         };
-        let mailboxes: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .filter(|s| s.via.is_none() && s.peer != *dest && self.shared.mutual(&s.peer))
-            .map(|s| s.peer)
-            .collect();
+        let mailboxes = self.mailbox_neighbours(dest);
         // Hide who deposits: through an onion circuit, wherever one reaches
         // the mailbox. Only with no circuit anywhere do we deposit directly.
         let handle = tokio::runtime::Handle::try_current().ok();
@@ -1061,6 +1072,15 @@ impl Node {
             // copy can't be asked for again.
             if self.record_incoming(&from, &msg, true) == Recorded::Duplicate {
                 return;
+            }
+            // It came through a mailbox, so its sender (very likely
+            // offline) learns it arrived from a receipt that goes the
+            // same way, or over the next session.
+            if let AppMessage::Text { id, .. } = &msg
+                && *id != 0
+                && self.is_accepted(&from)
+            {
+                self.queue_receipt(&from, &[*id], &[]);
             }
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {
                 self.emit(Event::OfflineMessage { from, via, msg });

@@ -912,6 +912,7 @@ impl Node {
         // A fresh outbox is saved at once, so when it began stays put.
         node.shared.receipts(|_| ());
         node.start_history_sweep();
+        node.start_receipt_flush();
         node.load_recovery();
         node.load_volunteer();
         node.load_credentials();
@@ -2238,6 +2239,9 @@ where
                             }
                         }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        // Receipts waiting for it, by what it says it takes
+                        // now: after `peer_acks`, so tracked ones can go.
+                        pending.extend(node.receipts_for(&peer, features));
                         // Remembered across restarts: probes matter most
                         // when there is no session to ask in.
                         let timed = features & FEATURE_TIMED_PROBES != 0;

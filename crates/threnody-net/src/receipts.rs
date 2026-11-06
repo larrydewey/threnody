@@ -16,7 +16,8 @@ use threnody_core::message::{FEATURE_READ, FEATURE_RECEIPTS};
 use threnody_core::receipt::{MAX_IDS, Receipt};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
-use crate::node::{Event, Node};
+use crate::delivery::Tag;
+use crate::node::{Event, Node, lock};
 
 /// A receipt for a device we can't reach live waits a random time in this
 /// window before it is sealed for mailboxes, so its deposit doesn't line up
@@ -370,6 +371,253 @@ impl Outbox {
 }
 
 impl Node {
+    /// Whether displayed messages are reported to their senders (on
+    /// unless turned off). Kept with the waiting receipts, so it holds
+    /// from the first instant after a restart.
+    pub fn send_read_receipts(&self) -> bool {
+        self.shared.receipts(|o| o.reads_on)
+    }
+
+    /// Turns read receipts on or off. Off also drops every read still
+    /// waiting to be sent: nothing leaves after the user says no.
+    pub fn set_send_read_receipts(&self, on: bool) {
+        self.shared.receipts(|o| o.set_reads(on));
+    }
+
+    /// Tests only: how long a receipt waits before it is sealed (a random
+    /// time from `min_ms` to `max_ms`).
+    #[doc(hidden)]
+    pub fn set_receipt_delay(&self, min_ms: u64, max_ms: u64) {
+        *lock(&self.shared.receipt_delay) = (min_ms, max_ms.max(min_ms));
+    }
+
+    /// Tests only: sends every waiting receipt that can go now, whatever
+    /// its delay.
+    #[doc(hidden)]
+    pub fn flush_receipts_now(&self) {
+        self.flush_receipts(true);
+    }
+
+    /// Tests only: how many messages the waiting receipts name.
+    #[doc(hidden)]
+    pub fn pending_receipts(&self) -> usize {
+        self.shared.receipts(|o| o.len())
+    }
+
+    /// Tests only: moves when the outbox began (see [`Outbox::since_ms`]).
+    #[doc(hidden)]
+    pub fn set_receipts_since(&self, since_ms: u64) {
+        self.shared.receipts(|o| {
+            o.since_ms = since_ms;
+            o.dirty = true;
+        });
+    }
+
+    /// A random wait in the delay window.
+    fn receipt_delay(&self) -> u64 {
+        let (min, max) = *lock(&self.shared.receipt_delay);
+        min + ((max - min) as f64 * crate::push::unit()) as u64
+    }
+
+    /// The feature bits `device` last said it has: in a session since we
+    /// started, else as saved with the contact. `None` if never heard.
+    fn known_features(&self, device: &PublicIdentity) -> Option<u64> {
+        let latest = lock(&self.shared.peer_features).get(device).copied();
+        latest.or_else(|| {
+            lock(&self.shared.contacts)
+                .get(device)
+                .map(|c| c.features)
+                .filter(|f| *f != 0)
+        })
+    }
+
+    /// Whether `device` may get our receipts: someone else's device, of a
+    /// contact we accepted (not blocked), not removed from its account.
+    /// Checked when a receipt is queued and again when it goes, so one
+    /// blocked, removed or revoked meanwhile gets nothing.
+    fn receipt_target_ok(&self, device: &PublicIdentity) -> bool {
+        *device != self.identity()
+            && !self.is_own_device(device)
+            && self.is_accepted(device)
+            && !self.is_revoked(device)
+    }
+
+    /// Sends `delivered` and `read` to `device` over its session, by what
+    /// its `Hello` in this run said: `Receipt`s, or `Read`s for the read
+    /// ones to an older peer (delivered can't be said to it). `None` if
+    /// there is no session, or its `Hello` hasn't come yet; else whether
+    /// anything went.
+    fn send_receipt_live(
+        &self,
+        device: &PublicIdentity,
+        delivered: &[u64],
+        read: &[u64],
+    ) -> Option<bool> {
+        if !self.connected(device) {
+            return None;
+        }
+        let features = lock(&self.shared.peer_features).get(device).copied()?;
+        let batch = Pending {
+            delivered: delivered.to_vec(),
+            read: read.to_vec(),
+            ..Pending::default()
+        };
+        if features & FEATURE_RECEIPTS != 0 {
+            let msgs = batch.messages(features, &[]);
+            Some(
+                !msgs.is_empty()
+                    && msgs
+                        .into_iter()
+                        .all(|m| self.send_tracked(device, m).is_ok()),
+            )
+        } else {
+            let conv = self.conversation_for(device).to_bytes();
+            let msgs = batch.messages(features, &conv);
+            Some(!msgs.is_empty() && msgs.into_iter().all(|m| self.send(device, m).is_ok()))
+        }
+    }
+
+    /// Queues receipts for `device`, the device that sent the messages:
+    /// at once if it is connected, else to wait for it (see
+    /// [`Node::flush_receipts`]). Reads are dropped with read receipts
+    /// off. Returns whether anything was sent or queued.
+    pub(crate) fn queue_receipt(
+        &self,
+        device: &PublicIdentity,
+        delivered: &[u64],
+        read: &[u64],
+    ) -> bool {
+        if !self.receipt_target_ok(device) {
+            return false;
+        }
+        let read = if self.send_read_receipts() { read } else { &[] };
+        if delivered.is_empty() && read.is_empty() {
+            return false;
+        }
+        if let Some(sent) = self.send_receipt_live(device, delivered, read)
+            && (sent || self.lacks(device, FEATURE_RECEIPTS))
+        {
+            return sent;
+        }
+        // Not connected (or it went down meanwhile): it waits, unless the
+        // device is known not to take what we would send it.
+        let mut delivered = delivered;
+        if let Some(f) = self.known_features(device)
+            && f & FEATURE_RECEIPTS == 0
+        {
+            delivered = &[];
+            if f & FEATURE_READ == 0 || read.is_empty() {
+                return false;
+            }
+        }
+        let (now, delay) = (now_ms(), self.receipt_delay());
+        self.shared
+            .receipts(|o| o.add(*device, delivered, read, now, delay));
+        true
+    }
+
+    /// The receipts waiting for `peer`, whose `Hello` just said
+    /// `features`: to send first thing in this session. A `Receipt` is
+    /// tracked, so it is sent again if the session dies.
+    pub(crate) fn receipts_for(&self, peer: &PublicIdentity, features: u64) -> Vec<AppMessage> {
+        if !self.receipt_target_ok(peer) {
+            self.shared.receipts(|o| o.forget(peer));
+            return Vec::new();
+        }
+        let Some(mut p) = self.shared.receipts(|o| o.take(peer)) else {
+            return Vec::new();
+        };
+        if !self.send_read_receipts() {
+            p.read.clear();
+        }
+        let conv = self.conversation_for(peer).to_bytes();
+        p.messages(features, &conv)
+            .into_iter()
+            .map(|m| match m {
+                AppMessage::Receipt(_) => self.shared.delivery(|d| d.track(peer, m, Tag::NONE)),
+                m => m,
+            })
+            .collect()
+    }
+
+    /// Sends the receipts that are due (with `all`, every one): over a
+    /// session with their device if there is one, else sealed through
+    /// mailboxes, if the device takes them and a mailbox is reachable.
+    /// One that can't go yet waits for a session, a mailbox or its expiry.
+    pub(crate) fn flush_receipts(&self, all: bool) {
+        let now = now_ms();
+        for d in self.shared.receipts(|o| o.due(now, all)) {
+            if !self.receipt_target_ok(&d) {
+                self.shared.receipts(|o| o.forget(&d));
+                continue;
+            }
+            if self.connected(&d) {
+                // Queued as its session came up, before its `Hello`: it
+                // goes now (what the device can't take is dropped). Until
+                // we have heard from it at all, it waits.
+                if lock(&self.shared.peer_features).contains_key(&d)
+                    && let Some(p) = self.shared.receipts(|o| o.take(&d))
+                {
+                    self.queue_receipt(&d, &p.delivered, &p.read);
+                }
+                continue;
+            }
+            // Sealing spends one of our prekeys for it: only when a mailbox
+            // can take the result.
+            if !self
+                .known_features(&d)
+                .is_some_and(|f| f & FEATURE_RECEIPTS != 0)
+                || !self.can_send_offline(&d)
+                || self.mailbox_neighbours(&d).is_empty()
+            {
+                continue;
+            }
+            let Some(mut p) = self.shared.receipts(|o| o.take(&d)) else {
+                continue;
+            };
+            if !self.send_read_receipts() {
+                p.read.clear();
+            }
+            let (mut sent, mut failed) = (false, false);
+            for m in p.messages(FEATURE_RECEIPTS, &[]) {
+                match self.send_offline(&d, &m) {
+                    Ok(_) => sent = true,
+                    Err(_) => failed = true,
+                }
+            }
+            let delay = self.receipt_delay();
+            self.shared.receipts(|o| {
+                if sent {
+                    o.sealed(d, now);
+                }
+                // Again later: a copy twice is harmless, the sender's
+                // marks are idempotent.
+                if failed {
+                    o.restore(d, p, now.saturating_add(delay));
+                }
+            });
+        }
+    }
+
+    /// Starts looking for due receipts every [`TICK`].
+    pub(crate) fn start_receipt_flush(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let node = self.clone();
+        handle.spawn(async move {
+            let closed = node.closed();
+            tokio::pin!(closed);
+            let mut tick = tokio::time::interval(TICK);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => node.flush_receipts(false),
+                    () = &mut closed => break,
+                }
+            }
+        });
+    }
+
     /// Handles a `Receipt` from `from`, live or sealed: our outgoing
     /// messages it names in our conversation with its account were
     /// delivered (read ones too), and the read ones displayed.
