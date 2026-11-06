@@ -883,14 +883,33 @@ impl Node {
                 }
             }
             if let Some(m) = &main {
-                for c in pp.theirs.standby.iter().take(8) {
+                for t in standby_targets(&pp, now_ms()) {
                     for p in probes_for(&d, &me, timed) {
-                        let _ = m.send_raw(c.addr, &p);
+                        let _ = m.send_raw(t, &p);
                     }
                 }
             }
         }
     }
+}
+
+/// Where our main socket keeps a hole open toward `pp`'s standby path:
+/// its public standby addresses (at most 8), while it could still dial
+/// through them, that is, until a day after its last `Paths` or session
+/// (as [`Node::network_switched`] dials only peers that recent). A peer
+/// gone longer, or one naming our LAN, loopback or a broadcast address,
+/// gets nothing.
+fn standby_targets(pp: &PeerPaths, now: u64) -> Vec<SocketAddr> {
+    if now.saturating_sub(pp.updated_ms) > ANNOUNCE_WITHIN_MS {
+        return Vec::new();
+    }
+    pp.theirs
+        .standby
+        .iter()
+        .map(|c| c.addr)
+        .filter(|a| is_public(&a.ip()))
+        .take(8)
+        .collect()
 }
 
 #[cfg(test)]
@@ -989,6 +1008,36 @@ mod tests {
             assert!(ended.is_err(), "ended at {rate:?} s: {ended:?}");
             assert!(c.sessions().iter().any(|s| s.peer == a.identity()));
         }
+    }
+
+    #[test]
+    fn standby_holes_go_only_to_public_addresses_of_recent_peers() {
+        let at = |a: &str| Candidate {
+            kind: CandidateKind::Reflexive,
+            addr: a.parse().unwrap(),
+        };
+        let now = 10 * ANNOUNCE_WITHIN_MS;
+        let mut pp = PeerPaths {
+            updated_ms: now - 1000,
+            theirs: Paths {
+                main: vec![],
+                standby: vec![
+                    at("127.0.0.1:631"),
+                    at("192.168.1.1:53"),
+                    at("224.0.0.251:5353"),
+                    at("203.0.113.9:40000"),
+                ],
+                beat_ms: 2000,
+            },
+            ..PeerPaths::default()
+        };
+        assert_eq!(
+            standby_targets(&pp, now),
+            ["203.0.113.9:40000".parse::<SocketAddr>().unwrap()]
+        );
+        // A peer heard from over a day ago: its standby mapping is long gone.
+        pp.updated_ms = now - ANNOUNCE_WITHIN_MS - 1;
+        assert!(standby_targets(&pp, now).is_empty());
     }
 
     #[test]

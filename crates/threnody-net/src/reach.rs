@@ -315,14 +315,20 @@ pub(crate) fn is_global_v6(ip: &IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xe000 == 0x2000)
 }
 
+/// A unicast address on the internet: not private, shared (CGNAT),
+/// loopback, link-local, multicast, broadcast, "this network" (0/8) or
+/// reserved (240/4).
 pub(crate) fn is_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             !(v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)
+                || v4.is_multicast()
+                || o[0] == 0
+                || o[0] >= 240
+                || o[0] == 100 && o[1] & 0xc0 == 64)
         }
         v6 => is_global_v6(v6),
     }
@@ -1590,6 +1596,12 @@ mod tests {
             "100.64.0.1",
             "127.0.0.1",
             "fe80::1",
+            "0.1.2.3",
+            "224.0.0.251",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
+            "ff02::1",
         ] {
             assert!(!is_public(&a.parse().unwrap()), "{a}");
         }
