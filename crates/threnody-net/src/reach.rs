@@ -753,11 +753,12 @@ impl Node {
                 }
             }
         }
-        // Two answers are enough (one can't show a symmetric NAT).
+        // Three answers are enough: two that agree outvote one that lies,
+        // and three that differ show a symmetric NAT.
         let deadline = Instant::now() + REFLECT_WAIT;
         while !targets.is_empty()
             && Instant::now() < deadline
-            && lock(&self.rdv().inner).reflected.len() < 2
+            && lock(&self.rdv().inner).reflected.len() < 3
         {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -778,24 +779,16 @@ impl Node {
         let contacts = self.contacts();
         // Only approved peers' observations count: anyone else could steer
         // our probes at an address of its choosing.
-        let observed = inner
+        let observed: Vec<SocketAddr> = inner
             .observed
             .iter()
             .filter(|(p, _)| contacts.get(p).is_some_and(|c| c.mutually_approved()))
-            .map(|(_, a)| *a);
-        let seen: Vec<SocketAddr> = inner.reflected.values().copied().chain(observed).collect();
-        let mut reflexive: Vec<SocketAddr> = Vec::new();
-        for a in seen.iter().filter(|a| is_public(&a.ip()) && a.is_ipv4()) {
-            if !reflexive.contains(a) {
-                reflexive.push(*a);
-            }
-        }
-        // Two observers seeing one address at different ports: symmetric NAT.
-        let symmetric = reflexive.iter().any(|a| {
-            reflexive
-                .iter()
-                .any(|b| a.ip() == b.ip() && a.port() != b.port())
-        });
+            .map(|(_, a)| *a)
+            .collect();
+        let reported: Vec<SocketAddr> = inner.reflected.values().copied().collect();
+        let seen: Vec<SocketAddr> = reported.iter().chain(&observed).copied().collect();
+        let dht_ip = dht_guess.map(|g| IpAddr::V4(*g.ip()));
+        let (mut reflexive, symmetric) = outside_v4(&reported, &observed, dht_ip);
         if reflexive.is_empty()
             && let Some(g) = dht_guess
             && is_public(&IpAddr::V4(*g.ip()))
@@ -1442,6 +1435,49 @@ fn recognise(
         .or_else(|| rendezvous::recognise_probe(data, untimed))
 }
 
+/// Our outside IPv4 addresses, from where DHT nodes (`reported`, one
+/// address each) and mutually approved contacts (`vouched`) saw us, and
+/// whether our NAT looks symmetric (Appendix N §2).
+///
+/// An address two observers agree on is trusted, as is one a contact saw.
+/// Without any, the addresses at an IP two observers (or the DHT client's
+/// own view, `dht_ip`) agree on are kept, whatever their ports: that is
+/// how a symmetric NAT, a new port per destination, looks. So a single
+/// DHT node can neither add an address of its choosing nor, where two
+/// others agree, make our NAT look symmetric.
+fn outside_v4(
+    reported: &[SocketAddr],
+    vouched: &[SocketAddr],
+    dht_ip: Option<IpAddr>,
+) -> (Vec<SocketAddr>, bool) {
+    let public = |a: &&SocketAddr| a.is_ipv4() && is_public(&a.ip());
+    let all: Vec<SocketAddr> = reported
+        .iter()
+        .chain(vouched)
+        .filter(public)
+        .copied()
+        .collect();
+    let count = |f: &dyn Fn(&SocketAddr) -> bool| all.iter().filter(|a| f(a)).count();
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for a in &all {
+        if (count(&|b| b == a) >= 2 || vouched.contains(a)) && !out.contains(a) {
+            out.push(*a);
+        }
+    }
+    if !out.is_empty() {
+        return (out, false);
+    }
+    for a in &all {
+        if (count(&|b| b.ip() == a.ip()) >= 2 || dht_ip == Some(a.ip())) && !out.contains(a) {
+            out.push(*a);
+        }
+    }
+    let symmetric = out
+        .iter()
+        .any(|a| out.iter().any(|b| a.ip() == b.ip() && a.port() != b.port()));
+    (out, symmetric)
+}
+
 async fn join_dht(cfg: &ReachConfig, warm: &[String]) -> std::io::Result<AsyncDht> {
     let mut b = Dht::builder();
     if let Some(bs) = &cfg.bootstrap {
@@ -1586,6 +1622,37 @@ mod tests {
         assert_eq!(addr, "203.0.113.5:7450".parse().unwrap());
         assert!(!is_krpc_reply(&krpc_ping(*b"xy")), "a query is not a reply");
         assert!(!is_krpc_reply(&[0x40; 1200]));
+    }
+
+    #[test]
+    fn one_dht_node_cannot_steer_our_outside_address() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let ours = a("203.0.113.5:7450");
+        // A liar among honest reflectors: neither its port nor its
+        // address gets in, and the NAT doesn't look symmetric.
+        let (list, symmetric) = outside_v4(
+            &[ours, ours, a("203.0.113.5:9999"), a("198.51.100.1:53")],
+            &[],
+            None,
+        );
+        assert_eq!((list, symmetric), (vec![ours], false));
+        // One answer alone, unconfirmed, isn't an address.
+        assert_eq!(outside_v4(&[a("198.51.100.1:53")], &[], None).0, []);
+        // Unless the DHT's own view of our IP agrees.
+        assert_eq!(outside_v4(&[ours], &[], Some(ours.ip())).0, [ours]);
+        // A contact's word is enough.
+        assert_eq!(outside_v4(&[], &[ours], None).0, [ours]);
+        // A port per destination at one IP: symmetric.
+        let sym = [
+            a("203.0.113.5:1001"),
+            a("203.0.113.5:1002"),
+            a("203.0.113.5:1003"),
+        ];
+        let (list, symmetric) = outside_v4(&sym, &[], None);
+        assert_eq!(list, sym);
+        assert!(symmetric);
+        // Private addresses never count.
+        assert_eq!(outside_v4(&[a("10.0.0.2:7450"); 3], &[], None).0, []);
     }
 
     #[test]
