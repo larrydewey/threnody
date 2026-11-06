@@ -18,7 +18,8 @@ Every leaf uses a `BasicCredential` whose identity is exactly the leaf's 32-byte
 There is no delivery service. Group traffic is carried as `AppMessage::Group(GroupWire)` (Appendix C, kind 6) inside the authenticated 1:1 ratchets:
 
 ```
-GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (32), ? 5: reference }
+GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (32), ? 5: reference,
+              ? 6: owner (32) }
   1 KeyPackageRequest  owner -> invitee           (name)
   2 KeyPackage         invitee -> owner           (MlsMessage(KeyPackage))
   3 Welcome            owner -> new member        (MlsMessage(Welcome), ratchet tree in extension)
@@ -28,8 +29,10 @@ GroupWire = { 0: kind, 1: group_id (16), ? 2: payload, ? 3: name, ? 4: member (3
   6 Receipt            forwarder -> sender      (member = who acknowledged, reference)
   7 Leave              member -> owner          (remove me)
   8 AddDevice          member -> owner, and     (member = another device of the sender's account)
-                       member -> that device
+                       member -> that device    (and owner = the group's owner)
 ```
+
+Receivers ignore keys they don't know, so older members skip `owner`.
 
 The sender fans every message out to each other member. The groups use the pure-ciphertext wire format, so commits are encrypted too.
 
@@ -59,12 +62,12 @@ Members need not be contacts of each other, or online together. Each copy goes t
 
 1. The live session with that member. Sessions acknowledge group messages end to end, and resend them in the next session if the current one dies first (Appendix C, *Acknowledgements*).
 2. Sealed for the member's mailboxes (Appendix H), when we hold their prekeys.
-3. Forwarded by another member we have a session with, the owner first. The `Forward` carries the same MLS ciphertext and names the member to deliver it to. This applies to MLS messages only, never to key packages or Welcomes.
+3. Forwarded by another member we have a session with, the owner first. The `Forward` carries the same MLS ciphertext and names the member to deliver it to. This applies to MLS messages only, never to key packages or Welcomes. A member being welcomed by the same change (an add's commit goes out with its Welcome) is never the forwarder: it doesn't know the group until its Welcome is in, and would drop the message.
 4. Held by us and sent when the member next connects. Meanwhile we try to reach them through relays (Appendix G).
 
 A forwarder checks that the sender and the target are both members of the group as it knows it, and that the target is neither itself nor the sender. It then delivers a plain `Message` by steps 1, 2 and 4, and never forwards again, so a message crosses at most one forwarding member. Since the owner invited everyone, it usually has a session with every member, and a member that only ever talks to the owner still reaches the whole group.
 
-Held messages are kept encrypted under the identity (`group-held` state), at most 200 per member, oldest dropped first. Pending invitations are kept the same way (`group-invites`). A message held for longer than five epochs' worth of membership changes can no longer be decrypted (see *Past epochs*).
+Held messages are kept encrypted under the identity (`group-held` state): at most 200 and 32 MiB per member and 128 MiB in all. Any member can have a forwarder hold what it sends, so these limits bound what one member can make another keep. Past a limit, the forwarder drops from whoever has it hold the most (counting itself for its own messages): their oldest application message, and only when they have none left, their oldest commit, proposal or Welcome. A member needs every commit to read anything after it, and there is no resync yet, so files sent to an offline member go before the commit that added it, and a member flooding the forwarder through `Forward` only loses its own messages. Anyone can tell a commit from an application message, as MLS leaves the content type in the clear. Dropped messages are not reported. Pending invitations are kept the same way (`group-invites`). A message held for longer than five epochs' worth of membership changes can no longer be decrypted (see *Past epochs*).
 
 Delivery ticks (Appendix C, *Acknowledgements*) count only a member's own acknowledgement. So when the sender hands a copy to a forwarder, it includes a reference. Once the member acknowledges the copy the forwarder delivered (live, or later from its hold), the forwarder sends the sender a `Receipt` naming the member and the reference. The sender believes receipts only from members, and only about members. A member could claim a delivery that didn't happen, but that only affects the ticks, and members can already drop messages they forward.
 
@@ -77,13 +80,13 @@ Spec §6.2 leaves admin semantics to the application layer.
 - **Owner.** The creator owns the group and is its only committer. Adds and removals are owner commits, and members reject commits from anyone else. Without a delivery service to order commits, this rules out epoch forks.
 - **Joining.**
   1. The owner sends a `KeyPackageRequest` to the invitee.
-  2. The invitee consents by returning a fresh key package. Requests from mutually approved contacts are accepted automatically; anyone else needs `/group accept`.
+  2. The invitee consents by returning a key package. Requests from mutually approved contacts are accepted automatically; anyone else needs `/group accept`. Group traffic doesn't go through message requests, so the invitee keeps at most 3 waiting invitations per inviter and 32 in all, and none from a blocked contact. The oldest go first, those from strangers before those from accepted contacts (or, for a group one of our own devices is in, from its owner), since a stranger can make any number of identities. After a stranger's invitation notifies, others from strangers in the next 10 minutes are listed without notifying. Group names lose control characters and the invisible ones that reorder or hide text. As for message requests (Appendix M), the apps' notification of an invitation from someone not accepted says only "New group invitation": the group's name is the inviter's to choose. The invitee keeps the key package's private keys (in its group state) only until a Welcome uses them. The owner may ask more than once while the add is pending and completes it with whichever answer arrives first, so another request for the same group from the same peer is answered with the same key package (a fresh one only once it has expired or been deleted). At most 16 are kept, the oldest deleted first.
   3. The owner completes adds only for key packages it asked for, and only when the key package comes from the identity it invited.
   4. The owner commits the add, sends the Welcome to the new member, and sends the commit to the existing members.
-- **Joining checks.** On a Welcome, the joiner checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members.
+- **Joining checks.** The joiner takes a Welcome only from someone whose invitation to that group it accepted (gave a key package to), before it uses up the key package, and only if that sender made the Welcome (signed its group info). It then checks the group id, the ciphersuite, that every member credential is valid, and that the inviter and the joiner are both members, and records the inviter as the owner. Several people can invite us to the same group id. Accepting one of them sends a key package to that inviter only, and declining one keeps the others. The apps answer the invitation they show.
 - **Leaving.** A member leaves by sending the owner `Leave` and forgetting the group at once. The owner commits its removal for the remaining members. An owner can't leave, but deleting the group removes every other member in one commit and then forgets it.
-- **Linked devices.** When a device is linked into an account (or first connects to a sibling after this was introduced), each sibling has it join every group the sibling is in, once per group: it invites the device itself if it may commit, and otherwise sends the owner `AddDevice`. The owner invites the device only if the sender is a member and both are devices of the same account, according to the sender's account chain. The sibling also sends `AddDevice` to the device itself, which then accepts the owner's invitation to that group automatically, as it does an invitation from its own sibling. Leaving is per device, and a device that left stays out: a sibling that sees one of its account's devices leave (or be removed from) a group never adds it back, and a device ignores `AddDevice` for a group it left or declined, and asks the user again before accepting any invitation to one.
-- **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it. When a device is removed from its account (Appendix J), an owner that learns of it removes it from every group it owns at once, without being asked, and every member stops delivering to it (no session, mailbox, forward or holding), including the removal commit.
+- **Linked devices.** When a device is linked into an account (or first connects to a sibling after this was introduced), each sibling has it join every group the sibling is in, once per group: it invites the device itself if it may commit, and otherwise sends the owner `AddDevice`. The owner invites the device only if the sender is a member and both are devices of the same account, according to the sender's account chain. The sibling also sends `AddDevice` to the device itself, naming the group's owner. The device then accepts that owner's invitation to that group automatically, as it does an invitation from its own sibling. Anyone else's invitation to the group still needs consent. An `AddDevice` from an older sibling doesn't name the owner, so that invitation needs consent too. Leaving is per device, and a device that left stays out: a sibling that sees one of its account's devices leave (or be removed from) a group never adds it back, and a device ignores `AddDevice` for a group it left or declined, and asks the user again before accepting any invitation to one.
+- **Removal.** On removal, the owner's commit goes to every member, including the one removed. The removed member's group becomes inactive, and later epochs are unreadable to it. The removed member then deletes the group and its secrets, as on leaving, so the owner can invite it again. When a device is removed from its account (Appendix J), an owner that learns of it removes it from every group it owns at once, without being asked, and every member stops delivering to it (no session, mailbox, forward or holding), including the removal commit.
 - **Past epochs.** Application messages from up to five past epochs are still accepted, to tolerate reordering around commits.
 
 ## Persistence
@@ -94,7 +97,7 @@ After every change, the full openmls key-value store and the group metadata are 
 file = nonce (12) || ChaCha20-Poly1305(KDF("state encryption key", identity_seed), nonce, ad = "groups", export)
 ```
 
-The key is derived from the identity seed, so group secrets are only as accessible as the identity: if the identity is passphrase-sealed, so is everything else. State is saved *before* any resulting message leaves, so a crash can't leave us behind an epoch our peers have already moved to.
+The key is derived from the identity seed, so group secrets are only as accessible as the identity: if the identity is passphrase-sealed, so is everything else. State is saved *before* any resulting message leaves, so a crash can't leave us behind an epoch our peers have already moved to. If it can't be saved (a full disk, say), nothing leaves: the change fails, and the groups go back to their last saved state, where the peers still are. An invitation that would have been accepted automatically then waits for consent instead.
 
 ## CLI
 
@@ -109,5 +112,6 @@ The key is derived from the identity seed, so group secrets are only as accessib
 ## Not yet done
 
 - **Secure deletion.** Each save rewrites the whole state file atomically. Old epoch secrets are gone from the file system's view, but not necessarily from the storage medium (spec §16 secure deletion).
+- **Member key updates.** Only the owner commits, so only the owner's leaf key changes, with each add or removal. Members never send updates, so a member's leaf key stays the same for as long as it is in the group. Until they do, groups give members forward secrecy but not post-compromise security (spec §3.3): someone who once copied a member's group state and identity seed can read every later epoch until that member is removed. Members would need to send update proposals for the owner to commit. Older members reject proposals, so this needs a feature bit.
 - **More committers.** Admin roles beyond a single owner. The owner can already mark members as admins (`promote_in_group` and `demote_in_group` in the FFI), but the role is kept only on the owner's devices: it isn't sent to members, and members still accept commits only from the owner.
 - **Ciphersuite version.** openmls's X-Wing HPKE implements X-Wing draft-06, while the 1:1 protocol uses draft-11. Both are hybrid; they will converge once the MLS PQ ciphersuite draft settles.

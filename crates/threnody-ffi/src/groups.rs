@@ -65,12 +65,13 @@ fn event(u: Update) -> NodeEvent {
             name,
             owner: fp(&owner),
         },
-        Update::Invited(i) => {
+        Update::Invited { invite: i, quiet } => {
             let i = invite(&i);
             NodeEvent::GroupInvited {
                 group: i.group,
                 name: i.name,
                 from: i.from,
+                quiet,
             }
         }
         Update::MemberAdded { group, member } => NodeEvent::GroupMembersChanged {
@@ -258,9 +259,44 @@ impl ThrenodyNode {
         Ok(())
     }
 
+    /// Accepts `from`'s invitation to `group` (both as `group_invites`
+    /// lists them), when more than one person invites us to that group.
+    pub fn accept_group_invite_from(&self, group: String, from: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let inviter = self
+            .group_node()
+            .invites()
+            .iter()
+            .find(|i| i.group == g && fp(&i.from) == from)
+            .map(|i| i.from)
+            .ok_or_else(|| fail("no such invitation"))?;
+        let _guard = self.rt.enter();
+        let updates = self
+            .group_node()
+            .accept_from(&self.node, &g, &inviter)
+            .map_err(fail)?;
+        self.queue_updates(updates);
+        Ok(())
+    }
+
     pub fn decline_group_invite(&self, group: String) -> Result<()> {
         let g = self.group_id(&group)?;
         self.group_node().decline(&g);
+        Ok(())
+    }
+
+    /// Declines `from`'s invitation to `group` (both as `group_invites`
+    /// lists them), keeping anyone else's to the same group.
+    pub fn decline_group_invite_from(&self, group: String, from: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let mut groups = self.group_node();
+        let inviter = groups
+            .invites()
+            .iter()
+            .find(|i| i.group == g && fp(&i.from) == from)
+            .map(|i| i.from)
+            .ok_or_else(|| fail("no such invitation"))?;
+        groups.decline_from(&g, &inviter);
         Ok(())
     }
 

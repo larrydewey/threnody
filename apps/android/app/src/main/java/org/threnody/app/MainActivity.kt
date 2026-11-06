@@ -223,7 +223,7 @@ class MainActivity : Activity() {
         // Section: Group Invitations
         val invites = n.groupInvites().map { i ->
             Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null,
-                open = { openGroup(i.group) }, section = Row.Section.Invites)
+                open = { openGroup(i.group, inviter = i.from) }, section = Row.Section.Invites)
         }
         if (invites.isNotEmpty()) {
             rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Invitations", section = Row.Section.Invites))
@@ -919,10 +919,13 @@ class MainActivity : Activity() {
         startActivity(Intent(this, ChatActivity::class.java).putExtra(ChatActivity.NOTE, true))
     }
 
-    private fun openGroup(id: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null) {
+    private fun openGroup(
+        id: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null, inviter: String? = null,
+    ) {
         startActivity(Intent(this, ChatActivity::class.java)
             .putExtra(ChatActivity.GROUP, id)
             .putExtra(ChatActivity.PERSONA, persona)
+            .putExtra(ChatActivity.INVITER, inviter)
             .jumpTo(jump, query))
     }
 
