@@ -66,8 +66,9 @@ pub(crate) struct HandleState {
     /// The meeting place our invite links name, once one was made.
     invite: Mutex<Option<Own>>,
     /// Probe keys for peers we punch toward through a handle: finders
-    /// knocking on ours, and owners of handles we looked up.
-    pub(crate) probe_keys: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
+    /// knocking on ours, and owners of handles we looked up; and when each
+    /// was added.
+    pub(crate) probe_keys: Mutex<HashMap<PublicIdentity, ([u8; 32], Instant)>>,
     pub(crate) kick: Notify,
 }
 
@@ -446,14 +447,20 @@ impl Node {
         // Knock, and punch while they answer.
         self.add_probe_key(peer, spot.probe_key());
         self.knock(spot).await?;
-        let symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
-        self.punch(peer, &rec.candidates.list, symmetric, Urge::Start);
+        let mut symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
+        let mut list = rec.candidates.list;
+        let mut punching = self.punch(peer, &list, symmetric, Urge::Start);
         let deadline = Instant::now() + FIND_FOR;
         let mut issued = rec.candidates.issued_ms;
         let mut reread = Instant::now() + REREAD_EVERY;
         while Instant::now() < deadline {
             if self.connected(&peer) {
                 return Ok(peer);
+            }
+            // Refused while others are punched (strangers get a share of
+            // the slots): try again until it starts.
+            if !punching {
+                punching = self.punch(peer, &list, symmetric, Urge::Start);
             }
             // The owner may have moved since (a phone off Wi-Fi): aim at
             // its new addresses too, or our side of the NAT stays shut.
@@ -470,8 +477,9 @@ impl Node {
                     self.emit(Event::ReachNote {
                         note: format!("{spot} moved: {} address(es)", r.candidates.list.len()),
                     });
-                    let symmetric = r.candidates.flags & FLAG_SYMMETRIC != 0;
-                    self.punch(peer, &r.candidates.list, symmetric, Urge::Start);
+                    symmetric = r.candidates.flags & FLAG_SYMMETRIC != 0;
+                    list = r.candidates.list;
+                    punching = self.punch(peer, &list, symmetric, Urge::Start);
                 }
                 continue;
             }
@@ -483,12 +491,23 @@ impl Node {
         }))
     }
 
+    /// Keeps `key` for probes to and from `peer`. When full, the oldest
+    /// key of a peer no longer punched makes room: knocks, which anyone
+    /// with the handle can write, never wipe out a meeting under way.
     fn add_probe_key(&self, peer: PublicIdentity, key: [u8; 32]) {
+        let punching: HashSet<PublicIdentity> = self.reachability().punching.into_iter().collect();
         let mut keys = lock(&self.handles().probe_keys);
         if keys.len() >= MAX_PROBE_KEYS && !keys.contains_key(&peer) {
-            keys.clear();
+            let oldest = keys
+                .iter()
+                .filter(|(p, _)| !punching.contains(*p))
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(p, _)| *p);
+            if let Some(p) = oldest {
+                keys.remove(&p);
+            }
         }
-        keys.insert(peer, key);
+        keys.insert(peer, (key, Instant::now()));
     }
 
     /// Leaves a knock with our addresses in a random slot of `spot`.
@@ -646,7 +665,13 @@ impl Node {
             });
             self.add_probe_key(k.id, spot.probe_key());
             let symmetric = k.candidates.flags & FLAG_SYMMETRIC != 0;
-            self.punch(k.id, &k.candidates.list, symmetric, Urge::Start);
+            if !self.punch(k.id, &k.candidates.list, symmetric, Urge::Start) {
+                // Not now (other strangers are punched, or it backs off):
+                // the knock stays new, and the next poll tries again.
+                if let Some(o) = lock(slot).as_mut() {
+                    o.seen.remove(&(k.id, k.candidates.issued_ms));
+                }
+            }
         }
     }
 }
@@ -688,4 +713,99 @@ async fn put(
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use threnody_core::Identity;
+
+    fn test_node(dir: &tempfile::TempDir, name: &str) -> Node {
+        let home = threnody_core::store::Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+        .0
+    }
+
+    fn at(a: &str) -> Vec<Candidate> {
+        vec![Candidate {
+            kind: CandidateKind::Reflexive,
+            addr: a.parse().unwrap(),
+        }]
+    }
+
+    /// A stranger who knocked (any id will do), with the key its probes use.
+    fn knocker(node: &Node) -> PublicIdentity {
+        let id = Identity::generate().public();
+        node.add_probe_key(id, [9; 32]);
+        id
+    }
+
+    #[tokio::test]
+    async fn knocks_leave_punch_slots_for_contacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "a");
+        node.listen_quic("127.0.0.1:0").await.unwrap();
+        // Knocks with made-up ids: only some get punched at once.
+        let started = (0..4)
+            .filter(|i| {
+                let k = knocker(&node);
+                node.punch(k, &at(&format!("203.0.113.{i}:7450")), false, Urge::Start)
+            })
+            .count();
+        assert_eq!(started, 2, "strangers took {started} punch slots");
+        // A contact still gets one.
+        let friend = Identity::generate().public();
+        node.update_contacts(|c| {
+            c.observe(friend, None, 0);
+            let x = c.get_mut(&friend).unwrap();
+            (x.local_approved, x.remote_approved) = (true, true);
+            x.set_discovery_key([5; 32]);
+        });
+        assert!(node.punch(friend, &at("203.0.113.50:7450"), false, Urge::Start));
+    }
+
+    #[tokio::test]
+    async fn knocks_cannot_aim_our_probes_at_the_lan() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "a");
+        node.listen_quic("127.0.0.1:0").await.unwrap();
+        let k = knocker(&node);
+        let lan = [
+            at("192.168.1.1:53"),
+            at("10.0.0.1:631"),
+            at("224.0.0.251:5353"),
+        ]
+        .concat();
+        assert!(
+            !node.punch(k, &lan, false, Urge::Start),
+            "probed a LAN address for a stranger"
+        );
+        assert!(node.punch(k, &at("203.0.113.9:7450"), false, Urge::Start));
+    }
+
+    #[tokio::test]
+    async fn knocks_cannot_wipe_out_a_meeting_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir, "a");
+        node.listen_quic("127.0.0.1:0").await.unwrap();
+        let owner = knocker(&node);
+        assert!(node.punch(owner, &at("203.0.113.1:7450"), false, Urge::Start));
+        for _ in 0..2 * MAX_PROBE_KEYS {
+            knocker(&node);
+        }
+        let keys = lock(&node.handles().probe_keys);
+        assert!(keys.len() <= MAX_PROBE_KEYS);
+        assert!(
+            keys.contains_key(&owner),
+            "the key of a peer being punched went"
+        );
+    }
 }

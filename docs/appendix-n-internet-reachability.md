@@ -180,7 +180,7 @@ An app starting after a long time away is found at the contact's next read of it
 - **Clocks.** Timed probes need the two clocks to agree, as LAN beacons do: a skew under 5 minutes always works, one over 10 minutes never does, and in between it depends on where each clock falls in its epoch. Contacts whose clocks are further apart don't recognise each other's timed probes. They lose the source-address hint and the probe that makes the other side join in, and connect only if the 3-second dial without a probe gets through, which a restrictive NAT can stop. A phone with a hand-set or drifting clock is the likely case. The handshake and sessions themselves don't depend on the clock.
 - **Records are encrypted and authenticated** under keys only the two contacts hold. BEP 44 signatures (from keys derived per direction and per epoch) stop DHT nodes from altering them.
 - **Revocation** deletes `D(A,B)`. From then on the node neither publishes records for that contact nor reads theirs.
-- **Resource limits:** at most 32 probes in flight, punching at most 4 contacts at once, and backoff per contact.
+- **Resource limits:** at most 32 probes in flight, punching at most 4 peers at once (at most 2 of them strangers met through a handle or invite, Appendix S), and backoff per contact.
 - **The QUIC endpoint** accepts connections only to run the Threnody handshake. `check_policy` applies as for TCP.
 
 ## Settings

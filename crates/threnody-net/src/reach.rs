@@ -69,6 +69,9 @@ const REDIAL_EVERY: Duration = Duration::from_secs(5);
 const LOST_DIAL_AFTER: Duration = Duration::from_secs(15);
 /// Contacts punched at once.
 const MAX_PUNCHES: usize = 4;
+/// Of those, people met through a handle or invite (Appendix S): anyone
+/// with one can knock, so knocks must leave room for contacts.
+const MAX_STRANGER_PUNCHES: usize = 2;
 /// Candidates probed per contact (so at most 32 probes in flight).
 const MAX_TARGETS: usize = 8;
 /// Waits before punching a contact again after failures.
@@ -186,6 +189,12 @@ struct Punch {
     /// Done only once a direct session exists (a relayed one is up
     /// already: see [`Urge::Upgrade`]).
     direct: bool,
+    /// Someone met through a handle or invite, not a contact: whoever
+    /// wrote its addresses (a knock, a record) may not be it, so we dial
+    /// only where its probes came from.
+    stranger: bool,
+    /// Where the peer's probes came from.
+    heard_from: Mutex<Vec<SocketAddr>>,
 }
 
 struct Published {
@@ -1094,11 +1103,20 @@ impl Node {
         {
             return false;
         }
+        // Anyone with a handle or invite can write a knock or record with
+        // addresses of their choosing: a stranger is probed only at public
+        // addresses (loopback too when we listen there, for tests), never
+        // our LAN or a broadcast one.
+        let stranger = !self.shared.mutual(&peer);
+        let on_loopback = quic.local.ip().is_loopback();
+        let allowed = |ip: IpAddr| {
+            quic.can_reach(ip) && (!stranger || is_public(&ip) || on_loopback && ip.is_loopback())
+        };
         let mut sorted = candidates.to_vec();
         sorted.sort_by_key(|c| c.kind.rank());
         let mut targets: Vec<SocketAddr> = Vec::new();
         for a in sorted.iter().map(|c| c.addr) {
-            if quic.can_reach(a.ip()) && !targets.contains(&a) && targets.len() < MAX_TARGETS {
+            if allowed(a.ip()) && !targets.contains(&a) && targets.len() < MAX_TARGETS {
                 targets.push(a);
             }
         }
@@ -1110,9 +1128,11 @@ impl Node {
                 .is_some_and(|(_, until)| Instant::now() < *until);
             let recovering = matches!(urge, Urge::Moved | Urge::Lost);
             let running = inner.punches.contains_key(&peer);
+            let strangers = inner.punches.values().filter(|p| p.stranger).count();
             if targets.is_empty()
                 || (backing_off && urge == Urge::Start && !running)
                 || (inner.punches.len() >= MAX_PUNCHES && !recovering && !running)
+                || (stranger && strangers >= MAX_STRANGER_PUNCHES && !running)
             {
                 return false;
             }
@@ -1156,7 +1176,6 @@ impl Node {
                 ),
             };
             let p = Arc::new(Punch {
-                targets: Mutex::new(targets),
                 lasts,
                 brisk: lasts.min(SEEK_FOR),
                 heard: Notify::new(),
@@ -1167,6 +1186,14 @@ impl Node {
                 // it hears the other; the larger leaves it to that side.
                 defer: urge == Urge::Lost && self.identity().as_bytes() > peer.as_bytes(),
                 direct: urge == Urge::Upgrade,
+                stranger,
+                // A probe brought this on: it came from there.
+                heard_from: Mutex::new(if urge == Urge::Probed {
+                    targets.clone()
+                } else {
+                    Vec::new()
+                }),
+                targets: Mutex::new(targets),
             });
             inner.punches.insert(peer, p.clone());
             inner.last_punch.insert(peer, now_ms());
@@ -1257,7 +1284,7 @@ impl Node {
                 .and_then(|c| c.discovery_key.map(|d| (d, c.timed_probes)))
                 .or_else(|| {
                     let keys = lock(&self.rdv().handles.probe_keys);
-                    keys.get(&peer).map(|d| (*d, false))
+                    keys.get(&peer).map(|(d, _)| (*d, false))
                 })
             else {
                 break false;
@@ -1275,7 +1302,20 @@ impl Node {
             }
             let idle = dialing.as_ref().is_none_or(|h| h.is_finished());
             let quiet = heard.is_none_or(|h| h.elapsed() > Duration::from_secs(5));
-            if punch.we_dial && brisk && idle && quiet && Instant::now() >= next_dial {
+            // A stranger only where it was heard from: the addresses it gave
+            // us may be anyone's (Appendix S).
+            let targets = if punch.stranger {
+                lock(&punch.heard_from).clone()
+            } else {
+                targets
+            };
+            if punch.we_dial
+                && brisk
+                && idle
+                && quiet
+                && !targets.is_empty()
+                && Instant::now() >= next_dial
+            {
                 next_dial = Instant::now() + REDIAL_EVERY;
                 let node = self.clone();
                 dialing = Some(tokio::spawn(async move {
@@ -1341,7 +1381,7 @@ impl Node {
         }
         let handle_keys: Vec<(PublicIdentity, [u8; 32])> = lock(&self.rdv().handles.probe_keys)
             .iter()
-            .map(|(p, k)| (*p, *k))
+            .map(|(p, (k, _))| (*p, *k))
             .collect();
         let Some(peer) = recognise(data, now_ms() / 1000, &self.contacts(), &handle_keys) else {
             return;
@@ -1360,6 +1400,13 @@ impl Node {
                     }
                     new
                 };
+                {
+                    let mut h = lock(&p.heard_from);
+                    if !h.contains(&src) {
+                        h.insert(0, src);
+                        h.truncate(MAX_TARGETS);
+                    }
+                }
                 if new {
                     self.emit(Event::ReachNote {
                         note: format!("probe from {} at {src}", peer.fingerprint()),
