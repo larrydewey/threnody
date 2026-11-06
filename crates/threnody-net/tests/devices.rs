@@ -531,8 +531,11 @@ async fn blocking_revokes_on_our_other_devices() {
     let mut laptop = spawn(&dir, "laptop").await;
     let mut phone = spawn(&dir, "phone").await;
     let mut bob = spawn(&dir, "bob").await;
+    laptop.node.set_tunnel_port(Some(51821)).unwrap();
+    bob.node.set_tunnel_port(Some(51822)).unwrap();
     link(&mut laptop, &mut bob).await;
     let bid = bob.node.identity();
+    wait_for(|| laptop.node.tunnel_peers().contains(&bid)).await;
     wait_for(|| {
         laptop
             .node
@@ -564,6 +567,8 @@ async fn blocking_revokes_on_our_other_devices() {
     })
     .await;
     wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    // The laptop's tunnel with Bob goes too.
+    assert!(!laptop.node.tunnel_peers().contains(&bid));
     // Bob hears that the laptop no longer approves him.
     let lid = laptop.node.identity();
     wait_for(|| {
@@ -859,4 +864,31 @@ async fn a_removed_device_cannot_write_through_a_mailbox() {
         "recorded in the account's chat"
     );
     let _ = (&mut laptop.rx, &mut m.rx);
+}
+
+/// A contact's device that leaves its account loses its tunnel with us at
+/// once, though no `Approval` message says so.
+#[tokio::test]
+async fn a_device_leaving_its_account_loses_its_tunnel() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    phone.node.set_tunnel_port(Some(51821)).unwrap();
+    bob.node.set_tunnel_port(Some(51822)).unwrap();
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    link(&mut phone, &mut bob).await;
+    wait_for(|| bob.node.tunnel_peers().contains(&pid)).await;
+
+    laptop.node.remove_device(&pid).unwrap();
+    next(
+        &mut bob.rx,
+        |e| matches!(e, Event::TunnelDown { peer, wg_public: Some(_) } if *peer == pid),
+    )
+    .await;
+    assert!(!bob.node.tunnel_peers().contains(&pid));
+    let _ = (&mut laptop.rx, &mut phone.rx);
 }

@@ -740,6 +740,7 @@ impl Node {
                 }
             }
         });
+        self.shared.prune_tunnels();
         for d in devices {
             self.disconnect(&d);
         }

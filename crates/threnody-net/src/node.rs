@@ -540,9 +540,10 @@ pub(crate) struct Shared {
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
     pub(crate) default_timer: std::sync::atomic::AtomicU32,
-    tunnel: Mutex<Option<(u16, [u8; 32])>>,
+    /// Our tunnel port and WireGuard public key, while tunnels are on.
+    pub(crate) tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
-    tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    pub(crate) tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
     /// When each peer's last Wi-Fi Direct request and offer were taken
     /// (see `direct`), to take at most one of each per interval.
     pub(crate) direct_taken: Mutex<HashMap<(PublicIdentity, bool), std::time::Instant>>,
@@ -633,7 +634,7 @@ impl Shared {
             .is_some_and(|c| c.mutually_approved())
     }
 
-    fn tunnel_down(&self, peer: &PublicIdentity) {
+    pub(crate) fn tunnel_down(&self, peer: &PublicIdentity) {
         if lock(&self.tunnel).is_some() {
             let removed = lock(&self.tunnel_peers).remove(peer);
             self.emit(Event::TunnelDown {
