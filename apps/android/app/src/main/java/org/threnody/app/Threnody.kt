@@ -731,6 +731,16 @@ object Threnody {
                             disappearing { node.groupHistory(e.group, 1u) })
                     }
                 }
+                is NodeEvent.GroupChangeFailed -> {
+                    // Whatever is on screen, as on Linux: an admin change given
+                    // up on is easily missed otherwise.
+                    say("* group ${e.group.take(6)}: a change of ours failed")
+                    val name = node.groups().firstOrNull { it.id == e.group }?.name ?: "the group"
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        android.widget.Toast.makeText(ctx, "Couldn't apply your change to $name: ${e.reason}",
+                            android.widget.Toast.LENGTH_LONG).show()
+                    }
+                }
                 is NodeEvent.GroupInvited -> {
                     say("* ${short(e.from)} invites us to a group")
                     if (e.quiet) {

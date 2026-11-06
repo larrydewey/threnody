@@ -76,9 +76,13 @@ Tunnel     = { 0 => 29, 2 => bstr }                        ; one WireGuard packe
 Push       = { 0 => 30, 2 => bstr .cbor PushReg }         ; wake-up endpoint or its withdrawal, mutual contacts only, Appendix R
 Receipt    = { 0 => 31, 2 => bstr .cbor ReceiptMsg }      ; delivery and read receipts, live or sealed, Appendix H
 
-GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
-          ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),
-          ; group id, payload, name, member (forward target or receipt subject), reference
+GroupWire = { 0 => 1..10, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint,
+              ? 6 => bstr .size 32, ? 7 => [* bstr], ? 8 => [uint, uint, bstr .size 8, bstr .size 8] }
+          ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt,
+          ; 7 leave, 8 add device, 9 pass welcome, 10 resync),
+          ; group id, payload, name, member (forward target, receipt subject, device, joiner or stale device),
+          ; reference, owner (add device), the proposals a commit references, sync hint
+          ; (epoch, term, epoch authenticator and coordinator, 8 bytes each); see Appendix F
 
 PushReg = { ? 1 => tstr, ? 2 => bstr .size 65, ? 3 => bstr .size 16, ? 4 => uint, ? 5 => uint }
           ; endpoint URL, Web Push p256dh and auth (both or neither), cover wake-ups per day (≤ 24),

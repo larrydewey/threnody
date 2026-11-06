@@ -7,8 +7,8 @@ use std::time::Duration;
 use threnody_core::history::ConversationId;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, PublicIdentity};
-use threnody_groups::GroupWire;
 use threnody_groups::node::{GroupNode, Update};
+use threnody_groups::{GroupWire, MemberRole};
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
@@ -593,6 +593,16 @@ async fn pins_reach_both_sides_and_only_admins_pin_in_groups() {
     })
     .await;
     assert_eq!(pins(&bob, gc), ["agenda"]);
+
+    // Made an admin, she pins too, and Bob takes it.
+    bob.groups.promote(&bob.node, &g, aid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[0].groups.may_pin(&g, &aid)
+    })
+    .await;
+    assert!(bob.groups.may_pin(&g, &aid), "every member agrees");
+    assert!(alice.groups.pin(&alice.node, &g, id, false).unwrap());
+    until(&mut [&mut alice, &mut bob], |ns| pins(ns[1], gc).is_empty()).await;
 }
 
 #[tokio::test]
@@ -1006,4 +1016,236 @@ async fn a_removed_device_is_dropped_from_our_groups() {
     .await;
     assert!(phone.texts(&g).iter().all(|t| t != "after removal"));
     assert_eq!(bob.groups.held_for(&pid), 0, "nothing held for it");
+}
+
+#[tokio::test]
+async fn admins_invite_on_running_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bob = spawn(&dir, "bob").await;
+    let mut alice = spawn(&dir, "alice").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let aid = approve(&mut bob, &mut alice).await;
+    // Carol is Alice's contact, not Bob's.
+    let cid = approve(&mut alice, &mut carol).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &aid).unwrap();
+    until(&mut [&mut bob, &mut alice], |ns| ns[1].in_group(&g)).await;
+    bob.groups.promote(&bob.node, &g, aid).unwrap();
+    until(&mut [&mut bob, &mut alice], |ns| {
+        ns[1].groups.roster(&g).is_ok_and(|r| r.admins == [aid])
+    })
+    .await;
+
+    // Alice invites Carol; Bob coordinates; Alice passes on the Welcome.
+    alice.groups.invite(&alice.node, &g, &cid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[2].in_group(&g) && ns[0].groups.list()[0].3.contains(&cid)
+    })
+    .await;
+    let bid = bob.node.identity();
+    assert_eq!(carol.groups.roster(&g).unwrap().lead, bid);
+    assert!(bob.updates.iter().any(|u| matches!(
+        u,
+        Update::MemberAdded { member, by: Some(by), .. } if *member == cid && *by == aid
+    )));
+    assert_eq!(alice.groups.pending_changes(&g), 0);
+}
+
+#[tokio::test]
+async fn a_new_successor_waits_the_full_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bob = spawn(&dir, "bob").await;
+    let mut alice = spawn(&dir, "alice").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let aid = approve(&mut bob, &mut alice).await;
+    let cid = approve(&mut bob, &mut carol).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &aid).unwrap();
+    bob.groups.invite(&bob.node, &g, &cid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g) && ns[1].groups.list()[0].3.len() == 3
+    })
+    .await;
+    bob.groups.promote(&bob.node, &g, aid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1].groups.roster(&g).is_ok_and(|r| r.admins == [aid])
+    })
+    .await;
+    // The group was quiet for 15 days; then Bob names Alice successor.
+    let day = 24 * 60 * 60 * 1000;
+    let now = threnody_core::now_ms();
+    alice.groups.set_owner_seen_for_testing(&g, now - 15 * day);
+    bob.groups.set_successor(&bob.node, &g, Some(aid)).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1].groups.roster(&g).is_ok_and(|r| r.successors == [aid])
+    })
+    .await;
+    let now = threnody_core::now_ms();
+    assert!(!alice.groups.can_claim(&alice.node, &g, now));
+    assert!(!alice.groups.can_claim(&alice.node, &g, now + 13 * day));
+    assert!(
+        alice
+            .groups
+            .can_claim(&alice.node, &g, now + 14 * day + 60_000)
+    );
+
+    // Any commit of the owner's, a role change of someone else's say,
+    // starts the clock over.
+    alice.groups.set_owner_seen_for_testing(&g, now - 15 * day);
+    assert!(alice.groups.can_claim(&alice.node, &g, now));
+    bob.groups.promote(&bob.node, &g, cid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1]
+            .groups
+            .roster(&g)
+            .is_ok_and(|r| r.admins.contains(&cid))
+    })
+    .await;
+    assert!(
+        !alice
+            .groups
+            .can_claim(&alice.node, &g, threnody_core::now_ms())
+    );
+}
+
+#[tokio::test]
+async fn an_owners_linked_device_becomes_an_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut laptop, &mut bob).await;
+    let g = laptop.groups.create("ours").unwrap();
+    laptop.groups.invite(&laptop.node, &g, &bid).unwrap();
+    until(&mut [&mut laptop, &mut bob], |ns| ns[1].in_group(&g)).await;
+    // A roster: Bob is an admin.
+    laptop.groups.promote(&laptop.node, &g, bid).unwrap();
+    until(&mut [&mut laptop, &mut bob], |ns| {
+        ns[1].groups.has_roster(&g)
+    })
+    .await;
+
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[2].in_group(&g)
+            && ns[1]
+                .groups
+                .roster(&g)
+                .is_ok_and(|r| r.role(&pid) == MemberRole::Owner)
+    })
+    .await;
+    assert_eq!(
+        phone.groups.roster(&g).unwrap().role(&pid),
+        MemberRole::Owner
+    );
+}
+
+#[tokio::test]
+async fn an_admins_linked_device_becomes_an_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bob = spawn(&dir, "bob").await;
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+    bob.groups.promote(&bob.node, &g, lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| {
+        ns[1].groups.roster(&g).is_ok_and(|r| r.admins == [lid])
+    })
+    .await;
+
+    // The admin links a phone; Bob (whose contact the admin is) can tell
+    // it's theirs, so it's an admin too.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[2].in_group(&g)
+            && ns[0]
+                .groups
+                .roster(&g)
+                .is_ok_and(|r| r.role(&pid) == MemberRole::Admin)
+    })
+    .await;
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1]
+            .groups
+            .roster(&g)
+            .is_ok_and(|r| r.role(&pid) == MemberRole::Admin)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_removed_device_loses_its_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    let g = laptop.groups.create("ours").unwrap();
+    laptop.groups.invite(&laptop.node, &g, &bid).unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+    // Both devices own it; the phone coordinates.
+    laptop.groups.promote(&laptop.node, &g, bid).unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns.iter().all(|n| {
+            n.groups
+                .roster(&g)
+                .is_ok_and(|r| r.role(&pid) == MemberRole::Owner)
+        })
+    })
+    .await;
+    laptop
+        .groups
+        .use_as_coordinator(&laptop.node, &g, pid)
+        .unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns.iter()
+            .all(|n| n.groups.roster(&g).is_ok_and(|r| r.lead == pid))
+    })
+    .await;
+
+    // The phone is lost: the laptop takes over and removes it.
+    laptop.node.remove_device(&pid).unwrap();
+    let lid = laptop.node.identity();
+    until(&mut [&mut laptop, &mut bob], |ns| {
+        ns.iter().all(|n| {
+            n.groups
+                .roster(&g)
+                .is_ok_and(|r| r.lead == lid && r.owners == [lid])
+                && !n.groups.list()[0].3.contains(&pid)
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_persona_owned_group_lists_only_the_persona() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_home = Home::new(dir.path().join("main"));
+    let main = main_home.create_identity(None).unwrap();
+    let personas = threnody_core::persona::Personas::new(&main_home, &main);
+    let (_, home, identity) = personas.create("anon", None, None, 0).unwrap();
+    let mut anon = start(home, identity).await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut anon, &mut bob).await;
+    let g = anon.groups.create("masked").unwrap();
+    anon.groups.invite(&anon.node, &g, &bid).unwrap();
+    until(&mut [&mut anon, &mut bob], |ns| ns[1].in_group(&g)).await;
+    anon.groups.promote(&anon.node, &g, bid).unwrap();
+    let aid = anon.node.identity();
+    until(&mut [&mut anon, &mut bob], |ns| ns[1].groups.has_roster(&g)).await;
+    assert_eq!(bob.groups.roster(&g).unwrap().owners, [aid]);
 }

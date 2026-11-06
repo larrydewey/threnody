@@ -1419,8 +1419,43 @@ impl App {
                 }
                 (Some(peer.clone()), None)
             }
+            NodeEvent::GroupMembersChanged {
+                group,
+                added,
+                removed,
+                by,
+            } => {
+                // "Carol was added by Bob", while the group is open.
+                if let Some(by) = by
+                    && self.showing_group(group)
+                    && self
+                        .core
+                        .node(persona.as_deref())
+                        .is_ok_and(|n| n.device_fingerprint() != *by)
+                    && let Some(who) = added.iter().chain(removed).next()
+                    && who != by
+                {
+                    let (who, by) = (
+                        self.name(persona.as_deref(), who),
+                        self.name(persona.as_deref(), by),
+                    );
+                    self.toast(&if added.is_empty() {
+                        format!("{who} was removed by {by}")
+                    } else {
+                        format!("{who} was added by {by}")
+                    });
+                }
+                (Some(group.clone()), None)
+            }
+            NodeEvent::GroupChangeFailed { group, reason } => {
+                let name = self.title_of(persona.as_deref(), group);
+                self.toast(&format!("Couldn't apply your change to {name}: {reason}"));
+                (Some(group.clone()), None)
+            }
             NodeEvent::GroupJoined { group, .. }
-            | NodeEvent::GroupMembersChanged { group, .. }
+            | NodeEvent::GroupRoleChanged { group, .. }
+            | NodeEvent::GroupOutOfStep { group }
+            | NodeEvent::GroupUpgradePending { group, .. }
             | NodeEvent::GroupLeft { group } => (Some(group.clone()), None),
             NodeEvent::CredentialOffered { offer } => {
                 self.credential_offer(persona.clone(), offer.clone());
@@ -1676,6 +1711,14 @@ impl App {
             }
         }
         self.refresh_soon();
+    }
+
+    /// Whether the open chat is `group`.
+    fn showing_group(&self, group: &str) -> bool {
+        self.chat
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| matches!(&c.chat().target, Target::Group(g) if g == group))
     }
 
     /// A scheduled message to `about` (a contact's device, or a group)

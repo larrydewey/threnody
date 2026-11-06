@@ -39,7 +39,9 @@ pub use volunteer::{
 
 pub use calls::{CallRecord, CallStats, VideoFrame};
 pub use groupcalls::{GroupCallParticipant, GroupCallRecord, GroupVideoFrame};
-pub use groups::{GroupInfo, GroupInvite};
+pub use groups::{
+    GroupBanner, GroupInfo, GroupInvite, GroupMemberAction, GroupMemberRow, MemberRole,
+};
 use threnody_groups::node::GroupNode;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -647,10 +649,13 @@ pub enum NodeEvent {
         /// One of many from strangers: list it, but don't notify.
         quiet: bool,
     },
+    /// `by`: who added or removed them (themselves, if they left), when
+    /// known: "Carol was added by Bob".
     GroupMembersChanged {
         group: String,
         added: Vec<String>,
         removed: Vec<String>,
+        by: Option<String>,
     },
     /// The owner removed us.
     GroupLeft {
@@ -661,6 +666,22 @@ pub enum NodeEvent {
         group: String,
         member: String,
         role: u8, // 0=Owner, 1=Admin, 2=Member
+    },
+    /// A change of ours (an invitation, a removal, a role) never made it
+    /// into the group: "Couldn't apply your change to <group>: <reason>".
+    GroupChangeFailed {
+        group: String,
+        reason: String,
+    },
+    /// Roles in `group` wait for these members to update Threnody.
+    GroupUpgradePending {
+        group: String,
+        outdated: Vec<String>,
+    },
+    /// This device fell out of step with the group and asked to be brought
+    /// back (`GroupInfo::out_of_step` says so until it is).
+    GroupOutOfStep {
+        group: String,
     },
     /// `ours`: sent by another device of our own account.
     GroupMessage {
@@ -1375,6 +1396,15 @@ impl ThrenodyNode {
             calls::media(&node, queued.clone())
         };
         let groups = Arc::new(Mutex::new(groups));
+        // What waited at shutdown: proposals the coordinator stored, roles
+        // waiting on an upgrade, upgrades of our own leaf.
+        let resumed = {
+            let _guard = rt.enter();
+            groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resume_all(&node)
+        };
         // The group call's leg signalling goes out in the order the media
         // made it (an offer before its candidates).
         let (leg_signals, mut legs) = tokio::sync::mpsc::unbounded_channel();
@@ -1389,7 +1419,7 @@ impl ThrenodyNode {
                 }
             });
         }
-        Ok(Arc::new(Self {
+        let this = Arc::new(Self {
             rt,
             node,
             events: Mutex::new(events),
@@ -1403,7 +1433,9 @@ impl ThrenodyNode {
             media,
             #[cfg(all(feature = "boringtun", unix))]
             tunnel_device: Mutex::new(None),
-        }))
+        });
+        this.queue_group_updates(resumed);
+        Ok(this)
     }
 
     pub fn device_fingerprint(&self) -> String {
@@ -3962,6 +3994,86 @@ mod tests {
         bob.shutdown();
         drop(bob);
         assert_eq!(open("b").groups()[0].members.len(), 2);
+    }
+
+    #[test]
+    fn group_admins_over_ffi() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            node.set_cover_traffic(None);
+            node
+        };
+        let (alice, bob, carol) = (open("a"), open("b"), open("c"));
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let a_fp = alice.device_fingerprint();
+        for n in [&bob, &carol] {
+            n.connect(alice.invite_link(addr.clone())).unwrap();
+        }
+        let mut all = Pump::new(&[&*alice, &*bob, &*carol]);
+        let (b_fp, c_fp) = (bob.device_fingerprint(), carol.device_fingerprint());
+        all.until(
+            0,
+            |e| matches!(e, NodeEvent::Connected { peer, .. } if *peer == c_fp),
+        );
+        for (n, fp) in [(&bob, &b_fp), (&carol, &c_fp)] {
+            alice.set_approval(fp.clone(), true).unwrap();
+            n.set_approval(a_fp.clone(), true).unwrap();
+        }
+        all.until(2, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+        let g = alice.create_group("crew".into()).unwrap();
+        for fp in [&b_fp, &c_fp] {
+            alice.invite_to_group(g.clone(), fp.clone()).unwrap();
+        }
+        all.until(1, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+        all.until(2, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+        all.until(0, |e| {
+            matches!(e, NodeEvent::GroupMembersChanged { added, .. } if *added == [c_fp.clone()])
+        });
+
+        // Alice makes Bob an admin: every member knows.
+        alice.promote_in_group(g.clone(), b_fp.clone()).unwrap();
+        all.until(
+            2,
+            |e| matches!(e, NodeEvent::GroupRoleChanged { member, role: 1, .. } if *member == b_fp),
+        );
+        all.until(1, |e| matches!(e, NodeEvent::GroupRoleChanged { .. }));
+        assert_eq!(bob.groups()[0].my_role, groups::MemberRole::Admin);
+        assert!(bob.may_pin_in_group(g.clone()).unwrap());
+        assert_eq!(carol.groups()[0].admins, std::slice::from_ref(&b_fp));
+        let rows = alice.group_member_rows(g.clone()).unwrap();
+        let row = |fp: &str| rows.iter().find(|r| r.fingerprint == fp).unwrap().clone();
+        assert!(
+            row(&b_fp)
+                .actions
+                .contains(&groups::GroupMemberAction::RemoveAdmin)
+        );
+        assert!(row(&a_fp).is_me && row(&a_fp).coordinator && row(&a_fp).actions.is_empty());
+        assert!(
+            carol
+                .group_member_rows(g.clone())
+                .unwrap()
+                .iter()
+                .all(|r| r.actions.is_empty())
+        );
+
+        // Bob removes Carol, through Alice.
+        bob.remove_from_group(g.clone(), c_fp.clone()).unwrap();
+        all.until(0, |e| {
+            matches!(e, NodeEvent::GroupMembersChanged { removed, by: Some(by), .. }
+                if *removed == [c_fp.clone()] && *by == b_fp)
+        });
+        all.until(2, |e| matches!(e, NodeEvent::GroupLeft { .. }));
+
+        // The owner can't just leave a group with others in it; she
+        // deletes it.
+        assert!(alice.leave_group(g.clone()).is_err());
+        alice.delete_group(g.clone()).unwrap();
+        all.until(1, |e| matches!(e, NodeEvent::GroupLeft { .. }));
+        assert!(alice.groups().is_empty() && bob.groups().is_empty());
     }
 
     /// Large frames over a slow, chunked, back-pressured link (like an

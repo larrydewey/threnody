@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use threnody_core::{Identity, PublicIdentity};
-use threnody_groups::{GroupError, GroupEvent, GroupWire, Groups, Output};
+use threnody_groups::{
+    GroupError, GroupEvent, GroupId, GroupWire, Groups, MemberRole, Outgoing, Output, RosterChange,
+};
 
 /// In-memory delivery: routes every outgoing message until quiescent,
 /// collecting each node's events.
@@ -10,6 +12,12 @@ struct Net {
     events: HashMap<PublicIdentity, Vec<GroupEvent>>,
     /// Auto-accept invitations (simulates user consent).
     accept: bool,
+    /// Unreachable for now: what's sent to them waits in `queue`.
+    offline: Vec<PublicIdentity>,
+    queue: Vec<(PublicIdentity, Outgoing)>,
+    /// Errors are noted rather than fatal (for forks and forgeries).
+    lenient: bool,
+    errors: Vec<(PublicIdentity, String)>,
 }
 
 impl Net {
@@ -18,6 +26,10 @@ impl Net {
             nodes: ids.iter().map(|i| (i.public(), Groups::new(i))).collect(),
             events: HashMap::new(),
             accept: true,
+            offline: Vec::new(),
+            queue: Vec::new(),
+            lenient: false,
+            errors: Vec::new(),
         }
     }
 
@@ -28,22 +40,111 @@ impl Net {
     fn deliver(&mut self, from: PublicIdentity, out: Output) {
         self.events.entry(from).or_default().extend(out.events);
         for o in out.send {
-            // Wire round trip, as over a real session.
-            let wire = GroupWire::decode(&o.wire.encode().unwrap()).unwrap();
-            let res = self.node(&o.to).handle(from, wire).unwrap();
-            for e in &res.events {
-                if let (true, GroupEvent::InviteRequested { group, peer, .. }) = (self.accept, e) {
-                    let reply = self.node(&o.to).accept_invite(group, *peer).unwrap();
-                    self.deliver(o.to, reply);
-                }
+            self.send(from, o);
+        }
+    }
+
+    /// Delivers only what `out` sends to `to`; the rest is lost.
+    fn deliver_only(&mut self, from: PublicIdentity, out: Output, to: &[PublicIdentity]) {
+        self.events.entry(from).or_default().extend(out.events);
+        for o in out.send {
+            if to.contains(&o.to) {
+                self.send(from, o);
             }
-            self.deliver(o.to, res);
+        }
+    }
+
+    fn send(&mut self, from: PublicIdentity, o: Outgoing) {
+        if self.offline.contains(&o.to) {
+            self.queue.push((from, o));
+            return;
+        }
+        if !self.nodes.contains_key(&o.to) {
+            return;
+        }
+        // Wire round trip, as over a real session.
+        let wire = GroupWire::decode(&o.wire.encode().unwrap()).unwrap();
+        let res = match self.node(&o.to).handle(from, wire) {
+            Ok(r) => r,
+            Err(e) if self.lenient => {
+                self.errors.push((o.to, e.to_string()));
+                return;
+            }
+            Err(e) => panic!("{:?} handling from {from:?}: {e}", o.to),
+        };
+        for e in &res.events {
+            if let (true, GroupEvent::InviteRequested { group, peer, .. }) = (self.accept, e) {
+                let reply = self.node(&o.to).accept_invite(group, *peer).unwrap();
+                self.deliver(o.to, reply);
+            }
+        }
+        self.deliver(o.to, res);
+    }
+
+    /// Delivers what waited for members that are back online, in order.
+    fn release(&mut self) {
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition(|(_, o)| !self.offline.contains(&o.to));
+        self.queue = later;
+        for (from, o) in now {
+            self.send(from, o);
         }
     }
 
     fn take(&mut self, id: &PublicIdentity) -> Vec<GroupEvent> {
         self.events.remove(id).unwrap_or_default()
     }
+
+    /// Restarts `id` from its exported state.
+    fn restart(&mut self, ident: &Identity) {
+        let id = ident.public();
+        let state = self.node(&id).export().unwrap();
+        self.nodes
+            .insert(id, Groups::restore(ident, &state).unwrap());
+    }
+}
+
+/// `n` identities, sorted by their bytes.
+fn people(n: usize) -> (Vec<Identity>, Vec<PublicIdentity>) {
+    let mut ids: Vec<Identity> = (0..n).map(|_| Identity::generate()).collect();
+    ids.sort_by_key(|i| *i.public().as_bytes());
+    let ps = ids.iter().map(Identity::public).collect();
+    (ids, ps)
+}
+
+/// A group created by `p[0]`, which invites everyone else.
+fn team(ids: &[Identity]) -> (Net, Vec<PublicIdentity>, GroupId) {
+    let refs: Vec<&Identity> = ids.iter().collect();
+    let mut net = Net::new(&refs);
+    let p: Vec<PublicIdentity> = ids.iter().map(Identity::public).collect();
+    let g = net.node(&p[0]).create("team").unwrap();
+    for q in &p[1..] {
+        let out = net.node(&p[0]).invite(&g, *q).unwrap();
+        net.deliver(p[0], out);
+    }
+    for q in &p {
+        net.take(q);
+    }
+    (net, p, g)
+}
+
+/// Every one of `who` on the same epoch with the same secrets.
+fn in_step(net: &mut Net, g: &GroupId, who: &[PublicIdentity]) -> bool {
+    let states: Vec<_> = who.iter().map(|p| net.node(p).epoch_state(g)).collect();
+    states.iter().all(|s| s.is_some() && *s == states[0])
+}
+
+fn members(net: &mut Net, g: &GroupId, p: &PublicIdentity) -> Vec<PublicIdentity> {
+    let mut m = net
+        .node(p)
+        .list()
+        .into_iter()
+        .find(|(id, ..)| id == g)
+        .map(|(.., m)| m)
+        .unwrap_or_default();
+    m.sort_by_key(|x| *x.as_bytes());
+    m
 }
 
 #[test]
@@ -66,7 +167,8 @@ fn create_invite_chat_and_remove() {
     }));
     assert!(net.take(&pa).contains(&GroupEvent::MemberAdded {
         group: g,
-        member: pb
+        member: pb,
+        by: Some(pa)
     }));
 
     let out = net.node(&pa).invite(&g, pc).unwrap();
@@ -78,7 +180,8 @@ fn create_invite_chat_and_remove() {
     );
     assert!(net.take(&pb).contains(&GroupEvent::MemberAdded {
         group: g,
-        member: pc
+        member: pc,
+        by: Some(pa)
     }));
 
     // Everyone agrees on the membership.
@@ -147,7 +250,8 @@ fn create_invite_chat_and_remove() {
     assert!(net.take(&pc).contains(&GroupEvent::Left { group: g }));
     assert!(net.take(&pb).contains(&GroupEvent::MemberRemoved {
         group: g,
-        member: pc
+        member: pc,
+        by: Some(pa)
     }));
     assert!(net.node(&pc).list().is_empty());
 
@@ -213,27 +317,12 @@ fn unsolicited_and_forged_inputs_are_rejected() {
     // Messages for unknown groups and garbage are errors, not panics.
     assert!(
         net.node(&pb)
-            .handle(
-                pa,
-                GroupWire::Message {
-                    group: g,
-                    message: vec![1, 2, 3]
-                }
-            )
+            .handle(pa, GroupWire::message(g, vec![1, 2, 3]))
             .is_err()
     );
     let mut ok = Groups::new(&b);
     let g2 = ok.create("y").unwrap();
-    assert!(
-        ok.handle(
-            pa,
-            GroupWire::Message {
-                group: g2,
-                message: vec![0; 64]
-            }
-        )
-        .is_err()
-    );
+    assert!(ok.handle(pa, GroupWire::message(g2, vec![0; 64])).is_err());
     assert!(
         ok.handle(
             pa,
@@ -318,6 +407,8 @@ fn members_forward_messages_for_each_other() {
         to: *pb.as_bytes(),
         message,
         reference: 1,
+        proposals: Vec::new(),
+        sync: None,
     };
     let wire = GroupWire::decode(&fwd.encode().unwrap()).unwrap();
     let relayed = net.node(&pa).handle(pc, wire.clone()).unwrap();
@@ -346,6 +437,8 @@ fn members_forward_messages_for_each_other() {
         to: *t.as_bytes(),
         message: vec![1],
         reference: 0,
+        proposals: Vec::new(),
+        sync: None,
     };
     assert!(
         net.node(&pa).handle(pc, to(px)).is_err(),
@@ -395,7 +488,8 @@ fn members_leave_and_owners_delete() {
     net.deliver(pc, out);
     assert!(net.take(&pb).contains(&GroupEvent::MemberRemoved {
         group: g,
-        member: pc
+        member: pc,
+        by: Some(pa)
     }));
     let members = |n: &mut Net, p: &PublicIdentity| n.node(p).list()[0].3.len();
     assert_eq!(members(&mut net, &pa), 2);
@@ -403,12 +497,24 @@ fn members_leave_and_owners_delete() {
     // A leave request only works on the owner, from a member.
     assert!(
         net.node(&pb)
-            .handle(pa, GroupWire::Leave { group: g })
+            .handle(
+                pa,
+                GroupWire::Leave {
+                    group: g,
+                    proposal: None
+                }
+            )
             .is_err()
     );
     assert!(
         net.node(&pa)
-            .handle(pc, GroupWire::Leave { group: g })
+            .handle(
+                pc,
+                GroupWire::Leave {
+                    group: g,
+                    proposal: None
+                }
+            )
             .is_err()
     );
 
@@ -589,4 +695,655 @@ fn names_lose_characters_that_reorder_text() {
         &out.events[..],
         [GroupEvent::InviteRequested { name, .. }] if name == "Yourknab club"
     ));
+}
+
+#[test]
+fn admins_are_known_to_every_member() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    let roster = net.node(&a).roster(&g).unwrap();
+    assert_eq!(roster.admins, vec![b]);
+    assert_eq!((roster.lead, roster.term), (a, 0));
+    for x in [b, c] {
+        assert_eq!(net.node(&x).roster(&g).unwrap(), roster);
+        assert_eq!(net.node(&x).role_of(&g, &b).unwrap(), MemberRole::Admin);
+    }
+    assert!(net.take(&c).contains(&GroupEvent::RoleChanged {
+        group: g,
+        member: b,
+        role: MemberRole::Admin
+    }));
+    // Members still can't, and the admin demoted is a member again.
+    assert!(matches!(
+        net.node(&c).promote(&g, c),
+        Err(GroupError::NotOwner)
+    ));
+    let out = net.node(&a).demote(&g, b).unwrap();
+    net.deliver(a, out);
+    assert_eq!(net.node(&c).role_of(&g, &b).unwrap(), MemberRole::Member);
+    assert!(in_step(&mut net, &g, &p));
+}
+
+#[test]
+fn admin_invites_and_removes_through_the_coordinator() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids[..3]);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    let d_id = &ids[3];
+    let d = d_id.public();
+    net.nodes.insert(d, Groups::new(d_id));
+    for x in [b, c] {
+        let out = net.node(&a).promote(&g, x).unwrap();
+        net.deliver(a, out);
+    }
+    net.take(&c);
+
+    // Bob (an admin) invites Dave: the coordinator commits it, Bob passes
+    // on the Welcome.
+    let out = net.node(&b).invite(&g, d).unwrap();
+    net.deliver(b, out);
+    assert!(net.take(&d).contains(&GroupEvent::Joined {
+        group: g,
+        name: "team".into(),
+        owner: a
+    }));
+    assert!(net.take(&c).contains(&GroupEvent::MemberAdded {
+        group: g,
+        member: d,
+        by: Some(b)
+    }));
+    assert_eq!(net.node(&b).pending_changes(&g), 0);
+    let everyone = [a, b, c, d];
+    assert!(in_step(&mut net, &g, &everyone));
+
+    // ...and removes him.
+    let out = net.node(&b).remove(&g, &d).unwrap();
+    net.deliver(b, out);
+    assert!(net.take(&d).contains(&GroupEvent::Left { group: g }));
+    for x in [a, c] {
+        assert!(net.take(&x).contains(&GroupEvent::MemberRemoved {
+            group: g,
+            member: d,
+            by: Some(b)
+        }));
+    }
+    // Admins remove members only.
+    assert!(matches!(
+        net.node(&b).remove(&g, &c),
+        Err(GroupError::NotAllowed(_))
+    ));
+    assert!(matches!(
+        net.node(&b).remove(&g, &a),
+        Err(GroupError::NotAllowed(_))
+    ));
+    assert!(in_step(&mut net, &g, &[a, b, c]));
+}
+
+#[test]
+fn concurrent_admin_changes_never_fork() {
+    for reverse in [false, true] {
+        let (ids, _) = people(5);
+        let (mut net, p, g) = team(&ids);
+        let (a, b, c, d, e) = (p[0], p[1], p[2], p[3], p[4]);
+        for x in [b, c] {
+            let out = net.node(&a).promote(&g, x).unwrap();
+            net.deliver(a, out);
+        }
+        for x in &p {
+            net.take(x);
+        }
+        // Both propose at the same epoch.
+        let ob = net.node(&b).remove(&g, &d).unwrap();
+        let oc = net.node(&c).remove(&g, &e).unwrap();
+        if reverse {
+            net.deliver(c, oc);
+            net.deliver(b, ob);
+        } else {
+            net.deliver(b, ob);
+            net.deliver(c, oc);
+        }
+        assert_eq!(members(&mut net, &g, &a), {
+            let mut m = vec![a, b, c];
+            m.sort_by_key(|x| *x.as_bytes());
+            m
+        });
+        assert!(in_step(&mut net, &g, &[a, b, c]));
+        for x in [a, b, c] {
+            assert!(
+                !net.take(&x)
+                    .iter()
+                    .any(|e| matches!(e, GroupEvent::ChangeFailed { .. }))
+            );
+            assert_eq!(net.node(&x).pending_changes(&g), 0);
+        }
+    }
+}
+
+#[test]
+fn duplicate_removals_apply_once() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c, d) = (p[0], p[1], p[2], p[3]);
+    for x in [b, c] {
+        let out = net.node(&a).promote(&g, x).unwrap();
+        net.deliver(a, out);
+    }
+    net.take(&a);
+    let ob = net.node(&b).remove(&g, &d).unwrap();
+    let oc = net.node(&c).remove(&g, &d).unwrap();
+    net.deliver(b, ob);
+    net.deliver(c, oc);
+    let removed = net
+        .take(&a)
+        .iter()
+        .filter(|e| matches!(e, GroupEvent::MemberRemoved { member, .. } if *member == d))
+        .count();
+    assert_eq!(removed, 1);
+    assert_eq!(net.node(&b).pending_changes(&g), 0);
+    assert_eq!(net.node(&c).pending_changes(&g), 0);
+    assert!(in_step(&mut net, &g, &[a, b, c]));
+}
+
+#[test]
+fn admin_changes_wait_for_an_offline_coordinator() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids[..3]);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    let d = ids[3].public();
+    net.nodes.insert(d, Groups::new(&ids[3]));
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+
+    net.offline = vec![a];
+    let out = net.node(&b).invite(&g, d).unwrap();
+    net.deliver(b, out);
+    assert_eq!(net.node(&b).pending_changes(&g), 1);
+    assert_eq!(members(&mut net, &g, &b).len(), 3);
+    // Bob still talks, reacts and pins while his change waits.
+    let out = net.node(&b).send_text(&g, "waiting").unwrap();
+    net.deliver(b, out);
+    assert!(net.take(&c).iter().any(
+        |e| matches!(e, GroupEvent::Text { text, from, .. } if text == "waiting" && *from == b)
+    ));
+    let out = net
+        .node(&b)
+        .send(&g, &threnody_groups::Content::Pin { id: 7, pin: true })
+        .unwrap();
+    net.deliver(b, out);
+    assert!(
+        net.take(&c)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Pin { from, .. } if *from == b))
+    );
+    assert_eq!(net.node(&b).stored_proposals(&g), 1, "still pending");
+
+    // The coordinator comes back: the add completes.
+    net.offline.clear();
+    net.release();
+    assert_eq!(net.node(&b).pending_changes(&g), 0);
+    assert!(net.node(&d).list().iter().any(|(id, ..)| *id == g));
+    assert!(in_step(&mut net, &g, &[a, b, c, d]));
+}
+
+#[test]
+fn future_epoch_messages_wait_for_their_commit() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids[..3]);
+    let (a, c) = (p[0], p[2]);
+    let d = ids[3].public();
+    net.nodes.insert(d, Groups::new(&ids[3]));
+    // Carol misses the add for now; Dave's first message reaches her first.
+    net.offline = vec![c];
+    let out = net.node(&a).invite(&g, d).unwrap();
+    net.deliver(a, out);
+    let out = net.node(&d).send_text(&g, "hi all").unwrap();
+    net.deliver(d, out);
+    net.offline.clear();
+    net.queue.reverse();
+    net.release();
+    assert!(net.take(&c).iter().any(
+        |e| matches!(e, GroupEvent::Text { text, from, .. } if text == "hi all" && *from == d)
+    ));
+    assert_eq!(net.node(&c).buffered(&g), 0);
+}
+
+#[test]
+fn legacy_groups_upgrade_before_admins() {
+    let (ids, _) = people(4);
+    let refs: Vec<&Identity> = ids.iter().collect();
+    let mut net = Net::new(&refs);
+    let p: Vec<PublicIdentity> = ids.iter().map(Identity::public).collect();
+    let (a, b, c, e) = (p[0], p[1], p[2], p[3]);
+    // Bob runs a version without roles.
+    net.nodes.insert(b, Groups::legacy_for_tests(&ids[1]));
+    let g = net.node(&a).create("team").unwrap();
+    for x in [b, c, e] {
+        let out = net.node(&a).invite(&g, x).unwrap();
+        net.deliver(a, out);
+    }
+    net.take(&a);
+    let out = net.node(&a).promote(&g, c).unwrap();
+    assert!(out.events.contains(&GroupEvent::UpgradePending {
+        group: g,
+        outdated: vec![b]
+    }));
+    net.deliver(a, out);
+    assert!(!net.node(&c).has_roster(&g).unwrap());
+    // Meanwhile Alice's commits are plain owner commits Bob takes.
+    let out = net.node(&a).remove(&g, &e).unwrap();
+    net.deliver(a, out);
+    assert!(in_step(&mut net, &g, &[a, b, c]));
+
+    // Bob updates: his leaf is upgraded, then the roster goes in.
+    let state = net.node(&b).export().unwrap();
+    net.nodes
+        .insert(b, Groups::restore(&ids[1], &state).unwrap());
+    let out = net.node(&b).resume(&g).unwrap();
+    net.deliver(b, out);
+    assert!(in_step(&mut net, &g, &[a, b, c]));
+    for x in [a, b, c] {
+        assert!(net.node(&x).has_roster(&g).unwrap());
+        assert_eq!(net.node(&x).role_of(&g, &c).unwrap(), MemberRole::Admin);
+        assert!(net.node(&x).outdated(&g).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn old_clients_cannot_join_groups_with_admins() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids[..2]);
+    let (a, b) = (p[0], p[1]);
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    let old = Groups::legacy_for_tests(&ids[2]);
+    let l = ids[2].public();
+    net.nodes.insert(l, old);
+    net.node(&a).invite(&g, l).unwrap();
+    let kp = net
+        .node(&l)
+        .accept_invite(&g, a)
+        .unwrap()
+        .send
+        .remove(0)
+        .wire;
+    assert!(matches!(
+        net.node(&a).handle(l, kp),
+        Err(GroupError::NeedsUpdate(_))
+    ));
+}
+
+#[test]
+fn owner_transfers_and_leaves() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    let out = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::Transfer(vec![b])])
+        .unwrap();
+    net.deliver(a, out);
+    for x in [a, b, c] {
+        let r = net.node(&x).roster(&g).unwrap();
+        assert_eq!((r.owners.clone(), r.lead, r.term), (vec![b], b, 1));
+        assert_eq!(r.admins, vec![a]);
+    }
+    for x in &p {
+        net.take(x);
+    }
+    let out = net.node(&a).leave(&g).unwrap();
+    net.deliver(a, out);
+    assert!(net.take(&c).contains(&GroupEvent::MemberRemoved {
+        group: g,
+        member: a,
+        by: Some(a)
+    }));
+    assert!(net.node(&b).roster(&g).unwrap().admins.is_empty());
+    assert!(in_step(&mut net, &g, &[b, c]));
+}
+
+#[test]
+fn last_owner_cannot_just_leave() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids);
+    let (a, b) = (p[0], p[1]);
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    assert!(matches!(
+        net.node(&a).leave(&g),
+        Err(GroupError::NotAllowed(_))
+    ));
+    // Admins can't delete it; the owner can.
+    assert!(matches!(
+        net.node(&b).disband(&g),
+        Err(GroupError::NotOwner)
+    ));
+    let out = net.node(&a).disband(&g).unwrap();
+    net.deliver(a, out);
+    for x in &p {
+        assert!(net.node(x).list().is_empty());
+    }
+}
+
+#[test]
+fn owner_device_takes_over_the_coordinator() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a1, a2, c, d) = (p[0], p[1], p[2], p[3]);
+    let out = net
+        .node(&a1)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2])])
+        .unwrap();
+    net.deliver(a1, out);
+    assert_eq!(net.node(&c).role_of(&g, &a2).unwrap(), MemberRole::Owner);
+    // The coordinator is away; the other owner device's remove waits...
+    net.offline = vec![a1];
+    let out = net.node(&a2).remove(&g, &d).unwrap();
+    net.deliver(a2, out);
+    assert_eq!(net.node(&a2).pending_changes(&g), 1);
+    // ...until it takes over.
+    let out = net.node(&a2).take_over(&g).unwrap();
+    net.deliver(a2, out);
+    for x in [a2, c] {
+        let r = net.node(&x).roster(&g).unwrap();
+        assert_eq!((r.lead, r.term), (a2, 1));
+        assert!(!members(&mut net, &g, &x).contains(&d));
+    }
+    assert_eq!(net.node(&a2).pending_changes(&g), 0);
+    // The old coordinator, back, commits the remove it finds waiting before
+    // it sees the takeover: it forks off, and is brought back.
+    net.offline.clear();
+    net.lenient = true;
+    net.release();
+    assert!(in_step(&mut net, &g, &[a1, a2, c]), "{:?}", net.errors);
+    assert!(!net.node(&a1).is_lead(&g));
+    assert!(!net.node(&a1).out_of_step(&g));
+}
+
+#[test]
+fn a_pending_handover_does_not_block_a_takeover() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a1, a2, c, d) = (p[0], p[1], p[2], p[3]);
+    let out = net
+        .node(&a1)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2])])
+        .unwrap();
+    net.deliver(a1, out);
+    let out = net.node(&a1).promote(&g, c).unwrap();
+    net.deliver(a1, out);
+    // With the coordinator away, the other owner device asks to hand the
+    // group to Carol, and to remove Dave.
+    net.offline = vec![a1];
+    let out = net
+        .node(&a2)
+        .change_roster(&g, &[RosterChange::Transfer(vec![c])])
+        .unwrap();
+    net.deliver(a2, out);
+    let out = net.node(&a2).remove(&g, &d).unwrap();
+    net.deliver(a2, out);
+    assert_eq!(net.node(&a2).pending_changes(&g), 2);
+    // Taking over still works; the handover follows in the next commit.
+    let out = net.node(&a2).take_over_removing(&g, &[a1]).unwrap();
+    net.deliver(a2, out);
+    let r = net.node(&c).roster(&g).unwrap();
+    assert_eq!((r.lead, r.owners.clone()), (c, vec![c]));
+    assert!(!members(&mut net, &g, &c).contains(&d));
+    assert!(!members(&mut net, &g, &c).contains(&a1));
+    assert_eq!(net.node(&a2).pending_changes(&g), 0);
+}
+
+#[test]
+fn successor_claims_when_the_owner_is_gone() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    let out = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::Successor(vec![b])])
+        .unwrap();
+    net.deliver(a, out);
+    // Only the successor may claim.
+    assert!(matches!(
+        net.node(&c).claim(&g),
+        Err(GroupError::NotAllowed(_))
+    ));
+    net.offline = vec![a];
+    let out = net.node(&b).claim(&g).unwrap();
+    net.deliver(b, out);
+    for x in [b, c] {
+        let r = net.node(&x).roster(&g).unwrap();
+        assert_eq!((r.owners.clone(), r.lead, r.term), (vec![b], b, 1));
+        assert_eq!(r.admins, vec![a]);
+        assert!(r.successors.is_empty());
+    }
+    // The old owner, back, is an admin.
+    net.offline.clear();
+    net.release();
+    assert_eq!(net.node(&a).role_of(&g, &a).unwrap(), MemberRole::Admin);
+    assert!(in_step(&mut net, &g, &p));
+}
+
+#[test]
+fn fork_after_takeover_is_repaired() {
+    let (ids, _) = people(5);
+    let (mut net, p, g) = team(&ids);
+    let (a, a2, c, d, e) = (p[0], p[1], p[2], p[3], p[4]);
+    let out = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2])])
+        .unwrap();
+    net.deliver(a, out);
+    let out = net.node(&a).send_text(&g, "before").unwrap();
+    net.deliver(a, out);
+    // The coordinator commits while the other owner device takes over:
+    // Carol follows the one, Dave the other.
+    let oa = net.node(&a).remove(&g, &e).unwrap();
+    let oa2 = net.node(&a2).take_over(&g).unwrap();
+    net.deliver_only(a, oa, &[c]);
+    net.deliver_only(a2, oa2, &[d]);
+    assert!(!in_step(&mut net, &g, &[c, d]));
+    for x in &p {
+        net.take(x);
+    }
+    // Dave writes: Carol sees she's behind and is brought back.
+    net.lenient = true;
+    let out = net.node(&d).send_text(&g, "hello?").unwrap();
+    net.deliver_only(d, out, &[c]);
+    assert!(net.take(&c).contains(&GroupEvent::OutOfStep { group: g }));
+    assert!(in_step(&mut net, &g, &[a2, c, d]));
+    assert!(!net.node(&c).out_of_step(&g));
+    assert_eq!(net.node(&c).roster(&g).unwrap().lead, a2);
+    // And reads what follows.
+    let out = net.node(&d).send_text(&g, "welcome back").unwrap();
+    net.deliver(d, out);
+    assert!(
+        net.take(&c)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Text { text, .. } if text == "welcome back"))
+    );
+}
+
+#[test]
+fn simultaneous_takeovers_converge() {
+    let (ids, _) = people(5);
+    let (mut net, p, g) = team(&ids);
+    // p is sorted: p[1] < p[2], so p[1]'s branch wins a tie.
+    let (a1, a2, a3, c, d) = (p[0], p[1], p[2], p[3], p[4]);
+    let out = net
+        .node(&a1)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2, a3])])
+        .unwrap();
+    net.deliver(a1, out);
+    let o2 = net.node(&a2).take_over(&g).unwrap();
+    let o3 = net.node(&a3).take_over(&g).unwrap();
+    net.deliver_only(a2, o2, &[c, a1]);
+    net.deliver_only(a3, o3, &[d]);
+    net.lenient = true;
+    // One message from each side.
+    let out = net.node(&c).send_text(&g, "from c").unwrap();
+    net.deliver(c, out);
+    let out = net.node(&d).send_text(&g, "from d").unwrap();
+    net.deliver(d, out);
+    let everyone = [a1, a2, a3, c, d];
+    assert!(in_step(&mut net, &g, &everyone), "{:?}", net.errors);
+    for x in everyone {
+        assert_eq!(net.node(&x).roster(&g).unwrap().lead, a2);
+    }
+}
+
+#[test]
+fn forged_resync_causes_no_churn() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a, a2, c, d) = (p[0], p[1], p[2], p[3]);
+    let out = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2])])
+        .unwrap();
+    net.deliver(a, out);
+    let out = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::Lead(a2)])
+        .unwrap();
+    net.deliver(a, out);
+    let (epoch, auth) = net.node(&a2).epoch_state(&g).unwrap();
+    let roster = net.node(&a2).roster(&g).unwrap();
+    let hint = |term: u32| threnody_groups::SyncHint {
+        epoch,
+        term,
+        auth: auth[..8].try_into().unwrap(),
+        lead: roster.lead.as_bytes()[..8].try_into().unwrap(),
+    };
+    // Carol claims Dave is behind, at the group's own rank: nothing.
+    let forged = GroupWire::Resync {
+        group: g,
+        member: Some(*d.as_bytes()),
+        sync: hint(roster.term),
+    };
+    assert!(net.node(&a2).handle(c, forged).unwrap().send.is_empty());
+    // A Dave really behind is brought back once per term, not twice.
+    let stale = GroupWire::Resync {
+        group: g,
+        member: Some(*d.as_bytes()),
+        sync: hint(roster.term - 1),
+    };
+    let first = net.node(&a2).handle(c, stale.clone()).unwrap();
+    assert!(matches!(
+        &first.send[..],
+        [o] if o.to == d && matches!(o.wire, GroupWire::KeyPackageRequest { .. })
+    ));
+    assert!(net.node(&a2).handle(c, stale).unwrap().send.is_empty());
+}
+
+#[test]
+fn leaves_reach_the_lead_in_any_order() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a, a2, b, c) = (p[0], p[1], p[2], p[3]);
+    let out = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2])])
+        .unwrap();
+    net.deliver(a, out);
+    // Alice hands over to her other device; Bob merges that before it does.
+    let oa = net
+        .node(&a)
+        .change_roster(&g, &[RosterChange::Lead(a2)])
+        .unwrap();
+    let for_a2: Vec<_> = oa.send.iter().filter(|o| o.to == a2).cloned().collect();
+    net.deliver_only(a, oa, &[b, c]);
+    for x in &p {
+        net.take(x);
+    }
+    let out = net.node(&b).leave(&g).unwrap();
+    net.deliver(b, out);
+    assert_eq!(
+        net.node(&a2).buffered(&g),
+        1,
+        "the leave waits for its epoch"
+    );
+    net.deliver(
+        a,
+        Output {
+            send: for_a2,
+            events: vec![],
+        },
+    );
+    assert!(net.take(&c).contains(&GroupEvent::MemberRemoved {
+        group: g,
+        member: b,
+        by: Some(b)
+    }));
+    assert!(in_step(&mut net, &g, &[a, a2, c]));
+}
+
+#[test]
+fn legacy_leave_is_bare() {
+    let (ids, _) = people(2);
+    let mut net = Net::new(&[&ids[0], &ids[1]]);
+    let (a, b) = (ids[0].public(), ids[1].public());
+    net.nodes.insert(a, Groups::legacy_for_tests(&ids[0]));
+    let g = net.node(&a).create("old").unwrap();
+    let out = net.node(&a).invite(&g, b).unwrap();
+    net.deliver(a, out);
+    let out = net.node(&b).leave(&g).unwrap();
+    assert!(matches!(
+        &out.send[..],
+        [o] if o.wire == GroupWire::Leave { group: g, proposal: None }
+    ));
+    net.deliver(b, out);
+    assert_eq!(members(&mut net, &g, &a), vec![a]);
+}
+
+#[test]
+fn roster_and_intents_survive_export_and_restore() {
+    let (ids, _) = people(5);
+    let (mut net, p, g) = team(&ids[..4]);
+    let (a, b, c, d) = (p[0], p[1], p[2], p[3]);
+    let e = ids[4].public();
+    net.nodes.insert(e, Groups::new(&ids[4]));
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    // Bob's remove waits for Alice; Alice's invitation waits for Eve.
+    net.offline = vec![a, e];
+    let out = net.node(&b).remove(&g, &d).unwrap();
+    net.deliver(b, out);
+    net.offline = vec![b, c, e];
+    let out = net.node(&a).invite(&g, e).unwrap();
+    net.deliver(a, out);
+    for (i, x) in ids.iter().enumerate().take(4) {
+        let _ = i;
+        net.restart(x);
+    }
+    assert_eq!(net.node(&b).pending_changes(&g), 1);
+    assert_eq!(net.node(&b).roster(&g).unwrap().admins, vec![b]);
+    net.offline.clear();
+    net.release();
+    assert!(!members(&mut net, &g, &a).contains(&d));
+    assert!(
+        members(&mut net, &g, &a).contains(&e),
+        "no longer unsolicited"
+    );
+    assert_eq!(net.node(&b).pending_changes(&g), 0);
+    assert!(in_step(&mut net, &g, &[a, b, c, e]));
+}
+
+#[test]
+fn groups_survive_export_and_restore_as_older_versions_read_them() {
+    let (ids, _) = people(2);
+    let (mut net, p, g) = team(&ids);
+    let out = net.node(&p[0]).promote(&g, p[1]).unwrap();
+    net.deliver(p[0], out);
+    let state = net.node(&p[0]).export().unwrap();
+    // { 0: 1, ... }: still version 1, so older versions read it.
+    assert_eq!(&state[..3], &[0xa7, 0x00, 0x01]);
+    net.restart(&ids[0]);
+    assert_eq!(net.node(&p[0]).roster(&g).unwrap().admins, vec![p[1]]);
 }

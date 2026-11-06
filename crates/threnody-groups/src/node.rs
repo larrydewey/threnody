@@ -7,7 +7,8 @@
 //! 1. the live session with that member;
 //! 2. sealed for the member's mailboxes (Appendix H);
 //! 3. forwarded by another member we have a session with, preferring the
-//!    owner (`GroupWire::Forward`), for MLS messages only;
+//!    coordinator, then the owner's other devices, then admins
+//!    (`GroupWire::Forward`), for MLS messages only;
 //! 4. held here, and sent when the member connects; meanwhile we try to
 //!    reach them through relays (Appendix G).
 //!
@@ -22,7 +23,10 @@ use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::{Extras, OutgoingFile};
 use threnody_net::{Node, Tag};
 
-use crate::{Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, MemberRole, Output};
+use crate::{
+    Content, GroupError, GroupEvent, GroupId, GroupWire, Groups, MemberRole, Output, Roster,
+    RosterChange,
+};
 
 type Result<T> = std::result::Result<T, GroupError>;
 
@@ -32,6 +36,7 @@ const HELD: &str = "group-held";
 const EXPECTED: &str = "group-expected";
 const OFFERED: &str = "group-offered";
 const LEFT: &str = "group-left";
+const OWNER_SEEN: &str = "group-owner-seen";
 const VERSION: u8 = 1;
 const HELD_VERSION: u8 = 4;
 /// `group-held` before it said whose message each one is.
@@ -56,6 +61,171 @@ pub const MAX_INVITES: usize = 32;
 /// After a stranger's invitation, others from strangers in this long
 /// come quietly: new identities cost nothing.
 pub const STRANGER_INVITE_QUIET: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long the owner must have been silent in a group before its
+/// successor is offered to take over (client policy: the protocol takes a
+/// claim from the successor at any time).
+pub const SUCCESSION_SILENCE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+#[cfg(debug_assertions)]
+static SILENCE_FOR_TESTING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Debug builds only: lowers the succession silence (0 restores 14 days),
+/// for trying the successor's banner without waiting.
+#[cfg(debug_assertions)]
+pub fn set_succession_silence_for_testing(ms: u64) {
+    SILENCE_FOR_TESTING.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The succession silence in force: 14 days, unless lowered in a debug
+/// build (`THRENODY_SUCCESSION_SILENCE_MS`, or
+/// [`set_succession_silence_for_testing`]).
+pub fn succession_silence() -> u64 {
+    #[cfg(debug_assertions)]
+    {
+        let set = SILENCE_FOR_TESTING.load(std::sync::atomic::Ordering::Relaxed);
+        if set != 0 {
+            return set;
+        }
+        if let Some(ms) = std::env::var("THRENODY_SUCCESSION_SILENCE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return ms;
+        }
+    }
+    SUCCESSION_SILENCE_MS
+}
+
+/// Whether a successor may claim: the owner was last seen at `seen` (never
+/// since we became successor: `None`), and `silence` has passed since.
+pub fn claim_allowed(seen: Option<u64>, now: u64, silence: u64) -> bool {
+    seen.is_some_and(|s| now.saturating_sub(s) >= silence)
+}
+
+/// What can be done to one row of a group's members.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberAction {
+    MakeAdmin,
+    RemoveAdmin,
+    MakeSuccessor,
+    NoLongerSuccessor,
+    /// Hand the group over to them.
+    MakeOwner,
+    /// This owner device applies changes from now on.
+    UseAsCoordinator,
+    /// Every device of theirs in the group.
+    Remove,
+    /// Take over from a lost coordinating device of ours and remove it.
+    RemoveThisDevice,
+    /// An admin gives up being one.
+    StepDown,
+}
+
+/// One row of a group's members: an account (one device, for devices we
+/// can't tie to an account).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberRow {
+    /// The device that stands for the row.
+    pub device: PublicIdentity,
+    pub devices: Vec<PublicIdentity>,
+    /// The highest role of its devices.
+    pub role: MemberRole,
+    pub successor: bool,
+    pub me: bool,
+    /// One of its devices coordinates.
+    pub coordinator: bool,
+    pub actions: Vec<MemberAction>,
+}
+
+/// The one banner a group shows, most pressing first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Banner {
+    /// This device fell out of step and asked to be brought back.
+    OutOfStep,
+    /// We're the successor and the owner has been silent long enough.
+    CanClaim { owner: PublicIdentity },
+    /// Our changes wait for the coordinator.
+    PendingChanges {
+        count: u32,
+        coordinator: PublicIdentity,
+    },
+    /// Roles wait for these members to update.
+    UpgradePending { outdated: Vec<PublicIdentity> },
+    /// Nobody else is in the group.
+    OnlyYou,
+}
+
+/// What a group's state calls for: at most one banner.
+pub fn banner(
+    out_of_step: bool,
+    can_claim: Option<PublicIdentity>,
+    pending: Option<(u32, PublicIdentity)>,
+    outdated: &[PublicIdentity],
+    only_you: bool,
+) -> Option<Banner> {
+    if out_of_step {
+        Some(Banner::OutOfStep)
+    } else if let Some(owner) = can_claim {
+        Some(Banner::CanClaim { owner })
+    } else if let Some((count, coordinator)) = pending.filter(|(n, _)| *n > 0) {
+        Some(Banner::PendingChanges { count, coordinator })
+    } else if !outdated.is_empty() {
+        Some(Banner::UpgradePending {
+            outdated: outdated.to_vec(),
+        })
+    } else if only_you {
+        Some(Banner::OnlyYou)
+    } else {
+        None
+    }
+}
+
+/// What this device (`me`, in `roster`) may do to the row of `row`
+/// devices; `mine` are our own account's devices in the group.
+pub fn member_actions(
+    roster: &Roster,
+    me: &PublicIdentity,
+    mine: &[PublicIdentity],
+    row: &[PublicIdentity],
+) -> Vec<MemberAction> {
+    use MemberAction::*;
+    let my_role = roster.role(me);
+    let ours = row.iter().any(|d| d == me || mine.contains(d));
+    let row_role = row
+        .iter()
+        .map(|d| roster.role(d))
+        .min_by_key(|r| r.to_wire())
+        .unwrap_or(MemberRole::Member);
+    if ours {
+        return match my_role {
+            MemberRole::Admin => vec![StepDown],
+            MemberRole::Owner if roster.lead != *me => {
+                let mut v = vec![UseAsCoordinator];
+                if row.contains(&roster.lead) {
+                    v.push(RemoveThisDevice);
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
+    }
+    let successor = row.iter().any(|d| roster.successors.contains(d));
+    match (my_role, row_role) {
+        (MemberRole::Owner, MemberRole::Member) => vec![MakeAdmin, MakeOwner, Remove],
+        (MemberRole::Owner, MemberRole::Admin) => vec![
+            RemoveAdmin,
+            if successor {
+                NoLongerSuccessor
+            } else {
+                MakeSuccessor
+            },
+            MakeOwner,
+            Remove,
+        ],
+        (MemberRole::Admin, MemberRole::Member) => vec![Remove],
+        _ => Vec::new(),
+    }
+}
 
 /// An invitation waiting for the user's consent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,8 +245,9 @@ struct Held {
     tag: Tag,
     /// The member whose message we forward; `None` for our own.
     origin: Option<PublicIdentity>,
-    /// A commit, proposal or Welcome: the member can't read anything later
-    /// without it, so it is kept longest.
+    /// A commit, proposal, Welcome (or one to pass on), Resync or Leave
+    /// with its proposal: the group can't move on without it, so it is
+    /// kept longest.
     handshake: bool,
 }
 
@@ -84,7 +255,15 @@ impl Held {
     fn new(to: PublicIdentity, bytes: Vec<u8>, tag: Tag, origin: Option<PublicIdentity>) -> Self {
         let handshake = match GroupWire::decode(&bytes) {
             Ok(GroupWire::Message { message, .. }) => crate::is_handshake(&message),
-            Ok(GroupWire::Welcome { .. }) => true,
+            Ok(GroupWire::Forward { message, .. }) => crate::is_handshake(&message),
+            Ok(
+                GroupWire::Welcome { .. }
+                | GroupWire::PassWelcome { .. }
+                | GroupWire::Resync { .. }
+                | GroupWire::Leave {
+                    proposal: Some(_), ..
+                },
+            ) => true,
             _ => false,
         };
         Self {
@@ -110,13 +289,17 @@ pub enum Update {
     /// Someone who isn't a mutually approved contact invites us. A quiet
     /// one shouldn't notify ([`STRANGER_INVITE_QUIET`]).
     Invited { invite: Invite, quiet: bool },
+    /// `by`: who added them, if known.
     MemberAdded {
         group: GroupId,
         member: PublicIdentity,
+        by: Option<PublicIdentity>,
     },
+    /// `by`: who removed them (themselves, if they left).
     MemberRemoved {
         group: GroupId,
         member: PublicIdentity,
+        by: Option<PublicIdentity>,
     },
     /// A member's role was changed.
     RoleChanged {
@@ -124,6 +307,15 @@ pub enum Update {
         member: PublicIdentity,
         role: MemberRole,
     },
+    /// A change of ours never made it into the group.
+    ChangeFailed { group: GroupId, reason: String },
+    /// Roles wait for these members to update Threnody.
+    UpgradePending {
+        group: GroupId,
+        outdated: Vec<PublicIdentity>,
+    },
+    /// This device fell out of step and asked to be brought back.
+    OutOfStep { group: GroupId },
     /// The owner removed us.
     Left { group: GroupId },
     /// `ours`: sent by another device of our own account (shown as ours,
@@ -193,6 +385,8 @@ pub struct GroupNode {
     left: Vec<GroupId>,
     /// When a stranger's invitation last notified.
     stranger_invited: Option<std::time::Instant>,
+    /// When each group's owner was last seen in it (ms), for succession.
+    owner_seen: Vec<(GroupId, u64)>,
     home: Home,
     identity: Identity,
 }
@@ -228,6 +422,7 @@ impl GroupNode {
             offered: decode_offered(&load(OFFERED)),
             left: decode_left(&load(LEFT)),
             stranger_invited: None,
+            owner_seen: decode_owner_seen(&load(OWNER_SEEN)),
             home: Home::new(home.dir()),
             identity: Identity::from_seed(&identity.seed()),
         })
@@ -254,6 +449,137 @@ impl GroupNode {
 
     pub fn invites(&self) -> &[Invite] {
         &self.invites
+    }
+
+    /// The group's roster (for a group without one: its creator alone).
+    pub fn roster(&self, group: &GroupId) -> Result<Roster> {
+        self.groups.roster(group)
+    }
+
+    /// Whether the group has a roster agreed by every member.
+    pub fn has_roster(&self, group: &GroupId) -> bool {
+        self.groups.has_roster(group).unwrap_or(false)
+    }
+
+    /// Our changes waiting for the coordinator.
+    pub fn pending_changes(&self, group: &GroupId) -> usize {
+        self.groups.pending_changes(group)
+    }
+
+    /// Members whose version doesn't support roles yet.
+    pub fn outdated(&self, group: &GroupId) -> Vec<PublicIdentity> {
+        self.groups.outdated(group).unwrap_or_default()
+    }
+
+    /// Whether we asked to be brought back in step and haven't been yet.
+    pub fn out_of_step(&self, group: &GroupId) -> bool {
+        self.groups.out_of_step(group)
+    }
+
+    /// Tests only: when the owner was last seen in `group`.
+    #[doc(hidden)]
+    pub fn set_owner_seen_for_testing(&mut self, group: &GroupId, ms: u64) {
+        self.owner_seen.retain(|(g, _)| g != group);
+        self.owner_seen.push((*group, ms));
+    }
+
+    /// Whether we are the group's successor and its owner has been silent
+    /// for [`succession_silence`] (as of `now_ms`).
+    pub fn can_claim(&self, node: &Node, group: &GroupId, now_ms: u64) -> bool {
+        let me = node.identity();
+        let Ok(roster) = self.groups.roster(group) else {
+            return false;
+        };
+        let seen = self
+            .owner_seen
+            .iter()
+            .find(|(g, _)| g == group)
+            .map(|(_, t)| *t);
+        roster.successors.contains(&me) && claim_allowed(seen, now_ms, succession_silence())
+    }
+
+    /// One row per account of the group's members, with what we may do
+    /// to each.
+    pub fn member_rows(&self, node: &Node, group: &GroupId) -> Result<Vec<MemberRow>> {
+        let me = node.identity();
+        let roster = self.groups.roster(group)?;
+        let members = self.members(group)?;
+        let mine: Vec<PublicIdentity> = members
+            .iter()
+            .copied()
+            .filter(|d| *d == me || node.is_own_device(d))
+            .collect();
+        let mut rows: Vec<([u8; 32], Vec<PublicIdentity>)> = Vec::new();
+        for d in &members {
+            let key = node.reactor_of(d);
+            match rows.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ds)) => ds.push(*d),
+                None => rows.push((key, vec![*d])),
+            }
+        }
+        let mut out: Vec<MemberRow> = rows
+            .into_iter()
+            .map(|(_, devices)| {
+                let role = devices
+                    .iter()
+                    .map(|d| roster.role(d))
+                    .min_by_key(|r| r.to_wire())
+                    .unwrap_or(MemberRole::Member);
+                let is_me = devices.iter().any(|d| mine.contains(d));
+                // Our own row stands for this device; others by a device
+                // that holds their highest role.
+                let device = if is_me {
+                    me
+                } else {
+                    devices
+                        .iter()
+                        .copied()
+                        .find(|d| *d == roster.lead)
+                        .or_else(|| devices.iter().copied().find(|d| roster.role(d) == role))
+                        .unwrap_or(devices[0])
+                };
+                MemberRow {
+                    device,
+                    successor: devices.iter().any(|d| roster.successors.contains(d)),
+                    me: is_me,
+                    coordinator: devices.contains(&roster.lead),
+                    actions: member_actions(&roster, &me, &mine, &devices),
+                    devices,
+                    role,
+                }
+            })
+            .collect();
+        // Owners, then admins, then members; ourselves first among equals.
+        out.sort_by_key(|r| (r.role.to_wire(), !r.me));
+        Ok(out)
+    }
+
+    /// The banner the group should show here now.
+    pub fn banner(&self, node: &Node, group: &GroupId, now_ms: u64) -> Option<Banner> {
+        let roster = self.groups.roster(group).ok()?;
+        let members = self.members(group).ok()?;
+        let me = node.identity();
+        let pending = u32::try_from(self.pending_changes(group)).unwrap_or(u32::MAX);
+        let outdated = if self.has_roster(group)
+            || !self
+                .groups
+                .list()
+                .iter()
+                .any(|(g, _, o, _)| g == group && *o == me)
+        {
+            Vec::new()
+        } else if self.groups.pending_changes(group) > 0 {
+            self.outdated(group)
+        } else {
+            Vec::new()
+        };
+        banner(
+            self.out_of_step(group),
+            self.can_claim(node, group, now_ms).then_some(roster.lead),
+            (pending > 0 && outdated.is_empty()).then_some((pending, roster.lead)),
+            &outdated,
+            members.len() <= 1,
+        )
     }
 
     /// How many messages are waiting for `member` to connect.
@@ -353,7 +679,7 @@ impl GroupNode {
     }
 
     /// Removes every device of `peer`'s account that is in the group (we
-    /// must own it).
+    /// must be an owner or, for a member, an admin).
     pub fn remove(
         &mut self,
         node: &Node,
@@ -376,58 +702,251 @@ impl GroupNode {
         Ok(updates)
     }
 
-    /// Promotes `peer` to Admin (only the group owner can do this).
+    /// Changes roles. In a group without a roster, the first change also
+    /// makes our own other devices in it owners.
+    pub fn change_roster(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        changes: Vec<RosterChange>,
+    ) -> Result<Vec<Update>> {
+        let me = node.identity();
+        let mut changes = changes;
+        if !self.has_roster(group) {
+            let ours: Vec<PublicIdentity> = self
+                .members(group)?
+                .into_iter()
+                .filter(|d| *d != me && node.is_own_device(d))
+                .collect();
+            if !ours.is_empty() {
+                changes.insert(0, RosterChange::AddOwners(ours));
+            }
+        }
+        let out = self.groups.change_roster(group, &changes)?;
+        self.apply(node, out, true)
+    }
+
+    /// `peer`'s devices in the group (just `peer` for an account we don't
+    /// know), with `peer` first.
+    fn devices_in(
+        &self,
+        node: &Node,
+        group: &GroupId,
+        peer: &PublicIdentity,
+    ) -> Result<Vec<PublicIdentity>> {
+        let members = self.members(group)?;
+        let mut devices: Vec<PublicIdentity> = account_devices(node, peer)
+            .into_iter()
+            .filter(|d| members.contains(d) && d != peer)
+            .collect();
+        if members.contains(peer) {
+            devices.insert(0, *peer);
+        }
+        if devices.is_empty() {
+            return Err(GroupError::NotMember(peer.fingerprint().to_string()));
+        }
+        Ok(devices)
+    }
+
+    /// Owner: makes every device of `peer`'s account in the group an admin.
     pub fn promote(
         &mut self,
         node: &Node,
         group: &GroupId,
         peer: PublicIdentity,
     ) -> Result<Vec<Update>> {
-        let members = self.members(group)?;
-        if !members.contains(&peer) {
-            return Err(GroupError::NotMember(peer.fingerprint().to_string()));
+        let roster = self.roster(group)?;
+        let devices: Vec<PublicIdentity> = self
+            .devices_in(node, group, &peer)?
+            .into_iter()
+            .filter(|d| roster.role(d) == MemberRole::Member)
+            .collect();
+        if devices.is_empty() {
+            return Err(GroupError::NotAllowed("already an admin"));
         }
-        let out = self.groups.promote(group, peer)?;
-        self.apply(node, out, true)
+        self.change_roster(node, group, vec![RosterChange::Promote(devices)])
     }
 
-    /// Demotes `peer` from Admin to Member (only the group owner can do this).
+    /// Owner: `peer`'s account is no longer admin. For ourselves (an
+    /// admin), steps down on this device; the coordinator follows on our
+    /// other devices when it knows them.
     pub fn demote(
         &mut self,
         node: &Node,
         group: &GroupId,
         peer: PublicIdentity,
     ) -> Result<Vec<Update>> {
-        let members = self.members(group)?;
-        if !members.contains(&peer) {
-            return Err(GroupError::NotMember(peer.fingerprint().to_string()));
+        let me = node.identity();
+        if peer == me || node.is_own_device(&peer) {
+            return self.change_roster(node, group, vec![RosterChange::Demote(vec![me])]);
         }
-        let out = self.groups.demote(group, peer)?;
+        let roster = self.roster(group)?;
+        let devices: Vec<PublicIdentity> = self
+            .devices_in(node, group, &peer)?
+            .into_iter()
+            .filter(|d| roster.role(d) == MemberRole::Admin)
+            .collect();
+        if devices.is_empty() {
+            return Err(GroupError::NotAllowed("only admins can be demoted"));
+        }
+        self.change_roster(node, group, vec![RosterChange::Demote(devices)])
+    }
+
+    /// Owner: hands the group to `peer`'s account (its devices in the group
+    /// own it; `peer` coordinates). Our devices become admins.
+    pub fn transfer(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        peer: PublicIdentity,
+    ) -> Result<Vec<Update>> {
+        let devices = self.devices_in(node, group, &peer)?;
+        self.change_roster(node, group, vec![RosterChange::Transfer(devices)])
+    }
+
+    /// Owner: hands the group to `peer`'s account and leaves it. Only once
+    /// the handover can go in at once (or, from an owner device that isn't
+    /// the coordinator, ahead of our leaving): in a group still waiting for
+    /// members to update, nothing changes.
+    pub fn transfer_and_leave(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        peer: PublicIdentity,
+    ) -> Result<Vec<Update>> {
+        let me = node.identity();
+        if !self.has_roster(group) {
+            return Err(GroupError::NotAllowed(
+                "everyone must update Threnody before you can hand the group over",
+            ));
+        }
+        let mut updates = self.transfer(node, group, peer)?;
+        if self.roster(group)?.lead == me {
+            return Err(GroupError::NotAllowed(
+                "the handover hasn't gone through yet: try leaving again later",
+            ));
+        }
+        updates.extend(self.leave(node, group)?);
+        Ok(updates)
+    }
+
+    /// Owner: makes `peer`'s account (admins all) the successor, who may
+    /// take over should we fall silent; `None` clears it.
+    pub fn set_successor(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        peer: Option<PublicIdentity>,
+    ) -> Result<Vec<Update>> {
+        let devices = match peer {
+            None => Vec::new(),
+            Some(p) => {
+                let roster = self.roster(group)?;
+                let d: Vec<PublicIdentity> = self
+                    .devices_in(node, group, &p)?
+                    .into_iter()
+                    .filter(|d| roster.role(d) == MemberRole::Admin)
+                    .collect();
+                if d.is_empty() {
+                    return Err(GroupError::NotAllowed("make them an admin first"));
+                }
+                d
+            }
+        };
+        self.change_roster(node, group, vec![RosterChange::Successor(devices)])
+    }
+
+    /// An owner device makes `device` (another owner device, or itself)
+    /// the coordinator, through the current one.
+    pub fn use_as_coordinator(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        device: PublicIdentity,
+    ) -> Result<Vec<Update>> {
+        self.change_roster(node, group, vec![RosterChange::Lead(device)])
+    }
+
+    /// An owner device takes over as coordinator now, without the current
+    /// one, applying our pending changes.
+    pub fn take_over(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
+        let out = self.groups.take_over(group)?;
         self.apply(node, out, true)
     }
 
-    /// Leaves a group: a member asks the owner to remove it, the owner
-    /// removes everyone. Either way the group is gone here at once.
+    /// Takes over from a lost coordinating device of ours and removes it.
+    pub fn remove_coordinator(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
+        let lead = self.roster(group)?.lead;
+        if !node.is_own_device(&lead) {
+            return Err(GroupError::NotAllowed("not one of our devices"));
+        }
+        let out = self.groups.take_over_removing(group, &[lead])?;
+        self.apply(node, out, true)
+    }
+
+    /// The successor takes ownership (the apps offer it after
+    /// [`succession_silence`], see [`Self::can_claim`]).
+    pub fn claim(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
+        let out = self.groups.claim(group)?;
+        self.apply(node, out, true)
+    }
+
+    /// Leaves a group: asks the coordinator to remove us; the group is gone
+    /// here at once. The last owner device must hand the group over or
+    /// delete it instead, unless nobody else is in it.
     pub fn leave(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
         let me = node.identity();
-        let owned = self
-            .groups
-            .list()
+        let roster = self.roster(group)?;
+        let members = self.members(group)?;
+        let other_owner = roster
+            .owners
             .iter()
-            .any(|(g, _, o, _)| g == group && *o == me);
-        let out = if owned {
+            .any(|o| *o != me && members.contains(o));
+        let out = if roster.role(&me) == MemberRole::Owner && !other_owner {
+            if members.iter().any(|m| *m != me) {
+                return Err(GroupError::NotAllowed(
+                    "transfer ownership first, or delete the group",
+                ));
+            }
             self.groups.disband(group)?
         } else {
             self.groups.leave(group)?
         };
-        // Copies held for this group's members are moot now.
+        self.gone(group);
+        self.apply(node, out, true)
+    }
+
+    /// Owner: deletes the group for everyone.
+    pub fn delete(&mut self, node: &Node, group: &GroupId) -> Result<Vec<Update>> {
+        let out = self.groups.disband(group)?;
+        self.gone(group);
+        self.apply(node, out, true)
+    }
+
+    /// We left `group` (or deleted it): copies held for its members are
+    /// moot, and our other devices don't add this one back.
+    fn gone(&mut self, group: &GroupId) {
         self.held
             .retain(|h| GroupWire::decode(&h.bytes).map_or(true, |w| w.group() != group));
         self.save_held();
-        // Leaving is per device: our other devices stay, and don't add
-        // this one back.
+        self.owner_seen.retain(|(g, _)| g != group);
+        self.save_owner_seen();
         self.note_left(*group);
-        self.apply(node, out, true)
+    }
+
+    /// After a start: the coordinator commits what it stored but hadn't
+    /// committed, and members propose upgrades that are due.
+    pub fn resume_all(&mut self, node: &Node) -> Vec<Update> {
+        let mut updates = Vec::new();
+        for (group, ..) in self.groups.list() {
+            if let Ok(out) = self.groups.resume(&group)
+                && (!out.send.is_empty() || !out.events.is_empty())
+                && let Ok(u) = self.apply(node, out, true)
+            {
+                updates.extend(u);
+            }
+        }
+        updates
     }
 
     /// Sends text to every other member and records it in the group's
@@ -721,12 +1240,20 @@ impl GroupNode {
             if only.is_some_and(|p| *p != o.to) {
                 continue;
             }
-            let GroupWire::Message { group, message } = o.wire else {
+            let GroupWire::Message {
+                group,
+                message,
+                proposals,
+                sync,
+            } = o.wire
+            else {
                 continue;
             };
             let direct = GroupWire::Message {
                 group,
                 message: message.clone(),
+                proposals: proposals.clone(),
+                sync,
             };
             if let Ok(b) = direct.encode()
                 && node.send(&o.to, AppMessage::Group(b)).is_ok()
@@ -739,6 +1266,8 @@ impl GroupNode {
                     to: *o.to.as_bytes(),
                     message,
                     reference: 0,
+                    proposals,
+                    sync,
                 };
                 if let Ok(b) = fwd.encode() {
                     let _ = node.send(&via, AppMessage::Group(b));
@@ -826,19 +1355,14 @@ impl GroupNode {
         Ok(true)
     }
 
-    /// Whether `who` may pin messages in `group`: its owner and admins.
+    /// Whether `who` may pin messages in `group`: its owners and admins,
+    /// as the roster every member holds says.
     pub fn may_pin(&self, group: &GroupId, who: &PublicIdentity) -> bool {
-        self.groups
-            .list_with_roles()
-            .into_iter()
-            .find(|(g, ..)| g == group)
-            .and_then(|(.., members, roles)| {
-                members
-                    .iter()
-                    .position(|m| m == who)
-                    .and_then(|i| roles.get(i).copied())
-            })
-            .is_some_and(|r| r.can_commit())
+        self.members(group).is_ok_and(|m| m.contains(who))
+            && self
+                .groups
+                .role_of(group, who)
+                .is_ok_and(MemberRole::can_manage_members)
     }
 
     /// Sends a file to every other member and records it (with
@@ -1075,7 +1599,8 @@ impl GroupNode {
 
     /// Our own device `sibling` is connected (or just linked): it joins
     /// every group we're in that it isn't, once. We add it ourselves if we
-    /// may, otherwise ask the owner; and tell it to accept the invitation.
+    /// may (an owner or admin), otherwise ask the coordinator; and tell it
+    /// to accept the invitation.
     fn add_sibling(&mut self, node: &Node, sibling: &PublicIdentity) {
         let me = node.identity();
         let todo: Vec<_> = self
@@ -1103,12 +1628,12 @@ impl GroupNode {
                 false,
                 Tag::NONE,
             );
-            let can_commit = members
+            let may_add = members
                 .iter()
                 .position(|m| *m == me)
                 .and_then(|i| roles.get(i))
-                .is_some_and(|r| r.can_commit());
-            if can_commit {
+                .is_some_and(|r| r.can_manage_members());
+            if may_add {
                 if let Ok(out) = self.groups.invite(&group, *sibling) {
                     let _ = self.apply(node, out, true);
                 }
@@ -1121,10 +1646,12 @@ impl GroupNode {
     }
 
     /// Devices were removed from their accounts (`Event::AccountChanged`):
-    /// in the groups we own, they're removed as members, so later epochs
-    /// are unreadable to them, and nothing held for them is sent. Members
-    /// that don't own a group stop delivering to them, and leave the
-    /// removal to its owner.
+    /// they lose their roles and their membership, so later epochs are
+    /// unreadable to them, and nothing held for them is sent. The
+    /// coordinator removes them; an owner device or admin that may
+    /// proposes it; if the device removed was our own coordinating device,
+    /// the remaining owner device of ours with the lowest identity takes
+    /// over and removes it. Always on: a stolen phone keeps no power.
     pub fn revoked(&mut self, node: &Node, removed: &[PublicIdentity]) -> Vec<Update> {
         let removed: Vec<PublicIdentity> = removed
             .iter()
@@ -1141,16 +1668,53 @@ impl GroupNode {
         }
         let me = node.identity();
         let mut updates = Vec::new();
-        for (group, _, owner, members) in self.groups.list() {
-            if owner != me {
+        for (group, _, lead, members) in self.groups.list() {
+            let gone: Vec<PublicIdentity> = members
+                .iter()
+                .copied()
+                .filter(|m| removed.contains(m))
+                .collect();
+            if gone.is_empty() {
                 continue;
             }
-            for d in members.iter().filter(|m| removed.contains(m)) {
-                if let Ok(out) = self.groups.remove(&group, d)
-                    && let Ok(u) = self.apply(node, out, true)
-                {
-                    updates.extend(u);
+            let Ok(roster) = self.groups.roster(&group) else {
+                continue;
+            };
+            let out = if gone.contains(&lead) && roster.role(&me) == MemberRole::Owner {
+                // The coordinating device of our account was removed (it's
+                // no longer "ours" now): one of us takes over, the same one
+                // on every device.
+                let next = roster
+                    .owners
+                    .iter()
+                    .copied()
+                    .filter(|o| {
+                        !removed.contains(o)
+                            && members.contains(o)
+                            && (*o == me || node.is_own_device(o))
+                    })
+                    .min_by_key(|o| *o.as_bytes());
+                if next != Some(me) {
+                    continue;
                 }
+                self.groups.take_over_removing(&group, &gone)
+            } else {
+                let mut out = Output::default();
+                for d in &gone {
+                    if *d == lead {
+                        continue;
+                    }
+                    if let Ok(o) = self.groups.remove(&group, d) {
+                        out.send.extend(o.send);
+                        out.events.extend(o.events);
+                    }
+                }
+                Ok(out)
+            };
+            if let Ok(out) = out
+                && let Ok(u) = self.apply(node, out, true)
+            {
+                updates.extend(u);
             }
         }
         updates
@@ -1190,6 +1754,27 @@ impl GroupNode {
     pub fn connected(&mut self, node: &Node, peer: &PublicIdentity) {
         if node.is_own_device(peer) {
             self.add_sibling(node, peer);
+        }
+        // An owner showing up resets the succession clock; our coordinator
+        // showing up takes what waited for it.
+        for (group, ..) in self.groups.list() {
+            let Ok(roster) = self.groups.roster(&group) else {
+                continue;
+            };
+            if roster.owners.contains(peer) {
+                self.stamp_owner_seen(&group);
+            }
+            if roster.lead == *peer
+                && let Ok(out) = self.groups.resume(&group)
+                && !out.send.is_empty()
+            {
+                let _ = self.apply(node, out, true);
+            }
+        }
+        // Messages from a branch that outranks ours waited long enough.
+        let out = self.groups.check_forks();
+        if !out.send.is_empty() {
+            let _ = self.apply(node, out, true);
         }
         if !self.held.iter().any(|h| h.to == *peer) {
             return;
@@ -1251,6 +1836,14 @@ impl GroupNode {
             out.extend_from_slice(g);
         }
         let _ = self.home.save_state(&self.identity, LEFT, &out);
+    }
+
+    fn save_owner_seen(&self) {
+        let _ = self.home.save_state(
+            &self.identity,
+            OWNER_SEEN,
+            &encode_owner_seen(&self.owner_seen),
+        );
     }
 
     fn save_held(&self) {
@@ -1355,7 +1948,15 @@ impl GroupNode {
         if node.can_send_offline(&to) && node.send_offline_or_hold(&to, &msg, t).is_ok() {
             return;
         }
-        if let (true, GroupWire::Message { group, message }) = (may_forward, &wire)
+        if let (
+            true,
+            GroupWire::Message {
+                group,
+                message,
+                proposals,
+                sync,
+            },
+        ) = (may_forward, &wire)
             && let Some(via) = self.forwarder(node, group, &to, avoid)
         {
             // Our own message asks for a receipt; one we forward doesn't.
@@ -1364,6 +1965,8 @@ impl GroupNode {
                 to: *to.as_bytes(),
                 message: message.clone(),
                 reference: if t.relay_for.is_none() { t.local_id } else { 0 },
+                proposals: proposals.clone(),
+                sync: *sync,
             };
             if let Ok(b) = fwd.encode()
                 && node.send(&via, AppMessage::Group(b)).is_ok()
@@ -1382,7 +1985,8 @@ impl GroupNode {
     }
 
     /// A member other than `to` (and those in `avoid`) with a live
-    /// session, the owner first.
+    /// session: the coordinator first, then the owner's other devices,
+    /// then admins, then anyone.
     fn forwarder(
         &self,
         node: &Node,
@@ -1390,19 +1994,122 @@ impl GroupNode {
         to: &PublicIdentity,
         avoid: &[PublicIdentity],
     ) -> Option<PublicIdentity> {
-        let (_, _, owner, members) = self.groups.list().into_iter().find(|(g, ..)| g == group)?;
+        let (_, _, lead, members) = self.groups.list().into_iter().find(|(g, ..)| g == group)?;
+        let roster = self.groups.roster(group).ok()?;
         let me = node.identity();
         let live: Vec<PublicIdentity> = node.sessions().iter().map(|s| s.peer).collect();
         let candidates = members
             .into_iter()
             .filter(|m| m != to && *m != me && live.contains(m) && !avoid.contains(m));
         let mut candidates: Vec<_> = candidates.collect();
-        candidates.sort_by_key(|m| *m != owner);
+        candidates.sort_by_key(|m| (*m != lead, roster.role(m).to_wire()));
         candidates.into_iter().next()
     }
 
+    /// The owner showed signs of life in `group` (`who` did something):
+    /// the successor's clock starts over.
+    fn seen_by(&mut self, group: &GroupId, who: Option<&PublicIdentity>) {
+        if let Some(w) = who
+            && self
+                .groups
+                .roster(group)
+                .is_ok_and(|r| r.owners.contains(w))
+        {
+            self.stamp_owner_seen(group);
+        }
+    }
+
+    fn stamp_owner_seen(&mut self, group: &GroupId) {
+        let now = threnody_core::now_ms();
+        match self.owner_seen.iter_mut().find(|(g, _)| g == group) {
+            Some((_, t)) if now.saturating_sub(*t) < 60_000 => return,
+            Some((_, t)) => *t = now,
+            None => self.owner_seen.push((*group, now)),
+        }
+        self.save_owner_seen();
+    }
+
+    /// As the coordinator: a device `by` added is an owner if it's one of
+    /// ours, or an admin if `by` is an admin and we can tell it's `by`'s
+    /// own device (members can't, so it's ours to check).
+    fn sibling_role(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        device: &PublicIdentity,
+        by: &PublicIdentity,
+        updates: &mut Vec<Update>,
+    ) {
+        let me = node.identity();
+        if !self.has_roster(group) || !self.groups.is_lead(group) {
+            return;
+        }
+        let Ok(roster) = self.groups.roster(group) else {
+            return;
+        };
+        let change = if node.is_own_device(device) && roster.role(device) != MemberRole::Owner {
+            RosterChange::AddOwners(vec![*device])
+        } else if roster.role(by) == MemberRole::Admin
+            && *by != me
+            && roster.role(device) == MemberRole::Member
+            && node
+                .account_of(by)
+                .is_some_and(|a| a.state().has(by) && a.state().has(device))
+        {
+            RosterChange::Promote(vec![*device])
+        } else {
+            return;
+        };
+        if let Ok(out) = self.groups.change_roster(group, &[change])
+            && let Ok(u) = self.apply(node, out, true)
+        {
+            updates.extend(u);
+        }
+    }
+
+    /// As the coordinator: an admin device stepped down, so its account's
+    /// other admin devices (if we know them) do too.
+    fn mirror_step_down(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        device: &PublicIdentity,
+        updates: &mut Vec<Update>,
+    ) {
+        if !self.groups.is_lead(group) {
+            return;
+        }
+        let Ok(roster) = self.groups.roster(group) else {
+            return;
+        };
+        let Some(account) = node.account_of(device) else {
+            return;
+        };
+        if !account.state().has(device) {
+            return;
+        }
+        let others: Vec<PublicIdentity> = roster
+            .admins
+            .iter()
+            .copied()
+            .filter(|a| a != device && account.state().has(a))
+            .collect();
+        if others.is_empty() {
+            return;
+        }
+        if let Ok(out) = self
+            .groups
+            .change_roster(group, &[RosterChange::Demote(others)])
+            && let Ok(u) = self.apply(node, out, true)
+        {
+            updates.extend(u);
+        }
+    }
+
     fn event(&mut self, node: &Node, e: GroupEvent, updates: &mut Vec<Update>) {
-        updates.push(match e {
+        // What our reaction to it brings, shown after it.
+        let mut extra = Vec::new();
+        let update = match e {
             GroupEvent::Joined { group, name, owner } => {
                 if self.expected.iter().any(|(g, _)| *g == group) {
                     self.expected.retain(|(g, _)| *g != group);
@@ -1420,13 +2127,21 @@ impl GroupNode {
                 // is the owner of a group our own device says to join;
                 // anyone else needs explicit consent, and so does a group
                 // we left.
-                let trusted = !self.left.contains(&group)
-                    && (node
-                        .contacts()
-                        .get(&peer)
-                        .is_some_and(|c| c.mutually_approved())
-                        || node.is_own_device(&peer)
-                        || self.expected.contains(&(group, Some(peer))));
+                // And, when we asked to be brought back in step, an owner or
+                // successor device of the group re-adding us.
+                let repair = self.groups.out_of_step(&group)
+                    && self
+                        .groups
+                        .roster(&group)
+                        .is_ok_and(|r| r.owners.contains(&peer) || r.successors.contains(&peer));
+                let trusted = repair
+                    || !self.left.contains(&group)
+                        && (node
+                            .contacts()
+                            .get(&peer)
+                            .is_some_and(|c| c.mutually_approved())
+                            || node.is_own_device(&peer)
+                            || self.expected.contains(&(group, Some(peer))));
                 // If our key package can't be kept and sent, the
                 // invitation waits for consent like any other.
                 if trusted
@@ -1474,25 +2189,65 @@ impl GroupNode {
                 }
                 Update::Invited { invite: inv, quiet }
             }
-            GroupEvent::MemberAdded { group, member } => Update::MemberAdded { group, member },
-            GroupEvent::MemberRemoved { group, member } => {
+            GroupEvent::MemberAdded { group, member, by } => {
+                self.seen_by(&group, by.as_ref());
+                if let Some(by) = by {
+                    self.sibling_role(node, &group, &member, &by, &mut extra);
+                }
+                Update::MemberAdded { group, member, by }
+            }
+            GroupEvent::MemberRemoved { group, member, by } => {
+                self.seen_by(&group, by.as_ref());
                 // One of our devices left (or was removed): it stays out.
                 if node.is_own_device(&member) && !self.offered.contains(&(member, group)) {
                     self.offered.push((member, group));
                     self.save_offered();
                 }
-                Update::MemberRemoved { group, member }
+                Update::MemberRemoved { group, member, by }
             }
-            GroupEvent::Left { group } => Update::Left { group },
+            GroupEvent::Left { group } => {
+                if self.owner_seen.iter().any(|(g, _)| *g == group) {
+                    self.owner_seen.retain(|(g, _)| *g != group);
+                    self.save_owner_seen();
+                }
+                Update::Left { group }
+            }
+            GroupEvent::Committed {
+                group,
+                by,
+                successor,
+            } => {
+                // Any commit of the owner's, a role change say, is a sign
+                // of life; becoming successor starts the clock afresh.
+                if successor {
+                    self.stamp_owner_seen(&group);
+                } else {
+                    self.seen_by(&group, Some(&by));
+                }
+                return;
+            }
             GroupEvent::RoleChanged {
                 group,
                 member,
                 role,
-            } => Update::RoleChanged {
+            } => {
+                if role == MemberRole::Member {
+                    self.mirror_step_down(node, &group, &member, &mut extra);
+                }
+                Update::RoleChanged {
+                    group,
+                    member,
+                    role,
+                }
+            }
+            GroupEvent::ChangeFailed { group, reason } => Update::ChangeFailed {
                 group,
-                member,
-                role,
+                reason: reason.to_owned(),
             },
+            GroupEvent::UpgradePending { group, outdated } => {
+                Update::UpgradePending { group, outdated }
+            }
+            GroupEvent::OutOfStep { group } => Update::OutOfStep { group },
             GroupEvent::Text {
                 group,
                 from,
@@ -1502,6 +2257,7 @@ impl GroupNode {
                 mentions,
                 forwarded,
             } => {
+                self.seen_by(&group, Some(&from));
                 // What our other devices send to the group is ours too.
                 let ours = node.is_own_device(&from);
                 let timer = node.effective_timer(ConversationId::Group(group));
@@ -1546,19 +2302,22 @@ impl GroupNode {
                 id,
                 clip,
                 forwarded,
-            } => Update::File {
-                group,
-                from,
-                name,
-                data,
-                ours: node.is_own_device(&from),
-                sensitive,
-                caption,
-                album,
-                id,
-                clip,
-                forwarded,
-            },
+            } => {
+                self.seen_by(&group, Some(&from));
+                Update::File {
+                    group,
+                    from,
+                    name,
+                    data,
+                    ours: node.is_own_device(&from),
+                    sensitive,
+                    caption,
+                    album,
+                    id,
+                    clip,
+                    forwarded,
+                }
+            }
             GroupEvent::React {
                 group,
                 from,
@@ -1566,6 +2325,7 @@ impl GroupNode {
                 emoji,
                 add,
             } => {
+                self.seen_by(&group, Some(&from));
                 let who = node.reactor_of(&from);
                 node.apply_reaction(ConversationId::Group(group), who, id, &emoji, add);
                 Update::Reacted { group, from }
@@ -1625,6 +2385,7 @@ impl GroupNode {
                 id,
                 choices,
             } => {
+                self.seen_by(&group, Some(&from));
                 let who = node.reactor_of(&from);
                 if !node.vote_in(ConversationId::Group(group), id, who, &choices) {
                     return;
@@ -1666,6 +2427,7 @@ impl GroupNode {
                 id,
                 pin,
             } => {
+                self.seen_by(&group, Some(&from));
                 // Only the owner's and admins' pins count.
                 if !self.may_pin(&group, &from)
                     || !node.pin_in(ConversationId::Group(group), id, pin)
@@ -1674,7 +2436,9 @@ impl GroupNode {
                 }
                 Update::Pinned { group, from, pin }
             }
-        });
+        };
+        updates.push(update);
+        updates.extend(extra);
     }
 }
 
@@ -1771,6 +2535,7 @@ fn account_devices(node: &Node, peer: &PublicIdentity) -> Vec<PublicIdentity> {
 //   held    = HELD_VERSION || * ( member (32) | delivery tag (Tag::LEN) | origin (32, zeros if ours) | len (u32 LE) | GroupWire bytes )
 //             (version 3 had no origin)
 //   expected = EXPECTED_VERSION || * ( group (16) | owner (32, zeros if not known) )
+//   owner-seen = VERSION || * ( group (16) | ms (u64 LE) )
 
 fn encode_invites(invites: &[Invite]) -> Vec<u8> {
     let mut out = vec![VERSION];
@@ -1838,6 +2603,33 @@ fn decode_expected(b: &[u8]) -> Vec<(GroupId, Option<PublicIdentity>)> {
             .0
             .iter()
             .map(|g| (*g, None))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn encode_owner_seen(seen: &[(GroupId, u64)]) -> Vec<u8> {
+    let mut out = vec![VERSION];
+    for (g, t) in seen {
+        out.extend_from_slice(g);
+        out.extend_from_slice(&t.to_le_bytes());
+    }
+    out
+}
+
+fn decode_owner_seen(b: &[u8]) -> Vec<(GroupId, u64)> {
+    match b.split_first() {
+        Some((&VERSION, rest)) => rest
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .map(|c| {
+                let (g, t) = c.split_at(16);
+                (
+                    g.try_into().unwrap_or_default(),
+                    u64::from_le_bytes(t.try_into().unwrap_or_default()),
+                )
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -2081,5 +2873,93 @@ mod tests {
             decode_expected(&[&[VERSION][..], &[3; 16]].concat()),
             [([3; 16], None)]
         );
+        // When each group's owner was last seen.
+        let seen = vec![([1; 16], 5), ([2; 16], u64::MAX)];
+        let b = encode_owner_seen(&seen);
+        assert_eq!(decode_owner_seen(&b), seen);
+        assert_eq!(decode_owner_seen(&b[..b.len() - 1]), seen[..1]);
+        assert!(decode_owner_seen(&[9, 1]).is_empty());
+    }
+
+    #[test]
+    fn claim_allowed_after_fourteen_days() {
+        let day = 24 * 60 * 60 * 1000;
+        assert!(!claim_allowed(None, 100 * day, SUCCESSION_SILENCE_MS));
+        assert!(!claim_allowed(Some(day), 14 * day, SUCCESSION_SILENCE_MS));
+        assert!(claim_allowed(Some(day), 15 * day, SUCCESSION_SILENCE_MS));
+        assert!(!claim_allowed(
+            Some(20 * day),
+            15 * day,
+            SUCCESSION_SILENCE_MS
+        ));
+    }
+
+    #[test]
+    fn member_actions_follow_roles() {
+        use MemberAction::*;
+        let mut p: Vec<PublicIdentity> = (0..6).map(|_| Identity::generate().public()).collect();
+        p.sort_by_key(|x| *x.as_bytes());
+        let (o1, o2, a1, a2, m, s) = (p[0], p[1], p[2], p[3], p[4], p[5]);
+        let mut r = Roster::legacy(o1);
+        r = r
+            .apply(&[
+                RosterChange::AddOwners(vec![o2]),
+                RosterChange::Promote(vec![a1, a2, s]),
+                RosterChange::Successor(vec![s]),
+            ])
+            .unwrap();
+        let ours = [o1, o2];
+        // The coordinator, owner.
+        assert_eq!(
+            member_actions(&r, &o1, &ours, &[m]),
+            [MakeAdmin, MakeOwner, Remove]
+        );
+        assert_eq!(
+            member_actions(&r, &o1, &ours, &[a1]),
+            [RemoveAdmin, MakeSuccessor, MakeOwner, Remove]
+        );
+        assert_eq!(
+            member_actions(&r, &o1, &ours, &[s]),
+            [RemoveAdmin, NoLongerSuccessor, MakeOwner, Remove]
+        );
+        assert!(member_actions(&r, &o1, &ours, &[o1, o2]).is_empty());
+        // Our other owner device, not coordinating.
+        assert_eq!(
+            member_actions(&r, &o2, &ours, &[o1, o2]),
+            [UseAsCoordinator, RemoveThisDevice]
+        );
+        // An admin.
+        assert_eq!(member_actions(&r, &a1, &[a1], &[m]), [Remove]);
+        assert!(member_actions(&r, &a1, &[a1], &[a2]).is_empty());
+        assert!(member_actions(&r, &a1, &[a1], &[o1, o2]).is_empty());
+        assert_eq!(member_actions(&r, &a1, &[a1], &[a1]), [StepDown]);
+        // A member.
+        for row in [&[o1, o2][..], &[a1], &[m], &[s]] {
+            assert!(member_actions(&r, &m, &[m], row).is_empty());
+        }
+    }
+
+    #[test]
+    fn banner_priority() {
+        let p = Identity::generate().public();
+        let all = banner(true, Some(p), Some((2, p)), &[p], true);
+        assert_eq!(all, Some(Banner::OutOfStep));
+        assert_eq!(
+            banner(false, Some(p), Some((2, p)), &[p], true),
+            Some(Banner::CanClaim { owner: p })
+        );
+        assert_eq!(
+            banner(false, None, Some((2, p)), &[p], true),
+            Some(Banner::PendingChanges {
+                count: 2,
+                coordinator: p
+            })
+        );
+        assert_eq!(
+            banner(false, None, Some((0, p)), &[p], true),
+            Some(Banner::UpgradePending { outdated: vec![p] })
+        );
+        assert_eq!(banner(false, None, None, &[], true), Some(Banner::OnlyYou));
+        assert_eq!(banner(false, None, None, &[], false), None);
     }
 }
