@@ -719,7 +719,7 @@ impl GroupNode {
             {
                 continue;
             }
-            if let Some(via) = self.forwarder(node, &group, &o.to) {
+            if let Some(via) = self.forwarder(node, &group, &o.to, &[]) {
                 let fwd = GroupWire::Forward {
                     group,
                     to: *o.to.as_bytes(),
