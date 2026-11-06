@@ -1053,6 +1053,22 @@ impl Core {
                     forwarded,
                 }
             }
+            // The passphrase is only for joining; nothing past here needs it.
+            NodeEvent::WifiDirectOffer {
+                peer,
+                ssid,
+                passphrase: _,
+                addr,
+            } => {
+                let e = NodeEvent::WifiDirectOffer {
+                    peer,
+                    ssid,
+                    passphrase: String::new(),
+                    addr,
+                };
+                self.say(describe(&e));
+                e
+            }
             e => {
                 match &e {
                     NodeEvent::Connected { peer, via } => self.say(format!(
@@ -1102,7 +1118,7 @@ impl Core {
                     NodeEvent::Fallback { peer, notice } => {
                         self.say(format!("* {}: {notice}", short(peer)));
                     }
-                    other => self.say(format!("· {other:?}")),
+                    other => self.say(describe(other)),
                 }
                 e
             }
@@ -1337,6 +1353,59 @@ pub fn short(fp: &str) -> String {
     fp.chars().take(9).collect()
 }
 
+/// An event for the log, which is for transports, not content: events
+/// carrying secrets (a Wi-Fi Direct passphrase) or content (credential
+/// attributes, pseudonyms, group names, reactions) are logged by kind and
+/// short ids only; anything else by its `Debug` text.
+pub fn describe(e: &NodeEvent) -> String {
+    match e {
+        NodeEvent::WifiDirectOffer {
+            peer, ssid, addr, ..
+        } => format!(
+            "· WifiDirectOffer {{ peer: {}, ssid: {ssid:?}, addr: {addr} }}",
+            short(peer)
+        ),
+        NodeEvent::CredentialOffered { offer } => format!(
+            "· CredentialOffered {{ id: {}, peer: {}, schema: {:?} }}",
+            offer.id,
+            short(&offer.peer),
+            offer.schema
+        ),
+        NodeEvent::CredentialAsked { ask } => format!(
+            "· CredentialAsked {{ id: {}, peer: {}, schema: {:?} }}",
+            ask.id,
+            short(&ask.peer),
+            ask.schema
+        ),
+        NodeEvent::CredentialPresented {
+            id, peer, schema, ..
+        } => format!(
+            "· CredentialPresented {{ id: {id}, peer: {}, schema: {schema:?} }}",
+            short(peer)
+        ),
+        NodeEvent::GroupInvited {
+            group, from, quiet, ..
+        } => format!(
+            "· GroupInvited {{ group: {}, from: {}, quiet: {quiet} }}",
+            short(group),
+            short(from)
+        ),
+        NodeEvent::GroupJoined { group, owner, .. } => format!(
+            "· GroupJoined {{ group: {}, owner: {} }}",
+            short(group),
+            short(owner)
+        ),
+        NodeEvent::IdentityRevealed { peer, .. } => {
+            format!("· IdentityRevealed {{ peer: {} }}", short(peer))
+        }
+        NodeEvent::CallReaction { peer, call, .. } => {
+            format!("· CallReaction {{ peer: {}, call: {call} }}", short(peer))
+        }
+        NodeEvent::Other { description } => description.clone(),
+        other => format!("· {other:?}"),
+    }
+}
+
 pub fn is_image(name: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(
@@ -1551,5 +1620,67 @@ mod tests {
         assert!(note.exists() && recording.exists());
         assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_never_logs_secrets_or_content() {
+        use threnody_ffi::{CredentialOfferRecord, ProfileAttr};
+        let peer = "ABCDEFGHIJKLMNOP".to_string();
+        let offer = describe(&NodeEvent::WifiDirectOffer {
+            peer: peer.clone(),
+            ssid: "DIRECT-th-abcd".into(),
+            passphrase: "s3cretpass".into(),
+            addr: "192.168.49.1:7450".into(),
+        });
+        assert!(!offer.contains("s3cretpass"), "{offer}");
+        assert!(offer.contains("DIRECT-th-abcd"), "{offer}");
+
+        let attr = |key: &str, value: &str| ProfileAttr {
+            key: key.into(),
+            value: value.into(),
+        };
+        let credential = describe(&NodeEvent::CredentialOffered {
+            offer: CredentialOfferRecord {
+                id: 7,
+                peer: peer.clone(),
+                issuer: "issuer".into(),
+                schema: "club/member".into(),
+                attributes: vec![attr("name", "Jane Roe")],
+                expires_day: 0,
+            },
+        });
+        assert!(!credential.contains("Jane Roe"), "{credential}");
+        assert!(credential.contains("club/member"), "{credential}");
+
+        let presented = describe(&NodeEvent::CredentialPresented {
+            id: 3,
+            peer: peer.clone(),
+            issuer: "issuer".into(),
+            schema: "age/over18".into(),
+            attributes: vec![attr("born", "1990-01-01")],
+            pseudonym: "nym123".into(),
+        });
+        assert!(!presented.contains("1990-01-01"), "{presented}");
+        assert!(!presented.contains("nym123"), "{presented}");
+        assert!(presented.contains("age/over18"), "{presented}");
+
+        let invited = describe(&NodeEvent::GroupInvited {
+            group: "0123456789abcdef".into(),
+            name: "Secret club".into(),
+            from: peer.clone(),
+            quiet: false,
+        });
+        assert!(!invited.contains("Secret club"), "{invited}");
+        assert!(invited.contains("012345678"), "{invited}");
+
+        let delivered = NodeEvent::Delivered {
+            peer: peer.clone(),
+            group: None,
+        };
+        assert!(describe(&delivered).contains(&format!("{delivered:?}")));
+        let other = NodeEvent::Other {
+            description: "radio: hello".into(),
+        };
+        assert_eq!(describe(&other), "radio: hello");
     }
 }
