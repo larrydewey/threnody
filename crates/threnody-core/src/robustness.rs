@@ -267,3 +267,53 @@ fn credential_and_directory_parsers_survive_mutated_input() {
         }
     }
 }
+
+#[test]
+fn tap_card_survives_mutated_apdus() {
+    use crate::crypto::hybrid::HybridSecret;
+    use crate::invite::{InviteKey, InviteLink};
+    use crate::tap::{self, Card, Outcome, Reader};
+
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed([11; 32]);
+    let link = InviteLink {
+        fingerprint: Identity::from_seed(&[1; 32]).public().fingerprint(),
+        addrs: vec!["198.51.100.4:7450".into()],
+        key: Some(InviteKey::from_bytes(&[9; 16]).unwrap()),
+    };
+    let fp_b = Identity::from_seed(&[2; 32]).public().fingerprint();
+    let card = || Card::with_seed(&link, [5; 64]).unwrap();
+
+    // Record a valid, seeded exchange.
+    let mut recorder = card();
+    let mut transcript = Vec::new();
+    let mut reader = Reader::with_secret(fp_b, HybridSecret::from_seed(&[3; 32]));
+    let outcome = tap::run(&mut reader, |cmd| {
+        let resp = recorder.process(cmd);
+        transcript.push((cmd.to_vec(), resp.clone()));
+        Some(resp)
+    });
+    assert!(matches!(outcome, Outcome::Tapped { mutual: true, .. }));
+    // Seeded on both sides, so a replay reproduces it byte for byte.
+    let mut replay = card();
+    for (cmd, resp) in &transcript {
+        assert_eq!(&replay.process(cmd), resp);
+    }
+    assert_eq!(replay.finished(), Some(fp_b));
+
+    for _ in 0..ITERATIONS {
+        let mut c = card();
+        let which = rng.next_u32() as usize % transcript.len();
+        for (i, (cmd, _)) in transcript.iter().enumerate() {
+            let cmd = if i == which {
+                mutate(&mut rng, cmd)
+            } else {
+                cmd.clone()
+            };
+            let r = c.process(&cmd);
+            assert!((2..=243).contains(&r.len()), "{}", r.len());
+        }
+        if let Some(fp) = c.finished() {
+            assert_eq!(fp, fp_b, "a mutated tap finished with another peer");
+        }
+    }
+}
