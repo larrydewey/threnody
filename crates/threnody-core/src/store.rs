@@ -18,6 +18,7 @@ use crate::crypto::aead::Suite;
 use crate::crypto::kdf;
 use crate::crypto::random_bytes;
 use crate::error::{Error, Result};
+use crate::history::ConversationId;
 use crate::identity::{Fingerprint, Identity, PublicIdentity, fingerprint_matches_prefix};
 use crate::sealed::{self, KdfParams};
 
@@ -164,16 +165,26 @@ impl Home {
     /// ([`Home::migrate_history_names`]).
     pub fn load_contacts(&self, identity: &Identity) -> Result<Contacts> {
         let (contacts, legacy) = self.read_contacts(identity)?;
-        if legacy {
+        if let Some(dropped) = legacy {
+            // The older version deleted these conversations under the
+            // names it knows; their keyed files go now (before the plain
+            // book does, so an interruption repeats this).
+            for c in dropped {
+                self.delete_history(identity, c)?;
+            }
             self.save_contacts(identity, &contacts)?;
         }
         self.migrate_history_names(identity);
         Ok(contacts)
     }
 
-    /// The contact book, with any plain `contacts.cbor` merged in, and
-    /// whether there was one. Writes nothing.
-    pub(crate) fn read_contacts(&self, identity: &Identity) -> Result<(Contacts, bool)> {
+    /// The contact book, with any plain `contacts.cbor` merged in, and if
+    /// there was one, the conversations whose contact it blocked or
+    /// deleted ([`OlderMerge::dropped`]). Writes nothing.
+    pub(crate) fn read_contacts(
+        &self,
+        identity: &Identity,
+    ) -> Result<(Contacts, Option<Vec<ConversationId>>)> {
         let state = self.load_state(identity, CONTACTS_STATE)?;
         let plain = match fs::read(self.contacts_path()) {
             Ok(b) => Some(Contacts::decode(&b)?),
@@ -183,12 +194,12 @@ impl Home {
         Ok(match (state, plain) {
             (Some(b), Some(plain)) => {
                 let mut c = Contacts::decode(&b)?;
-                c.merge_older(plain, crate::now_ms());
-                (c, true)
+                let m = c.merge_older(plain, crate::now_ms());
+                (c, Some(m.dropped))
             }
-            (Some(b), None) => (Contacts::decode(&b)?, false),
-            (None, Some(plain)) => (plain, true),
-            (None, None) => (Contacts::default(), false),
+            (Some(b), None) => (Contacts::decode(&b)?, None),
+            (None, Some(plain)) => (plain, Some(Vec::new())),
+            (None, None) => (Contacts::default(), None),
         })
     }
 
@@ -521,6 +532,15 @@ impl Contact {
     }
 }
 
+/// What [`Contacts::merge_older`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OlderMerge {
+    pub changed: bool,
+    /// Conversations whose contact the older version blocked or deleted:
+    /// their history goes too, as when this version blocks or deletes.
+    pub dropped: Vec<ConversationId>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contacts {
     list: Vec<Contact>,
@@ -741,15 +761,31 @@ impl Contacts {
     }
 
     /// Merges the contact book an older version wrote to plain
-    /// `contacts.cbor` on this device after the upgrade (it can't read the
-    /// `contacts` state file, so it starts from nothing). Contacts only it
-    /// knows are added as they are; for one known to both, approval,
-    /// verification, blocking and the name are taken from whichever
-    /// changed approval last (`approval_changed_ms`), the latest sighting
-    /// wins, and anything else this book lacks is filled in. Deletions made
-    /// there are kept. Returns true if anything changed.
-    pub fn merge_older(&mut self, plain: Contacts, now_ms: u64) -> bool {
+    /// `contacts.cbor` on this device after the upgrade. It can't read the
+    /// `contacts` state file, so it starts from nothing, and that file
+    /// isn't written while it runs: what the plain book records is the
+    /// later. Contacts only it knows are added as they are. For one known
+    /// to both:
+    ///
+    /// - A block there wins (0.17.3 blocks without moving
+    ///   `approval_changed_ms`), for every device of the account, dated
+    ///   now; the conversation goes, as when this version blocks.
+    /// - An approval or revocation there dated later than ours wins.
+    ///   Approving again keeps our verification (it's the same key);
+    ///   revoking clears it. A verification made there is kept.
+    /// - A name given there wins, except the "my …" one it gives our own
+    ///   devices by itself when they have none.
+    /// - The latest sighting wins, and anything else ours lacks is filled.
+    ///
+    /// Deletions made there are kept, and their conversations go.
+    pub fn merge_older(&mut self, plain: Contacts, now_ms: u64) -> OlderMerge {
         let mut changed = false;
+        let mut dropped: Vec<ConversationId> = Vec::new();
+        let conversations = |c: &Contact| {
+            let mut v = vec![ConversationId::Peer(*c.key.as_bytes())];
+            v.extend(c.account.map(|a| ConversationId::Peer(a.0)));
+            v
+        };
         for (k, t) in plain.forgotten {
             if self.forgotten_at(&k).is_none_or(|ours| ours < t) {
                 self.note_forgotten(k, t);
@@ -757,15 +793,25 @@ impl Contacts {
             }
         }
         self.prune_forgotten(now_ms);
-        let before = self.list.len();
-        let gone: Vec<PublicIdentity> = self
+        let gone: Vec<Contact> = self
             .list
             .iter()
             .filter(|c| self.deleted(&c.key, c.first_seen_ms))
-            .map(|c| c.key)
+            .cloned()
             .collect();
-        self.list.retain(|c| !gone.contains(&c.key));
-        changed |= self.list.len() != before;
+        self.list.retain(|c| !gone.iter().any(|g| g.key == c.key));
+        changed |= !gone.is_empty();
+        for g in &gone {
+            dropped.extend(conversations(g));
+        }
+        // 0.17.3 dates the approval of a device it first meets through its
+        // contact's account (one we know, of a contact back from the
+        // upgrade) with that account's approval there: none, unless given
+        // again. That is no revocation of the user's.
+        let decided = |o: &Contact| {
+            o.local_approved || o.accepted || o.approval_changed_ms > o.first_seen_ms + 1000
+        };
+        let mut blocked_accounts = Vec::new();
         for o in plain.list {
             if self.deleted(&o.key, o.first_seen_ms) {
                 continue;
@@ -777,20 +823,44 @@ impl Contacts {
                 continue;
             };
             let was = c.clone();
-            if o.approval_changed_ms > c.approval_changed_ms {
-                c.local_approved = o.local_approved;
-                c.verified = o.verified;
-                c.blocked = o.blocked;
-                c.accepted = o.accepted;
-                c.approval_changed_ms = o.approval_changed_ms;
-                if o.petname.is_some() {
-                    c.petname = o.petname.clone();
+            if c.account.is_none() {
+                c.account = o.account;
+            }
+            if o.blocked {
+                if !c.blocked {
+                    c.blocked = true;
+                    dropped.extend(conversations(c));
+                    blocked_accounts.extend(c.account);
                 }
+                c.accepted = false;
+                c.local_approved = false;
+                c.approval_changed_ms = c.approval_changed_ms.max(o.approval_changed_ms);
+                if was != *c {
+                    c.approval_changed_ms = c.approval_changed_ms.max(now_ms);
+                }
+                c.clear_discovery_keys();
+            } else if o.approval_changed_ms > c.approval_changed_ms && decided(&o) {
+                c.verified = if o.local_approved {
+                    c.verified || o.verified
+                } else {
+                    o.verified
+                };
+                c.local_approved = o.local_approved;
+                // Only approving unblocks (as there).
+                c.blocked &= !o.local_approved;
+                c.accepted = !c.blocked && (o.accepted || o.local_approved || c.accepted);
+                c.approval_changed_ms = o.approval_changed_ms;
                 if !c.local_approved {
                     c.clear_discovery_keys();
                 }
-            } else if o.accepted && !c.accepted && !c.blocked {
-                c.accepted = true;
+            } else if !c.blocked {
+                c.accepted |= o.accepted;
+                c.verified |= o.verified;
+            }
+            if let Some(name) = o.petname.as_ref()
+                && (c.petname.is_none() || !name.starts_with("my "))
+            {
+                c.petname = Some(name.clone());
             }
             // The latest session's view of the peer.
             if o.last_seen_ms > c.last_seen_ms {
@@ -810,14 +880,8 @@ impl Contacts {
             c.first_seen_ms = c.first_seen_ms.min(o.first_seen_ms);
             c.cleared_ms = c.cleared_ms.max(o.cleared_ms);
             // Gaps.
-            if c.petname.is_none() {
-                c.petname = o.petname;
-            }
             if c.last_addr.is_none() {
                 c.last_addr = o.last_addr;
-            }
-            if c.account.is_none() {
-                c.account = o.account;
             }
             if c.discovery_key.is_none() && c.local_approved && o.discovery_key.is_some() {
                 c.discovery_key = o.discovery_key;
@@ -837,7 +901,36 @@ impl Contacts {
             }
             changed |= *c != was;
         }
-        changed
+        // A block covers every device of the account, here too.
+        for c in self
+            .list
+            .iter_mut()
+            .filter(|c| !c.blocked && c.account.is_some_and(|a| blocked_accounts.contains(&a)))
+        {
+            c.blocked = true;
+            c.accepted = false;
+            c.local_approved = false;
+            c.approval_changed_ms = c.approval_changed_ms.max(now_ms);
+            c.clear_discovery_keys();
+            dropped.extend(conversations(c));
+            changed = true;
+        }
+        // A conversation still had with a remaining device of the account
+        // stays.
+        let kept: Vec<ConversationId> = self
+            .list
+            .iter()
+            .filter(|c| !c.blocked)
+            .flat_map(conversations)
+            .collect();
+        dropped.retain(|d| !kept.contains(d));
+        let mut seen = Vec::new();
+        dropped.retain(|d| {
+            let new = !seen.contains(d);
+            seen.push(*d);
+            new
+        });
+        OlderMerge { changed, dropped }
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
@@ -1219,9 +1312,10 @@ mod contacts_at_rest_tests {
         // Deleted under the older version.
         plain.forget(&eve, 30);
 
-        assert!(state.merge_older(plain.clone(), 40));
+        assert!(state.merge_older(plain.clone(), 40).changed);
         let b = state.get(&bob).unwrap();
-        assert!(b.blocked && !b.local_approved && !b.verified && !b.accepted);
+        assert!(b.blocked && !b.local_approved && !b.accepted);
+        assert!(b.verified, "blocking keeps the key's verification, as here");
         assert_eq!(b.petname.as_deref(), Some("bob-old"), "newer name");
         let c = state.get(&carol).unwrap();
         assert!(!c.local_approved, "older approval loses");
@@ -1229,7 +1323,164 @@ mod contacts_at_rest_tests {
         assert_eq!(c.last_addr.as_deref(), Some("carol.example:1"));
         assert_eq!(c.account, Some(AccountId([4; 32])));
         assert!(state.get(&eve).is_none(), "deletion kept");
-        assert!(!state.merge_older(plain, 40), "idempotent");
+        assert!(!state.merge_older(plain, 40).changed, "idempotent");
+    }
+
+    /// Bob as a 0.17.3 home sees him on his return after the upgrade:
+    /// unnamed, unapproved, and with no approval date (trust on first use).
+    fn returning(key: PublicIdentity) -> Contacts {
+        let mut plain = Contacts::default();
+        plain.observe(key, Some("127.0.0.1:9".into()), 50);
+        plain
+    }
+
+    fn approved_verified(key: PublicIdentity, account: Option<AccountId>) -> Contacts {
+        let mut state = Contacts::default();
+        state.observe(key, None, 1);
+        let c = state.get_mut(&key).unwrap();
+        c.petname = Some("bob".into());
+        c.local_approved = true;
+        c.accepted = true;
+        c.verified = true;
+        c.approval_changed_ms = 10;
+        c.discovery_key = Some([9; 32]);
+        c.account = account;
+        state
+    }
+
+    /// 0.17.3 blocks without dating it: the block still wins, for every
+    /// device of the account, and the conversation goes as it does when
+    /// this version blocks.
+    #[test]
+    fn a_block_made_under_an_older_version_wins() {
+        let (bob, bob2) = (Identity::generate().public(), Identity::generate().public());
+        let acct = AccountId([8; 32]);
+        for earlier in [0, 5] {
+            let mut state = approved_verified(bob, Some(acct));
+            state.observe(bob2, None, 1);
+            let c2 = state.get_mut(&bob2).unwrap();
+            c2.account = Some(acct);
+            c2.local_approved = true;
+            c2.approval_changed_ms = 10;
+
+            let mut plain = returning(bob);
+            let b = plain.get_mut(&bob).unwrap();
+            // Approved again (or not) earlier than the state's date, then
+            // blocked: 0.17.3's block_contact leaves the date alone.
+            b.approval_changed_ms = earlier;
+            b.blocked = true;
+            b.accepted = false;
+            b.local_approved = false;
+
+            let m = state.merge_older(plain.clone(), 60);
+            assert!(m.changed);
+            assert!(state.get(&bob).unwrap().verified, "kept, as blocking here");
+            for k in [bob, bob2] {
+                let c = state.get(&k).unwrap();
+                assert!(c.blocked, "blocked ({earlier})");
+                assert!(!c.local_approved && !c.accepted);
+                assert!(c.discovery_key.is_none());
+                assert!(c.approval_changed_ms >= 60, "dated now");
+            }
+            assert!(m.dropped.contains(&ConversationId::Peer(acct.0)));
+            assert!(m.dropped.contains(&ConversationId::Peer(*bob.as_bytes())));
+            // Again: nothing more to do.
+            let again = state.merge_older(plain, 61);
+            assert!(!again.changed && again.dropped.is_empty());
+        }
+    }
+
+    #[test]
+    fn approving_again_under_an_older_version_keeps_the_verification() {
+        let bob = Identity::generate().public();
+        // Approved again (the older version showed bob unapproved).
+        let mut state = approved_verified(bob, None);
+        let mut plain = returning(bob);
+        let b = plain.get_mut(&bob).unwrap();
+        b.local_approved = true;
+        b.accepted = true;
+        b.approval_changed_ms = 20;
+        state.merge_older(plain, 60);
+        let c = state.get(&bob).unwrap();
+        assert!(c.local_approved && c.verified, "still verified");
+        assert_eq!(c.approval_changed_ms, 20);
+
+        // Revoked under the older version: the verification goes with it.
+        let mut state = approved_verified(bob, None);
+        let mut plain = returning(bob);
+        let b = plain.get_mut(&bob).unwrap();
+        b.accepted = true;
+        b.approval_changed_ms = 20;
+        state.merge_older(plain, 60);
+        let c = state.get(&bob).unwrap();
+        assert!(!c.local_approved && !c.verified);
+
+        // Verified under the older version (which doesn't date it).
+        let mut state = approved_verified(bob, None);
+        state.get_mut(&bob).unwrap().verified = false;
+        let mut plain = returning(bob);
+        plain.get_mut(&bob).unwrap().verified = true;
+        state.merge_older(plain, 60);
+        assert!(state.get(&bob).unwrap().verified);
+
+        // Another device of bob's account, first met there through the
+        // account (dated, unapproved): no revocation.
+        let mut state = approved_verified(bob, None);
+        let mut plain = Contacts::default();
+        plain.observe(bob, None, 5_000);
+        plain.get_mut(&bob).unwrap().approval_changed_ms = 5_001;
+        state.merge_older(plain.clone(), 9_000);
+        let c = state.get(&bob).unwrap();
+        assert!(c.local_approved && c.verified);
+        // Revoked well after it was met: a revocation.
+        plain.get_mut(&bob).unwrap().approval_changed_ms = 8_000;
+        state.merge_older(plain, 9_000);
+        let c = state.get(&bob).unwrap();
+        assert!(!c.local_approved && !c.verified);
+
+        // Just seen again: the state's approval and verification stand.
+        let mut state = approved_verified(bob, None);
+        let m = state.merge_older(returning(bob), 60);
+        let c = state.get(&bob).unwrap();
+        assert!(c.local_approved && c.verified && c.accepted);
+        assert!(m.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_name_given_under_an_older_version_wins() {
+        let (bob, phone) = (Identity::generate().public(), Identity::generate().public());
+        let mut state = approved_verified(bob, None);
+        let mut plain = returning(bob);
+        plain.get_mut(&bob).unwrap().petname = Some("bobby".into());
+        state.merge_older(plain, 60);
+        assert_eq!(state.get(&bob).unwrap().petname.as_deref(), Some("bobby"));
+
+        // But not the name it gives our own devices by itself.
+        let mut state = Contacts::default();
+        state.observe(phone, None, 1);
+        state.get_mut(&phone).unwrap().petname = Some("work phone".into());
+        let mut plain = returning(phone);
+        plain.get_mut(&phone).unwrap().petname = Some("my phone".into());
+        state.merge_older(plain, 60);
+        assert_eq!(
+            state.get(&phone).unwrap().petname.as_deref(),
+            Some("work phone")
+        );
+    }
+
+    #[test]
+    fn a_contact_deleted_under_an_older_version_takes_its_conversation() {
+        let (bob, carol) = (Identity::generate().public(), Identity::generate().public());
+        let acct = AccountId([3; 32]);
+        let mut state = approved_verified(bob, Some(acct));
+        state.observe(carol, None, 1);
+        let mut plain = returning(bob);
+        plain.forget(&bob, 55);
+        let m = state.merge_older(plain, 60);
+        assert!(m.changed && state.get(&bob).is_none());
+        assert!(state.get(&carol).is_some());
+        assert!(m.dropped.contains(&ConversationId::Peer(acct.0)));
+        assert!(!m.dropped.contains(&ConversationId::Peer(*carol.as_bytes())));
     }
 }
 

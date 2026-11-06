@@ -490,22 +490,25 @@ impl History {
         added
     }
 
-    /// Takes in what `other`, another copy of this conversation, holds
-    /// that this one doesn't: its new entries and pins, and a timer and
-    /// draft where this has none.
-    fn absorb(&mut self, other: History, now_ms: u64) {
-        self.merge(other.entries, now_ms);
-        if self.timer_s.is_none() {
-            self.timer_s = other.timer_s;
+    /// Takes in what `newer`, the copy of this conversation an older
+    /// version kept under its old name after the upgrade, holds: its new
+    /// entries and pins, and what it set of the timer, notifications and
+    /// draft. It ran after this copy was last written (it never touches
+    /// keyed files), so what it set wins; what it left at the default
+    /// (no timer, notify all, no draft) leaves ours.
+    fn absorb_newer(&mut self, newer: History, now_ms: u64) {
+        self.merge(newer.entries, now_ms);
+        if newer.timer_s.is_some() {
+            self.timer_s = newer.timer_s;
         }
-        if self.draft.is_empty() {
-            self.draft = other.draft;
+        if !newer.draft.is_empty() {
+            self.draft = newer.draft;
         }
-        if self.notify == Notify::All {
-            self.notify = other.notify;
+        if newer.notify != Notify::All {
+            self.notify = newer.notify;
         }
-        self.seen_ms = self.seen_ms.max(other.seen_ms);
-        for p in other.pinned {
+        self.seen_ms = self.seen_ms.max(newer.seen_ms);
+        for p in newer.pinned {
             if !self.pinned.contains(&p) && self.entries.iter().any(|e| e.message_id() == p) {
                 self.pinned.push(p);
             }
@@ -1109,7 +1112,7 @@ impl Home {
             None => older,
             Some(b) => {
                 let mut h = History::decode_stored(&b)?.0;
-                h.absorb(older, crate::now_ms());
+                h.absorb_newer(older, crate::now_ms());
                 h
             }
         };
@@ -1157,15 +1160,24 @@ impl Home {
     /// The history files a backup holds: each conversation under the name
     /// it had before 0.18.0, so that older versions restore it too (the
     /// backup is sealed as a whole, so its names show nothing). A
-    /// conversation found under both names goes in once, merged. Files
-    /// that can't be read go in as they are.
-    pub(crate) fn history_for_backup(&self, identity: &Identity) -> Result<Vec<(String, Vec<u8>)>> {
+    /// conversation found under both names goes in once, merged as the
+    /// move to the keyed name would (the old name's copy is the newer).
+    /// Files that can't be read go in as they are. `dropped` (whose
+    /// contact an older version blocked or deleted) are left out.
+    pub(crate) fn history_for_backup(
+        &self,
+        identity: &Identity,
+        dropped: &[ConversationId],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         let _lock = history_lock();
-        let mut convs: Vec<(ConversationId, History)> = Vec::new();
+        // Each conversation's keyed copy, and its old-name one.
+        type Copies = (Option<History>, Option<History>);
+        let mut convs: Vec<(ConversationId, Copies)> = Vec::new();
         let mut out = Vec::new();
         for name in self.state_names()? {
             let read = || self.load_state(identity, &name).ok().flatten();
-            let found = if let Some(c) = ConversationId::parse_legacy_state_name(&name) {
+            let legacy = ConversationId::parse_legacy_state_name(&name);
+            let found = if let Some(c) = legacy {
                 read()
                     .and_then(|b| History::decode(&b).ok())
                     .map(|h| (c, h))
@@ -1178,10 +1190,22 @@ impl Home {
                 continue;
             };
             match found {
-                Some((c, h)) => match convs.iter_mut().find(|(x, _)| *x == c) {
-                    Some((_, into)) => into.absorb(h, crate::now_ms()),
-                    None => convs.push((c, h)),
-                },
+                Some((c, _)) if dropped.contains(&c) => {}
+                Some((c, h)) => {
+                    let i = match convs.iter().position(|(x, _)| *x == c) {
+                        Some(i) => i,
+                        None => {
+                            convs.push((c, (None, None)));
+                            convs.len() - 1
+                        }
+                    };
+                    let copies = &mut convs[i].1;
+                    if legacy.is_some() {
+                        copies.1 = Some(h);
+                    } else {
+                        copies.0 = Some(h);
+                    }
+                }
                 None => match std::fs::read(self.state_path(&name)?) {
                     Ok(b) => out.push((name, b)),
                     // Removed since we listed it.
@@ -1190,7 +1214,15 @@ impl Home {
                 },
             }
         }
-        for (c, h) in convs {
+        for (c, copies) in convs {
+            let h = match copies {
+                (Some(mut keyed), Some(older)) => {
+                    keyed.absorb_newer(older, crate::now_ms());
+                    keyed
+                }
+                (Some(h), None) | (None, Some(h)) => h,
+                (None, None) => continue,
+            };
             let name = c.legacy_state_name();
             let sealed = self.seal_state(identity, &name, &h.encode()?)?;
             out.push((name, sealed));
@@ -2079,6 +2111,11 @@ mod names_at_rest_tests {
         home.save_state(id, &name, &h.encode().unwrap()).unwrap();
     }
 
+    fn write_old_h(home: &Home, id: &Identity, c: ConversationId, h: &History) {
+        home.save_state(id, &c.legacy_state_name(), &h.encode().unwrap())
+            .unwrap();
+    }
+
     fn assert_no_ids(home: &Home, ids: &[&[u8]]) {
         for name in file_names(home) {
             assert!(
@@ -2180,6 +2217,107 @@ mod names_at_rest_tests {
             ["one", "two", "four", "five", "six", "seven"]
         );
         assert_no_ids(&home, &[&acct, &group]);
+    }
+
+    /// What 0.17.3 set in a conversation after the upgrade is the newer:
+    /// its file under the old name wins over the keyed one's settings.
+    #[test]
+    fn settings_an_older_version_changed_survive_the_return() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for (dir, by_backup) in [(a, false), (b, true)] {
+            let home = Home::new(dir.path());
+            let id = home.create_identity(None).unwrap();
+            let (p, q) = (
+                ConversationId::Peer([0x81; 32]),
+                ConversationId::Peer([0x82; 32]),
+            );
+            // Before the downgrade: timer off, notify all, a draft.
+            for c in [p, q] {
+                let mut h = History::default();
+                h.push(note(1, "before"), 0);
+                h.timer_s = Some(0);
+                h.draft = "kept".into();
+                h.notify = Notify::Off;
+                home.save_history(&id, c, &h).unwrap();
+            }
+            // Under 0.17.3: p's timer set to an hour, notify to mentions,
+            // a new draft; q only gets a message.
+            let mut h = History::default();
+            h.push(note(2, "under 0.17.3"), 0);
+            h.timer_s = Some(3600);
+            h.notify = Notify::Mentions;
+            h.draft = "newer".into();
+            write_old_h(&home, &id, p, &h);
+            write_old(&home, &id, q, &[note(3, "only a message")]);
+
+            let restored = tempfile::tempdir().unwrap();
+            let home = if by_backup {
+                let backup = home.export_backup_with(&id, PW, FAST).unwrap();
+                let new = Home::new(restored.path());
+                new.restore_backup(&backup, PW, None).unwrap();
+                new
+            } else {
+                home.load_contacts(&id).unwrap();
+                home
+            };
+            let h = home.load_history(&id, p, 9).unwrap();
+            assert_eq!(texts(&h), ["before", "under 0.17.3"]);
+            assert_eq!(h.timer_s, Some(3600), "backup: {by_backup}");
+            assert_eq!(h.notify, Notify::Mentions);
+            assert_eq!(h.draft, "newer");
+            let h = home.load_history(&id, q, 9).unwrap();
+            assert_eq!(texts(&h), ["before", "only a message"]);
+            assert_eq!(h.timer_s, Some(0), "unset there: ours stands");
+            assert_eq!(h.notify, Notify::Off);
+            assert_eq!(h.draft, "kept");
+        }
+    }
+
+    /// 0.17.3 blocking or deleting a contact deletes only the history
+    /// under the old name; the keyed one goes when the contacts merge.
+    #[test]
+    fn history_of_a_contact_an_older_version_dropped_goes_on_return() {
+        for blocked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home::new(dir.path());
+            let id = home.create_identity(None).unwrap();
+            let (bob, carol) = (Identity::generate().public(), Identity::generate().public());
+            let (pb, pc) = (
+                ConversationId::Peer(*bob.as_bytes()),
+                ConversationId::Peer(*carol.as_bytes()),
+            );
+            let mut state = crate::store::Contacts::default();
+            for k in [bob, carol] {
+                state.observe(k, None, 1);
+                let c = state.get_mut(&k).unwrap();
+                c.local_approved = true;
+                c.accepted = true;
+                c.approval_changed_ms = 10;
+            }
+            home.save_contacts(&id, &state).unwrap();
+            home.append_history(&id, pb, note(1, "pre-1"), 1).unwrap();
+            home.append_history(&id, pc, note(1, "carol"), 1).unwrap();
+
+            let mut plain = crate::store::Contacts::default();
+            plain.observe(bob, None, 50);
+            if blocked {
+                let b = plain.get_mut(&bob).unwrap();
+                b.blocked = true;
+                b.accepted = false;
+            } else {
+                plain.forget(&bob, crate::now_ms());
+            }
+            home.write_contacts_file(&plain.encode().unwrap()).unwrap();
+
+            let contacts = home.load_contacts(&id).unwrap();
+            assert_eq!(contacts.get(&bob).is_some_and(|c| c.blocked), blocked);
+            assert!(
+                home.load_history(&id, pb, 9).unwrap().entries().is_empty(),
+                "history back (blocked: {blocked})"
+            );
+            assert_eq!(home.conversations(&id), vec![pc]);
+            assert_eq!(texts(&home.load_history(&id, pc, 9).unwrap()), ["carol"]);
+        }
     }
 
     #[test]

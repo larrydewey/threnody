@@ -75,7 +75,8 @@ impl Home {
         p: KdfParams,
     ) -> Result<Vec<u8>> {
         check_passphrase(passphrase)?;
-        let contacts = Zeroizing::new(self.read_contacts(identity)?.0.encode()?);
+        let (contacts, dropped) = self.read_contacts(identity)?;
+        let contacts = Zeroizing::new(contacts.encode()?);
         let mut states = Vec::new();
         for name in self.state_names()? {
             if LEFT_OUT.contains(&name.as_str())
@@ -91,7 +92,7 @@ impl Home {
                 Err(e) => return Err(e.into()),
             }
         }
-        states.extend(self.history_for_backup(identity)?);
+        states.extend(self.history_for_backup(identity, &dropped.unwrap_or_default())?);
         let seed = identity.seed();
         let size = 128
             + contacts.len()
