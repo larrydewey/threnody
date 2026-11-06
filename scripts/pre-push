@@ -26,6 +26,8 @@ cargo clippy --workspace --all-targets --all-features --locked
 # the release builds compile them.
 step "Clippy (default features: threnody-cli, threnody-ffi)"
 cargo clippy -p threnody-cli -p threnody-ffi --all-targets --locked
+step "Clippy without calls (threnody-desktop)"
+cargo clippy -p threnody-desktop --no-default-features --all-targets --locked
 
 # test job
 step "Tests"

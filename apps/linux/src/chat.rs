@@ -191,8 +191,9 @@ impl ChatView {
             .sync_create()
             .build();
         header.pack_end(&find);
-        // Calls, with a contact or a group: voice, or video.
-        if conv.invite.is_none() {
+        // Calls, with a contact or a group, in builds with calls: voice, or
+        // video.
+        if conv.invite.is_none() && threnody_ffi::calls_built_in() {
             for (icon, tip, video) in [
                 ("camera-video-symbolic", "Video call", true),
                 ("call-start-symbolic", "Call", false),

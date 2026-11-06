@@ -12,14 +12,16 @@ name = "threnody-desktop"
 path = "src/main.rs"
 
 [features]
-default = ["nfc"]
+default = ["calls", "nfc"]
 boringtun = ["threnody-ffi/boringtun"]
+# Calls through LiveKit's prebuilt WebRTC; off for builds from source only.
+calls = ["threnody-ffi/calls"]
 # Tapping a phone on a PC/SC NFC reader to add a contact (Appendix T).
 # Links libpcsclite; pcscd is needed only to use a reader.
 nfc = ["dep:pcsc"]
 
 [dependencies]
-threnody-ffi = { path = "../../crates/threnody-ffi", features = ["boringtun", "calls", "radio"] }
+threnody-ffi = { path = "../../crates/threnody-ffi", features = ["boringtun", "radio"] }
 threnody-core.workspace = true
 # GTK 4.14 and libadwaita 1.5 are what Ubuntu 24.04 and Debian 13 ship.
 # gio_v2_80: the power-saver monitor (GLib 2.70+; both ship 2.80 or later).
