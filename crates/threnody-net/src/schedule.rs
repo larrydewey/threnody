@@ -25,14 +25,18 @@
 //! "Scheduled messages".
 
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, fixed_bytes, read_map};
+use threnody_core::history::ConversationId;
 use threnody_core::message::{Mention, Quote};
-use threnody_core::PublicIdentity;
+use threnody_core::{PublicIdentity, now_ms};
 
+use crate::error::{NetError, Result};
+use crate::history::{Extras, local_id};
+use crate::node::{Event, Node, lock};
 
 /// Where the schedule is kept (encrypted).
 pub(crate) const STATE: &str = "scheduled";
@@ -556,6 +560,428 @@ fn decode_item(d: &mut Decoder<'_>) -> threnody_core::Result<Option<Scheduled>> 
         mentions,
         status,
     }))
+}
+
+impl Node {
+    /// Saves the schedule (or deletes its file once it's empty).
+    fn persist_schedule(&self, s: &Schedule) {
+        if s.is_empty() {
+            if let Err(e) = self.shared.home.remove_state(STATE) {
+                eprintln!("threnody: failed to remove {STATE}: {e}");
+            }
+        } else {
+            self.shared.save_state(STATE, s.encode());
+        }
+    }
+
+    /// Runs `f` on the schedule, saves it, and wakes the scheduler.
+    fn schedule_mut<R>(&self, f: impl FnOnce(&mut Schedule) -> R) -> R {
+        let r = {
+            let mut s = lock(&self.shared.schedule.items);
+            let r = f(&mut s);
+            self.persist_schedule(&s);
+            r
+        };
+        self.shared.schedule.kick.notify_one();
+        r
+    }
+
+    fn scheduled_changed(&self, target: Target) {
+        self.emit(Event::ScheduledChanged {
+            peer: target.device(),
+            group: target.group(),
+        });
+    }
+
+    fn scheduled_failed(&self, s: &Scheduled, reason: Failure) {
+        self.emit(Event::ScheduledFailed {
+            peer: s.target.device(),
+            group: s.target.group(),
+            id: s.id,
+            reason,
+        });
+    }
+
+    fn target_of(&self, id: u64) -> Option<Target> {
+        lock(&self.shared.schedule.items)
+            .items()
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.target)
+    }
+
+    fn add_scheduled(&self, s: Scheduled) -> Result<Scheduled> {
+        let now = now_ms();
+        let id = s.id;
+        self.schedule_mut(|sch| sch.add(s, now))
+            .map_err(|e| NetError::NotAllowed(e.into()))?;
+        let s = lock(&self.shared.schedule.items)
+            .items()
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .ok_or(NetError::Closed)?;
+        self.scheduled_changed(s.target);
+        Ok(s)
+    }
+
+    /// Schedules `body` (replying to `quote`) for `peer`'s account at
+    /// `due_ms` (ms since the epoch). `peer` must be a contact we haven't
+    /// blocked.
+    pub fn schedule_text(
+        &self,
+        peer: &PublicIdentity,
+        body: &str,
+        quote: Option<Quote>,
+        due_ms: u64,
+    ) -> Result<Scheduled> {
+        let allowed = lock(&self.shared.contacts)
+            .get(peer)
+            .is_some_and(|c| !c.blocked);
+        if !allowed || *peer == self.identity() {
+            return Err(NetError::NotAllowed(
+                "only contacts can get scheduled messages".into(),
+            ));
+        }
+        let ConversationId::Peer(conv) = self.conversation_for(peer) else {
+            return Err(NetError::NotAllowed("not a contact".into()));
+        };
+        self.add_scheduled(Scheduled {
+            id: local_id(),
+            target: Target::Peer {
+                device: *peer.as_bytes(),
+                conv,
+            },
+            due_ms,
+            fire_ms: due_ms,
+            created_ms: now_ms(),
+            text: body.to_owned(),
+            quote,
+            mentions: Vec::new(),
+            status: Status::Waiting,
+        })
+    }
+
+    /// Schedules `body` for `group` at `due_ms`, replying to `quote` and
+    /// mentioning `mentions`. The app's MLS engine sends it when it's due
+    /// (see [`Node::take_due_group_scheduled`]).
+    pub fn schedule_group_text(
+        &self,
+        group: [u8; 16],
+        body: &str,
+        quote: Option<Quote>,
+        mentions: Vec<Mention>,
+        due_ms: u64,
+    ) -> Result<Scheduled> {
+        self.add_scheduled(Scheduled {
+            id: local_id(),
+            target: Target::Group(group),
+            due_ms,
+            fire_ms: due_ms,
+            created_ms: now_ms(),
+            text: body.to_owned(),
+            quote,
+            mentions: Mention::valid(mentions, body),
+            status: Status::Waiting,
+        })
+    }
+
+    /// Every item, soonest first.
+    pub fn all_scheduled(&self) -> Vec<Scheduled> {
+        let mut v = lock(&self.shared.schedule.items).items().to_vec();
+        v.sort_by_key(|s| (s.due_ms, s.created_ms));
+        v
+    }
+
+    /// The conversation an item belongs to now (its stored one, unless
+    /// its device has since been learned to be in another).
+    fn conversations_of(&self, s: &Scheduled) -> Vec<ConversationId> {
+        match s.target {
+            Target::Group(g) => vec![ConversationId::Group(g)],
+            Target::Peer { device, conv } => {
+                let mut v = vec![ConversationId::Peer(conv)];
+                if let Ok(d) = PublicIdentity::from_bytes(&device) {
+                    let now = self.conversation_for(&d);
+                    if !v.contains(&now) {
+                        v.push(now);
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    /// The items of conversation `conv`, soonest first.
+    pub fn scheduled_in(&self, conv: ConversationId) -> Vec<Scheduled> {
+        // Copied out first: `conversation_for` locks contacts and accounts.
+        self.all_scheduled()
+            .into_iter()
+            .filter(|s| self.conversations_of(s).contains(&conv))
+            .collect()
+    }
+
+    /// When the next item fires (ms since the epoch).
+    pub fn next_scheduled_ms(&self) -> Option<u64> {
+        lock(&self.shared.schedule.items).next_fire()
+    }
+
+    /// Replaces item `id`'s text; false if there's no such item, or it's
+    /// being sent.
+    pub fn edit_scheduled(&self, id: u64, body: &str) -> Result<bool> {
+        let done = self
+            .schedule_mut(|s| s.edit(id, body))
+            .map_err(|e| NetError::NotAllowed(e.into()))?;
+        if done && let Some(t) = self.target_of(id) {
+            self.scheduled_changed(t);
+        }
+        Ok(done)
+    }
+
+    /// Moves item `id` to `due_ms`; a failed item waits again.
+    pub fn reschedule(&self, id: u64, due_ms: u64) -> Result<bool> {
+        let now = now_ms();
+        let done = self
+            .schedule_mut(|s| s.reschedule(id, due_ms, now))
+            .map_err(|e| NetError::NotAllowed(e.into()))?;
+        if done && let Some(t) = self.target_of(id) {
+            self.scheduled_changed(t);
+        }
+        Ok(done)
+    }
+
+    /// Deletes item `id`; false if there's none, or it's being sent.
+    pub fn cancel_scheduled(&self, id: u64) -> bool {
+        let gone = self.schedule_mut(|s| s.cancel(id));
+        if let Some(s) = &gone {
+            self.scheduled_changed(s.target);
+        }
+        gone.is_some()
+    }
+
+    /// Sends item `id` (waiting, or failed) as soon as possible.
+    pub fn send_scheduled_now(&self, id: u64) -> bool {
+        let done = self.schedule_mut(|s| s.send_now(id, now_ms()));
+        if done && let Some(t) = self.target_of(id) {
+            self.scheduled_changed(t);
+        }
+        done
+    }
+
+    /// Whether conversation `conv` holds our message with local id `id`.
+    pub fn already_sent(&self, conv: ConversationId, id: u64) -> bool {
+        self.history(conv)
+            .is_ok_and(|h| h.entries().iter().any(|e| e.outgoing && e.local_id == id))
+    }
+
+    /// The device to send a contact's item to: the one it was scheduled
+    /// to while it's still a live contact device, else another live device
+    /// of the same conversation (a connected one first). `None` if the
+    /// contact was blocked or removed: sending would add it back.
+    fn route(&self, s: &Scheduled) -> Option<PublicIdentity> {
+        let Target::Peer { device, conv } = s.target else {
+            return None;
+        };
+        let stored = PublicIdentity::from_bytes(&device).ok()?;
+        let contacts: Vec<(PublicIdentity, bool)> = lock(&self.shared.contacts)
+            .iter()
+            .map(|c| (c.key, c.blocked))
+            .collect();
+        let live = |d: &PublicIdentity| {
+            contacts.iter().any(|(k, blocked)| k == d && !blocked) && !self.is_revoked(d)
+        };
+        if live(&stored) {
+            return Some(stored);
+        }
+        // Anyone of that conversation blocked means the contact is.
+        let conv = ConversationId::Peer(conv);
+        let mut others: Vec<PublicIdentity> = Vec::new();
+        for (d, blocked) in &contacts {
+            if *d == stored || self.conversation_for(d) != conv {
+                continue;
+            }
+            if *blocked {
+                return None;
+            }
+            if !self.is_revoked(d) {
+                others.push(*d);
+            }
+        }
+        let connected: Vec<PublicIdentity> = self.sessions().iter().map(|s| s.peer).collect();
+        others
+            .iter()
+            .find(|d| connected.contains(d))
+            .or(others.first())
+            .copied()
+    }
+
+    /// Sends one due item to a contact; returns how it went.
+    async fn send_scheduled_peer(&self, s: Scheduled) -> std::result::Result<(), Failure> {
+        let sent = |n: &Self| {
+            n.conversations_of(&s)
+                .iter()
+                .any(|c| n.already_sent(*c, s.id))
+        };
+        if sent(self) {
+            return Ok(());
+        }
+        let Some(p) = self.route(&s) else {
+            return Err(Failure::Contact);
+        };
+        self.seek(&p);
+        let _ = tokio::time::timeout(REACH_FIRST, self.reach_peer(&p)).await;
+        if self.is_closed() {
+            return Err(Failure::Error);
+        }
+        let node = self.clone();
+        let extras = Extras {
+            quote: s.quote.clone(),
+            ..Extras::default()
+        };
+        let (text, id) = (s.text.clone(), s.id);
+        // History I/O: off the runtime's (few) workers.
+        match tokio::task::spawn_blocking(move || node.send_message_with(&p, &text, extras, id))
+            .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Failure::Error),
+        }
+    }
+
+    /// Sends what's due: contacts' items here (each to a live device),
+    /// group items handed to the app's MLS engine (see
+    /// [`Node::take_due_group_scheduled`]). Items more than a day late
+    /// fail as missed instead. Returns how many items it handled.
+    pub async fn send_due_scheduled(&self) -> usize {
+        if self.is_closed() {
+            return 0;
+        }
+        // Removed from our account: contacts no longer take us as us.
+        let me = self.identity();
+        if lock(&self.shared.account).state().removed.contains(&me) {
+            return self.fail_all_scheduled(Failure::Removed);
+        }
+        let (send, missed) = {
+            let mut s = lock(&self.shared.schedule.items);
+            let r = s.due(now_ms());
+            if !r.1.is_empty() {
+                self.persist_schedule(&s);
+            }
+            r
+        };
+        for s in &missed {
+            self.scheduled_failed(s, Failure::Missed);
+            self.scheduled_changed(s.target);
+        }
+        let mut handled = missed.len();
+        let mut peers = tokio::task::JoinSet::new();
+        for s in send {
+            if let Target::Group(g) = s.target {
+                lock(&self.shared.schedule.items).to_groups.push(s);
+                self.emit(Event::ScheduledChanged {
+                    peer: None,
+                    group: Some(g),
+                });
+                handled += 1;
+                continue;
+            }
+            let node = self.clone();
+            peers.spawn(async move {
+                let id = s.id;
+                let r = node.send_scheduled_peer(s).await;
+                if !node.is_closed() {
+                    node.finish_scheduled(id, r);
+                }
+            });
+        }
+        while peers.join_next().await.is_some() {
+            handled += 1;
+        }
+        handled
+    }
+
+    /// The due group items, for the app's MLS engine to send (each then
+    /// reported with [`Node::finish_scheduled`]).
+    pub fn take_due_group_scheduled(&self) -> Vec<Scheduled> {
+        std::mem::take(&mut lock(&self.shared.schedule.items).to_groups)
+    }
+
+    /// Ends item `id`'s send: removed when sent, else marked failed (the
+    /// user is told).
+    pub fn finish_scheduled(&self, id: u64, r: std::result::Result<(), Failure>) {
+        let Some(s) = self.schedule_mut(|sch| sch.finish(id, r)) else {
+            return;
+        };
+        if let Err(f) = r {
+            self.scheduled_failed(&s, f);
+        }
+        self.scheduled_changed(s.target);
+    }
+
+    /// How many items are being sent right now.
+    pub fn scheduled_sending(&self) -> usize {
+        let s = lock(&self.shared.schedule.items);
+        s.sending() + s.to_groups.len()
+    }
+
+    /// Drops conversation `conv`'s items: the user blocked or deleted it,
+    /// or left the group.
+    pub fn drop_scheduled(&self, conv: ConversationId) {
+        let ids: Vec<u64> = self.scheduled_in(conv).into_iter().map(|s| s.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let gone = self.schedule_mut(|s| s.retain(|x| !ids.contains(&x.id)));
+        if let Some(s) = gone.first() {
+            self.scheduled_changed(s.target);
+        }
+    }
+
+    /// Fails every waiting item with `f`; returns how many.
+    pub(crate) fn fail_all_scheduled(&self, f: Failure) -> usize {
+        let failed = self.schedule_mut(|s| s.fail_waiting(f));
+        for s in &failed {
+            self.scheduled_failed(s, f);
+            self.scheduled_changed(s.target);
+        }
+        failed.len()
+    }
+
+    /// Starts sending scheduled messages when they're due. Apps call this
+    /// once they have applied the user's settings (disappearing timer,
+    /// cover traffic), so nothing goes out with the defaults a node opens
+    /// with. Later calls only wake the scheduler.
+    pub fn start_scheduled_sending(&self) {
+        if self.shared.schedule.started.swap(true, Ordering::SeqCst) {
+            self.shared.schedule.kick.notify_one();
+            return;
+        }
+        self.start_scheduler();
+    }
+
+    fn start_scheduler(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime to run on: let a later call try again.
+            self.shared.schedule.started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let node = self.clone();
+        handle.spawn(async move {
+            let closed = node.closed();
+            tokio::pin!(closed);
+            loop {
+                let wait = node.next_scheduled_ms().map_or(CHECK_EVERY, |t| {
+                    Duration::from_millis(t.saturating_sub(now_ms())).min(CHECK_EVERY)
+                });
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {
+                        node.send_due_scheduled().await;
+                    }
+                    () = node.shared.schedule.kick.notified() => {}
+                    () = &mut closed => break,
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]

@@ -777,6 +777,8 @@ impl Node {
     /// with them. Our other devices learn the block through contact sync.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        // Before the contacts change: their items are found through them.
+        self.drop_scheduled(conv);
         let now = now_ms();
         let devices = self.mark_contacts(peer, |c| {
             c.blocked = true;
@@ -811,6 +813,7 @@ impl Node {
             return false;
         }
         let conv = self.conversation_for(peer);
+        self.drop_scheduled(conv);
         let devices = self.mark_contacts(peer, |_| {});
         let mut gone = Vec::new();
         self.update_contacts(|c| {
@@ -836,6 +839,7 @@ impl Node {
     /// sync) on our other devices. If they write again, it's a new request.
     pub fn delete_conversation(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        self.drop_scheduled(conv);
         let devices = self.mark_contacts(peer, |_| {});
         let now = now_ms();
         self.update_contacts(|c| {
