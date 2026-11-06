@@ -43,7 +43,6 @@ object Bluetooth {
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var server: BluetoothServerSocket? = null
-    private var advertising: AdvertisingSet? = null
 
     val running get() = server != null
 
@@ -99,20 +98,30 @@ object Bluetooth {
             .addServiceData(uuid, node.bleBeacon(psm.toUShort()))
             .setIncludeDeviceName(false)
             .build()
-        val refresh = object : Runnable {
-            override fun run() {
-                advertising?.setAdvertisingData(data())
-                main.postDelayed(this, REFRESH_MS)
-            }
+        // Each refresh starts a new advertising set, then stops the old one,
+        // rather than giving the old one new data: the stack gives every set
+        // a random address of its own, so the address changes with the
+        // beacon, not only every quarter of an hour or so.
+        fun next(old: Pair<AdvertisingSet?, AdvertisingSetCallback>?) {
+            advertiser.startAdvertisingSet(params, data(), null, null, null, object : AdvertisingSetCallback() {
+                override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
+                    if (status != ADVERTISE_SUCCESS) {
+                        Threnody.say("! Bluetooth advertise failed ($status)")
+                        // The old set, if any, carries on with a new beacon
+                        // until the next try.
+                        if (old != null) {
+                            old.first?.setAdvertisingData(data())
+                            main.postDelayed({ next(old) }, REFRESH_MS)
+                        }
+                        return
+                    }
+                    if (old == null) Threnody.say("* Bluetooth: advertising, L2CAP psm $psm")
+                    else advertiser.stopAdvertisingSet(old.second)
+                    main.postDelayed({ next(set to this) }, REFRESH_MS)
+                }
+            })
         }
-        advertiser.startAdvertisingSet(params, data(), null, null, null, object : AdvertisingSetCallback() {
-            override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
-                if (status != ADVERTISE_SUCCESS) return Threnody.say("! Bluetooth advertise failed ($status)")
-                advertising = set
-                Threnody.say("* Bluetooth: advertising, L2CAP psm $psm")
-                main.postDelayed(refresh, REFRESH_MS)
-            }
-        })
+        next(null)
     }
 
     private fun settings() = ScanSettings.Builder()
