@@ -1,17 +1,19 @@
 //! Sending text to accounts, and recording history (spec §6.1, §6.4).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Query};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
-    Clip, FEATURE_READ, FEATURE_TIMER_OFF, FEATURE_TYPING, Mention, Quote,
+    Clip, FEATURE_READ, FEATURE_RECEIPTS, FEATURE_TIMER_OFF, FEATURE_TYPING, Mention, Quote,
 };
 
 use crate::delivery::{Tag, needs};
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
+use crate::receipts::read_messages;
 
 /// A week: the usual choice when the user turns disappearing messages on.
 pub const WEEK_S: u32 = 7 * 24 * 3600;
@@ -586,11 +588,7 @@ impl Node {
         if ids.is_empty() {
             return Ok(());
         }
-        let conv = self.conversation_for(peer);
-        let msg = AppMessage::Read {
-            conversation: conv.to_bytes(),
-            ids: ids.to_vec(),
-        };
+        let conv = self.conversation_for(peer).to_bytes();
         let devices: Vec<PublicIdentity> = match self.account_of(peer) {
             Some(a) if !self.is_own_device(peer) => {
                 a.state().devices.iter().map(|(d, _)| *d).collect()
@@ -599,11 +597,18 @@ impl Node {
         };
         let mut reached = false;
         for d in &devices {
-            if !self.supports(d, FEATURE_READ) {
-                continue;
-            }
-            if self.send(d, msg.clone()).is_ok() {
-                reached = true;
+            // At most 512 ids a message: the receiver refuses more, and
+            // that ends the session.
+            if self.supports(d, FEATURE_RECEIPTS) {
+                let sent = read_messages(FEATURE_RECEIPTS, &conv, ids)
+                    .into_iter()
+                    .all(|m| self.send_tracked(d, m).is_ok());
+                reached |= sent;
+            } else if self.supports(d, FEATURE_READ) {
+                let sent = read_messages(FEATURE_READ, &conv, ids)
+                    .into_iter()
+                    .all(|m| self.send(d, m).is_ok());
+                reached |= sent;
             }
         }
         if reached {
@@ -627,6 +632,7 @@ impl Node {
         }
         let conv = self.conversation_for(from);
         let now = now_ms();
+        let ids: HashSet<u64> = ids.iter().copied().collect();
         let n = self
             .shared
             .home

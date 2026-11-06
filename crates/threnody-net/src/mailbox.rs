@@ -1053,6 +1053,7 @@ impl Node {
                     pin,
                 } => return self.on_pin(&from, conversation, *id, *pin),
                 AppMessage::List(bytes) => return self.on_list_message(from, bytes),
+                AppMessage::Receipt(payload) => return self.on_receipt(&from, payload),
                 _ => {}
             }
             // A text already here (from its sender too) doesn't show

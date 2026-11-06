@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use threnody_core::message::{FEATURE_READ, FEATURE_RECEIPTS};
 use threnody_core::receipt::{MAX_IDS, Receipt};
-use threnody_core::{AppMessage, PublicIdentity};
+use threnody_core::{AppMessage, PublicIdentity, now_ms};
+
+use crate::node::{Event, Node};
 
 /// A receipt for a device we can't reach live waits a random time in this
 /// window before it is sealed for mailboxes, so its deposit doesn't line up
@@ -364,6 +366,38 @@ impl Outbox {
     /// How many messages the waiting receipts name, in all.
     pub fn len(&self) -> usize {
         self.pending.values().map(Pending::len).sum()
+    }
+}
+
+impl Node {
+    /// Handles a `Receipt` from `from`, live or sealed: our outgoing
+    /// messages it names in our conversation with its account were
+    /// delivered (read ones too), and the read ones displayed.
+    pub(crate) fn on_receipt(&self, from: &PublicIdentity, payload: &[u8]) {
+        if self.is_own_device(from) {
+            return;
+        }
+        let Ok(r) = Receipt::decode(payload) else {
+            return;
+        };
+        let conv = self.conversation_for(from);
+        let ids: Vec<u64> = r.delivered.iter().chain(&r.read).copied().collect();
+        let changed = self
+            .shared
+            .home
+            .mark_delivered_ids(self.identity_ref(), conv, &ids, now_ms())
+            .unwrap_or_default();
+        for local_id in changed {
+            self.emit(Event::Delivered {
+                peer: *from,
+                local_id,
+                group: None,
+                relay_for: None,
+            });
+        }
+        if !r.read.is_empty() {
+            self.on_read(from, &[], &r.read);
+        }
     }
 }
 

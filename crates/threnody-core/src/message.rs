@@ -126,7 +126,8 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_TUNNEL
     | FEATURE_PUSH
     | FEATURE_TIMED_PROBES
-    | FEATURE_TIMER_OFF;
+    | FEATURE_TIMER_OFF
+    | FEATURE_RECEIPTS;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -1164,6 +1165,30 @@ mod tests {
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn receipts_feature_is_advertised() {
+        assert_ne!(FEATURES & FEATURE_RECEIPTS, 0);
+        assert_eq!(FEATURE_RECEIPTS.count_ones(), 1);
+        let older = FEATURE_ACKS
+            | FEATURE_DELETE
+            | FEATURE_EDIT
+            | FEATURE_IDENTITY
+            | FEATURE_REACT
+            | FEATURE_OBSERVED
+            | FEATURE_PATHS
+            | FEATURE_CREDENTIALS
+            | FEATURE_TYPING
+            | FEATURE_READ
+            | FEATURE_CALLS
+            | FEATURE_PIN
+            | FEATURE_LISTS
+            | FEATURE_TUNNEL
+            | FEATURE_PUSH
+            | FEATURE_TIMED_PROBES
+            | FEATURE_TIMER_OFF;
+        assert_eq!(older & FEATURE_RECEIPTS, 0, "the bit is taken");
     }
 
     #[test]

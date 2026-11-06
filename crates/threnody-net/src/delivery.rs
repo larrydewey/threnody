@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use threnody_core::crypto::random_bytes;
 use threnody_core::message::{
-    FEATURE_DELETE, FEATURE_EDIT, FEATURE_LISTS, FEATURE_PIN, FEATURE_REACT,
+    FEATURE_DELETE, FEATURE_EDIT, FEATURE_LISTS, FEATURE_PIN, FEATURE_REACT, FEATURE_RECEIPTS,
 };
 use threnody_core::{AppMessage, PublicIdentity};
 
@@ -57,6 +57,10 @@ pub fn needs(m: &AppMessage) -> u64 {
         AppMessage::React { .. } => FEATURE_REACT,
         AppMessage::Pin { .. } => FEATURE_PIN,
         AppMessage::List(_) => FEATURE_LISTS,
+        // Not a change, but the same rules suit it: never to a peer that
+        // can't read it (an older build would end the session), and a run
+        // of them can't push out the texts held for the same device.
+        AppMessage::Receipt(_) => FEATURE_RECEIPTS,
         _ => 0,
     }
 }

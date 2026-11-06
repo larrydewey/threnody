@@ -2384,8 +2384,7 @@ where
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
                         AppMessage::Push(payload) => node.on_push(peer, &payload),
-                        // Handled once receipts are advertised.
-                        AppMessage::Receipt(_) => {}
+                        AppMessage::Receipt(payload) => node.on_receipt(&peer, &payload),
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}
@@ -2853,4 +2852,62 @@ fn device_name() -> String {
         .map(|h| h.trim().to_owned())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "device".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use threnody_core::message::FEATURE_RECEIPTS;
+
+    #[test]
+    fn ready_drops_receipts_for_a_peer_without_the_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        let receipt = || {
+            let b = threnody_core::receipt::Receipt {
+                delivered: vec![1],
+                read: vec![],
+            }
+            .encode()
+            .unwrap();
+            shared.delivery(|d| d.track(&p, AppMessage::Receipt(b), Tag::NONE))
+        };
+        let text = || {
+            let m = AppMessage::Text {
+                sent_ms: 0,
+                body: "hi".into(),
+                expires_in_s: None,
+                id: 3,
+                quote: None,
+                forwarded: false,
+            };
+            shared.delivery(|d| d.track(&p, m, Tag::NONE))
+        };
+
+        // A peer whose fresh Hello lacks the bit (an older build, say):
+        // the receipt left from an earlier session goes, unsent.
+        lock(&shared.peer_features).insert(p, FEATURES & !FEATURE_RECEIPTS);
+        assert!(matches!(ready(shared, &p, receipt(), Some(true)), Ok(None)));
+        assert_eq!(node.unacked(&p), 0);
+        let t = text();
+        assert_eq!(ready(shared, &p, t.clone(), Some(true)), Ok(Some(t)));
+        shared.delivery(|d| d.forget_peer(&p));
+
+        // With the bit, it goes.
+        lock(&shared.peer_features).insert(p, FEATURES);
+        let r = receipt();
+        assert_eq!(ready(shared, &p, r.clone(), Some(true)), Ok(Some(r)));
+        assert_eq!(node.unacked(&p), 1);
+    }
 }
