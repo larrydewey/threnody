@@ -274,16 +274,17 @@ pub(crate) struct FileSync {
 impl FileSync {
     /// `VERSION (1) || cbor [* { 0: conversation, 1: bstr .cbor FileRef, ? 2: true (auto) }]`
     pub(crate) fn encode(&self) -> threnody_core::Result<Vec<u8>> {
+        let refs = self
+            .fetches
+            .iter()
+            .map(|f| f.file.encode())
+            .collect::<threnody_core::Result<Vec<_>>>()?;
         let body = cbor::to_vec(self.fetches.len() * 200 + 16, |e| {
             e.array_len(self.fetches.len())?;
-            for f in &self.fetches {
-                let r = f
-                    .file
-                    .encode()
-                    .map_err(|_| const_cbor::Error::OUT_OF_SPACE)?;
+            for (f, r) in self.fetches.iter().zip(&refs) {
                 e.map_len(2 + usize::from(f.auto))?;
                 e.u8(0)?.bytes(&f.conv.to_bytes())?;
-                e.u8(1)?.bytes(&r)?;
+                e.u8(1)?.bytes(r)?;
                 if f.auto {
                     e.u8(2)?.bool(true)?;
                 }
