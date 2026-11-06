@@ -138,6 +138,20 @@ A forwarded text or file carries flag 8 in key 6 (`FORWARDED`; for files alongsi
 
 A conversation may keep a draft, what the user started writing and hasn't sent (history key 5). Drafts stay on the device, encrypted with the rest of the history; they're never sent.
 
+### Scheduled messages
+
+A message scheduled to be sent later ("send later") needs nothing on the wire. When it is due, the node sends it as an ordinary `Text` (in a group, an ordinary MLS text, Appendix F), with `sent_ms` the time it actually goes and the conversation's disappearing timer as it is then, not when the message was scheduled. Recipients, relays and mailboxes can't tell it was scheduled.
+
+- **Device-local.** The schedule stays on the device it was made on (the `scheduled` state file below). It is never synced to our other devices, which see the message only once it is sent, like any message we send, and it is never backed up (see *Backups*).
+- **Jitter.** When an item is added or moved, the node draws a delay of up to 30 seconds and at most a tenth of the time left (`fire = due + uniform(0 ..= min(30 s, lead / 10))`). It never fires early, and sends don't land on exact minute marks. "Send now" has no jitter. Apps show the time the user chose.
+- **Late.** An item whose time passed while the node wasn't running goes out as soon as it runs again, unless that is more than 24 hours late. Then it is not sent: it is marked missed, and the user decides.
+- **Sent once.** The item's id is the sent message's local id (history key 7), and with it the id the message carries. Before sending, the node looks for an outgoing history entry with that id, so a crash between sending and saving can't send it twice. An item being sent is never saved as such.
+- **Settings first.** A node sends nothing scheduled until the app says it has applied the user's settings (`start_scheduled_sending`), so an overdue message sent at startup still gets the user's default disappearing timer and cover traffic. A node opened by the CLI never sends scheduled messages.
+- **Routing.** An item to a contact keeps the device it was scheduled to and the conversation that device was in. If that device has since been removed from its account, another live device of the same conversation (a connected one first) gets it, and the message goes to every device of the account as usual. If the contact was blocked, or removed from our contacts here or on another of our devices, the item fails instead, and the contact is not added back. Blocking a contact, deleting its conversation or its request, or leaving a group drops that chat's items. Being removed from a group fails them when due.
+- **This device removed** from our account fails every pending item: contacts no longer take it as us.
+
+Limits: 256 items, 64 KiB of text each and 1 MiB in all, at most 366 days ahead.
+
 ### Pinned messages
 
 `Pin` (`{ 0 => 27, 3 => conversation, 5 => message id, ? 6 => 1 }`, key 6 present to unpin) pins a message in a conversation for everyone in it, named by the same id as `React`. It travels like `React`: to the peer's devices and our own, tracked, only to devices whose `Hello` has feature bit 2048. Either side of a 1:1 chat may pin. A conversation holds at most three pins (history key 3, oldest first); pinning a fourth unpins the oldest. A deleted or expired message loses its pin. In groups, pins travel inside MLS, and only the owner's and admins' count (Appendix F).
@@ -247,6 +261,23 @@ Contact = {
 }
 ```
 
+Scheduled messages (*Scheduled messages* above) are kept in `scheduled.state`, which is deleted while nothing is scheduled. Readers skip unknown keys and items they can't read; a file that can't be read at all is an empty schedule.
+
+```cddl
+ScheduledFile = { 0 => 1, 1 => [* ScheduledItem] }      ; version, items
+ScheduledItem = {
+  0 => uint,                   ; id (also the sent message's local id, history key 7)
+  1 => bstr,                   ; target: 0 || device key (32) || conversation id (32) for a contact, 1 || group id (16)
+  2 => uint,                   ; due (ms since the epoch), as the user chose
+  3 => uint,                   ; fire (ms): due + jitter
+  4 => uint,                   ; created (ms)
+  5 => tstr,                   ; text
+  ? 6 => [uint, bstr .size 32, tstr],      ; quote: id, author device, snippet (as history key 15)
+  ? 7 => [* [uint, uint, bstr .size 32]],  ; mentions: start, len, who (as history key 16)
+  ? 8 => uint,                 ; failed: 1 missed, 2 contact, 3 group, 4 error, 5 this device removed (absent = waiting; unknown values read as 4)
+}
+```
+
 ## Backups
 
 A backup (spec §6.4) holds everything needed to bring an identity back on a new device after the old one is lost. It is sealed under a passphrase the user chooses, at least 12 characters long (`threnody-core::backup`):
@@ -273,6 +304,7 @@ A backup leaves out:
 - **One-time prekeys,** ours (`prekeys`) and those we hold for contacts (`bundles`). A restored copy would let a sealed message that was already opened be opened again, or seal a second message to a prekey a contact already used. Fresh ones are made and handed out as sessions come up. Messages sealed to the lost device's prekeys can't be opened.
 - **Relay tokens** (`relay-wallet`, Appendix P), each of which can be spent once.
 - **Anonymous identities** (Appendix M). A backup would link them to the main identity.
+- **Scheduled messages** (`scheduled`). A backup restored later must not send old messages, or send them a second time while the old device still runs. Restoring drops any that are pending on the device restored onto.
 - **Received files' contents.** History keeps only where the app saved them.
 
 **Restoring** replaces the identity, contacts, state and personas in a data directory. The backup is opened and checked first, so a wrong passphrase or a damaged file changes nothing. The restored identity is sealed the way a new one would be (the keyring, a passphrase, or the Android Keystore). Apps can't stop their node while they run, so they *stage* a restore in `<data dir>.restore` and restart. The staged files replace the old ones before the node next opens. The user's other files in the data directory, such as downloads, stay.

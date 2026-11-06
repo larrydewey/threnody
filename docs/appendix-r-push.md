@@ -100,6 +100,8 @@ The device registers with its distributor, hands out the endpoint, and stops its
 
 While it sleeps it is nobody's mailbox, and its own contacts can only reach it by waking it.
 
+With scheduled messages pending (Appendix C, *Scheduled messages*), the device also sets an alarm for the next one. The alarm brings the node up the same way, reaches only the recipients, sends, and sleeps again.
+
 ## What it reveals
 
 Compared with the always-on connection, push trades metadata for battery. The trade, stated plainly:
@@ -111,6 +113,7 @@ Compared with the always-on connection, push trades metadata for battery. The tr
 | A network observer near the phone | That the phone talks to a push server and when it wakes, instead of seeing constant cover traffic. Sessions begin after wake-ups, so it sees when the phone is reachable. | The same things it can't see today. |
 | Each mutually approved contact | The endpoint URL, so the push server's address, and so roughly which push provider the user picked. | Nothing more about other contacts. |
 | A contact that misbehaves | It can wake the phone up to 20 times an hour. | — |
+| A network observer near the phone, with scheduled messages | That the phone wakes around the time a scheduled message is due. Jitter blurs exact minute marks. | Whether a wake-up was for a scheduled message, or whom it went to. |
 
 Weighing it:
 
@@ -126,6 +129,7 @@ The project rule holds: the always-on connection, with cover traffic, stays the 
 - With an endpoint, the app stops its foreground service a minute after it goes to the background (not during a call), then shuts its nodes down and ends its process. Nothing runs until the next wake-up or until the user opens the app.
 - On a wake-up, the connector's `PushService` starts the foreground service in wake mode (a brief "Checking for messages" notification). That brings the nodes up, runs `wake_sync`, and sleeps again if the app is still in the background.
 - Turning the setting off unregisters the endpoint, withdraws it from contacts, and brings back the always-on service.
+- With scheduled messages pending, the app sets an `AlarmManager` alarm for the next one (exact if the user allowed *Alarms & reminders*, otherwise allowed to run late in Doze). The alarm starts the foreground service in a scheduled-send mode (a brief "Sending scheduled messages" notification), which sends what is due, waits for it to be acknowledged, and sleeps again. After a reboot, a boot receiver does the same if anything is pending, since alarms don't survive a reboot.
 
 ## Linux and the CLI
 
