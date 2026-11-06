@@ -33,6 +33,11 @@ pub const GIPHY: &str = "giphy_search";
 pub const GIPHY_KEY: &str = "giphy_api_key";
 /// Which conversations the list shows: "all", "chats" or "groups".
 pub const LIST_TAB: &str = "list_tab";
+/// Bluetooth LE (advertising a private beacon, dialing contacts nearby)
+/// and joining contacts' Wi-Fi Direct groups: off unless chosen. They
+/// show this computer's presence on radios; they aren't protections.
+pub const BLUETOOTH: &str = "bluetooth";
+pub const WIFI_DIRECT: &str = "wifi_direct";
 
 /// Cover interval on unmetered networks, and on metered ones.
 pub const COVER_UNMETERED_MS: u32 = 2_000;
@@ -64,8 +69,12 @@ pub struct Settings {
 impl Settings {
     pub fn load() -> Self {
         let path = config_dir().join("desktop.conf");
-        let values = std::fs::read_to_string(&path)
-            .unwrap_or_default()
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        Self::parse(path, &text)
+    }
+
+    fn parse(path: PathBuf, text: &str) -> Self {
+        let values = text
             .lines()
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
@@ -145,4 +154,22 @@ pub fn default_home() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".local/share/threnody")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearby_defaults_off() {
+        let s = Settings::parse(PathBuf::from("/nonexistent/desktop.conf"), "");
+        assert!(!s.opted_in(BLUETOOTH));
+        assert!(!s.opted_in(WIFI_DIRECT));
+        let s = Settings::parse(
+            PathBuf::from("/nonexistent/desktop.conf"),
+            "bluetooth=true\n",
+        );
+        assert!(s.opted_in(BLUETOOTH));
+        assert!(!s.opted_in(WIFI_DIRECT));
+    }
 }

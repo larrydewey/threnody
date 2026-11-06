@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use threnody_ffi::{
     Clip, ContactInfo, FileOptions, GroupInfo, GroupInvite, HistoryEntry, NodeEvent, PersonaRecord,
@@ -24,6 +24,20 @@ pub type Node = Arc<ThrenodyNode>;
 
 /// The port the main identity listens on, as on Android and in the CLI.
 pub const PORT: u16 = 7450;
+
+/// How long after "Faster link" the Wi-Fi Direct group offered back is
+/// joined without asking (as the CLI's `/wifi-direct request`).
+const ASKED_FOR: Duration = Duration::from_secs(120);
+
+/// A Wi-Fi Direct group a contact offered without being asked, kept for
+/// "Faster link" to take.
+struct DirectOffered {
+    peer: String,
+    ssid: String,
+    passphrase: String,
+    addr: String,
+    at: Instant,
+}
 
 /// What the window hears from the nodes.
 pub enum UiEvent {
@@ -203,6 +217,10 @@ pub struct Core {
     /// Whether the nodes poll contacts at the foreground rate (as they
     /// start).
     foreground: AtomicBool,
+    /// Contacts asked to host a Wi-Fi Direct group, and when.
+    asked_direct: Mutex<HashMap<String, Instant>>,
+    /// The latest Wi-Fi Direct offer nobody asked for.
+    offered_direct: Mutex<Option<DirectOffered>>,
     redialing: Mutex<HashSet<Option<String>>>,
     /// The conversation on screen while the window is focused; its
     /// messages don't notify.
@@ -253,6 +271,8 @@ impl Core {
             visible: AtomicBool::new(true),
             power_saver: AtomicBool::new(false),
             foreground: AtomicBool::new(true),
+            asked_direct: Mutex::new(HashMap::new()),
+            offered_direct: Mutex::new(None),
             redialing: Mutex::new(HashSet::new()),
             watching: Mutex::new(None),
             _lock: lock_file,
@@ -268,6 +288,13 @@ impl Core {
             ));
         }
         core.apply_privacy_to(&core.main, false);
+        // Radios can take seconds to start: the window shouldn't wait.
+        let weak = Arc::downgrade(&core);
+        std::thread::spawn(move || {
+            if let Some(core) = weak.upgrade() {
+                core.apply_radio();
+            }
+        });
         // Tunnels as the setting says from the start: on, they come back
         // with the peers kept from the last run; off, anything a killed
         // run left on disk goes.
@@ -342,6 +369,132 @@ impl Core {
             ));
         }
         self.update_foreground();
+    }
+
+    // ----- Nearby: Bluetooth and Wi-Fi Direct -----
+
+    /// Starts or stops Bluetooth and leaves Wi-Fi Direct groups as the
+    /// Nearby settings say (main identity only: anonymous identities never
+    /// use radios). Blocks: call it off the GTK thread. Not run on network
+    /// changes, so a computer without an adapter doesn't retry and log
+    /// each time.
+    pub fn apply_radio(&self) {
+        let (bluetooth, wifi_direct) = {
+            let s = self.settings();
+            (
+                s.opted_in(settings::BLUETOOTH),
+                s.opted_in(settings::WIFI_DIRECT),
+            )
+        };
+        let running = self.main.bluetooth_running();
+        if bluetooth && !running {
+            match self.main.start_bluetooth() {
+                Ok(psm) => self.say(format!(
+                    "Bluetooth LE: advertising, L2CAP psm {psm}; approved contacts nearby connect automatically"
+                )),
+                Err(e) => self.say(format!("! Bluetooth LE unavailable: {e}")),
+            }
+        } else if !bluetooth && running {
+            self.main.stop_bluetooth();
+            self.say("* Bluetooth LE off");
+        }
+        if !wifi_direct {
+            lock(&self.offered_direct).take();
+            if !self.main.wifi_direct_joined().is_empty() {
+                let n = self.main.leave_wifi_direct();
+                self.say(format!("* left {n} Wi-Fi Direct group(s)"));
+            }
+        }
+    }
+
+    /// "Faster link" in a contact's chat: joins the group `devices` (the
+    /// contact's) offered unasked in the last two minutes, else asks
+    /// `device` to host one, whose offer is then joined when it comes.
+    /// Returns what happened, for a toast. Blocks.
+    pub fn faster_link(
+        self: &Arc<Self>,
+        devices: &[String],
+        device: &str,
+        title: &str,
+    ) -> Result<String, String> {
+        let waiting = {
+            let mut o = lock(&self.offered_direct);
+            match o.as_ref() {
+                Some(d) if devices.contains(&d.peer) && d.at.elapsed() < ASKED_FOR => o.take(),
+                _ => None,
+            }
+        };
+        if let Some(d) = waiting {
+            self.join_wifi_direct(d.peer, d.ssid, d.passphrase, d.addr);
+            return Ok(format!("Joining {title}'s Wi-Fi Direct link…"));
+        }
+        self.main
+            .request_wifi_direct(device.to_owned())
+            .map_err(|e| e.to_string())?;
+        lock(&self.asked_direct).insert(device.to_owned(), Instant::now());
+        Ok(format!("Asked {title} to set up Wi-Fi Direct…"))
+    }
+
+    /// An offer from a contact (main identity only): joined if we asked
+    /// that contact for it lately, else kept for "Faster link". Joining
+    /// takes this computer's Wi-Fi off its network, so a contact can't
+    /// make it happen alone.
+    fn wifi_direct_offer(self: &Arc<Self>, peer: &str, ssid: &str, passphrase: &str, addr: &str) {
+        let who = short(peer);
+        if !self.settings().opted_in(settings::WIFI_DIRECT) {
+            self.say(format!(
+                "* {who} offers a Wi-Fi Direct link; turn on Join Wi-Fi Direct links in Preferences to use it"
+            ));
+            return;
+        }
+        let asked = {
+            let mut asked = lock(&self.asked_direct);
+            asked.retain(|_, t| t.elapsed() < ASKED_FOR);
+            asked.remove(peer).is_some()
+        };
+        if asked {
+            self.join_wifi_direct(
+                peer.to_owned(),
+                ssid.to_owned(),
+                passphrase.to_owned(),
+                addr.to_owned(),
+            );
+        } else {
+            *lock(&self.offered_direct) = Some(DirectOffered {
+                peer: peer.to_owned(),
+                ssid: ssid.to_owned(),
+                passphrase: passphrase.to_owned(),
+                addr: addr.to_owned(),
+                at: Instant::now(),
+            });
+            self.say(format!(
+                "* {who} offers a Wi-Fi Direct link ({ssid}); Faster link in their chat takes it \
+                 (the Wi-Fi leaves its network meanwhile)"
+            ));
+        }
+    }
+
+    /// Joins in the background: it takes up to a minute.
+    fn join_wifi_direct(
+        self: &Arc<Self>,
+        peer: String,
+        ssid: String,
+        passphrase: String,
+        addr: String,
+    ) {
+        let weak = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let Some(core) = weak.upgrade() else { return };
+            let who = short(&peer);
+            core.say(format!("* joining {who}'s Wi-Fi Direct group {ssid}…"));
+            match core
+                .main
+                .join_wifi_direct(peer, ssid.clone(), passphrase, addr)
+            {
+                Ok(()) => core.say(format!("* joined {who}'s Wi-Fi Direct group {ssid}")),
+                Err(e) => core.say(format!("! Wi-Fi Direct: {e}")),
+            }
+        });
     }
 
     // ----- Foreground -----
@@ -1108,7 +1261,7 @@ impl Core {
             NodeEvent::WifiDirectOffer {
                 peer,
                 ssid,
-                passphrase: _,
+                passphrase,
                 addr,
             } => {
                 let e = NodeEvent::WifiDirectOffer {
@@ -1118,6 +1271,15 @@ impl Core {
                     addr,
                 };
                 self.say(describe(&e));
+                // Anonymous identities never get here (their nodes drop
+                // offers); were one to, it still mustn't join.
+                if persona.is_none()
+                    && let NodeEvent::WifiDirectOffer {
+                        peer, ssid, addr, ..
+                    } = &e
+                {
+                    self.wifi_direct_offer(peer, ssid, &passphrase, addr);
+                }
                 e
             }
             e => {
@@ -1169,6 +1331,11 @@ impl Core {
                     NodeEvent::Fallback { peer, notice } => {
                         self.say(format!("* {}: {notice}", short(peer)));
                     }
+                    // Hosting needs root access to wpa_supplicant.
+                    NodeEvent::WifiDirectRequested { peer } => self.say(format!(
+                        "* {} asked for a Wi-Fi Direct link; this computer can only join groups",
+                        short(peer)
+                    )),
                     other => self.say(describe(other)),
                 }
                 e

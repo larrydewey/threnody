@@ -40,15 +40,17 @@ Both messages are only sent to, and only honoured from, **mutually approved peer
   - An incoming request is answered by hosting a group and offering it.
 - **Linux joins.**
   - `threnody run --wifi-direct` joins offered groups as an ordinary Wi-Fi client through NetworkManager. It joins at once only a group it asked that peer for in the last two minutes (`/wifi-direct request`); an offer nobody asked for waits for `/wifi-direct join`.
+  - The desktop app does the same once Preferences → Nearby → *Join Wi-Fi Direct links* is on (off by default): *Faster link (Wi-Fi Direct)* in a contact's chat menu asks the contact to host, and the group offered back within two minutes is joined; an unasked offer is kept, and *Faster link* takes it. Turning the switch off, *Leave Wi-Fi Direct* in Diagnostics, or quitting (bounded to 10 s) leaves the group.
   - Joiners only join networks whose SSID starts with `DIRECT-` (Wi-Fi P2P groups always do), so a contact can't steer the computer onto an ordinary network. This is local policy, not a message rule.
   - One group at a time: joining a new group leaves any other first, and a repeated offer for the group already joined is ignored.
   - A group is left 60 s after the join once no session to that peer runs over the group owner's IP address, and at once if the pinned dial fails.
   - Profiles a crash left behind (`threnody-DIRECT-*`) are deleted on leave and before the first join after a start.
   - The profile is temporary: no autoconnect, no default route, no DNS.
   - The passphrase goes through a 0600 `passwd-file` rather than the command line.
-  - The Wi-Fi interface leaves its usual network while joined. `/wifi-direct leave`, or exiting, deletes the profile, and NetworkManager then reconnects the usual network.
+  - The Wi-Fi interface leaves its usual network while joined. `/wifi-direct leave` (or the app's *Leave Wi-Fi Direct*), or exiting, deletes the profile, and NetworkManager then reconnects the usual network.
   - Hosting a group from Linux needs root access to wpa_supplicant, so Linux answers a request by saying it can't host.
 - **CLI.** `/wifi-direct request` asks the current peer to host.
+- **Desktop.** *Faster link (Wi-Fi Direct)* in a contact's chat menu asks that contact to host; never in an anonymous identity's chats.
 
 ## Tested
 

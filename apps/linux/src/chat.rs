@@ -831,6 +831,51 @@ impl ChatView {
         }
     }
 
+    /// "Faster link": the contact (a phone nearby) hosts a Wi-Fi Direct
+    /// group and this computer joins it. Asks first while joining is off.
+    fn wifi_direct(self: &Rc<Self>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let go = {
+            let weak = self.weak_self.clone();
+            move || {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let c = t.conv.borrow().clone();
+                let core = app.core.clone();
+                let weak = t.weak_self.clone();
+                bg(
+                    move || core.faster_link(&c.devices, &c.device, &c.title),
+                    move |r| {
+                        let Some(t) = weak.upgrade() else { return };
+                        match r {
+                            Ok(m) => t.toast(&m),
+                            Err(e) => t.toast(&format!("Couldn't ask for Wi-Fi Direct: {e}")),
+                        }
+                    },
+                );
+            }
+        };
+        if app.core.settings().opted_in(settings::WIFI_DIRECT) {
+            go();
+            return;
+        }
+        let core = app.core.clone();
+        ui::confirm(
+            &app.window,
+            "Turn on Wi-Fi Direct?",
+            "Your contact creates a Wi-Fi Direct group and this computer's Wi-Fi joins it, \
+             leaving its network until the link ends. You can turn this off in Preferences.",
+            "Turn on",
+            false,
+            move || {
+                core.settings().set_flag(settings::WIFI_DIRECT, true);
+                go();
+            },
+        );
+    }
+
     /// Tells the contact (not a group) we started or stopped typing: on a
     /// change, and again now and then while typing goes on.
     fn notify_typing(&self, active: bool) {
@@ -1375,6 +1420,15 @@ impl ChatView {
             );
             if c.chat.persona.is_some() {
                 add("Reveal who you are…", "reveal", Self::reveal);
+            }
+            // Never for an anonymous identity: a group would show nearby
+            // devices who it is.
+            if c.connected && c.approved && c.chat.persona.is_none() {
+                add(
+                    "Faster link (Wi-Fi Direct)",
+                    "wifi-direct",
+                    Self::wifi_direct,
+                );
             }
             add("Clear chat…", "clear", Self::clear);
             add("Delete contact…", "delete", Self::delete_contact);

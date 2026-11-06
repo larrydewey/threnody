@@ -2879,6 +2879,7 @@ impl App {
             "Strangers in the public DHT see this computer's IP address, not who you talk to",
         );
         page.add(&privacy);
+        page.add(&self.nearby_group());
 
         let relays = adw::PreferencesGroup::builder()
             .title("Volunteer relays")
@@ -3194,6 +3195,74 @@ impl App {
         d.present(Some(&self.window));
     }
 
+    /// Bluetooth and Wi-Fi Direct, for the main identity: off until
+    /// chosen (they show this computer's presence on radios), and applied
+    /// off the GTK thread, since starting Bluetooth can take seconds.
+    fn nearby_group(self: &Rc<Self>) -> adw::PreferencesGroup {
+        let nearby = adw::PreferencesGroup::builder()
+            .title("Nearby")
+            .description("Off until you switch them on. Anonymous identities never use them.")
+            .build();
+        const BT_SUB: &str = "Advertise a private beacon only approved contacts recognise, \
+                              and connect to them nearby without a network";
+        let bt = adw::SwitchRow::builder()
+            .title("Bluetooth")
+            .subtitle(BT_SUB)
+            .active(self.core.settings().opted_in(settings::BLUETOOTH))
+            .build();
+        let wd = adw::SwitchRow::builder()
+            .title("Join Wi-Fi Direct links")
+            .subtitle(
+                "When a nearby approved contact offers a faster link you asked for, this \
+                 computer's Wi-Fi leaves its network to join it, through NetworkManager, and \
+                 returns when the link ends",
+            )
+            .active(self.core.settings().opted_in(settings::WIFI_DIRECT))
+            .build();
+        // The subtitle says how Bluetooth is once a start or stop is done.
+        let state = {
+            let bt = bt.downgrade();
+            move |(running, error): (bool, Option<String>)| {
+                let Some(bt) = bt.upgrade() else { return };
+                bt.set_subtitle(&match (bt.is_active(), running, error) {
+                    (false, _, _) => BT_SUB.to_owned(),
+                    (true, true, _) => "On".to_owned(),
+                    (true, false, Some(e)) => format!("Couldn't start: {e}"),
+                    (true, false, None) => "Starting…".to_owned(),
+                });
+            }
+        };
+        let apply = {
+            let core = self.core.clone();
+            move |state: Box<dyn FnOnce((bool, Option<String>))>| {
+                let core = core.clone();
+                bg(
+                    move || {
+                        core.apply_radio();
+                        (core.main.bluetooth_running(), core.main.bluetooth_error())
+                    },
+                    state,
+                );
+            }
+        };
+        {
+            let main = self.core.main.clone();
+            state((main.bluetooth_running(), main.bluetooth_error()));
+        }
+        for (row, key) in [(&bt, settings::BLUETOOTH), (&wd, settings::WIFI_DIRECT)] {
+            let (core, apply, state) = (self.core.clone(), apply.clone(), state.clone());
+            row.connect_active_notify(move |r| {
+                core.settings().set_flag(key, r.is_active());
+                if key == settings::BLUETOOTH {
+                    state((false, None));
+                }
+                apply(Box::new(state.clone()));
+            });
+            nearby.add(row);
+        }
+        nearby
+    }
+
     fn diagnostics(self: &Rc<Self>) {
         let d = adw::Dialog::builder()
             .title("Diagnostics")
@@ -3233,6 +3302,7 @@ impl App {
         }
         let reach = ui::label("", &["caption", "dim-label"]);
         info.append(&reach);
+        info.append(&self.radio_tools());
         let c = core.clone();
         let r = reach.clone();
         bg(
@@ -3293,6 +3363,116 @@ impl App {
             }
         });
         d.present(Some(&self.window));
+    }
+
+    /// Diagnostics' Bluetooth and Wi-Fi Direct tools (main identity), as
+    /// Android's log screen and the CLI's `/ble` have: a status line, a
+    /// scan with Connect per device found, and Leave Wi-Fi Direct.
+    fn radio_tools(self: &Rc<Self>) -> gtk::Box {
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let main = &self.core.main;
+        let status = ui::label(
+            &match (main.bluetooth_running(), main.bluetooth_error()) {
+                (true, _) => "Bluetooth: on".to_owned(),
+                (false, Some(e)) if self.core.settings().opted_in(settings::BLUETOOTH) => {
+                    format!("Bluetooth: {e}")
+                }
+                _ => "Bluetooth: off".to_owned(),
+            },
+            &["caption", "dim-label"],
+        );
+        status.set_halign(gtk::Align::Start);
+        b.append(&status);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let scan = gtk::Button::with_label("Scan Bluetooth");
+        let leave = gtk::Button::with_label("Leave Wi-Fi Direct");
+        buttons.append(&scan);
+        buttons.append(&leave);
+        b.append(&buttons);
+        let found = gtk::ListBox::new();
+        found.add_css_class("boxed-list");
+        found.set_selection_mode(gtk::SelectionMode::None);
+        found.set_visible(false);
+        b.append(&found);
+
+        let weak = Rc::downgrade(self);
+        let list = found.clone();
+        scan.connect_clicked(move |btn| {
+            let Some(this) = weak.upgrade() else { return };
+            btn.set_sensitive(false);
+            btn.set_label("Scanning…");
+            let (core, weak, list, btn) = (
+                this.core.clone(),
+                Rc::downgrade(&this),
+                list.clone(),
+                btn.clone(),
+            );
+            bg(
+                move || core.main.bluetooth_scan(8),
+                move |r| {
+                    btn.set_sensitive(true);
+                    btn.set_label("Scan Bluetooth");
+                    let Some(this) = weak.upgrade() else { return };
+                    while let Some(child) = list.first_child() {
+                        list.remove(&child);
+                    }
+                    let devices = match r {
+                        Ok(d) => d,
+                        Err(e) => {
+                            this.toast(&format!("Couldn't scan: {e}"));
+                            return;
+                        }
+                    };
+                    if devices.is_empty() {
+                        this.toast("No Threnody devices nearby");
+                    }
+                    list.set_visible(!devices.is_empty());
+                    for dev in devices {
+                        let row = adw::ActionRow::builder()
+                            .title(&dev.address)
+                            .subtitle(format!(
+                                "psm {} · rssi {} · {}",
+                                dev.psm,
+                                dev.rssi.map_or("?".into(), |r| r.to_string()),
+                                dev.name.as_deref().unwrap_or("-")
+                            ))
+                            .build();
+                        let connect = gtk::Button::with_label("Connect");
+                        connect.set_valign(gtk::Align::Center);
+                        let weak = Rc::downgrade(&this);
+                        connect.connect_clicked(move |_| {
+                            let Some(this) = weak.upgrade() else { return };
+                            let (a, r, psm) = (dev.address.clone(), dev.random, dev.psm);
+                            this.run(
+                                None,
+                                "connect over Bluetooth",
+                                move |n| n.bluetooth_connect(a, r, psm).map(|_| ()),
+                                Some("Connected".into()),
+                            );
+                        });
+                        row.add_suffix(&connect);
+                        list.append(&row);
+                    }
+                },
+            );
+        });
+        let weak = Rc::downgrade(self);
+        leave.connect_clicked(move |_| {
+            let Some(this) = weak.upgrade() else { return };
+            let (core, weak) = (this.core.clone(), Rc::downgrade(&this));
+            bg(
+                move || core.main.leave_wifi_direct(),
+                move |n| {
+                    if let Some(t) = weak.upgrade() {
+                        t.toast(&match n {
+                            0 => "No Wi-Fi Direct group joined".to_owned(),
+                            n => format!("Left {n} Wi-Fi Direct group(s)"),
+                        });
+                    }
+                },
+            );
+        });
+        b
     }
 
     fn about(self: &Rc<Self>) {
