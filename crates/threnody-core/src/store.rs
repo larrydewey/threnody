@@ -157,11 +157,17 @@ impl Home {
     /// there (an older version ran here after the upgrade and wrote what
     /// it learned to `contacts.cbor`), the plain one is merged in first
     /// ([`Contacts::merge_older`]), so nothing it learned is lost.
+    ///
+    /// Opening the contact book is where a node or a command first opens
+    /// a home, so history files still under the names older versions gave
+    /// them move to their keyed names here too
+    /// ([`Home::migrate_history_names`]).
     pub fn load_contacts(&self, identity: &Identity) -> Result<Contacts> {
         let (contacts, legacy) = self.read_contacts(identity)?;
         if legacy {
             self.save_contacts(identity, &contacts)?;
         }
+        self.migrate_history_names(identity);
         Ok(contacts)
     }
 
@@ -206,12 +212,23 @@ impl Home {
     /// file = nonce (12) || ChaCha20-Poly1305(KDF("state encryption key", seed), nonce, ad = name, data)
     /// ```
     pub fn save_state(&self, identity: &Identity, name: &str, data: &[u8]) -> Result<()> {
-        let path = self.state_path(name)?;
+        let out = self.seal_state(identity, name, data)?;
+        write_private(&self.dir, &self.state_path(name)?, &out)
+    }
+
+    /// The bytes [`Home::save_state`] would store for `name`.
+    pub(crate) fn seal_state(
+        &self,
+        identity: &Identity,
+        name: &str,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.state_path(name)?;
         let key = state_key(identity);
         let nonce: [u8; 12] = random_bytes();
         let mut out = nonce.to_vec();
         out.extend(Suite::ChaCha20Poly1305.seal(&key, &nonce, name.as_bytes(), data));
-        write_private(&self.dir, &path, &out)
+        Ok(out)
     }
 
     /// The names of the state files present.

@@ -403,7 +403,7 @@ impl Node {
                         self.withdraw_approval(&k);
                         self.disconnect(&k);
                         self.forget_peer(&k);
-                        let _ = self.shared.home.delete_history(conv);
+                        let _ = self.shared.home.delete_history(self.identity_ref(), conv);
                     }
                     // Contacts revoked or blocked on our other device lose
                     // their tunnel here too; blocked ones (including ones
@@ -429,7 +429,7 @@ impl Node {
                                     .map_or_else(|| self.conversation_for(&k), |(_, c)| *c);
                                 self.disconnect(&k);
                                 self.forget_peer(&k);
-                                let _ = self.shared.home.delete_history(conv);
+                                let _ = self.shared.home.delete_history(self.identity_ref(), conv);
                             }
                         }
                         self.enforce_policy();

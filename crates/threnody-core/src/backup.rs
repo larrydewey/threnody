@@ -78,7 +78,10 @@ impl Home {
         let contacts = Zeroizing::new(self.read_contacts(identity)?.0.encode()?);
         let mut states = Vec::new();
         for name in self.state_names()? {
-            if LEFT_OUT.contains(&name.as_str()) || name == CONTACTS_STATE {
+            if LEFT_OUT.contains(&name.as_str())
+                || name == CONTACTS_STATE
+                || crate::history::is_history_name(&name)
+            {
                 continue;
             }
             match fs::read(self.state_path(&name)?) {
@@ -88,6 +91,7 @@ impl Home {
                 Err(e) => return Err(e.into()),
             }
         }
+        states.extend(self.history_for_backup(identity)?);
         let seed = identity.seed();
         let size = 128
             + contacts.len()
@@ -147,6 +151,9 @@ impl Home {
                 self.write_state_file(name, bytes)?;
             }
         }
+        // History comes under the names older versions read; here it
+        // moves to keyed names at once.
+        self.migrate_history_names(identity);
         Ok(opened.restored)
     }
 
@@ -237,6 +244,12 @@ pub fn apply_staged_restore(home: &Home) -> Result<bool> {
 /// was made before replacing anything.
 pub fn inspect_backup(backup: &[u8], passphrase: &str) -> Result<Restored> {
     Ok(open(backup, passphrase)?.restored)
+}
+
+/// The state files a backup holds, by name (tests only).
+#[cfg(test)]
+pub(crate) fn states_in(backup: &[u8], passphrase: &str) -> Vec<(String, Vec<u8>)> {
+    open(backup, passphrase).unwrap().states
 }
 
 struct Opened {

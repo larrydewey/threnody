@@ -473,7 +473,7 @@ async fn a_message_that_could_not_be_stored_is_not_acknowledged() {
     let stuck = std::fs::read_dir(dir.path().join("bob"))
         .unwrap()
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .find(|n| n.starts_with("hist-p-") && n.ends_with(".state"))
+        .find(|n| n.starts_with("hist-") && n.ends_with(".state"))
         .map(|n| dir.path().join("bob").join(n.replace(".state", ".tmp")))
         .expect("the conversation is stored");
     std::fs::create_dir(&stuck).unwrap();

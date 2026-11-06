@@ -712,7 +712,7 @@ impl Node {
             self.disconnect(&d);
             self.forget_peer(&d);
         }
-        let _ = self.shared.home.delete_history(conv);
+        let _ = self.shared.home.delete_history(self.identity_ref(), conv);
         self.unshare_lists_with(conv);
         self.push_contact_sync();
     }
@@ -746,7 +746,7 @@ impl Node {
         for d in &gone {
             self.forget_peer(d);
         }
-        let _ = self.shared.home.delete_history(conv);
+        let _ = self.shared.home.delete_history(self.identity_ref(), conv);
         true
     }
 
@@ -767,7 +767,7 @@ impl Node {
             self.disconnect(d);
             self.forget_peer(d);
         }
-        let _ = self.shared.home.delete_history(conv);
+        let _ = self.shared.home.delete_history(self.identity_ref(), conv);
         self.push_contact_sync();
     }
 
