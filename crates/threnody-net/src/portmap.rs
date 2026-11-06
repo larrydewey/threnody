@@ -1,9 +1,10 @@
 //! Ask the router to forward our TCP and UDP ports to us, so contacts
 //! can often dial us directly instead of hole punching.
 //!
-//! Always on with reachability: failure just means we keep relying on
-//! observed addresses and hole punching. A mapping is released on
-//! shutdown. IPv4 only; IPv6 needs no mapping.
+//! Always on with reachability, and never without it (so never for an
+//! anonymous identity): failure just means we keep relying on observed
+//! addresses and hole punching. A mapping is released on shutdown and
+//! when reachability is turned off. IPv4 only; IPv6 needs no mapping.
 
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
@@ -11,7 +12,10 @@ use std::time::Duration;
 
 use port_control_client::{Config, Method, PortMapping, Protocol};
 
-use crate::node::{Node, lock};
+use crate::node::{Event, Node, lock};
+
+/// How often a node with reachability off checks whether it came on.
+const OFF_CHECK: Duration = Duration::from_secs(1);
 
 /// UPnP first (most widely supported router feature), then PCP, then
 /// NAT-PMP.
@@ -23,11 +27,33 @@ fn config(protocol: Protocol, port: NonZeroU16) -> Config {
         .methods(METHODS.to_vec())
 }
 
+/// Asks the router for mappings while reachability is on, and releases
+/// them when it goes off. Returns when the node shuts down.
+pub(crate) async fn run(node: Node, port: NonZeroU16) {
+    loop {
+        // Nothing goes to the router while reachability is off: the
+        // mapping itself would open this device to the internet.
+        while !node.reach_enabled() {
+            tokio::select! {
+                () = node.closed() => return,
+                () = tokio::time::sleep(OFF_CHECK) => {}
+            }
+        }
+        if !mapped(&node, port).await {
+            return;
+        }
+    }
+}
+
 /// Watches the router mappings for the node's TCP and UDP ports. While
 /// a mapping holds, its external address becomes a candidate; when it is
-/// lost or changes, candidates are regathered. Returns when the node
-/// shuts down, after releasing both mappings.
-pub(crate) async fn run(node: Node, port: NonZeroU16) {
+/// lost or changes, candidates are regathered. Returns, after releasing
+/// both mappings, when reachability goes off (`true`) or the node shuts
+/// down (`false`).
+async fn mapped(node: &Node, port: NonZeroU16) -> bool {
+    node.emit(Event::ReachNote {
+        note: format!("asking the router to forward port {port}"),
+    });
     let udp = PortMapping::start(config(Protocol::Udp, port));
     let tcp = PortMapping::start(config(Protocol::Tcp, port));
     let mut wu = udp.watch();
@@ -40,11 +66,11 @@ pub(crate) async fn run(node: Node, port: NonZeroU16) {
             _ = wt.wait_for(|m| m.is_some()) => true,
             () = tokio::time::sleep(Duration::from_secs(10)) => true,
         };
-        if !granted {
+        if !granted || !node.reach_enabled() {
             release(node, udp, tcp).await;
-            return;
+            return granted;
         }
-        publish(&node, &udp, &tcp);
+        publish(node, &udp, &tcp);
         // Steady state: re-check whenever a mapping changes, every 5 s
         // otherwise (the mappings renew and retry on their own).
         let open = tokio::select! {
@@ -53,11 +79,11 @@ pub(crate) async fn run(node: Node, port: NonZeroU16) {
             _ = wt.changed() => true,
             () = tokio::time::sleep(Duration::from_secs(5)) => true,
         };
-        if !open {
+        if !open || !node.reach_enabled() {
             release(node, udp, tcp).await;
-            return;
+            return open;
         }
-        publish(&node, &udp, &tcp);
+        publish(node, &udp, &tcp);
         if udp.mapping().is_none() && tcp.mapping().is_none() {
             let mut inner = lock(&node.rdv().inner);
             if !inner.mapped.is_empty() {
@@ -89,7 +115,7 @@ fn publish(node: &Node, udp: &PortMapping, tcp: &PortMapping) -> bool {
     true
 }
 
-async fn release(node: Node, udp: PortMapping, tcp: PortMapping) {
+async fn release(node: &Node, udp: PortMapping, tcp: PortMapping) {
     let changed = {
         let mut inner = lock(&node.rdv().inner);
         let changed = !inner.mapped.is_empty();

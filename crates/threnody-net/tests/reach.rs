@@ -312,7 +312,7 @@ async fn approval_withdrawn_and_restored_keeps_probes_timed() {
 #[tokio::test]
 async fn nothing_reaches_out_while_turned_off() {
     let dir = tempfile::tempdir().unwrap();
-    let (alice, _arx) = node(&dir, "alice");
+    let (alice, mut arx) = node(&dir, "alice");
     alice.listen_quic("127.0.0.1:0").await.unwrap();
     alice.set_reach(false);
     alice
@@ -322,11 +322,27 @@ async fn nothing_reaches_out_while_turned_off() {
             ..ReachConfig::default()
         })
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let router =
+        |e: &Event| matches!(e, Event::ReachNote { note } if note.starts_with("asking the router"));
+    let asked = timeout(Duration::from_millis(1500), async {
+        while let Some(e) = arx.recv().await {
+            if router(&e) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        asked.is_err(),
+        "asked the router for a port mapping while off"
+    );
     let r = alice.reachability();
     assert!(!r.enabled);
     assert!(!r.online, "joined the DHT while off");
     assert!(r.candidates.is_empty());
+    // Turned on, it asks.
+    alice.set_reach(true);
+    next(&mut arx, 5, router).await;
 }
 
 /// Forwards UDP between a client and `server` until `cut` is set, then

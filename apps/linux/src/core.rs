@@ -217,7 +217,11 @@ impl Core {
     ) -> Arc<Self> {
         // When the usual port is taken (the CLI running too), keep the one
         // used last time, so invites already given out keep working.
-        let fallback = Settings::load().number("port").unwrap_or(0);
+        let saved = Settings::load();
+        let fallback = saved.number("port").unwrap_or(0);
+        // Listening starts internet reachability, which mustn't join the
+        // DHT, even briefly, when the user turned it off.
+        main.set_reach_internet(saved.flag(settings::REACH));
         let port = main
             .listen(format!("0.0.0.0:{PORT}"))
             .or_else(|_| main.listen(format!("0.0.0.0:{fallback}")))
@@ -663,6 +667,7 @@ impl Core {
         let node = ThrenodyNode::open(rec.home.clone(), pw, None).map_err(|e| e.to_string())?;
         let key = format!("port_{}", rec.id);
         let want = self.settings().number(&key).unwrap_or(0);
+        self.apply_privacy_to(&node, true);
         let addr = node
             .listen(format!("0.0.0.0:{want}"))
             .or_else(|_| node.listen("0.0.0.0:0".into()))
@@ -673,7 +678,6 @@ impl Core {
             .and_then(|p| p.parse().ok())
             .unwrap_or(0);
         self.settings().set_number(&key, Some(u32::from(port)));
-        self.apply_privacy_to(&node, true);
         let alive = Arc::new(AtomicBool::new(true));
         self.pump(node.clone(), Some(rec.id.clone()), alive.clone());
         node.reconnect();

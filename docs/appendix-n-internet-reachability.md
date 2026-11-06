@@ -37,7 +37,7 @@ So two contacts meet only on the same network (LAN discovery, Appendix E), over 
 
 Most home routers let a device on the network request a port forward, using UPnP IGD, NAT-PMP or its successor PCP (RFC 6887).
 
-- **Requesting the mapping.** A node asks its router to forward its TCP and UDP port (7450 by default) to itself, trying UPnP first, then PCP, then NAT-PMP, with a two-hour lease that renews on its own. It removes the mapping on shutdown, and makes no request when internet reachability is off. Only IPv4 is mapped; IPv6 needs no mapping.
+- **Requesting the mapping.** A node asks its router to forward its TCP and UDP port (7450 by default) to itself, trying UPnP first, then PCP, then NAT-PMP, with a two-hour lease that renews on its own. It removes the mapping on shutdown and when internet reachability is turned off, and makes no request while it is off, so never for an anonymous identity. The apps apply the saved setting before the node starts listening, so a node with it off never joins the DHT, even for a moment. Only IPv4 is mapped; IPv6 needs no mapping.
 - **Learning the public address.** The router reports the public address in its answer, and it becomes a reflexive candidate (section 2). When the mapping is lost or changes, candidates are gathered again.
 - **Passing it on.** Like any candidate, it goes to contacts in `Paths` during a session (section 5) and in DHT records (section 3), so a phone that left home Wi-Fi can dial it at once.
 - **When the DHT is still needed:** when the mapping is refused, or the address changed and the contact hasn't seen the new one yet.

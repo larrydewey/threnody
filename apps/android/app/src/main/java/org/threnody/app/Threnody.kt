@@ -62,6 +62,9 @@ object Threnody {
         app = ctx.applicationContext
         debuggable = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (debuggable) debugHooks(ctx.applicationContext, it)
+        // Settings before listening: listening starts internet
+        // reachability, which mustn't join the DHT, even briefly, when off.
+        applyPrivacyTo(ctx, it)
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
         say("listening on $listenAddr")
@@ -121,10 +124,10 @@ object Threnody {
         personaNodes[rec.id]?.let { return it }
         val n = ThrenodyNode.open(rec.home, KeyVault.passphrase(ctx, rec.home), null)
         val port = prefs(ctx).getInt("port_${rec.id}", 0)
+        applyPrivacyTo(ctx, n)
         val addr = try { n.listen("0.0.0.0:$port") } catch (_: Exception) { n.listen("0.0.0.0:0") }
         prefs(ctx).edit().putInt("port_${rec.id}", addr.substringAfterLast(':').toInt()).apply()
         personaNodes[rec.id] = n
-        applyPrivacyTo(ctx, n)
         pump(ctx, n, rec.id)
         say("anonymous identity ${rec.id.take(6)} listening on port ${addr.substringAfterLast(':')}")
         // The same directories as the main identity, through links of its own.
