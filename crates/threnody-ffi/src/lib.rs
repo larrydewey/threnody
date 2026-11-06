@@ -3063,15 +3063,43 @@ mod tests {
         }
     }
 
+    /// The first event matching `pred` within 20 s (earlier ones are dropped).
+    #[track_caller]
     fn wait(node: &ThrenodyNode, pred: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
-        for _ in 0..200 {
-            if let Some(e) = node.next_event(100)
-                && pred(&e)
-            {
-                return e;
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        let mut skipped = VecDeque::new();
+        while std::time::Instant::now() < end {
+            if let Some(e) = node.next_event(100) {
+                if pred(&e) {
+                    return e;
+                }
+                skipped.push_back(format!("{e:?}"));
+                if skipped.len() > 20 {
+                    skipped.pop_front();
+                }
             }
         }
-        panic!("event did not arrive");
+        panic!("event did not arrive; last saw {skipped:#?}");
+    }
+
+    /// Waits for history syncs until `pred` holds for the last ten notes.
+    #[track_caller]
+    fn wait_notes(
+        node: &ThrenodyNode,
+        pred: impl Fn(&[HistoryEntry]) -> bool,
+    ) -> Vec<HistoryEntry> {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let n = node.note_history(10).unwrap();
+            if pred(&n) {
+                return n;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "notes never matched: {n:#?}"
+            );
+            node.next_event(100);
+        }
     }
 
     /// Renders `text` as a QR code into a `w`×`h` greyscale frame with
@@ -3403,19 +3431,22 @@ mod tests {
                 file_options(),
             )
             .unwrap();
-        wait(&phone, |e| matches!(e, NodeEvent::HistorySynced { .. }));
-        let n = phone.note_history(10).unwrap();
-        let e = n
-            .iter()
-            .find(|e| e.file.as_ref().is_some_and(|f| f.name == "notes.bin"))
-            .unwrap();
+        let is_notes = |e: &HistoryEntry| e.file.as_ref().is_some_and(|f| f.name == "notes.bin");
+        let n = wait_notes(&phone, |n| n.iter().any(is_notes));
+        let e = n.iter().find(|e| is_notes(e)).unwrap();
         assert_eq!(e.file.as_ref().unwrap().fetch, FileFetch::Idle);
         phone.fetch_note_file(e.at_ms, e.device.clone()).unwrap();
-        wait(&phone, |e| {
-            matches!(e, NodeEvent::HistorySynced { added: 0, .. })
+        let n = wait_notes(&phone, |n| {
+            n.iter()
+                .any(|e| is_notes(e) && e.file.as_ref().unwrap().location.is_some())
         });
-        let n = phone.note_history(10).unwrap();
-        let f = n.iter().find_map(|e| e.file.clone()).unwrap();
+        let f = n
+            .iter()
+            .find(|e| is_notes(e))
+            .unwrap()
+            .file
+            .clone()
+            .unwrap();
         assert_eq!(std::fs::read(f.location.unwrap()).unwrap(), data);
         assert!(phone.file_fetches().is_empty());
     }
