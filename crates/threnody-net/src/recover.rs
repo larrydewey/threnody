@@ -944,7 +944,7 @@ mod tests {
         let ((x, ax), (y, cy)) = tokio::join!(
             async {
                 let mut x = x;
-                let ch = crate::handshake::initiate(&mut x, a.identity_ref()).await;
+                let ch = crate::handshake::initiate(&mut x, a.identity_ref(), None).await;
                 (x, ch.unwrap())
             },
             async {

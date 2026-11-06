@@ -430,7 +430,7 @@ mod tests {
         let ((a, ca), (b, cb)) = tokio::join!(
             async {
                 let mut a = a;
-                let ch = handshake::initiate(&mut a, &Identity::generate()).await;
+                let ch = handshake::initiate(&mut a, &Identity::generate(), None).await;
                 (a, ch.unwrap())
             },
             async {
