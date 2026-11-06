@@ -151,10 +151,8 @@ struct Ui {
     #[cfg(all(feature = "ble", target_os = "linux"))]
     ble_seen: std::sync::Arc<std::sync::Mutex<Vec<threnody_radio::ble::Found>>>,
     wifi_direct: bool,
-    /// NetworkManager profiles of Wi-Fi Direct groups we joined.
-    joined: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// While a join runs (one at a time).
-    joining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Wi-Fi Direct groups we joined.
+    wifi: threnody_radio::wifidirect::Groups,
     /// Peers we asked to host a Wi-Fi Direct group, and when.
     asked_direct: std::cell::RefCell<std::collections::HashMap<PublicIdentity, std::time::Instant>>,
     /// The latest offer nobody asked for, for `/wifi-direct join`.
@@ -314,8 +312,7 @@ pub async fn run(opts: Options) -> Result<()> {
         #[cfg(all(feature = "ble", target_os = "linux"))]
         ble_seen: std::sync::Arc::default(),
         wifi_direct: opts.wifi_direct,
-        joined: std::sync::Arc::default(),
-        joining: std::sync::Arc::default(),
+        wifi: threnody_radio::wifidirect::Groups::new(),
         asked_direct: std::cell::RefCell::default(),
         offered: std::cell::RefCell::default(),
         scratch: opts_dir,
@@ -1006,68 +1003,26 @@ impl Ui {
         self.join_wifi_direct(peer, offer);
     }
 
+    /// Joins in the background; one group at a time, so any other is
+    /// left first. A group whose dial fails is left at once, and one
+    /// without a session over it for a minute is left too.
     fn join_wifi_direct(&self, peer: PublicIdentity, offer: threnody_net::DirectOffer) {
-        use std::sync::atomic::Ordering;
         let who = self.name(&peer);
-        let on_one = !self
-            .joined
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty();
-        if on_one {
-            say!(
-                "* not joining {who}'s Wi-Fi Direct group ({}): already on one; /wifi-direct leave first",
-                offer.ssid
-            );
-            return;
-        }
-        if self.joining.swap(true, Ordering::SeqCst) {
-            say!(
-                "* not joining {who}'s Wi-Fi Direct group ({}): already joining one",
-                offer.ssid
-            );
-            return;
-        }
         say!("* joining {who}'s Wi-Fi Direct group ({})…", offer.ssid);
-        let (node, joined, joining, scratch) = (
-            self.node.clone(),
-            std::sync::Arc::clone(&self.joined),
-            std::sync::Arc::clone(&self.joining),
-            self.scratch.clone(),
-        );
+        let (node, wifi, scratch) = (self.node.clone(), self.wifi.clone(), self.scratch.clone());
         tokio::spawn(async move {
-            let r = threnody_radio::wifidirect::join(&offer, &scratch).await;
-            joining.store(false, Ordering::SeqCst);
-            match r {
-                Ok(name) => {
-                    joined
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(name);
-                }
-                Err(e) => {
-                    say!("! Wi-Fi Direct join: {e:#}");
-                    return;
-                }
-            }
-            if let Err(e) = node.connect(&offer.addr, Some(peer.fingerprint())).await {
-                say!("! Wi-Fi Direct connect to {}: {e:#}", offer.addr);
+            let log: threnody_radio::Log = std::sync::Arc::new(|l| say!("* {l}"));
+            if let Err(e) = wifi.join(&node, peer, &offer, &scratch, log).await {
+                say!("! Wi-Fi Direct: {e:#}");
             }
         });
     }
 
     async fn leave_wifi_direct(&self) {
-        let names = std::mem::take(
-            &mut *self
-                .joined
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for n in names {
-            match threnody_radio::wifidirect::leave(&n).await {
-                Ok(()) => say!("* left Wi-Fi Direct group ({n})"),
-                Err(e) => say!("! leaving {n}: {e:#}"),
-            }
+        let log: threnody_radio::Log = std::sync::Arc::new(|l| say!("! {l}"));
+        match self.wifi.leave_all(&log).await {
+            0 => {}
+            n => say!("* left {n} Wi-Fi Direct group(s)"),
         }
     }
 

@@ -1,6 +1,6 @@
 # Appendix L: Wi-Fi Direct Link Upgrade (v1)
 
-Status: implemented in `threnody-net::direct` (messages), `apps/android` (hosting and joining groups) and `threnody-radio::wifidirect` (joining through NetworkManager). Fulfils spec §7.2's Wi-Fi Direct transport.
+Status: implemented in `threnody-net::direct` (messages), `apps/android` (hosting and joining groups) and `threnody-radio::wifidirect` (joining through NetworkManager, for the CLI and the desktop app). Fulfils spec §7.2's Wi-Fi Direct transport.
 
 ## Model
 
@@ -39,7 +39,11 @@ Both messages are only sent to, and only honoured from, **mutually approved peer
   - Both are API 29+ and need `NEARBY_WIFI_DEVICES` (`neverForLocation`).
   - An incoming request is answered by hosting a group and offering it.
 - **Linux joins.**
-  - `threnody run --wifi-direct` joins offered groups as an ordinary Wi-Fi client through NetworkManager. It joins at once only a group it asked that peer for in the last two minutes (`/wifi-direct request`); an offer nobody asked for waits for `/wifi-direct join`. It joins one group at a time.
+  - `threnody run --wifi-direct` joins offered groups as an ordinary Wi-Fi client through NetworkManager. It joins at once only a group it asked that peer for in the last two minutes (`/wifi-direct request`); an offer nobody asked for waits for `/wifi-direct join`.
+  - Joiners only join networks whose SSID starts with `DIRECT-` (Wi-Fi P2P groups always do), so a contact can't steer the computer onto an ordinary network. This is local policy, not a message rule.
+  - One group at a time: joining a new group leaves any other first, and a repeated offer for the group already joined is ignored.
+  - A group is left 60 s after the join once no session to that peer runs over the group owner's IP address, and at once if the pinned dial fails.
+  - Profiles a crash left behind (`threnody-DIRECT-*`) are deleted on leave and before the first join after a start.
   - The profile is temporary: no autoconnect, no default route, no DNS.
   - The passphrase goes through a 0600 `passwd-file` rather than the command line.
   - The Wi-Fi interface leaves its usual network while joined. `/wifi-direct leave`, or exiting, deletes the profile, and NetworkManager then reconnects the usual network.
