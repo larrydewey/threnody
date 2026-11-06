@@ -3361,11 +3361,18 @@ mod tests {
         }
 
         /// The first event of node `target` matching `pred` (earlier ones are dropped).
+        #[track_caller]
         fn until(&mut self, target: usize, pred: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
-            for _ in 0..400 {
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            let mut skipped = VecDeque::new();
+            while std::time::Instant::now() < end {
                 while let Some(e) = self.seen[target].pop_front() {
                     if pred(&e) {
                         return e;
+                    }
+                    skipped.push_back(format!("{e:?}"));
+                    if skipped.len() > 20 {
+                        skipped.pop_front();
                     }
                 }
                 for (i, n) in self.nodes.iter().enumerate() {
@@ -3374,7 +3381,7 @@ mod tests {
                     }
                 }
             }
-            panic!("event did not arrive");
+            panic!("event did not arrive at node {target}; it last saw {skipped:#?}");
         }
     }
 
