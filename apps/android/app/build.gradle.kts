@@ -26,9 +26,17 @@ android {
         // `giphyApiKey` Gradle property. Without one, the app asks for it.
         val giphy = System.getenv("GIPHY_API_KEY") ?: (project.findProperty("giphyApiKey") as String?) ?: ""
         buildConfigField("String", "GIPHY_API_KEY", "\"${giphy.replace("\"", "")}\"")
+        // Only the ABIs build.sh built libthrenody_ffi.so for; JNA alone ships
+        // others, and an APK listing them would install on phones it can't run on.
+        jniAbis().takeIf { it.isNotEmpty() }?.let { ndk { abiFilters += it } }
     }
     buildFeatures {
         buildConfig = true
+    }
+    // No dependency metadata blob (encrypted to Google's key) in the APK.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
     // Release signing comes only from the environment (CI secrets); the
     // key never lives in the repository. Without it, release builds are
@@ -86,3 +94,8 @@ fun workspaceVersion(): String {
     return Regex("""(?m)^version = "([^"]+)"""").find(section)?.groupValues?.get(1)
         ?: error("no workspace version in Cargo.toml")
 }
+
+/** ABIs with a native library in src/main/jniLibs, sorted. */
+fun jniAbis(): List<String> = file("src/main/jniLibs").listFiles()
+    ?.filter { it.isDirectory && it.resolve("libthrenody_ffi.so").exists() }
+    ?.map { it.name }?.sorted().orEmpty()

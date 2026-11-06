@@ -108,7 +108,12 @@ jobs:
       - name: Build (phone and emulator ABIs)
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
-        run: apps/android/build.sh --emulator
+        run: |
+          apps/android/build.sh --emulator
+          # Only the ABIs libthrenody_ffi.so was built for, not every one JNA ships.
+          apk=apps/android/app/build/outputs/apk/debug/app-debug.apk
+          libs=$(unzip -Z1 "$apk" 'lib/*' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          [[ "$libs" == "arm64-v8a x86_64 " ]] || { echo "::error::unexpected ABIs: $libs"; exit 1; }
       # Before the F-Droid build below, which overwrites the debug APK.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -130,6 +135,8 @@ jobs:
           fi
           apps/android/build.sh --no-calls
           apk=apps/android/app/build/outputs/apk/debug/app-debug.apk
+          libs=$(unzip -Z1 "$apk" 'lib/*' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          [[ "$libs" == "arm64-v8a " ]] || { echo "::error::unexpected ABIs: $libs"; exit 1; }
           unzip -q -o "$apk" 'lib/*' 'classes*.dex' -d "$out/apk"
           # WebRTC links statically into libthrenody_ffi.so (no separate .so to
           # look for), so check its JNI symbols and the jar's classes instead.
