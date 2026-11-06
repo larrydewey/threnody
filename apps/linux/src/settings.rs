@@ -38,6 +38,13 @@ pub const LIST_TAB: &str = "list_tab";
 /// show this computer's presence on radios; they aren't protections.
 pub const BLUETOOTH: &str = "bluetooth";
 pub const WIFI_DIRECT: &str = "wifi_direct";
+/// Volunteering as a relay at these public addresses, and running a
+/// relay directory at this one: none unless chosen.
+pub const VOLUNTEER_ADDRS: &str = "volunteer_addrs";
+pub const DIRECTORY_ADDR: &str = "directory_addr";
+/// The directory reviews relays before listing them (a protection
+/// against Sybil relays, so on unless turned off).
+pub const DIRECTORY_REVIEW: &str = "directory_review";
 
 /// Cover interval on unmetered networks, and on metered ones.
 pub const COVER_UNMETERED_MS: u32 = 2_000;
@@ -161,10 +168,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nearby_defaults_off() {
+    fn nearby_and_roles_default_off_review_on() {
         let s = Settings::parse(PathBuf::from("/nonexistent/desktop.conf"), "");
         assert!(!s.opted_in(BLUETOOTH));
         assert!(!s.opted_in(WIFI_DIRECT));
+        assert_eq!(s.text(VOLUNTEER_ADDRS), None);
+        assert_eq!(s.text(DIRECTORY_ADDR), None);
+        assert!(s.flag(DIRECTORY_REVIEW));
         let s = Settings::parse(
             PathBuf::from("/nonexistent/desktop.conf"),
             "bluetooth=true\n",

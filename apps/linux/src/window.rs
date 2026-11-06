@@ -2911,6 +2911,33 @@ impl App {
             }
         });
         relays.add(&dirs);
+        // Serving strangers: the main identity only, off until chosen.
+        let volunteer = adw::ActionRow::builder()
+            .title("Volunteer as a relay")
+            .subtitle(self.volunteer_state())
+            .activatable(true)
+            .build();
+        volunteer.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let weak = Rc::downgrade(self);
+        volunteer.connect_activated(move |row| {
+            if let Some(t) = weak.upgrade() {
+                t.volunteer_dialog(row);
+            }
+        });
+        relays.add(&volunteer);
+        let serve = adw::ActionRow::builder()
+            .title("Run a relay directory")
+            .subtitle(self.directory_state())
+            .activatable(true)
+            .build();
+        serve.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let weak = Rc::downgrade(self);
+        serve.connect_activated(move |row| {
+            if let Some(t) = weak.upgrade() {
+                t.directory_server_dialog(row);
+            }
+        });
+        relays.add(&serve);
         page.add(&relays);
 
         // A handle people can type to find us (Appendix S).
@@ -3570,6 +3597,318 @@ impl App {
         });
         add.add(&entry);
         page.add(&add);
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&page));
+        d.set_child(Some(&view));
+        d.present(Some(&self.window));
+    }
+
+    // ----- Volunteering and running a directory -----
+
+    fn volunteer_state(&self) -> String {
+        let main = &self.core.main;
+        let saved = self
+            .core
+            .settings()
+            .text(settings::VOLUNTEER_ADDRS)
+            .map(str::to_owned);
+        match (main.volunteering(), saved, self.core.volunteer_note()) {
+            (true, _, Some(note)) => note,
+            (true, Some(a), None) => format!("On at {}", a.replace(',', ", ")),
+            (true, None, None) => "On".into(),
+            (false, ..) => "Off".into(),
+        }
+    }
+
+    fn directory_state(&self) -> String {
+        if !self.core.main.serving_directory() {
+            return "Off".into();
+        }
+        let relays = self.core.main.directory_relays().len();
+        match self.core.settings().text(settings::DIRECTORY_ADDR) {
+            Some(a) => format!("Serving at {a} · {relays} relays"),
+            None => format!("Serving · {relays} relays"),
+        }
+    }
+
+    /// Fills `entry` with the saved addresses, else with a suggestion from
+    /// reachability (fetched off the GTK thread).
+    fn prefill_address(&self, entry: &adw::EntryRow, saved: Option<String>) {
+        if let Some(a) = saved {
+            entry.set_text(&a.replace(',', ", "));
+            return;
+        }
+        let (core, entry) = (self.core.clone(), entry.downgrade());
+        bg(
+            move || core.suggested_public_addr(),
+            move |a| {
+                if let (Some(e), Some(a)) = (entry.upgrade(), a)
+                    && e.text().is_empty()
+                {
+                    e.set_text(&a);
+                }
+            },
+        );
+    }
+
+    fn volunteer_dialog(self: &Rc<Self>, row: &adw::ActionRow) {
+        let d = adw::Dialog::builder()
+            .title("Volunteer as a relay")
+            .content_width(560)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .description(format!(
+                "Strangers' onion circuits pass through this computer, paid with anonymous \
+                 tokens. Directories you subscribe to list this computer's identity with this \
+                 address. Needs a public address that reaches port {}, TCP and UDP.",
+                self.core.port
+            ))
+            .build();
+        let entry = adw::EntryRow::builder()
+            .title("Public address (host:port, comma-separated)")
+            .build();
+        let saved = self
+            .core
+            .settings()
+            .text(settings::VOLUNTEER_ADDRS)
+            .map(str::to_owned);
+        self.prefill_address(&entry, saved);
+        group.add(&entry);
+        if self.core.main.directories().is_empty() {
+            group.add(
+                &adw::ActionRow::builder()
+                    .title("Subscribe to a directory to be listed")
+                    .subtitle("Preferences → Relay directories")
+                    .build(),
+            );
+        }
+        let state = adw::ActionRow::builder()
+            .title("Now")
+            .subtitle(self.volunteer_state())
+            .build();
+        group.add(&state);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.set_margin_top(12);
+        let stop = gtk::Button::with_label("Stop");
+        let start = gtk::Button::with_label("Start");
+        start.add_css_class("suggested-action");
+        stop.set_sensitive(self.core.main.volunteering());
+        buttons.append(&stop);
+        buttons.append(&start);
+        group.add(&buttons);
+        page.add(&group);
+
+        let done = {
+            let (weak, row, d) = (Rc::downgrade(self), row.clone(), d.clone());
+            move |r: Result<Vec<String>, String>| {
+                let Some(t) = weak.upgrade() else { return };
+                match r {
+                    Ok(a) if a.is_empty() => t.toast("Stopped volunteering"),
+                    Ok(_) => t.toast(
+                        "Volunteering; directories list this computer once it proves reachable",
+                    ),
+                    Err(e) => {
+                        t.toast(&format!("Couldn't volunteer: {e}"));
+                        return;
+                    }
+                }
+                row.set_subtitle(&t.volunteer_state());
+                d.close();
+            }
+        };
+        let (core, e, done2) = (self.core.clone(), entry.clone(), done.clone());
+        start.connect_clicked(move |_| {
+            let (core, text) = (core.clone(), e.text().to_string());
+            bg(move || core.set_volunteer(Some(&text)), done2.clone());
+        });
+        let core = self.core.clone();
+        stop.connect_clicked(move |_| {
+            let core = core.clone();
+            bg(move || core.set_volunteer(None), done.clone());
+        });
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&page));
+        d.set_child(Some(&view));
+        d.present(Some(&self.window));
+    }
+
+    fn directory_server_dialog(self: &Rc<Self>, row: &adw::ActionRow) {
+        let d = adw::Dialog::builder()
+            .title("Run a relay directory")
+            .content_width(600)
+            .content_height(560)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .description(
+                "List volunteer relays that register and prove reachable, and give out anonymous \
+                 tokens to pay them. The link you share names this identity and this address.",
+            )
+            .build();
+        let entry = adw::EntryRow::builder()
+            .title("Public address (host:port)")
+            .build();
+        let saved = self
+            .core
+            .settings()
+            .text(settings::DIRECTORY_ADDR)
+            .map(str::to_owned);
+        self.prefill_address(&entry, saved);
+        group.add(&entry);
+        let review = adw::SwitchRow::builder()
+            .title("Review relays before listing them")
+            .subtitle("Protects your users against someone registering many relays at once")
+            .active(self.core.settings().flag(settings::DIRECTORY_REVIEW))
+            .build();
+        group.add(&review);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.set_margin_top(12);
+        let serving = self.core.main.serving_directory();
+        let stop = gtk::Button::with_label("Stop");
+        let start = gtk::Button::with_label(if serving { "Apply" } else { "Start" });
+        start.add_css_class("suggested-action");
+        stop.set_sensitive(serving);
+        buttons.append(&stop);
+        buttons.append(&start);
+        group.add(&buttons);
+        page.add(&group);
+
+        if serving {
+            let link_group = adw::PreferencesGroup::builder().title("Link").build();
+            match self.core.directory_link() {
+                Some(link) => {
+                    let show = adw::ActionRow::builder()
+                        .title("Show link")
+                        .subtitle("Share it with people who should use your directory")
+                        .activatable(true)
+                        .build();
+                    show.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                    let weak = Rc::downgrade(self);
+                    show.connect_activated(move |_| {
+                        if let Some(t) = weak.upgrade() {
+                            ui::show_code(
+                                &t.window,
+                                "Relay directory",
+                                "Share this link with people who should use your directory.",
+                                &link,
+                                "",
+                                false,
+                            );
+                        }
+                    });
+                    link_group.add(&show);
+                }
+                None => link_group.add(
+                    &adw::ActionRow::builder()
+                        .title("Set its address above and apply to get its link")
+                        .build(),
+                ),
+            }
+            page.add(&link_group);
+            let relays = adw::PreferencesGroup::builder()
+                .title("Registered relays")
+                .description("Clients see only the listed ones.")
+                .build();
+            let list = self.core.main.directory_relays();
+            if list.is_empty() {
+                relays.add(&adw::ActionRow::builder().title("None yet").build());
+            }
+            for r in list {
+                let row = adw::ActionRow::builder()
+                    .title(core::short(&r.fingerprint))
+                    .subtitle(format!(
+                        "{} · until {}",
+                        r.addrs.join(", "),
+                        ui::time_label(r.expires_ms)
+                    ))
+                    .build();
+                let listed = gtk::Switch::builder()
+                    .active(r.listed)
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Listed")
+                    .build();
+                let (weak, fp) = (Rc::downgrade(self), r.fingerprint.clone());
+                listed.connect_state_set(move |_, on| {
+                    if let Some(t) = weak.upgrade() {
+                        let fp = fp.clone();
+                        t.run(
+                            None,
+                            "change the listing",
+                            move |n| n.set_relay_listed(fp, on).map(|_| ()),
+                            None,
+                        );
+                    }
+                    glib::Propagation::Proceed
+                });
+                row.add_suffix(&listed);
+                relays.add(&row);
+            }
+            page.add(&relays);
+        }
+
+        let (weak, e, sw, row2, d2) = (
+            Rc::downgrade(self),
+            entry.clone(),
+            review.clone(),
+            row.clone(),
+            d.clone(),
+        );
+        start.connect_clicked(move |_| {
+            let Some(t) = weak.upgrade() else { return };
+            let (core, addr, on) = (t.core.clone(), e.text().to_string(), sw.is_active());
+            let (weak, row, d) = (Rc::downgrade(&t), row2.clone(), d2.clone());
+            bg(
+                move || core.serve_directory(&addr, on),
+                move |r| {
+                    let Some(t) = weak.upgrade() else { return };
+                    match r {
+                        Ok(_) => {
+                            row.set_subtitle(&t.directory_state());
+                            d.close();
+                            // Open again, now with its link and relays.
+                            t.directory_server_dialog(&row);
+                        }
+                        Err(e) => t.toast(&format!("Couldn't run the directory: {e}")),
+                    }
+                },
+            );
+        });
+        let (weak, row, d2) = (Rc::downgrade(self), row.clone(), d.clone());
+        stop.connect_clicked(move |_| {
+            let Some(t) = weak.upgrade() else { return };
+            let (row, d) = (row.clone(), d2.clone());
+            ui::confirm(
+                &t.window,
+                "Stop the directory?",
+                "Its clients can't refresh from it any more, and it doesn't start again. \
+                 Relays that registered are forgotten.",
+                "Stop",
+                true,
+                {
+                    let weak = Rc::downgrade(&t);
+                    move || {
+                        let Some(t) = weak.upgrade() else { return };
+                        let (core, weak, row, d) =
+                            (t.core.clone(), Rc::downgrade(&t), row.clone(), d.clone());
+                        bg(
+                            move || core.stop_directory(),
+                            move |()| {
+                                if let Some(t) = weak.upgrade() {
+                                    row.set_subtitle(&t.directory_state());
+                                    t.toast("Stopped the relay directory");
+                                }
+                                d.close();
+                            },
+                        );
+                    }
+                },
+            );
+        });
         let view = adw::ToolbarView::new();
         view.add_top_bar(&adw::HeaderBar::new());
         view.set_content(Some(&page));

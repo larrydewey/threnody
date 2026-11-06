@@ -221,6 +221,10 @@ pub struct Core {
     asked_direct: Mutex<HashMap<String, Instant>>,
     /// The latest Wi-Fi Direct offer nobody asked for.
     offered_direct: Mutex<Option<DirectOffered>>,
+    /// The link of the relay directory this identity runs, if it does.
+    directory_link: Mutex<Option<String>>,
+    /// The last word on volunteering or directories (`VolunteerNote`).
+    volunteer_note: Mutex<Option<String>>,
     redialing: Mutex<HashSet<Option<String>>>,
     /// The conversation on screen while the window is focused; its
     /// messages don't notify.
@@ -273,6 +277,8 @@ impl Core {
             foreground: AtomicBool::new(true),
             asked_direct: Mutex::new(HashMap::new()),
             offered_direct: Mutex::new(None),
+            directory_link: Mutex::new(None),
+            volunteer_note: Mutex::new(None),
             redialing: Mutex::new(HashSet::new()),
             watching: Mutex::new(None),
             _lock: lock_file,
@@ -288,11 +294,13 @@ impl Core {
             ));
         }
         core.apply_privacy_to(&core.main, false);
-        // Radios can take seconds to start: the window shouldn't wait.
+        // Radios and the relay roles can take seconds to start: the
+        // window shouldn't wait.
         let weak = Arc::downgrade(&core);
         std::thread::spawn(move || {
             if let Some(core) = weak.upgrade() {
                 core.apply_radio();
+                core.start_roles();
             }
         });
         // Tunnels as the setting says from the start: on, they come back
@@ -495,6 +503,126 @@ impl Core {
                 Err(e) => core.say(format!("! Wi-Fi Direct: {e}")),
             }
         });
+    }
+
+    // ----- Volunteering and running a relay directory -----
+
+    /// Volunteers and serves a directory as the settings say (main
+    /// identity only: net refuses both for anonymous identities). Blocks.
+    fn start_roles(&self) {
+        let (volunteer, directory, review) = {
+            let s = self.settings();
+            (
+                s.text(settings::VOLUNTEER_ADDRS).map(str::to_owned),
+                s.text(settings::DIRECTORY_ADDR).map(str::to_owned),
+                s.flag(settings::DIRECTORY_REVIEW),
+            )
+        };
+        if let Some(text) = volunteer {
+            match threnody_ffi::relay_addrs(text)
+                .and_then(|a| self.main.set_volunteer(a.clone()).map(|()| a))
+            {
+                Ok(addrs) => {
+                    self.say(format!("* volunteering as a relay at {}", addrs.join(", ")));
+                    self.check_volunteer_port(&addrs);
+                }
+                Err(e) => self.say(format!("! volunteering: {e}")),
+            }
+        }
+        if let Some(addr) = directory {
+            match self.main.serve_directory(addr, review) {
+                Ok(link) => {
+                    self.say("* serving a relay directory");
+                    *lock(&self.directory_link) = Some(link);
+                }
+                Err(e) => self.say(format!("! relay directory: {e}")),
+            }
+        } else if self.main.serving_directory() {
+            self.say(
+                "* this identity serves a relay directory; set its address in Preferences to get its link",
+            );
+        }
+    }
+
+    /// A directory checks that a volunteer is reachable at its address:
+    /// after a fallback to another port, a saved address may not be.
+    fn check_volunteer_port(&self, addrs: &[String]) {
+        let ports: Vec<u16> = addrs
+            .iter()
+            .filter_map(|a| a.rsplit_once(':')?.1.parse().ok())
+            .collect();
+        if !ports.is_empty() && !ports.contains(&self.port) {
+            self.say(format!(
+                "! volunteer address uses port {}, this computer listens on {}",
+                ports[0], self.port
+            ));
+        }
+    }
+
+    /// Volunteers at the addresses in `text` (`host:port`s), or stops
+    /// (`None`), and keeps the choice. Returns the addresses. Blocks.
+    pub fn set_volunteer(&self, text: Option<&str>) -> Result<Vec<String>, String> {
+        let Some(text) = text else {
+            self.main
+                .set_volunteer(Vec::new())
+                .map_err(|e| e.to_string())?;
+            self.settings().set_text(settings::VOLUNTEER_ADDRS, "");
+            self.say("* stopped volunteering as a relay");
+            return Ok(Vec::new());
+        };
+        let addrs = threnody_ffi::relay_addrs(text.to_owned()).map_err(|e| e.to_string())?;
+        self.main
+            .set_volunteer(addrs.clone())
+            .map_err(|e| e.to_string())?;
+        self.settings()
+            .set_text(settings::VOLUNTEER_ADDRS, &addrs.join(","));
+        self.say(format!("* volunteering as a relay at {}", addrs.join(", ")));
+        self.check_volunteer_port(&addrs);
+        Ok(addrs)
+    }
+
+    /// Runs a relay directory at `addr`, and keeps the choice; returns
+    /// its link. Blocks.
+    pub fn serve_directory(&self, addr: &str, review: bool) -> Result<String, String> {
+        let link = self
+            .main
+            .serve_directory(addr.trim().to_owned(), review)
+            .map_err(|e| e.to_string())?;
+        {
+            let mut s = self.settings();
+            s.set_text(settings::DIRECTORY_ADDR, addr.trim());
+            s.set_flag(settings::DIRECTORY_REVIEW, review);
+        }
+        *lock(&self.directory_link) = Some(link.clone());
+        self.say("* serving a relay directory");
+        Ok(link)
+    }
+
+    /// Stops the directory and forgets it, so it doesn't start again.
+    pub fn stop_directory(&self) {
+        self.main.stop_serving_directory();
+        {
+            let mut s = self.settings();
+            s.set_text(settings::DIRECTORY_ADDR, "");
+            s.set_text(settings::DIRECTORY_REVIEW, "");
+        }
+        lock(&self.directory_link).take();
+        self.say("* stopped serving the relay directory");
+    }
+
+    pub fn directory_link(&self) -> Option<String> {
+        lock(&self.directory_link).clone()
+    }
+
+    pub fn volunteer_note(&self) -> Option<String> {
+        lock(&self.volunteer_note).clone()
+    }
+
+    /// An address to suggest for volunteering or a directory (blocks:
+    /// reachability asks the node).
+    pub fn suggested_public_addr(&self) -> Option<String> {
+        let r = self.main.reachability();
+        suggest_public_addr(&r.addresses, r.symmetric, self.port)
     }
 
     // ----- Foreground -----
@@ -1331,6 +1459,10 @@ impl Core {
                     NodeEvent::Fallback { peer, notice } => {
                         self.say(format!("* {}: {notice}", short(peer)));
                     }
+                    NodeEvent::VolunteerNote { note } if persona.is_none() => {
+                        self.say(format!("* {note}"));
+                        *lock(&self.volunteer_note) = Some(note.clone());
+                    }
                     // Hosting needs root access to wpa_supplicant.
                     NodeEvent::WifiDirectRequested { peer } => self.say(format!(
                         "* {} asked for a Wi-Fi Direct link; this computer can only join groups",
@@ -1573,6 +1705,36 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
 /// a contact's punch only lasts minutes).
 pub fn foreground_wanted(visible: bool, metered: bool, power_saver: bool) -> bool {
     visible || !(metered || power_saver)
+}
+
+/// A public address to suggest for volunteering or a directory: the
+/// first of ours (as contacts would dial them) whose IP is global, kept
+/// as reported; `port` only fills in one without a port. None behind a
+/// symmetric NAT, whose reflected address nobody can dial.
+pub fn suggest_public_addr(addresses: &[String], symmetric: bool, port: u16) -> Option<String> {
+    use std::net::{IpAddr, SocketAddr};
+    if symmetric {
+        return None;
+    }
+    let global = |ip: IpAddr| match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (a == 100 && (b & 0xc0) == 64))
+        }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
+    };
+    addresses.iter().find_map(|a| {
+        if let Ok(sa) = a.parse::<SocketAddr>() {
+            return global(sa.ip()).then(|| a.clone());
+        }
+        let ip = a.parse::<IpAddr>().ok()?;
+        global(ip).then(|| SocketAddr::new(ip, port).to_string())
+    })
 }
 
 pub fn short(fp: &str) -> String {
@@ -1918,5 +2080,33 @@ mod tests {
                 assert_eq!(foreground_wanted(false, metered, saver), !metered && !saver);
             }
         }
+    }
+
+    #[test]
+    fn public_address_suggestion() {
+        let pick = |a: &[&str], symmetric: bool| {
+            let a: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            suggest_public_addr(&a, symmetric, 7450)
+        };
+        let private = [
+            "192.168.1.5:7450",
+            "10.0.0.1:7450",
+            "100.64.0.1:1",
+            "127.0.0.1:1",
+            "fe80::1",
+        ];
+        assert_eq!(pick(&private, false), None);
+        let mut v4 = private.to_vec();
+        v4.push("203.0.113.9:40000");
+        assert_eq!(pick(&v4, false).as_deref(), Some("203.0.113.9:40000"));
+        let mut v6 = private.to_vec();
+        v6.push("[2001:db8::1]:7450");
+        assert_eq!(pick(&v6, false).as_deref(), Some("[2001:db8::1]:7450"));
+        assert_eq!(
+            pick(&["2001:db8::2"], false).as_deref(),
+            Some("[2001:db8::2]:7450")
+        );
+        assert_eq!(pick(&[], false), None);
+        assert_eq!(pick(&["203.0.113.9:40000"], true), None);
     }
 }
