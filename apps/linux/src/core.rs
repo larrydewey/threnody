@@ -269,6 +269,10 @@ impl Core {
         core.pump(core.main.clone(), None, Arc::new(AtomicBool::new(true)));
         core.open_personas();
         core.main.reconnect();
+        // Edited photos a crash left unsent.
+        if let Some(d) = core.edit_dir(None) {
+            clear_dir(&d);
+        }
         core.sweeper();
         core
     }
@@ -743,6 +747,9 @@ impl Core {
                 _lock: dir_lock,
             },
         );
+        if let Some(d) = self.edit_dir(Some(&rec.id)) {
+            clear_dir(&d);
+        }
         self.say(format!(
             "anonymous identity {} listening on port {port}",
             short(&rec.id)
@@ -841,6 +848,51 @@ impl Core {
                 .map_or_else(|| self.home.clone(), |p| p.home.clone()),
         };
         base.join("media")
+    }
+
+    /// An identity's own data directory: the main one's, or an open
+    /// anonymous identity's. None for one that isn't open (burned, or its
+    /// key missing), rather than the main one's in its place.
+    fn identity_home(&self, persona: Option<&str>) -> Option<PathBuf> {
+        match persona {
+            None => Some(self.home.clone()),
+            Some(id) => lock(&self.personas).get(id).map(|p| p.home.clone()),
+        }
+    }
+
+    /// Where edited photos wait to be sent or saved: beside, not in,
+    /// `media/`, so the sweep can't take one still being edited.
+    fn edit_dir(&self, persona: Option<&str>) -> Option<PathBuf> {
+        Some(self.identity_home(persona)?.join("edited"))
+    }
+
+    /// A new, empty file (only the user can read it) for an edited photo
+    /// called about `name`. Made at once, so two editors open at the same
+    /// time can't pick the same one.
+    pub fn edit_draft_path(&self, persona: Option<&str>, name: &str) -> Result<PathBuf, String> {
+        let dir = self
+            .edit_dir(persona)
+            .ok_or("that anonymous identity isn't open")?;
+        reserve_draft(&dir, name).map_err(|e| e.to_string())
+    }
+
+    /// Whether `path` is an edited photo of this identity's, not yet sent.
+    pub fn is_edit_draft(&self, persona: Option<&str>, path: &Path) -> bool {
+        self.edit_dir(persona).is_some_and(|d| path.starts_with(d))
+    }
+
+    /// Where a sent edited photo is kept (with received photos). Nothing
+    /// is moved yet: see [`adopt_edit`].
+    pub fn edit_destination(&self, persona: Option<&str>, draft: &Path) -> Result<PathBuf, String> {
+        let home = self
+            .identity_home(persona)
+            .ok_or("that anonymous identity isn't open")?;
+        let media = home.join("media");
+        std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
+        let name = draft
+            .file_name()
+            .map_or_else(|| "edited.jpg".into(), |n| n.to_string_lossy().into_owned());
+        Ok(free_path(&media, &name))
     }
 
     /// Where to record a voice or video message, beside received photos.
@@ -1367,6 +1419,50 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(candidate)
 }
 
+/// Creates a new file for a draft in `dir` (made 0700 if new): `name`,
+/// or a numbered one if that is taken, mode 0600.
+fn reserve_draft(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    for _ in 0..100 {
+        let path = free_path(dir, name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name for the edited photo"))
+}
+
+/// Keeps a sent edited photo at `dest` (in `media/`) and removes the
+/// draft. A link, not a rename: it fails rather than replace a file
+/// already at `dest`.
+pub fn adopt_edit(draft: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(draft, dest)?;
+    std::fs::remove_file(draft)
+}
+
+/// Removes the files in `dir`, ignoring errors.
+fn clear_dir(dir: &Path) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for f in files.flatten() {
+        if f.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+}
+
 /// What decides where a received file is kept.
 #[derive(Clone, Copy, Debug)]
 pub struct Keep {
@@ -1550,6 +1646,66 @@ mod tests {
         sweep_media(&media, &kept);
         assert!(note.exists() && recording.exists());
         assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("threnody-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn edit_drafts_move_into_media() {
+        let dir = temp("adopt");
+        let (edited, media) = (dir.join("edited"), dir.join("media"));
+        std::fs::create_dir_all(&edited).unwrap();
+        std::fs::create_dir_all(&media).unwrap();
+        let draft = edited.join("a-edited.jpg");
+        std::fs::write(&draft, b"jpeg").unwrap();
+        let dest = media.join("a-edited.jpg");
+        adopt_edit(&draft, &dest).unwrap();
+        assert!(!draft.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg");
+
+        // Never over a file already there.
+        std::fs::write(&draft, b"new").unwrap();
+        assert!(adopt_edit(&draft, &dest).is_err());
+        assert_eq!(std::fs::read(&draft).unwrap(), b"new");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn draft_names_are_reserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("reserve");
+        let edited = dir.join("edited");
+        let a = reserve_draft(&edited, "x-edited.jpg").unwrap();
+        let b = reserve_draft(&edited, "x-edited.jpg").unwrap();
+        assert_ne!(a, b);
+        for f in [&a, &b] {
+            let mode = std::fs::metadata(f).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", f.display());
+        }
+        let mode = std::fs::metadata(&edited).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A path from a sender's name can't leave the directory.
+        let c = reserve_draft(&edited, "../../escape.jpg").unwrap();
+        assert_eq!(c.parent(), Some(edited.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_drafts_are_cleared() {
+        let dir = temp("clear");
+        std::fs::write(dir.join("a.jpg"), b"a").unwrap();
+        std::fs::write(dir.join("b.jpg"), b"b").unwrap();
+        clear_dir(&dir);
+        assert!(dir.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        clear_dir(&dir.join("missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

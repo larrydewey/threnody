@@ -9,6 +9,7 @@ mod camera;
 mod chat;
 mod clip;
 mod core;
+mod editor;
 mod folders;
 mod gifs;
 mod keyring;
@@ -17,7 +18,9 @@ mod lists;
 mod nfc;
 mod schedule;
 mod settings;
+mod sketch;
 mod ui;
+mod viewer;
 mod window;
 
 use std::cell::RefCell;

@@ -185,3 +185,62 @@ windowtitle.warning .subtitle {
 .list-tabs {
   margin: 4px 12px 6px 12px;
 }
+/* Albums: a grid of square photos in one bubble. */
+.album-cell {
+  border-radius: 8px;
+  overflow: hidden;
+}
+.photo-cover {
+  background-color: alpha(currentColor, 0.18);
+  border-radius: 8px;
+  font-size: 22px;
+}
+.photo-missing {
+  background-color: alpha(currentColor, 0.08);
+  border-radius: 8px;
+}
+.send-thumb {
+  border-radius: 8px;
+  overflow: hidden;
+}
+/* The photo viewer and editor show photos on black. */
+.viewer-photo,
+.editor-canvas,
+.scan-preview {
+  background-color: black;
+}
+.viewer-caption {
+  padding: 8px 12px;
+}
+.editor-panel {
+  background-color: #16161a;
+  color: white;
+  padding: 10px 12px;
+}
+.editor-panel button {
+  color: white;
+}
+.pen-dot {
+  background-color: white;
+  border-radius: 999px;
+}
+.swatch {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid #888;
+  transition: transform 100ms;
+}
+.swatch.selected {
+  border: 3px solid white;
+  transform: scale(1.15);
+}
+.swatch-0 { background: #ffffff; }
+.swatch-1 { background: #000000; }
+.swatch-2 { background: #e53935; }
+.swatch-3 { background: #fb8c00; }
+.swatch-4 { background: #fdd835; }
+.swatch-5 { background: #43a047; }
+.swatch-6 { background: #1e88e5; }
+.swatch-7 { background: #8e24aa; }

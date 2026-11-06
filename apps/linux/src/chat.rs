@@ -13,11 +13,16 @@ use threnody_ffi::{
 
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target};
 use crate::ui::{self, bg};
+use crate::viewer::{self, MAX_PIXELS, MAX_SIDE, Thumbs};
 use crate::window::App;
-use crate::{clip, gifs, schedule, settings};
+use crate::{clip, editor, gifs, schedule, settings};
 
 /// How many messages a chat loads (more to reach an older search match).
 const HISTORY: u32 = 1000;
+/// How many messages *Media, files and links* looks through (Android's).
+const MEDIA_HISTORY: u32 = 10_000;
+/// Long side of photos decoded for the chat and the send dialog.
+const THUMB_SIDE: i32 = 640;
 /// The most matches a search in a chat finds.
 const SEARCH_LIMIT: u32 = 500;
 /// We're taken to have stopped typing after this long without a keystroke.
@@ -72,8 +77,12 @@ pub struct ChatView {
     loaded: Cell<bool>,
     /// Whether the main identity already has the contact they revealed.
     revealed_known: Cell<bool>,
-    /// Sensitive photos the user uncovered, by time and sender.
+    /// Sensitive voice and video messages the user uncovered, by time
+    /// and sender. (Sensitive photos open in the viewer instead.)
     shown: RefCell<Vec<(u64, String)>>,
+    /// Photos decoded for the bubbles, kept while the chat is open (it
+    /// redraws them all whenever a message comes).
+    thumbs: Thumbs,
     /// Voice and video messages by file, kept across redraws so one
     /// playing goes on playing when a message arrives.
     players: RefCell<HashMap<std::path::PathBuf, gtk::MediaFile>>,
@@ -408,6 +417,7 @@ impl ChatView {
             loaded: Cell::new(false),
             revealed_known: Cell::new(true),
             shown: RefCell::new(Vec::new()),
+            thumbs: Thumbs::default(),
             players: RefCell::new(HashMap::new()),
             typing_row,
             peer_typing: Cell::new(false),
@@ -550,7 +560,7 @@ impl ChatView {
             if paths.is_empty() {
                 return false;
             }
-            t.confirm_files(paths);
+            t.confirm_files(paths, String::new(), false);
             true
         });
         this.root.add_controller(drop);
@@ -693,8 +703,9 @@ impl ChatView {
         }
     }
 
-    /// Forwards a message to a chat the user picks, marked as forwarded.
-    fn forward(self: &Rc<Self>, e: &HistoryEntry) {
+    /// Forwards messages (one, or an album's photos) to a chat the user
+    /// picks, marked as forwarded.
+    fn forward(self: &Rc<Self>, entries: &[HistoryEntry]) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
@@ -706,7 +717,7 @@ impl ChatView {
             .filter(|c| c.chat.persona == persona && c.invite.is_none() && !c.is_request())
             .collect();
         let names: Vec<String> = targets.iter().map(|c| c.title.clone()).collect();
-        let (weak, e) = (self.weak_self.clone(), e.clone());
+        let (weak, entries) = (self.weak_self.clone(), entries.to_vec());
         ui::choose(
             &app.window,
             "Forward to",
@@ -718,7 +729,7 @@ impl ChatView {
                 let Some(c) = targets.get(i).cloned() else {
                     return;
                 };
-                let e = e.clone();
+                let entries = entries.clone();
                 let title = c.title.clone();
                 t.run(
                     "forward",
@@ -728,36 +739,60 @@ impl ChatView {
                             Target::Group(g) => Dest::Group(g.clone()),
                             Target::Contact(_) => Dest::Contact(c.device.clone()),
                         };
-                        match (&e.file, dest) {
-                            (None, Dest::Note) => n.write_note(e.text.clone(), None, None),
-                            (None, Dest::Group(g)) => n.forward_group_text(g, e.text.clone()),
-                            (None, Dest::Contact(d)) => {
-                                n.forward_text(d, e.text.clone()).map(|_| ())
-                            }
-                            (Some(f), dest) => {
-                                let path = f.location.clone().unwrap_or_default();
-                                let data = std::fs::read(&path).map_err(|x| {
-                                    threnody_ffi::ThrenodyError::Failed {
-                                        reason: format!("that file isn't on this device: {x}"),
-                                    }
-                                })?;
-                                let options = FileOptions {
-                                    sensitive: f.sensitive,
-                                    caption: e.text.clone(),
-                                    album: 0,
-                                    clip: f.clip,
-                                    forwarded: true,
-                                };
-                                send_file_to(
-                                    n,
-                                    &dest,
-                                    f.name.clone(),
-                                    data,
-                                    f.location.clone(),
-                                    options,
-                                )
+                        // Every file first: half an album isn't sent.
+                        let mut data = Vec::with_capacity(entries.len());
+                        for e in &entries {
+                            data.push(match &e.file {
+                                Some(f) => {
+                                    let path = f.location.clone().unwrap_or_default();
+                                    Some(std::fs::read(&path).map_err(|x| {
+                                        threnody_ffi::ThrenodyError::Failed {
+                                            reason: format!("that file isn't on this device: {x}"),
+                                        }
+                                    })?)
+                                }
+                                None => None,
+                            });
+                        }
+                        let album = if entries.len() > 1 {
+                            threnody_ffi::album_id()
+                        } else {
+                            0
+                        };
+                        for (i, (e, data)) in entries.iter().zip(data).enumerate() {
+                            match (&e.file, data, dest.clone()) {
+                                (Some(f), Some(data), dest) => {
+                                    let options = FileOptions {
+                                        sensitive: f.sensitive,
+                                        // An album's caption is its first entry's.
+                                        caption: if i == 0 {
+                                            e.text.clone()
+                                        } else {
+                                            String::new()
+                                        },
+                                        album,
+                                        clip: f.clip,
+                                        forwarded: true,
+                                    };
+                                    send_file_to(
+                                        n,
+                                        &dest,
+                                        f.name.clone(),
+                                        data,
+                                        f.location.clone(),
+                                        options,
+                                    )?;
+                                }
+                                (_, _, Dest::Note) => n.write_note(e.text.clone(), None, None)?,
+                                (_, _, Dest::Group(g)) => {
+                                    n.forward_group_text(g, e.text.clone())?;
+                                }
+                                (_, _, Dest::Contact(d)) => {
+                                    n.forward_text(d, e.text.clone())?;
+                                }
                             }
                         }
+                        Ok(())
                     },
                     Some(format!("Forwarded to {title}")),
                 );
@@ -1391,7 +1426,8 @@ impl ChatView {
         let group = self.group().is_some();
         let mut last_day = String::new();
         let mut prev: Option<&HistoryEntry> = None;
-        for e in &entries {
+        for run in album_runs(&entries) {
+            let e = &entries[run.start];
             let day = glib::DateTime::from_unix_local(i64::try_from(e.at_ms / 1000).unwrap_or(0))
                 .ok()
                 .and_then(|d| d.format("%A %-d %B %Y").ok())
@@ -1419,8 +1455,9 @@ impl ChatView {
                 node.as_ref()
                     .map_or_else(|| core::short(&e.device), |n| Core::name_of(n, &e.device))
             });
-            self.messages.append(&self.bubble(e, sender));
-            prev = Some(e);
+            self.messages
+                .append(&self.bubble(&entries[run.clone()], sender));
+            prev = entries.get(run.end - 1);
         }
         self.messages.append(&self.typing_row);
         self.report_read(&entries);
@@ -1451,7 +1488,9 @@ impl ChatView {
         });
     }
 
-    fn bubble(&self, e: &HistoryEntry, sender: Option<String>) -> gtk::Box {
+    /// A message's bubble; a run of an album's photos makes one bubble.
+    fn bubble(&self, run: &[HistoryEntry], sender: Option<String>) -> gtk::Box {
+        let e = &run[0];
         let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
         row.set_halign(if e.outgoing {
             gtk::Align::End
@@ -1480,7 +1519,11 @@ impl ChatView {
             bubble.append(&q);
             bubble.append(&self.poll_view(e, p));
         } else if let Some(f) = &e.file {
-            bubble.append(&self.file_view(e, f));
+            if run.len() > 1 {
+                bubble.append(&self.album_view(run));
+            } else {
+                bubble.append(&self.file_view(e, f));
+            }
             if !e.text.is_empty() {
                 let caption = ui::label(&e.text, &["message-text"]);
                 caption.set_selectable(true);
@@ -1502,21 +1545,7 @@ impl ChatView {
                 let weak = self.app.clone();
                 text.connect_activate_link(move |_, uri| {
                     if let Some(app) = weak.upgrade() {
-                        let (u, w) = (uri.to_owned(), app.window.clone());
-                        ui::confirm(
-                            &app.window,
-                            "Open this link?",
-                            uri,
-                            "Open",
-                            false,
-                            move || {
-                                gtk::UriLauncher::new(&u).launch(
-                                    Some(&w),
-                                    gio::Cancellable::NONE,
-                                    |_| {},
-                                );
-                            },
-                        );
+                        ui::confirm_link(&app.window, uri);
                     }
                     glib::Propagation::Stop
                 });
@@ -1562,9 +1591,11 @@ impl ChatView {
         }
         bubble.append(&meta);
         row.append(&bubble);
-        self.bubbles
-            .borrow_mut()
-            .push(((e.at_ms, e.device.clone()), bubble.clone()));
+        // Search finds any photo of an album in its bubble.
+        self.bubbles.borrow_mut().extend(
+            run.iter()
+                .map(|e| ((e.at_ms, e.device.clone()), bubble.clone())),
+        );
 
         if !e.reactions.is_empty() {
             let reactions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1598,20 +1629,20 @@ impl ChatView {
         let click = gtk::GestureClick::new();
         click.set_button(gdk::BUTTON_SECONDARY);
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let (weak, entry, anchor) = (self.weak_self.clone(), e.clone(), bubble.clone());
+        let (weak, entries, anchor) = (self.weak_self.clone(), run.to_vec(), bubble.clone());
         click.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk::EventSequenceState::Claimed);
             if let Some(t) = weak.upgrade() {
-                t.message_menu(&anchor, &entry, x, y);
+                t.message_menu(&anchor, &entries, x, y);
             }
         });
         bubble.add_controller(click);
         let press = gtk::GestureLongPress::new();
         press.set_touch_only(true);
-        let (weak, entry, anchor) = (self.weak_self.clone(), e.clone(), bubble.clone());
+        let (weak, entries, anchor) = (self.weak_self.clone(), run.to_vec(), bubble.clone());
         press.connect_pressed(move |_, x, y| {
             if let Some(t) = weak.upgrade() {
-                t.message_menu(&anchor, &entry, x, y);
+                t.message_menu(&anchor, &entries, x, y);
             }
         });
         bubble.add_controller(press);
@@ -1646,45 +1677,12 @@ impl ChatView {
             }
             return self.clip_view(c, p);
         }
-        if core::is_image(&f.name)
-            && let Some(p) = &path
-        {
-            if f.sensitive && !e.outgoing && !self.shown.borrow().contains(&key) {
-                // Not even decoded until asked for.
-                let b = gtk::Button::with_label("Sensitive photo · click to show");
-                b.add_css_class("sensitive-cover");
-                b.set_size_request(240, 160);
-                let weak = self.weak_self.clone();
-                b.connect_clicked(move |_| {
-                    if let Some(t) = weak.upgrade() {
-                        t.shown.borrow_mut().push(key.clone());
-                        let entries = t.entries.borrow().clone();
-                        t.display_entries(entries);
-                    }
-                });
-                return b.upcast();
-            }
-            let pic = gtk::Picture::for_filename(p);
-            animate(&pic, p);
-            pic.set_can_shrink(true);
-            pic.set_content_fit(gtk::ContentFit::Contain);
-            pic.set_size_request(240, 180);
-            pic.add_css_class("photo");
+        if core::is_image(&f.name) && path.is_some() {
             let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
             frame.set_size_request(320, 240);
-            pic.set_vexpand(true);
-            frame.append(&pic);
-            pic.set_cursor_from_name(Some("pointer"));
-            pic.set_tooltip_text(Some(&f.name));
-            let click = gtk::GestureClick::new();
-            click.set_button(gdk::BUTTON_PRIMARY);
-            let (weak, p) = (self.weak_self.clone(), p.clone());
-            click.connect_released(move |_, _, _, _| {
-                if let Some(t) = weak.upgrade() {
-                    t.open_file(&p);
-                }
-            });
-            pic.add_controller(click);
+            let cell = self.photo_cell(e, f, (240, 180), gtk::ContentFit::Contain);
+            cell.set_vexpand(true);
+            frame.append(&cell);
             return frame.upcast();
         }
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -1757,6 +1755,112 @@ impl ChatView {
             row.append(&folder);
         }
         row.upcast()
+    }
+
+    /// An album's photos as a two-column grid of square cells.
+    fn album_view(&self, run: &[HistoryEntry]) -> gtk::Widget {
+        let grid = gtk::Grid::builder()
+            .column_spacing(4)
+            .row_spacing(4)
+            .column_homogeneous(true)
+            .build();
+        let cells = run.iter().filter_map(|e| Some((e, e.file.as_ref()?)));
+        for (i, (e, f)) in cells.enumerate() {
+            let cell = self.photo_cell(e, f, (130, 130), gtk::ContentFit::Cover);
+            cell.add_css_class("album-cell");
+            let i = i32::try_from(i).unwrap_or(0);
+            grid.attach(&cell, i % 2, i / 2, 1, 1);
+        }
+        grid.upcast()
+    }
+
+    /// One photo in the chat, about `size`: a sensitive one (sent or
+    /// received) covered and not even decoded, the others decoded off
+    /// the main thread. Clicking opens it in the viewer, never another app.
+    fn photo_cell(
+        &self,
+        e: &HistoryEntry,
+        f: &threnody_ffi::FileInfo,
+        size: (i32, i32),
+        fit: gtk::ContentFit,
+    ) -> gtk::Widget {
+        let path = f
+            .location
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists());
+        let Some(p) = path else {
+            let l = gtk::Label::new(Some("📷 not available"));
+            l.add_css_class("dim-label");
+            l.add_css_class("caption");
+            l.add_css_class("photo-missing");
+            l.set_size_request(size.0, size.1);
+            return l.upcast();
+        };
+        let open = {
+            let (weak, e, f, p) = (self.weak_self.clone(), e.clone(), f.clone(), p.clone());
+            move || {
+                if let Some(t) = weak.upgrade() {
+                    t.view_photo(&e, &f, &p);
+                }
+            }
+        };
+        if f.sensitive {
+            let b = gtk::Button::with_label("Sensitive photo · click to view");
+            b.add_css_class("sensitive-cover");
+            b.set_size_request(size.0, size.1);
+            b.set_tooltip_text(Some("Opens in the viewer"));
+            b.connect_clicked(move |_| open());
+            return b.upcast();
+        }
+        let pic = gtk::Picture::new();
+        if viewer::is_gif(&f.name) {
+            // GTK decodes GIFs itself, here: only reasonable ones.
+            if viewer::checked_size(&p).is_ok() {
+                pic.set_filename(Some(&p));
+                ui::animate(&pic, &p);
+            }
+        } else {
+            viewer::thumbnail(
+                &pic,
+                Rc::default(),
+                p.clone(),
+                THUMB_SIDE,
+                self.thumbs.clone(),
+            );
+        }
+        pic.set_can_shrink(true);
+        pic.set_content_fit(fit);
+        pic.set_size_request(size.0, size.1);
+        pic.add_css_class("photo");
+        pic.set_cursor_from_name(Some("pointer"));
+        pic.set_tooltip_text(Some(&f.name));
+        let click = gtk::GestureClick::new();
+        click.set_button(gdk::BUTTON_PRIMARY);
+        click.connect_released(move |_, _, _, _| open());
+        pic.add_controller(click);
+        pic.upcast()
+    }
+
+    /// Opens a photo in the viewer; an edited copy is offered for sending
+    /// here, sensitive if the photo was.
+    fn view_photo(&self, e: &HistoryEntry, f: &threnody_ffi::FileInfo, path: &std::path::Path) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let weak = self.weak_self.clone();
+        let send: viewer::SendEdited = Rc::new(move |draft, sensitive| {
+            if let Some(t) = weak.upgrade() {
+                t.confirm_files(vec![draft], String::new(), sensitive);
+            }
+        });
+        let photo = viewer::Photo {
+            path: path.to_owned(),
+            name: f.name.clone(),
+            caption: e.text.clone(),
+            sensitive: f.sensitive,
+        };
+        viewer::show(&app, self.persona(), photo, Some(send));
     }
 
     /// A voice or video message that plays in the chat.
@@ -1937,23 +2041,23 @@ impl ChatView {
         );
     }
 
+    /// Opens a file that isn't a photo in the app the desktop picks.
     fn open_file(&self, path: &std::path::Path) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
         let weak = self.app.clone();
-        gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(
-            Some(&app.window),
-            gio::Cancellable::NONE,
-            move |r| {
-                if let (Err(_), Some(a)) = (r, weak.upgrade()) {
-                    a.toast("No application can open this file");
-                }
-            },
-        );
+        ui::open_externally(&app.window, path, move || {
+            if let Some(a) = weak.upgrade() {
+                a.toast("No application can open this file");
+            }
+        });
     }
 
-    fn message_menu(self: &Rc<Self>, anchor: &gtk::Box, e: &HistoryEntry, x: f64, y: f64) {
+    /// A message's menu. For an album (`run`: its photos), reply, react
+    /// and pin use the first photo; forward and delete take them all.
+    fn message_menu(self: &Rc<Self>, anchor: &gtk::Box, run: &[HistoryEntry], x: f64, y: f64) {
+        let e = &run[0];
         let pop = gtk::Popover::new();
         pop.set_parent(anchor);
         #[allow(clippy::cast_possible_truncation)]
@@ -2054,12 +2158,12 @@ impl ChatView {
             );
         }
         if e.poll.is_none() {
-            let (weak, entry) = (self.weak_self.clone(), e.clone());
+            let (weak, entries) = (self.weak_self.clone(), run.to_vec());
             item(
                 "Forward",
                 Box::new(move || {
                     if let Some(t) = weak.upgrade() {
-                        t.forward(&entry);
+                        t.forward(&entries);
                     }
                 }),
             );
@@ -2081,22 +2185,22 @@ impl ChatView {
                 }),
             );
         }
-        let (weak, entry) = (self.weak_self.clone(), e.clone());
+        let (weak, entries) = (self.weak_self.clone(), run.to_vec());
         item(
             "Delete for me",
             Box::new(move || {
                 if let Some(t) = weak.upgrade() {
-                    t.delete(&entry, false);
+                    t.delete(&entries, false);
                 }
             }),
         );
-        if e.outgoing && e.id != 0 && !group {
-            let (weak, entry) = (self.weak_self.clone(), e.clone());
+        if run.iter().all(|e| e.outgoing && e.id != 0) && !group {
+            let (weak, entries) = (self.weak_self.clone(), run.to_vec());
             item(
                 "Delete for everyone",
                 Box::new(move || {
                     if let Some(t) = weak.upgrade() {
-                        t.delete(&entry, true);
+                        t.delete(&entries, true);
                     }
                 }),
             );
@@ -2601,11 +2705,12 @@ impl ChatView {
         );
     }
 
-    fn delete(self: &Rc<Self>, e: &HistoryEntry, everyone: bool) {
+    /// Deletes messages: one, or every photo of an album.
+    fn delete(self: &Rc<Self>, entries: &[HistoryEntry], everyone: bool) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
-        let (group, device, entry) = (self.group(), self.device(), e.clone());
+        let (group, device, entries) = (self.group(), self.device(), entries.to_vec());
         let note = self.is_note();
         let ok = everyone.then(|| {
             "Deleted. Their devices delete it too, if they're running a current version.".to_owned()
@@ -2614,13 +2719,26 @@ impl ChatView {
             self.persona(),
             "delete",
             move |n| {
-                match group {
-                    _ if note => n.delete_note(entry.at_ms, entry.device),
-                    Some(g) => n.delete_group_entry(g, entry.at_ms, entry.device),
-                    None if entry.id != 0 => n.delete_messages(device, vec![entry.id], everyone),
-                    None => n.delete_entry(device, entry.at_ms, entry.device),
+                // With a chat's message ids, all in one go.
+                if !note && group.is_none() && entries.iter().all(|e| e.id != 0) {
+                    let ids = entries.iter().map(|e| e.id).collect();
+                    return n.delete_messages(device, ids, everyone).map(|_| ());
                 }
-                .map(|_| ())
+                for e in entries {
+                    match &group {
+                        _ if note => n.delete_note(e.at_ms, e.device).map(|_| ()),
+                        Some(g) => n
+                            .delete_group_entry(g.clone(), e.at_ms, e.device)
+                            .map(|_| ()),
+                        None if e.id != 0 => n
+                            .delete_messages(device.clone(), vec![e.id], everyone)
+                            .map(|_| ()),
+                        None => n
+                            .delete_entry(device.clone(), e.at_ms, e.device)
+                            .map(|_| ()),
+                    }?;
+                }
+                Ok(())
             },
             ok,
         );
@@ -3169,7 +3287,7 @@ impl ChatView {
             move |kept: Result<String, String>| {
                 let Some(t) = weak.upgrade() else { return };
                 match kept {
-                    Ok(path) => t.confirm_files(vec![path.into()]),
+                    Ok(path) => t.confirm_files(vec![path.into()], String::new(), false),
                     Err(e) => t.toast(&format!("Couldn't get the GIF: {e}")),
                 }
             },
@@ -3193,54 +3311,157 @@ impl ChatView {
                 .filter_map(|i| files.item(i).and_downcast::<gio::File>()?.path())
                 .collect();
             if !paths.is_empty() {
-                t.confirm_files(paths);
+                t.confirm_files(paths, String::new(), false);
             }
         });
     }
 
     /// Asks for a caption and whether the files are sensitive, then sends.
-    fn confirm_files(self: &Rc<Self>, paths: Vec<std::path::PathBuf>) {
+    /// Photos show as thumbnails with *Edit*; an edit replaces the photo
+    /// here and keeps the caption and *Sensitive* as they were.
+    fn confirm_files(
+        self: &Rc<Self>,
+        paths: Vec<std::path::PathBuf>,
+        caption: String,
+        sensitive: bool,
+    ) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
-        let images = paths
-            .iter()
-            .filter(|p| core::is_image(&p.file_name().unwrap_or_default().to_string_lossy()))
-            .count();
+        let name_of = |p: &std::path::Path| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let images = paths.iter().filter(|p| core::is_image(&name_of(p))).count();
         let what = match (paths.len(), images == paths.len()) {
             (1, true) => "a photo".to_owned(),
             (1, false) => "a file".to_owned(),
             (n, true) => format!("{n} photos"),
             (n, false) => format!("{n} files"),
         };
-        let names = paths
-            .iter()
-            .map(|p| {
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         let d = ui::alert(
             &format!("Send {what}"),
-            &names,
+            "",
             &[("cancel", "Cancel"), ("send", "Send")],
         );
         d.set_response_appearance("send", adw::ResponseAppearance::Suggested);
         let b = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        let caption = gtk::Entry::builder()
+        let caption_entry = gtk::Entry::builder()
             .placeholder_text("Add a message")
+            .text(&caption)
             .activates_default(true)
             .build();
-        let sensitive = gtk::CheckButton::with_label(if images > 0 {
+        let sensitive_check = gtk::CheckButton::with_label(if images > 0 {
             "Sensitive: they see it covered until they click it"
         } else {
             "Sensitive: shown covered until opened"
         });
-        b.append(&caption);
-        b.append(&sensitive);
+        sensitive_check.set_active(sensitive);
+        // Closed to edit a photo: its drafts stay for the dialog that
+        // comes back.
+        let editing = Rc::new(Cell::new(false));
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let thumbs = Thumbs::default();
+        for (i, p) in paths.iter().enumerate() {
+            let name = name_of(p);
+            let cell: gtk::Widget = if core::is_image(&name) && !viewer::is_gif(&name) {
+                let overlay = gtk::Overlay::new();
+                let pic = gtk::Picture::builder()
+                    .can_shrink(true)
+                    .content_fit(gtk::ContentFit::Cover)
+                    .build();
+                pic.add_css_class("photo");
+                viewer::thumbnail(&pic, Rc::default(), p.clone(), 2 * 104, thumbs.clone());
+                overlay.set_child(Some(&pic));
+                let edit = gtk::Button::with_label("Edit");
+                edit.add_css_class("osd");
+                edit.add_css_class("pill");
+                edit.set_halign(gtk::Align::End);
+                edit.set_valign(gtk::Align::End);
+                edit.set_margin_end(4);
+                edit.set_margin_bottom(4);
+                edit.set_tooltip_text(Some("Draw or add text"));
+                let (weak, dd, paths, caption_entry, sensitive_check, editing) = (
+                    self.weak_self.clone(),
+                    d.clone(),
+                    paths.clone(),
+                    caption_entry.clone(),
+                    sensitive_check.clone(),
+                    editing.clone(),
+                );
+                edit.connect_clicked(move |_| {
+                    let (Some(t), Some(app)) =
+                        (weak.upgrade(), weak.upgrade().and_then(|t| t.app.upgrade()))
+                    else {
+                        return;
+                    };
+                    let caption = caption_entry.text().trim().to_owned();
+                    let sensitive = sensitive_check.is_active();
+                    editing.set(true);
+                    dd.close();
+                    let (weak, paths, persona) = (t.weak_self.clone(), paths.clone(), t.persona());
+                    let core = app.core.clone();
+                    let source = paths[i].clone();
+                    editor::open(
+                        &app,
+                        persona.clone(),
+                        source,
+                        name_of(&paths[i]),
+                        move |r| {
+                            let Some(t) = weak.upgrade() else { return };
+                            let mut paths = paths.clone();
+                            if let Some(draft) = r {
+                                // An earlier edit of this photo is replaced.
+                                if core.is_edit_draft(persona.as_deref(), &paths[i]) {
+                                    let _ = std::fs::remove_file(&paths[i]);
+                                }
+                                paths[i] = draft;
+                            }
+                            t.confirm_files(paths, caption.clone(), sensitive);
+                        },
+                    );
+                });
+                overlay.add_overlay(&edit);
+                overlay.upcast()
+            } else if viewer::is_gif(&name) && viewer::checked_size(p).is_ok() {
+                let pic = gtk::Picture::for_filename(p);
+                pic.set_can_shrink(true);
+                pic.set_content_fit(gtk::ContentFit::Cover);
+                pic.add_css_class("photo");
+                ui::animate(&pic, p);
+                pic.upcast()
+            } else {
+                let file = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                file.set_valign(gtk::Align::Center);
+                let icon = gtk::Image::from_icon_name("text-x-generic-symbolic");
+                icon.set_pixel_size(32);
+                file.append(&icon);
+                let l = gtk::Label::builder()
+                    .label(&name)
+                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                    .max_width_chars(12)
+                    .build();
+                l.add_css_class("caption");
+                file.append(&l);
+                file.upcast()
+            };
+            cell.set_size_request(104, 104);
+            cell.set_tooltip_text(Some(&name));
+            cell.add_css_class("send-thumb");
+            strip.append(&cell);
+        }
+        let strip_scroll = gtk::ScrolledWindow::builder()
+            .child(&strip)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .min_content_height(112)
+            .propagate_natural_width(true)
+            .build();
+        b.append(&strip_scroll);
+        b.append(&caption_entry);
+        b.append(&sensitive_check);
         if images > 0 && app.core.settings().flag(settings::STRIP) {
             b.append(&ui::label(
                 "Location and camera details are removed before sending.",
@@ -3249,13 +3470,25 @@ impl ChatView {
         }
         d.set_extra_child(Some(&b));
         let weak = self.weak_self.clone();
-        d.connect_response(Some("send"), move |_, _| {
-            if let Some(t) = weak.upgrade() {
+        d.connect_response(None, move |_, r| {
+            let Some(t) = weak.upgrade() else { return };
+            if r == "send" {
                 t.send_files(
                     paths.clone(),
-                    caption.text().trim().to_owned(),
-                    sensitive.is_active(),
+                    caption_entry.text().trim().to_owned(),
+                    sensitive_check.is_active(),
                 );
+            } else if !editing.get()
+                && let Some(app) = t.app.upgrade()
+            {
+                // Cancelled: edited copies go.
+                let persona = t.persona();
+                for p in paths
+                    .iter()
+                    .filter(|p| app.core.is_edit_draft(persona.as_deref(), p))
+                {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         });
         d.present(Some(&app.window));
@@ -3267,12 +3500,12 @@ impl ChatView {
         caption: String,
         sensitive: bool,
     ) {
-        let Some(node) = self.node() else { return };
+        let (Some(node), Some(app)) = (self.node(), self.app.upgrade()) else {
+            return;
+        };
         let dest = self.dest();
-        let strip = self
-            .app
-            .upgrade()
-            .is_none_or(|a| a.core.settings().flag(settings::STRIP));
+        let strip = app.core.settings().flag(settings::STRIP);
+        let (core, persona) = (app.core.clone(), self.persona());
         self.toast(if paths.len() == 1 {
             "Sending…"
         } else {
@@ -3330,10 +3563,30 @@ impl ChatView {
                         clip: None,
                         forwarded: false,
                     };
-                    let location = Some(p.display().to_string());
-                    let r = send_file_to(&node, &dest, name.clone(), data, location, options);
-                    if let Err(e) = r {
-                        failed.push(format!("{name}: {e}"));
+                    // An edited photo is kept with the chat's photos once
+                    // sent; until then it stays a draft, which the sweep
+                    // can't take.
+                    let draft = core.is_edit_draft(persona.as_deref(), p);
+                    let location = if draft {
+                        match core.edit_destination(persona.as_deref(), p) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                failed.push(format!("{name}: {e}"));
+                                continue;
+                            }
+                        }
+                    } else {
+                        p.clone()
+                    };
+                    let at = Some(location.display().to_string());
+                    match send_file_to(&node, &dest, name.clone(), data, at, options) {
+                        Err(e) => failed.push(format!("{name}: {e}")),
+                        Ok(()) if draft => {
+                            if let Err(e) = core::adopt_edit(p, &location) {
+                                core.say(format!("! keeping an edited photo: {e}"));
+                            }
+                        }
+                        Ok(()) => {}
                     }
                 }
                 failed
@@ -4188,126 +4441,332 @@ impl ChatView {
     }
 
     /// The conversation's photos, files and links, newest first.
+    /// *Media, files and links*: the chat's photos, files and links, the
+    /// newest first, from its last [`MEDIA_HISTORY`] messages.
     fn media(self: &Rc<Self>) {
+        let Some(node) = self.node() else { return };
+        let (group, device, note) = (self.group(), self.device(), self.is_note());
+        let weak = self.weak_self.clone();
+        bg(
+            move || match &group {
+                _ if note => node.note_history(MEDIA_HISTORY).unwrap_or_default(),
+                Some(g) => node
+                    .group_history(g.clone(), MEDIA_HISTORY)
+                    .unwrap_or_default(),
+                None => node.history(device, MEDIA_HISTORY).unwrap_or_default(),
+            },
+            move |entries| {
+                if let Some(t) = weak.upgrade() {
+                    t.show_media(Rc::new(entries));
+                }
+            },
+        );
+    }
+
+    fn show_media(self: &Rc<Self>, entries: Rc<Vec<HistoryEntry>>) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
-        let entries = self.entries.borrow().clone();
+        let lists = media_lists(&entries);
         let d = adw::Dialog::builder()
             .title("Media, files and links")
-            .content_width(560)
-            .content_height(600)
+            .content_width(600)
+            .content_height(640)
             .build();
-        let page = adw::PreferencesPage::new();
-        let photos = adw::PreferencesGroup::builder().title("Photos").build();
-        let flow = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .min_children_per_line(3)
-            .max_children_per_line(5)
-            .row_spacing(6)
-            .column_spacing(6)
-            .build();
-        let files = adw::PreferencesGroup::builder().title("Files").build();
-        let links = adw::PreferencesGroup::builder().title("Links").build();
-        let (mut n_photos, mut n_files, mut n_links) = (0, 0, 0);
-        for e in entries.iter().rev() {
-            if let Some(f) = &e.file {
-                let path = f
+        let stack = adw::ViewStack::new();
+        let empty = |what: &str| -> gtk::Widget {
+            adw::StatusPage::builder()
+                .description(format!(
+                    "No {what} in this conversation (disappearing messages take theirs with them)."
+                ))
+                .build()
+                .upcast()
+        };
+
+        let photos: gtk::Widget = if lists.photos.is_empty() {
+            empty("photos")
+        } else {
+            self.photo_grid(&entries, &lists.photos).upcast()
+        };
+        stack
+            .add_titled(
+                &photos,
+                Some("photos"),
+                &format!("Photos · {}", lists.photos.len()),
+            )
+            .set_icon_name(Some("image-x-generic-symbolic"));
+
+        let files: gtk::Widget = if lists.files.is_empty() {
+            empty("files")
+        } else {
+            let page = adw::PreferencesPage::new();
+            let group = adw::PreferencesGroup::new();
+            for &i in &lists.files {
+                let (e, Some(f)) = (&entries[i], &entries[i].file) else {
+                    continue;
+                };
+                let title = match f.clip {
+                    Some(c) => core::file_label(&f.name, f.sensitive, "", Some(c)),
+                    None if f.sensitive => format!("📎 Sensitive file: {}", f.name),
+                    None => format!("📎 {}", f.name),
+                };
+                let mut sub = format!("{} · {}", ui::human_size(f.size), ui::time_label(e.at_ms));
+                if !e.text.is_empty() {
+                    sub.push_str(&format!(" · {}", e.text));
+                }
+                let row = ui::link_button_row(&title, &sub);
+                match f
                     .location
                     .as_ref()
                     .map(std::path::PathBuf::from)
-                    .filter(|p| p.exists());
-                if core::is_image(&f.name)
-                    && let Some(p) = path
+                    .filter(|p| p.exists())
                 {
-                    n_photos += 1;
-                    let w: gtk::Widget = if f.sensitive && !e.outgoing {
-                        gtk::Button::with_label("Sensitive").upcast()
-                    } else {
-                        let pic = gtk::Picture::for_filename(&p);
-                        pic.set_content_fit(gtk::ContentFit::Cover);
-                        pic.set_size_request(96, 96);
-                        let b = gtk::Button::new();
-                        b.set_child(Some(&pic));
-                        b.upcast()
-                    };
-                    w.set_size_request(96, 96);
-                    if let Ok(b) = w.clone().downcast::<gtk::Button>() {
+                    Some(p) => {
                         let weak = self.weak_self.clone();
-                        b.add_css_class("flat");
-                        b.connect_clicked(move |_| {
+                        row.connect_activated(move |_| {
                             if let Some(t) = weak.upgrade() {
                                 t.open_file(&p);
                             }
                         });
                     }
-                    flow.append(&w);
-                    continue;
+                    None => row.set_activatable(false),
                 }
-                n_files += 1;
-                let row = ui::link_button_row(
-                    &f.name,
-                    &format!("{} · {}", ui::human_size(f.size), ui::time_label(e.at_ms)),
-                );
-                if let Some(p) = path {
-                    let weak = self.weak_self.clone();
-                    row.connect_activated(move |_| {
-                        if let Some(t) = weak.upgrade() {
-                            t.open_file(&p);
-                        }
-                    });
-                } else {
-                    row.set_activatable(false);
-                }
-                files.add(&row);
+                group.add(&row);
             }
-            for url in urls(&e.text) {
-                n_links += 1;
-                let row = ui::link_button_row(&url, &ui::time_label(e.at_ms));
+            page.add(&group);
+            page.upcast()
+        };
+        stack
+            .add_titled(
+                &files,
+                Some("files"),
+                &format!("Files · {}", lists.files.len()),
+            )
+            .set_icon_name(Some("text-x-generic-symbolic"));
+
+        let links: gtk::Widget = if lists.links.is_empty() {
+            empty("links")
+        } else {
+            let page = adw::PreferencesPage::new();
+            let group = adw::PreferencesGroup::new();
+            for (url, i) in &lists.links {
+                let row = ui::link_button_row(url, &ui::time_label(entries[*i].at_ms));
                 let (w, u) = (app.window.clone(), url.clone());
-                row.connect_activated(move |_| {
-                    let u = u.clone();
-                    let w2 = w.clone();
-                    ui::confirm(
-                        &w,
-                        "Open this link?",
-                        &u.clone(),
-                        "Open",
-                        false,
-                        move || {
-                            gtk::UriLauncher::new(&u).launch(
-                                Some(&w2),
-                                gio::Cancellable::NONE,
-                                |_| {},
-                            );
-                        },
-                    );
-                });
-                links.add(&row);
+                row.connect_activated(move |_| ui::confirm_link(&w, &u));
+                group.add(&row);
             }
-        }
-        if n_photos > 0 {
-            photos.add(&flow);
-            page.add(&photos);
-        }
-        if n_files > 0 {
-            page.add(&files);
-        }
-        if n_links > 0 {
-            page.add(&links);
-        }
-        if n_photos + n_files + n_links == 0 {
-            let none = adw::PreferencesGroup::builder()
-                .description("No photos, files or links in this conversation yet.")
-                .build();
-            page.add(&none);
-        }
+            page.add(&group);
+            page.upcast()
+        };
+        stack
+            .add_titled(
+                &links,
+                Some("links"),
+                &format!("Links · {}", lists.links.len()),
+            )
+            .set_icon_name(Some("web-browser-symbolic"));
+
+        let header = adw::HeaderBar::new();
+        header.set_title_widget(Some(
+            &adw::ViewSwitcher::builder()
+                .stack(&stack)
+                .policy(adw::ViewSwitcherPolicy::Wide)
+                .build(),
+        ));
         let view = adw::ToolbarView::new();
-        view.add_top_bar(&adw::HeaderBar::new());
-        view.set_content(Some(&page));
+        view.add_top_bar(&header);
+        view.set_content(Some(&stack));
         d.set_child(Some(&view));
         d.present(Some(&app.window));
     }
+
+    /// The photos of `entries` (`photos`: their indices) as a grid that
+    /// decodes only the cells on screen, off the main thread. Sensitive
+    /// photos are covered and never decoded here; ones not on this
+    /// computer can't be opened.
+    fn photo_grid(
+        self: &Rc<Self>,
+        entries: &Rc<Vec<HistoryEntry>>,
+        photos: &[usize],
+    ) -> gtk::ScrolledWindow {
+        /// One cell's widgets, and the photo it shows now.
+        struct Cell {
+            pic: gtk::Picture,
+            cover: gtk::Label,
+            bound: Rc<RefCell<Option<std::path::PathBuf>>>,
+        }
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        for &i in photos {
+            store.append(&glib::BoxedAnyObject::new(i));
+        }
+        let cells: Rc<RefCell<HashMap<gtk::Overlay, Cell>>> = Rc::default();
+        let cache = Thumbs::default();
+        let factory = gtk::SignalListItemFactory::new();
+        let c = cells.clone();
+        factory.connect_setup(move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let overlay = gtk::Overlay::new();
+            overlay.set_size_request(120, 120);
+            overlay.add_css_class("album-cell");
+            let pic = gtk::Picture::builder()
+                .can_shrink(true)
+                .content_fit(gtk::ContentFit::Cover)
+                .build();
+            let cover = gtk::Label::new(None);
+            cover.add_css_class("photo-cover");
+            cover.set_hexpand(true);
+            cover.set_vexpand(true);
+            overlay.set_child(Some(&pic));
+            overlay.add_overlay(&cover);
+            item.set_child(Some(&overlay));
+            c.borrow_mut().insert(
+                overlay,
+                Cell {
+                    pic,
+                    cover,
+                    bound: Rc::default(),
+                },
+            );
+        });
+        let (c, e) = (cells.clone(), entries.clone());
+        factory.connect_bind(move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let (Some(overlay), Some(obj)) = (
+                item.child().and_downcast::<gtk::Overlay>(),
+                item.item().and_downcast::<glib::BoxedAnyObject>(),
+            ) else {
+                return;
+            };
+            let cells = c.borrow();
+            let Some(cell) = cells.get(&overlay) else {
+                return;
+            };
+            let Some(f) = e.get(*obj.borrow::<usize>()).and_then(|e| e.file.as_ref()) else {
+                return;
+            };
+            let path = f
+                .location
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.exists());
+            let cover = match (&path, f.sensitive) {
+                (Some(_), true) => Some(("🔒", "Sensitive photo")),
+                (None, _) => Some(("📷", "Photo not on this computer")),
+                (Some(_), false) => None,
+            };
+            match (cover, path) {
+                (Some((icon, what)), _) => {
+                    *cell.bound.borrow_mut() = None;
+                    cell.pic.set_paintable(gdk::Paintable::NONE);
+                    cell.cover.set_text(icon);
+                    cell.cover.set_tooltip_text(Some(what));
+                    cell.cover.set_visible(true);
+                }
+                (None, Some(p)) => {
+                    cell.cover.set_visible(false);
+                    cell.cover.set_tooltip_text(None);
+                    viewer::thumbnail(&cell.pic, cell.bound.clone(), p, 240, cache.clone());
+                }
+                (None, None) => {}
+            }
+        });
+        let c = cells.clone();
+        factory.connect_unbind(move |_, item| {
+            let Some(overlay) = item
+                .downcast_ref::<gtk::ListItem>()
+                .and_then(|i| i.child().and_downcast::<gtk::Overlay>())
+            else {
+                return;
+            };
+            if let Some(cell) = c.borrow().get(&overlay) {
+                *cell.bound.borrow_mut() = None;
+                cell.pic.set_paintable(gdk::Paintable::NONE);
+            }
+        });
+        let grid = gtk::GridView::builder()
+            .model(&gtk::NoSelection::new(Some(store)))
+            .factory(&factory)
+            .min_columns(3)
+            .max_columns(5)
+            .single_click_activate(true)
+            .build();
+        let (weak, e, order) = (self.weak_self.clone(), entries.clone(), photos.to_vec());
+        grid.connect_activate(move |_, pos| {
+            let Some(t) = weak.upgrade() else { return };
+            let Some(entry) = order.get(pos as usize).and_then(|&i| e.get(i)) else {
+                return;
+            };
+            let Some(f) = &entry.file else { return };
+            if let Some(p) = f
+                .location
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.exists())
+            {
+                // Sensitive ones too: uncovered only in the viewer.
+                t.view_photo(entry, f, &p);
+            }
+        });
+        gtk::ScrolledWindow::builder()
+            .child(&grid)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build()
+    }
+}
+
+/// A chat's photos, files and links, as indices into its entries, the
+/// newest first. Voice and video messages count as files; a photo counts
+/// whether or not it is on this computer.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MediaLists {
+    photos: Vec<usize>,
+    files: Vec<usize>,
+    links: Vec<(String, usize)>,
+}
+
+fn media_lists(entries: &[HistoryEntry]) -> MediaLists {
+    let mut out = MediaLists::default();
+    for (i, e) in entries.iter().enumerate().rev() {
+        if let Some(f) = &e.file {
+            if core::is_image(&f.name) && f.clip.is_none() {
+                out.photos.push(i);
+            } else {
+                out.files.push(i);
+            }
+        }
+        out.links.extend(urls(&e.text).into_iter().map(|u| (u, i)));
+    }
+    out
+}
+
+/// How a chat's entries are drawn: a run of two or more photos of one
+/// album, consecutive and from one sender in one direction, is one
+/// bubble; anything else is a run of one.
+fn album_runs(entries: &[HistoryEntry]) -> Vec<std::ops::Range<usize>> {
+    fn album_photo(e: &HistoryEntry) -> Option<(u64, &str, bool)> {
+        e.file
+            .as_ref()
+            .filter(|f| f.album != 0 && f.clip.is_none() && core::is_image(&f.name))
+            .map(|f| (f.album, e.device.as_str(), e.outgoing))
+    }
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let mut end = i + 1;
+        if let Some(key) = album_photo(&entries[i]) {
+            while end < entries.len() && album_photo(&entries[end]) == Some(key) {
+                end += 1;
+            }
+        }
+        runs.push(i..end);
+        i = end;
+    }
+    runs
 }
 
 /// Whether a message at `at_ms` may be older than all of `entries`, the
@@ -4365,41 +4824,9 @@ fn linkify(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Plays an animated GIF in `pic` (GTK draws only its first frame) while
-/// the picture exists; it only advances while it's on screen.
-fn animate(pic: &gtk::Picture, path: &std::path::Path) {
-    let is_gif = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
-    if !is_gif {
-        return;
-    }
-    let Ok(anim) = gdk::gdk_pixbuf::PixbufAnimation::from_file(path) else {
-        return;
-    };
-    if anim.is_static_image() {
-        return;
-    }
-    let iter = anim.iter(None);
-    let weak = pic.downgrade();
-    glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
-        let Some(pic) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        if pic.is_mapped() && iter.advance(std::time::SystemTime::now()) {
-            pic.set_paintable(Some(&gdk::Texture::for_pixbuf(&iter.pixbuf())));
-        }
-        glib::ControlFlow::Continue
-    });
-}
-
 /// Image formats the node can't strip metadata from (it does JPEG, PNG
 /// and WebP; GIFs carry none worth the name): they're sent as JPEG.
 const CONVERT: [&str; 6] = ["heic", "heif", "avif", "bmp", "tif", "tiff"];
-/// Larger images are refused rather than decoded (decompression bombs).
-const MAX_PIXELS: i64 = 100_000_000;
-/// Converted photos are scaled to fit this, as the Android app does.
-const MAX_SIDE: i32 = 4096;
 
 /// An image the node can't strip, re-encoded as JPEG (which then carries
 /// no metadata): the name and bytes to send. Others pass through. Its
@@ -4534,6 +4961,121 @@ fn action_confirm(a: GroupMemberAction, name: &str, group: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A history entry; `file`: (name, album, clip).
+    fn entry(
+        at_ms: u64,
+        device: &str,
+        file: Option<(&str, u64, bool)>,
+        text: &str,
+    ) -> HistoryEntry {
+        HistoryEntry {
+            at_ms,
+            outgoing: false,
+            device: device.into(),
+            text: text.into(),
+            disappearing: false,
+            file: file.map(|(name, album, clip)| threnody_ffi::FileInfo {
+                name: name.into(),
+                size: 1,
+                location: None,
+                sensitive: false,
+                album,
+                clip: clip.then_some(Clip {
+                    video: false,
+                    duration_ms: 1000,
+                }),
+            }),
+            delivered: false,
+            read: false,
+            id: at_ms,
+            edited: false,
+            recipients: 0,
+            delivered_to: 0,
+            reactions: Vec::new(),
+            quote: None,
+            mentions: Vec::new(),
+            poll: None,
+            forwarded: false,
+            list: None,
+        }
+    }
+
+    #[test]
+    fn albums_group_consecutive_photos_from_one_sender() {
+        let entries = [
+            entry(1, "d1", None, "hi"),
+            entry(2, "d1", Some(("a.jpg", 1, false)), ""),
+            entry(3, "d1", Some(("b.png", 1, false)), ""),
+            entry(4, "d2", Some(("c.jpg", 1, false)), ""),
+            entry(5, "d2", Some(("d.jpg", 0, false)), ""),
+            entry(6, "d2", Some(("e.jpg", 2, false)), ""),
+            entry(7, "d2", Some(("f.webp", 2, false)), ""),
+        ];
+        assert_eq!(album_runs(&entries), vec![0..1, 1..3, 3..4, 4..5, 5..7]);
+    }
+
+    #[test]
+    fn mixed_albums_stay_apart() {
+        // A photo and a PDF of one album: separate bubbles.
+        let mixed = [
+            entry(1, "d", Some(("a.jpg", 9, false)), ""),
+            entry(2, "d", Some(("b.pdf", 9, false)), ""),
+        ];
+        assert_eq!(album_runs(&mixed), vec![0..1, 1..2]);
+        // A voice message in an album.
+        let clip = [
+            entry(1, "d", Some(("a.jpg", 9, false)), ""),
+            entry(2, "d", Some(("voice.ogg", 9, true)), ""),
+        ];
+        assert_eq!(album_runs(&clip), vec![0..1, 1..2]);
+        // One device, one album, but one sent and one received.
+        let mut both = [
+            entry(1, "d", Some(("a.jpg", 9, false)), ""),
+            entry(2, "d", Some(("b.jpg", 9, false)), ""),
+        ];
+        both[0].outgoing = true;
+        assert_eq!(album_runs(&both), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn a_lone_album_photo_is_a_run_of_one() {
+        let one = [entry(1, "d", Some(("a.jpg", 5, false)), "caption")];
+        assert_eq!(album_runs(&one), vec![0..1]);
+        assert!(album_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn media_lists_are_newest_first() {
+        let mut on_device = entry(1, "d", Some(("a.jpg", 0, false)), "");
+        if let Some(f) = on_device.file.as_mut() {
+            f.location = Some("/tmp/a.jpg".into());
+        }
+        let entries = [
+            on_device,
+            entry(2, "d", None, "see https://example.org/a and http://x.test."),
+            entry(3, "d", Some(("report.pdf", 0, false)), ""),
+            entry(4, "d", Some(("voice.ogg", 0, true)), ""),
+            entry(
+                5,
+                "d",
+                Some(("b.png", 0, false)),
+                "caption https://example.org/b",
+            ),
+        ];
+        let l = media_lists(&entries);
+        // b.png isn't on this computer: a photo all the same.
+        assert_eq!(l.photos, vec![4, 0]);
+        assert_eq!(l.files, vec![3, 2]);
+        assert_eq!(
+            l.links,
+            vec![
+                ("https://example.org/b".to_owned(), 4),
+                ("https://example.org/a".to_owned(), 1),
+                ("http://x.test".to_owned(), 1),
+            ]
+        );
+    }
 
     #[test]
     fn photos_the_node_cant_strip_go_as_jpeg() {
