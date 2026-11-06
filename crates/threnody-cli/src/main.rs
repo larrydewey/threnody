@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use threnody_core::invite::{InviteKey, InviteLink};
+use threnody_core::persona::Personas;
 use threnody_core::store::{Contact, Home, Lookup};
 use threnody_core::{Identity, safety_number};
 use threnody_net::AcceptPolicy;
@@ -500,15 +501,7 @@ pub fn no_node_running(home: &Home) -> Result<std::fs::File> {
             );
         }
     }
-    std::fs::create_dir_all(home.dir())?;
-    let f = std::fs::File::create(home.dir().join("desktop.lock"))?;
-    if f.try_lock().is_err() {
-        bail!(
-            "a node is already running with {} (threnody run, or the app); stop it first",
-            home.dir().display()
-        );
-    }
-    Ok(f)
+    node_lock(home)
 }
 
 /// Asks for a new passphrase twice.
@@ -585,15 +578,18 @@ fn main() -> Result<()> {
     }
     // As a persona, every command works on the persona's own home; the
     // main identity is kept only to sign a reveal (`/reveal`).
-    let (home, main_identity) = match &cli.persona {
+    let main_dir = main_home.dir().to_path_buf();
+    let (home, main_identity, persona_info) = match &cli.persona {
         Some(q) => {
             let main = load_identity(&main_home)?;
-            let personas = threnody_core::persona::Personas::new(&main_home, &main);
-            personas.burn_expired(threnody_core::now_ms())?;
+            let personas = Personas::new(&main_home, &main);
+            for id in burn_expired(&personas, threnody_core::now_ms())? {
+                eprintln!("Burned expired anonymous identity {id}.");
+            }
             let info = find_persona(&personas.list()?, q)?;
-            (personas.home(&info.id)?, Some(main))
+            (personas.home(&info.id)?, Some(main), Some(info))
         }
-        None => (main_home, None),
+        None => (main_home, None, None),
     };
     match cli.cmd {
         Cmd::Persona { .. } => unreachable!(),
@@ -921,6 +917,20 @@ fn main() -> Result<()> {
             let _lock = no_node_running(&home)?;
             let identity = load_identity(&home)?;
             let persona = main_identity.is_some();
+            // The main identity's node burns its expired anonymous
+            // identities as it runs; an anonymous identity's node stops
+            // when its own time is up, and burns it below.
+            let burn_personas: Option<chat::BurnExpired> = (!persona).then(|| {
+                let (dir, main) = (main_dir.clone(), Identity::from_seed(&identity.seed()));
+                Box::new(move || {
+                    let home = Home::new(&dir);
+                    burn_expired(&Personas::new(&home, &main), threnody_core::now_ms())
+                }) as chat::BurnExpired
+            });
+            let burn_self = main_identity
+                .as_ref()
+                .map(|m| Identity::from_seed(&m.seed()))
+                .zip(persona_info.clone());
             if persona && (!volunteer_relay.is_empty() || serve_directory.is_some()) {
                 bail!(
                     "anonymous identities can't volunteer or run a directory: both publish \
@@ -973,10 +983,27 @@ fn main() -> Result<()> {
                 use_volunteers: !no_volunteers,
                 directory_threshold,
                 control,
+                expires_ms: persona_info.as_ref().and_then(|p| p.expires_ms),
+                burn_personas,
             }));
             // Don't wait on a stdin read still pending after a signal.
             rt.shutdown_timeout(std::time::Duration::from_secs(1));
             r?;
+            if let Some((main, info)) = burn_self
+                && info
+                    .expires_ms
+                    .is_some_and(|t| t <= threnody_core::now_ms())
+            {
+                // Its node (this one) has stopped; the lock is ours.
+                let main_home = Home::new(&main_dir);
+                let personas = Personas::new(&main_home, &main);
+                keyring::delete(&personas.home(&info.id)?);
+                personas.burn(&info.id)?;
+                println!(
+                    "Burned {} ({}): its time was up, and its keys and everything it kept are gone.",
+                    info.id, info.label
+                );
+            }
         }
         Cmd::Ctl { command } => ctl(&home, &command.join(" "))?,
     }
@@ -1052,13 +1079,45 @@ fn made_ago(at_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// Holds `home`'s node lock (see [`no_node_running`]) until dropped, or
+/// fails if a node has it.
+fn node_lock(home: &Home) -> Result<std::fs::File> {
+    std::fs::create_dir_all(home.dir())?;
+    let f = std::fs::File::create(home.dir().join("desktop.lock"))?;
+    if f.try_lock().is_err() {
+        bail!(
+            "a node is already running with {} (threnody run, or the app); stop it first",
+            home.dir().display()
+        );
+    }
+    Ok(f)
+}
+
+/// Burns the anonymous identities whose time is up, with their keyring
+/// entries; returns their ids. One whose node is running is left to it:
+/// the node stops at that time and burns it then.
+fn burn_expired(personas: &Personas, now_ms: u64) -> Result<Vec<String>> {
+    let mut burned = Vec::new();
+    for p in personas.list()? {
+        if !p.expires_ms.is_some_and(|t| t <= now_ms) {
+            continue;
+        }
+        let home = personas.home(&p.id)?;
+        let Ok(_lock) = node_lock(&home) else {
+            continue;
+        };
+        keyring::delete(&home);
+        personas.burn(&p.id)?;
+        burned.push(p.id);
+    }
+    Ok(burned)
+}
+
 fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
-    use threnody_core::persona::Personas;
     let main = load_identity(main_home)?;
     let personas = Personas::new(main_home, &main);
     let now = threnody_core::now_ms();
-    for id in personas.burn_expired(now)? {
-        keyring::delete(&personas.home(&id)?);
+    for id in burn_expired(&personas, now)? {
         println!("Burned expired anonymous identity {id}.");
     }
     match action {
@@ -1076,15 +1135,17 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
                 }
                 None => None,
             };
-            // Sealed like the main identity: with a keyring key of its own.
-            let (info, home, identity) = personas.create(&label, expires, None, now)?;
-            if !no_keyring {
-                match keyring::create(&home) {
-                    Ok(pw) => home.change_passphrase(None, Some(pw.as_bytes()))?,
-                    Err(e) => {
-                        eprintln!("No system keyring ({e:#}); its key is stored unprotected.")
-                    }
-                }
+            // Sealed like the main identity, from its first write: with a
+            // keyring key of its own.
+            let pw = (!no_keyring).then(keyring::random);
+            let (info, home, identity) =
+                personas.create(&label, expires, pw.as_ref().map(|p| p.as_bytes()), now)?;
+            if let Some(pw) = &pw
+                && let Err(e) = keyring::store(&home, pw)
+            {
+                // Nowhere to keep its key.
+                home.change_passphrase(Some(pw.as_bytes()), None)?;
+                eprintln!("No system keyring ({e:#}); its key is stored unprotected.");
             }
             println!("Anonymous identity {} ({label})", info.id);
             println!("Fingerprint: {}", identity.public().fingerprint());
@@ -1120,6 +1181,8 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
         PersonaCmd::Burn { persona } => {
             let info = find_persona(&personas.list()?, &persona)?;
             let home = personas.home(&info.id)?;
+            // Its running node would keep it reachable and write it back.
+            let _lock = node_lock(&home)?;
             keyring::delete(&home);
             personas.burn(&info.id)?;
             println!(

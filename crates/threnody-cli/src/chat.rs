@@ -56,7 +56,18 @@ pub struct Options {
     /// Run without a terminal, as a service: commands come over this
     /// control socket ([`control_path`]), not stdin.
     pub control: Option<PathBuf>,
+    /// When this anonymous identity's time is up: the node stops then.
+    pub expires_ms: Option<u64>,
+    /// Burns the main identity's expired anonymous identities, at the
+    /// start and then every minute.
+    pub burn_personas: Option<BurnExpired>,
 }
+
+/// Burns expired anonymous identities; returns their ids.
+pub type BurnExpired = Box<dyn Fn() -> Result<Vec<String>> + Send>;
+
+/// How often a node checks for anonymous identities whose time is up.
+const EXPIRY_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Where a node running as a service takes commands (`threnody ctl`):
 /// `$THRENODY_CONTROL`, else `control.sock` in the data directory.
@@ -335,6 +346,19 @@ pub async fn run(opts: Options) -> Result<()> {
         .then(|| BufReader::new(tokio::io::stdin()).lines());
     let stopped = stop_signal();
     tokio::pin!(stopped);
+    // To the millisecond while awake; the minute check catches a suspend.
+    let expires_ms = opts.expires_ms;
+    let expiry = async move {
+        match expires_ms {
+            Some(t) => {
+                let left = t.saturating_sub(threnody_core::now_ms());
+                tokio::time::sleep(std::time::Duration::from_millis(left)).await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(expiry);
+    let mut expiry_check = tokio::time::interval(EXPIRY_CHECK);
     loop {
         tokio::select! {
             line = next_line(&mut lines) => {
@@ -352,6 +376,25 @@ pub async fn run(opts: Options) -> Result<()> {
             }
             Some(ev) = events.recv() => ui.handle_event(ev),
             () = &mut stopped => break,
+            () = &mut expiry => {
+                say!("* this anonymous identity's time is up");
+                break;
+            }
+            _ = expiry_check.tick() => {
+                if expires_ms.is_some_and(|t| t <= threnody_core::now_ms()) {
+                    say!("* this anonymous identity's time is up");
+                    break;
+                }
+                match opts.burn_personas.as_ref().map(|burn| burn()) {
+                    Some(Ok(ids)) => {
+                        for id in ids {
+                            say!("* burned expired anonymous identity {id}");
+                        }
+                    }
+                    Some(Err(e)) => say!("! anonymous identities: {e:#}"),
+                    None => {}
+                }
+            }
         }
     }
     ui.leave_wifi_direct().await;

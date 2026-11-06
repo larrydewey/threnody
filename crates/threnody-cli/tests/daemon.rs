@@ -27,11 +27,12 @@ struct Daemon {
 
 impl Daemon {
     fn start(home: &Path, extra: &[&str]) -> Self {
-        Self::start_at(home, extra, None)
+        Self::start_at(home, &[], extra, None)
     }
 
-    /// With its control socket at `control` (`$THRENODY_CONTROL`).
-    fn start_at(home: &Path, extra: &[&str], control: Option<&Path>) -> Self {
+    /// With `pre` before `run` (such as `--persona <id>`), and its control
+    /// socket at `control` (`$THRENODY_CONTROL`).
+    fn start_at(home: &Path, pre: &[&str], extra: &[&str], control: Option<&Path>) -> Self {
         let log = home.with_extension("log");
         let mut cmd = Command::new(BIN);
         cmd.env_remove("THRENODY_CONTROL");
@@ -41,6 +42,7 @@ impl Daemon {
         let child = cmd
             .arg("--home")
             .arg(home)
+            .args(pre)
             .args([
                 "run",
                 "--daemon",
@@ -57,6 +59,18 @@ impl Daemon {
             .spawn()
             .expect("start daemon");
         Self { child, log }
+    }
+
+    /// Waits for it to stop on its own; false if it doesn't in `secs`.
+    fn exits_within(&mut self, secs: u64) -> bool {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if self.child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     fn log(&self) -> String {
@@ -167,7 +181,7 @@ fn nothing_else_writes_to_a_data_directory_a_node_has_open() {
     let a = dir.path().join("a");
     init(&a);
     // Its socket elsewhere, so only the lock tells others it runs.
-    let node = Daemon::start_at(&a, &[], Some(&dir.path().join("a.sock")));
+    let node = Daemon::start_at(&a, &[], &[], Some(&dir.path().join("a.sock")));
     node.wait_for("Running as a service");
 
     let refused = |args: &[&str]| {
@@ -226,4 +240,47 @@ fn a_replaced_identity_starts_with_nothing_of_the_old_one() {
     );
     assert!(run.status.success(), "{run:?}");
     assert!(a.join("downloads/photo.jpg").exists());
+}
+
+#[test]
+fn an_anonymous_identity_burns_itself_when_its_time_is_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    init(&a);
+    let made = threnody(
+        &a,
+        &["persona", "new", "brief", "--burn-after", "4s", "--no-keyring"],
+    );
+    assert!(made.status.success(), "{made:?}");
+    let made = String::from_utf8_lossy(&made.stdout).into_owned();
+    let id = made
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or_else(|| panic!("no persona id in {made:?}"))
+        .to_owned();
+
+    let mut node = Daemon::start_at(
+        &a,
+        &["--persona", &id],
+        &[],
+        Some(&dir.path().join("p.sock")),
+    );
+    node.wait_for("Running as a service");
+    // Not under its running node.
+    let burn = threnody(&a, &["persona", "burn", &id]);
+    assert!(!burn.status.success());
+    assert!(
+        String::from_utf8_lossy(&burn.stderr).contains("already running"),
+        "{burn:?}"
+    );
+    assert!(a.join("personas").join(&id).exists());
+
+    assert!(node.exits_within(20), "still running past its time");
+    assert!(node.log().contains("time is up"), "{}", node.log());
+    assert!(!a.join("personas").join(&id).exists());
+    let list = threnody(&a, &["persona", "list"]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("No anonymous identities"),
+        "{list:?}"
+    );
 }
