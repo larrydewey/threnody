@@ -16,6 +16,9 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Calls as the system knows them (self-managed): car audio, headset
+         buttons, and holding ours for a phone call. -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
@@ -90,6 +93,13 @@
             android:exported="false"
             android:grantUriPermissions="true" />
         <receiver android:name=".Calls$Decline" android:exported="false" />
+        <!-- Only the system's Telecom binds to it (its permission). -->
+        <service android:name=".CallConnectionService" android:exported="true"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
         <service android:name=".ThrenodyService" android:exported="false"
             android:foregroundServiceType="remoteMessaging|microphone" />
         <!-- UnifiedPush wake-ups (Appendix R), when the user turns them on. -->
