@@ -78,5 +78,10 @@ fn a_backup_restores_the_identity_on_another_device() {
 
     let done = threnody(&new, &["restore", file, "--force", "--no-keyring"], PW);
     assert!(done.status.success(), "{}", stderr(&done));
+    assert!(
+        stdout(&done).contains("made under a minute ago."),
+        "{}",
+        stdout(&done)
+    );
     assert_eq!(stdout(&threnody(&new, &["id"], PW)), id);
 }

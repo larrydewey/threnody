@@ -672,7 +672,7 @@ fn main() -> Result<()> {
             println!(
                 "Restored {} from a backup made {}.",
                 restored.identity.public().fingerprint(),
-                about(restored.created_ms)
+                made_ago(restored.created_ms, threnody_core::now_ms())
             );
         }
         Cmd::Passphrase { remove } => {
@@ -1028,6 +1028,15 @@ fn about(ms: u64) -> String {
     }
 }
 
+/// How long before `now_ms` something made at `at_ms` was made: "3 days
+/// ago", "under a minute ago" ("just now" when the clock is behind it).
+fn made_ago(at_ms: u64, now_ms: u64) -> String {
+    match now_ms.checked_sub(at_ms) {
+        Some(d) => format!("{} ago", about(d)),
+        None => "just now".into(),
+    }
+}
+
 fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
     use threnody_core::persona::Personas;
     let main = load_identity(main_home)?;
@@ -1125,4 +1134,18 @@ fn edit_contact(
     }
     home.save_contacts(identity, &contacts)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_age_is_how_long_ago_it_was_made() {
+        // 2026-11-05, and a backup made two days before.
+        let now = 1_793_923_200_000;
+        assert_eq!(made_ago(now - 2 * 86_400_000, now), "2 days ago");
+        assert_eq!(made_ago(now - 5_000, now), "under a minute ago");
+        assert_eq!(made_ago(now + 5_000, now), "just now");
+    }
 }
