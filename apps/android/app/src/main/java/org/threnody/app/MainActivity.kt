@@ -27,7 +27,10 @@ import android.graphics.drawable.ColorDrawable
 import uniffi.threnody_ffi.DeviceInfo
 import uniffi.threnody_ffi.FolderInfo
 import uniffi.threnody_ffi.HistoryEntry
+import uniffi.threnody_ffi.LinkInfo
+import uniffi.threnody_ffi.LinkKind
 import uniffi.threnody_ffi.ThrenodyNode
+import uniffi.threnody_ffi.classifyLink
 import uniffi.threnody_ffi.qrMatrix
 import uniffi.threnody_ffi.qrMatrix
 
@@ -1585,8 +1588,9 @@ class MainActivity : Activity() {
      * fingerprint too, so we'll be each other's contacts once we connect.
      */
     private fun addContact(prefill: String?, scanned: Boolean = false, tapped: Boolean = false, mutual: Boolean = true) {
+        val field = input("Invite link, handle or host:port", prefill)
         // A copied invite (say, from the camera app) fills itself in.
-        val field = input("Invite link, handle or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
+        if (prefill == null) fillFromClipboard(field, LinkKind.INVITE)
         val name = input("Name (optional; only you see it)", null,
             InputType.TYPE_TEXT_FLAG_CAP_WORDS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
         val fields = LinearLayout(this).apply {
@@ -1625,16 +1629,17 @@ class MainActivity : Activity() {
         scanLauncher.launch(Intent(this, ScanActivity::class.java)) { resultCode, data ->
             if (resultCode != RESULT_OK) return@launch
             val text = data?.getStringExtra(ScanActivity.RESULT)?.trim() ?: return@launch
-            when {
-                text.startsWith("threnody://") -> addContact(
-                    text,
+            val info = classifyLink(text)
+                ?: return@launch failed("That QR code isn't a Threnody invite, link code or directory link.")
+            when (info.kind) {
+                LinkKind.INVITE -> addContact(
+                    info.link,
                     scanned = true,
                     tapped = data.getBooleanExtra(ScanActivity.TAPPED, false),
                     mutual = data.getBooleanExtra(ScanActivity.MUTUAL, true),
                 )
-                text.startsWith("threnody-link://") -> joinAccount(text)
-                text.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, text)
-                else -> failed("That QR code isn't a Threnody invite, link code or directory link.")
+                LinkKind.DEVICE_LINK -> joinAccount(info.link)
+                LinkKind.DIRECTORY -> DirectoryUi.add(this, info.link)
             }
         }
     }
@@ -1645,14 +1650,43 @@ class MainActivity : Activity() {
         }
     }
 
-    /** A Threnody invite or link code on the clipboard, if any. */
-    private fun copiedLink(): String? = try {
+    /**
+     * The Threnody invite, link code or directory link on the clipboard, if
+     * it holds exactly one (`classifyLink`, shared with the Linux app).
+     */
+    private fun copiedLink(): LinkInfo? = try {
         getSystemService(ClipboardManager::class.java)?.primaryClip
             ?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
-            ?.takeIf { it.startsWith("threnody://") || it.startsWith("threnody-link://") || it.startsWith(DirectoryUi.SCHEME) }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()
+            // classifyLink takes at most 4096 characters; don't pass a huge clip.
+            ?.take(4097)
+            ?.let { classifyLink(it) }
     } catch (_: SecurityException) {
         null
+    }
+
+    /**
+     * Fingerprints our own invites and link codes carry: every device of the
+     * account (this one included) and each anonymous identity. A node call:
+     * run it in the background.
+     */
+    private fun ownFingerprints(n: ThrenodyNode): Set<String> =
+        (n.devices().map { it.fingerprint } + n.deviceFingerprint() +
+            Threnody.personaIds().mapNotNull { Threnody.personaNode(it)?.deviceFingerprint() }).toSet()
+
+    private fun isOwn(info: LinkInfo, own: Set<String>) =
+        info.kind != LinkKind.DIRECTORY && info.fingerprint in own
+
+    /** Fills an empty `field` with a copied link of `kind` that isn't one of ours. */
+    private fun fillFromClipboard(field: EditText, kind: LinkKind) {
+        val info = copiedLink()?.takeIf { it.kind == kind } ?: return
+        val n = node ?: return
+        Threading.background {
+            val own = ownFingerprints(n)
+            runOnUiThread {
+                if (!isOwn(info, own) && field.text.isEmpty()) field.setText(info.link)
+            }
+        }
     }
 
     /** The copied link last offered, so it's offered once. */
@@ -1662,30 +1696,49 @@ class MainActivity : Activity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus) return
-        val link = copiedLink() ?: return
+        val info = copiedLink() ?: return
         val n = node ?: return
-        if (link == offered) return
-        // Not our own invite or link code (say, just copied from "My invite").
-        if (link.contains(n.deviceFingerprint().replace("-", ""))) return
-        offered = link
-        if (link.startsWith(DirectoryUi.SCHEME)) {
-            SecureBuilder(this)
+        if (info.link == offered) return
+        Threading.background {
+            val own = ownFingerprints(n)
+            val subscribed = n.directories().map { it.idHex }.toSet()
+            runOnUiThread {
+                if (isFinishing || info.link == offered) return@runOnUiThread
+                // Not our own invite or link code (say, just copied from "My
+                // invite" here or on another device of the account), nor a
+                // directory we already subscribe to.
+                if (isOwn(info, own)) return@runOnUiThread
+                if (info.kind == LinkKind.DIRECTORY && info.directoryIdHex in subscribed) return@runOnUiThread
+                offered = info.link
+                offerCopied(info)
+            }
+        }
+    }
+
+    private fun offerCopied(info: LinkInfo) {
+        val link = info.link
+        when (info.kind) {
+            LinkKind.DIRECTORY -> SecureBuilder(this)
                 .setTitle("Subscribe to the copied directory?")
                 .setMessage(link)
                 .setPositiveButton("Subscribe") { _, _ -> DirectoryUi.subscribe(this, link) }
                 .setNegativeButton("Not now", null)
                 .show()
-            return
+            LinkKind.INVITE -> SecureBuilder(this)
+                .setTitle("Add the copied invite?")
+                .setMessage(link)
+                .setPositiveButton("Connect") { _, _ -> connect(link) }
+                .setNegativeButton("Not now", null)
+                .show()
+            // Joining someone else's account is the worst a copied link can
+            // lead to (a web page can write one): say so, and name the device.
+            LinkKind.DEVICE_LINK -> SecureBuilder(this)
+                .setTitle("Join with the copied link code?")
+                .setMessage("$link\n\nDevice ${info.fingerprint ?: "?"}\n\n$OWN_DEVICES_ONLY")
+                .setPositiveButton("Continue") { _, _ -> joinAccount(link) }
+                .setNegativeButton("Not now", null)
+                .show()
         }
-        val invite = link.startsWith("threnody://")
-        SecureBuilder(this)
-            .setTitle(if (invite) "Add the copied invite?" else "Join with the copied link code?")
-            .setMessage(link)
-            .setPositiveButton(if (invite) "Connect" else "Continue") { _, _ ->
-                if (invite) connect(link) else joinAccount(link)
-            }
-            .setNegativeButton("Not now", null)
-            .show()
     }
 
     /**
@@ -1716,8 +1769,7 @@ class MainActivity : Activity() {
 
     private fun joinAccount(prefill: String?) {
         val field = input("threnody-link://…", prefill)
-        val prefilled = prefill ?: copiedLink()?.takeIf { it.startsWith("threnody-link://") }
-        field.setText(prefilled ?: "")
+        if (prefill == null) fillFromClipboard(field, LinkKind.DEVICE_LINK)
         SecureBuilder(this)
             .setTitle("Join another device's account")
             .setMessage("This device becomes part of that account: your contacts see both as you. " +
@@ -1741,15 +1793,17 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** `threnody://` invites and `threnody-link://` codes, from a QR scan or a tapped link. */
+    /** `threnody://` invites, `threnody-link://` codes and `threnody-dir://` directories, from a tapped link. */
     private fun handleLink(intent: Intent?) {
         val uri = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString ?: return
         // Handle each link once, not again after rotation.
         intent.action = null
-        when {
-            uri.startsWith("threnody://") -> addContact(uri)
-            uri.startsWith("threnody-link://") -> joinAccount(uri)
-            uri.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, uri)
+        val info = classifyLink(uri)
+            ?: return Toast.makeText(this, "That isn't a Threnody link", Toast.LENGTH_LONG).show()
+        when (info.kind) {
+            LinkKind.INVITE -> addContact(info.link)
+            LinkKind.DEVICE_LINK -> joinAccount(info.link)
+            LinkKind.DIRECTORY -> DirectoryUi.add(this, info.link)
         }
     }
 
@@ -1774,5 +1828,8 @@ class MainActivity : Activity() {
         private const val TAB = "list_tab"
         private const val FOLDER = "folder:"
         private const val ARCHIVED = "archived"
+        /** Said with a copied link code offered: whoever made it gets this device's contacts and history. */
+        private const val OWN_DEVICES_ONLY = "Only continue if you made this code on one of your own devices: " +
+            "joining shares your contacts and history with that account."
     }
 }

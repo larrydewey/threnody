@@ -320,6 +320,25 @@ impl Core {
         self.main.personas().unwrap_or_default()
     }
 
+    /// The fingerprints our own invites and link codes carry: every device
+    /// of the account (this one included) and each open anonymous identity.
+    /// A copied link with one of these isn't offered.
+    pub fn own_fingerprints(&self) -> Vec<String> {
+        let mut own: Vec<String> = self
+            .main
+            .devices()
+            .into_iter()
+            .map(|d| d.fingerprint)
+            .collect();
+        own.push(self.main.device_fingerprint());
+        own.extend(
+            lock(&self.personas)
+                .values()
+                .map(|p| p.node.device_fingerprint()),
+        );
+        own
+    }
+
     pub fn persona_ids(&self) -> Vec<String> {
         lock(&self.personas).keys().cloned().collect()
     }

@@ -88,6 +88,19 @@ pub fn ask_text(
     confirm: &str,
     run: impl Fn(String) + 'static,
 ) {
+    ask_text_with(parent, heading, body, placeholder, initial, confirm, run);
+}
+
+/// As [`ask_text`], returning its entry (to fill it in later).
+pub fn ask_text_with(
+    parent: &impl IsA<gtk::Widget>,
+    heading: &str,
+    body: &str,
+    placeholder: &str,
+    initial: &str,
+    confirm: &str,
+    run: impl Fn(String) + 'static,
+) -> gtk::Entry {
     let d = alert(heading, body, &[("cancel", "Cancel"), ("ok", confirm)]);
     d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
     let entry = gtk::Entry::builder()
@@ -96,19 +109,19 @@ pub fn ask_text(
         .activates_default(true)
         .build();
     d.set_extra_child(Some(&entry));
+    let e = entry.clone();
     d.connect_response(None, move |_, r| {
         if r == "ok" {
-            run(entry.text().trim().to_owned());
+            run(e.text().trim().to_owned());
         }
     });
     d.present(Some(parent));
     // Grab after presenting; the dialog focuses its default button otherwise.
-    let e = d.extra_child();
+    let e = entry.clone();
     glib::idle_add_local_once(move || {
-        if let Some(e) = e {
-            e.grab_focus();
-        }
+        e.grab_focus();
     });
+    entry
 }
 
 /// Offers a list of choices; `run` gets the chosen index.
