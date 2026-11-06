@@ -263,12 +263,21 @@ impl Node {
             .cloned()
             .map(portable)
             .collect();
-        if let Ok(added) =
+        let files: Vec<Entry> = entries
+            .iter()
+            .filter(|e| e.file.is_some())
+            .cloned()
+            .collect();
+        let Ok(added) =
             self.shared
                 .home
                 .merge_entries(self.identity_ref(), conv, entries, now_ms())
-            && added > 0
-        {
+        else {
+            return;
+        };
+        // Queued before the event, so whoever sees it sees the queue.
+        self.fetch_auto(conv, &files);
+        if added > 0 {
             // Ticks that came before their entries.
             let waiting = lock(&self.shared.orphan_ticks).take(conv);
             if !waiting.is_empty() {
@@ -301,6 +310,7 @@ impl Node {
             for m in node.ticks_for(&peer) {
                 let _ = node.send_tracked(&peer, m);
             }
+            node.resume_fetches();
         };
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
@@ -419,22 +429,6 @@ impl Node {
         if n > 0 {
             self.emit(Event::DeviceSync { from });
         }
-    }
-}
-
-// Device sync handlers (Appendix J, *Files* and *Ticks*); filled in by
-// the following changes.
-impl Node {
-    pub(crate) fn on_file_want(&self, from: PublicIdentity, _conv: &[u8], want: &[u8]) {
-        let _ = (from, threnody_core::devsync::FileWant::decode(want));
-    }
-
-    pub(crate) fn on_file_part(&self, from: PublicIdentity, part: &[u8]) {
-        let _ = (from, threnody_core::devsync::FilePart::decode(part));
-    }
-
-    pub(crate) fn on_file_missing(&self, from: PublicIdentity, body: &[u8]) {
-        let _ = (from, threnody_core::devsync::FileMissing::decode(body));
     }
 }
 

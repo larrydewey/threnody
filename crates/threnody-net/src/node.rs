@@ -613,6 +613,11 @@ pub(crate) struct Shared {
     pub(crate) sync: Mutex<crate::sync::SyncState>,
     /// How far each of our other devices has our ticks (see `sync`).
     pub(crate) ticks_sync: Mutex<crate::sync::SyncState>,
+    /// Fetching file contents from our other devices, and serving ours
+    /// (see `filesync`).
+    pub(crate) file_sync: Mutex<crate::filesync::FileSync>,
+    /// Whether new photos from our other devices come over by themselves.
+    pub(crate) auto_fetch: std::sync::atomic::AtomicBool,
     /// Live ticks waiting a moment to go to our other devices together.
     pub(crate) tick_outbox:
         Mutex<HashMap<threnody_core::history::ConversationId, std::collections::BTreeSet<u64>>>,
@@ -885,6 +890,13 @@ impl Node {
                 .flatten()
                 .unwrap_or_default(),
         );
+        let file_sync = crate::filesync::FileSync::decode(
+            &cfg.home
+                .load_state(&cfg.identity, crate::filesync::STATE)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         let ticks_sync = crate::sync::SyncState::decode(
             &cfg.home
                 .load_state(&cfg.identity, crate::sync::TICKS_STATE)
@@ -949,6 +961,8 @@ impl Node {
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
             ticks_sync: Mutex::new(ticks_sync),
+            file_sync: Mutex::new(file_sync),
+            auto_fetch: std::sync::atomic::AtomicBool::new(true),
             tick_outbox: Mutex::new(HashMap::new()),
             orphan_ticks: Mutex::new(crate::sync::OrphanTicks::default()),
             folders: Mutex::new(folders),

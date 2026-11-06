@@ -760,6 +760,11 @@ impl Node {
         Ok(())
     }
 
+    /// Whether the app said the default network is mobile data.
+    pub(crate) fn on_mobile(&self) -> bool {
+        self.rec().on_mobile.load(Ordering::Relaxed)
+    }
+
     /// Tells recovery whether the default network is mobile data.
     pub fn set_on_mobile(&self, on: bool) {
         self.rec().on_mobile.store(on, Ordering::Relaxed);

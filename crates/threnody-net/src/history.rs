@@ -1505,6 +1505,7 @@ impl Node {
                         node.seal_expired_unacked(now_ms());
                         node.sweep_mailbox(now_ms());
                         node.shared.expire_saved_tunnels(now_ms());
+                        node.resume_fetches();
                     }
                     () = &mut closed => break,
                 }
