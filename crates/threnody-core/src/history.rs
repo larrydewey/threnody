@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::crypto::kdf;
+use crate::devsync::{FileRef, MAX_TICK_DEVICES, Tick};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::message::{Clip, Mention, Quote};
@@ -154,6 +155,9 @@ pub struct Entry {
     pub forwarded: bool,
     /// A list shared here (see `crate::lists`): the entry opens it.
     pub list: Option<[u8; 16]>,
+    /// When this device last learned something new about this outgoing
+    /// entry's ticks (0 = never). Local: transcripts carry 0.
+    pub ticked_ms: u64,
 }
 
 /// Most options a poll has, and longest question and option, in
@@ -450,6 +454,85 @@ pub fn quotes(q: &Quote, e: &Entry) -> bool {
     e.device == q.author && !q.text.is_empty() && snippet(e).starts_with(q.text.as_str())
 }
 
+/// What this device knows of an outgoing entry's ticks, for our other
+/// devices (Appendix J, *Ticks*). None for incoming entries and for
+/// messages without an id.
+pub fn tick_of(e: &Entry) -> Option<Tick> {
+    (e.outgoing && e.message_id() != 0).then(|| Tick {
+        id: e.message_id(),
+        device: e.device,
+        delivered: e.delivered,
+        read_ms: e.read_ms,
+        recipients: e.recipients,
+        delivered_to: e.delivered_to[..e.delivered_to.len().min(MAX_TICK_DEVICES)].to_vec(),
+    })
+}
+
+/// Merges `t` into `e`, only ever forward: delivered stays delivered, a
+/// read time once set stays (and is never in the future), the delivered
+/// devices only grow. Returns whether anything changed.
+fn merge_tick(e: &mut Entry, t: &Tick, group: bool, now_ms: u64) -> bool {
+    let before = (e.delivered, e.read_ms, e.recipients, e.delivered_to.len());
+    e.delivered |= t.delivered;
+    if e.read_ms == 0 && t.read_ms != 0 {
+        e.read_ms = t.read_ms.min(now_ms);
+    }
+    e.recipients = e.recipients.max(t.recipients);
+    for d in &t.delivered_to {
+        if e.delivered_to.len() >= MAX_TICK_DEVICES {
+            break;
+        }
+        if !e.delivered_to.contains(d) {
+            e.delivered_to.push(*d);
+        }
+    }
+    if group && e.recipients > 0 && e.delivered_to.len() >= e.recipients as usize {
+        e.delivered = true;
+    }
+    let after = (e.delivered, e.read_ms, e.recipients, e.delivered_to.len());
+    if before != after {
+        e.ticked_ms = now_ms;
+        true
+    } else {
+        false
+    }
+}
+
+/// How another of our devices names `e`'s file (Appendix J, *Files*).
+pub fn file_ref(e: &Entry) -> Option<FileRef> {
+    let f = e.file.as_ref()?;
+    Some(FileRef {
+        device: e.device,
+        id: e.message_id(),
+        name: f.name.clone(),
+        size: f.size,
+        at_ms: e.at_ms,
+    })
+}
+
+/// Whether `e` records the file `r` names: the same author, name and
+/// size, and the same message id where both have one, or else a time
+/// within ten minutes (as [`History::merge`] matches entries).
+pub fn file_matches(r: &FileRef, e: &Entry) -> bool {
+    let Some(f) = &e.file else {
+        return false;
+    };
+    if e.device != r.device || f.size != r.size {
+        return false;
+    }
+    // A name a FileRef carries may have been cut short.
+    let name = f.name.as_bytes();
+    let short = r.name.as_bytes();
+    if !(name == short || (short.len() >= crate::devsync::MAX_NAME - 3 && name.starts_with(short)))
+    {
+        return false;
+    }
+    if r.id != 0 && e.message_id() != 0 {
+        return r.id == e.message_id();
+    }
+    r.at_ms.abs_diff(e.at_ms) <= 10 * 60 * 1000
+}
+
 fn same(a: &Entry, b: &Entry) -> bool {
     if a.outgoing != b.outgoing || a.device != b.device {
         return false;
@@ -690,7 +773,8 @@ impl History {
                         + usize::from(!e.mentions.is_empty())
                         + usize::from(e.poll.is_some())
                         + usize::from(e.forwarded)
-                        + usize::from(e.list.is_some()),
+                        + usize::from(e.list.is_some())
+                        + usize::from(e.ticked_ms != 0),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -760,6 +844,9 @@ impl History {
                 if let Some(l) = &e.list {
                     enc.u8(19)?.bytes(l)?;
                 }
+                if e.ticked_ms != 0 {
+                    enc.u8(20)?.u64(e.ticked_ms)?;
+                }
                 if let Some(p) = &e.poll {
                     enc.u8(17)?.array_len(4)?;
                     enc.array_len(p.options.len())?;
@@ -823,6 +910,7 @@ impl History {
                         let mut poll = None;
                         let mut forwarded = false;
                         let mut list = None;
+                        let mut ticked_ms = 0;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -848,6 +936,7 @@ impl History {
                                 17 => poll = Some(decode_poll(d)?),
                                 18 => forwarded = d.bool()?,
                                 19 => list = Some(fixed_bytes::<16>(d)?),
+                                20 => ticked_ms = d.u64()?,
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -903,6 +992,7 @@ impl History {
                             poll,
                             forwarded,
                             list,
+                            ticked_ms,
                         });
                     }
                 }
@@ -1283,6 +1373,7 @@ impl Home {
             }
             _ => return Ok(false),
         }
+        e.ticked_ms = now_ms;
         self.save_history(identity, c, &h)?;
         Ok(true)
     }
@@ -1308,6 +1399,7 @@ impl Home {
             e.outgoing && e.local_id != 0 && !e.delivered && wanted.contains(&e.local_id)
         }) {
             e.delivered = true;
+            e.ticked_ms = now_ms;
             changed.push(e.local_id);
         }
         if !changed.is_empty() {
@@ -1550,9 +1642,9 @@ impl Home {
     }
 
     /// Marks the entries `pick` chooses as read at `now_ms`; returns how
-    /// many changed. Outgoing entries: the recipient displayed them.
-    /// Incoming ones: we reported them read. Entries already marked keep
-    /// their time.
+    /// many changed. Outgoing entries: the recipient displayed them (and
+    /// their `ticked_ms` is stamped, for our other devices). Incoming ones:
+    /// we reported them read. Entries already marked keep their time.
     pub fn mark_read_entries(
         &self,
         identity: &Identity,
@@ -1565,12 +1657,93 @@ impl Home {
         let mut n = 0;
         for e in h.entries.iter_mut().filter(|e| pick(e) && e.read_ms == 0) {
             e.read_ms = now_ms;
+            if e.outgoing {
+                e.ticked_ms = now_ms;
+            }
             n += 1;
         }
         if n > 0 {
             self.save_history(identity, c, &h)?;
         }
         Ok(n)
+    }
+
+    /// Merges ticks from another of our devices into the outgoing entries
+    /// they name, only ever forward (see `merge_tick`), stamping
+    /// `ticked_ms` on those that changed. Returns how many changed, and
+    /// the ticks that named no entry here (yet).
+    pub fn merge_ticks(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        ticks: &[Tick],
+        now_ms: u64,
+    ) -> Result<(usize, Vec<Tick>)> {
+        let _lock = history_lock();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let group = matches!(c, ConversationId::Group(_));
+        let (mut n, mut unmatched) = (0, Vec::new());
+        for t in ticks {
+            let found = (t.id != 0)
+                .then(|| {
+                    h.entries
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.outgoing && e.message_id() == t.id && e.device == t.device)
+                })
+                .flatten();
+            match found {
+                Some(e) => {
+                    if merge_tick(e, t, group, now_ms) {
+                        n += 1;
+                    }
+                }
+                None => unmatched.push(t.clone()),
+            }
+        }
+        if n > 0 {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok((n, unmatched))
+    }
+
+    /// Records where the file `r` names is kept here, on the newest entry
+    /// for it that has no location yet. Returns whether one changed.
+    pub fn set_file_location(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        r: &FileRef,
+        location: &str,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let _lock = history_lock();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let Some(f) = h
+            .entries
+            .iter_mut()
+            .rev()
+            .filter(|e| file_matches(r, e))
+            .find_map(|e| e.file.as_mut().filter(|f| f.location.is_none()))
+        else {
+            return Ok(false);
+        };
+        f.location = Some(location.to_owned());
+        self.save_history(identity, c, &h)?;
+        Ok(true)
+    }
+
+    /// The newest entry recording the file `r` names. Expired entries are
+    /// pruned on load, so they are never found.
+    pub fn find_file(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        r: &FileRef,
+        now_ms: u64,
+    ) -> Result<Option<Entry>> {
+        let h = self.load_history(identity, c, now_ms)?;
+        Ok(h.entries.iter().rev().find(|e| file_matches(r, e)).cloned())
     }
 
     /// Deletes a conversation's history.
@@ -1670,6 +1843,7 @@ mod tests {
             poll: None,
             forwarded: false,
             list: None,
+            ticked_ms: 0,
         }
     }
 
@@ -2145,6 +2319,283 @@ mod tests {
         assert!(!home.load_history(&id, g, 9).unwrap().entries()[0].delivered);
     }
 
+    fn photo(at: u64, local_id: u64, name: &str, size: u64) -> Entry {
+        Entry {
+            text: String::new(),
+            local_id,
+            file: Some(FileNote {
+                name: name.into(),
+                size,
+                location: None,
+                sensitive: false,
+                album: 0,
+                clip: None,
+                forwarded: false,
+            }),
+            ..entry(at, "", None)
+        }
+    }
+
+    #[test]
+    fn file_ref_matches_by_id_then_by_name_size_and_time() {
+        let minute = 60_000;
+        let e = photo(1_000_000, 42, "a.png", 10);
+        let r = file_ref(&e).unwrap();
+        assert_eq!((r.id, r.device, r.size), (42, [7; 32], 10));
+        assert!(file_matches(&r, &e));
+        // The id wins over a time difference...
+        let later = FileRef {
+            at_ms: e.at_ms + 60 * minute,
+            ..r.clone()
+        };
+        assert!(file_matches(&later, &e));
+        // ...and a different id never matches.
+        assert!(!file_matches(
+            &FileRef {
+                id: 43,
+                ..r.clone()
+            },
+            &e
+        ));
+        // Without an id, within ten minutes.
+        let no_id = FileRef { id: 0, ..r.clone() };
+        let at = |t: u64| FileRef {
+            at_ms: e.at_ms + t,
+            ..no_id.clone()
+        };
+        assert!(file_matches(&at(10 * minute), &e));
+        assert!(!file_matches(&at(11 * minute), &e));
+        let old = photo(1_000_000, 0, "a.png", 10);
+        assert!(file_matches(
+            &FileRef {
+                at_ms: e.at_ms + 9 * minute,
+                ..r.clone()
+            },
+            &old
+        ));
+        // A different name, size or device never matches.
+        assert!(!file_matches(
+            &FileRef {
+                name: "b.png".into(),
+                ..r.clone()
+            },
+            &e
+        ));
+        assert!(!file_matches(
+            &FileRef {
+                size: 11,
+                ..r.clone()
+            },
+            &e
+        ));
+        assert!(!file_matches(
+            &FileRef {
+                device: [8; 32],
+                ..r.clone()
+            },
+            &e
+        ));
+        assert!(!file_matches(&r, &entry(1_000_000, "text", None)));
+        // A long name, cut short on the wire, still matches.
+        let long = photo(2, 7, &"é".repeat(200), 10);
+        let wire =
+            crate::devsync::FileRef::decode(&file_ref(&long).unwrap().encode().unwrap()).unwrap();
+        assert!(wire.name.len() < 400);
+        assert!(file_matches(&wire, &long));
+    }
+
+    #[test]
+    fn merge_ticks_is_monotonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([4; 32]);
+        home.append_history(
+            &id,
+            c,
+            Entry {
+                local_id: 10,
+                ..entry(2, "ours", None)
+            },
+            2,
+        )
+        .unwrap();
+        let theirs = Entry {
+            remote_id: 10,
+            ..entry(3, "theirs", None)
+        };
+        home.append_history(&id, c, theirs, 3).unwrap();
+        let get = |at: u64| {
+            home.load_history(&id, c, 100)
+                .unwrap()
+                .entries()
+                .iter()
+                .find(|e| e.at_ms == at)
+                .cloned()
+                .unwrap()
+        };
+        let tick = |delivered, read_ms| Tick {
+            id: 10,
+            device: [7; 32],
+            delivered,
+            read_ms,
+            ..Tick::default()
+        };
+        let unknown = Tick {
+            id: 11,
+            ..tick(true, 0)
+        };
+        let (n, unmatched) = home
+            .merge_ticks(&id, c, &[tick(true, 0), unknown.clone()], 20)
+            .unwrap();
+        assert_eq!((n, unmatched), (1, vec![unknown]));
+        let e = get(2);
+        assert!(e.delivered);
+        assert_eq!(e.ticked_ms, 20);
+        // Never back to undelivered; nothing changed, no stamp.
+        assert_eq!(
+            home.merge_ticks(&id, c, &[tick(false, 0)], 30).unwrap().0,
+            0
+        );
+        assert!(get(2).delivered);
+        assert_eq!(get(2).ticked_ms, 20);
+        // A read time is set once, and never in the future.
+        assert_eq!(
+            home.merge_ticks(&id, c, &[tick(true, 500)], 40).unwrap().0,
+            1
+        );
+        assert_eq!((get(2).read_ms, get(2).ticked_ms), (40, 40));
+        assert_eq!(
+            home.merge_ticks(&id, c, &[tick(true, 35)], 50).unwrap().0,
+            0
+        );
+        assert_eq!(get(2).read_ms, 40);
+        // Incoming entries are never touched, even with the same id.
+        let other = Tick {
+            device: [7; 32],
+            ..tick(true, 9)
+        };
+        home.merge_ticks(&id, c, &[other], 60).unwrap();
+        let t = get(3);
+        assert!(!t.delivered && t.read_ms == 0 && t.ticked_ms == 0);
+
+        // Groups: the delivered devices are a union, delivered once all
+        // recipients have it.
+        let g = ConversationId::Group([5; 16]);
+        let e = Entry {
+            local_id: 13,
+            recipients: 3,
+            delivered_to: vec![[1; 32]],
+            ..entry(8, "all", None)
+        };
+        home.append_history(&id, g, e, 8).unwrap();
+        let gt = |to: Vec<[u8; 32]>| Tick {
+            id: 13,
+            device: [7; 32],
+            recipients: 3,
+            delivered_to: to,
+            ..Tick::default()
+        };
+        assert_eq!(
+            home.merge_ticks(&id, g, &[gt(vec![[2; 32]])], 9).unwrap().0,
+            1
+        );
+        let ge = || home.load_history(&id, g, 10).unwrap().entries()[0].clone();
+        assert_eq!(ge().delivered_to, vec![[1; 32], [2; 32]]);
+        assert!(!ge().delivered);
+        assert_eq!(
+            home.merge_ticks(&id, g, &[gt(vec![[2; 32]])], 9).unwrap().0,
+            0
+        );
+        assert_eq!(
+            home.merge_ticks(&id, g, &[gt(vec![[3; 32], [1; 32]])], 10)
+                .unwrap()
+                .0,
+            1
+        );
+        assert!(ge().delivered);
+        assert_eq!(ge().delivered_to.len(), 3);
+    }
+
+    #[test]
+    fn marking_delivered_or_read_stamps_ticked_ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([4; 32]);
+        for (at, local_id) in [(2, 10), (4, 11)] {
+            let e = Entry {
+                local_id,
+                ..entry(at, "ours", None)
+            };
+            home.append_history(&id, c, e, at).unwrap();
+        }
+        home.append_history(
+            &id,
+            c,
+            Entry {
+                remote_id: 5,
+                ..entry(5, "theirs", None)
+            },
+            5,
+        )
+        .unwrap();
+        assert!(home.mark_delivered(&id, c, 10, [1; 32], 20).unwrap());
+        assert_eq!(home.mark_delivered_ids(&id, c, &[11], 21).unwrap(), [11]);
+        let stamps = |h: History| -> Vec<u64> { h.entries().iter().map(|e| e.ticked_ms).collect() };
+        assert_eq!(stamps(home.load_history(&id, c, 22).unwrap()), [20, 21, 0]);
+        home.mark_read_entries(&id, c, 30, |e| e.at_ms == 2 || e.at_ms == 5)
+            .unwrap();
+        let h = home.load_history(&id, c, 31).unwrap();
+        assert_eq!(
+            stamps(h.clone()),
+            [30, 21, 0],
+            "incoming entries get no stamp"
+        );
+        assert_eq!(h.entries()[2].read_ms, 30);
+    }
+
+    #[test]
+    fn ticked_ms_round_trips_and_is_optional() {
+        let e = Entry {
+            ticked_ms: 77,
+            ..entry(2, "x", None)
+        };
+        let b = History::transcript(vec![e.clone()]).encode().unwrap();
+        assert_eq!(History::decode(&b).unwrap().entries()[0].ticked_ms, 77);
+        let zero = History::transcript(vec![entry(2, "x", None)])
+            .encode()
+            .unwrap();
+        assert!(zero.len() < b.len(), "0 is left out");
+        assert_eq!(History::decode(&zero).unwrap().entries()[0].ticked_ms, 0);
+        assert_eq!(
+            History::decode(&zero).unwrap().entries()[0],
+            entry(2, "x", None)
+        );
+    }
+
+    #[test]
+    fn set_file_location_fills_only_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([4; 32]);
+        let e = photo(2, 10, "a.png", 5);
+        let r = file_ref(&e).unwrap();
+        home.append_history(&id, c, e, 2).unwrap();
+        assert!(home.set_file_location(&id, c, &r, "/m/a.png", 3).unwrap());
+        let found = home.find_file(&id, c, &r, 4).unwrap().unwrap();
+        assert_eq!(found.file.unwrap().location.as_deref(), Some("/m/a.png"));
+        assert!(!home.set_file_location(&id, c, &r, "/m/b.png", 5).unwrap());
+        let other = FileRef { id: 11, ..r };
+        assert!(home.find_file(&id, c, &other, 6).unwrap().is_none());
+        assert!(
+            !home
+                .set_file_location(&id, c, &other, "/m/c.png", 6)
+                .unwrap()
+        );
+    }
+
     #[test]
     fn read_ms_marks_reported_incoming_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -2203,6 +2654,7 @@ mod names_at_rest_tests {
             poll: None,
             forwarded: false,
             list: None,
+            ticked_ms: 0,
         }
     }
 

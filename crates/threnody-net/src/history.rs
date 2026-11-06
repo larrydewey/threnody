@@ -319,6 +319,7 @@ impl Node {
                 poll: None,
                 forwarded: false,
                 list: None,
+                ticked_ms: 0,
             },
         );
     }
@@ -1025,6 +1026,7 @@ impl Node {
                 poll: None,
                 forwarded,
                 list: None,
+                ticked_ms: 0,
             },
         );
         Ok(r)
@@ -1323,6 +1325,7 @@ impl Node {
             poll: None,
             forwarded: extras.forwarded,
             list: None,
+            ticked_ms: 0,
         };
         if let Err(e) = self
             .shared
@@ -1396,6 +1399,7 @@ impl Node {
                 poll: None,
                 forwarded: false,
                 list: None,
+                ticked_ms: 0,
             },
         );
     }
