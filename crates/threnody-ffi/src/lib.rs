@@ -946,7 +946,8 @@ fn history_entries(
                 clip: f.clip.map(Into::into),
             }),
             delivered: e.delivered,
-            read: e.read_ms != 0,
+            // On incoming entries `read_ms` records that we reported it.
+            read: e.outgoing && e.read_ms != 0,
             id: e.message_id(),
             edited: e.edited_ms != 0,
             recipients: e.recipients,
@@ -1858,6 +1859,18 @@ PersistentKeepalive = 25\n",
         self.node.strip_metadata()
     }
 
+    /// Read receipts (on unless turned off): whether displayed messages
+    /// are reported to their sender, live or through mailboxes. Kept by
+    /// the node, so it holds from the moment it starts; turning it off
+    /// drops any reads still waiting to be sent.
+    pub fn set_send_read_receipts(&self, on: bool) {
+        self.node.set_send_read_receipts(on);
+    }
+
+    pub fn send_read_receipts(&self) -> bool {
+        self.node.send_read_receipts()
+    }
+
     /// Deletes messages (by `HistoryEntry.id`) with `peer`, here and on
     /// our other devices; with `everyone`, our own among them also on
     /// `peer`'s devices that support it. Returns how many went here.
@@ -2175,9 +2188,13 @@ PersistentKeepalive = 25\n",
         self.node.set_typing(&p, active).map_err(fail)
     }
 
-    /// Marks the incoming messages of `peer` we've now displayed —
-    /// `ids` are their sender-ids — and tells `peer`'s devices, so our
-    /// own ticks can show "seen". No-op without a live session.
+    /// Reports the incoming messages of `peer` we've now displayed —
+    /// `ids` are their sender-ids — so its ticks can show "seen": live to
+    /// its connected devices, and to the device that sent each one, if it
+    /// isn't connected, by a receipt that waits for it or goes through
+    /// mailboxes. Each is reported once. Does nothing with read receipts
+    /// off or for someone not accepted. Fails only when nothing could go
+    /// or wait (messages from before this version, with no session).
     pub fn report_read(&self, peer: String, ids: Vec<u64>) -> Result<()> {
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();
@@ -3556,6 +3573,50 @@ mod tests {
             );
             assert_eq!(roster.participants.len(), 2, "{}", fps[i]);
         }
+    }
+
+    #[test]
+    fn read_receipts_switch_reaches_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").display().to_string();
+        let node = ThrenodyNode::open(path.clone(), None, None).unwrap();
+        assert!(node.send_read_receipts(), "on unless turned off");
+        node.set_send_read_receipts(false);
+        assert!(!node.send_read_receipts());
+        node.shutdown();
+        drop(node);
+        let node = ThrenodyNode::open(path, None, None).unwrap();
+        assert!(!node.send_read_receipts(), "kept across a restart");
+        node.set_send_read_receipts(true);
+        assert!(node.send_read_receipts());
+    }
+
+    #[test]
+    fn incoming_entries_never_show_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        let alice = ThrenodyNode::open(path("a"), None, None).unwrap();
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let bob = ThrenodyNode::open(path("b"), None, None).unwrap();
+        let a_fp = bob.connect(alice.invite_link(addr)).unwrap();
+        let b_fp = bob.device_fingerprint();
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp.clone(), true).unwrap();
+        wait(&bob, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+        alice.send_text(b_fp.clone(), "seen?".into()).unwrap();
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        let incoming = bob.history(a_fp.clone(), 10).unwrap();
+        let theirs = incoming.iter().find(|e| !e.outgoing).unwrap();
+        bob.report_read(a_fp.clone(), vec![theirs.id]).unwrap();
+        wait(&alice, |e| matches!(e, NodeEvent::Read { .. }));
+        let ours = alice.history(b_fp, 10).unwrap();
+        assert!(ours.iter().any(|e| e.outgoing && e.read));
+        // Bob reported it read; to Bob it is still just a message.
+        let incoming = bob.history(a_fp, 10).unwrap();
+        assert!(incoming.iter().all(|e| !e.outgoing && !e.read));
     }
 
     #[test]

@@ -1187,6 +1187,82 @@ async fn read_receipts_reach_the_sender() {
     assert!(read, "Alice's message shows as read");
 }
 
+/// A read report for more messages than one `Read` or `Receipt` may name
+/// goes in pieces: the receiver refuses an oversize one, which would end
+/// the session.
+#[tokio::test]
+async fn oversize_read_report_is_chunked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    alice.set_approval(&bob_id, true).unwrap();
+    bob.set_approval(&alice.identity(), true).unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::ApprovalChanged { mutual: true, .. })
+    })
+    .await;
+
+    const N: usize = 600;
+    for i in 0..N {
+        alice.send_text(&bob_id, &format!("message {i}")).unwrap();
+    }
+    let conv_b = bob.conversation_for(&alice.identity());
+    let ids = timeout(Duration::from_secs(60), async {
+        loop {
+            let ids: Vec<u64> = bob
+                .history(conv_b)
+                .map(|h| {
+                    h.entries()
+                        .iter()
+                        .filter(|e| !e.outgoing)
+                        .map(|e| e.remote_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.len() == N {
+                return ids;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("all messages arrived");
+    while brx.try_recv().is_ok() {}
+
+    bob.report_read(&alice.identity(), &ids).unwrap();
+    let conv_a = alice.conversation_for(&bob_id);
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let read = alice
+                .history(conv_a)
+                .unwrap()
+                .entries()
+                .iter()
+                .filter(|e| e.outgoing && e.read_ms != 0)
+                .count();
+            if read == N {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every message shows as read");
+    let dropped = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(Event::Disconnected { .. }) = brx.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(dropped.is_err(), "the session ended");
+    assert!(bob.sessions().iter().any(|s| s.peer == alice.identity()));
+}
+
 /// Copies `from` to `to` frame by frame, recording the length of every
 /// ratchet frame (everything after the handshake) in `seen`.
 async fn tap_frames(

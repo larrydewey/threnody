@@ -224,6 +224,9 @@ impl Core {
         // Listening starts internet reachability, which mustn't join the
         // DHT, even briefly, when the user turned it off.
         main.set_reach_internet(saved.flag(settings::REACH));
+        // Receipts waiting for a contact may go as soon as it connects:
+        // the user's choice applies first (the node keeps it too).
+        main.set_send_read_receipts(saved.flag(settings::SEND_READ));
         let port = main
             .listen(format!("0.0.0.0:{PORT}"))
             .or_else(|_| main.listen(format!("0.0.0.0:{fallback}")))
@@ -424,7 +427,7 @@ impl Core {
     }
 
     fn apply_privacy_to(&self, node: &Node, persona: bool) {
-        let (onion, strip, reach, timer, volunteers) = {
+        let (onion, strip, reach, timer, volunteers, read) = {
             let s = self.settings();
             (
                 s.flag(settings::ONION),
@@ -432,12 +435,15 @@ impl Core {
                 s.flag(settings::REACH),
                 s.number(settings::TIMER),
                 s.flag(settings::VOLUNTEERS),
+                s.flag(settings::SEND_READ),
             )
         };
         node.set_use_volunteers(volunteers);
         node.set_cover_traffic(self.cover_ms());
         node.set_onion_first(onion);
         node.set_strip_metadata(strip);
+        // Off also drops reads still waiting for their sender.
+        node.set_send_read_receipts(read);
         // Anonymous identities never publish themselves in the DHT.
         node.set_reach_internet(reach && !persona);
         node.set_default_disappearing(timer);

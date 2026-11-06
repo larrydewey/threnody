@@ -20,7 +20,7 @@ Threnody is a private messenger that works without a company in the middle. Ther
 - **Groups** using MLS, with no server. Members who can't reach each other directly pass messages through a member who can.
 - **Several devices, one account.** Link a laptop to your phone with a one-time code. Devices are equal: any of them can add or remove the others, and they share your contacts and history.
 - **WireGuard tunnels.** Approved contacts can get private network tunnels between their devices, with keys from the post-quantum session.
-- **Messages for offline contacts** are sealed so only the recipient can open them, and held by mutual contacts until the recipient comes back.
+- **Messages for offline contacts** are sealed so only the recipient can open them, and held by mutual contacts until the recipient comes back. Their delivered and read ticks come back the same way, even if you are offline by then.
 - **Open source**, under Apache-2.0 or MIT.
 
 ## Get it

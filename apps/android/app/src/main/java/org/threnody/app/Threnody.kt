@@ -213,6 +213,9 @@ object Threnody {
         node.setOnionFirst(Privacy.onionFirst(ctx))
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
         node.setStripMetadata(Privacy.stripMetadata(ctx))
+        // Kept by the node too, so it holds before this runs after a
+        // restart; off drops reads still waiting for their sender.
+        node.setSendReadReceipts(Privacy.sendReadReceipts(ctx))
         node.setReachInternet(Privacy.reachInternet(ctx))
         node.setUseVolunteers(Privacy.useVolunteers(ctx))
     }

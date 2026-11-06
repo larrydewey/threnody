@@ -29,6 +29,7 @@ pub(crate) mod portmap;
 pub mod push;
 mod quic;
 pub mod reach;
+pub mod receipts;
 mod recover;
 pub mod relay;
 pub mod sync;

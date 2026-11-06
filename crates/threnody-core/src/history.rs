@@ -127,8 +127,10 @@ pub struct Entry {
     /// An outgoing message the recipient acknowledged (Appendix C); for a
     /// group, every recipient.
     pub delivered: bool,
-    /// When the recipient displayed this message (0 = not yet). Only
-    /// meaningful on outgoing entries.
+    /// For outgoing entries: when the recipient displayed it (0 = not
+    /// yet). For incoming ones: nonzero once we reported it read, so it is
+    /// reported once (the network layer stores 1, so no reading time is
+    /// kept at rest).
     pub read_ms: u64,
     /// For outgoing group messages: how many members it went to, and the
     /// devices that acknowledged it so far.
@@ -1285,6 +1287,35 @@ impl Home {
         Ok(true)
     }
 
+    /// Marks the outgoing 1:1 entries whose local ids are in `ids`
+    /// delivered, with one load and at most one save (a receipt names up
+    /// to 1,024). Returns the ids that changed; for a group, none.
+    pub fn mark_delivered_ids(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        ids: &[u64],
+        now_ms: u64,
+    ) -> Result<Vec<u64>> {
+        if matches!(c, ConversationId::Group(_)) || ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _lock = history_lock();
+        let wanted: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let mut changed = Vec::new();
+        for e in h.entries.iter_mut().filter(|e| {
+            e.outgoing && e.local_id != 0 && !e.delivered && wanted.contains(&e.local_id)
+        }) {
+            e.delivered = true;
+            changed.push(e.local_id);
+        }
+        if !changed.is_empty() {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(changed)
+    }
+
     /// Merges entries from another of our devices into a conversation;
     /// returns how many were new.
     pub fn merge_entries(
@@ -1519,7 +1550,9 @@ impl Home {
     }
 
     /// Marks the entries `pick` chooses as read at `now_ms`; returns how
-    /// many changed. Only our outgoing entries are meant to get this.
+    /// many changed. Outgoing entries: the recipient displayed them.
+    /// Incoming ones: we reported them read. Entries already marked keep
+    /// their time.
     pub fn mark_read_entries(
         &self,
         identity: &Identity,
@@ -2049,6 +2082,93 @@ mod tests {
         e.poll = Some(p);
         let h = History::transcript(vec![e]);
         assert_eq!(History::decode(&h.encode().unwrap()).unwrap(), h);
+    }
+
+    #[test]
+    fn mark_delivered_ids_marks_once_in_one_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([4; 32]);
+        for (at, local_id) in [(2, 10), (4, 11), (6, 12)] {
+            let e = Entry {
+                local_id,
+                ..entry(at, "ours", None)
+            };
+            home.append_history(&id, c, e, at).unwrap();
+        }
+        // Theirs, with a remote id equal to one of ours: never touched.
+        let theirs = Entry {
+            remote_id: 11,
+            local_id: 11,
+            ..entry(7, "theirs", None)
+        };
+        home.append_history(&id, c, theirs, 7).unwrap();
+        let file = dir.path().join(format!("{}.state", c.state_name(&id)));
+        let mut changed = home.mark_delivered_ids(&id, c, &[12, 10, 99], 8).unwrap();
+        changed.sort_unstable();
+        assert_eq!(changed, [10, 12]);
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(
+            home.mark_delivered_ids(&id, c, &[10, 12], 9)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            written,
+            "nothing changed, nothing saved"
+        );
+        let h = home.load_history(&id, c, 9).unwrap();
+        let delivered: Vec<(bool, bool)> = h
+            .entries()
+            .iter()
+            .map(|e| (e.outgoing, e.delivered))
+            .collect();
+        assert_eq!(
+            delivered,
+            [(true, true), (true, false), (true, true), (false, false)]
+        );
+        // Groups count members' acknowledgements instead.
+        let g = ConversationId::Group([5; 16]);
+        let e = Entry {
+            local_id: 13,
+            recipients: 2,
+            ..entry(8, "all", None)
+        };
+        home.append_history(&id, g, e, 8).unwrap();
+        assert!(
+            home.mark_delivered_ids(&id, g, &[13], 9)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!home.load_history(&id, g, 9).unwrap().entries()[0].delivered);
+    }
+
+    #[test]
+    fn read_ms_marks_reported_incoming_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([3; 32]);
+        let incoming = Entry {
+            remote_id: 41,
+            ..entry(1, "from them", None)
+        };
+        let outgoing = Entry {
+            local_id: 42,
+            ..entry(2, "from us", None)
+        };
+        assert!(!incoming.outgoing && outgoing.outgoing);
+        home.append_history(&id, c, incoming, 1).unwrap();
+        home.append_history(&id, c, outgoing, 2).unwrap();
+        let reported = |e: &Entry| !e.outgoing && e.remote_id == 41;
+        assert_eq!(home.mark_read_entries(&id, c, 10, reported).unwrap(), 1);
+        // Once only: a second report changes nothing and keeps the time.
+        assert_eq!(home.mark_read_entries(&id, c, 20, reported).unwrap(), 0);
+        let h = home.load_history(&id, c, 30).unwrap();
+        let read: Vec<u64> = h.entries().iter().map(|e| e.read_ms).collect();
+        assert_eq!(read, [10, 0], "survives a save and load; ours untouched");
     }
 }
 
