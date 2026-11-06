@@ -28,6 +28,8 @@ mod groupcalls;
 mod groups;
 mod persona;
 mod push;
+#[cfg(all(feature = "radio", target_os = "linux"))]
+mod radio;
 pub use push::{PushEndpoint, WakeReport};
 mod schedule;
 pub use schedule::{ScheduleFailure, ScheduledInfo};
@@ -891,6 +893,18 @@ pub struct ThrenodyNode {
     /// Userspace WireGuard on a TUN descriptor (`tunnel_start_device`).
     #[cfg(all(feature = "boringtun", unix))]
     tunnel_device: Mutex<Option<threnody_net::WgDevice>>,
+    /// Bluetooth LE and Wi-Fi Direct (see `radio`).
+    #[cfg(all(feature = "radio", target_os = "linux"))]
+    radio: radio::Radio,
+}
+
+/// Radio state holds D-Bus objects that must go while the runtime (the
+/// first field, so dropped first) still exists.
+#[cfg(all(feature = "radio", target_os = "linux"))]
+impl Drop for ThrenodyNode {
+    fn drop(&mut self) {
+        self.radio_drop();
+    }
 }
 
 /// Groups an entry's reactions by emoji; `me` is our reactor id.
@@ -1373,6 +1387,8 @@ impl ThrenodyNode {
         passphrase: Option<String>,
         tunnel_port: Option<u16>,
     ) -> Result<Arc<Self>> {
+        #[cfg(all(feature = "radio", target_os = "linux"))]
+        let scratch = std::path::PathBuf::from(&home);
         let home = Home::new(home);
         let pw = passphrase.as_deref().map(str::as_bytes);
         let identity = if home.has_identity() {
@@ -1444,6 +1460,8 @@ impl ThrenodyNode {
             media,
             #[cfg(all(feature = "boringtun", unix))]
             tunnel_device: Mutex::new(None),
+            #[cfg(all(feature = "radio", target_os = "linux"))]
+            radio: radio::Radio::new(scratch),
         });
         this.queue_group_updates(resumed);
         Ok(this)
@@ -2709,8 +2727,11 @@ impl ThrenodyNode {
 
 #[uniffi::export]
 impl ThrenodyNode {
-    /// Stops listening and closes every session.
+    /// Stops listening and closes every session (and, on Linux, stops
+    /// Bluetooth and leaves Wi-Fi Direct groups).
     pub fn shutdown(&self) {
+        #[cfg(all(feature = "radio", target_os = "linux"))]
+        self.radio_shutdown();
         self.node.shutdown();
     }
 }

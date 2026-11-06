@@ -5853,6 +5853,7 @@ dependencies = [
  "threnody-groups",
  "threnody-media",
  "threnody-net",
+ "threnody-radio",
  "threnody-tun",
  "tokio",
  "uniffi",

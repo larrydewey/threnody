@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use bluer::AdapterEvent;
 use bluer::adv::{Advertisement, SecondaryChannel};
 use bluer::l2cap::{SocketAddr, Stream, StreamListener};
-use bluer::{AdapterEvent, Address, AddressType};
 use futures_util::StreamExt;
 use threnody_core::PublicIdentity;
 use threnody_core::discovery::{EPOCH_SECS, beacon_port};
@@ -17,6 +17,9 @@ use threnody_net::Node;
 use threnody_net::discovery::BLE_SERVICE_UUID;
 
 use crate::Log;
+
+/// BlueZ's address types, for building a [`Found`] from stored values.
+pub use bluer::{Address, AddressType};
 
 /// A Threnody device seen over Bluetooth LE.
 #[derive(Clone, Debug)]
