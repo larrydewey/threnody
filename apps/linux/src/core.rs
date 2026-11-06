@@ -450,6 +450,20 @@ impl Core {
 
     /// This machine's address on its default network, for invites: IPv4,
     /// else a global IPv6 address on an IPv6-only network.
+    /// Our addresses on the default IPv4 and IPv6 routes: which network
+    /// we are on, as far as sessions can tell.
+    pub fn route_addrs() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+        let route = |bind: &str, to: &str| {
+            let s = std::net::UdpSocket::bind(bind).ok()?;
+            s.connect(to).ok()?;
+            Some(s.local_addr().ok()?.ip())
+        };
+        (
+            route("0.0.0.0:0", "192.0.2.1:9"),
+            route("[::]:0", "[2001:db8::1]:9"),
+        )
+    }
+
     pub fn lan_ip() -> Option<std::net::IpAddr> {
         // Connecting a UDP socket picks a route without sending anything.
         let route = |bind: &str, to: &str| {

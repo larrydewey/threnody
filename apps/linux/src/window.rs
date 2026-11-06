@@ -1773,16 +1773,28 @@ impl App {
         ui::bg_quiet(move || core.set_metered(metered));
         let weak = Rc::downgrade(self);
         let last = Rc::new(Cell::new(monitor.is_network_available()));
+        // GNetworkMonitor signals any change of routes, not only another
+        // network: only a new address on a default route, or the network
+        // coming back, is a change for the node. Each one marks every
+        // session as possibly dead, and costs onion circuits their first
+        // hops until they are heard from again.
+        let addrs = Arc::new(std::sync::Mutex::new(Core::route_addrs()));
         monitor.connect_network_changed(move |m, available| {
             let Some(this) = weak.upgrade() else { return };
             let core = this.core.clone();
             let metered = m.is_network_metered();
             let was = last.replace(available);
+            let addrs = addrs.clone();
             ui::bg_quiet(move || {
                 core.set_metered(metered);
-                if available {
+                let now = Core::route_addrs();
+                let moved = {
+                    let mut last = addrs.lock().unwrap_or_else(|e| e.into_inner());
+                    std::mem::replace(&mut *last, now) != now
+                };
+                if available && (moved || !was) {
                     core.network_changed();
-                } else if was {
+                } else if !available && was {
                     core.say("* network lost");
                 }
             });
