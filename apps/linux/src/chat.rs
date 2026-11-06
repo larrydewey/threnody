@@ -3060,12 +3060,13 @@ impl ChatView {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
-                    let original = name.clone();
+                    let mut converted = false;
                     let data = match std::fs::read(p) {
                         Ok(d) if !strip => d,
                         Ok(d) => match prepare(p, name.clone(), d) {
-                            Ok((n, d)) => {
+                            Ok((n, d, c)) => {
                                 name = n;
+                                converted = c;
                                 d
                             }
                             Err(e) => {
@@ -3100,7 +3101,7 @@ impl ChatView {
                     // A converted photo can never be made again from the
                     // original: keep what was sent, privately, so our
                     // other devices can have it too.
-                    let location = if name == original {
+                    let location = if !converted {
                         Some(p.display().to_string())
                     } else {
                         keep_private(&name, &data).or_else(|| Some(p.display().to_string()))
@@ -4038,20 +4039,20 @@ const MAX_PIXELS: i64 = 100_000_000;
 const MAX_SIDE: i32 = 4096;
 
 /// An image the node can't strip, re-encoded as JPEG (which then carries
-/// no metadata): the name and bytes to send. Others pass through. Its
-/// content decides as well as its name, so a HEIC called "photo.jpg" is
-/// converted too.
+/// no metadata): the name and bytes to send, and whether it was converted.
+/// Others pass through. Its content decides as well as its name, so a HEIC
+/// called "photo.jpg" is converted too (and keeps its name).
 fn prepare(
     path: &std::path::Path,
     name: String,
     data: Vec<u8>,
-) -> Result<(String, Vec<u8>), String> {
+) -> Result<(String, Vec<u8>, bool), String> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     if !CONVERT.contains(&ext.as_str()) && !threnody_core::media::needs_converting(&data) {
-        return Ok((name, data));
+        return Ok((name, data, false));
     }
     let unreadable =
         || format!("{name}: can't remove its location and camera details, so it wasn't sent");
@@ -4071,7 +4072,7 @@ fn prepare(
         .save_to_bufferv("jpeg", &[("quality", "92")])
         .map_err(|_| unreadable())?;
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
-    Ok((format!("{stem}.jpg"), jpeg))
+    Ok((format!("{stem}.jpg"), jpeg, true))
 }
 
 /// What a file whose contents another of our devices may have says.
@@ -4141,21 +4142,23 @@ mod tests {
         p.fill(0x3366_99ff);
         p.savev(&tiff, "tiff", &[]).unwrap();
         let data = std::fs::read(&tiff).unwrap();
-        let (name, out) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
+        let (name, out, converted) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
         assert_eq!(name, "scan.jpg");
+        assert!(converted);
         assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
 
         // Whatever it is called.
         let misnamed = dir.join("misnamed.jpg");
         std::fs::copy(&tiff, &misnamed).unwrap();
-        let (name, out) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
+        let (name, out, converted) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
         assert_eq!(name, "misnamed.jpg");
+        assert!(converted, "though its name stayed");
         assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
 
         // Formats the node strips itself pass through untouched.
         let png = dir.join("a.png");
-        let (name, out) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
-        assert!(name == "a.png" && out == b"as is");
+        let (name, out, converted) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
+        assert!(name == "a.png" && out == b"as is" && !converted);
 
         // One it can't read isn't sent with its metadata.
         let heic = dir.join("broken.heic");

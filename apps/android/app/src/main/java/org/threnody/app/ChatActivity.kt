@@ -1129,11 +1129,12 @@ class ChatActivity : Activity() {
                     var finished = false
                     for ((k, v) in fetchLabels) {
                         val p = byEntry[k]
-                        if (p == null) { finished = true; continue }
+                        // Gone from the queue, or nobody has it: redrawn
+                        // as it now is (with its tap to try again).
+                        if (p == null || p.fetch is FileFetch.Unavailable) { finished = true; continue }
                         fetchText(p.fetch)?.let { v.first.text = v.second(it) }
                         if (p.fetch is FileFetch.Fetching || p.fetch is FileFetch.Waiting) coming = true
                     }
-                    // Done (or given up on): the chat shows it as it now is.
                     if (finished) refreshSoon()
                     if (coming) pollFetches()
                 }
