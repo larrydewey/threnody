@@ -39,7 +39,7 @@ Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 ack
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
                                                            ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off,
-                                                           ; 131072 receipts); absent = 0
+                                                           ; 131072 receipts, 262144 device sync); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded, 16 timer off)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
@@ -192,6 +192,8 @@ receipts-out = 1 || flags (1: read receipts off) || created_ms (u64 BE)
 ```
 
 A damaged tail is skipped; an unreadable file is started afresh, with read receipts on.
+
+History key 20 on an outgoing entry is when this device last learned something new about its ticks (`ticked_ms`; absent = never). It is local: transcripts carry none, and a receiver drops any it is sent. A device keeps how far each sibling has its ticks in `history-sync-ticks`, in the same layout as `history-sync` (`1 || *(device (32) || until ms (u64 BE))`). Its queue of file contents to fetch from its siblings is `file-fetches` (`1 || cbor [* { 0: conversation, 1: bstr .cbor FileRef, ? 2: true (automatic) }]`, at most 64; references only, never contents). See Appendix J, *Files* and *Ticks*. Older readers skip key 20 and ignore both files.
 
 A history file's name is keyed, so a listing of the data directory shows neither whom the user talks to nor which groups they are in:
 

@@ -182,7 +182,10 @@ pub enum TickMark {
     /// Sent from this device.
     Sent,
     /// A group message some members have.
-    Partial { delivered: u32, recipients: u32 },
+    Partial {
+        delivered: u32,
+        recipients: u32,
+    },
     Delivered,
     Read,
 }
@@ -3014,8 +3017,19 @@ mod tests {
         );
         // Weakest first: an album shows the least of its ticks.
         assert!(TickMark::None < TickMark::Sent);
-        assert!(TickMark::Sent < TickMark::Partial { delivered: 1, recipients: 2 });
-        assert!(TickMark::Partial { delivered: 1, recipients: 2 } < TickMark::Delivered);
+        assert!(
+            TickMark::Sent
+                < TickMark::Partial {
+                    delivered: 1,
+                    recipients: 2
+                }
+        );
+        assert!(
+            TickMark::Partial {
+                delivered: 1,
+                recipients: 2
+            } < TickMark::Delivered
+        );
         assert!(TickMark::Delivered < TickMark::Read);
     }
 

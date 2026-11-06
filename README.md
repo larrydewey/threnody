@@ -18,7 +18,7 @@ Threnody is a private messenger that works without a company in the middle. Ther
 - **Anonymous identities.** Make a separate identity for one conversation, with its own keys, contacts and history. Nothing links it to you unless you choose to reveal it, and it can delete itself after a day, a week or four weeks.
 - **Voice and video calls** between two people, and group calls of up to eight in a group, carried inside the same encrypted connections. A call rings every device of your contact's account.
 - **Groups** using MLS, with no server. Members who can't reach each other directly pass messages through a member who can.
-- **Several devices, one account.** Link a laptop to your phone with a one-time code. Devices are equal: any of them can add or remove the others, and they share your contacts and history.
+- **Several devices, one account.** Link a laptop to your phone with a one-time code. Devices are equal: any of them can add or remove the others, and they share your contacts, history and delivery ticks. Recent photos and voice messages follow you to your other devices on Wi-Fi; other files come over when you tap them.
 - **WireGuard tunnels.** Approved contacts can get private network tunnels between their devices, with keys from the post-quantum session.
 - **Messages for offline contacts** are sealed so only the recipient can open them, and held by mutual contacts until the recipient comes back. Their delivered and read ticks come back the same way, even if you are offline by then.
 - **Open source**, under Apache-2.0 or MIT.
