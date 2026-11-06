@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -252,6 +252,13 @@ pub(crate) struct ReachState {
     anchor_kick: Notify,
     /// Our handle and handle lookups (Appendix S).
     pub(crate) handles: crate::handle::HandleState,
+    /// When the network last changed (ms): a session older than that may
+    /// be dead without our knowing yet, so it is no first hop for a
+    /// background onion circuit (see `Node::reconnect_hidden`).
+    pub(crate) changed_ms: AtomicU64,
+    /// The contact a background reconnection dials directly, to bring up
+    /// a first hop for the others, and since when.
+    pub(crate) first_hop: Mutex<Option<(PublicIdentity, Instant)>>,
 }
 
 impl ReachState {
@@ -269,6 +276,8 @@ impl ReachState {
             anchor: Mutex::new(None),
             anchor_kick: Notify::new(),
             handles: Default::default(),
+            changed_ms: AtomicU64::new(0),
+            first_hop: Mutex::new(None),
         }
     }
 }
@@ -404,6 +413,7 @@ impl Node {
 
     /// The network changed: gather candidates again, publish and poll.
     pub fn network_changed(&self) {
+        self.rdv().changed_ms.store(now_ms(), Ordering::Relaxed);
         {
             let mut inner = lock(&self.rdv().inner);
             inner.backoff.clear();
@@ -1212,9 +1222,14 @@ impl Node {
             targets: lock(&punch.targets).clone(),
             dialing: punch.we_dial,
         });
+        // Onion first (Appendix I), whenever a circuit can be built: a
+        // punched path shows each side's address to the other. Not for an
+        // upgrade, which a call asks for to get a direct path.
+        let hide = urge != Urge::Upgrade && !stranger;
         let node = self.clone();
         tokio::spawn(async move {
-            let ok = node.run_punch(peer, &punch).await;
+            let ok = (hide && node.reconnect_hidden(&peer, 0).await)
+                || node.run_punch(peer, &punch).await;
             let mut inner = lock(&node.rdv().inner);
             inner.punches.remove(&peer);
             if ok {

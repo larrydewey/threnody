@@ -310,7 +310,7 @@ impl Node {
             return Ok(s.peer);
         }
         let first = link.addrs.first().map(String::as_str);
-        if let Some(p) = self.reach_hidden(first, fp).await {
+        if let Some(p) = self.reach_hidden(first, fp, true).await {
             return Ok(p);
         }
         // From here on, whoever made the link sees our address (or a

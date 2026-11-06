@@ -232,6 +232,13 @@ impl Node {
                     if cfg.auto_connect && node.should_dial(&peer, &mut last_dial) {
                         let node = node.clone();
                         tokio::spawn(async move {
+                            // Through an onion circuit when one can be
+                            // built, as any background reconnection; a
+                            // LAN peer we'd need as the first hop is
+                            // dialed here directly.
+                            if node.reconnect_hidden(&peer, 0).await {
+                                return;
+                            }
                             let _ = node
                                 .connect(&addr.to_string(), Some(peer.fingerprint()))
                                 .await;

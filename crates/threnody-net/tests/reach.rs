@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use threnody_core::rendezvous;
 use threnody_core::store::Home;
-use threnody_core::{AppMessage, Identity};
+use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::reach::ReachConfig;
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -895,4 +895,111 @@ async fn invites_try_every_address_ipv6_included() {
         .expect("didn't wait for the dead address")
         .unwrap();
     assert_eq!(peer, bob.identity());
+}
+
+/// x dials y over TCP and both approve each other; without `keep` the
+/// session is dropped again.
+async fn approve(
+    x: &(Node, UnboundedReceiver<Event>),
+    y: &(Node, UnboundedReceiver<Event>),
+    y_tcp: std::net::SocketAddr,
+    keep: bool,
+) {
+    let (xn, yn) = (&x.0, &y.0);
+    let yid = xn.connect(&y_tcp.to_string(), None).await.unwrap();
+    xn.set_approval(&yid, true).unwrap();
+    yn.set_approval(&xn.identity(), true).unwrap();
+    let keyed = |a: &Node, b: &PublicIdentity| {
+        a.contacts()
+            .get(b)
+            .is_some_and(|c| c.mutually_approved() && c.discovery_key.is_some())
+    };
+    timeout(Duration::from_secs(10), async {
+        while !keyed(xn, &yid) || !keyed(yn, &xn.identity()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if !keep {
+        xn.disconnect(&yid);
+        timeout(Duration::from_secs(10), async {
+            while yn.sessions().iter().any(|s| s.peer == xn.identity()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// Contacts that find each other through the DHT meet through an onion
+/// circuit when either can build one, not over a punched path.
+#[tokio::test]
+async fn rendezvous_goes_through_a_circuit_when_one_can_be_built() {
+    let testnet = tokio::task::spawn_blocking(|| mainline::Testnet::builder(8).build().unwrap())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let names = ["alice", "bob", "r1", "r2"];
+    let mut nodes = Vec::new();
+    let mut tcp = Vec::new();
+    for n in names {
+        let x = node(&dir, n);
+        tcp.push(x.0.listen("127.0.0.1:0").await.unwrap());
+        nodes.push(x);
+    }
+    let [alice, bob, r1, r2] = &nodes[..] else {
+        unreachable!()
+    };
+    // alice → r1 → r2 → bob, or bob → r2 → r1 → alice.
+    approve(alice, bob, tcp[1], false).await;
+    approve(alice, r2, tcp[3], false).await;
+    approve(bob, r1, tcp[2], false).await;
+    approve(alice, r1, tcp[2], true).await;
+    approve(bob, r2, tcp[3], true).await;
+    approve(r1, r2, tcp[3], true).await;
+    let bob_id = bob.0.identity();
+    assert!(!alice.0.sessions().iter().any(|s| s.peer == bob_id));
+
+    let cfg = ReachConfig {
+        bootstrap: Some(testnet.bootstrap.clone()),
+        reflectors: vec![],
+        poll_foreground: Duration::from_secs(1),
+        poll_seeking: Duration::from_secs(1),
+        loopback: true,
+        ..ReachConfig::default()
+    };
+    for n in [alice, bob] {
+        n.0.listen_quic("127.0.0.1:0").await.unwrap();
+        n.0.start_reach(cfg.clone()).unwrap();
+    }
+    alice.0.seek(&bob_id);
+    let way = timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(s) = alice.0.sessions().into_iter().find(|s| s.peer == bob_id) {
+                return s.transport;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("alice and bob met");
+    assert_eq!(way, "onion");
+    // And it stays one session, not two circuits fighting.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let s: Vec<_> = alice
+        .0
+        .sessions()
+        .into_iter()
+        .filter(|s| s.peer == bob_id)
+        .collect();
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0].transport, "onion");
+    assert!(
+        bob.0
+            .sessions()
+            .iter()
+            .any(|s| s.peer == alice.0.identity())
+    );
 }

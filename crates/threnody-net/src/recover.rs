@@ -556,6 +556,9 @@ impl Node {
     /// every recovery slot and punch toward the peers we lost.
     pub fn network_switched(&self, to_standby: bool) {
         *lock(&self.rec().t0) = Some(Instant::now());
+        // Sessions from before may be dead: no first hops (see below).
+        let changed = now_ms();
+        self.rdv().changed_ms.store(changed, Ordering::Relaxed);
         self.timed(if to_standby {
             "network changed to the standby network"
         } else {
@@ -589,7 +592,14 @@ impl Node {
                     continue;
                 }
                 let (node, quic, peer) = (self.clone(), quic.clone(), *peer);
-                tokio::spawn(async move { node.dial_through(&quic, peer, &targets).await });
+                // Through an onion circuit once one can be built (the
+                // first peer back gives the others their first hop); else
+                // straight through the standby hole.
+                tokio::spawn(async move {
+                    if !node.reconnect_hidden(&peer, changed).await {
+                        node.dial_through(&quic, peer, &targets).await;
+                    }
+                });
             }
         }
         self.network_changed();

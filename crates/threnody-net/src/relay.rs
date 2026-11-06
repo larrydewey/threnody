@@ -18,6 +18,7 @@
 //! See `docs/appendix-g-relay.md`.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
@@ -216,6 +217,15 @@ pub(crate) const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Circuits through volunteers cross anonymous links with cover traffic,
 /// which spaces every message: they take longer to build.
 const VOLUNTEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A background reconnection with no first hop for its circuit dials
+/// directly, to bring one up for the others; the others leave it this
+/// long before one of them tries instead.
+const FIRST_HOP_CLAIM: Duration = Duration::from_secs(5);
+/// The longest a background reconnection waits for a first hop before
+/// dialing directly anyway.
+const FIRST_HOP_WAIT: Duration = Duration::from_secs(30);
+/// How often a waiting one looks again.
+const FIRST_HOP_POLL: Duration = Duration::from_millis(200);
 
 impl Node {
     fn relay_send(&self, to: &PublicIdentity, msg: &RelayMsg) -> bool {
@@ -479,8 +489,19 @@ impl Node {
         addr: Option<&str>,
         pin: Option<Fingerprint>,
     ) -> Result<PublicIdentity> {
+        self.reach_with(addr, pin, true).await
+    }
+
+    /// [`Node::reach`]; without `onion`, no onion circuit is tried (the
+    /// caller tried one already).
+    async fn reach_with(
+        &self,
+        addr: Option<&str>,
+        pin: Option<Fingerprint>,
+        onion: bool,
+    ) -> Result<PublicIdentity> {
         if let Some(fp) = pin
-            && let Some(p) = self.reach_hidden(addr, fp).await
+            && let Some(p) = self.reach_hidden(addr, fp, onion).await
         {
             return Ok(p);
         }
@@ -525,6 +546,7 @@ impl Node {
         &self,
         addr: Option<&str>,
         fp: Fingerprint,
+        onion: bool,
     ) -> Option<PublicIdentity> {
         if !self.prefer_onion() {
             return None;
@@ -532,7 +554,8 @@ impl Node {
         // Metadata first (spec §9 layer 2): with two approved relays, an
         // onion circuit keeps any single relay, and anyone watching our
         // network, from seeing who we talk to.
-        if self.onion_possible(fp)
+        if onion
+            && self.onion_possible(fp)
             && let Ok(Ok(p)) =
                 tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
         {
@@ -554,20 +577,104 @@ impl Node {
     /// Whether a two-relay onion path to `dest` could exist: a live,
     /// mutually approved neighbour plus another approved contact.
     pub(crate) fn onion_possible(&self, dest: Fingerprint) -> bool {
+        self.first_hops(dest, 0) && self.onion_relays(dest)
+    }
+
+    /// Whether we have a live direct session with a mutually approved
+    /// neighbour other than `dest`, begun at or after `since_ms` or over
+    /// a radio link (which a change of network leaves alone).
+    fn first_hops(&self, dest: Fingerprint, since_ms: u64) -> bool {
+        self.sessions().into_iter().any(|s| {
+            s.via.is_none()
+                && s.peer.fingerprint() != dest
+                && (s.since_ms >= since_ms || s.addr.ip().is_unspecified())
+                && self.shared.mutual(&s.peer)
+        })
+    }
+
+    /// Whether we have the two mutually approved contacts besides `dest`
+    /// that a two-relay circuit to it needs.
+    fn onion_relays(&self, dest: Fingerprint) -> bool {
         let me = self.identity();
-        let firsts = self
-            .sessions()
-            .into_iter()
-            .filter(|s| {
-                s.via.is_none() && s.peer.fingerprint() != dest && self.shared.mutual(&s.peer)
-            })
-            .count();
-        let others = self
-            .contacts()
+        self.contacts()
             .iter()
             .filter(|c| c.mutually_approved() && c.fingerprint() != dest && c.key != me)
-            .count();
-        firsts >= 1 && others >= 2
+            .take(2)
+            .count()
+            >= 2
+    }
+
+    /// Onion first for background reconnections (Appendix I, *Background
+    /// reconnection*): reaches mutually approved `peer` through an onion
+    /// circuit when onion routing is on and one can be built. True once a
+    /// session with `peer` begun at or after `since_ms` is up; false when
+    /// the caller should go direct. When the circuit lacks only a first
+    /// hop (none since the network last changed, say, or just after
+    /// start-up), one reconnection at a time goes direct to bring one up,
+    /// and the others wait for it, at most [`FIRST_HOP_WAIT`].
+    pub(crate) async fn reconnect_hidden(&self, peer: &PublicIdentity, since_ms: u64) -> bool {
+        let fp = peer.fingerprint();
+        // A call with `peer` runs now: it needs its path back at once,
+        // and datagrams for its media, so it goes as before.
+        let calling = self.call().is_some_and(|c| c.peer == *peer);
+        if !self.prefer_onion() || !self.shared.mutual(peer) || calling || !self.onion_relays(fp) {
+            return false;
+        }
+        let up = || {
+            self.sessions()
+                .iter()
+                .any(|s| s.peer == *peer && s.since_ms >= since_ms)
+        };
+        let start = Instant::now();
+        loop {
+            if up() {
+                return true;
+            }
+            let fresh = self.rdv().changed_ms.load(Ordering::Relaxed);
+            if self.first_hops(fp, fresh) {
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
+                {
+                    return true;
+                }
+                self.emit(Event::ReachNote {
+                    note: format!("no onion circuit to {fp}: reconnecting directly"),
+                });
+                return up();
+            }
+            if start.elapsed() >= FIRST_HOP_WAIT || self.claim_first_hop(peer) {
+                return false;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(FIRST_HOP_POLL) => {}
+                () = self.closed() => return false,
+            }
+        }
+    }
+
+    /// Takes the turn to dial `peer` directly as the first hop, unless
+    /// another contact has it (for [`FIRST_HOP_CLAIM`]).
+    fn claim_first_hop(&self, peer: &PublicIdentity) -> bool {
+        let mut c = lock(&self.rdv().first_hop);
+        if c.is_some_and(|(p, t)| p != *peer && t.elapsed() < FIRST_HOP_CLAIM) {
+            return false;
+        }
+        *c = Some((*peer, Instant::now()));
+        true
+    }
+
+    /// [`Node::reach_peer`] for reconnecting in the background (apps
+    /// call it on start and when the network comes back): onion first as
+    /// [`Node::reconnect_hidden`] says, then volunteer relays, a direct
+    /// dial and relay circuits.
+    pub async fn reconnect_peer(&self, peer: &PublicIdentity) -> Result<()> {
+        if self.connected(peer) || self.reconnect_hidden(peer, 0).await {
+            return Ok(());
+        }
+        let addr = self.contacts().get(peer).and_then(|c| c.last_addr.clone());
+        self.reach_with(addr.as_deref(), Some(peer.fingerprint()), false)
+            .await
+            .map(|_| ())
     }
 
     /// Makes sure there is a session with `peer`: an existing one, a

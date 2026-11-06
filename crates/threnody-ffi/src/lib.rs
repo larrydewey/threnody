@@ -1638,10 +1638,11 @@ PersistentKeepalive = 25\n",
             .map_err(fail)
     }
 
-    /// Dials every mutually approved contact that isn't connected, at its
-    /// last known address or through relays. Returns at once; sessions
-    /// show up as `Connected` events. Apps call it on start and when the
-    /// network comes back.
+    /// Reconnects every mutually approved contact that isn't connected:
+    /// through an onion circuit once one can be built (with onion routing
+    /// on), else at its last known address or through relays. Returns at
+    /// once; sessions show up as `Connected` events. Apps call it on start
+    /// and when the network comes back.
     pub fn reconnect(&self) {
         let live: Vec<PublicIdentity> = self.node.sessions().iter().map(|s| s.peer).collect();
         for c in self.node.contacts().iter() {
@@ -1650,7 +1651,9 @@ PersistentKeepalive = 25\n",
             }
             let (node, peer) = (self.node.clone(), c.key);
             self.rt.spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(30), node.reach_peer(&peer)).await;
+                // Room to wait for a first hop, then dial.
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(75), node.reconnect_peer(&peer)).await;
             });
         }
     }

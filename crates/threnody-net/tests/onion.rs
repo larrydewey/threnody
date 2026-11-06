@@ -277,3 +277,175 @@ async fn without_relays_contacts_are_dialled_directly() {
     )
     .await;
 }
+
+/// How our session with `peer` runs, if there is one.
+fn transport(x: &N, peer: &N) -> Option<&'static str> {
+    let id = peer.node.identity();
+    x.node
+        .sessions()
+        .into_iter()
+        .find(|s| s.peer == id)
+        .map(|s| s.transport)
+}
+
+/// Waits until `x` has a session with `peer`, and says how it runs.
+async fn transport_soon(x: &N, peer: &N) -> &'static str {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(t) = transport(x, peer) {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a session came up")
+}
+
+/// a knows r1 (connected), r2 and c (approved, not connected); r1, r2
+/// and c are linked in a chain, so a circuit a → r1 → r2 → c exists.
+async fn chain(dir: &tempfile::TempDir) -> (N, N, N, N) {
+    let mut a = spawn(dir, "a").await;
+    let mut r1 = spawn(dir, "r1").await;
+    let mut r2 = spawn(dir, "r2").await;
+    let mut c = spawn(dir, "c").await;
+    befriend(&mut a, &mut r2).await;
+    befriend(&mut a, &mut c).await;
+    link(&mut a, &mut r1).await;
+    link(&mut r1, &mut r2).await;
+    link(&mut r2, &mut c).await;
+    (a, r1, r2, c)
+}
+
+#[tokio::test]
+async fn background_reconnection_goes_through_a_circuit_when_one_can_be_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, r1, _r2, c) = chain(&dir).await;
+    // c's address is known (a dialed it before): only onion-first keeps
+    // a from dialing it there.
+    assert!(
+        a.node
+            .contacts()
+            .get(&c.node.identity())
+            .unwrap()
+            .last_addr
+            .is_some()
+    );
+    a.node.reconnect_peer(&c.node.identity()).await.unwrap();
+    assert_eq!(transport(&a, &c), Some("onion"));
+    let via = a
+        .node
+        .sessions()
+        .into_iter()
+        .find(|s| s.peer == c.node.identity())
+        .and_then(|s| s.via);
+    assert_eq!(via, Some(r1.node.identity()));
+}
+
+#[tokio::test]
+async fn background_reconnection_goes_direct_when_no_circuit_can_be_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut c = spawn(&dir, "c").await;
+    // One approved contact besides c: too few relays for a circuit.
+    befriend(&mut a, &mut c).await;
+    link(&mut a, &mut r1).await;
+    link(&mut r1, &mut c).await;
+    a.node.reconnect_peer(&c.node.identity()).await.unwrap();
+    assert_eq!(transport(&a, &c), Some("tcp"));
+}
+
+#[tokio::test]
+async fn background_reconnection_goes_direct_while_onion_routing_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _r1, _r2, c) = chain(&dir).await;
+    a.node.set_prefer_onion(false);
+    a.node.reconnect_peer(&c.node.identity()).await.unwrap();
+    assert_eq!(transport(&a, &c), Some("tcp"));
+}
+
+/// With no session at all (just started), one reconnection goes direct
+/// to give the other a first hop, and the other then goes through a
+/// circuit.
+#[tokio::test]
+async fn the_first_background_reconnection_brings_up_a_first_hop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = spawn(&dir, "a").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut r2 = spawn(&dir, "r2").await;
+    let mut c = spawn(&dir, "c").await;
+    befriend(&mut a, &mut r1).await;
+    befriend(&mut a, &mut r2).await;
+    befriend(&mut a, &mut c).await;
+    link(&mut r1, &mut r2).await;
+    link(&mut r2, &mut c).await;
+    assert!(a.node.sessions().is_empty());
+    let (r1id, cid) = (r1.node.identity(), c.node.identity());
+    let (x, y) = tokio::join!(a.node.reconnect_peer(&r1id), a.node.reconnect_peer(&cid));
+    x.unwrap();
+    y.unwrap();
+    let mut ways = [transport(&a, &r1).unwrap(), transport(&a, &c).unwrap()];
+    ways.sort_unstable();
+    assert_eq!(ways, ["onion", "tcp"]);
+}
+
+/// After a network change, sessions from before may be dead: they aren't
+/// first hops until something has come back on the new network.
+#[tokio::test]
+async fn sessions_from_before_a_network_change_are_no_first_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, r1, _r2, c) = chain(&dir).await;
+    a.node.network_changed();
+    a.node.reconnect_peer(&c.node.identity()).await.unwrap();
+    assert_eq!(transport(&a, &c), Some("tcp"), "c is the first hop now");
+    // r1's old session still stands; a fresh one from the new network
+    // would make circuits possible again (as c's is, for r1).
+    assert_eq!(transport(&a, &r1), Some("tcp"));
+}
+
+/// A contact found on the LAN is reached through a circuit when one can
+/// be built, like any background reconnection.
+#[tokio::test]
+async fn lan_discovery_goes_through_a_circuit_when_one_can_be_built() {
+    use threnody_net::DiscoveryConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let mut x = spawn(&dir, "x").await;
+    let mut y = spawn(&dir, "y").await;
+    let mut r1 = spawn(&dir, "r1").await;
+    let mut r2 = spawn(&dir, "r2").await;
+    // Whichever of x and y dials has a first hop and two other contacts:
+    // x → r1 → r2 → y, or y → r2 → r1 → x.
+    befriend(&mut x, &mut y).await;
+    befriend(&mut x, &mut r2).await;
+    befriend(&mut y, &mut r1).await;
+    link(&mut x, &mut r1).await;
+    link(&mut y, &mut r2).await;
+    link(&mut r1, &mut r2).await;
+    let keyed = |a: &N, b: &N| {
+        a.node
+            .contacts()
+            .get(&b.node.identity())
+            .is_some_and(|c| c.discovery_key.is_some())
+    };
+    assert!(keyed(&x, &y) && keyed(&y, &x));
+    let port = || {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (px, py) = (port(), port());
+    let cfg = |me: u16, other: u16| DiscoveryConfig {
+        bind: format!("127.0.0.1:{me}").parse().unwrap(),
+        targets: vec![format!("127.0.0.1:{other}").parse().unwrap()],
+        interval: Duration::from_millis(100),
+        auto_connect: true,
+    };
+    let tcp = |n: &N| n.addr.parse::<std::net::SocketAddr>().unwrap().port();
+    x.node.start_discovery(cfg(px, py), tcp(&x)).unwrap();
+    y.node.start_discovery(cfg(py, px), tcp(&y)).unwrap();
+    assert_eq!(transport_soon(&x, &y).await, "onion");
+    assert_eq!(transport_soon(&y, &x).await, "onion");
+}

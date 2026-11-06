@@ -1593,12 +1593,18 @@ impl Node {
     /// let each side keep a different one and lose the other, over and
     /// over; so both keep the one dialed by the smaller identity key. True
     /// if the new session (`outbound` from our side) is the one to drop.
-    fn loses_duplicate(&self, peer: &PublicIdentity, outbound: bool) -> bool {
+    ///
+    /// Two onion sessions count the same way (each side may build a
+    /// circuit to the other when it reconnects in the background), though
+    /// their first hops differ; a direct and a circuit session never do.
+    fn loses_duplicate(&self, peer: &PublicIdentity, outbound: bool, onion: bool) -> bool {
         let sessions = lock(&self.shared.sessions);
         let Some(old) = sessions.get(peer) else {
             return false;
         };
-        if old.info.via.is_some()
+        let old_onion = old.info.transport == "onion";
+        if (old.info.via.is_some() && !old_onion)
+            || old_onion != onion
             || now_ms().saturating_sub(old.info.since_ms) > DUPLICATE_WINDOW_MS
             || old.info.outbound == outbound
         {
@@ -1643,7 +1649,8 @@ impl Node {
         };
         let (dialed, via, transport, remote) = route.into_parts(addr);
         let peer = *chan.peer();
-        if via.is_none() && self.loses_duplicate(&peer, outbound) {
+        let onion = transport == "onion";
+        if (via.is_none() || onion) && self.loses_duplicate(&peer, outbound, onion) {
             // Both sides dialed at once; the other session stays (dropping
             // this stream closes it).
             return;
@@ -1752,7 +1759,7 @@ impl Node {
             // a young one gets a moment for the twin before counting as
             // a disconnection.
             let young = started.elapsed() < Duration::from_millis(DUPLICATE_WINDOW_MS);
-            let current = if current && via.is_none() && young {
+            let current = if current && (via.is_none() || onion) && young {
                 tokio::time::sleep(TWIN_GRACE).await;
                 !node.connected(&peer)
             } else {

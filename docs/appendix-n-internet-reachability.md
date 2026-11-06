@@ -118,6 +118,8 @@ Once either side sees the other's fresh candidates:
 4. **The handshake decides.** The Threnody handshake inside the QUIC stream authenticates both sides. A probe from anyone else can at most cause a connection attempt that then fails.
 5. **Fallback.** If nothing connects, the existing paths are tried as today: relays and onion circuits through reachable contacts, and mailboxes for offline delivery. A node relays only between its own mutually approved contacts (Appendix G), so this works only through a contact both people already share. A message none of these can take is held (with the unacknowledged ones, so it survives a restart when small) and goes first in the next session with the contact, instead of failing. The node backs off before starting to punch that contact again: 2, 5, then 15 minutes.
 
+**Onion first.** With onion routing on (the default), a punch toward a mutually approved contact first tries to reach it through an onion circuit when one can be built. The same goes for the standby dials and the announcements after a move (section 5). Probing and dialing as above happen only when no circuit can be built, or when building one fails (Appendix I, *Background reconnection*). A contact reached that way doesn't learn our address. The direct path a call asks for (`upgrade`), the reconnection of a contact in a call with us, and the always-on relay stay direct.
+
 **Symmetric NAT.** With `flags & 1` set on exactly one side, the other side (which has a stable port) dials, and the symmetric side's probes open its own mapping toward that port. That usually works. When both sides are symmetric, the relay fallback applies.
 
 **Where this fails in practice.** Hole punching often fails behind symmetric NAT, which many VPNs use, especially when both people are on one. Relaying then needs a contact the two already share, so a brand-new contact (met through an invite or a handle) with both sides behind VPNs may not connect at all until one of them turns the VPN off, or both are on the same network.
@@ -165,7 +167,7 @@ An app starting after a long time away is found at the contact's next read of it
 |---|---|
 | A passive network observer | UDP traffic to some IP addresses, like any QUIC or BitTorrent traffic. Not who the devices are. |
 | DHT nodes | That this IP address stores and fetches small values under random-looking, hourly-changing keys. Not identities, contacts, or how many contacts (records are padded and keys don't link). A recovery slot (section 5) is the exception: its key is per session, not per hour, so the moves a device makes before the contact reconnects (within a day) are written under one key, and a node near it can tie those addresses together. |
-| A contact | Our current public addresses. They learn this anyway once a direct session exists. |
+| A contact | Our current public addresses. They learn this anyway once a direct session exists. A contact reached through an onion circuit learns no address, but our records still give them to it. |
 | Anyone else | Nothing. Without `D(A,B)` they can neither find nor decrypt our records, nor recognise our probes. |
 
 **Trade-offs, stated honestly:**

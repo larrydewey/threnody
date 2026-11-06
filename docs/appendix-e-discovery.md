@@ -25,7 +25,7 @@ k      = number of approved peers rounded up to a multiple of 8 (max 64); spare 
 
 - **Sending.** A node sends a beacon every 10 s to UDP `239.255.84.86:7451`, but only when it has at least one approved peer with a discovery key.
 - **Receiving.** A node checks each mutually approved contact's key against the current epoch and its two neighbours.
-- **Dialing.** On a match, the node with the smaller identity key dials `(source IP, port)`, pinning the peer's fingerprint. It waits at least 30 s before redialing the same peer.
+- **Dialing.** On a match, the node with the smaller identity key dials `(source IP, port)`, pinning the peer's fingerprint. It waits at least 30 s before redialing the same peer. With onion routing on, it first tries an onion circuit when one can be built (Appendix I, *Background reconnection*), so an observer on the network doesn't see the two talk. A LAN contact that is the only possible first hop is dialed directly.
 
 ## Properties
 
