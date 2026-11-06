@@ -563,7 +563,22 @@ pub fn describe_contact(c: &Contact) -> String {
     format!("{:<40} {approval}, {verified}, last addr {addr}", c.label())
 }
 
+/// `println!` panics once stdout is a closed pipe (`threnody id | head
+/// -0`): stop quietly instead, as other command-line tools do.
+fn quiet_on_closed_stdout() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.payload().downcast_ref::<String>().map(String::as_str);
+        if msg.is_some_and(|m| m.starts_with("failed printing to stdout") && m.contains("Broken pipe"))
+        {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
+}
+
 fn main() -> Result<()> {
+    quiet_on_closed_stdout();
     let cli = Cli::parse();
     let main_home = Home::new(cli.home.unwrap_or_else(default_home));
     // The desktop app stages a restore and quits; finish it if it hasn't.
