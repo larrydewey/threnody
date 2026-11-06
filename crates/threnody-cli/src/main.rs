@@ -211,8 +211,18 @@ enum Cmd {
         /// relay tokens. Prints the link to share.
         #[arg(long, value_name = "HOST:PORT")]
         serve_directory: Option<String>,
-        /// With --serve-directory: list relays only after `/directory list`.
+        /// With --serve-directory: list relays as soon as they prove
+        /// reachable, without waiting for `/directory list <relay>`. Review
+        /// is on by default.
         #[arg(long, requires = "serve_directory")]
+        no_review_relays: bool,
+        /// Accepted for older service files and does nothing: relays wait
+        /// for review by default (see --no-review-relays).
+        #[arg(
+            long,
+            requires = "serve_directory",
+            conflicts_with = "no_review_relays"
+        )]
         review_relays: bool,
         /// Never route through volunteer relays, even with directories
         /// subscribed.
@@ -895,7 +905,8 @@ fn main() -> Result<()> {
             wifi_direct,
             volunteer_relay,
             serve_directory,
-            review_relays,
+            no_review_relays,
+            review_relays: _,
             no_volunteers,
             directory_threshold,
             daemon,
@@ -950,7 +961,7 @@ fn main() -> Result<()> {
                     apply: wg_apply,
                 }),
                 volunteer_relay,
-                serve_directory: serve_directory.map(|a| (a, review_relays)),
+                serve_directory: directory_opts(serve_directory, no_review_relays),
                 use_volunteers: !no_volunteers,
                 directory_threshold,
                 control,
@@ -1108,6 +1119,13 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
     Ok(())
 }
 
+/// The directory to serve, and whether relays wait for the operator's
+/// review before they're listed: yes unless `--no-review-relays` (every
+/// protection is on until turned off).
+fn directory_opts(serve: Option<String>, no_review: bool) -> Option<(String, bool)> {
+    serve.map(|a| (a, !no_review))
+}
+
 fn edit_contact(home: &Home, peer: &str, f: impl FnOnce(&mut Contact)) -> Result<()> {
     let mut contacts = home.load_contacts()?;
     let key = find_contact(&contacts, peer)?.key;
@@ -1116,4 +1134,53 @@ fn edit_contact(home: &Home, peer: &str, f: impl FnOnce(&mut Contact)) -> Result
     }
     home.save_contacts(&contacts)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The directory options `args` give `threnody run`.
+    fn directory(args: &[&str]) -> Option<(String, bool)> {
+        let cli = Cli::try_parse_from(["threnody", "run"].iter().chain(args)).unwrap();
+        let Cmd::Run {
+            serve_directory,
+            no_review_relays,
+            ..
+        } = cli.cmd
+        else {
+            unreachable!()
+        };
+        directory_opts(serve_directory, no_review_relays)
+    }
+
+    #[test]
+    fn directories_review_relays_unless_told_not_to() {
+        let at = "dir.example.org:7450";
+        assert_eq!(directory(&[]), None);
+        assert_eq!(
+            directory(&["--serve-directory", at]),
+            Some((at.into(), true))
+        );
+        assert_eq!(
+            directory(&["--serve-directory", at, "--no-review-relays"]),
+            Some((at.into(), false))
+        );
+        // Older service files still start.
+        assert_eq!(
+            directory(&["--serve-directory", at, "--review-relays"]),
+            Some((at.into(), true))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "threnody",
+                "run",
+                "--serve-directory",
+                at,
+                "--review-relays",
+                "--no-review-relays"
+            ])
+            .is_err()
+        );
+    }
 }
