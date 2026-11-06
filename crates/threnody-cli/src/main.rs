@@ -492,7 +492,7 @@ fn backup_passphrase(new: bool) -> Result<zeroize_string::Secret> {
 /// for the desktop app, which took it first) while it runs: `run`, with
 /// or without `--daemon`, and the desktop app. A daemon from before that
 /// only had its control socket, so that is tried too.
-pub fn no_node_running(home: &Home) -> Result<std::fs::File> {
+fn no_node_running(home: &Home) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
         let path = chat::control_path(home);
