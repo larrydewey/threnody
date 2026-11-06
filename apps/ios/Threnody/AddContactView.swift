@@ -14,6 +14,9 @@ struct AddContactView: View {
     @State private var busy = false
     @State private var failure: String?
     @State private var confirmReset = false
+    /// The invite a tap gave us (Appendix T), while the field still holds it.
+    @State private var tappedLink: String?
+    @State private var nfc = NfcTap()
 
     var body: some View {
         NavigationStack {
@@ -25,6 +28,19 @@ struct AddContactView: View {
                         .autocorrectionDisabled()
                     TextField("Name (only you see it)", text: $name)
                     Button("Scan QR code", systemImage: "qrcode.viewfinder") { scanning = true }
+                    if NfcTap.available, let n = store.node {
+                        Button("Tap an Android phone", systemImage: "wave.3.right") {
+                            nfc.begin(reader: n.nfcReader()) { o in
+                                switch o {
+                                case let .tapped(l, _):
+                                    link = l
+                                    tappedLink = l
+                                case let .failed(why):
+                                    failure = why.text
+                                }
+                            }
+                        }
+                    }
                     PasteButton(payloadType: String.self) { strings in
                         if let s = strings.first { link = s.trimmingCharacters(in: .whitespacesAndNewlines) }
                     }
@@ -37,7 +53,7 @@ struct AddContactView: View {
                 } header: {
                     Text("Their invite")
                 } footer: {
-                    Text("Scan their QR code or paste the link they sent you.")
+                    Text("Scan their QR code, paste the link they sent you, or tap their Android phone.")
                 }
                 Section {
                     if let invite {
@@ -53,7 +69,7 @@ struct AddContactView: View {
                 } header: {
                     Text("Your invite")
                 } footer: {
-                    Text("Let the other person scan this, or send them the link. Anyone with it can contact this device.")
+                    Text("Let the other person scan this, or send them the link. Anyone with it can contact this device. To add by tapping, they show their invite on an Android phone and you choose Tap.")
                 }
             }
             .navigationTitle("Add contact")
@@ -89,10 +105,14 @@ struct AddContactView: View {
     private func connect() {
         guard let n = store.node else { return }
         let (target, petname) = (link.trimmingCharacters(in: .whitespacesAndNewlines), name.trimmingCharacters(in: .whitespaces))
+        // A hand-edited link isn't the phone we tapped.
+        let tapped = tappedLink == target
         busy = true
         Task {
             do {
                 let peer = try await offMain {
+                    // We tapped phones: they're a contact even if they reached us first.
+                    if tapped { _ = try n.expectContact(target: target, name: petname.isEmpty ? nil : petname) }
                     let peer = try n.connect(target: target)
                     if !petname.isEmpty { try? n.setName(peer: peer, name: petname) }
                     return peer

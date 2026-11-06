@@ -48,3 +48,9 @@ name = "directory"
 path = "fuzz_targets/directory.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "nfc_card"
+path = "fuzz_targets/nfc_card.rs"
+test = false
+doc = false

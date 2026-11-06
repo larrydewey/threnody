@@ -144,11 +144,15 @@ class MainActivity : Activity() {
         Threnody.visible++
         unsubscribe = Threnody.subscribe { refreshSoon() }
         refreshSoon()
+        // "My invite" still showing: serve it to a tapping phone again.
+        nfcInvite?.let { (dialog, link) -> if (dialog.isShowing) armNfc(dialog, link) }
     }
 
     override fun onStop() {
         Threnody.visible--
         unsubscribe?.invoke()
+        // A stopped activity never answers taps.
+        NfcShare.disarm(this)
         super.onStop()
     }
 
@@ -1218,13 +1222,77 @@ class MainActivity : Activity() {
         // With internet reachability on, the link finds us without one.
         if (addr.isEmpty() && !n.reachInternet()) return failed("No network: connect to a network to make an invite.")
         val link = n.inviteLink(addr)
-        showCode(
+        val hce = NfcShare.hce(this)
+        val dialog = showCode(
             "Your invite",
             "Let the other person scan this, or send them the link. " +
                 "Anyone with it can contact this device.",
             link,
             "Device ${n.deviceFingerprint()}",
+            extraHelp = when {
+                !hce -> null
+                NfcShare.on(this) -> "Or let them tap: they choose Scan and hold their phone to the back of yours."
+                else -> "Turn on NFC to let them add you by tapping."
+            },
         )
+        // Only the main identity's invite is ever served over NFC.
+        if (hce) {
+            nfcInvite = dialog to link
+            armNfc(dialog, link)
+            dialog.setOnDismissListener {
+                NfcShare.disarm(this)
+                nfcInvite = null
+            }
+        }
+    }
+
+    /** "My invite" while it shows, for serving it over NFC (Appendix T). */
+    private var nfcInvite: Pair<android.app.AlertDialog, String>? = null
+
+    private fun armNfc(dialog: android.app.AlertDialog, link: String) {
+        NfcShare.arm(this, link) { fp -> onTapped(dialog, fp) }
+    }
+
+    /** A phone tapped ours while "My invite" showed: it has our invite, we its fingerprint. */
+    private fun onTapped(dialog: android.app.AlertDialog, fp: String) {
+        // NfcShare turns the service off itself, once its last answer is out.
+        dialog.setOnDismissListener(null)
+        nfcInvite = null
+        dialog.dismiss()
+        tick(window.decorView)
+        addTapper(fp)
+    }
+
+    /** Asks whether to take the phone that tapped ours as a contact when it connects. */
+    private fun addTapper(fp: String) {
+        val n = node ?: return
+        val name = input("Name (optional; only you see it)", null,
+            InputType.TYPE_TEXT_FLAG_CAP_WORDS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+        val dialog = SecureBuilder(this)
+            .setTitle("Add the person who tapped you?")
+            .setMessage(
+                "Their device: $fp. When it connects in the next few minutes, it's a contact, " +
+                    "not a message request. You'll check their safety number together later."
+            )
+            .setView(padded(name))
+            .setPositiveButton("Add") { _, _ ->
+                val given = name.text.toString().trim().ifEmpty { null }
+                Threading.background {
+                    try {
+                        n.expectContact(fp, given)
+                        runOnUiThread {
+                            Toast.makeText(this, "Added: they'll appear when their device connects", Toast.LENGTH_LONG).show()
+                        }
+                        refresh()
+                    } catch (e: Exception) {
+                        runOnUiThread { failed("Couldn't add them: ${e.message}") }
+                    }
+                }
+            }
+            .setNegativeButton("Not now", null)
+            .show()
+        name.requestFocus()
+        dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
     }
 
     /**
@@ -1446,13 +1514,21 @@ class MainActivity : Activity() {
      * A dialog showing [code] as a QR code, with copy and share. A [secret]
      * code is copied marked sensitive, kept out of clipboard previews.
      */
-    private fun showCode(title: String, help: String, code: String, footer: String, secret: Boolean = false) {
+    private fun showCode(
+        title: String,
+        help: String,
+        code: String,
+        footer: String,
+        secret: Boolean = false,
+        extraHelp: String? = null,
+    ): android.app.AlertDialog {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(Design.xl), dp(Design.md), dp(Design.xl), dp(Design.md))
         }
-        box.addView(label(help, Design.typeBody, R.color.text_secondary, maxLines = 0, weight = Design.weightMedium).apply {
+        val text = if (extraHelp == null) help else "$help $extraHelp"
+        box.addView(label(text, Design.typeBody, R.color.text_secondary, maxLines = 0, weight = Design.weightMedium).apply {
             gravity = Gravity.CENTER_HORIZONTAL
         }, matchWrap)
         try {
@@ -1468,7 +1544,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(0, dp(Design.md), 0, 0)
         }, matchWrap)
-        SecureBuilder(this)
+        return SecureBuilder(this)
             .setTitle(title)
             .setView(android.widget.ScrollView(this).apply { addView(box) })
             .setPositiveButton("Share") { _, _ ->
@@ -1503,8 +1579,12 @@ class MainActivity : Activity() {
         addView(v, matchWrap)
     }
 
-    /** `scanned`: the invite came from a QR code, so naming them comes next. */
-    private fun addContact(prefill: String?, scanned: Boolean = false) {
+    /**
+     * `scanned`: the invite came from a QR code or a tap, so naming them
+     * comes next. `tapped`: from a tap; `mutual`: the other phone got our
+     * fingerprint too, so we'll be each other's contacts once we connect.
+     */
+    private fun addContact(prefill: String?, scanned: Boolean = false, tapped: Boolean = false, mutual: Boolean = true) {
         // A copied invite (say, from the camera app) fills itself in.
         val field = input("Invite link, handle or host:port", prefill ?: copiedLink()?.takeIf { it.startsWith("threnody://") })
         val name = input("Name (optional; only you see it)", null,
@@ -1515,18 +1595,25 @@ class MainActivity : Activity() {
             addView(field, matchWrap)
             addView(name, matchWrap)
         }
+        val both = tapped && mutual
         val dialog = SecureBuilder(this)
-            .setTitle(if (scanned) "Add the scanned contact" else "Add a contact")
+            .setTitle(if (both) "Add the person you tapped" else if (scanned) "Add the scanned contact" else "Add a contact")
             .setMessage(
-                if (scanned) "Give them a name you'll recognise, if you like. You'll check their safety number together later."
+                if (both) "Their phone has your fingerprint, so once you connect you'll be each other's contacts. " +
+                    "Give them a name you'll recognise, if you like. You'll check their safety number together later."
+                else if (scanned) "Give them a name you'll recognise, if you like. You'll check their safety number together later."
                 else "Scan or paste their invite, or type their handle (name-XXXX-XXXX). You'll check their safety number together later."
             )
             .setView(fields)
-            .setPositiveButton("Connect") { _, _ -> connect(field.text.toString().trim(), name.text.toString().trim()) }
+            .setPositiveButton("Connect") { _, _ ->
+                val target = field.text.toString().trim()
+                // A hand-edited link isn't the phone we tapped.
+                connect(target, name.text.toString().trim(), expect = tapped && target == prefill)
+            }
             .setNeutralButton("Scan") { _, _ -> scan() }
             .setNegativeButton("Cancel", null)
             .show()
-        if (scanned) {
+        if (scanned || tapped) {
             name.requestFocus()
             dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
         }
@@ -1539,7 +1626,12 @@ class MainActivity : Activity() {
             if (resultCode != RESULT_OK) return@launch
             val text = data?.getStringExtra(ScanActivity.RESULT)?.trim() ?: return@launch
             when {
-                text.startsWith("threnody://") -> addContact(text, scanned = true)
+                text.startsWith("threnody://") -> addContact(
+                    text,
+                    scanned = true,
+                    tapped = data.getBooleanExtra(ScanActivity.TAPPED, false),
+                    mutual = data.getBooleanExtra(ScanActivity.MUTUAL, true),
+                )
                 text.startsWith("threnody-link://") -> joinAccount(text)
                 text.startsWith(DirectoryUi.SCHEME) -> DirectoryUi.add(this, text)
                 else -> failed("That QR code isn't a Threnody invite, link code or directory link.")
@@ -1596,8 +1688,12 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** Dials `target`; a `name` given is what we call them (only here). */
-    private fun connect(target: String, name: String = "") {
+    /**
+     * Dials `target`; a `name` given is what we call them (only here).
+     * `expect`: we tapped phones with them, so take them as a contact even
+     * if they reach us first (a request already waiting is accepted).
+     */
+    private fun connect(target: String, name: String = "", expect: Boolean = false) {
         if (target.isEmpty()) return
         val n = node ?: return
         val handle = !target.contains("://") && Regex("^@?[A-Za-z0-9_.]+[- ]").containsMatchIn(target) &&
@@ -1605,6 +1701,7 @@ class MainActivity : Activity() {
         Toast.makeText(this, if (handle) "Looking for $target… (up to two minutes)" else "Connecting…", Toast.LENGTH_SHORT).show()
         Threading.background {
             try {
+                if (expect) n.expectContact(target, null)
                 val peer = n.connect(target)
                 if (name.isNotEmpty()) {
                     try { n.setName(peer, name) } catch (e: Exception) { Threnody.say("! naming a contact: ${e.message}") }

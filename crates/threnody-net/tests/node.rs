@@ -1403,3 +1403,249 @@ async fn withheld_features_stay_out_of_hello() {
     assert!(bob.supports(&a_id, FEATURE_LISTS));
     assert!(alice.supports(&bob_id, FEATURE_CALLS));
 }
+
+// --- Expected contacts after an NFC tap (Appendix T) ---
+
+use threnody_net::EXPECT_FOR;
+
+/// Alice dials bob (pinned, as after a scan or tap) and sends a text;
+/// returns whether bob took it as a message (true) or a request (false).
+async fn alice_writes(
+    alice: &Node,
+    bob: &Node,
+    brx: &mut UnboundedReceiver<Event>,
+    addr: &str,
+) -> bool {
+    let bob_id = alice
+        .connect(addr, Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    alice.send_text(&bob_id, "hi").unwrap();
+    let e = next(brx, |e| {
+        matches!(e, Event::Message { .. } | Event::MessageRequest { .. })
+    })
+    .await;
+    matches!(e, Event::Message { .. })
+}
+
+#[tokio::test]
+async fn expected_peers_arrive_as_contacts_not_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    bob.expect_contact(
+        alice.identity().fingerprint(),
+        Some(" Al ".into()),
+        EXPECT_FOR,
+    )
+    .unwrap();
+    assert!(alice_writes(&alice, &bob, &mut brx, &addr).await);
+    let contacts = bob.contacts();
+    let c = contacts.get(&alice.identity()).unwrap();
+    assert!(c.accepted);
+    assert_eq!(c.petname.as_deref(), Some("Al"));
+    assert!(!c.verified && !c.local_approved);
+}
+
+#[tokio::test]
+async fn unexpected_peers_are_still_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    assert!(!alice_writes(&alice, &bob, &mut brx, &addr).await);
+    assert!(!bob.is_accepted(&alice.identity()));
+}
+
+#[tokio::test]
+async fn expecting_a_known_requester_accepts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    assert!(!alice_writes(&alice, &bob, &mut brx, &addr).await);
+    bob.expect_contact(
+        alice.identity().fingerprint(),
+        Some("Al".into()),
+        EXPECT_FOR,
+    )
+    .unwrap();
+    assert!(bob.is_accepted(&alice.identity()));
+    let contacts = bob.contacts();
+    assert_eq!(
+        contacts.get(&alice.identity()).unwrap().petname.as_deref(),
+        Some("Al")
+    );
+}
+
+#[tokio::test]
+async fn expectations_do_not_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    assert!(!alice_writes(&alice, &bob, &mut brx, &addr).await);
+    let a = alice.identity();
+    bob.update_contacts(|c| c.get_mut(&a).unwrap().petname = Some("Alice".into()));
+    bob.expect_contact(a.fingerprint(), Some("Al".into()), EXPECT_FOR)
+        .unwrap();
+    assert_eq!(
+        bob.contacts().get(&a).unwrap().petname.as_deref(),
+        Some("Alice")
+    );
+    // Nor does the session the expectation lets in.
+    alice.disconnect(&bob.identity());
+    next(&mut brx, |e| matches!(e, Event::Disconnected { .. })).await;
+    bob.expect_contact(a.fingerprint(), Some("Al".into()), EXPECT_FOR)
+        .unwrap();
+    assert!(alice_writes(&alice, &bob, &mut brx, &addr).await);
+    assert_eq!(
+        bob.contacts().get(&a).unwrap().petname.as_deref(),
+        Some("Alice")
+    );
+}
+
+#[tokio::test]
+async fn expectations_expire() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    bob.expect_contact(alice.identity().fingerprint(), None, Duration::ZERO)
+        .unwrap();
+    assert!(!alice_writes(&alice, &bob, &mut brx, &addr).await);
+}
+
+#[tokio::test]
+async fn expectations_are_used_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::ContactsOnly, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    bob.expect_contact(alice.identity().fingerprint(), None, EXPECT_FOR)
+        .unwrap();
+    assert!(alice_writes(&alice, &bob, &mut brx, &addr).await);
+    // Alice is a contact now and keeps getting in; the expectation is
+    // gone, which bob forgetting her shows: she is refused again.
+    let a = alice.identity();
+    alice.disconnect(&bob.identity());
+    next(&mut brx, |e| matches!(e, Event::Disconnected { .. })).await;
+    bob.update_contacts(|c| c.remove(&a));
+    let _ = alice.connect(&addr, None).await;
+    let e = next(&mut brx, |e| matches!(e, Event::Rejected { .. })).await;
+    assert!(matches!(e, Event::Rejected { reason, .. } if reason.contains("refused")));
+}
+
+#[tokio::test]
+async fn expectations_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    // Alice's expires soonest, so the seventeenth pushes it out.
+    bob.expect_contact(alice.identity().fingerprint(), None, EXPECT_FOR / 2)
+        .unwrap();
+    for _ in 0..16 {
+        let other = Identity::generate().public().fingerprint();
+        bob.expect_contact(other, None, EXPECT_FOR).unwrap();
+    }
+    assert!(!alice_writes(&alice, &bob, &mut brx, &addr).await);
+}
+
+#[tokio::test]
+async fn expecting_yourself_or_a_blocked_contact_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    assert!(matches!(
+        bob.expect_contact(bob.identity().fingerprint(), None, EXPECT_FOR),
+        Err(NetError::NotAllowed(_))
+    ));
+    assert!(!alice_writes(&alice, &bob, &mut brx, &addr).await);
+    bob.block_contact(&alice.identity());
+    assert!(matches!(
+        bob.expect_contact(alice.identity().fingerprint(), None, EXPECT_FOR),
+        Err(NetError::NotAllowed(_))
+    ));
+    let _ = alice.connect(&addr, None).await;
+    let e = next(&mut brx, |e| matches!(e, Event::Rejected { .. })).await;
+    assert!(matches!(e, Event::Rejected { reason, .. } if reason.contains("blocked")));
+}
+
+#[tokio::test]
+async fn contacts_only_policy_admits_expected_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (carol, _crx) = node(&dir, "carol", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::ContactsOnly, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    bob.expect_contact(alice.identity().fingerprint(), None, EXPECT_FOR)
+        .unwrap();
+    assert!(alice_writes(&alice, &bob, &mut brx, &addr).await);
+    assert!(bob.is_accepted(&alice.identity()));
+    let _ = carol.connect(&addr, None).await;
+    let e = next(&mut brx, |e| matches!(e, Event::Rejected { .. })).await;
+    assert!(matches!(e, Event::Rejected { reason, .. } if reason.contains("refused")));
+}
+
+#[tokio::test]
+async fn approved_only_policy_ignores_expectations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::ApprovedOnly, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    bob.expect_contact(alice.identity().fingerprint(), None, EXPECT_FOR)
+        .unwrap();
+    let _ = alice.connect(&addr, None).await;
+    let e = next(&mut brx, |e| matches!(e, Event::Rejected { .. })).await;
+    assert!(matches!(e, Event::Rejected { reason, .. } if reason.contains("refused")));
+    assert!(!bob.is_accepted(&alice.identity()));
+}
+
+#[tokio::test]
+async fn the_expecting_side_dialing_still_gets_the_name() {
+    // Across networks the hole punch may have the expecting side dial
+    // (Appendix S): the session is outbound, and the name still applies.
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let a_addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    let a = alice.identity();
+    bob.expect_contact(a.fingerprint(), Some("Al".into()), EXPECT_FOR)
+        .unwrap();
+    bob.connect(&a_addr, Some(a.fingerprint())).await.unwrap();
+    assert!(bob.is_accepted(&a));
+    assert_eq!(
+        bob.contacts().get(&a).unwrap().petname.as_deref(),
+        Some("Al")
+    );
+}
+
+#[tokio::test]
+async fn crossed_dials_keep_the_expected_name() {
+    // Whichever session survives the duplicate check, the first to start
+    // took the expectation, so the name lands either way.
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let a_addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    let b_addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    let a = alice.identity();
+    bob.expect_contact(a.fingerprint(), Some("Al".into()), EXPECT_FOR)
+        .unwrap();
+    let (x, y) = tokio::join!(
+        alice.connect(&b_addr, Some(bob.identity().fingerprint())),
+        bob.connect(&a_addr, Some(a.fingerprint())),
+    );
+    x.unwrap();
+    y.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(alice.is_accepted(&bob.identity()));
+    assert!(bob.is_accepted(&a));
+    assert_eq!(
+        bob.contacts().get(&a).unwrap().petname.as_deref(),
+        Some("Al")
+    );
+}

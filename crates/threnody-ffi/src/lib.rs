@@ -31,6 +31,8 @@ mod push;
 pub use push::{PushEndpoint, WakeReport};
 mod schedule;
 pub use schedule::{ScheduleFailure, ScheduledInfo};
+mod tap;
+pub use tap::{NfcCard, NfcFailure, NfcOutcome, NfcReader, NfcStep, NfcTransport};
 mod volunteer;
 pub use persona::{PersonaRecord, ProfileAttr};
 pub use volunteer::{
@@ -1742,6 +1744,32 @@ PersistentKeepalive = 25\n",
             self.node.seek(d);
         }
         Ok(())
+    }
+
+    /// A reader for tapping a phone that shows its invite (Appendix T); it
+    /// gives that phone this device's fingerprint, nothing else. Make one
+    /// per tag.
+    pub fn nfc_reader(&self) -> Arc<NfcReader> {
+        Arc::new(NfcReader::from(threnody_core::tap::Reader::new(
+            self.node.identity().fingerprint(),
+        )))
+    }
+
+    /// We tapped devices with whoever `target` (an invite link or a
+    /// fingerprint) names, and the user said to add them: for the next ten
+    /// minutes their session is a contact we want, called `name` if given
+    /// (and it has no name yet), not a request. A contact that already
+    /// wrote is accepted at once. Returns their fingerprint.
+    pub fn expect_contact(&self, target: String, name: Option<String>) -> Result<String> {
+        let fp = match target.parse::<threnody_core::invite::InviteLink>() {
+            Ok(l) => l.fingerprint,
+            Err(_) => target.trim().parse::<Fingerprint>().map_err(fail)?,
+        };
+        let name = name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        self.node
+            .expect_contact(fp, name, threnody_net::EXPECT_FOR)
+            .map_err(fail)?;
+        Ok(fp.to_string())
     }
 
     /// Connects to an invite link, handle, `host:port`, contact or fingerprint;
@@ -4508,5 +4536,167 @@ mod tests {
         );
         let listed = bob.group_scheduled(g).unwrap();
         assert_eq!(listed[0].failed, Some(ScheduleFailure::Group));
+    }
+
+    /// A test transport: the card in-process, optionally going away
+    /// before the command numbered `drop_at` (or answering `fixed`).
+    struct Wire {
+        card: Arc<NfcCard>,
+        sent: Mutex<usize>,
+        drop_at: Option<usize>,
+        fixed: Option<Vec<u8>>,
+    }
+
+    impl NfcTransport for Wire {
+        fn transceive(&self, apdu: Vec<u8>) -> Option<Vec<u8>> {
+            let mut sent = self.sent.lock().unwrap();
+            if self.drop_at.is_some_and(|n| *sent >= n) {
+                return None;
+            }
+            *sent += 1;
+            Some(match &self.fixed {
+                Some(r) => r.clone(),
+                None => self.card.process(apdu),
+            })
+        }
+    }
+
+    fn wire(card: &Arc<NfcCard>, drop_at: Option<usize>, fixed: Option<Vec<u8>>) -> Arc<Wire> {
+        Arc::new(Wire {
+            card: card.clone(),
+            sent: Mutex::new(0),
+            drop_at,
+            fixed,
+        })
+    }
+
+    #[test]
+    fn nfc_tap_adds_both_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let bob =
+            ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let addr = bob.listen("127.0.0.1:0".into()).unwrap();
+        // Bob shows his invite; alice taps.
+        let card = NfcCard::new(bob.invite_link(addr)).unwrap();
+        let NfcOutcome::Tapped { peer_link, mutual } =
+            alice.nfc_reader().run(wire(&card, None, None))
+        else {
+            panic!("the tap failed")
+        };
+        assert!(mutual);
+        let a_fp = card.peer_fingerprint().unwrap();
+        assert_eq!(a_fp, alice.device_fingerprint());
+        assert_eq!(
+            bob.expect_contact(a_fp.clone(), Some("Alice".into()))
+                .unwrap(),
+            a_fp
+        );
+        alice.expect_contact(peer_link.clone(), None).unwrap();
+        let b_fp = alice.connect(peer_link).unwrap();
+        assert_eq!(b_fp, bob.device_fingerprint());
+        alice.send_text(b_fp.clone(), "hello".into()).unwrap();
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        let a = bob
+            .contacts()
+            .into_iter()
+            .find(|c| c.fingerprint == a_fp)
+            .unwrap();
+        assert!(a.accepted && !a.verified && !a.mutually_approved);
+        assert_eq!(a.name.as_deref(), Some("Alice"));
+        let b = alice
+            .contacts()
+            .into_iter()
+            .find(|c| c.fingerprint == b_fp)
+            .unwrap();
+        assert!(b.accepted && !b.verified);
+    }
+
+    #[test]
+    fn nfc_half_tap_is_one_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let card =
+            NfcCard::new("threnody://0000000000000000000000000000000Z@192.0.2.1:7450".into())
+                .unwrap();
+        // 14 commands: everything but the GIVE.
+        let outcome = alice.nfc_reader().run(wire(&card, Some(14), None));
+        assert!(matches!(outcome, NfcOutcome::Tapped { mutual: false, .. }));
+        assert_eq!(card.peer_fingerprint(), None);
+    }
+
+    #[test]
+    fn nfc_failures_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let card =
+            NfcCard::new("threnody://0000000000000000000000000000000Z@192.0.2.1:7450".into())
+                .unwrap();
+        assert_eq!(
+            alice
+                .nfc_reader()
+                .run(wire(&card, None, Some(vec![0x6A, 0x82]))),
+            NfcOutcome::Failed {
+                why: NfcFailure::NotAnInvite
+            }
+        );
+        assert_eq!(
+            alice.nfc_reader().run(wire(&card, Some(0), None)),
+            NfcOutcome::Failed {
+                why: NfcFailure::Moved
+            }
+        );
+        // Step by step, as iOS drives it.
+        let reader = alice.nfc_reader();
+        let mut apdu = reader.start();
+        let link = loop {
+            match reader.step(card.process(apdu)) {
+                NfcStep::Send { apdu: next } => apdu = next,
+                NfcStep::Done { peer_link } => break peer_link,
+                NfcStep::Failed { why } => panic!("{why:?}"),
+            }
+        };
+        assert!(link.starts_with("threnody://0000000000000000000000000000000Z@"));
+        assert_eq!(reader.lost(), Some(link));
+    }
+
+    #[test]
+    fn nfc_bad_input_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        assert!(NfcCard::new("https://x".into()).is_err());
+        assert!(alice.expect_contact("nonsense".into(), None).is_err());
+        assert!(
+            alice
+                .expect_contact(alice.device_fingerprint(), None)
+                .is_err()
+        );
+    }
+
+    /// The AID is written out in the platforms' manifests: they must match
+    /// `threnody_core::tap::AID`.
+    #[test]
+    fn nfc_aid_matches_platform_manifests() {
+        let hex: String = threnody_core::tap::AID
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        for (file, text) in [
+            (
+                "nfc_invite.xml",
+                include_str!("../../../apps/android/app/src/main/res/xml/nfc_invite.xml"),
+            ),
+            (
+                "Nfc.kt",
+                include_str!("../../../apps/android/app/src/main/java/org/threnody/app/Nfc.kt"),
+            ),
+            ("project.yml", include_str!("../../../apps/ios/project.yml")),
+        ] {
+            assert!(text.contains(&hex), "{file} doesn't name AID {hex}");
+        }
     }
 }

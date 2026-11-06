@@ -157,7 +157,7 @@ The strongest practical multi-device model compatible with MLS and the identity 
 
 ### 5.1 Discovery Methods (all complementary)
 
-1. Out-of-band: QR codes, invite links, NFC, safety numbers, shared secrets, physical exchange. In the reference implementation an invite link (`threnody://FP[@addr,…][?r=KEY]`) pins the inviter's fingerprint, lists up to four of its addresses, and, when internet reachability is on, carries a key naming a DHT meeting place where the inviter keeps its current addresses ([Appendix S](docs/appendix-s-handles.md#invite-links)). Handles (Section 4.4) serve the same purpose for someone who can only type or say a short name.
+1. Out-of-band: QR codes, invite links, NFC, safety numbers, shared secrets, physical exchange. In the reference implementation an invite link (`threnody://FP[@addr,…][?r=KEY]`) pins the inviter's fingerprint, lists up to four of its addresses, and, when internet reachability is on, carries a key naming a DHT meeting place where the inviter keeps its current addresses ([Appendix S](docs/appendix-s-handles.md#invite-links)). Handles (Section 4.4) serve the same purpose for someone who can only type or say a short name. Two devices can also add each other by tapping (NFC): the reader gets the other's invite link and gives back only its fingerprint, both encrypted to a one-time X-Wing key ([Appendix T](docs/appendix-t-nfc.md)).
 2. Optional public directories / introducers (rate-limited, anti-scraping).
 3. Social / web-of-trust encrypted introductions.
 
