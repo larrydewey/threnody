@@ -602,7 +602,7 @@ impl Shared {
     }
 
     pub(crate) fn save_contacts(&self, c: &Contacts) {
-        if let Err(e) = self.home.save_contacts(c) {
+        if let Err(e) = self.home.save_contacts(&self.identity, c) {
             eprintln!("threnody: failed to save contacts: {e}");
         }
     }
@@ -615,7 +615,7 @@ pub struct Node {
 
 impl Node {
     pub fn new(cfg: NodeConfig) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
-        let contacts = cfg.home.load_contacts()?;
+        let contacts = cfg.home.load_contacts(&cfg.identity)?;
         let now = now_ms();
         let prekeys = match cfg.home.load_state(&cfg.identity, "prekeys")? {
             Some(b) => PrekeyStore::decode(&b)?,

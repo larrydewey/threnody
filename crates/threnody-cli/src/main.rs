@@ -798,7 +798,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Contacts => {
-            let contacts = home.load_contacts()?;
+            let contacts = home.load_contacts(&load_identity(&home)?)?;
             let mut any = false;
             for c in contacts.iter() {
                 any = true;
@@ -808,9 +808,12 @@ fn main() -> Result<()> {
                 println!("No contacts yet.");
             }
         }
-        Cmd::Name { peer, name } => edit_contact(&home, &peer, |c| c.petname = Some(name))?,
+        Cmd::Name { peer, name } => {
+            let id = load_identity(&home)?;
+            edit_contact(&home, &id, &peer, |c| c.petname = Some(name))?
+        }
         Cmd::Approve { peer } => {
-            edit_contact(&home, &peer, |c| {
+            edit_contact(&home, &load_identity(&home)?, &peer, |c| {
                 c.local_approved = true;
                 c.approval_changed_ms = threnody_core::now_ms();
             })?;
@@ -819,7 +822,7 @@ fn main() -> Result<()> {
         Cmd::Revoke { peer } => {
             // Dated, so our other devices follow it rather than undo it,
             // and the discovery keys go as with any revocation.
-            edit_contact(&home, &peer, |c| {
+            edit_contact(&home, &load_identity(&home)?, &peer, |c| {
                 c.local_approved = false;
                 c.approval_changed_ms = threnody_core::now_ms();
                 c.clear_discovery_keys();
@@ -828,7 +831,7 @@ fn main() -> Result<()> {
         }
         Cmd::Verify { peer } => {
             let id = load_identity(&home)?;
-            let contacts = home.load_contacts()?;
+            let contacts = home.load_contacts(&id)?;
             let c = find_contact(&contacts, &peer)?;
             println!(
                 "Safety number with {}:\n\n  {}\n",
@@ -840,7 +843,7 @@ fn main() -> Result<()> {
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line)?;
             let ok = line.trim().eq_ignore_ascii_case("y");
-            edit_contact(&home, &peer, |c| c.verified = ok)?;
+            edit_contact(&home, &id, &peer, |c| c.verified = ok)?;
             println!(
                 "{}",
                 if ok {
@@ -851,7 +854,8 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Forget { peer } => {
-            let mut contacts = home.load_contacts()?;
+            let id = load_identity(&home)?;
+            let mut contacts = home.load_contacts(&id)?;
             let c = find_contact(&contacts, &peer)?;
             let (key, account) = (c.key, c.account);
             // Every device of their account, and the conversation.
@@ -864,7 +868,7 @@ fn main() -> Result<()> {
             for k in &keys {
                 contacts.forget(k, now);
             }
-            home.save_contacts(&contacts)?;
+            home.save_contacts(&id, &contacts)?;
             let conv = threnody_core::history::ConversationId::Peer(
                 account.map_or(*key.as_bytes(), |a| a.0),
             );
@@ -1108,12 +1112,17 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
     Ok(())
 }
 
-fn edit_contact(home: &Home, peer: &str, f: impl FnOnce(&mut Contact)) -> Result<()> {
-    let mut contacts = home.load_contacts()?;
+fn edit_contact(
+    home: &Home,
+    identity: &Identity,
+    peer: &str,
+    f: impl FnOnce(&mut Contact),
+) -> Result<()> {
+    let mut contacts = home.load_contacts(identity)?;
     let key = find_contact(&contacts, peer)?.key;
     if let Some(c) = contacts.get_mut(&key) {
         f(c);
     }
-    home.save_contacts(&contacts)?;
+    home.save_contacts(identity, &contacts)?;
     Ok(())
 }
