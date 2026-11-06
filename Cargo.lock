@@ -5922,6 +5922,7 @@ name = "threnody-radio"
 version = "0.18.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bluer",
  "futures-util",
  "tempfile",

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use threnody_core::PublicIdentity;
 use threnody_net::DirectOffer;
 use threnody_radio::ble::{Address, AddressType, Found, Listening};
 use threnody_radio::wifidirect::Groups;
@@ -29,13 +30,13 @@ pub(crate) struct Radio {
 }
 
 impl Radio {
-    pub(crate) fn new(scratch: PathBuf) -> Self {
+    pub(crate) fn new(scratch: PathBuf, id: &PublicIdentity) -> Self {
         Self {
             scratch,
             ble: Mutex::new(None),
             ble_op: Mutex::new(()),
             ble_error: Mutex::new(None),
-            groups: Groups::new(),
+            groups: Groups::new(id),
         }
     }
 }
@@ -183,8 +184,9 @@ impl ThrenodyNode {
             .map_err(|e| fail(format!("{e:#}")))
     }
 
-    /// Leaves every joined group, and deletes profiles a crash left
-    /// behind; returns how many.
+    /// Leaves every joined group (and a join still running, once it is
+    /// done), and deletes profiles this identity left behind in a crash;
+    /// returns how many.
     pub fn leave_wifi_direct(&self) -> u32 {
         let _g = self.rt.enter();
         let n = self
@@ -196,6 +198,12 @@ impl ThrenodyNode {
     /// The contacts whose Wi-Fi Direct groups are joined.
     pub fn wifi_direct_joined(&self) -> Vec<String> {
         self.radio.groups.peers().iter().map(fp).collect()
+    }
+
+    /// Whether a Wi-Fi Direct group is joined or being joined: whether
+    /// `leave_wifi_direct` would leave one.
+    pub fn wifi_direct_busy(&self) -> bool {
+        self.radio.groups.busy()
     }
 }
 
@@ -221,7 +229,9 @@ impl ThrenodyNode {
     /// never hangs on NetworkManager).
     pub(crate) fn radio_shutdown(&self) {
         self.stop_bluetooth();
-        if self.radio.groups.peers().is_empty() {
+        // A join still running counts: leaving deletes its profile, so
+        // NetworkManager doesn't finish it after we're gone.
+        if !self.radio.groups.busy() {
             return;
         }
         let log = self.radio_log();
@@ -238,7 +248,8 @@ impl ThrenodyNode {
     pub(crate) fn radio_drop(&mut self) {
         let _g = self.rt.enter();
         drop(lock(&self.radio.ble).take());
-        drop(std::mem::take(&mut self.radio.groups));
+        let fresh = Groups::new(&self.node.identity());
+        drop(std::mem::replace(&mut self.radio.groups, fresh));
     }
 }
 
@@ -305,6 +316,7 @@ mod tests {
         assert!(!a.bluetooth_running());
         assert!(a.bluetooth_error().is_none());
         assert!(a.wifi_direct_joined().is_empty());
+        assert!(!a.wifi_direct_busy());
         drop(a);
     }
 }

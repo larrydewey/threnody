@@ -217,6 +217,12 @@ pub struct Core {
     /// Whether the nodes poll contacts at the foreground rate (as they
     /// start).
     foreground: AtomicBool,
+    /// Held across `update_foreground`, so the last caller applies the
+    /// current state.
+    foreground_op: Mutex<()>,
+    /// Held across `apply_radio`: its settings read and the start or stop
+    /// it leads to, so a quick on-then-off always ends off.
+    radio_op: Mutex<()>,
     /// Contacts asked to host a Wi-Fi Direct group, and when.
     asked_direct: Mutex<HashMap<String, Instant>>,
     /// The latest Wi-Fi Direct offer nobody asked for.
@@ -275,6 +281,8 @@ impl Core {
             visible: AtomicBool::new(true),
             power_saver: AtomicBool::new(false),
             foreground: AtomicBool::new(true),
+            foreground_op: Mutex::new(()),
+            radio_op: Mutex::new(()),
             asked_direct: Mutex::new(HashMap::new()),
             offered_direct: Mutex::new(None),
             directory_link: Mutex::new(None),
@@ -387,6 +395,10 @@ impl Core {
     /// changes, so a computer without an adapter doesn't retry and log
     /// each time.
     pub fn apply_radio(&self) {
+        // Settings are read under the lock: whichever call runs last sees
+        // the latest switches, and a start still running when the switch
+        // goes off finishes before that call stops it.
+        let _op = lock(&self.radio_op);
         let (bluetooth, wifi_direct) = {
             let s = self.settings();
             (
@@ -402,13 +414,17 @@ impl Core {
                 )),
                 Err(e) => self.say(format!("! Bluetooth LE unavailable: {e}")),
             }
-        } else if !bluetooth && running {
+        } else if !bluetooth {
+            // Always: stopping what isn't running costs nothing.
             self.main.stop_bluetooth();
-            self.say("* Bluetooth LE off");
+            if running {
+                self.say("* Bluetooth LE off");
+            }
         }
         if !wifi_direct {
             lock(&self.offered_direct).take();
-            if !self.main.wifi_direct_joined().is_empty() {
+            // A join still running counts: it's left once done.
+            if self.main.wifi_direct_busy() {
                 let n = self.main.leave_wifi_direct();
                 self.say(format!("* left {n} Wi-Fi Direct group(s)"));
             }
@@ -547,14 +563,10 @@ impl Core {
     /// A directory checks that a volunteer is reachable at its address:
     /// after a fallback to another port, a saved address may not be.
     fn check_volunteer_port(&self, addrs: &[String]) {
-        let ports: Vec<u16> = addrs
-            .iter()
-            .filter_map(|a| a.rsplit_once(':')?.1.parse().ok())
-            .collect();
-        if !ports.is_empty() && !ports.contains(&self.port) {
+        if volunteer_port_moved(addrs, self.port) {
             self.say(format!(
-                "! volunteer address uses port {}, this computer listens on {}",
-                ports[0], self.port
+                "! volunteer address uses port {PORT}, but it was taken: this computer listens on {}",
+                self.port
             ));
         }
     }
@@ -627,21 +639,22 @@ impl Core {
 
     // ----- Foreground -----
 
-    /// The window was shown or hidden.
+    /// The window was shown or hidden. Only notes it: call it on the GTK
+    /// thread, in signal order, then `update_foreground` off that thread.
     pub fn set_window_visible(&self, on: bool) {
         self.visible.store(on, Ordering::Relaxed);
-        self.update_foreground();
     }
 
-    /// The system's power saver was turned on or off.
+    /// The system's power saver was turned on or off. Only notes it, as
+    /// `set_window_visible` does.
     pub fn set_power_saver(&self, on: bool) {
         self.power_saver.store(on, Ordering::Relaxed);
-        self.update_foreground();
     }
 
     /// Polls contacts at the foreground rate unless the window is hidden
-    /// and the network is metered or power saver is on.
-    fn update_foreground(&self) {
+    /// and the network is metered or power saver is on. Blocks briefly.
+    pub fn update_foreground(&self) {
+        let _op = lock(&self.foreground_op);
         let on = foreground_wanted(
             self.visible.load(Ordering::Relaxed),
             self.metered.load(Ordering::Relaxed),
@@ -1703,6 +1716,18 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
 /// window is shown; hidden, unless the network is metered or power saver
 /// is on (a desktop on mains power and an unmetered network keeps it, as
 /// a contact's punch only lasts minutes).
+/// Whether volunteer addresses name the usual port while this computer
+/// fell back to another. Only then: a router's mapping or a reflected
+/// address (what `suggest_public_addr` offers) often has a port of its
+/// own, and that's fine.
+fn volunteer_port_moved(addrs: &[String], listening: u16) -> bool {
+    let ports: Vec<u16> = addrs
+        .iter()
+        .filter_map(|a| a.rsplit_once(':')?.1.parse().ok())
+        .collect();
+    listening != PORT && ports.contains(&PORT) && !ports.contains(&listening)
+}
+
 pub fn foreground_wanted(visible: bool, metered: bool, power_saver: bool) -> bool {
     visible || !(metered || power_saver)
 }
@@ -2108,5 +2133,21 @@ mod tests {
         );
         assert_eq!(pick(&[], false), None);
         assert_eq!(pick(&["203.0.113.9:40000"], true), None);
+    }
+
+    #[test]
+    fn volunteer_port_warning_only_after_a_fallback() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A mapped or reflected port of its own is fine.
+        assert!(!volunteer_port_moved(&v(&["203.0.113.9:40000"]), PORT));
+        assert!(!volunteer_port_moved(&v(&["203.0.113.9:40000"]), 40001));
+        assert!(!volunteer_port_moved(&v(&["203.0.113.9:7450"]), PORT));
+        // Saved with the usual port, which was taken this time.
+        assert!(volunteer_port_moved(&v(&["203.0.113.9:7450"]), 40001));
+        assert!(!volunteer_port_moved(
+            &v(&["203.0.113.9:7450", "198.51.100.2:40001"]),
+            40001
+        ));
+        assert!(!volunteer_port_moved(&v(&["relay.example"]), 40001));
     }
 }

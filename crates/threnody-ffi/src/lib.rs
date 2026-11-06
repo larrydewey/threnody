@@ -1446,6 +1446,8 @@ impl ThrenodyNode {
                 }
             });
         }
+        #[cfg(all(feature = "radio", target_os = "linux"))]
+        let me = node.identity();
         let this = Arc::new(Self {
             rt,
             node,
@@ -1461,7 +1463,7 @@ impl ThrenodyNode {
             #[cfg(all(feature = "boringtun", unix))]
             tunnel_device: Mutex::new(None),
             #[cfg(all(feature = "radio", target_os = "linux"))]
-            radio: radio::Radio::new(scratch),
+            radio: radio::Radio::new(scratch, &me),
         });
         this.queue_group_updates(resumed);
         Ok(this)

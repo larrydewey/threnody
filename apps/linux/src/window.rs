@@ -1980,8 +1980,10 @@ impl App {
         });
         let core = self.core.clone();
         self.window.connect_visible_notify(move |w| {
-            let (core, on) = (core.clone(), w.is_visible());
-            ui::bg_quiet(move || core.set_window_visible(on));
+            // Noted here, in signal order; applied off the GTK thread.
+            core.set_window_visible(w.is_visible());
+            let core = core.clone();
+            ui::bg_quiet(move || core.update_foreground());
         });
         // Closing the window keeps the node running for messages, unless
         // the user turned that off.
@@ -2009,12 +2011,13 @@ impl App {
         // Power saver slows polling while the window is hidden.
         let ppm = gio::PowerProfileMonitor::get_default();
         let core = self.core.clone();
-        let saver = ppm.is_power_saver_enabled();
-        ui::bg_quiet(move || core.set_power_saver(saver));
+        core.set_power_saver(ppm.is_power_saver_enabled());
+        ui::bg_quiet(move || core.update_foreground());
         let core = self.core.clone();
         ppm.connect_power_saver_enabled_notify(move |m| {
-            let (core, on) = (core.clone(), m.is_power_saver_enabled());
-            ui::bg_quiet(move || core.set_power_saver(on));
+            core.set_power_saver(m.is_power_saver_enabled());
+            let core = core.clone();
+            ui::bg_quiet(move || core.update_foreground());
         });
         *self.power.borrow_mut() = Some(ppm);
         let monitor = gio::NetworkMonitor::default();
@@ -3254,7 +3257,10 @@ impl App {
                 bt.set_subtitle(&match (bt.is_active(), running, error) {
                     (false, _, _) => BT_SUB.to_owned(),
                     (true, true, _) => "On".to_owned(),
-                    (true, false, Some(e)) => format!("Couldn't start: {e}"),
+                    // BlueZ errors are text, not markup.
+                    (true, false, Some(e)) => {
+                        format!("Couldn't start: {}", glib::markup_escape_text(&e))
+                    }
                     (true, false, None) => "Starting…".to_owned(),
                 });
             }
@@ -3455,14 +3461,15 @@ impl App {
                     }
                     list.set_visible(!devices.is_empty());
                     for dev in devices {
+                        // Any nearby device picks its advertised name.
                         let row = adw::ActionRow::builder()
-                            .title(&dev.address)
-                            .subtitle(format!(
+                            .title(glib::markup_escape_text(&dev.address))
+                            .subtitle(glib::markup_escape_text(&format!(
                                 "psm {} · rssi {} · {}",
                                 dev.psm,
                                 dev.rssi.map_or("?".into(), |r| r.to_string()),
                                 dev.name.as_deref().unwrap_or("-")
-                            ))
+                            )))
                             .build();
                         let connect = gtk::Button::with_label("Connect");
                         connect.set_valign(gtk::Align::Center);
@@ -3606,7 +3613,13 @@ impl App {
 
     // ----- Volunteering and running a directory -----
 
+    /// As markup, for a row's subtitle: the note can quote a directory's
+    /// reason for refusing.
     fn volunteer_state(&self) -> String {
+        glib::markup_escape_text(&self.volunteer_text()).to_string()
+    }
+
+    fn volunteer_text(&self) -> String {
         let main = &self.core.main;
         let saved = self
             .core
@@ -3621,7 +3634,12 @@ impl App {
         }
     }
 
+    /// As markup, for a row's subtitle.
     fn directory_state(&self) -> String {
+        glib::markup_escape_text(&self.directory_text()).to_string()
+    }
+
+    fn directory_text(&self) -> String {
         if !self.core.main.serving_directory() {
             return "Off".into();
         }
@@ -3821,11 +3839,12 @@ impl App {
             for r in list {
                 let row = adw::ActionRow::builder()
                     .title(core::short(&r.fingerprint))
-                    .subtitle(format!(
+                    // Relays register their own addresses.
+                    .subtitle(glib::markup_escape_text(&format!(
                         "{} · until {}",
                         r.addrs.join(", "),
                         ui::time_label(r.expires_ms)
-                    ))
+                    )))
                     .build();
                 let listed = gtk::Switch::builder()
                     .active(r.listed)

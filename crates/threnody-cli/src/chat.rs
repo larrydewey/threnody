@@ -300,6 +300,7 @@ pub async fn run(opts: Options) -> Result<()> {
             say!("QUIC on udp/{}; internet rendezvous off", q.port());
         }
     }
+    let wifi = threnody_radio::wifidirect::Groups::new(&node.identity());
     let mut ui = Ui {
         node,
         downloads,
@@ -312,7 +313,7 @@ pub async fn run(opts: Options) -> Result<()> {
         #[cfg(all(feature = "ble", target_os = "linux"))]
         ble_seen: std::sync::Arc::default(),
         wifi_direct: opts.wifi_direct,
-        wifi: threnody_radio::wifidirect::Groups::new(),
+        wifi,
         asked_direct: std::cell::RefCell::default(),
         offered: std::cell::RefCell::default(),
         scratch: opts_dir,
@@ -431,7 +432,12 @@ pub async fn run(opts: Options) -> Result<()> {
             }
         }
     }
-    ui.leave_wifi_direct().await;
+    // Only with a group joined or joining: otherwise there's nothing to
+    // leave, and no reason to wait on NetworkManager. Bounded, so quitting
+    // never hangs on it.
+    if ui.wifi.busy() {
+        let _ = tokio::time::timeout(Duration::from_secs(10), ui.leave_wifi_direct()).await;
+    }
     #[cfg(all(feature = "ble", target_os = "linux"))]
     if let Some(b) = _ble {
         b.shutdown().await;

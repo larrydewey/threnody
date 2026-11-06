@@ -8,12 +8,14 @@
 //!
 //! [`Groups`] keeps track of what was joined: one group at a time (a
 //! computer has one Wi-Fi interface), left once no session runs over it.
+//! Profile names carry a tag of the identity that joined, so one Threnody
+//! process (the app, a CLI with another home) never deletes another's.
 
 use std::ffi::OsStr;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -59,9 +61,58 @@ pub fn check_offer(o: &DirectOffer) -> Result<()> {
     Ok(())
 }
 
-/// NetworkManager connection-profile name for a group.
-pub fn profile(offer: &DirectOffer) -> String {
-    format!("threnody-{}", offer.ssid)
+/// A short tag for the profiles `id` joins: derived from the identity
+/// without showing it, since every local user can list profile names.
+pub fn owner_tag(id: &PublicIdentity) -> String {
+    let k = blake3::derive_key("threnody 2026-11 wifi-direct profile owner", id.as_bytes());
+    k[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// NetworkManager connection-profile name for a group joined by the
+/// identity tagged `owner` ([`owner_tag`]).
+pub fn profile(owner: &str, offer: &DirectOffer) -> String {
+    format!("threnody-{owner}-{}", offer.ssid)
+}
+
+/// Profiles named before profile names carried an owner. Another process
+/// may still use one, so only inactive ones count as leftovers.
+const LEGACY_PREFIX: &str = "threnody-DIRECT-";
+
+/// The fields of one line of `nmcli -t` output: `:` separates them, and
+/// `\` escapes `:` and `\` inside them.
+fn terse_fields(line: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let (Some(n), Some(f)) = (chars.next(), out.last_mut()) {
+                    f.push(n);
+                }
+            }
+            ':' => out.push(String::new()),
+            c => {
+                if let Some(f) = out.last_mut() {
+                    f.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The profiles to delete as leftovers, from `nmcli -t -f NAME,ACTIVE
+/// connection show`: `owner`'s, and inactive ones from before owners.
+fn leftovers(owner: &str, list: &str) -> Vec<String> {
+    let mine = format!("threnody-{owner}-{SSID_PREFIX}");
+    list.lines()
+        .filter_map(|l| {
+            let f = terse_fields(l);
+            let (name, active) = (f.first()?, f.get(1).map_or("", String::as_str));
+            (name.starts_with(&mine) || (name.starts_with(LEGACY_PREFIX) && active == "no"))
+                .then(|| name.clone())
+        })
+        .collect()
 }
 
 /// The passwd-file line carrying the passphrase: exactly one line, since
@@ -95,16 +146,22 @@ async fn nmcli_with(program: &OsStr, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Joins the group; returns the profile name to pass to [`leave`].
-/// `scratch` is a private directory for the short-lived password file
-/// (the passphrase never appears on a command line).
-pub async fn join(offer: &DirectOffer, scratch: &Path) -> Result<String> {
-    join_with(OsStr::new("nmcli"), offer, scratch).await
+/// Joins the group as the identity tagged `owner`; returns the profile
+/// name to pass to [`leave`]. `scratch` is a private directory for the
+/// short-lived password file (the passphrase never appears on a command
+/// line).
+pub async fn join(owner: &str, offer: &DirectOffer, scratch: &Path) -> Result<String> {
+    join_with(OsStr::new("nmcli"), owner, offer, scratch).await
 }
 
-async fn join_with(program: &OsStr, offer: &DirectOffer, scratch: &Path) -> Result<String> {
+async fn join_with(
+    program: &OsStr,
+    owner: &str,
+    offer: &DirectOffer,
+    scratch: &Path,
+) -> Result<String> {
     check_offer(offer)?;
-    let name = profile(offer);
+    let name = profile(owner, offer);
     let _ = nmcli_with(program, &["connection", "delete", &name]).await;
     nmcli_with(
         program,
@@ -164,13 +221,14 @@ pub async fn leave(name: &str) -> Result<()> {
     nmcli(&["connection", "delete", name]).await.map(|_| ())
 }
 
-/// Deletes profiles of groups joined before a crash (named as
-/// [`profile`] names them); returns how many.
-pub async fn forget_leftovers() -> Result<usize> {
-    let list = nmcli(&["-t", "-f", "NAME", "connection", "show"]).await?;
+/// Deletes the profiles of groups the identity tagged `owner` joined
+/// before a crash, and inactive ones named before profile names carried
+/// an owner; returns how many. Other identities' profiles stay.
+pub async fn forget_leftovers(owner: &str) -> Result<usize> {
+    let list = nmcli(&["-t", "-f", "NAME,ACTIVE", "connection", "show"]).await?;
     let mut n = 0;
-    for name in list.lines().filter(|l| l.starts_with("threnody-DIRECT-")) {
-        if leave(name).await.is_ok() {
+    for name in leftovers(owner, &list) {
+        if leave(&name).await.is_ok() {
             n += 1;
         }
     }
@@ -236,7 +294,7 @@ pub async fn join_and_connect(
 ) -> Result<Joined> {
     check_offer(offer)?;
     let ip = offer.addr.parse::<SocketAddr>()?.ip();
-    let profile = join(offer, scratch).await?;
+    let profile = join(&owner_tag(&node.identity()), offer, scratch).await?;
     if let Err(e) = node.connect(&offer.addr, Some(peer.fingerprint())).await {
         let _ = leave(&profile).await;
         return Err(anyhow!(
@@ -259,12 +317,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The groups one node joined, left automatically once no session runs
 /// over them. Clones share them.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Groups(Arc<Inner>);
 
-#[derive(Default)]
 struct Inner {
+    /// [`owner_tag`] of the node's identity.
+    owner: String,
     joined: Arc<Mutex<Vec<Joined>>>,
+    /// Bumped by [`Groups::leave_all`], with `joined` locked: a join that
+    /// started before leaves its group instead of keeping it.
+    generation: AtomicU64,
     /// Checks joined groups for sessions; stopped when the last clone goes.
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// While a join runs (one at a time).
@@ -291,8 +353,35 @@ impl Drop for Joining<'_> {
 }
 
 impl Groups {
-    pub fn new() -> Self {
-        Self::default()
+    /// The groups `id` (the node's identity) joins.
+    pub fn new(id: &PublicIdentity) -> Self {
+        Self(Arc::new(Inner {
+            owner: owner_tag(id),
+            joined: Arc::default(),
+            generation: AtomicU64::new(0),
+            sweeper: Mutex::new(None),
+            joining: AtomicBool::new(false),
+            cleaned: AtomicBool::new(false),
+        }))
+    }
+
+    /// Keeps a group just joined, unless [`Groups::leave_all`] ran since
+    /// `generation`; then returns it, to leave.
+    fn keep(&self, generation: u64, j: Joined) -> Option<Joined> {
+        let mut joined = lock(&self.0.joined);
+        if self.0.generation.load(Ordering::SeqCst) != generation {
+            return Some(j);
+        }
+        joined.push(j);
+        None
+    }
+
+    /// Takes every joined group, and turns joins still running into
+    /// groups to leave once joined.
+    fn take_all(&self) -> Vec<Joined> {
+        let mut joined = lock(&self.0.joined);
+        self.0.generation.fetch_add(1, Ordering::SeqCst);
+        std::mem::take(&mut *joined)
     }
 
     /// Joins `peer`'s group and dials it, unless it is joined already.
@@ -310,6 +399,7 @@ impl Groups {
             bail!("already joining a Wi-Fi Direct group");
         }
         let _joining = Joining(&self.0.joining);
+        let generation = self.0.generation.load(Ordering::SeqCst);
         let leaving: Vec<Joined> = {
             let mut joined = lock(&self.0.joined);
             match plan(&joined, &peer, offer) {
@@ -334,10 +424,18 @@ impl Groups {
             }
         }
         if !self.0.cleaned.swap(true, Ordering::SeqCst) {
-            let _ = forget_leftovers().await;
+            let _ = forget_leftovers(&self.0.owner).await;
+        }
+        if self.0.generation.load(Ordering::SeqCst) != generation {
+            bail!("Wi-Fi Direct was left while joining");
         }
         let j = join_and_connect(node, peer, offer, scratch).await?;
-        lock(&self.0.joined).push(j);
+        if let Some(j) = self.keep(generation, j) {
+            if let Err(e) = leave(&j.profile).await {
+                log(format!("leaving {}: {e:#}", j.profile));
+            }
+            bail!("Wi-Fi Direct was left while joining");
+        }
         self.start_sweeper(node, log);
         Ok(())
     }
@@ -376,10 +474,11 @@ impl Groups {
         }));
     }
 
-    /// Leaves every joined group, and deletes profiles a crash left
-    /// behind; returns how many groups were left.
+    /// Leaves every joined group, and a join still running once it is
+    /// done (deleting its profile now cuts it short), and deletes profiles
+    /// a crash left behind; returns how many groups were left.
     pub async fn leave_all(&self, log: &Log) -> usize {
-        let all = std::mem::take(&mut *lock(&self.0.joined));
+        let all = self.take_all();
         let mut n = 0;
         for j in all {
             match leave(&j.profile).await {
@@ -388,12 +487,18 @@ impl Groups {
             }
         }
         self.0.cleaned.store(true, Ordering::SeqCst);
-        n + forget_leftovers().await.unwrap_or(0)
+        n + forget_leftovers(&self.0.owner).await.unwrap_or(0)
     }
 
     /// The peers whose groups are joined.
     pub fn peers(&self) -> Vec<PublicIdentity> {
         lock(&self.0.joined).iter().map(|j| j.peer).collect()
+    }
+
+    /// Whether a group is joined, or a join is running: whether
+    /// [`Groups::leave_all`] has anything to do besides leftovers.
+    pub fn busy(&self) -> bool {
+        self.0.joining.load(Ordering::SeqCst) || !lock(&self.0.joined).is_empty()
     }
 }
 
@@ -487,8 +592,59 @@ mod tests {
     }
 
     #[test]
-    fn profile_names_follow_the_ssid() {
-        assert_eq!(profile(&offer()), "threnody-DIRECT-th-abcd");
+    fn profile_names_carry_the_owner_and_the_ssid() {
+        let (a, b) = (someone(), someone());
+        let tag = owner_tag(&a);
+        assert_eq!(tag.len(), 8);
+        assert_eq!(tag, owner_tag(&a));
+        assert_ne!(tag, owner_tag(&b));
+        assert!(!a.fingerprint().compact().to_lowercase().contains(&tag));
+        assert_eq!(
+            profile("0a1b2c3d", &offer()),
+            "threnody-0a1b2c3d-DIRECT-th-abcd"
+        );
+    }
+
+    #[test]
+    fn only_our_own_or_idle_old_profiles_are_leftovers() {
+        let list = "Home:yes\n\
+threnody-0a1b2c3d-DIRECT-th-abcd:yes\n\
+threnody-0a1b2c3d-DIRECT-th-x\\:y:no\n\
+threnody-99999999-DIRECT-th-abcd:yes\n\
+threnody-99999999-DIRECT-th-wxyz:no\n\
+threnody-DIRECT-th-old:no\n\
+threnody-DIRECT-th-busy:yes\n";
+        assert_eq!(
+            leftovers("0a1b2c3d", list),
+            vec![
+                "threnody-0a1b2c3d-DIRECT-th-abcd",
+                "threnody-0a1b2c3d-DIRECT-th-x:y",
+                "threnody-DIRECT-th-old",
+            ]
+        );
+        assert_eq!(terse_fields("a\\\\b\\:c:d"), vec!["a\\b:c", "d"]);
+    }
+
+    #[test]
+    fn a_join_finishing_after_leave_all_is_left() {
+        let (me, alice) = (someone(), someone());
+        let g = Groups::new(&me);
+        let now = Instant::now();
+        // Not left in between: kept.
+        let generation = g.0.generation.load(Ordering::SeqCst);
+        assert!(
+            g.keep(generation, joined(alice, "DIRECT-a", "192.168.49.1", now))
+                .is_none()
+        );
+        assert_eq!(g.peers(), vec![alice]);
+        assert!(g.busy());
+        // Left while a second join ran: that one is handed back to leave.
+        let generation = g.0.generation.load(Ordering::SeqCst);
+        assert_eq!(g.take_all().len(), 1);
+        let back = g.keep(generation, joined(alice, "DIRECT-b", "192.168.49.1", now));
+        assert_eq!(back.map(|j| j.ssid).as_deref(), Some("DIRECT-b"));
+        assert!(g.peers().is_empty());
+        assert!(!g.busy());
     }
 
     #[test]
@@ -516,14 +672,18 @@ mod tests {
         let program = OsStr::new("/nonexistent/nmcli");
         let mut bad = offer();
         bad.passphrase = "abcdefgh\nmode=ap".into();
-        let e = join_with(program, &bad, dir.path()).await.unwrap_err();
+        let e = join_with(program, "0a1b2c3d", &bad, dir.path())
+            .await
+            .unwrap_err();
         let e = format!("{e:#}");
         assert!(
             e.contains("passphrase") && !e.contains("running nmcli"),
             "{e}"
         );
         // A good offer gets as far as running the program.
-        let e = join_with(program, &offer(), dir.path()).await.unwrap_err();
+        let e = join_with(program, "0a1b2c3d", &offer(), dir.path())
+            .await
+            .unwrap_err();
         assert!(format!("{e:#}").contains("running nmcli"), "{e:#}");
     }
 }
