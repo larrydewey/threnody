@@ -315,6 +315,15 @@ pub fn album_id() -> u64 {
     threnody_net::history::album_id()
 }
 
+/// Whether a file is a photo whose location and camera details the node
+/// can't remove (HEIC, AVIF, TIFF and camera raw), going by its first bytes
+/// (32 are enough) rather than its name. The app sends such a photo as
+/// JPEG; the node refuses it as it is while metadata removal is on.
+#[uniffi::export]
+pub fn needs_converting(head: Vec<u8>) -> bool {
+    threnody_core::media::needs_converting(&head)
+}
+
 /// A QR code as a square of modules, row by row (`true` = dark).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct QrMatrix {
@@ -581,6 +590,8 @@ pub enum NodeEvent {
         group: String,
         name: String,
         from: String,
+        /// One of many from strangers: list it, but don't notify.
+        quiet: bool,
     },
     GroupMembersChanged {
         group: String,
@@ -658,6 +669,13 @@ pub enum NodeEvent {
     Typing {
         peer: String,
         active: bool,
+    },
+    /// Onion routing is on, but nothing could hide a session with `peer`,
+    /// or a message left for it, so it went in the open: show `notice`
+    /// quietly in the chat with `peer`.
+    Fallback {
+        peer: String,
+        notice: String,
     },
     /// `peer` (a persona, to us) proved it is `identity`; `invite` reaches
     /// that identity. Also kept as `ContactInfo::revealed`.
@@ -739,20 +757,26 @@ pub trait ByteLink: Send + Sync {
 /// The app's handle for feeding a link's received bytes into the node.
 #[derive(uniffi::Object)]
 pub struct LinkHandle {
-    tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    tx: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
+
+/// Reads from a link waiting for the session, at most. Past this
+/// [`LinkHandle::receive`] waits, so the platform stops reading and the
+/// far end, out of flow-control credit, stops sending.
+const LINK_QUEUE: usize = 64;
 
 #[uniffi::export]
 impl LinkHandle {
-    /// Bytes read from the platform socket.
+    /// Bytes read from the platform socket. Call it from the thread that
+    /// reads the socket: it waits while the session is behind.
     pub fn receive(&self, data: Vec<u8>) {
-        if let Some(tx) = self
+        let tx = self
             .tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            let _ = tx.send(data);
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.blocking_send(data);
         }
     }
 
@@ -1115,10 +1139,57 @@ fn convert(e: Event) -> NodeEvent {
             reason: calls::reason(reason),
             by_us,
         },
+        Event::Fallback { peer, path } => NodeEvent::Fallback {
+            peer: fp(&peer),
+            notice: path.notice().into(),
+        },
+        // Other messages (pins, reactions, lists, a file a contact sealed)
+        // are applied by the node; the log gets their kind, never what
+        // they carry.
+        Event::Message { msg, .. } | Event::OfflineMessage { msg, .. } => NodeEvent::Other {
+            description: format!("{} message", kind_of(&msg)),
+        },
         other => NodeEvent::Other {
-            description: format!("{other:?}"),
+            description: describe(&other, MAX_DESCRIPTION),
         },
     }
+}
+
+/// Longest description an `Other` event carries.
+const MAX_DESCRIPTION: usize = 512;
+
+/// The name of a message's kind ("File", "Pin"), without its content.
+fn kind_of(msg: &AppMessage) -> String {
+    describe(msg, 32)
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+/// `value`'s debug text, cut to at most `max` bytes. Formatting stops at
+/// the limit, so a large value is never written out whole.
+fn describe(value: &impl std::fmt::Debug, max: usize) -> String {
+    struct Bounded(String, usize);
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let room = self.1 - self.0.len();
+            if s.len() <= room {
+                self.0.push_str(s);
+                return Ok(());
+            }
+            let mut cut = room;
+            while !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.0.push_str(&s[..cut]);
+            Err(std::fmt::Error)
+        }
+    }
+    let mut out = Bounded(String::new(), max);
+    if std::fmt::write(&mut out, format_args!("{value:?}")).is_err() {
+        out.0.push('…');
+    }
+    out.0
 }
 
 impl ThrenodyNode {
@@ -1467,16 +1538,22 @@ Address = {}/128\n",
         for peer in self.node.tunnel_peers_full() {
             let psk = threnody_core::tunnel::base64(&peer.psk.0[..]);
             let peer_overlay = peer.overlay;
+            // Learned over Bluetooth only: WireGuard finds it from its packets.
+            let endpoint = if threnody_net::node::has_endpoint(&peer.endpoint) {
+                format!("Endpoint = {}\n", peer.endpoint)
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
                 "\n[Peer]\n\
 PublicKey = {}\n\
 PresharedKey = {}\n\
-Endpoint = {}\n\
+{}\
 AllowedIPs = {}/128\n\
 PersistentKeepalive = 25\n",
                 threnody_core::tunnel::base64(&peer.wg_public),
                 psk,
-                peer.endpoint,
+                endpoint,
                 peer_overlay
             ));
         }
@@ -1561,10 +1638,11 @@ PersistentKeepalive = 25\n",
             .map_err(fail)
     }
 
-    /// Dials every mutually approved contact that isn't connected, at its
-    /// last known address or through relays. Returns at once; sessions
-    /// show up as `Connected` events. Apps call it on start and when the
-    /// network comes back.
+    /// Reconnects every mutually approved contact that isn't connected:
+    /// through an onion circuit once one can be built (with onion routing
+    /// on), else at its last known address or through relays. Returns at
+    /// once; sessions show up as `Connected` events. Apps call it on start
+    /// and when the network comes back.
     pub fn reconnect(&self) {
         let live: Vec<PublicIdentity> = self.node.sessions().iter().map(|s| s.peer).collect();
         for c in self.node.contacts().iter() {
@@ -1573,7 +1651,9 @@ PersistentKeepalive = 25\n",
             }
             let (node, peer) = (self.node.clone(), c.key);
             self.rt.spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(30), node.reach_peer(&peer)).await;
+                // Room to wait for a first hop, then dial.
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(75), node.reconnect_peer(&peer)).await;
             });
         }
     }
@@ -1843,8 +1923,11 @@ PersistentKeepalive = 25\n",
     }
 
     /// Deletes a message request; they can write again as a new request.
+    /// Fails, changing nothing, if `peer` isn't a message request.
     pub fn delete_request(&self, peer: String) -> Result<()> {
-        self.node.delete_request(&self.resolve(&peer)?);
+        if !self.node.delete_request(&self.resolve(&peer)?) {
+            return Err(fail(format!("{peer:?} is not a message request")));
+        }
         Ok(())
     }
 
@@ -2082,7 +2165,7 @@ PersistentKeepalive = 25\n",
 
     /// Cover traffic (spec §9 layer 1): each session sends one padded frame
     /// every `interval_ms`, filler when idle, so timing shows nothing.
-    /// `None` turns it off. Each frame is about 2.7 kB. On by default.
+    /// `None` turns it off. Each frame is about 6.5 kB. On by default.
     pub fn set_cover_traffic(&self, interval_ms: Option<u32>) {
         self.node
             .set_constant_rate(interval_ms.map(|ms| Duration::from_millis(u64::from(ms.max(10)))));
@@ -2193,30 +2276,45 @@ PersistentKeepalive = 25\n",
             _ => "link",
         };
         let (ours, theirs) = tokio::io::duplex(1 << 18);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(LINK_QUEUE);
         let handle = Arc::new(LinkHandle {
             tx: Mutex::new(Some(tx)),
         });
-        // Pump: session bytes -> platform, platform bytes -> session.
+        // Pump: session bytes -> platform, platform bytes -> session. Each
+        // direction runs on its own: a write the platform holds up (a peer
+        // that grants no credit) must not stop what it reads reaching the
+        // session.
         let pump_link = Arc::clone(&link);
         self.rt.spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(ours);
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                tokio::select! {
-                    n = rd.read(&mut buf) => {
-                        let Ok(n) = n else { break };
-                        if n == 0 { break }
-                        let data = buf[..n].to_vec();
-                        let l = Arc::clone(&pump_link);
-                        let ok = tokio::task::spawn_blocking(move || l.send(data)).await.unwrap_or(false);
-                        if !ok { break }
+            let l = Arc::clone(&pump_link);
+            let outbound = async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let n = match rd.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    let data = buf[..n].to_vec();
+                    let l = Arc::clone(&l);
+                    let ok = tokio::task::spawn_blocking(move || l.send(data))
+                        .await
+                        .unwrap_or(false);
+                    if !ok {
+                        break;
                     }
-                    inbound = rx.recv() => match inbound {
-                        Some(d) => if wr.write_all(&d).await.is_err() { break },
-                        None => break,
-                    },
                 }
+            };
+            let inbound = async move {
+                while let Some(d) = rx.recv().await {
+                    if wr.write_all(&d).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                () = outbound => {}
+                () = inbound => {}
             }
             let l = Arc::clone(&pump_link);
             let _ = tokio::task::spawn_blocking(move || l.disconnect()).await;
@@ -2388,6 +2486,9 @@ impl ThrenodyNode {
                     match &other {
                         Event::Connected { peer, .. } => self.group_connected(peer),
                         Event::DeviceLinked { device } => self.group_linked(device),
+                        Event::AccountChanged { removed, .. } if !removed.is_empty() => {
+                            self.group_revoked(removed);
+                        }
                         Event::ListChanged { .. } => {
                             let _guard = self.rt.enter();
                             for (bytes, g) in self.node.take_list_forwards() {
@@ -2518,12 +2619,60 @@ mod tests {
         assert_eq!(decode_qr(0, 0, 0, vec![]), None);
     }
 
+    /// A message the app has no event for is logged by kind only: a sealed
+    /// file's bytes, or a pin's text, never reach the log.
+    #[test]
+    fn other_messages_are_described_without_their_content() {
+        let from = threnody_core::Identity::generate().public();
+        let file = AppMessage::File {
+            sent_ms: 1,
+            name: "secret.bin".into(),
+            data: vec![7; 1 << 20],
+            id: 1,
+            sensitive: false,
+            caption: "a caption".into(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        };
+        let e = Event::OfflineMessage {
+            from,
+            via: from,
+            msg: file,
+        };
+        let NodeEvent::Other { description } = convert(e) else {
+            panic!("expected Other");
+        };
+        assert_eq!(description, "File message");
+        // Anything else is cut short.
+        let long = describe(&vec![7u8; 1 << 20], MAX_DESCRIPTION);
+        assert!(long.len() <= MAX_DESCRIPTION + '…'.len_utf8());
+    }
+
     #[test]
     fn qr_matrix_is_square() {
         let q = qr_matrix("threnody://ABC@192.0.2.7:7450".into()).unwrap();
         assert!(q.size >= 21);
         assert_eq!(q.dark.len(), (q.size * q.size) as usize);
         assert!(q.dark[0], "finder pattern corner is dark");
+    }
+
+    #[test]
+    fn going_in_the_open_reaches_the_app_as_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let b = ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let addr = b.listen("127.0.0.1:0".into()).unwrap();
+        // No relays to build a circuit from: the dial goes direct.
+        let b_fp = a.connect(b.invite_link(addr)).unwrap();
+        let e = wait(&a, |e| matches!(e, NodeEvent::Fallback { .. }));
+        assert_eq!(
+            e,
+            NodeEvent::Fallback {
+                peer: b_fp,
+                notice: "Sent directly: no relay circuit was available".into(),
+            }
+        );
     }
 
     #[test]
@@ -2572,7 +2721,9 @@ mod tests {
         assert_eq!(seen.name.as_deref(), Some("Stall 12"));
         assert_eq!(seen.shared_profile.len(), 1);
 
-        me.reveal_through(p.clone(), b_fp, Some("threnody://ME@10.0.0.2:7450".into()))
+        // The main identity's own link: one naming anyone else is dropped.
+        let link = me.invite_link("10.0.0.2:7450".into());
+        me.reveal_through(p.clone(), b_fp, Some(link.clone()))
             .unwrap();
         let e = wait(&bob, |e| matches!(e, NodeEvent::IdentityRevealed { .. }));
         assert_eq!(
@@ -2580,7 +2731,7 @@ mod tests {
             NodeEvent::IdentityRevealed {
                 peer: p_fp.clone(),
                 identity: me.device_fingerprint(),
-                invite: Some("threnody://ME@10.0.0.2:7450".into()),
+                invite: Some(link),
             }
         );
         let seen = bob
@@ -3420,5 +3571,82 @@ mod tests {
         got(&bob, "to-bob");
         got(&alice, "to-alice");
         wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+    }
+
+    /// A link whose writes stall (a peer that grants no credit) still
+    /// carries what arrives into the session.
+    #[test]
+    fn a_stalled_write_does_not_stop_reading() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{Receiver, channel};
+        struct Stalling {
+            to: Mutex<Option<Arc<LinkHandle>>>,
+            stall: AtomicBool,
+            release: Mutex<Receiver<()>>,
+        }
+        impl ByteLink for Stalling {
+            fn send(&self, data: Vec<u8>) -> bool {
+                if self.stall.load(Ordering::SeqCst) {
+                    // Until the test ends.
+                    let _ = self.release.lock().unwrap().recv();
+                    return false;
+                }
+                let h = self.to.lock().unwrap().clone();
+                h.is_some_and(|h| {
+                    h.receive(data);
+                    true
+                })
+            }
+            fn disconnect(&self) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let bob =
+            ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let (_release_a, ra) = channel();
+        let (release_b, rb) = channel();
+        let (to_bob, to_alice) = (
+            Arc::new(Stalling {
+                to: Mutex::new(None),
+                stall: AtomicBool::new(false),
+                release: Mutex::new(ra),
+            }),
+            Arc::new(Stalling {
+                to: Mutex::new(None),
+                stall: AtomicBool::new(false),
+                release: Mutex::new(rb),
+            }),
+        );
+        let ha = alice
+            .attach_link(to_bob.clone(), true, "ble".into(), "b".into(), None)
+            .unwrap();
+        let hb = bob
+            .attach_link(to_alice.clone(), false, "ble".into(), "a".into(), None)
+            .unwrap();
+        *to_bob.to.lock().unwrap() = Some(hb);
+        *to_alice.to.lock().unwrap() = Some(ha);
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(alice.device_fingerprint()).unwrap();
+        alice.accept_contact(bob.device_fingerprint()).unwrap();
+        // Both ways once, so each side has the other's Hello.
+        bob.send_text(alice.device_fingerprint(), "hi".into())
+            .unwrap();
+        wait(
+            &alice,
+            |e| matches!(e, NodeEvent::Message { text, .. } if text == "hi"),
+        );
+        // Bob's writes now hang; his cover traffic soon runs into that.
+        to_alice.stall.store(true, Ordering::SeqCst);
+        bob.send_text(alice.device_fingerprint(), "stuck".into())
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        alice
+            .send_text(bob.device_fingerprint(), "still heard".into())
+            .unwrap();
+        let m = wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        assert!(matches!(m, NodeEvent::Message { text, .. } if text == "still heard"));
+        drop(release_b);
     }
 }

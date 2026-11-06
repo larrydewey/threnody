@@ -323,6 +323,19 @@ impl AccountChain {
         finish(&dec)?;
         Self::from_links(links)
     }
+
+    /// The account an encoded chain says it is, read from its genesis link
+    /// alone. Nothing is verified: this only tells, cheaply, which account
+    /// a chain is about before deciding whether to check it.
+    pub fn claimed_id(b: &[u8]) -> Result<AccountId> {
+        let mut dec = Decoder::new(b);
+        let n = dec.array_len()?;
+        if n == 0 || n > MAX_LINKS {
+            return Err(Error::Malformed("account chain length"));
+        }
+        let g = Link::decode(dec.bytes()?)?;
+        Ok(AccountId(kdf::derive(label::ACCOUNT_ID, &[&g.body()?])))
+    }
 }
 
 fn decode_link(dec: &mut Decoder<'_>) -> Result<Link> {
@@ -602,7 +615,9 @@ impl FromStr for LinkCode {
             .ok_or(Error::Malformed("link code"))?;
         let (fp, rest) = rest.split_once('@').ok_or(Error::Malformed("link code"))?;
         let (addr, hex) = rest.rsplit_once('#').ok_or(Error::Malformed("link code"))?;
-        if hex.len() != 32 || addr.is_empty() {
+        // Checking for hex digits first also keeps the slicing below on
+        // character boundaries.
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) || addr.is_empty() {
             return Err(Error::Malformed("link code"));
         }
         let mut secret = [0u8; 16];
@@ -704,6 +719,11 @@ mod tests {
         let again = AccountChain::decode(&chain.encode().unwrap()).unwrap();
         assert_eq!(again, chain);
         assert_ne!(id.fingerprint(), a.public().fingerprint());
+        assert_eq!(
+            AccountChain::claimed_id(&chain.encode().unwrap()).unwrap(),
+            id
+        );
+        assert!(AccountChain::claimed_id(&[0x80]).is_err(), "no links");
     }
 
     #[test]
@@ -856,5 +876,25 @@ mod tests {
         );
         assert_ne!(code.proof(&sid, &n.public()), code.proof(&sid, &e.public()));
         assert!("threnody-link://x@y#00".parse::<LinkCode>().is_err());
+    }
+
+    #[test]
+    fn link_codes_with_stray_characters_are_rejected_not_panicked_on() {
+        let fp = Identity::generate().public().fingerprint().compact();
+        let good = format!("{LINK_SCHEME}{fp}@192.0.2.1:7450#{}", "0".repeat(32));
+        assert!(good.parse::<LinkCode>().is_ok());
+        // 32 bytes, but the first character is three of them.
+        let multibyte = format!(
+            "{LINK_SCHEME}{fp}@192.0.2.1:7450#\u{20ac}{}",
+            "0".repeat(29)
+        );
+        // A sign is not a hex digit, though u8::from_str_radix takes one.
+        let signed = format!("{LINK_SCHEME}{fp}@192.0.2.1:7450#+f{}", "0".repeat(30));
+        for code in [multibyte, signed] {
+            assert!(matches!(
+                code.parse::<LinkCode>(),
+                Err(Error::Malformed("link code"))
+            ));
+        }
     }
 }

@@ -420,3 +420,173 @@ fn members_leave_and_owners_delete() {
     let saved = net.node(&pa).export().unwrap();
     assert!(Groups::restore(&a, &saved).unwrap().list().is_empty());
 }
+
+#[test]
+fn removed_members_can_be_invited_again() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let g = net.node(&pa).create("club").unwrap();
+    let before = net.node(&pb).export().unwrap().len();
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    let out = net.node(&pa).remove(&g, &pb).unwrap();
+    net.deliver(pa, out);
+    assert!(net.take(&pb).contains(&GroupEvent::Left { group: g }));
+    // Nothing of the group is left behind: no old epoch secrets on disk.
+    let after = net.node(&pb).export().unwrap().len();
+    assert!(after <= before + 64, "{before} -> {after} bytes");
+
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    assert!(
+        net.take(&pb)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Joined { .. }))
+    );
+    let out = net.node(&pa).send_text(&g, "welcome back").unwrap();
+    net.deliver(pa, out);
+    assert!(net.take(&pb).contains(&GroupEvent::Text {
+        group: g,
+        from: pa,
+        text: "welcome back".into(),
+        id: 0,
+        quote: None,
+        mentions: Vec::new(),
+        forwarded: false,
+    }));
+}
+
+#[test]
+fn key_packages_for_unanswered_invitations_are_bounded() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let size = |net: &mut Net| net.node(&pb).export().unwrap().len();
+    let base = size(&mut net);
+    net.node(&pb).accept_invite(&[0; 16], pa).unwrap();
+    let one = size(&mut net) - base;
+
+    // Asking again for the same group answers with the same key package.
+    for _ in 0..10 {
+        net.node(&pb).accept_invite(&[0; 16], pa).unwrap();
+    }
+    assert!(size(&mut net) < base + 2 * one);
+    // A flood of requests keeps only the latest few.
+    for i in 0..100u8 {
+        net.node(&pb).accept_invite(&[i; 16], pa).unwrap();
+    }
+    let flooded = size(&mut net);
+    assert!(
+        flooded < base + (threnody_groups::MAX_KEY_PACKAGES + 1) * one,
+        "{flooded} bytes"
+    );
+    // They survive a restart.
+    let restored = Groups::restore(&b, &net.node(&pb).export().unwrap()).unwrap();
+    assert_eq!(restored.export().unwrap().len(), flooded);
+
+    // An invitation still works, and takes its key packages with it.
+    let g = net.node(&pa).create("x").unwrap();
+    let out = net.node(&pa).invite(&g, pb).unwrap();
+    net.deliver(pa, out);
+    assert!(
+        net.take(&pb)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Joined { .. }))
+    );
+}
+
+#[test]
+fn a_welcome_built_from_the_first_of_several_answers_still_opens() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (pa, pb) = (a.public(), b.public());
+    let mut net = Net::new(&[&a, &b]);
+    let g = net.node(&pa).create("team").unwrap();
+    // Alice asks twice (two of Bob's devices asked her to add a third,
+    // say) and Bob answers both; she adds him with the first answer.
+    net.node(&pa).invite(&g, pb).unwrap();
+    net.node(&pa).invite(&g, pb).unwrap();
+    let first = net.node(&pb).accept_invite(&g, pa).unwrap().send[0]
+        .wire
+        .clone();
+    let second = net.node(&pb).accept_invite(&g, pa).unwrap().send[0]
+        .wire
+        .clone();
+    let out = net.node(&pa).handle(pb, first).unwrap();
+    assert!(net.node(&pa).handle(pb, second).is_err());
+    let w = out.send.into_iter().find(|o| o.to == pb).unwrap().wire;
+    let res = net.node(&pb).handle(pa, w).unwrap();
+    assert!(res.events.contains(&GroupEvent::Joined {
+        group: g,
+        name: "team".into(),
+        owner: pa
+    }));
+}
+
+#[test]
+fn a_welcome_must_come_from_whom_we_gave_a_key_package() {
+    let (a, b, c) = (
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+    );
+    let (pa, pb, pc) = (a.public(), b.public(), c.public());
+    let mut net = Net::new(&[&a, &b, &c]);
+    // Alice's Welcome for Bob into `g`, Bob having given key packages to
+    // those in `gave`.
+    let welcome = |net: &mut Net, gave: &[PublicIdentity]| {
+        let g = net.node(&pa).create("team").unwrap();
+        net.accept = true;
+        let out = net.node(&pa).invite(&g, pc).unwrap();
+        net.deliver(pa, out);
+        net.accept = false;
+        net.node(&pa).invite(&g, pb).unwrap();
+        let mut kp = None;
+        for p in gave {
+            let out = net.node(&pb).accept_invite(&g, *p).unwrap();
+            if *p == pa {
+                kp = Some(out.send[0].wire.clone());
+            }
+        }
+        let out = net.node(&pa).handle(pb, kp.unwrap()).unwrap();
+        let w = out.send.into_iter().find(|o| o.to == pb).unwrap().wire;
+        (g, w)
+    };
+
+    // Passed on by Carol, another member Bob gave nothing: refused, and
+    // Bob can still join from Alice, with Alice as the owner.
+    let (g, w) = welcome(&mut net, &[pa]);
+    assert!(net.node(&pb).handle(pc, w.clone()).is_err());
+    assert!(net.node(&pb).list().is_empty());
+    let res = net.node(&pb).handle(pa, w).unwrap();
+    assert!(res.events.contains(&GroupEvent::Joined {
+        group: g,
+        name: "team".into(),
+        owner: pa
+    }));
+
+    // Bob accepted Carol's invitation to that group too, but she didn't
+    // make this Welcome: still refused.
+    let (g, w) = welcome(&mut net, &[pa, pc]);
+    assert!(net.node(&pb).handle(pc, w).is_err());
+    assert!(!net.node(&pb).list().iter().any(|(id, ..)| *id == g));
+}
+
+#[test]
+fn names_lose_characters_that_reorder_text() {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let mut gb = Groups::new(&b);
+    let out = gb
+        .handle(
+            a.public(),
+            GroupWire::KeyPackageRequest {
+                group: [1; 16],
+                name: "Your\u{202E}knab\u{2066} \u{200B}club\u{FEFF}\n".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        &out.events[..],
+        [GroupEvent::InviteRequested { name, .. }] if name == "Yourknab club"
+    ));
+}

@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use threnody_core::tunnel::{WgKeys, base64, overlay_addr};
 use threnody_core::{Identity, PublicIdentity};
-use threnody_net::node::Secret;
+use threnody_net::node::{Secret, has_endpoint};
 
 struct Peer {
     wg_public: [u8; 32],
@@ -115,23 +115,22 @@ impl Tunnels {
 
     fn wg_set_peer(&self, p: &Peer) -> Result<()> {
         let psk = zeroize::Zeroizing::new(base64(&p.psk.0[..]));
-        run_wg(
-            &[
-                "set",
-                &self.iface,
-                "peer",
-                &base64(&p.wg_public),
-                "preshared-key",
-                "/dev/stdin",
-                "endpoint",
-                &p.endpoint.to_string(),
-                "allowed-ips",
-                &format!("{}/128", p.overlay),
-                "persistent-keepalive",
-                "25",
-            ],
-            Some(psk.as_bytes()),
-        )
+        let (key, endpoint) = (base64(&p.wg_public), p.endpoint.to_string());
+        let allowed = format!("{}/128", p.overlay);
+        let mut args = vec![
+            "set",
+            &self.iface,
+            "peer",
+            &key,
+            "preshared-key",
+            "/dev/stdin",
+        ];
+        // Learned over Bluetooth only: WireGuard finds it from its packets.
+        if has_endpoint(&p.endpoint) {
+            args.extend(["endpoint", &endpoint]);
+        }
+        args.extend(["allowed-ips", &allowed, "persistent-keepalive", "25"]);
+        run_wg(&args, Some(psk.as_bytes()))
     }
 
     /// Renders the wg-quick config. Contains the private key.
@@ -152,7 +151,9 @@ impl Tunnels {
             let _ = writeln!(s, "\n[Peer]");
             let _ = writeln!(s, "PublicKey = {}", base64(&p.wg_public));
             let _ = writeln!(s, "PresharedKey = {}", psk.as_str());
-            let _ = writeln!(s, "Endpoint = {}", p.endpoint);
+            if has_endpoint(&p.endpoint) {
+                let _ = writeln!(s, "Endpoint = {}", p.endpoint);
+            }
             let _ = writeln!(s, "AllowedIPs = {}/128", p.overlay);
             let _ = writeln!(s, "PersistentKeepalive = 25");
         }
@@ -242,5 +243,22 @@ mod tests {
                 .contains("[Peer]")
         );
         assert!(Tunnels::new(&me, dir.path(), "bad name; rm".into(), 1, false).is_err());
+    }
+
+    #[test]
+    fn a_peer_known_only_over_bluetooth_has_no_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = Identity::from_seed(&[1; 32]);
+        let peer = Identity::from_seed(&[2; 32]).public();
+        let mut t = Tunnels::new(&me, dir.path(), "thr0".into(), 51820, false).unwrap();
+        t.up(
+            &peer,
+            [9; 32],
+            "0.0.0.0:51820".parse().unwrap(),
+            Secret(Zeroizing::new([5; 32])),
+        )
+        .unwrap();
+        let conf = std::fs::read_to_string(t.conf_path()).unwrap();
+        assert!(conf.contains("[Peer]") && !conf.contains("Endpoint"));
     }
 }

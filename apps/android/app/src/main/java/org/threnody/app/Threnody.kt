@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.ContactInfo
 import uniffi.threnody_ffi.FileOptions
+import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.PersonaRecord
 import uniffi.threnody_ffi.ThrenodyNode
@@ -62,6 +63,9 @@ object Threnody {
         app = ctx.applicationContext
         debuggable = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (debuggable) debugHooks(ctx.applicationContext, it)
+        // Settings before listening: listening starts internet
+        // reachability, which mustn't join the DHT, even briefly, when off.
+        applyPrivacyTo(ctx, it)
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
         say("listening on $listenAddr")
@@ -121,10 +125,10 @@ object Threnody {
         personaNodes[rec.id]?.let { return it }
         val n = ThrenodyNode.open(rec.home, KeyVault.passphrase(ctx, rec.home), null)
         val port = prefs(ctx).getInt("port_${rec.id}", 0)
+        applyPrivacyTo(ctx, n)
         val addr = try { n.listen("0.0.0.0:$port") } catch (_: Exception) { n.listen("0.0.0.0:0") }
         prefs(ctx).edit().putInt("port_${rec.id}", addr.substringAfterLast(':').toInt()).apply()
         personaNodes[rec.id] = n
-        applyPrivacyTo(ctx, n)
         pump(ctx, n, rec.id)
         say("anonymous identity ${rec.id.take(6)} listening on port ${addr.substringAfterLast(':')}")
         // The same directories as the main identity, through links of its own.
@@ -230,13 +234,22 @@ object Threnody {
     }
 
     /**
-     * Keeps a received file: images and voice or video messages privately,
-     * others in Downloads. A persona keeps everything privately, so
-     * burning it leaves nothing.
+     * Keeps a received file: images, voice or video messages, and files
+     * that are sensitive or disappear ([privately]) privately, where the
+     * sweep removes them with their message; others in Downloads, where any
+     * app can read them and they outlive the message. A persona keeps
+     * everything privately, so burning it leaves nothing.
      */
-    private fun keep(ctx: Context, name: String, data: ByteArray, persona: String?, clip: Boolean): String? =
-        if (persona != null || clip || Media.isImage(name)) Media.savePrivate(ctx, name, data, persona)
+    private fun keep(ctx: Context, name: String, data: ByteArray, persona: String?, privately: Boolean): String? =
+        if (persona != null || privately || Media.isImage(name)) Media.savePrivate(ctx, name, data, persona)
         else saveDownload(ctx, name, data)?.toString()
+
+    /** Whether a chat's messages disappear; if it can't be told, they are taken to. */
+    private fun disappears(timer: () -> UInt?): Boolean = try {
+        timer() != null
+    } catch (_: Exception) {
+        true
+    }
 
     /**
      * New identities are called "device"; give this one the phone's model
@@ -541,6 +554,14 @@ object Threnody {
         Runtime.getRuntime().exit(0)
     }
 
+    /**
+     * Quiet notices for chats, by the identity that heard them (null: the
+     * main one, else a persona) and the device: onion routing couldn't
+     * hide a session with it or a message left for it (`NodeEvent.Fallback`).
+     * Shown in that identity's chat until dismissed there.
+     */
+    val notices = java.util.concurrent.ConcurrentHashMap<Pair<String?, String>, String>()
+
     /** Subscribes to node events (called on the event thread); returns an unsubscriber. */
     fun subscribe(l: (NodeEvent) -> Unit): () -> Unit {
         listeners.add(l)
@@ -584,6 +605,16 @@ object Threnody {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             ctx.registerReceiver(receiver, filter)
         }
+    }
+
+    /**
+     * Whether the newest message in a history disappears, so its text stays
+     * out of notifications. If it can't be told, it is taken to.
+     */
+    private fun disappearing(history: () -> List<HistoryEntry>): Boolean = try {
+        history().lastOrNull()?.disappearing != false
+    } catch (_: Exception) {
+        true
     }
 
     fun say(line: String) {
@@ -641,13 +672,15 @@ object Threnody {
                     val k = key(contacts, e.peer)
                     if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
                         val name = contacts.firstOrNull { it.fingerprint == e.peer }?.name ?: short(e.peer)
-                        ThrenodyService.notifyMessage(ctx, k, e.peer, name, e.text, persona)
+                        ThrenodyService.notifyMessage(ctx, k, e.peer, name, e.text, persona,
+                            disappearing { node.history(e.peer, 1u) })
                     }
                 }
                 is NodeEvent.ApprovalChanged -> say("* ${short(e.peer)} approval: mutual=${e.mutual}")
                 is NodeEvent.File -> {
                     say("* ${short(e.peer)} sent a file (${e.data.size} bytes)")
-                    val location = keep(ctx, e.name, e.data, persona, e.clip != null)
+                    val privately = e.clip != null || e.sensitive || disappears { node.disappearing(e.peer) }
+                    val location = keep(ctx, e.name, e.data, persona, privately)
                     try {
                         node.recordReceivedFile(e.peer, e.name, e.data.size.toULong(), location, e.id,
                             FileOptions(e.sensitive, e.caption, e.album, e.clip, e.forwarded))
@@ -657,7 +690,8 @@ object Threnody {
                     if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
                         val contacts = node.contacts()
                         ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer),
-                            fileLabel(e.name, e.sensitive, e.caption, e.clip), persona)
+                            fileLabel(e.name, e.sensitive, e.caption, e.clip), persona,
+                            disappearing { node.history(e.peer, 1u) })
                     }
                 }
                 is NodeEvent.GroupMessage -> {
@@ -665,12 +699,14 @@ object Threnody {
                     // Our own other device's messages aren't news.
                     if (!e.ours && !e.quiet && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
-                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}", persona)
+                        ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group", "${nameOf(node, e.from)}: ${e.text}", persona,
+                            disappearing { node.groupHistory(e.group, 1u) })
                     }
                 }
                 is NodeEvent.GroupFile -> {
                     say("* group ${e.group.take(6)}: ${short(e.from)} sent a file (${e.data.size} bytes)")
-                    val location = keep(ctx, e.name, e.data, persona, e.clip != null)
+                    val privately = e.clip != null || e.sensitive || disappears { node.groupDisappearing(e.group) }
+                    val location = keep(ctx, e.name, e.data, persona, privately)
                     try {
                         node.recordReceivedGroupFile(e.group, e.from, e.name, e.data.size.toULong(), location, e.id,
                             FileOptions(e.sensitive, e.caption, e.album, e.clip, e.forwarded))
@@ -680,12 +716,20 @@ object Threnody {
                     if (!e.ours && !e.quiet && (visible == 0 || e.group !in visibleChat)) {
                         val group = node.groups().firstOrNull { it.id == e.group }
                         ThrenodyService.notifyGroup(ctx, e.group, group?.name ?: "Group",
-                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption, e.clip)}", persona)
+                            "${nameOf(node, e.from)}: ${fileLabel(e.name, e.sensitive, e.caption, e.clip)}", persona,
+                            disappearing { node.groupHistory(e.group, 1u) })
                     }
                 }
                 is NodeEvent.GroupInvited -> {
-                    say("* ${short(e.from)} invites us to group ${e.name}")
-                    ThrenodyService.notifyGroup(ctx, e.group, e.name, "${nameOf(node, e.from)} invites you to join", persona)
+                    say("* ${short(e.from)} invites us to a group")
+                    if (e.quiet) {
+                        // One of many from strangers: it waits in the list.
+                    } else if (node.contacts().any { it.fingerprint == e.from && it.accepted }) {
+                        ThrenodyService.notifyGroup(ctx, e.group, e.name, "${nameOf(node, e.from)} invites you to join", persona)
+                    } else {
+                        // Not even the group's name: a stranger's can be a message in itself.
+                        ThrenodyService.notifyGroup(ctx, e.group, "Threnody", "New group invitation", persona)
+                    }
                 }
                 is NodeEvent.CredentialOffered -> {
                     say("* ${short(e.offer.peer)} offers a credential (${e.offer.schema})")
@@ -704,8 +748,11 @@ object Threnody {
                     }
                 }
                 is NodeEvent.VolunteerNote -> say("* ${e.note}")
-                is NodeEvent.WifiDirectOffer -> WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
-                is NodeEvent.WifiDirectRequested -> {
+                // An anonymous identity's node never passes these on; were
+                // one to, it still mustn't host or join (Appendix M).
+                is NodeEvent.WifiDirectOffer ->
+                    if (persona == null) WifiDirect.join(ctx, node, e.peer, e.ssid, e.passphrase, e.addr)
+                is NodeEvent.WifiDirectRequested -> if (persona == null) {
                     say("* ${short(e.peer)} asks for a Wi-Fi Direct link")
                     WifiDirect.host(ctx, node, e.peer)
                 }
@@ -730,8 +777,19 @@ object Threnody {
                     ThrenodyService.notifyAccount(ctx, "This device was removed from your account. " +
                         "Your contacts no longer accept it as you.")
                 }
+                is NodeEvent.DeviceLinked -> {
+                    say("* a new device joined your account")
+                    // A leaked link code adds a device without asking: say so.
+                    ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
+                        "If you didn't link it, remove it in Devices.")
+                }
                 is NodeEvent.AccountChanged -> {
                     say("· $e")
+                    if (e.added.isNotEmpty() && e.account == node.accountFingerprint()) {
+                        // Another of our devices linked one: say so here too.
+                        ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
+                            "If you didn't link it, remove it in Devices.")
+                    }
                     // A verified contact gained a device we haven't verified.
                     if (e.added.isNotEmpty() && e.account != node.accountFingerprint()) {
                         val c = conversations(node).firstOrNull { c -> e.added.any { it in c.devices } }
@@ -752,6 +810,10 @@ object Threnody {
                 }
                 // The tunnel's preshared key stays out of the log.
                 is NodeEvent.TunnelUp -> say("* tunnel up with ${short(e.peer)} at ${e.endpoint}")
+                is NodeEvent.Fallback -> {
+                    notices[persona to e.peer] = e.notice
+                    say("* ${short(e.peer)}: ${e.notice}")
+                }
                 else -> say("· $e")
             }
             for (l in listeners) l(e)

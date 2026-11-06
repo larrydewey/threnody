@@ -8,7 +8,7 @@ use threnody_core::history::{ConversationId, FileNote};
 use threnody_core::store::Home;
 use threnody_core::{Identity, PublicIdentity};
 use threnody_groups::GroupId;
-use threnody_groups::node::{GroupNode, Update};
+use threnody_groups::node::{GroupNode, Invite, Update};
 use threnody_net::Node;
 
 pub const HELP: &str = "\
@@ -103,7 +103,7 @@ impl GroupUi {
                         name(&owner)
                     );
                 }
-                Update::Invited(i) => say!(
+                Update::Invited { invite: i, .. } => say!(
                     "* {} invites you to group {:?}. /group accept {} to join",
                     name(&i.from),
                     i.name,
@@ -232,9 +232,29 @@ impl GroupUi {
         }
     }
 
+    /// Devices were removed from their accounts: the groups we own drop
+    /// them, and none of our groups delivers to them any more.
+    pub fn revoked(
+        &mut self,
+        node: &Node,
+        name: &dyn Fn(&PublicIdentity) -> String,
+        removed: &[PublicIdentity],
+    ) {
+        let updates = self.groups.revoked(node, removed);
+        self.show(node, name, updates);
+    }
+
     /// Adds our newly linked `device` to our groups.
     pub fn linked(&mut self, node: &Node, device: &PublicIdentity) {
         self.groups.linked(node, device);
+    }
+
+    /// Sends lists a contact changed on to the groups they're also shared
+    /// with (see `Node::take_list_forwards`).
+    pub fn forward_lists(&mut self, node: &Node) {
+        for (bytes, g) in node.take_list_forwards() {
+            let _ = self.groups.send_list(node, &g, bytes);
+        }
     }
 
     /// Sends group messages held for `peer`, who just connected.
@@ -266,7 +286,7 @@ impl GroupUi {
     }
 
     /// Picks pending invitation `n` (1-based; the latest by default).
-    fn pending(&self, n: Option<&str>) -> Result<GroupId> {
+    fn pending(&self, n: Option<&str>) -> Result<Invite> {
         let invites = self.groups.invites();
         if invites.is_empty() {
             bail!("no pending invitations");
@@ -275,7 +295,7 @@ impl GroupUi {
         if n == 0 || n > invites.len() {
             bail!("pick 1..={}", invites.len());
         }
-        Ok(invites[n - 1].group)
+        Ok(invites[n - 1].clone())
     }
 
     /// `/group ...` and `/groups`.
@@ -310,15 +330,16 @@ impl GroupUi {
                 say!("* invitation sent to {} ({n} device(s))", name(&p));
             }
             "accept" => {
-                let g = self.pending(it.next())?;
-                say!("* accepting {}", self.label(&g));
-                let updates = self.groups.accept(node, &g)?;
+                let i = self.pending(it.next())?;
+                say!("* accepting {}", self.label(&i.group));
+                // That inviter's, even if others invite us to the same id.
+                let updates = self.groups.accept_from(node, &i.group, &i.from)?;
                 self.show(node, name, updates);
             }
             "decline" => {
-                let g = self.pending(it.next())?;
-                say!("* declined {}", self.label(&g));
-                self.groups.decline(&g);
+                let i = self.pending(it.next())?;
+                say!("* declined {}", self.label(&i.group));
+                self.groups.decline_from(&i.group, &i.from);
             }
             "remove" | "kick" => {
                 let (g, p) = (it.next(), it.next());

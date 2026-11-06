@@ -6,11 +6,10 @@ use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Quer
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use threnody_core::message::{
-    Clip, FEATURE_DELETE, FEATURE_EDIT, FEATURE_PIN, FEATURE_REACT, FEATURE_READ, FEATURE_TYPING,
-    Mention, Quote,
+    Clip, FEATURE_READ, FEATURE_TIMER_OFF, FEATURE_TYPING, Mention, Quote,
 };
 
-use crate::delivery::Tag;
+use crate::delivery::{Tag, needs};
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 
@@ -66,6 +65,17 @@ pub fn album_id() -> u64 {
     local_id()
 }
 
+/// What [`Node::record_incoming`] did with a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// Recorded (or nothing to record): it shows.
+    New,
+    /// A copy of a text already recorded: it doesn't show again.
+    Duplicate,
+    /// It couldn't be stored (a full disk, no file descriptors left).
+    Failed,
+}
+
 impl Node {
     /// Whether we want `peer`'s messages: we accepted it, or another device
     /// of its account, or it's ours. Blocked peers never are.
@@ -110,11 +120,10 @@ impl Node {
             conversation: conv.to_bytes(),
             ids,
         };
-        // Our other devices delete the same, whatever they are.
-        for s in self.sessions() {
-            if self.is_own_device(&s.peer) && self.supports(&s.peer, FEATURE_DELETE) {
-                let _ = self.send_tracked(&s.peer, msg(ids.to_vec()));
-            }
+        // Our other devices delete the same, whatever they are, and those
+        // away now when they come back.
+        for d in self.own_devices() {
+            self.send_change(&d, &msg(ids.to_vec()));
         }
         if everyone && !ours.is_empty() {
             let devices: Vec<PublicIdentity> = match self.account_of(peer) {
@@ -122,11 +131,8 @@ impl Node {
                 None => vec![*peer],
             };
             for d in devices {
-                if !self.supports(&d, FEATURE_DELETE) {
-                    continue;
-                }
-                if self.send_tracked(&d, msg(ours.clone())).is_err() && self.can_send_offline(&d) {
-                    let _ = self.send_offline(&d, &msg(ours.clone()));
+                if d != self.identity() {
+                    self.send_change(&d, &msg(ours.clone()));
                 }
             }
         }
@@ -218,25 +224,8 @@ impl Node {
             id,
             body: body.to_owned(),
         };
-        let mut targets: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .map(|s| s.peer)
-            .filter(|p| self.is_own_device(p))
-            .collect();
-        match self.account_of(peer) {
-            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
-            None => targets.push(*peer),
-        }
-        targets.sort_unstable_by_key(|p| *p.as_bytes());
-        targets.dedup();
-        for d in targets {
-            if d == self.identity() || !self.supports(&d, FEATURE_EDIT) {
-                continue;
-            }
-            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
-                let _ = self.send_offline(&d, &msg);
-            }
+        for d in self.account_targets(peer) {
+            self.send_change(&d, &msg);
         }
         true
     }
@@ -383,12 +372,7 @@ impl Node {
             pin,
         };
         for d in self.account_targets(peer) {
-            if !self.supports(&d, FEATURE_PIN) {
-                continue;
-            }
-            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
-                let _ = self.send_offline(&d, &msg);
-            }
+            self.send_change(&d, &msg);
         }
         true
     }
@@ -426,15 +410,10 @@ impl Node {
         }
     }
 
-    /// Every device of `peer`'s account and our other connected devices,
-    /// except this one: where a change to our chat with `peer` goes.
+    /// Every device of `peer`'s account and our other devices, connected
+    /// or not, except this one: where a change to our chat with `peer` goes.
     fn account_targets(&self, peer: &PublicIdentity) -> Vec<PublicIdentity> {
-        let mut targets: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .map(|s| s.peer)
-            .filter(|p| self.is_own_device(p))
-            .collect();
+        let mut targets = self.own_devices();
         match self.account_of(peer) {
             Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
             None => targets.push(*peer),
@@ -443,6 +422,37 @@ impl Node {
         targets.dedup();
         targets.retain(|d| *d != self.identity());
         targets
+    }
+
+    /// Our account's other devices, connected or not.
+    pub(crate) fn own_devices(&self) -> Vec<PublicIdentity> {
+        let me = self.identity();
+        self.account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, _)| *d)
+            .filter(|d| *d != me)
+            .collect()
+    }
+
+    /// Sends `msg`, a change to a conversation (a deletion, an edit, a
+    /// reaction, a pin or a list), to device `d`. It is tracked, so it is
+    /// sent again if lost. For a device that isn't connected it waits for
+    /// its next session, and is also sealed for its mailboxes when we can,
+    /// so it arrives even if we don't meet first; taking a change twice
+    /// does nothing more, and a mailbox copy of one already taken is
+    /// dropped (see `Delivery::seen_change`). A device that told us it can't read such changes
+    /// is skipped; one we haven't heard from since starting gets it held,
+    /// dropped then if it can't (see `needs`).
+    pub(crate) fn send_change(&self, d: &PublicIdentity, msg: &AppMessage) {
+        if self.lacks(d, needs(msg)) || self.send_tracked(d, msg.clone()).is_ok() {
+            return;
+        }
+        self.hold(d, msg.clone(), Tag::NONE);
+        if self.can_send_offline(d) {
+            let _ = self.send_offline(d, msg);
+        }
     }
 
     /// Adds (or with `add` false, takes away) our `emoji` on message `id`
@@ -477,25 +487,8 @@ impl Node {
             emoji: emoji.to_owned(),
             add,
         };
-        let mut targets: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .map(|s| s.peer)
-            .filter(|p| self.is_own_device(p))
-            .collect();
-        match self.account_of(peer) {
-            Some(a) => targets.extend(a.state().devices.iter().map(|(d, _)| *d)),
-            None => targets.push(*peer),
-        }
-        targets.sort_unstable_by_key(|p| *p.as_bytes());
-        targets.dedup();
-        for d in targets {
-            if d == self.identity() || !self.supports(&d, FEATURE_REACT) {
-                continue;
-            }
-            if self.send_tracked(&d, msg.clone()).is_err() && self.can_send_offline(&d) {
-                let _ = self.send_offline(&d, &msg);
-            }
+        for d in self.account_targets(peer) {
+            self.send_change(&d, &msg);
         }
         true
     }
@@ -692,40 +685,69 @@ impl Node {
     pub fn accept_contact(&self, peer: &PublicIdentity) {
         // Accepting in advance (before they've connected) works too.
         self.update_contacts(|c| c.observe(*peer, None, now_ms()));
-        self.mark_contacts(peer, |c| c.accepted = true);
+        let devices = self.mark_contacts(peer, |c| c.accepted = true);
+        // Now they may see our account (withheld from strangers).
+        self.send_chain(&devices);
     }
 
     /// Blocks `peer` and every device of its account: their sessions end
-    /// and are refused, and our conversation with them is deleted.
+    /// and are refused, their tunnels and discovery keys go, our
+    /// conversation with them is deleted, and lists are no longer shared
+    /// with them. Our other devices learn the block through contact sync.
     pub fn block_contact(&self, peer: &PublicIdentity) {
         let conv = self.conversation_for(peer);
+        let now = now_ms();
         let devices = self.mark_contacts(peer, |c| {
             c.blocked = true;
             c.accepted = false;
+            // A revocation like any other: dated, so an older approval
+            // synced from our other devices can't bring it back (the
+            // latest of a block and an approval wins across our devices).
             c.local_approved = false;
+            c.approval_changed_ms = c.approval_changed_ms.max(now);
+            c.clear_discovery_keys();
         });
         for d in devices {
+            self.withdraw_approval(&d);
             self.disconnect(&d);
+            self.forget_peer(&d);
         }
         let _ = self.shared.home.delete_history(conv);
+        self.unshare_lists_with(conv);
+        self.push_contact_sync();
     }
 
     /// Deletes a message request: the contact and the conversation go, and
-    /// they can write again (as a new request).
-    pub fn delete_request(&self, peer: &PublicIdentity) {
+    /// they can write again (as a new request). Returns false, changing
+    /// nothing, when `peer` isn't a request: an accepted contact (its
+    /// conversation stays), a blocked one (it stays blocked) or a stranger.
+    pub fn delete_request(&self, peer: &PublicIdentity) -> bool {
+        let request = !self.is_accepted(peer)
+            && lock(&self.shared.contacts)
+                .get(peer)
+                .is_some_and(|c| !c.blocked);
+        if !request {
+            return false;
+        }
         let conv = self.conversation_for(peer);
         let devices = self.mark_contacts(peer, |_| {});
+        let mut gone = Vec::new();
         self.update_contacts(|c| {
             for d in &devices {
                 if c.get(d).is_some_and(|x| !x.accepted) {
                     c.remove(d);
+                    gone.push(*d);
                 }
             }
         });
         for d in devices {
             self.disconnect(&d);
         }
+        for d in &gone {
+            self.forget_peer(d);
+        }
         let _ = self.shared.home.delete_history(conv);
+        true
     }
 
     /// Deletes the conversation with `peer`: every device of its account
@@ -741,7 +763,9 @@ impl Node {
             }
         });
         for d in &devices {
+            self.withdraw_approval(d);
             self.disconnect(d);
+            self.forget_peer(d);
         }
         let _ = self.shared.home.delete_history(conv);
         self.push_contact_sync();
@@ -864,7 +888,7 @@ impl Node {
         let msg = AppMessage::Text {
             sent_ms: now_ms(),
             body: body.to_owned(),
-            expires_in_s: timer,
+            expires_in_s: self.announced_timer(conv),
             id: local_id,
             quote: quote.clone(),
             forwarded,
@@ -887,7 +911,8 @@ impl Node {
             }
             // Try to reach it directly while the message waits.
             self.seek(d);
-            if self.can_send_offline(d) && self.send_offline(d, &msg).is_ok() {
+            // Should every mailbox decline it, it waits here after all.
+            if self.can_send_offline(d) && self.send_offline_or_hold(d, &msg, tag).is_ok() {
                 r.sealed += 1;
             } else {
                 self.hold(d, msg.clone(), tag);
@@ -924,12 +949,21 @@ impl Node {
     }
 
     /// Makes file contents ready to send: images lose their metadata
-    /// unless that is switched off, and the size limit is checked.
+    /// unless that is switched off, and the size limit is checked. A photo
+    /// whose metadata can't be removed (HEIC, AVIF, TIFF) is refused rather
+    /// than sent with it; apps convert those to JPEG first.
     pub fn prepare_file(&self, data: Vec<u8>) -> Result<Vec<u8>> {
+        use threnody_core::media::{Stripped, needs_converting, strip};
         let data = if self.strip_metadata() {
-            match threnody_core::media::strip(data)? {
-                threnody_core::media::Stripped::Image(d)
-                | threnody_core::media::Stripped::Unsupported(d) => d,
+            match strip(data)? {
+                Stripped::Unsupported(d) if needs_converting(&d) => {
+                    return Err(NetError::NotAllowed(
+                        "this photo's location and camera details can't be removed: \
+                         send it as a JPEG, or turn metadata removal off"
+                            .into(),
+                    ));
+                }
+                Stripped::Image(d) | Stripped::Unsupported(d) => d,
             }
         } else {
             data
@@ -1074,6 +1108,16 @@ impl Node {
             .map_err(NetError::from)
     }
 
+    /// The timer our messages in `conv` carry: the effective one, or
+    /// `Some(0)` when the user turned it off on purpose (as opposed to
+    /// never choosing one), so the peer can tell the two apart.
+    fn announced_timer(&self, conv: ConversationId) -> Option<u32> {
+        match self.history(conv).ok().and_then(|h| h.timer_s) {
+            Some(0) => Some(0),
+            _ => self.effective_timer(conv),
+        }
+    }
+
     /// The timer messages in `peer`'s conversation get now.
     pub fn timer(&self, peer: &PublicIdentity) -> Option<u32> {
         self.effective_timer(self.conversation_for(peer))
@@ -1159,6 +1203,7 @@ impl Node {
     }
 
     /// [`Node::record`] for an incoming message with the sender's id.
+    /// False if it couldn't be stored.
     #[allow(clippy::too_many_arguments)]
     pub fn record_with_id(
         &self,
@@ -1170,7 +1215,7 @@ impl Node {
         timer: Option<u32>,
         remote_id: u64,
         extras: Extras,
-    ) {
+    ) -> bool {
         if !outgoing {
             self.unarchive(conv);
         }
@@ -1197,10 +1242,15 @@ impl Node {
             forwarded: extras.forwarded,
             list: None,
         };
-        let _ = self
+        if let Err(e) = self
             .shared
             .home
-            .append_history(self.identity_ref(), conv, entry, now);
+            .append_history(self.identity_ref(), conv, entry, now)
+        {
+            eprintln!("threnody: failed to save history: {e}");
+            return false;
+        }
+        true
     }
 
     /// Records a file received from (or sent to) `peer`'s conversation,
@@ -1269,7 +1319,17 @@ impl Node {
     }
 
     /// Records an incoming text, adopting the sender's timer setting.
-    pub(crate) fn record_incoming(&self, from: &PublicIdentity, msg: &AppMessage, offline: bool) {
+    /// Says what became of it: a copy of a text already recorded (one may
+    /// come both from its sender and from a mailbox, when the sender
+    /// stopped waiting for the mailbox's receipt) shouldn't show again, and
+    /// one that couldn't be stored shouldn't be acknowledged. Other
+    /// messages need nothing here.
+    pub(crate) fn record_incoming(
+        &self,
+        from: &PublicIdentity,
+        msg: &AppMessage,
+        offline: bool,
+    ) -> Recorded {
         let AppMessage::Text {
             body,
             expires_in_s,
@@ -1279,28 +1339,50 @@ impl Node {
             ..
         } = msg
         else {
-            return;
+            return Recorded::New;
         };
         let conv = self.conversation_for(from);
+        // Held until it is recorded, so two copies can't both pass.
         let lock = threnody_core::history::history_lock();
-        if self.effective_timer(conv) != *expires_in_s
+        if *id != 0
+            && self.history(conv).is_ok_and(|h| {
+                h.entries()
+                    .iter()
+                    .any(|e| !e.outgoing && e.device == *from.as_bytes() && e.remote_id == *id)
+            })
+        {
+            return Recorded::Duplicate;
+        }
+        // `Some(0)`: turned off on purpose. No timer at all from a peer that
+        // would have said so means it never chose one: ours stands, and
+        // it adopts ours from our next message. From an older peer it may
+        // mean either, and is taken as off, as such peers intend.
+        let chosen = expires_in_s.is_some() || !self.known_to_support(from, FEATURE_TIMER_OFF);
+        // A message with no timer of its own goes when ours says: in a
+        // disappearing chat, it must not stay for good.
+        let expiry = if chosen {
+            expires_in_s.filter(|&s| s > 0)
+        } else {
+            self.effective_timer(conv)
+        };
+        if chosen
+            && self.effective_timer(conv) != expiry
             && let Ok(mut h) = self.history(conv)
         {
-            h.timer_s = Some(expires_in_s.unwrap_or(0));
+            h.timer_s = Some(expiry.unwrap_or(0));
             let _ = self.shared.home.save_history(self.identity_ref(), conv, &h);
             self.emit(Event::TimerChanged {
                 peer: *from,
-                secs: *expires_in_s,
+                secs: expiry,
             });
         }
-        drop(lock);
-        self.record_with_id(
+        let stored = self.record_with_id(
             conv,
             *from.as_bytes(),
             false,
             body,
             offline,
-            *expires_in_s,
+            expiry,
             *id,
             Extras {
                 quote: quote.clone(),
@@ -1308,9 +1390,17 @@ impl Node {
                 ..Extras::default()
             },
         );
+        drop(lock);
+        if stored {
+            Recorded::New
+        } else {
+            Recorded::Failed
+        }
     }
 
-    /// Starts the background sweep of expired history.
+    /// Starts the background sweep of expired history (and of what is
+    /// left of it waiting for a peer), and of sealed messages we have held
+    /// too long for others.
     pub(crate) fn start_history_sweep(&self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -1324,6 +1414,8 @@ impl Node {
                 tokio::select! {
                     _ = tick.tick() => {
                         node.shared.home.sweep_history(node.identity_ref(), now_ms());
+                        node.seal_expired_unacked(now_ms());
+                        node.sweep_mailbox(now_ms());
                     }
                     () = &mut closed => break,
                 }

@@ -117,6 +117,29 @@ async fn link_a_device_sync_contacts_and_show_the_account_to_peers() {
 }
 
 #[tokio::test]
+async fn our_other_devices_hear_of_a_newly_linked_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut tablet = spawn(&dir, "tablet").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    tablet.node.link_with(&code).await.unwrap();
+    wait_for(|| tablet.node.is_own_device(&laptop.node.identity())).await;
+
+    // The laptop links the phone; the tablet learns of it as a new device
+    // of our own account, so it can tell the user too.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let (pid, account) = (phone.node.identity(), laptop.node.account().id());
+    next(&mut tablet.rx, |e| {
+        matches!(e, Event::AccountChanged { account: a, added, .. }
+            if *a == account && added.contains(&pid))
+    })
+    .await;
+    let _ = (&mut laptop.rx, &mut phone.rx);
+}
+
+#[tokio::test]
 async fn link_codes_are_single_use_and_must_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut laptop = spawn(&dir, "laptop").await;
@@ -148,6 +171,7 @@ async fn removing_a_device_revokes_it_everywhere() {
     phone.node.link_with(&code).await.unwrap();
     let pid = phone.node.identity();
     wait_for(|| bob.node.account_of(&pid).is_some()).await;
+    wait_for(|| bob.node.can_send_offline(&pid)).await;
 
     // Not a device of ours: refused.
     assert!(laptop.node.remove_device(&bob.node.identity()).is_err());
@@ -160,6 +184,24 @@ async fn removing_a_device_revokes_it_everywhere() {
     )
     .await;
     assert!(laptop.node.account().state().removed.contains(&pid));
+    // The laptop's own groups hear of it as its siblings would.
+    next(
+        &mut laptop.rx,
+        |e| matches!(e, Event::AccountChanged { removed, .. } if removed.contains(&pid)),
+    )
+    .await;
+    // Nothing more is sealed to it: its prekeys are gone.
+    assert!(!bob.node.can_send_offline(&pid));
+    assert!(!laptop.node.can_send_offline(&pid));
+    let note = threnody_core::AppMessage::Text {
+        sent_ms: 0,
+        body: "still there?".into(),
+        expires_in_s: None,
+        id: 0,
+        quote: None,
+        forwarded: false,
+    };
+    assert!(bob.node.send_offline(&pid, &note).is_err());
     // The laptop is now the account's only device: it can't remove itself.
     assert!(laptop.node.remove_device(&laptop.node.identity()).is_err());
 
@@ -480,6 +522,60 @@ async fn deleting_a_chat_deletes_it_on_our_other_devices() {
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
 
+/// Blocking on one device is a revocation on all of them: our other
+/// devices stop approving the contact, drop its discovery keys and end
+/// their sessions with it.
+#[tokio::test]
+async fn blocking_revokes_on_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let bid = bob.node.identity();
+    wait_for(|| {
+        laptop
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.discovery_key.is_some())
+    })
+    .await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    wait_for(|| {
+        phone
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.local_approved)
+    })
+    .await;
+
+    phone.node.block_contact(&bid);
+    let c = phone.node.contacts().get(&bid).cloned().unwrap();
+    assert!(c.blocked && !c.local_approved && c.discovery_key.is_none());
+    wait_for(|| {
+        laptop
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.blocked && !c.local_approved && c.discovery_key.is_none())
+    })
+    .await;
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    // Bob hears that the laptop no longer approves him.
+    let lid = laptop.node.identity();
+    wait_for(|| {
+        bob.node
+            .contacts()
+            .get(&lid)
+            .is_some_and(|c| !c.mutually_approved())
+    })
+    .await;
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}
+
 #[tokio::test]
 async fn clearing_a_chat_keeps_the_contact_on_every_device() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,4 +611,252 @@ async fn clearing_a_chat_keeps_the_contact_on_every_device() {
         .unwrap();
     assert_eq!(h.entries()[0].text, "new news", "old messages stay cleared");
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn blocking_and_unblocking_follow_us_across_our_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    let blocked = |n: &Node| n.contacts().get(&bid).is_some_and(|c| c.blocked);
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    bob.node
+        .send_text(&laptop.node.identity(), "hello")
+        .unwrap();
+    wait_for(|| !texts(&laptop.node, &bid).is_empty()).await;
+
+    // Blocking on the phone reaches the connected laptop at once, and the
+    // laptop drops Bob's session and the conversation as the phone did.
+    phone.node.block_contact(&bid);
+    wait_for(|| blocked(&laptop.node)).await;
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    assert!(
+        texts(&laptop.node, &bid).is_empty(),
+        "the laptop kept the blocked conversation"
+    );
+
+    // Approving again on the laptop unblocks on the phone, and the phone's
+    // older block doesn't come back when the two next meet.
+    laptop.node.set_approval(&bid, true).unwrap();
+    wait_for(|| !blocked(&phone.node)).await;
+    let lid = laptop.node.identity();
+    phone.node.disconnect(&lid);
+    wait_for(|| {
+        laptop
+            .node
+            .sessions()
+            .iter()
+            .all(|s| s.peer != phone.node.identity())
+    })
+    .await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!blocked(&laptop.node), "unblocking stuck on the laptop");
+    assert!(!blocked(&phone.node), "unblocking stuck on the phone");
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn deleting_and_editing_reach_a_sibling_that_was_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    for t in ["to delete", "to edit"] {
+        laptop.node.send_text(&bid, t).unwrap();
+    }
+    let want = |v: &[&str]| {
+        v.iter()
+            .map(|t| (true, (*t).to_owned()))
+            .collect::<Vec<_>>()
+    };
+    wait_for(|| texts(&phone.node, &bid) == want(&["to delete", "to edit"])).await;
+    let id_of = |t: &str| {
+        let conv = laptop.node.conversation_for(&bid);
+        laptop
+            .node
+            .history(conv)
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| e.text == t)
+            .unwrap()
+            .message_id()
+    };
+
+    // The phone goes away; the laptop deletes one message (only for us)
+    // and edits the other.
+    let pid = phone.node.identity();
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    assert_eq!(
+        laptop
+            .node
+            .delete_messages(&bid, &[id_of("to delete")], false),
+        1
+    );
+    assert!(laptop.node.edit_message(&bid, id_of("to edit"), "edited"));
+
+    // The phone comes back and follows.
+    let home = Home::new(dir.path().join("phone"));
+    let identity = home.load_identity(None).unwrap();
+    let (phone2, _prx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    phone2.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| texts(&phone2, &bid) == want(&["edited"])).await;
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn strangers_learn_our_devices_only_once_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut stranger = spawn(&dir, "stranger").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = laptop.node.identity();
+
+    // A stranger dials us: our chain, with our devices' names, isn't sent.
+    let sid = stranger.node.identity();
+    stranger.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::Connected { .. })).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        stranger.node.account_of(&lid).is_none(),
+        "a stranger saw our account"
+    );
+
+    // Once we accept them, they learn it (on the session they have).
+    laptop.node.accept_contact(&sid);
+    wait_for(|| stranger.node.account_of(&lid).is_some()).await;
+    let _ = &mut stranger.rx;
+}
+
+#[tokio::test]
+async fn a_device_that_was_away_cant_undo_deleting_or_unsharing_a_list() {
+    use threnody_core::history::ConversationId;
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    next(&mut laptop.rx, |e| matches!(e, Event::DeviceLinked { .. })).await;
+    let pid = phone.node.identity();
+
+    // Two lists, one shared with a group, on both devices.
+    let group = ConversationId::Group([5; 16]);
+    let gifts = laptop.node.create_list("Gifts").unwrap();
+    let old = laptop.node.create_list("Old").unwrap();
+    laptop.node.share_list(&gifts, group);
+    wait_for(|| {
+        phone.node.list(&old).is_some()
+            && phone.node.list(&gifts).is_some_and(|l| l.shared == [group])
+    })
+    .await;
+
+    // With the phone away, the laptop unshares one and deletes the other.
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    laptop.node.unshare_list(&gifts, group);
+    laptop.node.delete_list(&old);
+
+    // The phone comes back with its old copies: both changes stand, on
+    // both devices.
+    let home = threnody_core::store::Home::new(dir.path().join("phone"));
+    let identity = home.load_identity(None).unwrap();
+    let (phone2, _prx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    phone2.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| {
+        phone2.list(&old).is_none() && phone2.list(&gifts).is_some_and(|l| l.shared.is_empty())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        laptop.node.list(&old).is_none(),
+        "the deleted list stays gone"
+    );
+    assert!(laptop.node.list(&gifts).unwrap().shared.is_empty());
+    assert!(phone2.list(&old).is_none());
+    assert!(phone2.list(&gifts).unwrap().shared.is_empty());
+}
+
+#[tokio::test]
+async fn a_removed_device_cannot_write_through_a_mailbox() {
+    use threnody_core::AppMessage;
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut m = spawn(&dir, "m").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let (pid, bid) = (phone.node.identity(), bob.node.identity());
+    link(&mut phone, &mut bob).await;
+    link(&mut phone, &mut m).await;
+    link(&mut bob, &mut m).await;
+    wait_for(|| phone.node.can_send_offline(&bid)).await;
+    bob.node.accept_contact(&laptop.node.identity());
+
+    // The phone is stolen and removed; it still holds Bob's prekeys and
+    // seals to him through a mailbox that never heard of the removal.
+    laptop.node.remove_device(&pid).unwrap();
+    next(
+        &mut bob.rx,
+        |e| matches!(e, Event::AccountChanged { removed, .. } if removed.contains(&pid)),
+    )
+    .await;
+    wait_for(|| phone.node.sessions().iter().all(|s| s.peer != bid)).await;
+    let text = AppMessage::Text {
+        sent_ms: 0,
+        body: "pay 1 BTC to X".into(),
+        expires_in_s: None,
+        id: 0,
+        quote: None,
+        forwarded: false,
+    };
+    phone.node.send_offline(&bid, &text).unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DepositReceipt { .. })).await;
+    let got = timeout(Duration::from_millis(800), async {
+        loop {
+            if let Some(Event::OfflineMessage { .. } | Event::MessageRequest { .. }) =
+                bob.rx.recv().await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        got.is_err(),
+        "a removed device's sealed message got through"
+    );
+    assert!(
+        texts(&bob.node, &pid).is_empty(),
+        "recorded in the account's chat"
+    );
+    let _ = (&mut laptop.rx, &mut m.rx);
 }

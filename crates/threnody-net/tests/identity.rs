@@ -155,12 +155,12 @@ async fn a_persona_is_unlinkable_until_it_reveals_its_identity() {
             .is_err()
     );
 
+    let link = format!(
+        "threnody://{}@10.0.0.1:7450",
+        main_id.fingerprint().compact()
+    );
     p.node
-        .reveal(
-            &bid,
-            LinkProof::sign(&me, &pkey),
-            Some("threnody://ME@10.0.0.1:7450".into()),
-        )
+        .reveal(&bid, LinkProof::sign(&me, &pkey), Some(link.clone()))
         .unwrap();
     let Event::IdentityRevealed {
         peer,
@@ -171,10 +171,29 @@ async fn a_persona_is_unlinkable_until_it_reveals_its_identity() {
         unreachable!()
     };
     assert_eq!((peer, identity), (pkey, main_id));
-    assert_eq!(invite.as_deref(), Some("threnody://ME@10.0.0.1:7450"));
+    assert_eq!(invite.as_deref(), Some(link.as_str()));
     // Kept with the contact, for when the app wasn't watching.
     let kept = b.node.contacts().get(&pkey).unwrap().revealed.clone();
     assert_eq!(kept, Some((main_id, invite)));
+
+    // An invite that doesn't lead to the proven identity (someone else's,
+    // or an address nothing pins) is dropped: adding them would dial it.
+    let elsewhere = format!(
+        "threnody://{}@10.0.0.2:7450",
+        other.public().fingerprint().compact()
+    );
+    for invite in [elsewhere, "10.0.0.2:7450".to_owned()] {
+        p.node
+            .reveal(&bid, LinkProof::sign(&me, &pkey), Some(invite))
+            .unwrap();
+        let Event::IdentityRevealed {
+            identity, invite, ..
+        } = next(&mut b.rx, |e| matches!(e, Event::IdentityRevealed { .. })).await
+        else {
+            unreachable!()
+        };
+        assert_eq!((identity, invite), (main_id, None));
+    }
     // A persona manages no personas of its own.
     assert!(p.node.personas().is_err() && p.node.link_proof(&bid).is_err());
     let _ = &mut p.rx;
@@ -196,4 +215,55 @@ async fn the_main_node_manages_its_personas() {
     assert_eq!(main.node.personas().unwrap()[0].label, "old forum");
     assert_eq!(main.node.burn_expired_personas().unwrap(), vec![info.id]);
     assert!(!home.exists() && main.node.personas().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_persona_takes_no_part_in_wifi_direct() {
+    use threnody_net::DirectOffer;
+    let dir = tempfile::tempdir().unwrap();
+    let main_home = Home::new(dir.path().join("me"));
+    let me = main_home.create_identity(None).unwrap();
+    let (_, home, pid) = Personas::new(&main_home, &me)
+        .create("market", None, None, 0)
+        .unwrap();
+    let mut p = run(home, pid).await;
+    let mut b = spawn(&dir, "b").await;
+    let bid = p.node.connect(&b.addr, None).await.unwrap();
+    next(&mut b.rx, |e| matches!(e, Event::Connected { .. })).await;
+    let pkey = p.node.identity();
+    p.node.accept_contact(&bid);
+    b.node.accept_contact(&pkey);
+    p.node.set_approval(&bid, true).unwrap();
+    b.node.set_approval(&pkey, true).unwrap();
+    for rx in [&mut p.rx, &mut b.rx] {
+        next(rx, |e| {
+            matches!(e, Event::ApprovalChanged { mutual: true, .. })
+        })
+        .await;
+    }
+    let offer = DirectOffer {
+        ssid: "DIRECT-th-test".into(),
+        passphrase: "a long passphrase".into(),
+        addr: "192.168.49.1:7450".into(),
+    };
+
+    // A persona neither asks for a group nor offers one: either would
+    // show a nearby contact the phone, and its main identity's listener.
+    assert!(p.node.request_wifi_direct(&bid).is_err());
+    assert!(p.node.offer_wifi_direct(&bid, offer.clone()).is_err());
+
+    // A contact's request or offer goes no further than its node.
+    b.node.request_wifi_direct(&pkey).unwrap();
+    b.node.offer_wifi_direct(&pkey, offer).unwrap();
+    b.node.send_text(&pkey, "after").unwrap();
+    let e = next(&mut p.rx, |e| {
+        matches!(
+            e,
+            Event::WifiDirectRequested { .. }
+                | Event::WifiDirectOffer { .. }
+                | Event::Message { .. }
+        )
+    })
+    .await;
+    assert!(matches!(e, Event::Message { .. }), "{e:?}");
 }

@@ -33,6 +33,7 @@ import java.util.Date
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupInfo
+import uniffi.threnody_ffi.GroupInvite
 import uniffi.threnody_ffi.MentionInfo
 import uniffi.threnody_ffi.NotifyLevel
 import uniffi.threnody_ffi.QuoteInfo
@@ -48,6 +49,10 @@ class ChatActivity : Activity() {
     private lateinit var node: ThrenodyNode
     /** The group id, for a group conversation. */
     private var group: String? = null
+    /** Whose invitation to [group] was opened, when more than one person may invite us to it. */
+    private var inviter: String? = null
+    /** The invitation the banner shows, which Join and Decline answer. */
+    private var shownInvite: GroupInvite? = null
     /** The anonymous identity this chat belongs to; null for the main one. */
     private var persona: String? = null
     /** They proved they are a contact of our main identity: its name. */
@@ -158,6 +163,7 @@ class ChatActivity : Activity() {
         super.onCreate(savedInstanceState)
         Privacy.apply(this)
         group = intent.getStringExtra(GROUP)
+        inviter = intent.getStringExtra(INVITER)
         persona = intent.getStringExtra(PERSONA)
         note = intent.getBooleanExtra(NOTE, false)
         key = group ?: (if (note) NOTE else intent.getStringExtra(KEY)) ?: return finish()
@@ -734,6 +740,7 @@ class ChatActivity : Activity() {
             is NodeEvent.Pinned -> if (e.group == null) e.peer else return false
             is NodeEvent.IdentityRevealed -> e.peer
             is NodeEvent.Typing -> e.peer
+            is NodeEvent.Fallback -> e.peer
             is NodeEvent.Read -> e.peer
             is NodeEvent.CredentialOffered -> e.offer.peer
             is NodeEvent.CredentialAsked -> e.ask.peer
@@ -938,13 +945,24 @@ class ChatActivity : Activity() {
                 warning = true,
             )
         }
+        // Onion routing couldn't hide the last session or deposit: say so
+        // quietly until dismissed.
+        val devices = listOf(device) + c.devices
+        devices.firstNotNullOfOrNull { Threnody.notices[persona to it] }?.let { notice ->
+            banner(notice, "OK" to {
+                devices.forEach { Threnody.notices.remove(persona to it) }
+                refreshSoon()
+            })
+        }
     }
 
     private fun groupHeader(g: GroupInfo?) {
         clearBanner()
         bar.subtitle.visibility = View.VISIBLE
         if (g == null) {
-            val invite = try { node.groupInvites().firstOrNull { it.group == group } } catch (_: Exception) { null }
+            val invites = try { node.groupInvites().filter { it.group == group } } catch (_: Exception) { emptyList() }
+            val invite = invites.firstOrNull { it.from == inviter } ?: invites.firstOrNull()
+            shownInvite = invite
             if (invite != null) {
                 bar.title.text = invite.name
                 bar.subtitle.text = "invitation"
@@ -2176,7 +2194,8 @@ class ChatActivity : Activity() {
             if (persona != null && c != null) {
                 menu.add("Reveal who you are…").setOnMenuItemClickListener { reveal(c); true }
             }
-            if (c?.connected == true && c.approved) {
+            // Not for an anonymous identity: a group shows a nearby contact the phone.
+            if (persona == null && c?.connected == true && c.approved) {
                 menu.add("Faster link (Wi-Fi Direct)").setOnMenuItemClickListener { wifiDirect(); true }
             }
             if (c != null) {
@@ -2367,15 +2386,20 @@ class ChatActivity : Activity() {
 
     private fun declineGroup() {
         val g = group ?: return
+        // Only the invitation shown: someone else may invite us to the same group.
+        val from = shownInvite?.from
         Threading.background {
-            run("decline") { node.declineGroupInvite(g) }
+            run("decline") { if (from != null) node.declineGroupInviteFrom(g, from) else node.declineGroupInvite(g) }
             runOnUiThread { finish() }
         }
     }
 
     private fun joinGroup() {
         val g = group ?: return
-        Threading.background { run("join") { node.acceptGroupInvite(g) } }
+        val from = shownInvite?.from
+        Threading.background {
+            run("join") { if (from != null) node.acceptGroupInviteFrom(g, from) else node.acceptGroupInvite(g) }
+        }
     }
 
     private fun rename() {
@@ -2553,6 +2577,8 @@ class ChatActivity : Activity() {
         const val KEY = "key"
         const val DEVICE = "device"
         const val GROUP = "group"
+        /** With [GROUP]: the inviter (fingerprint) whose invitation to show. */
+        const val INVITER = "inviter"
         const val PERSONA = "persona"
         /** Opened from a search result: the message to show (its time and sender device), and the query. */
         const val JUMP_AT_MS = "jump_at_ms"

@@ -108,7 +108,19 @@ impl<'a> Initiator<'a> {
     /// Consumes HS2, authenticates the responder, and returns HS3 plus the
     /// established session. The caller decides whether `peer` is acceptable
     /// (TOFU, pinned fingerprint, approved contact) before using it.
-    pub fn finish(mut self, frame: &[u8]) -> Result<(Vec<u8>, Established)> {
+    ///
+    /// HS3 carries our identity, so a caller that wants one particular peer
+    /// should use [`Initiator::authenticate`] and check it first: once HS3
+    /// is sent, whoever answered knows who we are.
+    pub fn finish(self, frame: &[u8]) -> Result<(Vec<u8>, Established)> {
+        self.authenticate(frame)?.finish()
+    }
+
+    /// Consumes HS2 and authenticates the responder without revealing who
+    /// we are. The caller checks [`Authenticated::peer`] and only then calls
+    /// [`Authenticated::finish`] for HS3; dropping the state instead keeps
+    /// our identity hidden from a responder we did not mean to reach.
+    pub fn authenticate(mut self, frame: &[u8]) -> Result<Authenticated<'a>> {
         let body = wire::expect(frame, MsgType::HandshakeResp)?;
         let mut dec = Decoder::new(body);
         let (mut suite, mut ct, mut sealed) = (None, None, None);
@@ -146,6 +158,42 @@ impl<'a> Initiator<'a> {
             &sig,
         )?;
         self.transcript.absorb(b"sealed_r", sealed);
+        Ok(Authenticated {
+            identity: self.identity,
+            peer,
+            suite,
+            ss,
+            keys,
+            ratchet_pub,
+            transcript: self.transcript,
+            rng: self.rng,
+        })
+    }
+}
+
+/// Initiator state after HS2: the responder is authenticated, but HS3, and
+/// with it our identity, has not been produced yet.
+pub struct Authenticated<'a> {
+    identity: &'a Identity,
+    peer: PublicIdentity,
+    suite: Suite,
+    ss: Zeroizing<[u8; 32]>,
+    keys: TrafficKeys,
+    ratchet_pub: HybridPublic,
+    transcript: Transcript,
+    rng: RngSource,
+}
+
+impl Authenticated<'_> {
+    /// The responder, proven by its signature over the transcript.
+    pub fn peer(&self) -> &PublicIdentity {
+        &self.peer
+    }
+
+    /// Reveals our identity: returns HS3 plus the established session.
+    pub fn finish(mut self) -> Result<(Vec<u8>, Established)> {
+        let (suite, peer) = (self.suite, self.peer);
+        let keys = &self.keys;
         let h3 = self.transcript.hash();
 
         let me = self.identity.public();
@@ -166,8 +214,8 @@ impl<'a> Initiator<'a> {
         })?;
         self.transcript.absorb(b"sealed_i", &sealed_i);
         let session_id = self.transcript.hash();
-        let root = session_root(&ss, &session_id);
-        let ratchet = Ratchet::new_initiator(suite, session_id, &root, ratchet_pub, self.rng)?;
+        let root = session_root(&self.ss, &session_id);
+        let ratchet = Ratchet::new_initiator(suite, session_id, &root, self.ratchet_pub, self.rng)?;
         let frame = wire::encode_envelope(MsgType::HandshakeFinish, &body)?;
         Ok((
             frame,
@@ -175,7 +223,7 @@ impl<'a> Initiator<'a> {
                 peer,
                 suite,
                 session_id,
-                exporter: exporter_secret(&ss, &session_id),
+                exporter: exporter_secret(&self.ss, &session_id),
                 ratchet,
             },
         ))
@@ -407,6 +455,20 @@ mod tests {
         assert_eq!(*ea.exporter, *eb.exporter);
         assert_ne!(*ea.exporter, ea.session_id);
         assert_eq!(ea.suite, Suite::ChaCha20Poly1305);
+    }
+
+    #[test]
+    fn responder_is_known_before_hs3_is_built() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let (ini, m1) = Initiator::start(&a).unwrap();
+        let (resp, m2) = Responder::respond(&b, &m1).unwrap();
+        let auth = ini.authenticate(&m2).unwrap();
+        assert_eq!(*auth.peer(), b.public());
+        let (m3, ea) = auth.finish().unwrap();
+        let eb = resp.finish(&m3).unwrap();
+        assert_eq!(eb.peer, a.public());
+        assert_eq!(ea.session_id, eb.session_id);
     }
 
     #[test]

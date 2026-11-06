@@ -42,16 +42,22 @@ record:     seed, salt, enc_key = KDF("… handle signing key" | "… salt" | "�
 knock slot: seed, salt, enc_key = KDF(…, base, epoch, "knock", slot)      slot in 0..4
 probe key  = KDF("… handle probe key", base)
 value      = nonce (24) || XChaCha20-Poly1305(enc_key, nonce, pad(payload, 448), aad)
-Record     = { 0: id bstr(32), 1: version uint, 2: Candidates bstr }   aad "threnody handle record v1"
-Knock      = { 0: id bstr(32), 1: Candidates bstr }                    aad "threnody handle knock v1"
+Record     = { 0: id bstr(32), 1: version uint, 2: Candidates bstr, ? 3: 1 }   aad "threnody handle record v1"
+Knock      = { 2: eph bstr(32), 3: sealed bstr }                               aad "threnody handle knock v1"
+sealed     = XChaCha20-Poly1305(k, nonce 0, { 0: id bstr(32), 1: Candidates bstr }, aad "threnody handle knock v1")
+k          = KDF("… handle knock seal", X25519(eph, owner), eph, owner)
+old Knock  = { 0: id bstr(32), 1: Candidates bstr }
 ```
 
 `Candidates` is Appendix N's record body. Every value is 488 bytes, whatever it holds.
+
+**Knocks are sealed to the owner.** Everyone holding the handle has the knock slots' keys, and a knock says who is looking for the owner and where they are (their identity key and every address, LAN and public). So a finder seals its knock to the owner: `owner` is the owner's Ed25519 identity key as an X25519 key (the birational map), `eph` a fresh X25519 key. Only the owner opens it; others holding the handle see that a slot was written, not by whom. The owner's record says it opens sealed knocks with key `3`; to a record without it (an owner on an older version) the finder writes the old, readable knock, and owners still read those. Older finders ignore key `3`. X25519 is classical: an ML-KEM ciphertext doesn't fit BEP 44's 1,000 bytes beside the knock.
 
 - **Publishing.** The owner publishes its record when its addresses change, when the epoch changes, and otherwise every 30 minutes.
 - **Finding.** A finder reads the record for the current and previous epoch, checks the code, and dials the owner's addresses for five seconds. Public IPv6 addresses and mapped ports usually answer.
 - **Knocking.** If the dial fails, the finder writes a knock, with its own addresses, to a random slot and starts punching toward the owner (Appendix N, section 4) for two minutes.
 - **Answering.** The owner polls the four knock slots of the current and previous epoch at the rendezvous rates (every 20 s while the app is open, every 15 minutes in the background). It punches toward each fresh knock (under five minutes old) it hasn't acted on.
+- **Strangers get a share.** Anyone with the handle can knock, with any identity key and any addresses. So people met through a handle or invite get at most two of the four punch slots (Appendix N, section 4), leaving the rest for contacts, and a knock that can't be acted on yet stays new for the next poll. A stranger is probed only at public addresses, never a LAN, loopback or broadcast one, and dialed only at an address its probes came from: whoever wrote a knock or record may not be the one it names. Probe keys kept for strangers make room by dropping the oldest one not being punched, so knocks can't wipe out a meeting under way.
 - **Probes.** Both sides key their probes with the handle's probe key, in place of the discovery key two contacts share.
 
 The session that results is an ordinary session with a stranger: its messages are a message request until the owner accepts.
@@ -85,13 +91,14 @@ Raising `version` gives a new code. Removing the handle, or changing it, stops p
 
 | Who | Learns |
 |---|---|
-| Someone with the handle | The owner's identity key and current addresses, and that the owner is online when the record is fresh. They can write a message request. |
+| Someone with the handle | The owner's identity key and current addresses, and that the owner is online when the record is fresh. They can write a message request. They see that knock slots are written, but not who knocks or from where. |
 | DHT nodes | Small values under random-looking keys that change every hour. Not the handle, the name or the identity. |
 | Anyone else | Nothing: the keys come from the whole handle, including its 40-bit code. |
 
 **Trade-offs, stated honestly:**
 - **A handle is as public as you make it.** Posting it publicly is posting an invite: anyone can send message requests and see your IP address. Change the code if it gets abused.
 - **Anyone with the handle can overwrite its DHT records**, since the DHT keys come from the handle. They can stop people from finding you (until the next hour's keys, or a new code), but not pretend to be you: a forged record fails the code check or the handshake.
+- **Knocks to older owners are readable.** An owner whose record doesn't ask for sealed knocks gets the old knock, which anyone with the handle can read. Someone who overwrites the owner's record (see above) can leave the flag out and so get the next finders' knocks in the old form: it shows who looks for the owner, as before this change, and the record's addresses still have to pass the code check and the handshake.
 - **Background delay.** A finder reaches an owner behind NAT only while the owner polls: within about 20 s if its app is open, otherwise when the knock is seen within the finder's two minutes of punching. Owners reachable directly (IPv6, mapped port) answer at once.
 
 ## Implementation

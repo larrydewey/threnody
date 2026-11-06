@@ -18,6 +18,7 @@
 //! See `docs/appendix-g-relay.md`.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
@@ -29,7 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
-use crate::node::{Node, lock};
+use crate::node::{Event, FallbackPath, Node, lock};
 
 /// Most relays a circuit may pass through.
 pub const MAX_TTL: u8 = 3;
@@ -37,6 +38,7 @@ pub const MAX_TTL: u8 = 3;
 pub const MAX_CIRCUITS_PER_PEER: usize = 64;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const NONCE_MEMORY: Duration = Duration::from_secs(600);
+const NONCE_PRUNE_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelayMsg {
@@ -156,6 +158,11 @@ pub(crate) struct RelayState {
     hops: HashMap<(PublicIdentity, u64), Hop>,
     pending: HashMap<(PublicIdentity, u64), oneshot::Sender<bool>>,
     seen: HashMap<[u8; 16], Instant>,
+    /// When `seen` was last pruned.
+    pruned: Option<Instant>,
+    /// Per neighbour: OPENs still looking for a path. They count against
+    /// its circuits, or it could start any number of searches at once.
+    opening: HashMap<PublicIdentity, usize>,
 }
 
 impl RelayState {
@@ -165,8 +172,42 @@ impl RelayState {
 
     /// Records an open nonce; false if it was already seen (a loop).
     fn first_sighting(&mut self, nonce: [u8; 16]) -> bool {
-        self.seen.retain(|_, t| t.elapsed() < NONCE_MEMORY);
-        self.seen.insert(nonce, Instant::now()).is_none()
+        let now = Instant::now();
+        // Forgotten nonces are swept now and then, not on every OPEN.
+        if self
+            .pruned
+            .is_none_or(|t| now.duration_since(t) > NONCE_PRUNE_EVERY)
+        {
+            self.seen
+                .retain(|_, t| now.duration_since(*t) < NONCE_MEMORY);
+            self.pruned = Some(now);
+        }
+        match self.seen.insert(nonce, now) {
+            None => true,
+            Some(t) => now.duration_since(t) >= NONCE_MEMORY,
+        }
+    }
+
+    /// Takes an OPEN from `from` on its circuit `circ`, if there is room;
+    /// [`Self::open_done`] once it has a hop or has failed.
+    fn admit_open(&mut self, from: PublicIdentity, circ: u64, nonce: [u8; 16]) -> bool {
+        let searching = self.opening.get(&from).copied().unwrap_or(0);
+        let ok = self.circuits_with(&from) + searching < MAX_CIRCUITS_PER_PEER
+            && !self.hops.contains_key(&(from, circ))
+            && self.first_sighting(nonce);
+        if ok {
+            *self.opening.entry(from).or_default() += 1;
+        }
+        ok
+    }
+
+    fn open_done(&mut self, from: &PublicIdentity) {
+        if let Some(n) = self.opening.get_mut(from) {
+            *n -= 1;
+            if *n == 0 {
+                self.opening.remove(from);
+            }
+        }
     }
 }
 
@@ -176,6 +217,47 @@ pub(crate) const ONION_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Circuits through volunteers cross anonymous links with cover traffic,
 /// which spaces every message: they take longer to build.
 const VOLUNTEER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A background reconnection with no first hop for its circuit dials
+/// directly, to bring one up for the others; the others leave it this
+/// long (or until its dial is over) before one of them tries instead.
+const FIRST_HOP_CLAIM: Duration = Duration::from_secs(5);
+/// At most this many such direct dials at once (an offline contact's
+/// mustn't hold up the rest)...
+const FIRST_HOP_CLAIMS: usize = 2;
+/// ...each this long after the last: one that answers by then gives the
+/// others their first hop, and no second contact is dialed in the open.
+const FIRST_HOP_STAGGER: Duration = Duration::from_secs(1);
+/// The longest a background reconnection waits for a first hop before
+/// dialing directly anyway.
+const FIRST_HOP_WAIT: Duration = Duration::from_secs(30);
+/// How often a waiting one looks again.
+const FIRST_HOP_POLL: Duration = Duration::from_millis(200);
+
+/// How [`Node::reconnect_hidden`] went.
+pub(crate) enum Hidden {
+    /// A session with the peer is up (through a circuit, or it came up
+    /// another way meanwhile).
+    Up,
+    /// Go direct; with the turn to bring up a first hop for the others,
+    /// held until the direct dial is over.
+    Direct(Option<FirstHopClaim>),
+}
+
+/// A turn to dial directly as a first hop (see [`Node::claim_first_hop`]),
+/// given back on drop.
+pub(crate) struct FirstHopClaim {
+    claims: FirstHopClaims,
+    at: Instant,
+}
+
+/// When the turns now running were taken (see [`Node::claim_first_hop`]).
+pub(crate) type FirstHopClaims = std::sync::Arc<std::sync::Mutex<Vec<Instant>>>;
+
+impl Drop for FirstHopClaim {
+    fn drop(&mut self) {
+        lock(&self.claims).retain(|t| *t != self.at);
+    }
+}
 
 impl Node {
     fn relay_send(&self, to: &PublicIdentity, msg: &RelayMsg) -> bool {
@@ -196,20 +278,18 @@ impl Node {
                 ttl,
                 nonce,
             } => {
-                let admitted = {
-                    let mut st = lock(&self.shared.relay);
-                    self.shared.mutual(&from)
-                        && ttl <= MAX_TTL
-                        && st.circuits_with(&from) < MAX_CIRCUITS_PER_PEER
-                        && !st.hops.contains_key(&(from, circ))
-                        && st.first_sighting(nonce)
-                };
+                let admitted = self.shared.mutual(&from)
+                    && ttl <= MAX_TTL
+                    && lock(&self.shared.relay).admit_open(from, circ, nonce);
                 if !admitted {
                     self.relay_send(&from, &RelayMsg::Refused { circ });
                     return;
                 }
                 let node = self.clone();
-                tokio::spawn(async move { node.handle_open(from, circ, dest, ttl, nonce).await });
+                tokio::spawn(async move {
+                    node.handle_open(from, circ, dest, ttl, nonce).await;
+                    lock(&node.shared.relay).open_done(&from);
+                });
             }
             RelayMsg::Opened { circ } | RelayMsg::Refused { circ } => {
                 let ok = matches!(msg, RelayMsg::Opened { .. });
@@ -389,33 +469,16 @@ impl Node {
 
     /// Wires one end of an in-memory stream to circuit hop `(peer, circ)`.
     fn bind_endpoint(&self, peer: PublicIdentity, circ: u64, stream: tokio::io::DuplexStream) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         lock(&self.shared.relay)
             .hops
             .insert((peer, circ), Hop::Endpoint(tx));
         let node = self.clone();
         tokio::spawn(async move {
-            let (mut rd, mut wr) = tokio::io::split(stream);
-            loop {
-                tokio::select! {
-                    frame = read_frame(&mut rd) => match frame {
-                        Ok(Some(f)) => {
-                            if !node.relay_send(&peer, &RelayMsg::Data { circ, frame: f }) {
-                                break;
-                            }
-                        }
-                        _ => break,
-                    },
-                    inbound = rx.recv() => match inbound {
-                        Some(f) => {
-                            if write_frame(&mut wr, &f).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    },
-                }
-            }
+            pump_frames(stream, rx, |frame| {
+                node.relay_send(&peer, &RelayMsg::Data { circ, frame })
+            })
+            .await;
             node.close_circuit(peer, circ);
         });
     }
@@ -437,20 +500,13 @@ impl Node {
         let (ours, theirs) = tokio::io::duplex(1 << 20);
         self.bind_endpoint(via, circ, ours);
         let mut stream = theirs;
-        let chan = match handshake::initiate(&mut stream, self.identity_ref()).await {
+        let chan = match handshake::initiate(&mut stream, self.identity_ref(), Some(dest)).await {
             Ok(c) => c,
             Err(e) => {
                 self.close_circuit(via, circ);
                 return Err(e);
             }
         };
-        if chan.peer().fingerprint() != dest {
-            self.close_circuit(via, circ);
-            return Err(NetError::IdentityMismatch {
-                expected: dest.to_string(),
-                got: chan.peer().fingerprint().to_string(),
-            });
-        }
         let peer = *chan.peer();
         self.spawn_relayed_session(stream, chan, via, true);
         Ok(peer)
@@ -465,8 +521,19 @@ impl Node {
         addr: Option<&str>,
         pin: Option<Fingerprint>,
     ) -> Result<PublicIdentity> {
+        self.reach_with(addr, pin, true).await
+    }
+
+    /// [`Node::reach`]; without `onion`, no onion circuit is tried (the
+    /// caller tried one already).
+    async fn reach_with(
+        &self,
+        addr: Option<&str>,
+        pin: Option<Fingerprint>,
+        onion: bool,
+    ) -> Result<PublicIdentity> {
         if let Some(fp) = pin
-            && let Some(p) = self.reach_hidden(addr, fp).await
+            && let Some(p) = self.reach_hidden(addr, fp, onion).await
         {
             return Ok(p);
         }
@@ -474,13 +541,33 @@ impl Node {
             Some(a) => self.connect(a, pin).await,
             None => Err(NetError::NoRoute("no address".into())),
         };
+        // Only a contact we could have hidden from (we know who it is)
+        // falls back.
+        let fell_back = |p: PublicIdentity, path| {
+            if pin.is_some() {
+                self.fell_back(p, path);
+            }
+            p
+        };
         match (direct, pin) {
-            (Ok(p), _) => Ok(p),
+            (Ok(p), _) => Ok(fell_back(p, FallbackPath::Direct)),
             (Err(NetError::IdentityMismatch { expected, got }), _) => {
                 Err(NetError::IdentityMismatch { expected, got })
             }
-            (Err(_), Some(fp)) => self.connect_relayed(fp).await,
+            (Err(_), Some(fp)) => self
+                .connect_relayed(fp)
+                .await
+                .map(|p| fell_back(p, FallbackPath::Relayed)),
             (Err(e), None) => Err(e),
+        }
+    }
+
+    /// Tells the app that `peer` was reached in the open after hidden
+    /// paths failed, if we wanted them (with onion routing off, going
+    /// direct is the user's choice).
+    pub(crate) fn fell_back(&self, peer: PublicIdentity, path: FallbackPath) {
+        if self.prefer_onion() {
+            self.emit(Event::Fallback { peer, path });
         }
     }
 
@@ -491,6 +578,7 @@ impl Node {
         &self,
         addr: Option<&str>,
         fp: Fingerprint,
+        onion: bool,
     ) -> Option<PublicIdentity> {
         if !self.prefer_onion() {
             return None;
@@ -498,7 +586,8 @@ impl Node {
         // Metadata first (spec §9 layer 2): with two approved relays, an
         // onion circuit keeps any single relay, and anyone watching our
         // network, from seeing who we talk to.
-        if self.onion_possible(fp)
+        if onion
+            && self.onion_possible(fp)
             && let Ok(Ok(p)) =
                 tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion(fp, 2)).await
         {
@@ -520,20 +609,144 @@ impl Node {
     /// Whether a two-relay onion path to `dest` could exist: a live,
     /// mutually approved neighbour plus another approved contact.
     pub(crate) fn onion_possible(&self, dest: Fingerprint) -> bool {
+        self.first_hops(dest, 0) && self.onion_relays(dest)
+    }
+
+    /// Whether we have a live direct session with a mutually approved
+    /// neighbour other than `dest`, begun or heard from after `since_ms`
+    /// or over a radio link (see [`Node::first_hop_peers`]).
+    fn first_hops(&self, dest: Fingerprint, since_ms: u64) -> bool {
+        self.first_hop_peers(since_ms)
+            .iter()
+            .any(|p| p.fingerprint() != dest)
+    }
+
+    /// Whether we have the two mutually approved contacts besides `dest`
+    /// that a two-relay circuit to it needs.
+    fn onion_relays(&self, dest: Fingerprint) -> bool {
         let me = self.identity();
-        let firsts = self
-            .sessions()
-            .into_iter()
-            .filter(|s| {
-                s.via.is_none() && s.peer.fingerprint() != dest && self.shared.mutual(&s.peer)
-            })
-            .count();
-        let others = self
-            .contacts()
+        self.contacts()
             .iter()
             .filter(|c| c.mutually_approved() && c.fingerprint() != dest && c.key != me)
-            .count();
-        firsts >= 1 && others >= 2
+            .take(2)
+            .count()
+            >= 2
+    }
+
+    /// Onion first for background reconnections (Appendix I, *Background
+    /// reconnection*): reaches mutually approved `peer` through an onion
+    /// circuit when onion routing is on and one can be built, starting
+    /// only on first hops begun or heard from since the network last
+    /// changed. [`Hidden::Up`] once a session with `peer` begun at or
+    /// after `since_ms` is up; else the caller goes direct.
+    ///
+    /// When the circuit lacks only a first hop (none since the network
+    /// last changed, say, or just after start-up), a reconnection that
+    /// gets [`Node::claim_first_hop`]'s turn goes direct at once to bring
+    /// one up, and returns the claim to hold while it dials. The others
+    /// wait for a first hop, or a turn, at most [`FIRST_HOP_WAIT`]; with
+    /// `wait` false (a LAN contact, itself the quickest first hop) none
+    /// do.
+    pub(crate) async fn reconnect_hidden(
+        &self,
+        peer: &PublicIdentity,
+        since_ms: u64,
+        wait: bool,
+    ) -> Hidden {
+        let fp = peer.fingerprint();
+        // A call with `peer` runs now: it needs its path back at once,
+        // and datagrams for its media, so it goes as before.
+        let calling = self.call().is_some_and(|c| c.peer == *peer);
+        if !self.prefer_onion() || !self.shared.mutual(peer) || calling || !self.onion_relays(fp) {
+            return Hidden::Direct(None);
+        }
+        let up = || {
+            self.sessions()
+                .iter()
+                .any(|s| s.peer == *peer && s.since_ms >= since_ms)
+        };
+        let start = Instant::now();
+        loop {
+            if up() {
+                return Hidden::Up;
+            }
+            let fresh = self.rdv().changed_ms.load(Ordering::Relaxed);
+            if self.first_hops(fp, fresh) {
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(ONION_DIAL_TIMEOUT, self.connect_onion_since(fp, 2, fresh))
+                        .await
+                {
+                    return Hidden::Up;
+                }
+                self.emit(Event::ReachNote {
+                    note: format!("no onion circuit to {fp}: reconnecting directly"),
+                });
+                return if up() {
+                    Hidden::Up
+                } else {
+                    Hidden::Direct(None)
+                };
+            }
+            if let Some(claim) = self.claim_first_hop() {
+                return Hidden::Direct(Some(claim));
+            }
+            if !wait || start.elapsed() >= FIRST_HOP_WAIT {
+                return Hidden::Direct(None);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(FIRST_HOP_POLL) => {}
+                () = self.closed() => return Hidden::Direct(None),
+            }
+        }
+    }
+
+    /// A turn to dial a contact directly as a first hop for the others'
+    /// circuits: at most [`FIRST_HOP_CLAIMS`] at once, each
+    /// [`FIRST_HOP_STAGGER`] after the last (most dials bring one up
+    /// sooner, and the next waiting one then goes through a circuit). A
+    /// turn ends when its holder drops it (its dial is over) or after
+    /// [`FIRST_HOP_CLAIM`].
+    fn claim_first_hop(&self) -> Option<FirstHopClaim> {
+        let mut claims = lock(&self.rdv().first_hop);
+        claims.retain(|t| t.elapsed() < FIRST_HOP_CLAIM);
+        if claims.len() >= FIRST_HOP_CLAIMS
+            || claims.iter().any(|t| t.elapsed() < FIRST_HOP_STAGGER)
+        {
+            return None;
+        }
+        let at = Instant::now();
+        claims.push(at);
+        Some(FirstHopClaim {
+            claims: self.rdv().first_hop.clone(),
+            at,
+        })
+    }
+
+    /// [`Node::reach_peer`] for reconnecting in the background (apps
+    /// call it on start and when the network comes back): onion first as
+    /// [`Node::reconnect_hidden`] says, then volunteer relays, a direct
+    /// dial and relay circuits. With a turn to bring up a first hop,
+    /// straight to the last known address first.
+    pub async fn reconnect_peer(&self, peer: &PublicIdentity) -> Result<()> {
+        if self.connected(peer) {
+            return Ok(());
+        }
+        let claim = match self.reconnect_hidden(peer, 0, true).await {
+            Hidden::Up => return Ok(()),
+            Hidden::Direct(claim) => claim,
+        };
+        let fp = peer.fingerprint();
+        let addr = self.contacts().get(peer).and_then(|c| c.last_addr.clone());
+        if let (Some(_), Some(a)) = (&claim, &addr)
+            && let Ok(p) = self.connect(a, Some(fp)).await
+        {
+            self.fell_back(p, FallbackPath::Direct);
+            return Ok(());
+        }
+        drop(claim);
+        self.reach_with(addr.as_deref(), Some(fp), false)
+            .await
+            .map(|_| ())
     }
 
     /// Makes sure there is a session with `peer`: an existing one, a
@@ -585,9 +798,93 @@ impl Node {
     }
 }
 
+/// Moves whole frames between `stream` and a circuit hop: each frame read
+/// goes to `send` (which returns false to stop), and each one from
+/// `inbound` is written. Returns when either side ends.
+///
+/// Reading and writing run as two loops side by side, never as one
+/// `select!` per frame: a frame read is two reads, and dropping it halfway
+/// when a frame came the other way would lose bytes and garble the stream.
+async fn pump_frames<S>(
+    stream: S,
+    mut inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut send: impl FnMut(Vec<u8>) -> bool,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+{
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let reading = async {
+        while let Ok(Some(f)) = read_frame(&mut rd).await {
+            if !send(f) {
+                break;
+            }
+        }
+    };
+    let writing = async {
+        while let Some(f) = inbound.recv().await {
+            if write_frame(&mut wr, &f).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = reading => {}
+        () = writing => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn opens_still_searching_count_against_the_cap() {
+        let mut st = RelayState::default();
+        let peer = threnody_core::Identity::generate().public();
+        let other = threnody_core::Identity::generate().public();
+        for c in 0..MAX_CIRCUITS_PER_PEER as u64 {
+            assert!(st.admit_open(peer, c, random_bytes()));
+        }
+        // None has a hop yet: each is still searching for a path.
+        assert!(!st.admit_open(peer, 1000, random_bytes()));
+        assert!(st.admit_open(other, 1000, random_bytes()));
+        st.open_done(&peer);
+        assert!(st.admit_open(peer, 1001, random_bytes()));
+        // A nonce is taken once.
+        let nonce = random_bytes();
+        assert!(st.admit_open(other, 1, nonce));
+        assert!(!st.admit_open(other, 2, nonce));
+    }
+
+    #[tokio::test]
+    async fn a_frame_read_in_pieces_survives_frames_the_other_way() {
+        let (ours, theirs) = tokio::io::duplex(256);
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let pump = tokio::spawn(pump_frames(ours, in_rx, move |f| out_tx.send(f).is_ok()));
+        let (mut rd, mut wr) = tokio::io::split(theirs);
+        // A frame much bigger than the pipe, so the pump reads it in pieces
+        // and is still waiting for the rest when a frame comes the other way.
+        let frame: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
+        wr.write_all(&(frame.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        wr.write_all(&frame[..2000]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        in_tx.send(vec![9; 10]).unwrap();
+        let mut back = [0u8; 14];
+        rd.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back[4..], &[9; 10]);
+        wr.write_all(&frame[2000..]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("the frame never came through")
+            .unwrap();
+        assert_eq!(got, frame);
+        drop(in_tx);
+        pump.await.unwrap();
+    }
 
     #[test]
     fn relay_messages_round_trip() {

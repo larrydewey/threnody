@@ -23,6 +23,8 @@ use crate::sealed::{self, KdfParams};
 
 const FILE_VERSION: u64 = 1;
 const IDENTITY_PURPOSE: &str = "threnody v1 identity seed";
+/// The state file holding the contact book.
+pub(crate) const CONTACTS_STATE: &str = "contacts";
 
 enum IdentityFile {
     Plain(Zeroizing<[u8; 32]>),
@@ -47,6 +49,8 @@ impl Home {
         self.dir.join("identity.cbor")
     }
 
+    /// Where contacts were kept, unencrypted, before they became the
+    /// `contacts` state file (see [`Home::load_contacts`]).
     pub(crate) fn contacts_path(&self) -> PathBuf {
         self.dir.join("contacts.cbor")
     }
@@ -147,16 +151,36 @@ impl Home {
         }
     }
 
-    pub fn load_contacts(&self) -> Result<Contacts> {
+    /// Loads the contact book, kept encrypted like any state (the
+    /// `contacts` state file). A home from before that keeps it in plain
+    /// `contacts.cbor`: that is read, encrypted and deleted.
+    pub fn load_contacts(&self, identity: &Identity) -> Result<Contacts> {
+        let (contacts, legacy) = self.read_contacts(identity)?;
+        if legacy {
+            self.save_contacts(identity, &contacts)?;
+        } else {
+            secure_delete(&self.contacts_path())?;
+        }
+        Ok(contacts)
+    }
+
+    /// The contact book, and whether it came from plain `contacts.cbor`.
+    /// Writes nothing.
+    pub(crate) fn read_contacts(&self, identity: &Identity) -> Result<(Contacts, bool)> {
+        if let Some(b) = self.load_state(identity, CONTACTS_STATE)? {
+            return Ok((Contacts::decode(&b)?, false));
+        }
         match fs::read(self.contacts_path()) {
-            Ok(b) => Contacts::decode(&b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Contacts::default()),
+            Ok(b) => Ok((Contacts::decode(&b)?, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Contacts::default(), false)),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn save_contacts(&self, c: &Contacts) -> Result<()> {
-        write_private(&self.dir, &self.contacts_path(), &c.encode()?)
+    /// Stores the contact book encrypted (see [`Home::save_state`]).
+    pub fn save_contacts(&self, identity: &Identity, c: &Contacts) -> Result<()> {
+        self.save_state(identity, CONTACTS_STATE, &c.encode()?)?;
+        secure_delete(&self.contacts_path())
     }
 
     pub(crate) fn state_path(&self, name: &str) -> Result<PathBuf> {
@@ -205,7 +229,8 @@ impl Home {
         write_private(&self.dir, &self.identity_path(), bytes)
     }
 
-    /// Writes the contacts file exactly as [`Home::save_contacts`] stored it.
+    /// Writes a plain `contacts.cbor` exactly as stored (from before
+    /// contacts were encrypted).
     pub(crate) fn write_contacts_file(&self, bytes: &[u8]) -> Result<()> {
         write_private(&self.dir, &self.contacts_path(), bytes)
     }
@@ -356,6 +381,12 @@ pub struct Contact {
     /// leave each side with a different "latest" key; keeping recent ones
     /// means both still recognise each other. Cleared on revocation.
     pub discovery_older: Vec<[u8; 32]>,
+    /// The peer's latest `Hello` had `FEATURE_TIMED_PROBES`: probes to and
+    /// from it under its discovery keys are timed (Appendix N), and an
+    /// untimed one claiming to be from it is ignored. It describes the
+    /// peer's build, so it outlives the keys, but it is this device's
+    /// knowledge and is not synced to our others.
+    pub timed_probes: bool,
     /// Account this device belongs to (Appendix J), once its chain is known.
     pub account: Option<AccountId>,
     /// When the approval or verification flags last changed (own-device
@@ -378,6 +409,10 @@ pub struct Contact {
     /// The user cleared the conversation up to this time: on every one of
     /// our devices, older messages go and don't come back (0 = never).
     pub cleared_ms: u64,
+    /// The feature bits of this peer's latest `Hello`, kept across
+    /// restarts so that what arrives before a session does (mailbox
+    /// deliveries, say) is read as the peer meant it.
+    pub features: u64,
 }
 
 impl Contact {
@@ -393,6 +428,7 @@ impl Contact {
             last_seen_ms: now_ms,
             discovery_key: None,
             discovery_older: Vec::new(),
+            timed_probes: false,
             account: None,
             approval_changed_ms: 0,
             accepted: false,
@@ -401,6 +437,7 @@ impl Contact {
             shares: Vec::new(),
             revealed: None,
             cleared_ms: 0,
+            features: 0,
         }
     }
 
@@ -580,13 +617,16 @@ impl Contacts {
         for x in &mut c.list {
             x.clear_discovery_keys();
             x.remote_approved = false;
+            x.timed_probes = false;
         }
         c.encode()
     }
 
-    /// Merges a snapshot from one of our own devices. Approval and
-    /// verification are last-writer-wins on `approval_changed_ms`; names,
-    /// addresses and accounts fill gaps. Returns true if anything changed.
+    /// Merges a snapshot from one of our own devices. Approval,
+    /// verification and blocking are last-writer-wins on
+    /// `approval_changed_ms` (a tie keeps a block, as devices that predate
+    /// this rule block without moving it); names, addresses and accounts
+    /// fill gaps. Returns true if anything changed.
     pub fn merge_snapshot(&mut self, bytes: &[u8], now_ms: u64) -> Result<bool> {
         let other = Self::decode(bytes)?;
         let mut changed = false;
@@ -615,6 +655,7 @@ impl Contacts {
                     let mut c = o;
                     c.clear_discovery_keys();
                     c.remote_approved = false;
+                    c.timed_probes = false;
                     c.first_seen_ms = now_ms;
                     self.list.push(c);
                     changed = true;
@@ -623,7 +664,26 @@ impl Contacts {
                     if o.approval_changed_ms > c.approval_changed_ms {
                         c.local_approved = o.local_approved;
                         c.verified = o.verified;
+                        // Only approving again unblocks; a later revocation
+                        // that never saw the block leaves it in place.
+                        c.blocked = o.blocked || (c.blocked && !o.local_approved);
+                        if o.blocked {
+                            c.accepted = false;
+                        }
                         c.approval_changed_ms = o.approval_changed_ms;
+                        // Revoked on our other device: the discovery keys
+                        // go here too (Appendix E).
+                        if !c.local_approved {
+                            c.clear_discovery_keys();
+                        }
+                        changed = true;
+                    } else if o.approval_changed_ms == c.approval_changed_ms
+                        && o.blocked
+                        && !c.blocked
+                    {
+                        c.blocked = true;
+                        c.accepted = false;
+                        c.local_approved = false;
                         changed = true;
                     }
                     if c.petname.is_none() && o.petname.is_some() {
@@ -638,13 +698,9 @@ impl Contacts {
                         c.account = o.account;
                         changed = true;
                     }
-                    // Accepting or blocking on one device does on all.
-                    if o.accepted && !c.accepted {
+                    // Accepting on one device does on all, unless blocked.
+                    if o.accepted && !c.accepted && !c.blocked {
                         c.accepted = true;
-                        changed = true;
-                    }
-                    if o.blocked && !c.blocked {
-                        c.blocked = true;
                         changed = true;
                     }
                     // Clearing a chat on one device clears it on all.
@@ -678,6 +734,8 @@ impl Contacts {
                         + usize::from(c.revealed.is_some())
                         + usize::from(c.revealed.as_ref().is_some_and(|r| r.1.is_some()))
                         + usize::from(c.cleared_ms != 0)
+                        + usize::from(c.timed_probes)
+                        + usize::from(c.features != 0)
                         + 2;
                     e.map_len(n)?;
                     e.u8(0)?.bytes(c.key.as_bytes())?;
@@ -729,6 +787,12 @@ impl Contacts {
                     }
                     if c.cleared_ms != 0 {
                         e.u8(18)?.u64(c.cleared_ms)?;
+                    }
+                    if c.timed_probes {
+                        e.u8(19)?.bool(true)?;
+                    }
+                    if c.features != 0 {
+                        e.u8(20)?.u64(c.features)?;
                     }
                 }
                 if !self.forgotten.is_empty() {
@@ -788,6 +852,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         last_seen_ms: 0,
         discovery_key: None,
         discovery_older: Vec::new(),
+        timed_probes: false,
         account: None,
         approval_changed_ms: 0,
         // Contacts saved before message requests existed were wanted.
@@ -797,6 +862,7 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
         shares: Vec::new(),
         revealed: None,
         cleared_ms: 0,
+        features: 0,
     };
     let (mut revealed, mut invite) = (None, None);
     read_map(d, |k, d| {
@@ -836,6 +902,8 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
             16 => revealed = Some(fixed_bytes::<32>(d)?),
             17 => invite = Some(d.str()?.to_owned()),
             18 => c.cleared_ms = d.u64()?,
+            19 => c.timed_probes = d.bool()?,
+            20 => c.features = d.u64()?,
             11 => {
                 for _ in 0..d.array_len()? {
                     let k = fixed_bytes::<32>(d)?;
@@ -868,7 +936,7 @@ mod tests {
         assert_eq!(home.load_identity(None).unwrap().public(), id.public());
 
         let peer = Identity::generate().public();
-        let mut c = home.load_contacts().unwrap();
+        let mut c = home.load_contacts(&id).unwrap();
         assert!(c.observe(peer, Some("10.0.0.1:7450".into()), 5));
         assert!(!c.observe(peer, None, 6));
         let ct = c.get_mut(&peer).unwrap();
@@ -878,9 +946,10 @@ mod tests {
         ct.account = Some(AccountId([5; 32]));
         ct.approval_changed_ms = 77;
         ct.blocked = true;
+        ct.features = 1 << 16;
         assert!(!ct.accepted, "new contacts start as message requests");
-        home.save_contacts(&c).unwrap();
-        let loaded = home.load_contacts().unwrap();
+        home.save_contacts(&id, &c).unwrap();
+        let loaded = home.load_contacts(&id).unwrap();
         assert_eq!(loaded, c);
         assert!(matches!(loaded.find("alice"), Lookup::Found(_)));
         let fp = peer.fingerprint().to_string();
@@ -899,18 +968,69 @@ mod tests {
 }
 
 #[cfg(test)]
+mod contacts_at_rest_tests {
+    use super::*;
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn contacts_are_encrypted_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(Some(b"pw")).unwrap();
+        let peer = Identity::generate().public();
+        let mut c = Contacts::default();
+        c.observe(peer, Some("203.0.113.9:7450".into()), 5);
+        c.get_mut(&peer).unwrap().petname = Some("alice".into());
+        home.save_contacts(&id, &c).unwrap();
+
+        assert!(!home.contacts_path().exists());
+        for entry in fs::read_dir(home.dir()).unwrap() {
+            let bytes = fs::read(entry.unwrap().path()).unwrap();
+            assert!(!contains(&bytes, peer.as_bytes()));
+            assert!(!contains(&bytes, b"alice"));
+            assert!(!contains(&bytes, b"203.0.113.9"));
+        }
+        assert_eq!(home.load_contacts(&id).unwrap(), c);
+        // Someone else's seed can't read them.
+        assert!(home.load_contacts(&Identity::generate()).is_err());
+    }
+
+    #[test]
+    fn plain_contacts_from_before_are_encrypted_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(None).unwrap();
+        let peer = Identity::generate().public();
+        let mut c = Contacts::default();
+        c.observe(peer, None, 5);
+        home.write_contacts_file(&c.encode().unwrap()).unwrap();
+
+        assert_eq!(home.load_contacts(&id).unwrap(), c);
+        assert!(!home.contacts_path().exists());
+        assert!(home.load_state(&id, CONTACTS_STATE).unwrap().is_some());
+        assert_eq!(home.load_contacts(&id).unwrap(), c);
+    }
+}
+
+#[cfg(test)]
 mod sync_tests {
     use super::*;
 
     #[test]
     fn snapshots_merge_last_writer_wins_without_pairwise_secrets() {
         let (bob, carol) = (Identity::generate().public(), Identity::generate().public());
+        let dave = Identity::generate().public();
         let mut mine = Contacts::default();
-        mine.observe(bob, None, 1);
-        let c = mine.get_mut(&bob).unwrap();
-        c.local_approved = true;
-        c.approval_changed_ms = 10;
-        c.discovery_key = Some([1; 32]);
+        for (k, key) in [(bob, 1), (dave, 2)] {
+            mine.observe(k, None, 1);
+            let c = mine.get_mut(&k).unwrap();
+            c.local_approved = true;
+            c.approval_changed_ms = 10;
+            c.discovery_key = Some([key; 32]);
+        }
 
         let mut theirs = Contacts::default();
         theirs.observe(bob, Some("bob.example:1".into()), 1);
@@ -921,6 +1041,11 @@ mod sync_tests {
         t.petname = Some("bob".into());
         t.remote_approved = true;
         theirs.get_mut(&carol).unwrap().discovery_key = Some([9; 32]);
+        theirs.get_mut(&carol).unwrap().timed_probes = true;
+        theirs.observe(dave, None, 1);
+        let d = theirs.get_mut(&dave).unwrap();
+        d.local_approved = true; // approved again, still approved
+        d.approval_changed_ms = 20;
 
         assert!(
             mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 5)
@@ -929,10 +1054,12 @@ mod sync_tests {
         let b = mine.get(&bob).unwrap();
         assert!(!b.local_approved, "later revocation wins");
         assert_eq!(b.petname.as_deref(), Some("bob"));
-        assert_eq!(b.discovery_key, Some([1; 32]), "own pairwise key kept");
+        assert!(b.discovery_key.is_none(), "a revocation takes the key");
+        let d = mine.get(&dave).unwrap();
+        assert_eq!(d.discovery_key, Some([2; 32]), "own pairwise key kept");
         let c = mine.get(&carol).unwrap();
         assert!(
-            c.discovery_key.is_none() && !c.remote_approved,
+            c.discovery_key.is_none() && !c.remote_approved && !c.timed_probes,
             "pairwise state not copied"
         );
         assert!(
@@ -941,6 +1068,56 @@ mod sync_tests {
                 .unwrap(),
             "idempotent"
         );
+    }
+
+    #[test]
+    fn blocking_and_unblocking_merge_last_writer_wins() {
+        let bob = Identity::generate().public();
+        let book = |blocked: bool, approved: bool, at: u64| {
+            let mut c = Contacts::default();
+            c.observe(bob, None, 1);
+            let b = c.get_mut(&bob).unwrap();
+            b.blocked = blocked;
+            b.local_approved = approved;
+            b.accepted = !blocked;
+            b.approval_changed_ms = at;
+            c
+        };
+        // Blocked on this device at 10, approved again on the other at 20:
+        // the unblock wins, and the older block doesn't come back.
+        let mut mine = book(true, false, 10);
+        let theirs = book(false, true, 20);
+        assert!(
+            mine.merge_snapshot(&theirs.sync_snapshot().unwrap(), 30)
+                .unwrap()
+        );
+        let b = mine.get(&bob).unwrap();
+        assert!(!b.blocked && b.local_approved && b.accepted, "unblocked");
+        let mut theirs = theirs;
+        theirs
+            .merge_snapshot(&book(true, false, 10).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        assert!(!theirs.get(&bob).unwrap().blocked, "stale block ignored");
+
+        // A later block wins over an earlier approval, and clears acceptance.
+        let mut mine = book(false, true, 10);
+        mine.merge_snapshot(&book(true, false, 20).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        let b = mine.get(&bob).unwrap();
+        assert!(b.blocked && !b.local_approved && !b.accepted);
+
+        // Revoking approval later, unaware of the block, doesn't unblock.
+        let mut mine = book(true, false, 10);
+        mine.merge_snapshot(&book(false, false, 20).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        assert!(mine.get(&bob).unwrap().blocked);
+
+        // A device that blocks without moving the time still blocks.
+        let mut mine = book(false, true, 10);
+        mine.merge_snapshot(&book(true, false, 10).sync_snapshot().unwrap(), 30)
+            .unwrap();
+        let b = mine.get(&bob).unwrap();
+        assert!(b.blocked && !b.local_approved && !b.accepted);
     }
 }
 
@@ -1018,6 +1195,7 @@ mod passphrase_tests {
             c.set_discovery_key([k; 32]);
         }
         c.set_discovery_key([4; 32]);
+        c.timed_probes = true;
         assert_eq!(c.discovery_key, Some([4; 32]));
         assert_eq!(c.discovery_older, vec![[3; 32], [2; 32]]);
         assert_eq!(c.recognition_keys().count(), 3);
@@ -1027,6 +1205,10 @@ mod passphrase_tests {
         assert_eq!(back.list[0], c);
         c.clear_discovery_keys();
         assert_eq!(c.recognition_keys().count(), 0);
+        // What the peer's build supports doesn't change with approval: a
+        // contact approved again in the same session (no new Hello) still
+        // gets timed probes under its next key.
+        assert!(c.timed_probes);
     }
 
     #[test]

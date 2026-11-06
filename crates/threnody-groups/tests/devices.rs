@@ -7,6 +7,7 @@ use std::time::Duration;
 use threnody_core::history::ConversationId;
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, PublicIdentity};
+use threnody_groups::GroupWire;
 use threnody_groups::node::{GroupNode, Update};
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -19,11 +20,24 @@ struct N {
     groups: GroupNode,
     /// What incoming group traffic produced, for the app to show.
     updates: Vec<Update>,
+    /// Every group message that arrived, as sent.
+    wires: Vec<(PublicIdentity, GroupWire)>,
 }
 
 async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
     let home = Home::new(dir.path().join(name));
     let identity = home.create_identity(None).unwrap();
+    start(home, identity).await
+}
+
+/// Starts `name` again from what it saved.
+async fn restart(dir: &tempfile::TempDir, name: &str) -> N {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    start(home, identity).await
+}
+
+async fn start(home: Home, identity: threnody_core::Identity) -> N {
     let groups = GroupNode::load(&home, &identity).unwrap();
     let (node, rx) = Node::new(NodeConfig {
         home,
@@ -40,6 +54,7 @@ async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
         addr,
         groups,
         updates: Vec::new(),
+        wires: Vec::new(),
     }
 }
 
@@ -57,12 +72,19 @@ impl N {
                     msg: AppMessage::Group(b),
                     ..
                 } => {
+                    if let Ok(w) = GroupWire::decode(&b) {
+                        self.wires.push((peer, w));
+                    }
                     if let Ok(u) = self.groups.incoming(&self.node, peer, &b) {
                         self.updates.extend(u);
                     }
                 }
                 Event::Connected { peer, .. } => self.groups.connected(&self.node, &peer),
                 Event::DeviceLinked { device } => self.groups.linked(&self.node, &device),
+                Event::AccountChanged { removed, .. } => {
+                    let u = self.groups.revoked(&self.node, &removed);
+                    self.updates.extend(u);
+                }
                 _ => {}
             }
         }
@@ -161,6 +183,270 @@ async fn a_linked_device_joins_our_groups_with_their_history() {
     })
     .await;
     assert_eq!(phone.texts(&g).len(), 3, "no duplicates");
+}
+
+#[tokio::test]
+async fn a_member_offline_during_an_add_still_gets_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let mut dave = spawn(&dir, "dave").await;
+    let cid = approve(&mut alice, &mut carol).await;
+    // Dave isn't Alice's contact: she has no mailbox route to him.
+    let aid = dave.node.connect(&alice.addr, None).await.unwrap();
+    let did = dave.node.identity();
+    let g = alice.groups.create("team").unwrap();
+    alice.groups.invite(&alice.node, &g, &did).unwrap();
+    until(&mut [&mut alice, &mut dave], |ns| {
+        !ns[1].groups.invites().is_empty()
+    })
+    .await;
+    dave.groups.accept_from(&dave.node, &g, &aid).unwrap();
+    until(&mut [&mut alice, &mut dave], |ns| ns[1].in_group(&g)).await;
+
+    // Dave goes away; Alice adds Carol meanwhile. Carol, just invited,
+    // doesn't know the group yet: she can't pass Dave the commit.
+    dave.node.shutdown();
+    drop(dave);
+    alice.node.disconnect(&did);
+    alice.groups.invite(&alice.node, &g, &cid).unwrap();
+    until(&mut [&mut alice, &mut carol], |ns| ns[1].in_group(&g)).await;
+    assert_eq!(alice.groups.held_for(&did), 1, "the commit waits for Dave");
+
+    // Back, Dave catches up and reads what's said after.
+    let mut dave = restart(&dir, "dave").await;
+    dave.node.connect(&alice.addr, None).await.unwrap();
+    until(&mut [&mut alice, &mut carol, &mut dave], |ns| {
+        ns[2].groups.list()[0].3.len() == 3
+    })
+    .await;
+    alice.groups.send_text(&alice.node, &g, "hi all").unwrap();
+    until(&mut [&mut alice, &mut carol, &mut dave], |ns| {
+        ns[2].texts(&g) == ["hi all"] && ns[1].texts(&g) == ["hi all"]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_linked_device_takes_only_the_owners_invitation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut mallory = spawn(&dir, "mallory").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+
+    // Mallory knows the group's id and invites the phone to it first.
+    let pid = mallory.node.connect(&phone.addr, None).await.unwrap();
+    let request = GroupWire::KeyPackageRequest {
+        group: g,
+        name: "team".into(),
+    };
+    mallory
+        .node
+        .send(&pid, AppMessage::Group(request.encode().unwrap()))
+        .unwrap();
+    let mid = mallory.node.identity();
+    until(&mut [&mut phone, &mut mallory], |ns| {
+        ns[0].groups.invites().iter().any(|i| i.from == mid)
+    })
+    .await;
+
+    // The laptop says to join the group: the phone takes Bob's
+    // invitation, not Mallory's.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(
+        &mut [&mut bob, &mut laptop, &mut phone, &mut mallory],
+        |ns| ns[2].in_group(&g),
+    )
+    .await;
+    for _ in 0..25 {
+        for n in [&mut bob, &mut laptop, &mut phone, &mut mallory] {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(phone.groups.list()[0].2, bob.node.identity());
+    assert!(phone.groups.invites().iter().any(|i| i.from == mid));
+    assert!(
+        !mallory
+            .wires
+            .iter()
+            .any(|(_, w)| matches!(w, GroupWire::KeyPackage { .. })),
+        "Mallory got a key package"
+    );
+}
+
+#[tokio::test]
+async fn invitations_from_strangers_are_few_and_from_the_blocked_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut mallory = spawn(&dir, "mallory").await;
+    let aid = mallory.node.connect(&alice.addr, None).await.unwrap();
+    let mid = mallory.node.identity();
+    let request = |i: u8| {
+        let r = GroupWire::KeyPackageRequest {
+            group: [i; 16],
+            name: format!("Free money {i}"),
+        };
+        r.encode().unwrap()
+    };
+    for i in 0..10 {
+        mallory
+            .node
+            .send(&aid, AppMessage::Group(request(i)))
+            .unwrap();
+    }
+    // The newest few stay.
+    until(&mut [&mut alice, &mut mallory], |ns| {
+        ns[0].groups.invites().iter().any(|i| i.group == [9; 16])
+    })
+    .await;
+    let groups: Vec<_> = alice.groups.invites().iter().map(|i| i.group[0]).collect();
+    assert_eq!(groups, [7, 8, 9]);
+
+    // Once blocked, whatever still reaches us (from a mailbox, say) asks
+    // nothing.
+    alice.node.block_contact(&mid);
+    let updates = alice
+        .groups
+        .incoming(&alice.node, mid, &request(20))
+        .unwrap();
+    assert!(updates.is_empty());
+    assert_eq!(alice.groups.invites().len(), 3);
+}
+
+#[tokio::test]
+async fn a_crowd_of_strangers_neither_hides_invitations_nor_floods_notifications() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    // `from` invites Alice to group `i`: whether that is quiet.
+    let invite = |alice: &mut N, from: PublicIdentity, i: u8| {
+        let r = GroupWire::KeyPackageRequest {
+            group: [i; 16],
+            name: format!("Group {i}"),
+        };
+        let r = r.encode().unwrap();
+        let mut updates = alice.groups.incoming(&alice.node, from, &r).unwrap();
+        let Some(Update::Invited { invite, quiet }) = updates.pop() else {
+            panic!("no invitation");
+        };
+        assert_eq!((invite.from, invite.group), (from, [i; 16]));
+        quiet
+    };
+    // Carol, whom Alice accepted but who hasn't approved her back.
+    let carol = threnody_core::Identity::generate().public();
+    alice.node.set_approval(&carol, true).unwrap();
+    assert!(!invite(&mut alice, carol, 1));
+    // Then fresh identities, more than are kept: only the first notifies.
+    let quiet: Vec<bool> = (0..40)
+        .map(|i| {
+            invite(
+                &mut alice,
+                threnody_core::Identity::generate().public(),
+                100 + i,
+            )
+        })
+        .collect();
+    assert!(!quiet[0] && quiet[1..].iter().all(|q| *q));
+    let invites = alice.groups.invites();
+    assert_eq!(invites.len(), threnody_groups::node::MAX_INVITES);
+    assert!(invites.iter().any(|i| i.from == carol), "Carol's stays");
+    assert_eq!(invites.last().unwrap().group, [139; 16], "the newest stay");
+    // Someone we know still notifies.
+    assert!(!invite(&mut alice, carol, 2));
+}
+
+#[tokio::test]
+async fn a_trusted_invitation_that_could_not_be_saved_waits_for_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    // Alice's group state can't be written, so her key package for Bob's
+    // invitation can't be kept or sent: the invitation is kept instead.
+    let blocker = dir.path().join("alice").join("groups.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let request = GroupWire::KeyPackageRequest {
+        group: [5; 16],
+        name: "team".into(),
+    };
+    let updates = alice
+        .groups
+        .incoming(&alice.node, bid, &request.encode().unwrap())
+        .unwrap();
+    assert!(
+        updates
+            .iter()
+            .any(|u| matches!(u, Update::Invited { invite, quiet: false } if invite.from == bid))
+    );
+    assert_eq!(alice.groups.invites().len(), 1);
+}
+
+#[tokio::test]
+async fn declining_one_inviter_keeps_anothers_invitation_to_the_same_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let (bob, mallory) = (
+        threnody_core::Identity::generate().public(),
+        threnody_core::Identity::generate().public(),
+    );
+    let request = GroupWire::KeyPackageRequest {
+        group: [3; 16],
+        name: "team".into(),
+    };
+    for from in [mallory, bob] {
+        alice
+            .groups
+            .incoming(&alice.node, from, &request.encode().unwrap())
+            .unwrap();
+    }
+    alice.groups.decline_from(&[3; 16], &mallory);
+    let invites = alice.groups.invites();
+    assert_eq!(invites.len(), 1);
+    assert_eq!(invites[0].from, bob);
+}
+
+#[tokio::test]
+async fn nothing_leaves_that_could_not_be_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let g = alice.groups.create("team").unwrap();
+    alice.groups.invite(&alice.node, &g, &bid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[1].in_group(&g)).await;
+
+    // Alice's group state can't be written (here: its temporary file's
+    // name is taken), so her removing Bob must not reach him.
+    let blocker = dir.path().join("alice").join("groups.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(alice.groups.remove(&alice.node, &g, &bid).is_err());
+    assert!(alice.groups.send_text(&alice.node, &g, "lost").is_err());
+    for _ in 0..25 {
+        for n in [&mut alice, &mut bob] {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(bob.in_group(&g) && bob.texts(&g).is_empty());
+    assert_eq!(alice.groups.list()[0].3.len(), 2, "back to what was saved");
+
+    // Once it can be, the group carries on where both left it.
+    std::fs::remove_dir(&blocker).unwrap();
+    alice
+        .groups
+        .send_text(&alice.node, &g, "still here")
+        .unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[1].texts(&g) == ["still here"]
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -526,9 +812,9 @@ async fn lists_are_shared_and_edited_together() {
     let aid = alice.node.identity();
 
     // Alice's shopping list, shared with Bob.
-    let id = alice.node.create_list("Groceries");
+    let id = alice.node.create_list("Groceries").unwrap();
     alice.node.edit_list(&id, |l, s| {
-        let milk = l.add(None, "milk", false, s);
+        let milk = l.add(None, "milk", false, s).unwrap();
         l.add(Some(milk), "eggs", false, s);
         true
     });
@@ -601,4 +887,123 @@ async fn lists_are_shared_and_edited_together() {
         texts(ns[0]).get(1).is_some_and(|(_, done)| *done)
     })
     .await;
+}
+
+/// Pumps every node for `d`, letting traffic settle.
+async fn settle(ns: &mut [&mut N], d: Duration) {
+    let end = tokio::time::Instant::now() + d;
+    while tokio::time::Instant::now() < end {
+        for n in ns.iter_mut() {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_device_that_leaves_a_group_stays_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = approve(&mut bob, &mut laptop).await;
+    let pid = phone.node.identity();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[0].node.account_of(&pid).is_some()
+    })
+    .await;
+
+    // Bob invites the account: both devices join directly.
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+
+    // The phone leaves; everyone sees it go.
+    phone.groups.leave(&phone.node, &g).unwrap();
+    let member = |n: &N| {
+        n.groups
+            .list()
+            .iter()
+            .any(|(x, .., m)| *x == g && m.contains(&pid))
+    };
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        !ns[2].in_group(&g) && !member(ns[0]) && !member(ns[1])
+    })
+    .await;
+
+    // The phone and the laptop meet again: the phone isn't put back.
+    phone.node.disconnect(&laptop.node.identity());
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].node.sessions().iter().all(|s| s.peer != pid)
+    })
+    .await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(!phone.in_group(&g), "the phone rejoined a group it left");
+    assert!(!member(&bob) && !member(&laptop));
+}
+
+#[tokio::test]
+async fn a_removed_device_is_dropped_from_our_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = approve(&mut bob, &mut laptop).await;
+    let pid = phone.node.identity();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[0].node.account_of(&pid).is_some()
+    })
+    .await;
+    let g = bob.groups.create("club").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+
+    // The phone is lost: the laptop removes it from the account. Bob, who
+    // owns the group, removes it from the group as soon as he hears.
+    laptop.node.remove_device(&pid).unwrap();
+    let member = |n: &N| {
+        n.groups
+            .list()
+            .iter()
+            .any(|(x, .., m)| *x == g && m.contains(&pid))
+    };
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        !member(ns[0]) && !member(ns[1])
+    })
+    .await;
+    assert!(!bob.node.can_send_offline(&pid), "its prekeys are gone");
+
+    // What Bob says next reaches the laptop and never the phone.
+    bob.groups
+        .send_text(&bob.node, &g, "after removal")
+        .unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].texts(&g).iter().any(|t| t == "after removal")
+    })
+    .await;
+    let _ = phone.node.connect(&bob.addr, None).await;
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(phone.texts(&g).iter().all(|t| t != "after removal"));
+    assert_eq!(bob.groups.held_for(&pid), 0, "nothing held for it");
 }

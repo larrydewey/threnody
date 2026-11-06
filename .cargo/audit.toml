@@ -2,16 +2,6 @@
 
 [advisories]
 ignore = [
-    # zip 0.6.6: extraction can follow symlinks out of the target directory
-    # and keep SUID/SGID bits. Only webrtc-sys-build (already its newest
-    # release, 0.3.19) uses it, at build time, to unpack LiveKit's prebuilt
-    # WebRTC archive downloaded over HTTPS from LiveKit's own releases.
-    # Nothing in Threnody extracts zip files at run time, and a tampered
-    # archive there would already run code in the build. Drop these once
-    # webrtc-sys-build moves to zip >= 9.
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
     # crypto-bigint 0.5.5: timing variability in operations meant to be
     # constant time. It comes in through zkryptium -> bls12_381_plus 0.8 ->
     # elliptic-curve 0.13, and no release of either moves off it yet

@@ -110,7 +110,7 @@ All symmetric keys derived from the handshake MUST use a domain-separated KDF.
 ### 3.3 Forward Secrecy and Post-Compromise Security
 
 - 1:1 channels use a double-ratchet (or Noise-based continuous ratchet) with hybrid PQ updates.
-- MLS groups provide their own epoch-based forward secrecy and post-compromise security.
+- MLS groups provide their own epoch-based forward secrecy. MLS gives post-compromise security only to members whose leaf keys change, and Threnody members don't yet send key updates (only the owner's key changes, with each add or removal). Until they do, a compromised member stays compromised until it is removed (Appendix F, "Member key updates").
 - WireGuard-style tunnels use ephemeral keys per session with periodic rekeying.
 
 ### 3.4 Formal Verification

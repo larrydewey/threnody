@@ -30,6 +30,7 @@ reason: 0 ended, 1 declined, 2 busy, 3 unanswered, 4 failed,
 - **Offer.** The caller picks a random non-zero 64-bit call id and a fresh 32-byte secret.
 - **Ringing.** The callee says it is ringing. Offers from someone not accepted (a message request) never ring. They get no answer at all, so a stranger can't tell whether we're there.
 - **Busy.** An offer while a call is in progress gets `busy`.
+- **Both calling at once.** When two people call each other at the same moment, each receives the other's offer while its own still rings. Rather than both answering `busy`, both sides keep the call with the higher call id: its caller ignores the other offer, and the other side ends its own call (sending `hangup`) and rings with the offer it received.
 - **Answer.** The callee answers with its own fresh secret.
 - **Signal.** This carries the media layer's session descriptions and ICE candidates. It is tracked, so it survives a replaced session. Apps never see it, and neither do their logs.
 - **Reaction.** One emoji, at most 32 bytes with no control characters or whitespace, that both apps float up over the call's video for a few seconds. It's only accepted in an answered call, and reactions arriving less than 150 ms after the last one are dropped, so a peer can't flood the screen. It isn't stored or shown anywhere else. A peer that predates it rejects it as an unknown op, and nothing floats there.

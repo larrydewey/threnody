@@ -33,7 +33,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::node::{Node, TunnelPeer};
+use crate::node::{Node, TunnelPeer, has_endpoint};
 
 /// How often WireGuard's timers run (handshakes, keepalives, expiry).
 const TICK: Duration = Duration::from_millis(250);
@@ -250,7 +250,9 @@ async fn send(node: &Node, udp: &UdpSocket, id: &PublicIdentity, peer: &Peer, pa
     // Data packets carry at least one byte more than a bare keepalive.
     let data = packet.first() == Some(&4) && packet.len() > 32;
     let over_session = node.send_tunnel_packet(id, packet);
-    if !data || !over_session {
+    // No UDP endpoint yet (learned over Bluetooth): only the session, until
+    // the peer's packets show where it is.
+    if (!data || !over_session) && has_endpoint(&peer.endpoint) {
         let _ = udp.send_to(packet, mapped(peer.endpoint)).await;
     }
 }

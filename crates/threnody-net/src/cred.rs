@@ -26,6 +26,8 @@ use crate::node::{Event, Node, lock};
 const STATE: &str = "credentials";
 /// Exchanges waiting for the user or the peer, per kind.
 const MAX_PENDING: usize = 64;
+/// Of those waiting for the user, from one peer.
+const MAX_PENDING_PER_PEER: usize = 8;
 
 /// A held credential, as apps show it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,8 +66,8 @@ pub(crate) struct CredState {
     offered: HashMap<u64, (PublicIdentity, String, Profile, u32)>,
     /// Offers made to us, waiting for the user.
     offers: HashMap<u64, (CredentialOffer, IssuerKey)>,
-    /// Offers we accepted: id -> (issuer peer, our secrets, its key).
-    requested: HashMap<u64, (PublicIdentity, Request, IssuerKey)>,
+    /// Offers we accepted: id -> (the offer, our secrets, its key).
+    requested: HashMap<u64, (CredentialOffer, Request, IssuerKey)>,
     /// Presentations we asked for: id -> (peer, schema, keys, nonce).
     asked: HashMap<u64, (PublicIdentity, String, Vec<String>, [u8; 32])>,
     /// Requests for our presentations, waiting for the user.
@@ -188,7 +190,7 @@ impl Node {
         )?;
         lock(&self.shared.creds)
             .requested
-            .insert(id, (offer.peer, req, key));
+            .insert(id, (offer, req, key));
         Ok(())
     }
 
@@ -343,12 +345,18 @@ impl Node {
                     attributes,
                     expires_day,
                 };
-                {
+                let taken = self.may_wait(&peer) && {
                     let mut st = lock(&self.shared.creds);
-                    if st.offers.len() >= MAX_PENDING {
-                        return;
+                    let theirs = st.offers.values().filter(|(o, _)| o.peer == peer).count();
+                    let room = st.offers.len() < MAX_PENDING && theirs < MAX_PENDING_PER_PEER;
+                    if room {
+                        st.offers.insert(id, (offer.clone(), key));
                     }
-                    st.offers.insert(id, (offer.clone(), key));
+                    room
+                };
+                if !taken {
+                    let _ = self.cred_send(&peer, &CredMsg::Decline { id });
+                    return;
                 }
                 self.emit(Event::CredentialOffered { offer });
             }
@@ -374,12 +382,25 @@ impl Node {
                 let pending = {
                     let mut st = lock(&self.shared.creds);
                     match st.requested.get(&id) {
-                        Some((p, ..)) if *p == peer => st.requested.remove(&id),
+                        Some((o, ..)) if o.peer == peer => st.requested.remove(&id),
                         _ => None,
                     }
                 };
-                let Some((_, req, key)) = pending else { return };
+                let Some((offer, req, key)) = pending else {
+                    return;
+                };
                 let cred = Issued::decode(&issued).and_then(|i| req.finish(&key, &i));
+                // Exactly what the user accepted: another expiry, schema or
+                // a hidden extra attribute shows in every presentation, so
+                // the issuer could tell this holder's apart.
+                let cred = cred.and_then(|c| {
+                    let same = c.header.schema == offer.schema
+                        && c.header.expires_day == offer.expires_day
+                        && c.attributes == offer.attributes;
+                    same.then_some(c).ok_or(threnody_core::Error::Malformed(
+                        "the issuer signed something other than its offer",
+                    ))
+                });
                 match cred {
                     Ok(cred) => {
                         let schema = cred.header.schema.clone();
@@ -421,12 +442,18 @@ impl Node {
                     schema,
                     keys,
                 };
-                {
+                let taken = self.may_wait(&peer) && {
                     let mut st = lock(&self.shared.creds);
-                    if st.asks.len() >= MAX_PENDING {
-                        return;
+                    let theirs = st.asks.values().filter(|(a, _)| a.peer == peer).count();
+                    let room = st.asks.len() < MAX_PENDING && theirs < MAX_PENDING_PER_PEER;
+                    if room {
+                        st.asks.insert(id, (ask.clone(), nonce));
                     }
-                    st.asks.insert(id, (ask.clone(), nonce));
+                    room
+                };
+                if !taken {
+                    let _ = self.cred_send(&peer, &CredMsg::Decline { id });
+                    return;
                 }
                 self.emit(Event::CredentialAsked { ask });
             }
@@ -452,6 +479,14 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Whether an offer or ask from `peer` may wait for the user: only
+    /// from someone whose messages are accepted. A stranger's would show
+    /// past the message-request gate, one notification each. Anything
+    /// turned away is declined, so the peer hears of it.
+    fn may_wait(&self, peer: &PublicIdentity) -> bool {
+        self.is_accepted(peer)
     }
 
     fn check_proof(
@@ -492,6 +527,143 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_node(dir: &tempfile::TempDir) -> Node {
+        let home = threnody_core::store::Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+        .0
+    }
+
+    fn offer(from: &threnody_core::Identity, id: u64) -> Vec<u8> {
+        CredMsg::Offer {
+            id,
+            key: Issuer::new(from, 0).unwrap().key().encode().unwrap(),
+            schema: "example/member/1".into(),
+            attributes: vec![("member".into(), "yes".into())],
+            expires_day: 99_999,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn ask(id: u64) -> Vec<u8> {
+        CredMsg::Ask {
+            id,
+            schema: "example/member/1".into(),
+            keys: vec!["member".into()],
+            nonce: [0; 32],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    async fn next(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+        pred: impl Fn(&Event) -> bool,
+    ) -> Event {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let e = rx.recv().await.expect("event stream open");
+                if pred(&e) {
+                    return e;
+                }
+            }
+        })
+        .await
+        .expect("expected event did not arrive")
+    }
+
+    #[tokio::test]
+    async fn holders_take_only_what_was_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let home = threnody_core::store::Home::new(dir.path().join(name));
+            let identity = home.create_identity(None).unwrap();
+            Node::new(crate::NodeConfig {
+                home,
+                identity,
+                policy: crate::AcceptPolicy::Anyone,
+                constant_rate: None,
+                tunnel_port: None,
+            })
+            .unwrap()
+        };
+        let (issuer, mut irx) = open("issuer");
+        let (holder, mut hrx) = open("holder");
+        let addr = holder.listen("127.0.0.1:0").await.unwrap().to_string();
+        let hid = issuer.connect(&addr, None).await.unwrap();
+        holder.accept_contact(&issuer.identity());
+        // Features are exchanged in the first messages.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let attrs = vec![("member".to_owned(), "yes".to_owned())];
+        let today = credential::day(now_ms());
+        for tamper in [
+            |o: &mut (PublicIdentity, String, Profile, u32)| o.3 += 1,
+            |o: &mut (PublicIdentity, String, Profile, u32)| o.1.push('2'),
+            |o: &mut (PublicIdentity, String, Profile, u32)| o.2.push(("x".into(), "1".into())),
+        ] {
+            let id = issuer
+                .offer_credential(&hid, "example/member/1", attrs.clone(), today + 30)
+                .unwrap();
+            // The issuer signs something other than what it offered: a
+            // different expiry or a hidden attribute could mark this
+            // holder's presentations.
+            tamper(lock(&issuer.shared.creds).offered.get_mut(&id).unwrap());
+            next(&mut hrx, |e| matches!(e, Event::CredentialOffered { .. })).await;
+            holder.accept_credential_offer(id).unwrap();
+            next(&mut hrx, |e| {
+                matches!(
+                    e,
+                    Event::CredentialFailed { .. } | Event::CredentialReceived { .. }
+                )
+            })
+            .await;
+            assert!(holder.credentials().is_empty());
+        }
+        let id = issuer
+            .offer_credential(&hid, "example/member/1", attrs.clone(), today + 30)
+            .unwrap();
+        next(&mut hrx, |e| matches!(e, Event::CredentialOffered { .. })).await;
+        holder.accept_credential_offer(id).unwrap();
+        next(&mut hrx, |e| matches!(e, Event::CredentialReceived { .. })).await;
+        assert_eq!(holder.credentials().len(), 1);
+        let _ = &mut irx;
+    }
+
+    #[tokio::test]
+    async fn offers_and_asks_wait_only_from_accepted_peers_and_only_so_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node(&dir);
+        // A stranger's offers and asks are message requests' business.
+        let stranger = threnody_core::Identity::generate();
+        node.on_credential(stranger.public(), &offer(&stranger, 1));
+        node.on_credential(stranger.public(), &ask(2));
+        assert!(node.credential_offers().is_empty());
+        assert!(node.credential_asks().is_empty());
+        // An accepted peer can't take every slot either.
+        let friend = threnody_core::Identity::generate();
+        node.accept_contact(&friend.public());
+        for id in 0..100 {
+            node.on_credential(friend.public(), &offer(&friend, 10 + id));
+            node.on_credential(friend.public(), &ask(1000 + id));
+        }
+        assert_eq!(node.credential_offers().len(), MAX_PENDING_PER_PEER);
+        assert_eq!(node.credential_asks().len(), MAX_PENDING_PER_PEER);
+        let other = threnody_core::Identity::generate();
+        node.accept_contact(&other.public());
+        node.on_credential(other.public(), &offer(&other, 5000));
+        node.on_credential(other.public(), &ask(5001));
+        assert_eq!(node.credential_offers().len(), MAX_PENDING_PER_PEER + 1);
+        assert_eq!(node.credential_asks().len(), MAX_PENDING_PER_PEER + 1);
+    }
 
     #[test]
     fn held_credentials_round_trip() {

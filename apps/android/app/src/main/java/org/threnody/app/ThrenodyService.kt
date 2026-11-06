@@ -106,6 +106,8 @@ class ThrenodyService : Service() {
         private const val CHANNEL_WAKE = "wake"
         private const val ID_SERVICE = 1
         private const val ID_MESSAGE = 2
+        /** What a notification says when it may not say more. */
+        private const val NEW = "New message"
 
         fun start(ctx: Context) {
             ctx.startForegroundService(Intent(ctx, ThrenodyService::class.java))
@@ -130,13 +132,20 @@ class ThrenodyService : Service() {
             }
         }
 
-        /** Shows an incoming message while its chat isn't on screen. */
-        fun notifyMessage(ctx: Context, key: String, device: String, from: String, text: String, persona: String? = null) {
+        /**
+         * Shows an incoming message while its chat isn't on screen. A
+         * [disappearing] message's text is left out: the notification
+         * would outlive it.
+         */
+        fun notifyMessage(
+            ctx: Context, key: String, device: String, from: String, text: String, persona: String? = null,
+            disappearing: Boolean = false,
+        ) {
             val open = Intent(ctx, ChatActivity::class.java)
                 .putExtra(ChatActivity.KEY, key)
                 .putExtra(ChatActivity.DEVICE, device)
                 .putExtra(ChatActivity.PERSONA, persona)
-            post(ctx, notificationKey(key, persona), titled(from, persona), text, open)
+            post(ctx, notificationKey(key, persona), titled(from, persona), if (disappearing) NEW else text, open)
         }
 
         /** About this device's account (it was removed from it); opens the app. */
@@ -164,19 +173,24 @@ class ThrenodyService : Service() {
         private fun titled(title: String, persona: String?): String =
             if (persona == null) title else "🎭 ${Threnody.personaLabels[persona] ?: "Anonymous"} · $title"
 
-        /** One notification per conversation [key], opening [open] above the list. */
+        /**
+         * One notification per conversation [key], opening [open] above the
+         * list. With private notifications (on unless turned off) it says
+         * only that something arrived, not who or what, wherever it shows.
+         */
         private fun post(ctx: Context, key: String, title: String, text: String, open: Intent) {
             channels(ctx)
+            val hidden = Privacy.privateNotifications(ctx)
             // On the lock screen: only that something arrived, not who or what.
             val public = Notification.Builder(ctx, CHANNEL_MESSAGES)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("Threnody")
-                .setContentText("New message")
+                .setContentText(NEW)
                 .build()
             val n = Notification.Builder(ctx, CHANNEL_MESSAGES)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(title)
-                .setContentText(text)
+                .setContentTitle(if (hidden) "Threnody" else title)
+                .setContentText(if (hidden) NEW else text)
                 .setVisibility(Notification.VISIBILITY_PRIVATE)
                 .setPublicVersion(public)
                 .setContentIntent(
@@ -195,12 +209,15 @@ class ThrenodyService : Service() {
             }
         }
 
-        /** A group message or invitation; opens the group. */
-        fun notifyGroup(ctx: Context, group: String, title: String, text: String, persona: String? = null) {
+        /** A group message or invitation; opens the group. As for [notifyMessage]. */
+        fun notifyGroup(
+            ctx: Context, group: String, title: String, text: String, persona: String? = null,
+            disappearing: Boolean = false,
+        ) {
             val open = Intent(ctx, ChatActivity::class.java)
                 .putExtra(ChatActivity.GROUP, group)
                 .putExtra(ChatActivity.PERSONA, persona)
-            post(ctx, notificationKey(group, persona), titled(title, persona), text, open)
+            post(ctx, notificationKey(group, persona), titled(title, persona), if (disappearing) NEW else text, open)
         }
 
         fun clearNotification(ctx: Context, key: String) {

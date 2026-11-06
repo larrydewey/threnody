@@ -290,8 +290,15 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     let (bob, mut brx) = node(&dir, "bob");
     let b = bob.identity();
     let (cut_a, _) = lossy_link(&alice, &bob).await;
-    let conv = alice.conversation_for(&b);
-    let last = |a: &Node| a.history(conv).unwrap().entries().last().cloned().unwrap();
+    // Looked up each time: it moves to Bob's account once his chain arrives.
+    let last = |a: &Node| {
+        a.history(a.conversation_for(&b))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
 
     alice.send_text(&b, "tick").unwrap();
     let e = next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
@@ -377,6 +384,16 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     assert!(data.ends_with(&[0x12, 0x34, 0xFF, 0xD9]));
     assert!(sensitive && caption == "the view" && album == 5);
     assert_eq!(last(&alice).text, "the view");
+    // A photo format the node can't strip isn't sent with its metadata,
+    // whatever its name says: apps convert it to JPEG first.
+    let mut heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic".to_vec();
+    heic.extend(b"Exif\0\0GPS 51.5N");
+    let heic_file = threnody_net::history::OutgoingFile {
+        name: "IMG.jpg".into(),
+        data: heic.clone(),
+        ..Default::default()
+    };
+    assert!(alice.send_file(&b, heic_file).is_err());
     // Switched off, it goes as it is.
     alice.set_strip_metadata(false);
     send_photo(photo.clone());
@@ -436,4 +453,45 @@ async fn text_sent_with_no_way_through_waits_for_a_session() {
     next(&mut brx, |e| is_text(e, "when you're back")).await;
     next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
     wait_for(|| alice.unacked(&b) == 0).await;
+}
+
+/// A text the receiver can't store (a full disk, no file descriptors
+/// left) is not acknowledged, so the sender keeps it and sends it again.
+#[tokio::test]
+async fn a_message_that_could_not_be_stored_is_not_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b = bob.identity();
+    lossy_link(&alice, &bob).await;
+    alice.send(&b, text("warm up")).unwrap();
+    next(&mut brx, |e| is_text(e, "warm up")).await;
+    wait_for(|| alice.unacked(&b) == 0).await;
+
+    // Bob's storage fails: a directory sits where the conversation's
+    // file is written first.
+    let stuck = std::fs::read_dir(dir.path().join("bob"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .find(|n| n.starts_with("hist-p-") && n.ends_with(".state"))
+        .map(|n| dir.path().join("bob").join(n.replace(".state", ".tmp")))
+        .expect("the conversation is stored");
+    std::fs::create_dir(&stuck).unwrap();
+    alice.send(&b, text("not kept")).unwrap();
+    none(&mut brx, |e| is_text(e, "not kept")).await;
+    assert_eq!(alice.unacked(&b), 1, "unacknowledged, Alice keeps it");
+
+    // Storage works again: the next session carries it.
+    std::fs::remove_dir(&stuck).unwrap();
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    alice
+        .connect(&addr.to_string(), Some(b.fingerprint()))
+        .await
+        .unwrap();
+    next(&mut brx, |e| is_text(e, "not kept")).await;
+    wait_for(|| alice.unacked(&b) == 0).await;
+    let h = bob
+        .history(bob.conversation_for(&alice.identity()))
+        .unwrap();
+    assert!(h.entries().iter().any(|e| e.text == "not kept"));
 }

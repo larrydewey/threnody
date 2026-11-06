@@ -30,14 +30,25 @@ pub fn get(home: &Path) -> Option<Secret> {
 
 /// Makes a random passphrase for `home` and stores it, replacing any old one.
 pub fn create(home: &Path) -> Result<Secret, String> {
-    let e = entry(home)?;
+    let pw = random();
+    store(home, &pw)?;
+    Ok(pw)
+}
+
+/// A random passphrase, for [`store`].
+pub fn random() -> Secret {
     let bytes: [u8; 32] = threnody_core::crypto::random_bytes();
-    let pw = Secret(bytes.iter().map(|b| format!("{b:02x}")).collect());
+    Secret(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Stores `pw` as `home`'s passphrase, replacing any old one.
+pub fn store(home: &Path, pw: &Secret) -> Result<(), String> {
+    let e = entry(home)?;
     e.set_password(&pw.0)
         .map_err(|e| format!("storing the key in the keyring: {e}"))?;
     // Only rely on it once it reads back.
     match e.get_password() {
-        Ok(back) if back == pw.0 => Ok(pw),
+        Ok(back) if back == pw.0 => Ok(()),
         _ => Err("the keyring did not keep the key".into()),
     }
 }

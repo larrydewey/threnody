@@ -37,7 +37,10 @@ use tokio::task::JoinSet;
 use crate::error::{NetError, Result};
 use crate::node::{Event, Node, lock};
 use crate::quic::{Quic, canonical};
-use crate::reach::{Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply};
+use crate::reach::{
+    ReachConfig, Urge, is_global_v6, is_public, krpc_ping, parse_krpc_reply, probes_for,
+};
+use crate::relay::Hidden;
 
 /// How long the side that didn't move keeps trying after losing a session.
 pub(crate) const RECOVER_FOR: Duration = Duration::from_secs(60);
@@ -46,6 +49,9 @@ const SLOT_POLL: Duration = Duration::from_millis(1500);
 /// The longest silence on a session when cover traffic is off: an empty
 /// frame goes out at least this often, so the lease means something.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(10);
+/// The longest heartbeat a peer may announce: cover traffic slower than
+/// this still sends a frame this often.
+pub(crate) const MAX_BEAT: Duration = Duration::from_secs(120);
 /// Missed heartbeats before a session counts as lost. QUIC and TCP
 /// retransmit, so a frame arrives late rather than not at all.
 const LEASE_BEATS: u32 = 2;
@@ -64,6 +70,9 @@ const HOLE_KEEPALIVE: Duration = Duration::from_secs(20);
 /// address. An idle mobile radio takes a second or more to wake, so the
 /// first IPv4 answers came too late at 1.5 s in testing.
 const STANDBY_WAIT: Duration = Duration::from_secs(4);
+/// A contact's `Paths` wakes the keepalive round at most this often: a
+/// contact sending one after another can't keep our radio busy.
+const PATHS_KICK_GAP: Duration = Duration::from_secs(10);
 /// The recovery slot record is per session, so it has no epochs.
 const SLOT_EPOCH: u64 = 0;
 /// State file for recovery slots and peers' paths, so a restarted app can
@@ -152,6 +161,15 @@ struct Standby {
     reflected: HashMap<SocketAddr, SocketAddr>,
 }
 
+/// What a recovery slot watcher reads: the slot of the session lost last,
+/// when that was (ms), and when it began watching for it.
+#[derive(Clone, Copy)]
+struct Watch {
+    slot: [u8; 32],
+    lost_ms: u64,
+    since: Instant,
+}
+
 pub(crate) struct RecoverState {
     peers: Mutex<HashMap<PublicIdentity, PeerPaths>>,
     standby: Mutex<Option<Standby>>,
@@ -168,6 +186,13 @@ pub(crate) struct RecoverState {
     on_mobile: AtomicBool,
     /// Wakes the keepalive loop (a hole to open now).
     kick: Notify,
+    /// Recovery slots being watched, one watcher per peer.
+    watching: Mutex<HashMap<PublicIdentity, Watch>>,
+    /// When a contact's `Paths` last woke it.
+    paths_kick: Mutex<Option<Instant>>,
+    /// A `learn_standby` is running (one at a time), and whether it was
+    /// asked for again meanwhile.
+    learning: Mutex<(bool, bool)>,
     /// When the current recovery began, for the timings in the log.
     t0: Mutex<Option<Instant>>,
 }
@@ -184,14 +209,32 @@ impl RecoverState {
             force: AtomicBool::new(false),
             on_mobile: AtomicBool::new(false),
             kick: Notify::new(),
+            watching: Mutex::default(),
+            paths_kick: Mutex::default(),
+            learning: Mutex::default(),
             t0: Mutex::default(),
         }
     }
 }
 
+/// Link ticks between heartbeats inside a relay or onion circuit: a
+/// heartbeat frame there (its ratchet header alone is over 2 KB) takes
+/// two cells, and a constant-rate link carries one per tick, so beating
+/// at the link's rate would queue cells on it without end.
+const INNER_BEAT_TICKS: u32 = 16;
+
+/// The heartbeat of a session inside a relay or onion circuit, over links
+/// sending one frame per `rate` (or, with no cover, as fast as they like).
+pub(crate) fn inner_beat_for(rate: Option<Duration>) -> Duration {
+    rate.map_or(HEARTBEAT, |r| {
+        (r * INNER_BEAT_TICKS).clamp(HEARTBEAT, MAX_BEAT)
+    })
+}
+
 /// The lease for a peer whose heartbeat is `beat_ms`.
 pub(crate) fn lease_for(beat_ms: u64) -> Duration {
-    Duration::from_millis(beat_ms.clamp(500, 120_000)) * LEASE_BEATS + Duration::from_secs(2)
+    Duration::from_millis(beat_ms.clamp(500, MAX_BEAT.as_millis() as u64)) * LEASE_BEATS
+        + Duration::from_secs(2)
 }
 
 fn slot_key(slot: &[u8; 32], writer: &PublicIdentity) -> rendezvous::RecordKeys {
@@ -225,12 +268,24 @@ impl Node {
         self.emit(Event::ReachNote { note });
     }
 
-    /// Our heartbeat: the cover-traffic interval, else [`HEARTBEAT`].
+    /// Our heartbeat: the cover-traffic interval, else [`HEARTBEAT`]; at
+    /// most [`MAX_BEAT`]. Sessions send at least this often, and the
+    /// `Paths` we send say so.
     pub(crate) fn beat(&self) -> Duration {
-        self.constant_rate().unwrap_or(HEARTBEAT).min(HEARTBEAT)
+        self.constant_rate().unwrap_or(HEARTBEAT).min(MAX_BEAT)
     }
 
-    fn our_paths(&self) -> Paths {
+    /// Our heartbeat in a session inside a relay or onion circuit
+    /// (`inner`), else on a link.
+    pub(crate) fn beat_for(&self, inner: bool) -> Duration {
+        if inner {
+            inner_beat_for(self.constant_rate())
+        } else {
+            self.beat()
+        }
+    }
+
+    fn our_paths(&self, inner: bool) -> Paths {
         let main = lock(&self.rdv().inner).candidates.clone();
         let standby = if self.rec().warm.load(Ordering::Relaxed) {
             lock(&self.rec().standby)
@@ -243,26 +298,28 @@ impl Node {
         Paths {
             main,
             standby,
-            beat_ms: self.beat().as_millis() as u64,
+            beat_ms: self.beat_for(inner).as_millis() as u64,
         }
     }
 
-    /// The `Paths` message for a peer, when rendezvous is on.
-    pub(crate) fn paths_message(&self) -> Option<AppMessage> {
+    /// The `Paths` message for a peer, when rendezvous is on: for a
+    /// session inside a relay or onion circuit when `inner`, which beats
+    /// more slowly.
+    pub(crate) fn paths_message(&self, inner: bool) -> Option<AppMessage> {
         if !self.reach_enabled() {
             return None;
         }
-        self.our_paths().encode().ok().map(AppMessage::Paths)
+        self.our_paths(inner).encode().ok().map(AppMessage::Paths)
     }
 
     /// Tells every approved peer on a direct session our current paths.
     pub(crate) fn broadcast_paths(&self) {
-        let Some(msg) = self.paths_message() else {
-            return;
-        };
         for s in self.sessions() {
-            if self.supports(&s.peer, FEATURE_PATHS) && self.shared.mutual(&s.peer) {
-                let _ = self.send(&s.peer, msg.clone());
+            if self.supports(&s.peer, FEATURE_PATHS)
+                && self.shared.mutual(&s.peer)
+                && let Some(msg) = self.paths_message(s.via.is_some())
+            {
+                let _ = self.send(&s.peer, msg);
             }
         }
     }
@@ -306,17 +363,32 @@ impl Node {
         }
         let paths = Paths::decode(payload).ok()?;
         let lease = lease_for(paths.beat_ms);
-        let (new_standby, new_main) = {
+        let (new_standby, new_main, changed) = {
             let mut peers = lock(&self.rec().peers);
             let p = peers.entry(peer).or_default();
-            let changed = p.theirs.standby != paths.standby;
+            let standby = p.theirs.standby != paths.standby;
             let main = p.theirs.main != paths.main;
+            let changed = p.theirs != paths;
             p.theirs = paths;
             p.updated_ms = now_ms();
-            (changed && !p.theirs.standby.is_empty(), main)
+            (standby && !p.theirs.standby.is_empty(), main, changed)
         };
-        self.save_recovery();
-        if new_main {
+        // The same paths again (each session sends them) change nothing
+        // worth a write; the time they came is saved with the next change.
+        if changed {
+            self.save_recovery();
+        }
+        // A contact sending one `Paths` after another gets one round per
+        // [`PATHS_KICK_GAP`]; the regular rounds pick up the rest.
+        let kick = (new_main || new_standby) && {
+            let mut last = lock(&self.rec().paths_kick);
+            let due = last.is_none_or(|t| t.elapsed() >= PATHS_KICK_GAP);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if new_main && kick {
             // Open our standby socket's hole toward its new addresses now:
             // the next round may come after the network has changed.
             self.rec().force.store(true, Ordering::Relaxed);
@@ -341,7 +413,9 @@ impl Node {
                 ),
             });
             // Open our side of its standby hole now, not at the next keepalive.
-            self.rec().kick.notify_one();
+            if kick {
+                self.rec().kick.notify_one();
+            }
         }
         Some(lease)
     }
@@ -386,9 +460,26 @@ impl Node {
             self.punch(peer, &targets, false, Urge::Lost);
         }
         if let Some(slot) = paths.slot {
-            let node = self.clone();
-            tokio::spawn(async move { node.watch_slot(peer, slot, lost_ms).await });
+            self.watch(peer, slot, lost_ms);
         }
+    }
+
+    /// Watches `peer`'s recovery `slot` for [`RECOVER_FOR`]. A peer
+    /// already watched keeps its one watcher, now reading this slot for
+    /// another [`RECOVER_FOR`]: sessions lost one after another don't add
+    /// DHT reads. True if a watcher started.
+    fn watch(&self, peer: PublicIdentity, slot: [u8; 32], lost_ms: u64) -> bool {
+        let w = Watch {
+            slot,
+            lost_ms,
+            since: Instant::now(),
+        };
+        if lock(&self.rec().watching).insert(peer, w).is_some() {
+            return false;
+        }
+        let node = self.clone();
+        tokio::spawn(async move { node.watch_slot(peer).await });
+        true
     }
 
     /// A call's media stopped arriving over a session that still looks up:
@@ -408,24 +499,43 @@ impl Node {
         !targets.is_empty() && self.punch(peer, &targets, false, Urge::Moved)
     }
 
-    /// Reads `peer`'s recovery slot every [`SLOT_POLL`] until it is back or
-    /// [`RECOVER_FOR`] has passed; new addresses there go to the punch.
-    async fn watch_slot(&self, peer: PublicIdentity, slot: [u8; 32], lost_ms: u64) {
-        let start = Instant::now();
-        let rk = slot_key(&slot, &peer);
-        let key = SigningKey::from_bytes(&rk.signing_seed)
-            .verifying_key()
-            .to_bytes();
+    /// Reads `peer`'s recovery slot (see [`Node::watch`]) every
+    /// [`SLOT_POLL`] until it is back or [`RECOVER_FOR`] has passed; new
+    /// addresses there go to the punch.
+    async fn watch_slot(&self, peer: PublicIdentity) {
         let mut seen = 0;
-        while start.elapsed() < RECOVER_FOR && !self.is_closed() {
-            if self.connected(&peer) {
-                self.timed(format_args!("{} is back", peer.fingerprint()));
+        let mut current = None;
+        loop {
+            let back = self.connected(&peer);
+            let w = {
+                let mut watching = lock(&self.rec().watching);
+                let w = watching
+                    .get(&peer)
+                    .copied()
+                    .filter(|w| !back && w.since.elapsed() < RECOVER_FOR && !self.is_closed());
+                if w.is_none() {
+                    watching.remove(&peer);
+                }
+                w
+            };
+            let Some(w) = w else {
+                if back {
+                    self.timed(format_args!("{} is back", peer.fingerprint()));
+                }
                 return;
+            };
+            if current != Some(w.slot) {
+                current = Some(w.slot);
+                seen = 0;
             }
+            let rk = slot_key(&w.slot, &peer);
+            let key = SigningKey::from_bytes(&rk.signing_seed)
+                .verifying_key()
+                .to_bytes();
             if let Some(dht) = self.dht()
                 && let Some(item) = crate::reach::get_latest(&dht, &key, &rk.salt).await
                 && let Ok(rec) = rendezvous::open_record(&rk, item.value())
-                && rec.issued_ms + 10_000 >= lost_ms
+                && rec.issued_ms + 10_000 >= w.lost_ms
                 && rec.issued_ms > seen
             {
                 seen = rec.issued_ms;
@@ -447,6 +557,9 @@ impl Node {
     /// every recovery slot and punch toward the peers we lost.
     pub fn network_switched(&self, to_standby: bool) {
         *lock(&self.rec().t0) = Some(Instant::now());
+        // Sessions from before may be dead: no first hops (see below).
+        let changed = now_ms();
+        self.rdv().changed_ms.store(changed, Ordering::Relaxed);
         self.timed(if to_standby {
             "network changed to the standby network"
         } else {
@@ -458,6 +571,11 @@ impl Node {
             .filter(|(p, pp)| self.shared.mutual(p) && pp.updated_ms >= recent)
             .map(|(p, pp)| (*p, pp.clone()))
             .collect();
+        // The standby path is part of internet reachability: with it off,
+        // nothing is dialed from the new network but what the user dials.
+        if !self.reach_enabled() {
+            return;
+        }
         let standby = lock(&self.rec().standby).as_ref().map(|s| s.quic.clone());
         if to_standby && let Some(quic) = standby {
             for (peer, pp) in &peers {
@@ -475,11 +593,17 @@ impl Node {
                     continue;
                 }
                 let (node, quic, peer) = (self.clone(), quic.clone(), *peer);
-                tokio::spawn(async move { node.dial_through(&quic, peer, &targets).await });
+                // Through an onion circuit once one can be built (the
+                // first peer back gives the others their first hop); else
+                // straight through the standby hole.
+                tokio::spawn(async move {
+                    if let Hidden::Direct(_claim) =
+                        node.reconnect_hidden(&peer, changed, true).await
+                    {
+                        node.dial_through(&quic, peer, &targets).await;
+                    }
+                });
             }
-        }
-        if !self.reach_enabled() {
-            return;
         }
         self.network_changed();
         let node = self.clone();
@@ -611,7 +735,8 @@ impl Node {
 
     /// The socket from [`Node::standby_socket`] is bound to the standby
     /// network, whose global IPv6 addresses are `ipv6`. Opens a QUIC
-    /// endpoint on it and learns its outside address.
+    /// endpoint on it and, with internet reachability on, learns its
+    /// outside address.
     pub fn standby_bound(&self, ipv6: Vec<IpAddr>) -> Result<()> {
         let sock = lock(&self.rec().pending)
             .take()
@@ -693,13 +818,38 @@ impl Node {
     /// and tells peers when it changed (after a long idle gap the mobile
     /// network may hand out a new port).
     async fn learn_standby(&self) {
-        let Some(cfg) = self.reach_config() else {
+        // DHT pings from the mobile network are internet reachability too.
+        let Some(cfg) = self.reach_config().filter(|_| self.reach_enabled()) else {
             return;
         };
-        let targets = self.reflectors(&cfg).await;
+        // One at a time: two would clear each other's pings. Asked for
+        // again meanwhile (a new standby socket), the running one goes again.
+        {
+            let mut l = lock(&self.rec().learning);
+            if l.0 {
+                l.1 = true;
+                return;
+            }
+            *l = (true, false);
+        }
+        loop {
+            self.learn_standby_with(&cfg).await;
+            let mut l = lock(&self.rec().learning);
+            if !std::mem::take(&mut l.1) {
+                l.0 = false;
+                break;
+            }
+        }
+    }
+
+    async fn learn_standby_with(&self, cfg: &ReachConfig) {
+        let targets = self.reflectors(cfg).await;
         let Some(quic) = lock(&self.rec().standby).as_ref().map(|s| s.quic.clone()) else {
             return;
         };
+        // A standby socket just bound isn't writable yet: the pings would
+        // all fail, and its address wait for the next keepalive round.
+        let _ = tokio::time::timeout(Duration::from_secs(1), quic.writable()).await;
         {
             let mut st = lock(&self.rec().standby);
             let Some(s) = st.as_mut() else { return };
@@ -831,10 +981,10 @@ impl Node {
             .map(|(p, pp)| (*p, pp.clone()))
             .collect();
         for (peer, pp) in peers {
-            let Some(d) = contacts
+            let Some((d, timed)) = contacts
                 .get(&peer)
                 .filter(|c| c.mutually_approved())
-                .and_then(|c| c.discovery_key)
+                .and_then(|c| c.discovery_key.map(|d| (d, c.timed_probes)))
             else {
                 continue;
             };
@@ -845,21 +995,240 @@ impl Node {
                     .chain(pp.theirs.main.iter().map(|c| c.addr))
                     .filter(|a| is_public(&a.ip()));
                 for t in targets.take(8) {
-                    let _ = s.send_raw(t, &rendezvous::probe(&d, &me));
+                    for p in probes_for(&d, &me, timed) {
+                        let _ = s.send_raw(t, &p);
+                    }
                 }
             }
             if let Some(m) = &main {
-                for c in pp.theirs.standby.iter().take(8) {
-                    let _ = m.send_raw(c.addr, &rendezvous::probe(&d, &me));
+                for t in standby_targets(&pp, now_ms()) {
+                    for p in probes_for(&d, &me, timed) {
+                        let _ = m.send_raw(t, &p);
+                    }
                 }
             }
         }
     }
 }
 
+/// Where our main socket keeps a hole open toward `pp`'s standby path:
+/// its public standby addresses (at most 8), while it could still dial
+/// through them, that is, until a day after its last `Paths` or session
+/// (as [`Node::network_switched`] dials only peers that recent). A peer
+/// gone longer, or one naming our LAN, loopback or a broadcast address,
+/// gets nothing.
+fn standby_targets(pp: &PeerPaths, now: u64) -> Vec<SocketAddr> {
+    if now.saturating_sub(pp.updated_ms) > ANNOUNCE_WITHIN_MS {
+        return Vec::new();
+    }
+    pp.theirs
+        .standby
+        .iter()
+        .map(|c| c.addr)
+        .filter(|a| is_public(&a.ip()))
+        .take(8)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standby_holes_go_only_to_public_addresses_of_recent_peers() {
+        let at = |a: &str| Candidate {
+            kind: CandidateKind::Reflexive,
+            addr: a.parse().unwrap(),
+        };
+        let now = 10 * ANNOUNCE_WITHIN_MS;
+        let mut pp = PeerPaths {
+            updated_ms: now - 1000,
+            theirs: Paths {
+                main: vec![],
+                standby: vec![
+                    at("127.0.0.1:631"),
+                    at("192.168.1.1:53"),
+                    at("224.0.0.251:5353"),
+                    at("203.0.113.9:40000"),
+                ],
+                beat_ms: 2000,
+            },
+            ..PeerPaths::default()
+        };
+        assert_eq!(
+            standby_targets(&pp, now),
+            ["203.0.113.9:40000".parse::<SocketAddr>().unwrap()]
+        );
+        // A peer heard from over a day ago: its standby mapping is long gone.
+        pp.updated_ms = now - ANNOUNCE_WITHIN_MS - 1;
+        assert!(standby_targets(&pp, now).is_empty());
+    }
+
+    #[test]
+    fn heartbeats_inside_circuits_leave_room_on_constant_rate_links() {
+        for rate in [500, 2000, 5000, 10_000, 30_000].map(Duration::from_millis) {
+            let beat = inner_beat_for(Some(rate));
+            // A heartbeat frame inside a circuit (its ratchet header is
+            // over 2 KB) takes two cells, and a link carries one per tick:
+            // heartbeats use at most an eighth of a link, or, with very
+            // slow cover, as little as the peer's lease allows.
+            assert!(
+                beat >= rate * 16 || beat == MAX_BEAT,
+                "{beat:?} at {rate:?}"
+            );
+            assert!(beat >= rate * 4, "{beat:?} at {rate:?}");
+            // And the peer's lease, from the beat we tell it, still holds.
+            assert!(lease_for(beat.as_millis() as u64) > beat * 2);
+        }
+        assert_eq!(inner_beat_for(None), HEARTBEAT);
+    }
+
+    type Events = tokio::sync::mpsc::UnboundedReceiver<Event>;
+
+    fn test_node(dir: &tempfile::TempDir, name: &str) -> (Node, Events) {
+        let home = threnody_core::store::Home::new(dir.path().join(name));
+        let identity = home.create_identity(None).unwrap();
+        Node::new(crate::NodeConfig {
+            home,
+            identity,
+            policy: crate::AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_heartbeats_follow_the_cover_rate_they_advertise() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, mut arx) = test_node(&dir, "a");
+        let (c, mut crx) = test_node(&dir, "c");
+        // A phone on mobile data: slow cover, so a slow beat in circuits.
+        a.set_constant_rate(Some(Duration::from_secs(10)));
+        // A session inside a relay circuit (the relay itself plays no part).
+        let relay = threnody_core::Identity::generate().public();
+        let (x, y) = tokio::io::duplex(1 << 20);
+        let ((x, ax), (y, cy)) = tokio::join!(
+            async {
+                let mut x = x;
+                let ch = crate::handshake::initiate(&mut x, a.identity_ref(), None).await;
+                (x, ch.unwrap())
+            },
+            async {
+                let mut y = y;
+                let ch = crate::handshake::accept(&mut y, c.identity_ref()).await;
+                (y, ch.unwrap())
+            },
+        );
+        a.spawn_relayed_session(x, ax, relay, true);
+        c.spawn_relayed_session(y, cy, relay, false);
+        a.set_approval(&c.identity(), true).unwrap();
+        c.set_approval(&a.identity(), true).unwrap();
+        for rx in [&mut arx, &mut crx] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !matches!(
+                    rx.recv().await,
+                    Some(Event::ApprovalChanged { mutual: true, .. }) | None
+                ) {}
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // It joins Wi-Fi: faster cover, and new addresses to tell contacts.
+        // Then back to mobile data, with nothing else to tell, and then
+        // cover goes off. The lease `c` gives `a` must hold through each.
+        for rate in [Some(2), Some(10), None] {
+            a.set_constant_rate(rate.map(Duration::from_secs));
+            if rate == Some(2) {
+                a.broadcast_paths();
+            }
+            let ended = tokio::time::timeout(Duration::from_secs(600), async {
+                loop {
+                    match crx.recv().await {
+                        Some(Event::Disconnected { reason, .. }) => return reason,
+                        None => return "closed".into(),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            assert!(ended.is_err(), "ended at {rate:?} s: {ended:?}");
+            assert!(c.sessions().iter().any(|s| s.peer == a.identity()));
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_lost_one_after_another_keep_one_slot_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _arx) = test_node(&dir, "a");
+        let peer = threnody_core::Identity::generate().public();
+        assert!(a.watch(peer, [1; 32], 1));
+        for i in 2..50 {
+            assert!(!a.watch(peer, [i; 32], u64::from(i)), "a second watcher");
+        }
+        let w = lock(&a.rec().watching)[&peer];
+        assert_eq!(
+            (w.slot, w.lost_ms),
+            ([49; 32], 49),
+            "watches the latest slot"
+        );
+        // Another peer gets its own.
+        assert!(a.watch(threnody_core::Identity::generate().public(), [1; 32], 1));
+    }
+
+    /// The file `name` somewhere under `dir`.
+    fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(f) = find_file(&p, name) {
+                    return Some(f);
+                }
+            } else if p.file_name().is_some_and(|n| n == name) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn repeated_paths_neither_rewrite_state_nor_keep_waking_the_radio() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _arx) = test_node(&dir, "a");
+        let peer = threnody_core::Identity::generate().public();
+        a.update_contacts(|c| {
+            c.observe(peer, None, 0);
+            let x = c.get_mut(&peer).unwrap();
+            (x.local_approved, x.remote_approved) = (true, true);
+        });
+        let paths = |port: u16| {
+            Paths {
+                main: vec![Candidate {
+                    kind: CandidateKind::Reflexive,
+                    addr: SocketAddr::new([203, 0, 113, 4].into(), port),
+                }],
+                standby: vec![],
+                beat_ms: 2000,
+            }
+            .encode()
+            .unwrap()
+        };
+        a.on_paths(peer, &paths(1)).unwrap();
+        let state = find_file(dir.path(), "recovery.state").expect("saved");
+        assert!(a.rec().force.swap(false, Ordering::Relaxed));
+        // The same again: nothing to write.
+        std::fs::remove_file(&state).unwrap();
+        a.on_paths(peer, &paths(1)).unwrap();
+        assert!(!state.exists(), "the same paths were written again");
+        // New ones are kept, but don't force another standby round so soon.
+        a.on_paths(peer, &paths(2)).unwrap();
+        assert!(state.exists());
+        assert!(
+            !a.rec().force.load(Ordering::Relaxed),
+            "a second Paths within seconds forced another standby round"
+        );
+    }
 
     #[test]
     fn saved_peers_round_trip() {

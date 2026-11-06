@@ -183,6 +183,8 @@ pub struct Persona {
     pub home: PathBuf,
     pub port: u16,
     alive: Arc<AtomicBool>,
+    /// Keeps other nodes (`threnody --persona … run`) off its directory.
+    _lock: std::fs::File,
 }
 
 pub struct Core {
@@ -217,7 +219,11 @@ impl Core {
     ) -> Arc<Self> {
         // When the usual port is taken (the CLI running too), keep the one
         // used last time, so invites already given out keep working.
-        let fallback = Settings::load().number("port").unwrap_or(0);
+        let saved = Settings::load();
+        let fallback = saved.number("port").unwrap_or(0);
+        // Listening starts internet reachability, which mustn't join the
+        // DHT, even briefly, when the user turned it off.
+        main.set_reach_internet(saved.flag(settings::REACH));
         let port = main
             .listen(format!("0.0.0.0:{PORT}"))
             .or_else(|_| main.listen(format!("0.0.0.0:{fallback}")))
@@ -444,6 +450,20 @@ impl Core {
 
     /// This machine's address on its default network, for invites: IPv4,
     /// else a global IPv6 address on an IPv6-only network.
+    /// Our addresses on the default IPv4 and IPv6 routes: which network
+    /// we are on, as far as sessions can tell.
+    pub fn route_addrs() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+        let route = |bind: &str, to: &str| {
+            let s = std::net::UdpSocket::bind(bind).ok()?;
+            s.connect(to).ok()?;
+            Some(s.local_addr().ok()?.ip())
+        };
+        (
+            route("0.0.0.0:0", "192.0.2.1:9"),
+            route("[::]:0", "[2001:db8::1]:9"),
+        )
+    }
+
     pub fn lan_ip() -> Option<std::net::IpAddr> {
         // Connecting a UDP socket picks a route without sending anything.
         let route = |bind: &str, to: &str| {
@@ -622,9 +642,18 @@ impl Core {
     // ----- Anonymous identities -----
 
     fn open_personas(self: &Arc<Self>) {
+        let homes: HashMap<String, PathBuf> = self
+            .personas()
+            .into_iter()
+            .map(|r| (r.id, PathBuf::from(r.home)))
+            .collect();
         match self.main.burn_expired_personas() {
             Ok(burned) => {
                 for id in burned {
+                    // Its keyring entry would show it existed.
+                    if let Some(h) = homes.get(&id) {
+                        keyring::delete(h);
+                    }
                     self.say(format!(
                         "* burned expired anonymous identity {}",
                         short(&id)
@@ -648,6 +677,7 @@ impl Core {
             return Ok(());
         }
         let home = PathBuf::from(&rec.home);
+        let dir_lock = crate::lock_home(&home)?;
         let sealed =
             threnody_ffi::identity_is_sealed(rec.home.clone()).map_err(|e| e.to_string())?;
         let pw = if sealed {
@@ -663,6 +693,7 @@ impl Core {
         let node = ThrenodyNode::open(rec.home.clone(), pw, None).map_err(|e| e.to_string())?;
         let key = format!("port_{}", rec.id);
         let want = self.settings().number(&key).unwrap_or(0);
+        self.apply_privacy_to(&node, true);
         let addr = node
             .listen(format!("0.0.0.0:{want}"))
             .or_else(|_| node.listen("0.0.0.0:0".into()))
@@ -673,7 +704,6 @@ impl Core {
             .and_then(|p| p.parse().ok())
             .unwrap_or(0);
         self.settings().set_number(&key, Some(u32::from(port)));
-        self.apply_privacy_to(&node, true);
         let alive = Arc::new(AtomicBool::new(true));
         self.pump(node.clone(), Some(rec.id.clone()), alive.clone());
         node.reconnect();
@@ -685,6 +715,7 @@ impl Core {
                 home,
                 port,
                 alive,
+                _lock: dir_lock,
             },
         );
         self.say(format!(
@@ -714,24 +745,23 @@ impl Core {
         Ok(())
     }
 
-    /// Makes and starts an anonymous identity, sealed with a keyring key of
-    /// its own (as the CLI does).
+    /// Makes and starts an anonymous identity, sealed from its first
+    /// write with a keyring key of its own (as the CLI does).
     pub fn create_persona(
         self: &Arc<Self>,
         label: &str,
         expires_ms: Option<u64>,
     ) -> Result<String, String> {
+        let pw = keyring::random();
         let rec = self
             .main
-            .create_persona(label.into(), expires_ms, None)
+            .create_persona(label.into(), expires_ms, Some(pw.0.clone()))
             .map_err(|e| e.to_string())?;
-        let home = PathBuf::from(&rec.home);
-        match keyring::create(&home) {
-            Ok(pw) => {
-                threnody_ffi::change_passphrase(rec.home.clone(), None, Some(pw.0.clone()))
-                    .map_err(|e| e.to_string())?;
-            }
-            Err(e) => self.say(format!("! no keyring ({e}); its key is stored unprotected")),
+        if let Err(e) = keyring::store(&PathBuf::from(&rec.home), &pw) {
+            // Nowhere to keep its key.
+            threnody_ffi::change_passphrase(rec.home.clone(), Some(pw.0.clone()), None)
+                .map_err(|e| e.to_string())?;
+            self.say(format!("! no keyring ({e}); its key is stored unprotected"));
         }
         self.open_persona(&rec)?;
         let _ = self.ui.send_blocking(UiEvent::PersonasChanged);
@@ -800,17 +830,16 @@ impl Core {
         Ok(free_path(&dir, &name))
     }
 
-    /// Keeps a received file: photos and voice or video messages
-    /// privately, others in Downloads/Threnody. A persona keeps everything
-    /// privately.
+    /// Keeps a received file: privately as [`Keep::privately`] says,
+    /// others in Downloads/Threnody. A persona keeps everything privately.
     pub fn keep(
         &self,
         persona: Option<&str>,
         name: &str,
         data: &[u8],
-        clip: bool,
+        how: Keep,
     ) -> Option<String> {
-        let dir = if persona.is_some() || clip || is_image(name) {
+        let dir = if persona.is_some() || how.privately(name) {
             self.media_dir(persona)
         } else {
             gtk::glib::user_special_dir(gtk::glib::UserDirectory::Downloads)
@@ -852,30 +881,8 @@ impl Core {
 
     fn sweep(&self, persona: Option<&str>) {
         let Ok(node) = self.node(persona) else { return };
-        let dir = self.media_dir(persona);
-        let Ok(files) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        let mut kept: HashSet<String> = HashSet::new();
-        let mut all = Vec::new();
-        for c in node.contacts() {
-            match node.history(c.fingerprint, u32::MAX) {
-                Ok(h) => all.extend(h),
-                Err(_) => return,
-            }
-        }
-        for g in node.groups() {
-            match node.group_history(g.id, u32::MAX) {
-                Ok(h) => all.extend(h),
-                Err(_) => return,
-            }
-        }
-        kept.extend(all.into_iter().filter_map(|e| e.file?.location));
-        for f in files.flatten() {
-            let path = f.path().display().to_string();
-            if !kept.contains(&path) {
-                let _ = std::fs::remove_file(f.path());
-            }
+        if let Some(kept) = media_in_use(&node) {
+            sweep_media(&self.media_dir(persona), &kept);
         }
     }
 
@@ -922,7 +929,14 @@ impl Core {
                     short(&peer),
                     data.len()
                 ));
-                let location = self.keep(persona, &name, &data, clip.is_some());
+                let how = Keep {
+                    clip: clip.is_some(),
+                    sensitive,
+                    disappears: node
+                        .disappearing(peer.clone())
+                        .map_or(true, |t| t.is_some()),
+                };
+                let location = self.keep(persona, &name, &data, how);
                 let options = FileOptions {
                     sensitive,
                     caption: caption.clone(),
@@ -973,7 +987,14 @@ impl Core {
                     short(&from),
                     data.len()
                 ));
-                let location = self.keep(persona, &name, &data, clip.is_some());
+                let how = Keep {
+                    clip: clip.is_some(),
+                    sensitive,
+                    disappears: node
+                        .group_disappearing(group.clone())
+                        .map_or(true, |t| t.is_some()),
+                };
+                let location = self.keep(persona, &name, &data, how);
                 let options = FileOptions {
                     sensitive,
                     caption: caption.clone(),
@@ -1052,6 +1073,9 @@ impl Core {
                         if persona.is_none() {
                             self.write_wireguard_conf();
                         }
+                    }
+                    NodeEvent::Fallback { peer, notice } => {
+                        self.say(format!("* {}: {notice}", short(peer)));
                     }
                     other => self.say(format!("· {other:?}")),
                 }
@@ -1318,6 +1342,67 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(candidate)
 }
 
+/// What decides where a received file is kept.
+#[derive(Clone, Copy, Debug)]
+pub struct Keep {
+    /// A voice or video message.
+    pub clip: bool,
+    /// The sender marked it sensitive.
+    pub sensitive: bool,
+    /// Its chat has disappearing messages (or that can't be told).
+    pub disappears: bool,
+}
+
+impl Keep {
+    /// Whether a file called `name` stays in the data directory, where the
+    /// sweep removes it with its message, rather than going to Downloads,
+    /// where any app can read it and it outlives the message: photos,
+    /// voice and video messages, and files that are sensitive or disappear.
+    pub fn privately(self, name: &str) -> bool {
+        self.clip || self.sensitive || self.disappears || is_image(name)
+    }
+}
+
+/// How long a kept file is safe from the sweep without a message referring
+/// to it: a clip being recorded, or a photo or GIF waiting to be sent, has
+/// no message yet.
+const MEDIA_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Every file location a node's messages refer to: its chats, its groups
+/// and its notes to self. `None` if some history can't be read, so nothing
+/// is swept on a guess.
+fn media_in_use(node: &ThrenodyNode) -> Option<HashSet<String>> {
+    let mut all = Vec::new();
+    for c in node.contacts() {
+        all.extend(node.history(c.fingerprint, u32::MAX).ok()?);
+    }
+    for g in node.groups() {
+        all.extend(node.group_history(g.id, u32::MAX).ok()?);
+    }
+    all.extend(node.note_history(u32::MAX).ok()?);
+    Some(all.into_iter().filter_map(|e| e.file?.location).collect())
+}
+
+/// Deletes the files in `dir` that nothing in `kept` refers to, once they
+/// are older than [`MEDIA_GRACE`].
+fn sweep_media(dir: &Path, kept: &HashSet<String>) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for f in files.flatten() {
+        let path = f.path();
+        let recent = f
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age < MEDIA_GRACE);
+        if !recent && !kept.contains(&path.display().to_string()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// What the list or a notification says for a file.
 pub fn file_label(name: &str, sensitive: bool, caption: &str, clip: Option<Clip>) -> String {
     if let Some(c) = clip {
@@ -1366,4 +1451,80 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     f.write_all(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_plain_files_go_to_downloads() {
+        let plain = Keep {
+            clip: false,
+            sensitive: false,
+            disappears: false,
+        };
+        assert!(!plain.privately("report.pdf"));
+        assert!(plain.privately("photo.jpg"));
+        for private in [
+            Keep {
+                clip: true,
+                ..plain
+            },
+            Keep {
+                sensitive: true,
+                ..plain
+            },
+            Keep {
+                disappears: true,
+                ..plain
+            },
+        ] {
+            assert!(private.privately("report.pdf"), "{private:?}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_keeps_notes_and_recent_files() {
+        let dir = std::env::temp_dir().join(format!("threnody-sweep-{}", std::process::id()));
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let node = ThrenodyNode::open(dir.join("node").display().to_string(), None, None).unwrap();
+
+        // A photo kept only in notes to self is in use.
+        let note = media.join("note.jpg");
+        std::fs::write(&note, b"photo").unwrap();
+        let options = FileOptions {
+            sensitive: false,
+            caption: String::new(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        };
+        let location = note.display().to_string();
+        node.add_note_file("note.jpg".into(), 5, Some(location.clone()), options)
+            .unwrap();
+        let kept = media_in_use(&node).unwrap();
+        assert!(kept.contains(&location));
+
+        // A clip still being recorded has no message yet; an old file
+        // nothing refers to goes.
+        let recording = media.join("voice-1.ogg");
+        let stale = media.join("stale.jpg");
+        std::fs::write(&recording, b"ogg").unwrap();
+        std::fs::write(&stale, b"old").unwrap();
+        let long_ago = std::time::SystemTime::now() - 2 * MEDIA_GRACE;
+        for f in [&note, &stale] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        sweep_media(&media, &kept);
+        assert!(note.exists() && recording.exists());
+        assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

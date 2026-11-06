@@ -1141,8 +1141,12 @@ impl RelayToken {
         slot: u16,
         e_pub: &[u8],
     ) -> Result<Self> {
-        if cred.header.schema != RELAY_SCHEMA || slot >= RELAY_SLOTS {
-            return Err(Error::Malformed("not a relay credential"));
+        if cred.header.schema != RELAY_SCHEMA
+            || cred.header.expires_day != epoch
+            || !cred.attributes.is_empty()
+            || slot >= RELAY_SLOTS
+        {
+            return Err(Error::Malformed("not a relay credential for that day"));
         }
         Ok(Self {
             epoch,
@@ -1158,6 +1162,11 @@ impl RelayToken {
     /// Checks a token for this relay (`me`) and this circuit (`e_pub`),
     /// issued by one of `issuers`, for today or yesterday. Returns the
     /// pseudonym, which the relay must not have seen in this epoch.
+    ///
+    /// The credential must be for the token's day and carry no attributes:
+    /// one valid on other days too would pay for their slots as well, and
+    /// the count of hidden attributes, which every presentation shows,
+    /// could mark one client's circuits.
     pub fn verify(
         &self,
         issuers: &[IssuerKey],
@@ -1173,13 +1182,14 @@ impl RelayToken {
             .iter()
             .find(|k| k.id() == self.presentation.issuer)
             .ok_or(Error::Malformed("relay token from an unknown directory"))?;
+        // Valid on the token's own day: yesterday's are still spendable.
         let v = self.presentation.verify(
             key,
             &relay_context(me, self.epoch, self.slot),
             &relay_binding(e_pub),
-            now_ms,
+            u64::from(self.epoch) * 86_400_000,
         )?;
-        if v.schema != RELAY_SCHEMA || v.expires_day < self.epoch {
+        if v.schema != RELAY_SCHEMA || v.expires_day != self.epoch || self.presentation.total != 0 {
             return Err(Error::Malformed("not a relay token"));
         }
         Ok(v.pseudonym)
@@ -1370,7 +1380,7 @@ mod tests {
         let now = crate::now_ms();
         let req = Request::new().unwrap();
         let iss = dir
-            .issue(&req.commitment, RELAY_SCHEMA, &vec![], day(now) + 1)
+            .issue(&req.commitment, RELAY_SCHEMA, &vec![], day(now))
             .unwrap();
         let cred = req.finish(dir.key(), &iss).unwrap();
         let relay = Identity::generate().public();
@@ -1394,13 +1404,100 @@ mod tests {
         assert!(t0.verify(&[], &relay, &e_pub, now).is_err());
         // Out-of-range slots and stale epochs are refused.
         assert!(RelayToken::new(&cred, &relay, day(now), RELAY_SLOTS, &e_pub).is_err());
-        let old = RelayToken::new(&cred, &relay, day(now) - 2, 0, &e_pub).unwrap();
+        let stale = relay_credential(&dir, day(now) - 2, &vec![]);
+        let old = RelayToken::new(&stale, &relay, day(now) - 2, 0, &e_pub).unwrap();
         assert!(old.verify(&keys, &relay, &e_pub, now).is_err());
         // A peer credential isn't a relay token.
         let peer = issued(&dir, "example/member/1", &attrs());
         assert!(RelayToken::new(&peer, &relay, day(now), 0, &e_pub).is_err());
         // Small enough to ride in an EXTEND cell beside an X-Wing key.
         assert!(t0.encode().unwrap().len() < 700);
+    }
+
+    fn relay_credential(dir: &Issuer, expires_day: u32, attributes: &Profile) -> Credential {
+        let req = Request::new().unwrap();
+        let iss = dir
+            .issue(&req.commitment, RELAY_SCHEMA, attributes, expires_day)
+            .unwrap();
+        req.finish(dir.key(), &iss).unwrap()
+    }
+
+    #[test]
+    fn relay_tokens_spend_only_their_credentials_day() {
+        let dir = Issuer::new(&Identity::generate(), 0).unwrap();
+        let keys = vec![dir.key().clone()];
+        let relay = Identity::generate().public();
+        let e_pub = [5u8; 64];
+        let now = crate::now_ms();
+        let today = day(now);
+        let token = |cred: &Credential, epoch| RelayToken::new(cred, &relay, epoch, 0, &e_pub);
+        // Today's credential pays today's slots, still spendable tomorrow.
+        let cred = relay_credential(&dir, today, &vec![]);
+        assert!(
+            token(&cred, today)
+                .unwrap()
+                .verify(&keys, &relay, &e_pub, now)
+                .is_ok()
+        );
+        let yesterday = relay_credential(&dir, today - 1, &vec![]);
+        let late = token(&yesterday, today - 1).unwrap();
+        assert!(late.verify(&keys, &relay, &e_pub, now).is_ok());
+        // But not yesterday's slots as well: that would double them.
+        assert!(token(&cred, today - 1).is_err());
+        let p = cred
+            .present(
+                &[],
+                &relay_context(&relay, today - 1, 0),
+                &relay_binding(&e_pub),
+            )
+            .unwrap();
+        let stale = RelayToken {
+            epoch: today - 1,
+            slot: 0,
+            presentation: p,
+        };
+        assert!(stale.verify(&keys, &relay, &e_pub, now).is_err());
+        // Nor tomorrow's credential today's.
+        let early = relay_credential(&dir, today + 1, &vec![]);
+        let p = early
+            .present(
+                &[],
+                &relay_context(&relay, today, 0),
+                &relay_binding(&e_pub),
+            )
+            .unwrap();
+        let ahead = RelayToken {
+            epoch: today,
+            slot: 0,
+            presentation: p,
+        };
+        assert!(ahead.verify(&keys, &relay, &e_pub, now).is_err());
+    }
+
+    #[test]
+    fn relay_tokens_carry_no_attributes() {
+        let dir = Issuer::new(&Identity::generate(), 0).unwrap();
+        let keys = vec![dir.key().clone()];
+        let relay = Identity::generate().public();
+        let e_pub = [5u8; 64];
+        let now = crate::now_ms();
+        // A directory marking one client with a hidden attribute: the count
+        // would show on every circuit it opens.
+        let marked = relay_credential(&dir, day(now), &vec![("x".into(), "1".into())]);
+        assert!(RelayToken::new(&marked, &relay, day(now), 0, &e_pub).is_err());
+        let p = marked
+            .present(
+                &[],
+                &relay_context(&relay, day(now), 0),
+                &relay_binding(&e_pub),
+            )
+            .unwrap();
+        let token = RelayToken {
+            epoch: day(now),
+            slot: 0,
+            presentation: p,
+        };
+        assert!(token.verify(&keys, &relay, &e_pub, now).is_err());
     }
 
     #[test]

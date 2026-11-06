@@ -223,7 +223,7 @@ class MainActivity : Activity() {
         // Section: Group Invitations
         val invites = n.groupInvites().map { i ->
             Row(i.name, i.group, "${Threnody.nameOf(n, i.from)} invites you", Long.MAX_VALUE, null,
-                open = { openGroup(i.group) }, section = Row.Section.Invites)
+                open = { openGroup(i.group, inviter = i.from) }, section = Row.Section.Invites)
         }
         if (invites.isNotEmpty()) {
             rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Invitations", section = Row.Section.Invites))
@@ -919,10 +919,13 @@ class MainActivity : Activity() {
         startActivity(Intent(this, ChatActivity::class.java).putExtra(ChatActivity.NOTE, true))
     }
 
-    private fun openGroup(id: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null) {
+    private fun openGroup(
+        id: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null, inviter: String? = null,
+    ) {
         startActivity(Intent(this, ChatActivity::class.java)
             .putExtra(ChatActivity.GROUP, id)
             .putExtra(ChatActivity.PERSONA, persona)
+            .putExtra(ChatActivity.INVITER, inviter)
             .jumpTo(jump, query))
     }
 
@@ -987,6 +990,11 @@ class MainActivity : Activity() {
             { Privacy.setStripMetadata(this@MainActivity, it) }) {
             if (it) "Photos are sent without location, camera or time details"
             else "Photos are sent with their metadata, which can include where they were taken"
+        }
+        toggle("Private notifications", Privacy.privateNotifications(this@MainActivity),
+            { Privacy.setPrivateNotifications(this@MainActivity, it) }) {
+            if (it) "Notifications say only \u201cNew message\u201d, without sender or text"
+            else "Notifications show who wrote and what they said, where other apps and watches can read them"
         }
         toggle("Screen security", Privacy.screenSecurity(this@MainActivity),
             { Privacy.setScreenSecurity(this@MainActivity, it) }) {
@@ -1430,11 +1438,15 @@ class MainActivity : Activity() {
                 "It works once. Only show it to your own devices.",
             n.createLinkCode(addr),
             "Account ${n.accountFingerprint()}",
+            secret = true,
         )
     }
 
-    /** A dialog showing [code] as a QR code, with copy and share. */
-    private fun showCode(title: String, help: String, code: String, footer: String) {
+    /**
+     * A dialog showing [code] as a QR code, with copy and share. A [secret]
+     * code is copied marked sensitive, kept out of clipboard previews.
+     */
+    private fun showCode(title: String, help: String, code: String, footer: String, secret: Boolean = false) {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -1464,7 +1476,14 @@ class MainActivity : Activity() {
                     Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, code), title))
             }
             .setNeutralButton("Copy") { _, _ ->
-                getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText(title, code))
+                val clip = ClipData.newPlainText(title, code)
+                if (secret) {
+                    // ClipDescription.EXTRA_IS_SENSITIVE from Android 13; the key works before it too.
+                    clip.description.extras = android.os.PersistableBundle().apply {
+                        putBoolean("android.content.extra.IS_SENSITIVE", true)
+                    }
+                }
+                getSystemService(ClipboardManager::class.java)?.setPrimaryClip(clip)
                 Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Done", null)
@@ -1605,7 +1624,8 @@ class MainActivity : Activity() {
         SecureBuilder(this)
             .setTitle("Join another device's account")
             .setMessage("This device becomes part of that account: your contacts see both as you. " +
-                "Get the code from “Link a new device” on the other device.")
+                "Get the code from “Link a new device” on the other device. " +
+                "Only use a code you made yourself: whoever made it gets this device's contacts and history.")
             .setView(padded(field))
             .setPositiveButton("Join") { _, _ ->
                 val code = field.text.toString().trim()

@@ -485,8 +485,13 @@ impl ListsWindow {
                     move || node.create_list(title),
                     move |r| {
                         let Some(t) = weak.upgrade() else { return };
-                        if let Ok(id) = r {
-                            *t.open.borrow_mut() = Some(id);
+                        match r {
+                            Ok(id) => *t.open.borrow_mut() = Some(id),
+                            Err(e) => {
+                                if let Some(app) = t.app.upgrade() {
+                                    app.toast(&format!("Couldn't start the list: {e}"));
+                                }
+                            }
                         }
                         t.reload();
                     },

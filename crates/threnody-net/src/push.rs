@@ -18,7 +18,9 @@ use std::time::Duration;
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map};
 use threnody_core::message::FEATURE_PUSH;
-use threnody_core::push::{MAX_KEEP_MS, PushReg, PushTarget, WebPushKeys};
+use threnody_core::push::{
+    MAX_KEEP_MS, PushReg, PushTarget, WebPushKeys, public_ip, valid_url_with,
+};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::error::{NetError, Result};
@@ -113,6 +115,8 @@ pub(crate) struct PushState {
     held: HashMap<[u8; 32], Held>,
     pace: HashMap<[u8; 32], Pace>,
     upkeep: bool,
+    /// Endpoints on loopback are taken (tests on one machine only).
+    loopback: bool,
 }
 
 impl PushState {
@@ -149,7 +153,12 @@ impl PushState {
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
-                1 => me.own = PushReg::decode(d.bytes()?)?.0,
+                // Ours as we set it; contacts check it themselves.
+                1 => {
+                    me.own = PushReg::decode_with(d.bytes()?, true)
+                        .ok()
+                        .and_then(|r| r.0)
+                }
                 2 => me.withdrawn = d.bool()?,
                 3 => {
                     for _ in 0..d.array_len()? {
@@ -157,9 +166,11 @@ impl PushState {
                             return Err(threnody_core::Error::Malformed("push entry"));
                         }
                         let k = fixed_bytes::<32>(d)?;
-                        let reg = PushReg::decode(d.bytes()?)?;
+                        // One an older version took that we no longer would
+                        // (on the local network, say) is dropped.
+                        let reg = PushReg::decode(d.bytes()?).ok();
                         let until_ms = d.u64()?;
-                        if let Some(target) = reg.0
+                        if let Some(PushReg(Some(target))) = reg
                             && until_ms > now
                         {
                             let next_dummy_ms = next_dummy(now, target.dummies_per_day);
@@ -338,10 +349,31 @@ fn client() -> Option<reqwest::Client> {
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(PublicOnly))
                 .build()
                 .ok()
         })
         .clone()
+}
+
+/// Resolves push server names to public addresses only: a contact's
+/// endpoint must not lead our request into our own machine or network
+/// through a name that resolves there.
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
+                .await?
+                .filter(|a| public_ip(&a.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("{} has no public address", name.as_str()).into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// What a wake-up sync found.
@@ -387,7 +419,7 @@ impl Node {
             ));
         }
         if let Some(t) = &target {
-            t.validate()?;
+            t.validate_with(self.push().loopback)?;
         }
         {
             let mut s = self.push();
@@ -406,6 +438,14 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    /// Takes push endpoints on loopback (plain `http://` too), ours and
+    /// contacts'. Only for tests with every node on one machine: anywhere
+    /// else a contact's loopback endpoint points us at our own machine.
+    /// Off by default.
+    pub fn allow_loopback_push(&self, on: bool) {
+        self.push().loopback = on;
     }
 
     /// Our endpoint, if contacts may wake us.
@@ -441,7 +481,8 @@ impl Node {
         if self.is_persona() || !self.shared.mutual(&from) {
             return;
         }
-        let reg = match PushReg::decode(payload) {
+        let loopback = self.push().loopback;
+        let reg = match PushReg::decode_with(payload, loopback) {
             Ok(PushReg(reg)) => reg,
             Err(e) => {
                 self.emit(Event::ReachNote {
@@ -551,7 +592,9 @@ impl Node {
             let s = self.push();
             s.held
                 .get(dest.as_bytes())
-                .filter(|h| h.until_ms > now_ms())
+                .filter(|h| {
+                    h.until_ms > now_ms() && valid_url_with(&h.target.url, s.loopback).is_ok()
+                })
                 .map(|h| h.target.clone())
         };
         // Connected again by now, or no longer a contact: nothing to wake.
@@ -816,15 +859,20 @@ mod tests {
             expires_ms: 0,
         };
         let mut s = PushState {
-            own: Some(t("https://a/x")),
+            own: Some(t("https://a.example/x")),
             withdrawn: false,
             ..PushState::default()
         };
-        for (k, until) in [([1; 32], 100), ([2; 32], 5000)] {
+        for (k, until, url) in [
+            ([1; 32], 100, "https://b.example/y"),
+            ([2; 32], 5000, "https://b.example/y"),
+            // Taken by an older version: dropped now.
+            ([3; 32], 5000, "http://127.0.0.1:2375/x"),
+        ] {
             s.held.insert(
                 k,
                 Held {
-                    target: t("https://b/y"),
+                    target: t(url),
                     until_ms: until,
                     next_dummy_ms: 0,
                 },
@@ -833,7 +881,7 @@ mod tests {
         let back = PushState::decode(&s.encode().unwrap(), 1000).unwrap();
         assert_eq!(back.own, s.own);
         assert_eq!(back.held.len(), 1);
-        assert_eq!(back.held[&[2; 32]].target, t("https://b/y"));
+        assert_eq!(back.held[&[2; 32]].target, t("https://b.example/y"));
         assert!(back.held[&[2; 32]].next_dummy_ms > 1000);
     }
 }

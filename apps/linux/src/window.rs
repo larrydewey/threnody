@@ -54,6 +54,12 @@ pub struct App {
     lists: RefCell<Option<Rc<crate::lists::ListsWindow>>>,
     folder_chats: RefCell<HashMap<u64, HashSet<String>>>,
     unread: RefCell<HashMap<ChatRef, u32>>,
+    /// Quiet notices for chats, by the identity that heard them (`None`:
+    /// the main one, else a persona) and the device: onion routing
+    /// couldn't hide a session with it or a message left for it
+    /// (`NodeEvent::Fallback`). Shown in that identity's chat until
+    /// dismissed there.
+    pub notices: RefCell<HashMap<(Option<String>, String), String>>,
     chat: RefCell<Option<Rc<ChatView>>>,
     refresh_pending: Cell<bool>,
     /// Ignore selection changes while the list is rebuilt.
@@ -252,6 +258,7 @@ impl App {
             lists: RefCell::new(None),
             folder_chats: RefCell::new(HashMap::new()),
             unread: RefCell::new(HashMap::new()),
+            notices: RefCell::new(HashMap::new()),
             chat: RefCell::new(None),
             refresh_pending: Cell::new(false),
             rebuilding: Cell::new(false),
@@ -1319,16 +1326,31 @@ impl App {
                     )
                 }),
             ),
-            NodeEvent::GroupInvited { group, name, from } => (
-                Some(group.clone()),
-                Some((
-                    name.clone(),
-                    format!(
-                        "{} invites you to join",
-                        self.name(persona.as_deref(), from)
-                    ),
-                )),
-            ),
+            NodeEvent::GroupInvited {
+                group, name, from, ..
+            } => {
+                let known = self.core.node(persona.as_deref()).is_ok_and(|n| {
+                    n.contacts()
+                        .iter()
+                        .any(|c| c.fingerprint == *from && c.accepted)
+                });
+                (
+                    Some(group.clone()),
+                    Some(if known {
+                        (
+                            name.clone(),
+                            format!(
+                                "{} invites you to join",
+                                self.name(persona.as_deref(), from)
+                            ),
+                        )
+                    } else {
+                        // Not even the group's name: a stranger's can be a
+                        // message in itself.
+                        ("Threnody".into(), "New group invitation".into())
+                    }),
+                )
+            }
             // Not even who: a stranger's name can be a message in itself.
             NodeEvent::MessageRequest { peer, .. } => (
                 Some(peer.clone()),
@@ -1372,6 +1394,12 @@ impl App {
             | NodeEvent::Reacted { peer, group }
             | NodeEvent::Pinned { peer, group, .. } => {
                 (Some(group.clone().unwrap_or_else(|| peer.clone())), None)
+            }
+            NodeEvent::Fallback { peer, notice } => {
+                self.notices
+                    .borrow_mut()
+                    .insert((persona.clone(), peer.clone()), notice.clone());
+                (Some(peer.clone()), None)
             }
             NodeEvent::Typing { peer, active } => {
                 if let Some(chat) = self.chat.borrow().as_ref() {
@@ -1501,8 +1529,16 @@ impl App {
                 self.toast("This device was removed from your account.");
                 (None, None)
             }
+            // Linked here, or (seen as a new device of our own account)
+            // through another of our devices.
             NodeEvent::DeviceLinked { .. } => {
-                self.toast("A new device joined your account.");
+                self.toast("A new device joined your account. If you didn't link it, remove it in Devices.");
+                (None, None)
+            }
+            NodeEvent::AccountChanged { account, added, .. }
+                if !added.is_empty() && *account == self.core.main.account_fingerprint() =>
+            {
+                self.toast("A new device joined your account. If you didn't link it, remove it in Devices.");
                 (None, None)
             }
             NodeEvent::ListChanged { .. } => {
@@ -1568,9 +1604,16 @@ impl App {
                         | NodeEvent::File { quiet: true, .. }
                         | NodeEvent::GroupMessage { quiet: true, .. }
                         | NodeEvent::GroupFile { quiet: true, .. }
+                        | NodeEvent::GroupInvited { quiet: true, .. }
                 );
                 if !quiet {
-                    self.notify(&chat, &title, &body);
+                    // A disappearing message's text would outlive it there.
+                    let body = if self.disappears(persona.as_deref(), &event) {
+                        "New message"
+                    } else {
+                        &body
+                    };
+                    self.notify(&chat, &title, body);
                 }
             }
         }
@@ -1634,6 +1677,27 @@ impl App {
         };
         n.set_priority(gio::NotificationPriority::Urgent);
         self.app.send_notification(Some("call"), &n);
+    }
+
+    /// Whether the message an event brought disappears, so its text stays
+    /// out of the notification. If it can't be told, it is taken to.
+    fn disappears(&self, persona: Option<&str>, event: &NodeEvent) -> bool {
+        let Ok(node) = self.core.node(persona) else {
+            return true;
+        };
+        let newest = match event {
+            NodeEvent::Message { peer, .. } | NodeEvent::File { peer, .. } => {
+                node.history(peer.clone(), 1)
+            }
+            NodeEvent::GroupMessage { group, .. } | NodeEvent::GroupFile { group, .. } => {
+                node.group_history(group.clone(), 1)
+            }
+            _ => return false,
+        };
+        newest
+            .ok()
+            .and_then(|mut h| h.pop())
+            .is_none_or(|e| e.disappearing)
     }
 
     fn notify(&self, chat: &ChatRef, title: &str, body: &str) {
@@ -1709,16 +1773,28 @@ impl App {
         ui::bg_quiet(move || core.set_metered(metered));
         let weak = Rc::downgrade(self);
         let last = Rc::new(Cell::new(monitor.is_network_available()));
+        // GNetworkMonitor signals any change of routes, not only another
+        // network: only a new address on a default route, or the network
+        // coming back, is a change for the node. Each one marks every
+        // session as possibly dead, and costs onion circuits their first
+        // hops until they are heard from again.
+        let addrs = Arc::new(std::sync::Mutex::new(Core::route_addrs()));
         monitor.connect_network_changed(move |m, available| {
             let Some(this) = weak.upgrade() else { return };
             let core = this.core.clone();
             let metered = m.is_network_metered();
             let was = last.replace(available);
+            let addrs = addrs.clone();
             ui::bg_quiet(move || {
                 core.set_metered(metered);
-                if available {
+                let now = Core::route_addrs();
+                let moved = {
+                    let mut last = addrs.lock().unwrap_or_else(|e| e.into_inner());
+                    std::mem::replace(&mut *last, now) != now
+                };
+                if available && (moved || !was) {
                     core.network_changed();
-                } else if was {
+                } else if !available && was {
                     core.say("* network lost");
                 }
             });
@@ -1833,7 +1909,7 @@ impl App {
                             .unwrap_or_default(),
                     ),
                 };
-                ui::show_code(&self.window, &heading, body, &link, &caption);
+                ui::show_code(&self.window, &heading, body, &link, &caption, false);
             }
             Err(e) => self.toast(&e),
         }
@@ -2337,6 +2413,7 @@ impl App {
                  It works once. Only show it to your own devices.",
                 &code,
                 &format!("Account {}", self.core.main.account_fingerprint()),
+                true,
             ),
             Err(e) => self.toast(&e),
         }
@@ -2348,7 +2425,8 @@ impl App {
             &self.window,
             "Join another device's account",
             "Paste the link code your other device shows (its menu → Link a new device). \
-             This device then shares its contacts and history.",
+             Only use a code you made yourself: whoever made it gets this device's \
+             contacts and history.",
             "threnody-link://…",
             initial,
             "Join",

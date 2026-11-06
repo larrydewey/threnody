@@ -88,6 +88,71 @@ async fn history_records_both_sides_and_disappearing_messages_vanish() {
     );
 }
 
+/// A peer that never chose a timer doesn't turn ours off by writing:
+/// neither one set for the chat nor a default. Turning it off on purpose
+/// still reaches the other side.
+#[tokio::test]
+async fn a_peer_without_a_timer_does_not_turn_ours_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, mut arx, a_addr) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    let message = |e: &Event| matches!(e, Event::Message { .. });
+
+    // Alice chose an hour; Bob, who never chose, writes first.
+    alice.set_timer(&bob_id, Some(3600)).unwrap();
+    bob.send_text(&a_id, "no timer here").unwrap();
+    next(&mut arx, message).await;
+    assert_eq!(alice.timer(&bob_id), Some(3600), "Alice's choice stands");
+    // And it applies to Bob's message too, as to every one in the chat.
+    let last = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .last()
+            .cloned()
+            .unwrap()
+    };
+    let theirs = last(&alice, &bob_id);
+    assert_eq!(theirs.text, "no timer here");
+    assert_eq!(
+        theirs.expires_at_ms.map(|t| t - theirs.at_ms),
+        Some(3_600_000),
+        "a timer-less message in a disappearing chat disappears"
+    );
+    // Alice's next message carries it, and Bob adopts it.
+    alice.send_text(&bob_id, "an hour").unwrap();
+    next(&mut brx, message).await;
+    assert_eq!(bob.timer(&a_id), Some(3600));
+
+    // Bob turns it off on purpose: that does reach Alice.
+    bob.set_timer(&a_id, None).unwrap();
+    bob.send_text(&a_id, "off now").unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::TimerChanged { secs: None, .. })
+    })
+    .await;
+    assert_eq!(alice.timer(&bob_id), None);
+    let off = last(&alice, &bob_id);
+    assert_eq!(off.text, "off now");
+    assert!(off.expires_at_ms.is_none(), "stays, not gone at once");
+
+    // A default Alice chose isn't pinned off by a chat Bob opens.
+    let (carol, _crx, _) = spawn(&dir, "carol").await;
+    alice.set_default_timer(Some(30));
+    let c_id = carol.identity();
+    carol.connect(&a_addr, None).await.unwrap();
+    carol.send_text(&a_id, "first").unwrap();
+    next(&mut arx, |e| {
+        matches!(e, Event::Message { .. } | Event::MessageRequest { .. })
+    })
+    .await;
+    assert_eq!(alice.timer(&c_id), Some(30));
+}
+
 #[tokio::test]
 async fn messages_stay_by_default_and_disappear_when_chosen() {
     let dir = tempfile::tempdir().unwrap();
@@ -173,6 +238,15 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
     })
     .await;
     assert!(matches!(e, Event::Message { .. }));
+    // No longer a request: deleting one leaves the conversation alone.
+    assert!(!me.delete_request(&sid));
+    assert_eq!(
+        me.history(me.conversation_for(&sid))
+            .unwrap()
+            .entries()
+            .len(),
+        2
+    );
 
     // Blocked: the conversation goes and they can't come back.
     me.block_contact(&sid);
@@ -183,6 +257,7 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
             .is_empty()
     );
     assert!(!me.is_accepted(&sid));
+    assert!(!me.delete_request(&sid), "a block isn't a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = stranger.connect(&addr, None).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -193,6 +268,27 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
     stranger.connect(&addr, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(me.sessions().iter().any(|s| s.peer == sid));
+}
+
+#[tokio::test]
+async fn deleting_a_request_takes_it_and_its_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stranger, _srx, _) = spawn(&dir, "stranger").await;
+    let (me, mut rx, addr) = spawn(&dir, "me").await;
+    let my_id = stranger.connect(&addr, None).await.unwrap();
+    let sid = stranger.identity();
+    stranger.send_text(&my_id, "hi, it's me").unwrap();
+    next(&mut rx, |e| matches!(e, Event::MessageRequest { .. })).await;
+
+    assert!(me.delete_request(&sid));
+    assert!(
+        me.history(me.conversation_for(&sid))
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    assert!(me.contacts().get(&sid).is_none());
+    assert!(!me.delete_request(&sid), "nothing left to delete");
 }
 
 #[tokio::test]
@@ -336,4 +432,78 @@ async fn reactions_several_per_person_both_ways() {
     // No such message, or not an emoji: nothing happens.
     assert!(!alice.react(&b, 12345, "👍", true));
     assert!(!alice.react(&b, id, "", true));
+}
+
+/// `name`'s node again, from its home (as after a restart).
+async fn restart(dir: &tempfile::TempDir, name: &str) -> (Node, UnboundedReceiver<Event>) {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    let (node, rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    node.listen("127.0.0.1:0").await.unwrap();
+    (node, rx)
+}
+
+#[tokio::test]
+async fn changes_made_while_the_contact_is_away_reach_it_when_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, aaddr) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    for t in ["secret", "draft", "pin me"] {
+        alice.send_text(&bob_id, t).unwrap();
+        next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    }
+    let entries = |n: &Node, p| n.history(n.conversation_for(p)).unwrap().entries().to_vec();
+    let id_of = |t: &str| {
+        entries(&alice, &bob_id)
+            .iter()
+            .find(|e| e.text == t)
+            .unwrap()
+            .message_id()
+    };
+    let (secret, draft, pin_me) = (id_of("secret"), id_of("draft"), id_of("pin me"));
+
+    // Bob goes away; Alice deletes, edits, pins and reacts meanwhile.
+    bob.shutdown();
+    drop(brx);
+    let gone = std::time::Instant::now();
+    while alice.sessions().iter().any(|s| s.peer == bob_id) {
+        assert!(gone.elapsed() < Duration::from_secs(10), "session stayed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(alice.delete_messages(&bob_id, &[secret], true), 1);
+    assert!(alice.edit_message(&bob_id, draft, "final"));
+    assert!(alice.pin(&bob_id, pin_me, true));
+    assert!(alice.react(&bob_id, pin_me, "👍", true));
+
+    // Bob comes back: every change reaches him.
+    let (bob, _brx) = restart(&dir, "bob").await;
+    bob.connect(&aaddr, None).await.unwrap();
+    let texts =
+        |n: &Node| -> Vec<String> { entries(n, &a_id).iter().map(|e| e.text.clone()).collect() };
+    let start = std::time::Instant::now();
+    while texts(&bob) != ["final", "pin me"]
+        || bob.pinned(bob.conversation_for(&a_id)).len() != 1
+        || entries(&bob, &a_id)
+            .last()
+            .is_none_or(|e| e.reactions.is_empty())
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "changes lost: {:?}, {} pinned",
+            texts(&bob),
+            bob.pinned(bob.conversation_for(&a_id)).len()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

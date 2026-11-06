@@ -24,6 +24,7 @@ use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::signatures::{Signer, SignerError};
+use openmls_traits::storage::StorageProvider as _;
 use threnody_core::crypto::random_bytes;
 use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::{Identity, PublicIdentity};
@@ -36,6 +37,9 @@ const STATE_VERSION: u8 = 1;
 const MAX_PAST_EPOCHS: usize = 5;
 /// Group names are display labels; keep them short.
 pub const MAX_NAME: usize = 64;
+/// Key packages kept for invitations we accepted that no Welcome has
+/// answered yet; past this the oldest are deleted.
+pub const MAX_KEY_PACKAGES: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GroupError {
@@ -281,6 +285,9 @@ pub struct Groups {
     groups: HashMap<GroupId, Group>,
     /// Invitations we sent and are waiting on a key package for.
     pending_adds: Vec<(GroupId, PublicIdentity)>,
+    /// Key packages we gave out and are waiting on a Welcome for, oldest
+    /// first: the group, who asked, and where the key package is stored.
+    key_packages: Vec<(GroupId, PublicIdentity, KeyPackageRef)>,
 }
 
 fn credential_for(id: &PublicIdentity) -> CredentialWithKey {
@@ -313,6 +320,7 @@ impl Groups {
             me: identity.public(),
             groups: HashMap::new(),
             pending_adds: Vec::new(),
+            key_packages: Vec::new(),
         }
     }
 
@@ -331,8 +339,14 @@ impl Groups {
             .map(|(k, v)| k.len() + v.len() + 16)
             .sum::<usize>()
             + 256;
+        let key_packages = self
+            .key_packages
+            .iter()
+            .map(|(g, p, kp)| Ok((g, p, kp.tls_serialize_detached().map_err(mls)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let size = size + key_packages.len() * 128;
         Ok(threnody_core::cbor::to_vec(size, |e| {
-            e.map_len(3)?;
+            e.map_len(4)?;
             e.u8(0)?.u8(STATE_VERSION)?;
             e.u8(1)?.array_len(values.len())?;
             for (k, v) in values.iter() {
@@ -348,6 +362,13 @@ impl Groups {
                 for (member, role) in &g.roles {
                     e.bytes(member.as_bytes())?.u8(*role as u8)?;
                 }
+            }
+            e.u8(3)?.array_len(key_packages.len())?;
+            for (group, peer, kp) in &key_packages {
+                e.array_len(3)?
+                    .bytes(*group)?
+                    .bytes(peer.as_bytes())?
+                    .bytes(kp)?;
             }
             Ok(())
         })?)
@@ -366,6 +387,7 @@ impl Groups {
             HashMap<PublicIdentity, MemberRole>,
         )> = Vec::new();
         let mut version = None;
+        let mut key_packages = Vec::new();
         {
             let mut values = me
                 .provider
@@ -406,6 +428,18 @@ impl Groups {
                             meta.push((id, name, owner, roles));
                         }
                     }
+                    3 => {
+                        for _ in 0..d.array_len()? {
+                            if d.array_len()? != 3 {
+                                return Err(threnody_core::Error::Malformed("key package entry"));
+                            }
+                            let group = fixed_bytes::<16>(d)?;
+                            let peer = PublicIdentity::from_bytes(&fixed_bytes::<32>(d)?)?;
+                            let kp = KeyPackageRef::tls_deserialize_exact(d.bytes()?)
+                                .map_err(|_| threnody_core::Error::Malformed("key package ref"))?;
+                            key_packages.push((group, peer, kp));
+                        }
+                    }
                     _ => return Ok(false),
                 }
                 Ok(true)
@@ -427,6 +461,7 @@ impl Groups {
             group.roles = roles;
             me.groups.insert(id, group);
         }
+        me.key_packages = key_packages;
         Ok(me)
     }
 
@@ -518,17 +553,31 @@ impl Groups {
         })
     }
 
-    /// Consents to an invitation: sends `peer` a fresh key package.
+    /// Consents to an invitation: sends `peer` a key package for it.
     pub fn accept_invite(&mut self, group: &GroupId, peer: PublicIdentity) -> Result<Output> {
-        let bundle = KeyPackage::builder()
-            .build(
-                CIPHERSUITE,
-                &self.provider,
-                &self.signer,
-                credential_for(&self.me),
-            )
-            .map_err(mls)?;
-        let key_package = MlsMessageOut::from(bundle.key_package().clone())
+        // The inviter may ask more than once before the add completes, and
+        // adds us with whichever answer reaches it first, so every answer
+        // to the same invitation is the same key package.
+        let unanswered = self
+            .key_packages
+            .iter()
+            .find(|(g, p, _)| g == group && *p == peer)
+            .map(|(.., kp)| kp.clone());
+        let stored = match unanswered {
+            Some(kp) => self
+                .provider
+                .storage()
+                .key_package::<_, KeyPackageBundle>(&kp)
+                .map_err(mls)?,
+            None => None,
+        };
+        let key_package = match stored {
+            Some(bundle) if bundle.key_package().life_time().validate().is_ok() => {
+                bundle.key_package().clone()
+            }
+            _ => self.new_key_package(group, peer)?,
+        };
+        let key_package = MlsMessageOut::from(key_package)
             .tls_serialize_detached()
             .map_err(mls)?;
         Ok(Output {
@@ -541,6 +590,52 @@ impl Groups {
             }],
             events: vec![],
         })
+    }
+
+    /// Makes and stores a key package for `peer`'s invitation to `group`.
+    fn new_key_package(&mut self, group: &GroupId, peer: PublicIdentity) -> Result<KeyPackage> {
+        let bundle = KeyPackage::builder()
+            .build(
+                CIPHERSUITE,
+                &self.provider,
+                &self.signer,
+                credential_for(&self.me),
+            )
+            .map_err(mls)?;
+        // Each stays stored, private keys and all, until a Welcome uses
+        // it: keep one per invitation, and only the latest few.
+        let kp = bundle
+            .key_package()
+            .hash_ref(self.provider.crypto())
+            .map_err(mls)?;
+        self.drop_key_packages(|(g, p, _)| g == group && *p == peer)?;
+        self.key_packages.push((*group, peer, kp));
+        let extra = self.key_packages.len().saturating_sub(MAX_KEY_PACKAGES);
+        for (.., kp) in self.key_packages.drain(..extra).collect::<Vec<_>>() {
+            self.provider
+                .storage()
+                .delete_key_package(&kp)
+                .map_err(mls)?;
+        }
+        Ok(bundle.key_package().clone())
+    }
+
+    /// Deletes the key packages `which` picks, which no Welcome will need.
+    fn drop_key_packages(
+        &mut self,
+        which: impl Fn(&(GroupId, PublicIdentity, KeyPackageRef)) -> bool,
+    ) -> Result<()> {
+        let (gone, kept) = std::mem::take(&mut self.key_packages)
+            .into_iter()
+            .partition(which);
+        self.key_packages = kept;
+        for (.., kp) in gone {
+            self.provider
+                .storage()
+                .delete_key_package(&kp)
+                .map_err(mls)?;
+        }
+        Ok(())
     }
 
     /// Checks if the current user can commit (owner or admin).
@@ -702,7 +797,20 @@ impl Groups {
     /// Drops a group and its MLS secrets from our state.
     fn forget(&mut self, group: &GroupId) -> Result<()> {
         if let Some(mut g) = self.groups.remove(group) {
-            g.mls.delete(self.provider.storage()).map_err(mls)?;
+            let storage = self.provider.storage();
+            // A commit that removed us moved the group on an epoch without
+            // us, so our leaf keys are still filed under the one before,
+            // which `delete` doesn't look at.
+            if let Some(prev) = g.mls.epoch().as_u64().checked_sub(1) {
+                storage
+                    .delete_encryption_epoch_key_pairs(
+                        g.mls.group_id(),
+                        &GroupEpoch::from(prev),
+                        g.mls.own_leaf_index().u32(),
+                    )
+                    .map_err(mls)?;
+            }
+            g.mls.delete(storage).map_err(mls)?;
         }
         self.pending_adds.retain(|(g, _)| g != group);
         Ok(())
@@ -896,19 +1004,38 @@ impl Groups {
         if self.groups.contains_key(&group) {
             return Err(GroupError::Unexpected("already in group"));
         }
+        // Only from someone whose invitation to this group we accepted;
+        // anyone else's must not use up the key package.
+        if !self
+            .key_packages
+            .iter()
+            .any(|(g, p, _)| *g == group && *p == from)
+        {
+            return Err(GroupError::Unexpected("welcome we didn't ask for"));
+        }
         let msg = MlsMessageIn::tls_deserialize_exact(bytes).map_err(mls)?;
         let MlsMessageBodyIn::Welcome(welcome) = msg.extract() else {
             return Err(GroupError::Unexpected("not a welcome"));
         };
+        // A group we were removed from before its secrets were dropped
+        // on removal would block joining it again.
+        let stale = openmls::group::GroupId::from_slice(&group);
+        if let Some(mut old) = MlsGroup::load(self.provider.storage(), &stale).map_err(mls)? {
+            old.delete(self.provider.storage()).map_err(mls)?;
+        }
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(MAX_PAST_EPOCHS)
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .build();
-        let mls = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
-            .map_err(mls)?
-            .into_group(&self.provider)
-            .map_err(mls)?;
+        let staged =
+            StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None).map_err(mls)?;
+        // ...and who made the Welcome, so it's the owner we record.
+        let sender = staged.welcome_sender().map_err(mls)?;
+        if identity_of(sender.credential(), sender.signature_key().as_slice())? != from {
+            return Err(GroupError::Unexpected("welcome made by someone else"));
+        }
+        let mls = staged.into_group(&self.provider).map_err(mls)?;
         if mls.group_id().as_slice() != group {
             return Err(GroupError::Unexpected("group id mismatch"));
         }
@@ -924,6 +1051,8 @@ impl Groups {
         if !members.contains(&from) || !members.contains(&self.me) {
             return Err(GroupError::Unexpected("welcome from non-member"));
         }
+        // The Welcome used one; any others for this group are spare.
+        self.drop_key_packages(|(g, ..)| *g == group)?;
         let name = truncate(name);
         let mut roles = HashMap::new();
         roles.insert(from, MemberRole::Owner);
@@ -1070,7 +1199,10 @@ impl Groups {
                     .merge_staged_commit(&self.provider, *staged)
                     .map_err(mls)?;
                 if !g.mls.is_active() {
-                    self.groups.remove(&group);
+                    // We were removed: drop the group's secrets too, or
+                    // they'd stay in our state, and a later Welcome to the
+                    // same group would find it there and fail.
+                    self.forget(&group)?;
                     return Ok(Output {
                         send: vec![],
                         events: vec![GroupEvent::Left { group }],
@@ -1110,9 +1242,40 @@ impl Groups {
     }
 }
 
+/// Whether `message` (the MLS message in a `GroupWire::Message`) is a
+/// commit or proposal, without which its member can't read what follows.
+/// Anyone can tell: MLS leaves the content type outside the encryption.
+#[cfg(feature = "node")]
+pub(crate) fn is_handshake(message: &[u8]) -> bool {
+    let Ok(msg) = MlsMessageIn::tls_deserialize_exact(message) else {
+        return false;
+    };
+    let content = match msg.extract() {
+        MlsMessageBodyIn::PrivateMessage(m) => m.content_type(),
+        MlsMessageBodyIn::PublicMessage(m) => m.content_type(),
+        _ => return false,
+    };
+    content != ContentType::Application
+}
+
+/// A name as we show it: at most [`MAX_NAME`] characters, without
+/// control characters or the invisible ones that reorder or hide text
+/// (bidirectional overrides and isolates, zero-width characters).
 fn truncate(name: &str) -> String {
     name.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible(*c))
         .take(MAX_NAME)
         .collect()
+}
+
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }

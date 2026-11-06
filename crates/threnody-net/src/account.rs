@@ -213,15 +213,25 @@ impl Node {
     }
 
     /// True for devices removed from their account (ours or a peer's).
-    pub(crate) fn is_revoked(&self, device: &PublicIdentity) -> bool {
+    pub fn is_revoked(&self, device: &PublicIdentity) -> bool {
         lock(&self.shared.account).state().removed.contains(device)
             || lock(&self.shared.accounts).is_revoked(device)
+    }
+
+    /// Whether `peer` may see our account chain: the devices of our
+    /// account and their names (a host name or phone model, often the
+    /// owner's name). Our own devices and contacts we accepted may; a
+    /// stranger only once accepted.
+    pub(crate) fn shows_account_to(&self, peer: &PublicIdentity) -> bool {
+        self.is_accepted(peer)
     }
 
     /// Messages to send when a session with `peer` starts.
     pub(crate) fn account_hello(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
         let mut out = Vec::new();
-        if let Ok(b) = self.account().encode() {
+        if self.shows_account_to(peer)
+            && let Ok(b) = self.account().encode()
+        {
             out.extend(AccountMsg::Chain(b).encode().ok().map(AppMessage::Account));
         }
         if self.is_own_device(peer) {
@@ -287,14 +297,21 @@ impl Node {
     }
 
     fn broadcast_chain(&self) {
+        let peers: Vec<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        self.send_chain(&peers);
+    }
+
+    /// Sends our account chain to those of `peers` with a session that may
+    /// see it.
+    pub(crate) fn send_chain(&self, peers: &[PublicIdentity]) {
         let Ok(b) = self.account().encode() else {
             return;
         };
         let Ok(m) = AccountMsg::Chain(b).encode() else {
             return;
         };
-        for s in self.sessions() {
-            let _ = self.send(&s.peer, AppMessage::Account(m.clone()));
+        for p in peers.iter().filter(|p| self.shows_account_to(p)) {
+            let _ = self.send(p, AppMessage::Account(m.clone()));
         }
     }
 
@@ -308,12 +325,18 @@ impl Node {
         self.shared.save_state("accounts", book);
     }
 
-    pub(crate) fn on_account(&self, from: PublicIdentity, payload: &[u8]) {
+    /// Handles an account message from `from`. False for a chain that
+    /// waits until `from` is accepted (see [`Node::chain_wanted`]): the
+    /// session offers it again then.
+    pub(crate) fn on_account(&self, from: PublicIdentity, payload: &[u8]) -> bool {
         let Ok(msg) = AccountMsg::decode(payload) else {
-            return;
+            return true;
         };
         match msg {
             AccountMsg::Chain(b) => {
+                if !self.chain_wanted(&from, &b) {
+                    return false;
+                }
                 if let Ok(chain) = AccountChain::decode(&b) {
                     self.on_chain(from, chain);
                 }
@@ -347,6 +370,12 @@ impl Node {
                         .collect();
                     let cleared_before: std::collections::HashMap<PublicIdentity, u64> =
                         keys.iter().copied().collect();
+                    // (approved, blocked) before the merge.
+                    let trust_before: std::collections::HashMap<PublicIdentity, (bool, bool)> =
+                        lock(&self.shared.contacts)
+                            .iter()
+                            .map(|c| (c.key, (c.local_approved, c.blocked)))
+                            .collect();
                     let keys: Vec<PublicIdentity> = keys.into_iter().map(|(k, _)| k).collect();
                     let before: Vec<(PublicIdentity, ConversationId)> = keys
                         .into_iter()
@@ -365,13 +394,45 @@ impl Node {
                     let left: Vec<(PublicIdentity, ConversationId)> = {
                         let c = lock(&self.shared.contacts);
                         before
-                            .into_iter()
+                            .iter()
                             .filter(|(k, _)| c.get(k).is_none() && c.forgotten_at(k).is_some())
+                            .copied()
                             .collect()
                     };
                     for (k, conv) in left {
+                        self.withdraw_approval(&k);
                         self.disconnect(&k);
+                        self.forget_peer(&k);
                         let _ = self.shared.home.delete_history(conv);
+                    }
+                    // Contacts revoked or blocked on our other device lose
+                    // their tunnel here too; blocked ones (including ones
+                    // we first hear of already blocked) also lose their
+                    // sessions and conversation, as on that device.
+                    let withdrawn: Vec<(PublicIdentity, bool)> = lock(&self.shared.contacts)
+                        .iter()
+                        .filter_map(|c| {
+                            let (approved, blocked) =
+                                trust_before.get(&c.key).copied().unwrap_or((false, false));
+                            let newly_blocked = c.blocked && !blocked;
+                            (newly_blocked || (approved && !c.local_approved))
+                                .then_some((c.key, newly_blocked))
+                        })
+                        .collect();
+                    if !withdrawn.is_empty() {
+                        for (k, newly_blocked) in withdrawn {
+                            self.withdraw_approval(&k);
+                            if newly_blocked {
+                                let conv = before
+                                    .iter()
+                                    .find(|(b, _)| *b == k)
+                                    .map_or_else(|| self.conversation_for(&k), |(_, c)| *c);
+                                self.disconnect(&k);
+                                self.forget_peer(&k);
+                                let _ = self.shared.home.delete_history(conv);
+                            }
+                        }
+                        self.enforce_policy();
                     }
                     // Chats cleared on our other device.
                     let cleared: Vec<(PublicIdentity, u64)> = lock(&self.shared.contacts)
@@ -388,6 +449,24 @@ impl Node {
                 }
             }
         }
+        true
+    }
+
+    /// Whether to take `from`'s chain `b` now. Anyone can present a chain,
+    /// and a stored one stays (with every device in it a contact), so only
+    /// chains from devices the user accepted, or about our own account or
+    /// one we already know (a contact's new device), are checked and kept.
+    /// A stranger's waits until the user accepts it; until then it costs
+    /// neither checking nor storage.
+    fn chain_wanted(&self, from: &PublicIdentity, b: &[u8]) -> bool {
+        if self.is_accepted(from) {
+            return true;
+        }
+        // Malformed: decoding will fail at once anyway.
+        let Ok(id) = AccountChain::claimed_id(b) else {
+            return true;
+        };
+        id == lock(&self.shared.account).id() || lock(&self.shared.accounts).get(&id).is_some()
     }
 
     fn on_chain(&self, from: PublicIdentity, chain: AccountChain) {
@@ -475,7 +554,8 @@ impl Node {
         }
     }
 
-    /// A device left its account: stop trusting it everywhere.
+    /// A device left its account: stop trusting it everywhere, and seal
+    /// nothing more to it (its prekeys go).
     fn revoke_device(&self, device: &PublicIdentity) {
         {
             let mut contacts = lock(&self.shared.contacts);
@@ -487,7 +567,14 @@ impl Node {
             }
             self.shared.save_contacts(&contacts);
         }
+        {
+            let mut bundles = lock(&self.shared.bundles);
+            if bundles.remove(device) {
+                self.shared.persist_bundles(&bundles);
+            }
+        }
         self.disconnect(device);
+        self.forget_peer(device);
     }
 
     fn on_own_chain(&self, from: PublicIdentity, own: AccountChain, chain: AccountChain) {
@@ -502,6 +589,16 @@ impl Node {
                 .copied()
                 .filter(|d| !own.state().removed.contains(d))
                 .collect();
+            // Devices linked through another of ours: the app tells the
+            // user here too, as the linking device does (`DeviceLinked`).
+            let me = self.identity();
+            let added: Vec<PublicIdentity> = chain
+                .state()
+                .devices
+                .iter()
+                .map(|(d, _)| *d)
+                .filter(|d| *d != me && !own.state().has(d))
+                .collect();
             *lock(&self.shared.account) = chain.clone();
             self.persist_account();
             self.tag_own_devices();
@@ -513,7 +610,7 @@ impl Node {
             }
             self.emit(Event::AccountChanged {
                 account: chain.id(),
-                added: vec![],
+                added,
                 removed,
             });
             // Pass it on so every own device converges.
@@ -584,6 +681,15 @@ impl Node {
         st.codes.retain(|(_, t)| t.elapsed() < LINK_CODE_TTL);
         st.codes.push((code.clone(), Instant::now()));
         code
+    }
+
+    /// Whether a link code we issued is still out (see `Node::admit`).
+    pub(crate) fn link_code_out(&self) -> bool {
+        !self.shared.persona
+            && lock(&self.shared.linking)
+                .codes
+                .iter()
+                .any(|(_, t)| t.elapsed() < LINK_CODE_TTL)
     }
 
     fn on_link_request(&self, from: PublicIdentity, proof: [u8; 32], name: &str) {
@@ -770,6 +876,13 @@ impl Node {
             self.emit(Event::ThisDeviceRemoved);
         } else {
             self.revoke_device(device);
+            // As our other devices see it when the chain reaches them, so
+            // the groups this one runs drop the device too.
+            self.emit(Event::AccountChanged {
+                account: self.account().id(),
+                added: vec![],
+                removed: vec![*device],
+            });
         }
         Ok(())
     }
@@ -823,5 +936,70 @@ impl Node {
     /// Known peer accounts.
     pub fn known_accounts(&self) -> AccountBook {
         lock(&self.shared.accounts).clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{AcceptPolicy, NodeConfig};
+    use threnody_core::Identity;
+    use threnody_core::account::Action;
+    use threnody_core::store::Home;
+
+    fn add(chain: &mut AccountChain, by: &Identity, new: &Identity) {
+        let mut link = chain.propose(Action::Add {
+            device: new.public(),
+            name: "device".into(),
+        });
+        link.sign(by).unwrap();
+        link.sign(new).unwrap();
+        chain.append(link).unwrap();
+    }
+
+    /// A stranger's chain is neither stored nor turned into contacts until
+    /// the user accepts the stranger; a known account's new device is
+    /// recognised at once.
+    #[tokio::test]
+    async fn a_strangers_chain_waits_until_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let stranger = Identity::generate();
+        let genesis = Identity::generate();
+        let mut chain = AccountChain::genesis(&genesis, "genesis").unwrap();
+        add(&mut chain, &genesis, &stranger);
+        let fakes: Vec<Identity> = (0..20).map(|_| Identity::generate()).collect();
+        for f in &fakes {
+            add(&mut chain, &stranger, f);
+        }
+        let msg = AccountMsg::Chain(chain.encode().unwrap()).encode().unwrap();
+        let contacts = || node.contacts().iter().count();
+        let before = contacts();
+
+        assert!(!node.on_account(stranger.public(), &msg), "set aside");
+        assert!(node.known_accounts().get(&chain.id()).is_none());
+        assert_eq!(contacts(), before, "no contacts from a stranger's chain");
+
+        node.accept_contact(&stranger.public());
+        assert!(node.on_account(stranger.public(), &msg));
+        assert!(node.known_accounts().get(&chain.id()).is_some());
+        assert!(node.contacts().get(&fakes[0].public()).is_some());
+
+        // Another device of that account, not accepted itself, is taken.
+        let other = Identity::generate();
+        add(&mut chain, &stranger, &other);
+        let msg = AccountMsg::Chain(chain.encode().unwrap()).encode().unwrap();
+        assert!(node.on_account(other.public(), &msg));
+        assert!(node.account_of(&other.public()).is_some());
+        node.shutdown();
     }
 }

@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 import UIKit
 
@@ -249,12 +250,13 @@ private struct Bubble: View {
 private struct FileContent: View {
     let file: FileInfo
     let caption: String
+    @State private var image: UIImage?
 
     var body: some View {
         let url = Paths.resolve(file.location)
         let label = file.sensitive ? "Sensitive file" : (caption.isEmpty ? file.name : caption)
         VStack(alignment: .leading, spacing: 6) {
-            if !file.sensitive, let url, let image = UIImage(contentsOfFile: url.path) {
+            if let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
@@ -267,6 +269,36 @@ private struct FileContent: View {
                 Label(label, systemImage: "paperclip")
             }
         }
+        .task(id: file.location) {
+            guard !file.sensitive, let url else { return }
+            image = try? await offMain { Thumbnail.load(url, maxSide: 960) }
+        }
+    }
+}
+
+/// Pictures for chat bubbles: decoded small, off the main thread, and
+/// refused when too large, as on Android.
+enum Thumbnail {
+    /// Larger images are refused rather than decoded (decompression bombs).
+    static let maxPixels = 100_000_000.0
+
+    /// The image at `url`, at most `maxSide` pixels on its longer side, or
+    /// nil if it isn't one, can't be read, or is too large to decode.
+    static func load(_ url: URL, maxSide: Int) -> UIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              w > 0, h > 0, Double(w) * Double(h) <= maxPixels
+        else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return UIImage(cgImage: cg)
     }
 }
 

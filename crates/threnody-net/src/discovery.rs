@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 
 use crate::error::Result;
 use crate::node::{Event, Node};
+use crate::relay::Hidden;
 
 /// Bluetooth LE service UUID for Threnody. Devices advertise service data
 /// under it: a beacon ([`Node::ble_beacon`]) whose port field is the L2CAP
@@ -232,6 +233,16 @@ impl Node {
                     if cfg.auto_connect && node.should_dial(&peer, &mut last_dial) {
                         let node = node.clone();
                         tokio::spawn(async move {
+                            // Through an onion circuit when one can be
+                            // built, as any background reconnection. With
+                            // no first hop for one, the LAN peer is dialed
+                            // directly at once, without waiting behind
+                            // reconnections over the internet: it is the
+                            // quickest first hop there is.
+                            let _claim = match node.reconnect_hidden(&peer, 0, false).await {
+                                Hidden::Up => return,
+                                Hidden::Direct(claim) => claim,
+                            };
                             let _ = node
                                 .connect(&addr.to_string(), Some(peer.fingerprint()))
                                 .await;

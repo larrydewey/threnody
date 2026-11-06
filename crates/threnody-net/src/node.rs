@@ -1,9 +1,9 @@
 //! A running Threnody node: listens, dials, runs one task per session,
 //! enforces the trust policy and keeps the contact book current.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -12,7 +12,8 @@ use threnody_core::account::{AccountBook, AccountChain, AccountId};
 use threnody_core::crypto::aead::Suite;
 use threnody_core::discovery::DISCOVERY_CONTEXT;
 use threnody_core::message::{
-    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURES, MAX_ACK_IDS,
+    FEATURE_ACKS, FEATURE_OBSERVED, FEATURE_PATHS, FEATURE_PUSH, FEATURE_TIMED_PROBES, FEATURES,
+    MAX_ACK_IDS, PAD_LINK,
 };
 use threnody_core::prekey::{BundleBook, PrekeyBundle, PrekeyStore};
 use threnody_core::store::{Contacts, Home};
@@ -24,10 +25,12 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::account::LinkState;
-use crate::delivery::{Delivery, Tag, trackable};
+use crate::delivery::{Delivery, Tag, needs, trackable};
 use crate::error::{NetError, Result};
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{MAX_FRAME, read_body_metered, read_len, write_frame};
+use crate::gate::{Pass, Source};
 use crate::handshake;
+use crate::history::Recorded;
 use crate::mailbox::MailboxStore;
 use crate::onion::OnionState;
 use crate::relay::RelayState;
@@ -70,6 +73,13 @@ impl std::fmt::Debug for Secret {
 /// the userspace device.
 pub(crate) type TunnelInbound = mpsc::Sender<(PublicIdentity, Vec<u8>)>;
 
+/// Whether a tunnel endpoint says where to send: one learned only over a
+/// link with no IP address (Bluetooth) doesn't, and WireGuard then waits
+/// for the peer's own packets to show it.
+pub fn has_endpoint(endpoint: &SocketAddr) -> bool {
+    !endpoint.ip().is_unspecified()
+}
+
 /// A peer's WireGuard tunnel info.
 #[derive(Clone)]
 pub struct TunnelPeer {
@@ -77,6 +87,36 @@ pub struct TunnelPeer {
     pub endpoint: SocketAddr,
     pub overlay: Ipv6Addr,
     pub psk: Secret,
+}
+
+/// How something went when no circuit could hide it (see
+/// [`Event::Fallback`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPath {
+    /// A session dialed straight to the peer: it sees our address, and
+    /// anyone watching our network sees that we talk.
+    Direct,
+    /// A session through a relay circuit (Appendix G): the relays know
+    /// both ends.
+    Relayed,
+    /// A sealed message for the peer, left with `mailbox` directly: the
+    /// mailbox learns that we write to the peer.
+    Deposit { mailbox: PublicIdentity },
+}
+
+impl FallbackPath {
+    /// A short notice for the chat with the peer.
+    pub fn notice(&self) -> &'static str {
+        match self {
+            Self::Direct => "Sent directly: no relay circuit was available",
+            Self::Relayed => {
+                "Sent through a relay that can see both of you: no onion circuit was available"
+            }
+            Self::Deposit { .. } => {
+                "Left with a mailbox directly: no relay circuit reached it, so it knows who sent it"
+            }
+        }
+    }
 }
 
 /// Something the user interface should know about.
@@ -301,6 +341,14 @@ pub enum Event {
         /// sent it.
         anonymous: bool,
     },
+    /// Onion routing is on, but no onion or volunteer circuit could be
+    /// used, so we reached `peer` (or left a message for it) in the open
+    /// instead (Appendix I, *Fallback*). Apps show a quiet notice in the
+    /// chat with `peer`.
+    Fallback {
+        peer: PublicIdentity,
+        path: FallbackPath,
+    },
     /// An automatic dial (e.g. after discovery) failed.
     DialFailed {
         peer: PublicIdentity,
@@ -428,6 +476,9 @@ struct SessionHandle {
     info: SessionInfo,
     /// The QUIC connection under a QUIC session, for call media datagrams.
     datagrams: Option<quinn::Connection>,
+    /// When a frame last came in (ms), to tell a live session from one a
+    /// network change may have left dead (see [`Node::first_hop_peers`]).
+    heard_ms: Arc<AtomicU64>,
 }
 
 pub(crate) struct Shared {
@@ -453,6 +504,9 @@ pub(crate) struct Shared {
     tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
     tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    /// When each peer's last Wi-Fi Direct request and offer were taken
+    /// (see `direct`), to take at most one of each per interval.
+    pub(crate) direct_taken: Mutex<HashMap<(PublicIdentity, bool), std::time::Instant>>,
     /// Where WireGuard packets that arrive over sessions go: the userspace
     /// device (`wg_userspace`), when one runs.
     tunnel_inbound: Mutex<Option<TunnelInbound>>,
@@ -460,6 +514,8 @@ pub(crate) struct Shared {
     pub(crate) prekeys: Mutex<PrekeyStore>,
     pub(crate) bundles: Mutex<BundleBook>,
     pub(crate) mailbox: Mutex<MailboxStore>,
+    /// Our sealed messages waiting to hear whether a mailbox took them.
+    pub(crate) placements: Mutex<crate::mailbox::Placements>,
     pub(crate) onion: Mutex<OnionState>,
     pub(crate) account: Mutex<AccountChain>,
     pub(crate) accounts: Mutex<AccountBook>,
@@ -487,6 +543,27 @@ pub(crate) struct Shared {
     pub(crate) recover: crate::recover::RecoverState,
     /// Anonymous links (see `anon`).
     pub(crate) anon: Mutex<crate::anon::AnonState>,
+    /// Inbound TCP connections still in their handshake (see `gate`).
+    pub(crate) inbound: crate::gate::Gate,
+    /// The same for radio links, apart so internet load can't fill it.
+    pub(crate) link_inbound: crate::gate::Gate,
+    /// The same for QUIC (see `quic`).
+    pub(crate) quic_inbound: crate::gate::Gate,
+    /// Sessions with strangers, which unlike handshakes last (see
+    /// [`MAX_STRANGERS`]).
+    pub(crate) strangers: crate::gate::Gate,
+    /// How long a stranger's session lasts without application traffic
+    /// (see [`STRANGER_IDLE`]); tests shorten it.
+    stranger_idle: Mutex<Duration>,
+    /// Places past [`MAX_STRANGERS`] for a new device of ours linking
+    /// while a link code is out (see [`MAX_LINKING`]), and how long one
+    /// may stay a stranger's; tests shorten that.
+    pub(crate) linkers: crate::gate::Gate,
+    link_grace: Mutex<Duration>,
+    /// Peers whose waiting messages we try to deliver again (see
+    /// `retry_held`), and the first wait between tries.
+    retrying: Mutex<HashSet<PublicIdentity>>,
+    retry_after: Mutex<Duration>,
     /// Directories, volunteering and relay tokens (see `volunteer`).
     pub(crate) volunteer: crate::volunteer::VolunteerState,
     /// Credentials held and exchanges in progress (see `cred`).
@@ -495,6 +572,9 @@ pub(crate) struct Shared {
     pub(crate) calls: Mutex<crate::call::CallState>,
     /// Wake-up endpoints, ours and contacts' (see `push`).
     pub(crate) push: Mutex<crate::push::PushState>,
+    /// Bytes of frames from untrusted peers read but not yet handled,
+    /// across every session (see `read_inbound`).
+    untrusted_held: AtomicUsize,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -521,6 +601,41 @@ impl Shared {
                 wg_public: removed.map(|tp| tp.wg_public),
             });
         }
+    }
+
+    /// Where `peer`'s tunnel endpoint is, offered `port` on a session from
+    /// `addr`. A link with no IP address (Bluetooth) has an unspecified
+    /// one: the endpoint an earlier session gave stays, else it is left
+    /// unspecified (see [`has_endpoint`]) until the peer's packets show it.
+    fn tunnel_endpoint(&self, peer: &PublicIdentity, addr: SocketAddr, port: u16) -> SocketAddr {
+        let ip = if addr.ip().is_unspecified() {
+            lock(&self.tunnel_peers)
+                .get(peer)
+                .map_or(addr.ip(), |tp| tp.endpoint.ip())
+        } else {
+            addr.ip()
+        };
+        SocketAddr::new(ip, port)
+    }
+
+    /// Records `peer`'s tunnel, unless its WireGuard key is ours or
+    /// already another peer's. WireGuard knows peers by key, so a contact
+    /// offering someone else's key would take over that peer's entry (and,
+    /// once revoked, remove it). The first to hold a key keeps it. Returns
+    /// whether it was recorded.
+    fn add_tunnel_peer(&self, peer: PublicIdentity, tp: TunnelPeer) -> bool {
+        if lock(&self.tunnel).is_some_and(|(_, ours)| ours == tp.wg_public) {
+            return false;
+        }
+        let mut peers = lock(&self.tunnel_peers);
+        if peers
+            .iter()
+            .any(|(id, p)| *id != peer && p.wg_public == tp.wg_public)
+        {
+            return false;
+        }
+        peers.insert(peer, tp);
+        true
     }
 
     pub(crate) fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
@@ -556,7 +671,7 @@ impl Shared {
     }
 
     pub(crate) fn save_contacts(&self, c: &Contacts) {
-        if let Err(e) = self.home.save_contacts(c) {
+        if let Err(e) = self.home.save_contacts(&self.identity, c) {
             eprintln!("threnody: failed to save contacts: {e}");
         }
     }
@@ -569,7 +684,7 @@ pub struct Node {
 
 impl Node {
     pub fn new(cfg: NodeConfig) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
-        let contacts = cfg.home.load_contacts()?;
+        let contacts = cfg.home.load_contacts(&cfg.identity)?;
         let now = now_ms();
         let prekeys = match cfg.home.load_state(&cfg.identity, "prekeys")? {
             Some(b) => PrekeyStore::decode(&b)?,
@@ -609,7 +724,14 @@ impl Node {
             None => AccountBook::default(),
         };
         let mailbox = match cfg.home.load_state(&cfg.identity, "mailbox")? {
-            Some(b) => MailboxStore::decode(&b)?,
+            Some(b) => {
+                let mut mb = MailboxStore::decode(&b)?;
+                if mb.prune(now) {
+                    cfg.home
+                        .save_state(&cfg.identity, "mailbox", &mb.encode()?)?;
+                }
+                mb
+            }
             None => MailboxStore::default(),
         };
         let folders = cfg
@@ -662,11 +784,13 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
+            direct_taken: Mutex::new(HashMap::new()),
             tunnel_inbound: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
             prekeys: Mutex::new(prekeys),
             bundles: Mutex::new(bundles),
             mailbox: Mutex::new(mailbox),
+            placements: Mutex::default(),
             onion: Mutex::new(OnionState::default()),
             ble: Mutex::default(),
             account: Mutex::new(account),
@@ -684,20 +808,45 @@ impl Node {
             reach: crate::reach::ReachState::new(!persona),
             recover: crate::recover::RecoverState::new(),
             anon: Mutex::default(),
+            inbound: crate::gate::Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE),
+            link_inbound: crate::gate::Gate::new(
+                MAX_HANDSHAKING_PER_SOURCE,
+                MAX_HANDSHAKING_PER_SOURCE,
+            ),
+            quic_inbound: crate::gate::Gate::new(
+                crate::quic::MAX_HANDSHAKING,
+                crate::quic::MAX_HANDSHAKING_PER_SOURCE,
+            ),
+            strangers: crate::gate::Gate::new(MAX_STRANGERS, MAX_STRANGERS_PER_SOURCE),
+            stranger_idle: Mutex::new(STRANGER_IDLE),
+            linkers: crate::gate::Gate::new(MAX_LINKING, MAX_LINKING_PER_SOURCE),
+            link_grace: Mutex::new(LINK_GRACE),
+            retrying: Mutex::default(),
+            retry_after: Mutex::new(RETRY_AFTER),
             volunteer: crate::volunteer::VolunteerState::new(),
             creds: Mutex::default(),
             calls: Mutex::default(),
             push: Mutex::default(),
+            untrusted_held: AtomicUsize::new(0),
         };
         let node = Self {
             shared: Arc::new(shared),
         };
+        // Which peers' delivered ids to keep longest: not saved with them.
+        let contacts: HashSet<PublicIdentity> = node
+            .shared
+            .delivery(|d| d.delivered_from())
+            .into_iter()
+            .filter(|p| node.is_accepted(p))
+            .collect();
+        node.shared.delivery(|d| d.mark_contacts(&contacts));
         node.start_history_sweep();
         node.load_recovery();
         node.load_volunteer();
         node.load_credentials();
         node.start_directory_upkeep();
         node.load_push();
+        node.resume_placements();
         Ok((node, rx))
     }
 
@@ -713,8 +862,26 @@ impl Node {
         *lock(&self.shared.policy)
     }
 
+    /// Sets who may hold a session with us. Sessions the new policy would
+    /// refuse end at once rather than when they next reconnect.
     pub fn set_policy(&self, p: AcceptPolicy) {
         *lock(&self.shared.policy) = p;
+        self.enforce_policy();
+    }
+
+    /// Ends sessions the accept policy refuses now, as it would have at
+    /// accept: after it tightens, or an approval it relied on is revoked.
+    /// Sessions we dialed ourselves stay, as the policy never covered them.
+    pub(crate) fn enforce_policy(&self) {
+        let refused: Vec<PublicIdentity> = self
+            .sessions()
+            .into_iter()
+            .filter(|s| !s.outbound && self.check_policy(&s.peer).is_err())
+            .map(|s| s.peer)
+            .collect();
+        for peer in refused {
+            self.disconnect(&peer);
+        }
     }
 
     pub fn constant_rate(&self) -> Option<Duration> {
@@ -828,21 +995,16 @@ impl Node {
         // Then add/update each peer
         for peer in self.tunnel_peers_full() {
             let psk = zeroize::Zeroizing::new(threnody_core::tunnel::base64(&peer.psk.0[..]));
+            let key = threnody_core::tunnel::base64(&peer.wg_public);
+            let endpoint = peer.endpoint.to_string();
+            let allowed = format!("{}/128", peer.overlay);
+            let mut args = vec!["set", iface, "peer", &key, "preshared-key", "/dev/stdin"];
+            if has_endpoint(&peer.endpoint) {
+                args.extend(["endpoint", &endpoint]);
+            }
+            args.extend(["allowed-ips", &allowed, "persistent-keepalive", "25"]);
             let mut child = Command::new("wg")
-                .args([
-                    "set",
-                    iface,
-                    "peer",
-                    &threnody_core::tunnel::base64(&peer.wg_public),
-                    "preshared-key",
-                    "/dev/stdin",
-                    "endpoint",
-                    &peer.endpoint.to_string(),
-                    "allowed-ips",
-                    &format!("{}/128", peer.overlay),
-                    "persistent-keepalive",
-                    "25",
-                ])
+                .args(args)
                 .stdin(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -888,11 +1050,23 @@ impl Node {
                     a = listener.accept() => a,
                     () = &mut closed => break,
                 };
-                let Ok((stream, peer_addr)) = accepted else {
+                let (stream, peer_addr) = match accepted {
+                    Ok(a) => a,
+                    Err(_) => {
+                        // Most likely out of file descriptors. The listener
+                        // stays ready, so accepting again at once would spin.
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                // Over the limit the connection closes at once, before it
+                // holds anything for long.
+                let Some(pass) = node.shared.inbound.enter(Source::ip(peer_addr.ip())) else {
                     continue;
                 };
                 let node = node.clone();
                 tokio::spawn(async move {
+                    let _pass = pass;
                     if let Err(e) = node.run_inbound(stream, peer_addr).await {
                         node.shared.emit(Event::Rejected {
                             addr: peer_addr,
@@ -907,17 +1081,18 @@ impl Node {
 
     async fn run_inbound(&self, mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
         tune_tcp(&stream);
-        let first = tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, read_frame(&mut stream))
-            .await
-            .map_err(|_| NetError::Timeout)??
-            .ok_or(NetError::Closed)?;
+        // Either the anonymous-link marker or HS1, both small.
+        let first =
+            tokio::time::timeout(handshake::HANDSHAKE_TIMEOUT, handshake::next(&mut stream))
+                .await
+                .map_err(|_| NetError::Timeout)??;
         // An anonymous link (Appendix P) announces itself before the handshake.
         if first == crate::anon::MAGIC {
             return self.accept_anon(stream, addr).await;
         }
         let chan = handshake::accept_first(&mut stream, &self.shared.identity, &first).await?;
-        self.check_policy(chan.peer())?;
-        self.spawn_session(stream, chan, addr, false, Route::Direct(None));
+        let pass = self.admit(chan.peer(), Source::ip(addr.ip()))?;
+        self.start_session(stream, chan, addr, false, Route::Direct(None), pass);
         Ok(())
     }
 
@@ -963,16 +1138,8 @@ impl Node {
     ) -> Result<PublicIdentity> {
         tune_tcp(&stream);
         let peer_addr = stream.peer_addr()?;
-        let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;
+        let chan = handshake::initiate(&mut stream, &self.shared.identity, expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         self.spawn_session(
             stream,
             chan,
@@ -996,16 +1163,8 @@ impl Node {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let chan = handshake::initiate(&mut stream, &self.shared.identity).await?;
+        let chan = handshake::initiate(&mut stream, &self.shared.identity, expect).await?;
         let peer = *chan.peer();
-        if let Some(want) = expect
-            && peer.fingerprint() != want
-        {
-            return Err(NetError::IdentityMismatch {
-                expected: want.to_string(),
-                got: peer.fingerprint().to_string(),
-            });
-        }
         self.spawn_session(
             stream,
             chan,
@@ -1027,15 +1186,21 @@ impl Node {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let _pass = self
+            .shared
+            .link_inbound
+            .enter(Source::Link)
+            .ok_or_else(|| NetError::Refused("too many links in their handshake".into()))?;
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
-        self.check_policy(chan.peer())?;
+        let pass = self.admit(chan.peer(), Source::Link)?;
         let peer = *chan.peer();
-        self.spawn_session(
+        self.start_session(
             stream,
             chan,
             SocketAddr::from(([0, 0, 0, 0], 0)),
             false,
             Route::Link { transport, remote },
+            pass,
         );
         Ok(peer)
     }
@@ -1045,6 +1210,8 @@ impl Node {
     pub fn shutdown(&self) {
         self.shared.shutdown.send_replace(true);
         lock(&self.shared.sessions).clear();
+        // Relay tokens spent a moment ago, not saved yet.
+        self.save_seen();
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -1131,6 +1298,108 @@ impl Node {
         }
     }
 
+    /// Whether `peer` is a stranger: not a contact we accepted, not one
+    /// of our devices, not mutually approved. Its message requests still
+    /// come in, but its session is capped and expires (see
+    /// [`MAX_STRANGERS`]).
+    pub(crate) fn is_stranger(&self, peer: &PublicIdentity) -> bool {
+        !self.is_accepted(peer) && !self.shared.mutual(peer)
+    }
+
+    /// [`Node::check_policy`] for a session arriving over its own
+    /// connection from `source`; a stranger also needs a place among
+    /// [`MAX_STRANGERS`], which the returned pass holds. Relay and onion
+    /// circuits don't come through here: they ride on a contact's
+    /// session, hold no socket of ours, and are capped per neighbour.
+    ///
+    /// A new device of ours, linking with a code we issued, is a stranger
+    /// until it shows the code inside its session: while a code is out,
+    /// one past the limit takes one of [`MAX_LINKING`] places instead,
+    /// and must have become ours within [`LINK_GRACE`].
+    pub(crate) fn admit(
+        &self,
+        peer: &PublicIdentity,
+        source: Source,
+    ) -> Result<Option<StrangerPass>> {
+        self.check_policy(peer)?;
+        if !self.is_stranger(peer) {
+            return Ok(None);
+        }
+        if let Some(place) = self.shared.strangers.enter(source) {
+            return Ok(Some(StrangerPass {
+                _place: place,
+                linking: false,
+            }));
+        }
+        if self.link_code_out()
+            && let Some(place) = self.shared.linkers.enter(source)
+        {
+            return Ok(Some(StrangerPass {
+                _place: place,
+                linking: true,
+            }));
+        }
+        Err(NetError::Refused(format!(
+            "{} (too many strangers connected; it can try again later)",
+            peer.fingerprint()
+        )))
+    }
+
+    /// Tests only: how long a session let in past the strangers' limit
+    /// for linking may stay a stranger's (normally [`LINK_GRACE`]).
+    #[doc(hidden)]
+    pub fn set_link_grace(&self, grace: Duration) {
+        *lock(&self.shared.link_grace) = grace;
+    }
+
+    /// Tests only: how long a stranger's session may go without
+    /// application traffic (normally [`STRANGER_IDLE`]).
+    #[doc(hidden)]
+    pub fn set_stranger_idle(&self, idle: Duration) {
+        *lock(&self.shared.stranger_idle) = idle;
+    }
+
+    /// Tests only: the first wait before messages held for a peer that
+    /// isn't mutually approved are tried again (normally [`RETRY_AFTER`]).
+    #[doc(hidden)]
+    pub fn set_retry_after(&self, wait: Duration) {
+        *lock(&self.shared.retry_after) = wait;
+    }
+
+    /// Messages wait for `peer`, who isn't mutually approved: nothing
+    /// else (recovery, rendezvous) will bring a session back to it, and
+    /// a stranger's node may have refused ours for want of room (see
+    /// [`MAX_STRANGERS`]). Dial it again now and then, waiting longer
+    /// each time, while anything is unacknowledged and no session is up.
+    pub(crate) fn retry_held(&self, peer: PublicIdentity) {
+        if self.shared.mutual(&peer)
+            || self.is_closed()
+            || tokio::runtime::Handle::try_current().is_err()
+            || !lock(&self.shared.retrying).insert(peer)
+        {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut wait = *lock(&node.shared.retry_after);
+            for _ in 0..RETRIES {
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = node.closed() => break,
+                }
+                wait = (wait * 2).min(RETRY_MAX);
+                if node.unacked(&peer) == 0 || node.shared.mutual(&peer) || node.is_closed() {
+                    break;
+                }
+                if node.connected(&peer) {
+                    continue;
+                }
+                let _ = tokio::time::timeout(RETRY_DIAL, node.reach_peer(&peer)).await;
+            }
+            lock(&node.shared.retrying).remove(&peer);
+        });
+    }
+
     /// Queues a message to a connected peer. User content (text, files,
     /// group and mailbox messages) is kept until the peer acknowledges it
     /// and sent again in the next session if this one dies first.
@@ -1169,6 +1438,15 @@ impl Node {
         });
         // It waits for a session: wake the peer if it sleeps (Appendix R).
         self.push_wake(peer);
+        self.retry_held(*peer);
+    }
+
+    /// `peer` is gone (forgotten, blocked, or removed from its account):
+    /// drops what we kept for it.
+    pub(crate) fn forget_peer(&self, peer: &PublicIdentity) {
+        self.shared.delivery(|d| d.forget_peer(peer));
+        self.forget_push(peer);
+        self.forget_held(peer);
     }
 
     /// The QUIC connection under the session with `peer`, if it has one.
@@ -1249,6 +1527,24 @@ impl Node {
             .is_some_and(|f| f & feature != 0)
     }
 
+    /// Like [`Node::supports`], but for a peer with no session since we
+    /// started, by what it said in its last one (saved with the contact).
+    pub(crate) fn known_to_support(&self, peer: &PublicIdentity, feature: u64) -> bool {
+        let latest = lock(&self.shared.peer_features).get(peer).copied();
+        latest
+            .or_else(|| lock(&self.shared.contacts).get(peer).map(|c| c.features))
+            .is_some_and(|f| f & feature != 0)
+    }
+
+    /// Whether `peer` said (in a session since we started) it doesn't
+    /// support `feature`. Unlike `!supports`, false for a peer we haven't
+    /// heard from yet.
+    pub(crate) fn lacks(&self, peer: &PublicIdentity, feature: u64) -> bool {
+        lock(&self.shared.peer_features)
+            .get(peer)
+            .is_some_and(|f| f & feature == 0)
+    }
+
     /// How many messages to `peer` are waiting for an acknowledgement.
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
         lock(&self.shared.delivery).unacked(peer)
@@ -1273,17 +1569,59 @@ impl Node {
             }
             self.shared.save_contacts(&contacts);
         }
-        if !approved {
+        if approved {
+            // A stranger until now may not have our account yet.
+            self.send_chain(&[*peer]);
+        } else {
             self.shared.tunnel_down(peer);
+            // No longer mutual: its wake-up endpoint goes (Appendix R).
+            self.forget_push(peer);
         }
         let _ = self.send(peer, AppMessage::Approval { approved });
+        if !approved {
+            // Under `ApprovedOnly` the peer has no business holding a
+            // session any more (the revocation above still goes first).
+            self.enforce_policy();
+        }
         self.push_contact_sync();
         Ok(())
+    }
+
+    /// Takes back what mutual approval gave `peer`, when it is blocked or
+    /// forgotten rather than revoked: its tunnel peer goes at once, and it
+    /// is told we no longer approve it, so its side removes ours too. The
+    /// session may end right after; its last act is to send that.
+    pub(crate) fn withdraw_approval(&self, peer: &PublicIdentity) {
+        self.shared.tunnel_down(peer);
+        // No longer mutual: its wake-up endpoint goes (Appendix R).
+        self.forget_push(peer);
+        let _ = self.send(peer, AppMessage::Approval { approved: false });
     }
 
     /// Ends the session with `peer`, if any.
     pub fn disconnect(&self, peer: &PublicIdentity) -> bool {
         lock(&self.shared.sessions).remove(peer).is_some()
+    }
+
+    /// Peers of the direct sessions a circuit can start on (mutually
+    /// approved), most recently heard from first. With `since_ms`, only
+    /// sessions begun or heard from after it, or over a radio link (which
+    /// a change of network leaves alone): an older one may be dead
+    /// without our knowing yet.
+    pub(crate) fn first_hop_peers(&self, since_ms: u64) -> Vec<PublicIdentity> {
+        let mut firsts: Vec<(u64, PublicIdentity)> = lock(&self.shared.sessions)
+            .values()
+            .filter_map(|h| {
+                let s = &h.info;
+                let heard = h.heard_ms.load(Ordering::Relaxed);
+                let live =
+                    s.since_ms >= since_ms || heard > since_ms || s.addr.ip().is_unspecified();
+                (s.via.is_none() && live).then_some((heard, s.peer))
+            })
+            .collect();
+        firsts.retain(|(_, p)| self.shared.mutual(p));
+        firsts.sort_by_key(|f| std::cmp::Reverse(f.0));
+        firsts.into_iter().map(|(_, p)| p).collect()
     }
 
     pub fn sessions(&self) -> Vec<SessionInfo> {
@@ -1310,12 +1648,18 @@ impl Node {
     /// let each side keep a different one and lose the other, over and
     /// over; so both keep the one dialed by the smaller identity key. True
     /// if the new session (`outbound` from our side) is the one to drop.
-    fn loses_duplicate(&self, peer: &PublicIdentity, outbound: bool) -> bool {
+    ///
+    /// Two onion sessions count the same way (each side may build a
+    /// circuit to the other when it reconnects in the background), though
+    /// their first hops differ; a direct and a circuit session never do.
+    fn loses_duplicate(&self, peer: &PublicIdentity, outbound: bool, onion: bool) -> bool {
         let sessions = lock(&self.shared.sessions);
         let Some(old) = sessions.get(peer) else {
             return false;
         };
-        if old.info.via.is_some()
+        let old_onion = old.info.transport == "onion";
+        if (old.info.via.is_some() && !old_onion)
+            || old_onion != onion
             || now_ms().saturating_sub(old.info.since_ms) > DUPLICATE_WINDOW_MS
             || old.info.outbound == outbound
         {
@@ -1336,6 +1680,22 @@ impl Node {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.start_session(stream, chan, addr, outbound, route, None);
+    }
+
+    /// [`Node::spawn_session`], holding `stranger`'s place (see
+    /// [`Node::admit`]) for as long as the session runs as a stranger's.
+    pub(crate) fn start_session<S>(
+        &self,
+        stream: S,
+        chan: SecureChannel,
+        addr: SocketAddr,
+        outbound: bool,
+        route: Route,
+        stranger: Option<StrangerPass>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // Over QUIC the peer's address is its outside address, worth telling it.
         let (over, datagrams) = match &route {
             Route::Quic(c) => (Over::Quic(addr), Some(c.clone())),
@@ -1344,7 +1704,8 @@ impl Node {
         };
         let (dialed, via, transport, remote) = route.into_parts(addr);
         let peer = *chan.peer();
-        if via.is_none() && self.loses_duplicate(&peer, outbound) {
+        let onion = transport == "onion";
+        if (via.is_none() || onion) && self.loses_duplicate(&peer, outbound, onion) {
             // Both sides dialed at once; the other session stays (dropping
             // this stream closes it).
             return;
@@ -1362,12 +1723,14 @@ impl Node {
             self.shared.save_contacts(&contacts);
             is_new
         };
+        let since_ms = now_ms();
+        let heard_ms = Arc::new(AtomicU64::new(since_ms));
         let info = SessionInfo {
             peer,
             addr,
             suite: chan.suite(),
             transport,
-            since_ms: now_ms(),
+            since_ms,
             outbound,
             via,
             session_id: *chan.session_id(),
@@ -1394,6 +1757,7 @@ impl Node {
                 tx,
                 info,
                 datagrams,
+                heard_ms: heard_ms.clone(),
             },
         );
         self.shared.emit(Event::ReachNote {
@@ -1428,8 +1792,12 @@ impl Node {
         });
 
         let node = self.clone();
+        let started = tokio::time::Instant::now();
         tokio::spawn(async move {
-            let result = run_session(&node, stream, chan, addr, via, over, rx).await;
+            let result = run_session(
+                &node, stream, chan, addr, via, over, rx, outbound, stranger, heard_ms,
+            )
+            .await;
             // Closed on purpose (either side) is not a loss to repair.
             let failed = result.is_err();
             let reason = match result {
@@ -1446,6 +1814,17 @@ impl Node {
                 }
                 current
             };
+            // When both sides dial at once, the other side may drop this
+            // session (see `loses_duplicate`) before its twin reaches us:
+            // a young one gets a moment for the twin before counting as
+            // a disconnection.
+            let young = started.elapsed() < Duration::from_millis(DUPLICATE_WINDOW_MS);
+            let current = if current && (via.is_none() || onion) && young {
+                tokio::time::sleep(TWIN_GRACE).await;
+                !node.connected(&peer)
+            } else {
+                current
+            };
             // Circuits relayed over this link die with it (unless a newer
             // session to the same peer already took over).
             if current && via.is_none() {
@@ -1459,11 +1838,17 @@ impl Node {
                 if via.is_none() && failed {
                     node.on_session_lost(peer);
                 }
+                // Left unacknowledged (refused by a stranger's full node,
+                // say): try again later.
+                if outbound && node.unacked(&peer) > 0 {
+                    node.retry_held(peer);
+                }
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     node: &Node,
     stream: S,
@@ -1472,6 +1857,9 @@ async fn run_session<S>(
     via: Option<PublicIdentity>,
     over: Over,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
+    outbound: bool,
+    mut stranger_pass: Option<StrangerPass>,
+    heard_ms: Arc<AtomicU64>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1483,13 +1871,18 @@ where
     let on_standby = matches!(over, Over::Standby);
     let shared: &Shared = &node.shared;
     let peer = *chan.peer();
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, mut wr) = tokio::io::split(stream);
+    // Bytes of a frame still arriving (a large file) count as the peer
+    // talking, for the lease: a whole frame may take longer than it.
+    let heard = Heard::new();
+    let mut rd = heard.reader(rd);
 
     // Frame reads are not cancellation-safe, so they get their own task.
-    let (in_tx, mut inbox) = mpsc::channel::<Result<Vec<u8>>>(16);
+    let (in_tx, mut inbox) = mpsc::channel::<Result<Inbound>>(16);
+    let reader_shared = node.shared.clone();
     let reader = tokio::spawn(async move {
         loop {
-            let r = read_frame(&mut rd).await;
+            let r = read_inbound(&reader_shared, &mut rd, || reader_shared.mutual(&peer)).await;
             let stop = !matches!(r, Ok(Some(_)));
             let item = match r {
                 Ok(Some(f)) => Ok(f),
@@ -1519,7 +1912,8 @@ where
 
     let make_ticker = |rate: Option<Duration>| {
         rate.map(|d| {
-            let mut t = tokio::time::interval(d);
+            // No slower than the longest heartbeat a lease allows.
+            let mut t = tokio::time::interval(d.min(crate::recover::MAX_BEAT));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             t
         })
@@ -1528,7 +1922,8 @@ where
     // Inside a relay or onion circuit the links' cover traffic hides the
     // timing (Appendix I); cover from this session too would send more
     // cells than a constant-rate link carries, and the backlog would grow
-    // without end.
+    // without end. For the same reason its heartbeat is slow (see
+    // `inner_beat_for`).
     let inner = via.is_some();
     let mut ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
 
@@ -1542,10 +1937,30 @@ where
     // `Paths` that arrived before approval was mutual (the peer's
     // `Approval` can trail them), kept until it is.
     let mut early_paths: Option<Vec<u8>> = None;
+    // The peer's account chain, kept until the user accepts the peer (see
+    // `Node::chain_wanted`).
+    let mut early_chain: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
-    let setup_until = last_rx + SETUP_BURST;
-    let mut heartbeat = tokio::time::interval(node.beat());
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let began = last_rx;
+    let setup_until = began + SETUP_BURST;
+    // A stranger's session (one we didn't dial, from someone we haven't
+    // accepted) ends after this long without application traffic either
+    // way, and holds its place among the strangers' until then or until
+    // we accept it.
+    let mut stranger = !outbound && node.is_stranger(&peer);
+    let stranger_idle = *lock(&shared.stranger_idle);
+    // Let in past the limit to link: it has this long to become ours.
+    let link_grace = stranger_pass
+        .as_ref()
+        .is_some_and(|p| p.linking)
+        .then(|| *lock(&shared.link_grace));
+    let mut last_app = last_rx;
+    let make_heartbeat = || {
+        let mut t = tokio::time::interval(node.beat_for(inner));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    };
+    let mut heartbeat = make_heartbeat();
     let mut discovery_keyed = false;
     let mut prekeys_sent = false;
     let mut push_sent = false;
@@ -1560,6 +1975,11 @@ where
     }
     let result: Result<()> = async {
         loop {
+            // Accepted (or approved) meanwhile: a stranger no more.
+            if stranger && !node.is_stranger(&peer) {
+                stranger = false;
+                stranger_pass = None;
+            }
             // Refresh the pairwise LAN discovery key once per session.
             if !discovery_keyed && shared.mutual(&peer) {
                 let key = *chan.export(DISCOVERY_CONTEXT);
@@ -1581,6 +2001,12 @@ where
             {
                 lease = node.on_paths(peer, &payload).or(lease);
             }
+            if early_chain.is_some()
+                && node.is_accepted(&peer)
+                && let Some(payload) = early_chain.take()
+            {
+                node.on_account(peer, &payload);
+            }
             // Tell an approved peer how to find us if this session breaks.
             // Over relay and onion circuits too: the endpoints are mutual
             // contacts, and a persistent circuit to an always-on contact
@@ -1595,7 +2021,7 @@ where
                 // get its lease and recovery paths across.
                 // Behind `Hello` and our `Approval`, though: the peer only
                 // takes paths from a peer it knows approves it.
-                if let Some(m) = node.paths_message() {
+                if let Some(m) = node.paths_message(inner) {
                     let at = pending
                         .iter()
                         .rposition(|m| matches!(m, AppMessage::Hello { .. } | AppMessage::Approval { .. }))
@@ -1655,7 +2081,7 @@ where
                     )
                 ) {
                     if let Some(m) = pending.pop_front() {
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
             }
@@ -1663,14 +2089,41 @@ where
                 let mut waiting = VecDeque::new();
                 while let Some(m) = pending.pop_front() {
                     match ready(shared, &peer, m, peer_acks) {
-                        Ok(m) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                        Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                        Ok(None) => {}
                         Err(m) => waiting.push_back(m),
                     }
                 }
                 pending = waiting;
             }
+            // The lease runs from whatever came in last, a whole frame or
+            // just some bytes of one.
+            let since = last_rx.max(heard.last());
             tokio::select! {
-                () = lease_expired(lease, last_rx) => {
+                () = lease_expired(link_grace.filter(|_| stranger), began) => {
+                    if node.is_stranger(&peer) {
+                        return Err(NetError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "not linked in time",
+                        )));
+                    }
+                }
+                () = lease_expired(stranger.then_some(stranger_idle), last_app) => {
+                    if node.is_stranger(&peer) {
+                        return Err(NetError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "stranger idle",
+                        )));
+                    }
+                }
+                () = lease_expired(lease, since) => {
+                    // Bytes came in after `since`, or frames wait unread
+                    // after a long write of ours: not silent. Only bytes
+                    // newer than `since` count: a frame cut off midway
+                    // would otherwise hold the session open for good.
+                    if heard.last() > since || !inbox.is_empty() {
+                        continue;
+                    }
                     return Err(NetError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "lease expired (peer silent)",
@@ -1684,6 +2137,7 @@ where
                 }
                 frame = inbox.recv() => {
                     last_rx = tokio::time::Instant::now();
+                    heard_ms.store(now_ms(), Ordering::Relaxed);
                     let frame = match frame {
                         Some(Ok(f)) => f,
                         Some(Err(NetError::Closed)) | None => return Ok(()),
@@ -1691,14 +2145,40 @@ where
                     };
                     // Any authentication failure ends the session: on a
                     // reliable stream it can only mean tampering or a broken peer.
-                    let opened = chan.open(&frame)?;
+                    let opened = chan.open(&frame.bytes)?;
+                    drop(frame);
+                    if !matches!(opened, AppMessage::Cover) {
+                        last_app = last_rx;
+                    }
                     if peer_acks.is_none() {
                         let features = match opened {
                             AppMessage::Hello { features } => features,
                             _ => 0,
                         };
                         lock(&shared.peer_features).insert(peer, features);
+                        {
+                            // Kept for what arrives before the next session.
+                            let mut contacts = lock(&shared.contacts);
+                            if let Some(c) = contacts.get_mut(&peer)
+                                && c.features != features
+                            {
+                                c.features = features;
+                                shared.save_contacts(&contacts);
+                            }
+                        }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        // Remembered across restarts: probes matter most
+                        // when there is no session to ask in.
+                        let timed = features & FEATURE_TIMED_PROBES != 0;
+                        {
+                            let mut contacts = lock(&shared.contacts);
+                            if let Some(c) = contacts.get_mut(&peer)
+                                && c.timed_probes != timed
+                            {
+                                c.timed_probes = timed;
+                                shared.save_contacts(&contacts);
+                            }
+                        }
                         node.send_profile(&peer);
                         if let Some(addr) = observed
                             && features & FEATURE_OBSERVED != 0
@@ -1706,6 +2186,9 @@ where
                             pending.push_back(AppMessage::Observed { addr });
                         }
                     }
+                    // The id of a tracked message delivered for the first
+                    // time, saved as delivered only once handled below.
+                    let mut handling = None;
                     let msg = match opened {
                         AppMessage::Tracked { id, inner } => {
                             // Acknowledge every copy (the last ack may have
@@ -1714,17 +2197,27 @@ where
                                 Some(AppMessage::Ack(ids)) if ids.len() < MAX_ACK_IDS => ids.push(id),
                                 _ => pending.push_back(AppMessage::Ack(vec![id])),
                             }
-                            shared.delivery(|d| d.first_delivery(&peer, id)).then_some(*inner)
+                            let first = shared.delivery(|d| d.first_delivery(&peer, id));
+                            handling = first.then_some(id);
+                            first.then_some(*inner)
                         }
                         AppMessage::Ack(ids) => {
-                            for tag in shared.delivery(|d| d.acked(&peer, &ids)) {
+                            let (tags, mail) = shared.delivery(|d| d.acked(&peer, &ids));
+                            for tag in tags {
                                 node.mark_delivered(&peer, tag);
+                            }
+                            for m in mail {
+                                shared.mail_delivered(&peer, &m);
                             }
                             None
                         }
                         m => Some(m),
                     };
                     let Some(msg) = msg else { continue };
+                    // Remembered so a mailbox copy of it opened later is
+                    // dropped (see `Delivery::seen_change`).
+                    let contact = node.is_accepted(&peer);
+                    shared.delivery(|d| d.seen_change(&peer, &msg, contact));
                     match msg {
                         AppMessage::Delete { conversation, ids } => node.on_delete(&peer, &conversation, &ids),
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
@@ -1770,15 +2263,25 @@ where
                             }
                         }
                         AppMessage::TunnelOffer { wg_public, port } => {
-                            // Spec §8: tunnels only between mutually approved devices.
-                            if lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
+                            // Spec §8: tunnels only between mutually approved
+                            // devices, offered on direct sessions only: the
+                            // address of a relayed one is the relay's.
+                            if via.is_none() && lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
                                 let tp = TunnelPeer {
                                     wg_public,
-                                    endpoint: SocketAddr::new(addr.ip(), port),
+                                    endpoint: shared.tunnel_endpoint(&peer, addr, port),
                                     overlay: overlay_addr(&peer),
                                     psk: Secret(chan.export(PSK_CONTEXT)),
                                 };
-                                lock(&shared.tunnel_peers).insert(peer, tp.clone());
+                                if !shared.add_tunnel_peer(peer, tp.clone()) {
+                                    shared.emit(Event::ReachNote {
+                                        note: format!(
+                                            "tunnel offer from {} refused: its key is not its own",
+                                            peer.fingerprint()
+                                        ),
+                                    });
+                                    continue;
+                                }
                                 // They may have offered while our tunnels
                                 // were off, and so ignored ours: answer
                                 // their first offer with ours.
@@ -1812,7 +2315,11 @@ where
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}
-                        AppMessage::Account(payload) => node.on_account(peer, &payload),
+                        AppMessage::Account(payload) => {
+                            if !node.on_account(peer, &payload) {
+                                early_chain = Some(payload);
+                            }
+                        }
                         AppMessage::Mailbox(payload) => node.on_mailbox(peer, &payload),
                         AppMessage::Onion(payload) => {
                             if via.is_none() {
@@ -1839,29 +2346,103 @@ where
                             }
                         }
                         msg @ (AppMessage::Text { .. } | AppMessage::File { .. } | AppMessage::Group(_)) => {
-                            node.record_incoming(&peer, &msg, false);
-                            if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
-                                shared.emit(Event::Message { peer, msg });
-                            } else {
-                                shared.emit(Event::MessageRequest { peer, msg });
+                            let recorded = node.record_incoming(&peer, &msg, false);
+                            if recorded == Recorded::Failed
+                                && let Some(id) = handling
+                            {
+                                // Not stored (a full disk, no file descriptors
+                                // left): unacknowledged, it stays with the
+                                // sender, who sends it again.
+                                unack(&mut pending, id);
+                                shared.delivery(|d| d.undeliver(&peer, id));
+                                continue;
+                            }
+                            // A text already here (through a mailbox too)
+                            // doesn't show again.
+                            if recorded != Recorded::Duplicate {
+                                if matches!(msg, AppMessage::Group(_)) || node.is_accepted(&peer) {
+                                    shared.emit(Event::Message { peer, msg });
+                                } else {
+                                    shared.emit(Event::MessageRequest { peer, msg });
+                                }
                             }
                         }
                     }
+                    if let Some(id) = handling {
+                        let contact = node.is_accepted(&peer);
+                        shared.delivery(|d| d.delivered(&peer, id, contact));
+                    }
                 }
-                out = outbox.recv() => match out {
+                out = outbox.recv() => {
+                    // Our own revocation on its way out: what this session
+                    // set up under mutual approval (tunnel offer, discovery
+                    // key, prekeys, push) is set up afresh if it returns,
+                    // as when the peer revokes.
+                    if matches!(out, Some(AppMessage::Approval { approved: false })) {
+                        offered = false;
+                        took_offer = false;
+                        discovery_keyed = false;
+                        prekeys_sent = false;
+                        push_sent = false;
+                    }
+                    if out.as_ref().is_some_and(|m| !matches!(m, AppMessage::Cover)) {
+                        last_app = tokio::time::Instant::now();
+                    }
+                    match out {
                     // Calls can't hide behind cover traffic (their media
                     // shows anyway), and a call can't wait for ticks.
                     Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
                         match ready(shared, &peer, m, peer_acks) {
-                            Ok(m) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                            Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                            Ok(None) => {}
                             Err(m) => pending.push_back(m),
                         }
                     }
                     Some(m) => pending.push_back(m),
-                    None => return Ok(()), // replaced or disconnected locally
-                },
+                    None => {
+                        // Replaced or disconnected locally. A revocation
+                        // queued just before (a block, say) still goes, even
+                        // under cover traffic, so the peer drops its side.
+                        // Only while it still holds: a replaced session's
+                        // stale one must not undo a later approval.
+                        let revoked = !lock(&shared.contacts).get(&peer).is_some_and(|c| c.local_approved);
+                        if revoked && chan.can_send() {
+                            for m in pending.iter().filter(|m| matches!(m, AppMessage::Approval { approved: false })) {
+                                let sealed = seal_link(&mut chan, m, ticker.is_some())?;
+                                let _ = tokio::time::timeout(LAST_WORDS, write_frame(&mut wr, &sealed)).await;
+                            }
+                            // Close gently, reading until the peer closes too:
+                            // closing with its frames unread would reset the
+                            // connection, and a reset can discard the
+                            // revocation before the peer reads it.
+                            let _ = tokio::time::timeout(LAST_WORDS, async {
+                                let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
+                                while let Some(Ok(_)) = inbox.recv().await {}
+                            })
+                            .await;
+                        }
+                        return Ok(());
+                    }
+                    }
+                }
                 Ok(()) = rate.changed() => {
+                    // The peer's lease follows the heartbeat our `Paths`
+                    // announced: announce the new one at once, before
+                    // sending less often, or a slower rate would outlast
+                    // the old lease and the peer would end the session.
+                    if paths_sent && shared.mutual(&peer) && node.supports(&peer, FEATURE_PATHS) {
+                        if chan.can_send() {
+                            if let Some(m) = node.paths_message(inner) {
+                                // Padded if either rate paces the link.
+                                let paced = ticker.is_some() || rate.borrow().is_some_and(|_| !inner);
+                                write_frame(&mut wr, &seal_link(&mut chan, &m, paced)?).await?;
+                            }
+                        } else {
+                            paths_sent = false;
+                        }
+                    }
                     ticker = make_ticker(rate.borrow_and_update().filter(|_| !inner));
+                    heartbeat = make_heartbeat();
                 }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {
@@ -1870,14 +2451,15 @@ where
                         for _ in 0..pending.len() {
                             let Some(next) = pending.pop_front() else { break };
                             match ready(shared, &peer, next, peer_acks) {
-                                Ok(r) => {
+                                Ok(Some(r)) => {
                                     m = r;
                                     break;
                                 }
+                                Ok(None) => {}
                                 Err(w) => pending.push_back(w),
                             }
                         }
-                        write_frame(&mut wr, &chan.seal(&m)?).await?;
+                        write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
                     }
                 }
             }
@@ -1896,6 +2478,29 @@ fn is_wireguard(d: &[u8]) -> bool {
     d.len() >= 32 && (1..=4).contains(&d[0]) && d[1..4] == [0, 0, 0]
 }
 
+/// Takes `id` back out of the acknowledgements waiting in `pending`.
+fn unack(pending: &mut VecDeque<AppMessage>, id: u64) {
+    for m in pending.iter_mut() {
+        if let AppMessage::Ack(ids) = m {
+            ids.retain(|x| *x != id);
+        }
+    }
+    pending.retain(|m| !matches!(m, AppMessage::Ack(ids) if ids.is_empty()));
+}
+
+/// Seals `m` for a session or anonymous link. On a constant-rate link
+/// (`paced`) every frame pads to at least [`PAD_LINK`], the size of an
+/// onion cell's, so ticks carrying cells, messages or cover look the same
+/// (Appendix C, *Padding*). Urgent messages (calls, tunnel packets) are
+/// sealed plainly: they skip the ticks, so their size hides nothing.
+pub(crate) fn seal_link(chan: &mut SecureChannel, m: &AppMessage, paced: bool) -> Result<Vec<u8>> {
+    Ok(if paced {
+        chan.seal_padded(m, PAD_LINK)?
+    } else {
+        chan.seal(m)?
+    })
+}
+
 /// Call signalling and media, and tunnel packets: sent at once even under
 /// constant-rate cover traffic.
 fn urgent(m: &AppMessage) -> bool {
@@ -1908,28 +2513,164 @@ fn urgent(m: &AppMessage) -> bool {
 
 /// What to send for `m` now: tracked messages wait until we know whether
 /// the peer acknowledges them, and go out plain (untracked) if it doesn't.
+/// One the peer can't read (a change held before we knew its features) is
+/// dropped: `Ok(None)`.
 fn ready(
     shared: &Shared,
     peer: &PublicIdentity,
     m: AppMessage,
     peer_acks: Option<bool>,
-) -> std::result::Result<AppMessage, AppMessage> {
+) -> std::result::Result<Option<AppMessage>, AppMessage> {
     match (m, peer_acks) {
         (m @ AppMessage::Tracked { .. }, None) => Err(m),
-        (AppMessage::Tracked { id, inner }, Some(false)) => {
-            shared.delivery(|d| d.forget(peer, id));
-            Ok(*inner)
+        (AppMessage::Tracked { id, inner }, Some(acks)) => {
+            let feature = needs(&inner);
+            let readable = feature == 0
+                || lock(&shared.peer_features)
+                    .get(peer)
+                    .is_some_and(|f| f & feature != 0);
+            if !readable {
+                shared.delivery(|d| d.forget(peer, id));
+                return Ok(None);
+            }
+            if acks {
+                Ok(Some(AppMessage::Tracked { id, inner }))
+            } else {
+                shared.delivery(|d| d.forget(peer, id));
+                // Sent plain is as delivered as it gets with this peer.
+                if let AppMessage::Mailbox(m) = &*inner {
+                    shared.mail_delivered(peer, m);
+                }
+                Ok(Some(*inner))
+            }
         }
-        (m, _) => Ok(m),
+        (m, _) => Ok(Some(m)),
     }
 }
+
+/// What frames from untrusted peers may hold at once, across every
+/// session: four maximal frames. Past it their frames are refused (and the
+/// session ends) until some are handled; trusted peers are unaffected.
+const UNTRUSTED_BUDGET: usize = 4 * MAX_FRAME;
+/// An untrusted peer's frame that stops arriving for this long ends the
+/// session. Cover traffic on a metered link spaces frames 10 s apart, and
+/// each onion hop adds its own spacing, so a live transfer never pauses
+/// this long.
+const UNTRUSTED_STALL: Duration = Duration::from_secs(120);
+
+/// A frame a session's reader has read, keeping its share of the untrusted
+/// budget until handled.
+pub(crate) struct Inbound {
+    pub(crate) bytes: Vec<u8>,
+    _held: Option<Held>,
+}
+
+/// Bytes counted against [`UNTRUSTED_BUDGET`], given back on drop.
+struct Held {
+    shared: Arc<Shared>,
+    n: usize,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.shared
+            .untrusted_held
+            .fetch_sub(self.n, Ordering::Relaxed);
+    }
+}
+
+/// Reads a session's next frame; `Ok(None)` on clean end of stream.
+///
+/// Authentication alone is cheap (anyone can make an identity), so frames
+/// from a peer `trusted` says no to, asked once each frame's length is in,
+/// are read a step at a time against [`UNTRUSTED_BUDGET`] and must keep
+/// arriving (see [`UNTRUSTED_STALL`]). Without this a stranger could
+/// announce maximal frames on many sessions and make us hold them forever.
+pub(crate) async fn read_inbound<R: AsyncRead + Unpin>(
+    shared: &Arc<Shared>,
+    rd: &mut R,
+    trusted: impl Fn() -> bool,
+) -> Result<Option<Inbound>> {
+    let Some(len) = read_len(rd, MAX_FRAME).await? else {
+        return Ok(None);
+    };
+    if trusted() {
+        let mut bytes = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(rd, &mut bytes).await?;
+        return Ok(Some(Inbound { bytes, _held: None }));
+    }
+    let mut held = Held {
+        shared: shared.clone(),
+        n: 0,
+    };
+    let bytes = read_body_metered(rd, len, UNTRUSTED_STALL, |step| {
+        let taken = shared.untrusted_held.fetch_add(step, Ordering::Relaxed) + step;
+        held.n += step;
+        taken <= UNTRUSTED_BUDGET
+    })
+    .await?;
+    Ok(Some(Inbound {
+        bytes,
+        _held: Some(held),
+    }))
+}
+
+/// Inbound connections in their handshake at once, and from one source.
+/// Each can sit for the handshake timeout without sending a byte.
+const MAX_HANDSHAKING: usize = 256;
+const MAX_HANDSHAKING_PER_SOURCE: usize = 16;
+/// The pause after a failed accept (see `listen`).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long after a session starts its setup messages skip the cover-traffic
 /// schedule.
 const SETUP_BURST: Duration = Duration::from_secs(5);
 
+/// How long a session ended locally may take to send its last revocation.
+const LAST_WORDS: Duration = Duration::from_secs(1);
+
+/// How long a young session that ended waits for a twin (see
+/// `spawn_session`) before it counts as a disconnection.
+const TWIN_GRACE: Duration = Duration::from_millis(500);
+
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;
+
+/// Sessions with strangers at once, and from one network (an IPv4
+/// address, an IPv6 /64; radio links count as one). Under the `Anyone`
+/// policy each fresh identity that completes a handshake would otherwise
+/// keep a session, and a socket, for good. Past the limit a stranger is
+/// refused after its handshake; what it sends waits on its side, and
+/// gets through on a later try.
+pub const MAX_STRANGERS: usize = 64;
+pub const MAX_STRANGERS_PER_SOURCE: usize = 4;
+/// A stranger's session ends after this long without application
+/// traffic (anything but cover) either way.
+pub const STRANGER_IDLE: Duration = Duration::from_secs(5 * 60);
+/// Places past [`MAX_STRANGERS`] (in all, and from one network) for a
+/// new device of ours that comes to link while a link code is out: one
+/// stranger's crowd mustn't keep the user from adding a device. A session
+/// let in there must have become one of our devices within
+/// [`LINK_GRACE`], or it ends.
+pub const MAX_LINKING: usize = 4;
+pub const MAX_LINKING_PER_SOURCE: usize = 2;
+pub const LINK_GRACE: Duration = Duration::from_secs(30);
+
+/// A stranger's place (see [`Node::admit`]), held while its session runs
+/// as a stranger's.
+pub(crate) struct StrangerPass {
+    _place: Pass,
+    /// Let in past the limit to link a device (see [`MAX_LINKING`]).
+    linking: bool,
+}
+
+/// Messages waiting for a peer that isn't mutually approved are tried
+/// again after this, then after twice as long each time up to
+/// [`RETRY_MAX`], at most [`RETRIES`] times (about 8 hours in all).
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+const RETRIES: usize = 20;
+const RETRY_DIAL: Duration = Duration::from_secs(30);
 
 /// What a session runs over, as far as addresses go.
 #[derive(Clone, Copy)]
@@ -1941,6 +2682,58 @@ enum Over {
     /// network's address, not ours.
     Standby,
     Other,
+}
+
+/// When bytes from the peer last arrived on a session, partial frames
+/// included, shared with the session's reader task.
+#[derive(Clone)]
+struct Heard {
+    t0: tokio::time::Instant,
+    /// Milliseconds after `t0`.
+    at_ms: Arc<AtomicU64>,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Self {
+            t0: tokio::time::Instant::now(),
+            at_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        self.t0 + Duration::from_millis(self.at_ms.load(Ordering::Relaxed))
+    }
+
+    /// `inner`, noting here whenever bytes arrive on it.
+    fn reader<R>(&self, inner: R) -> HeardReader<R> {
+        HeardReader {
+            inner,
+            heard: self.clone(),
+        }
+    }
+}
+
+struct HeardReader<R> {
+    inner: R,
+    heard: Heard,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for HeardReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            let ms = this.heard.t0.elapsed().as_millis() as u64;
+            this.heard.at_ms.store(ms, Ordering::Relaxed);
+        }
+        r
+    }
 }
 
 /// Resolves when `lease` has passed since `last_rx`; never without a lease.

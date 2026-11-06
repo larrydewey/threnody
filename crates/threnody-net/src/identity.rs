@@ -8,6 +8,7 @@
 //! Identity messages only go to peers whose `Hello` has
 //! `FEATURE_IDENTITY`.
 
+use threnody_core::invite::InviteLink;
 use threnody_core::message::FEATURE_IDENTITY;
 use threnody_core::persona::{self, IdentityMsg, LinkProof, PersonaInfo, Personas, Profile};
 use threnody_core::{AppMessage, PublicIdentity};
@@ -146,6 +147,13 @@ impl Node {
             }
             IdentityMsg::Reveal { proof, invite } => {
                 if proof.verify(&from).is_ok() {
+                    // The invite is the sender's word, not part of the proof:
+                    // keep it only if it is pinned to the proven identity, so
+                    // adding them can't reach someone else instead.
+                    let invite = invite.filter(|i| {
+                        i.parse::<InviteLink>()
+                            .is_ok_and(|l| l.fingerprint == proof.identity.fingerprint())
+                    });
                     {
                         let mut contacts = lock(&self.shared.contacts);
                         if let Some(c) = contacts.get_mut(&from) {

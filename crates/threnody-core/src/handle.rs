@@ -9,14 +9,18 @@
 //! seed, salt, enc_key  from base and the hour's epoch     -- the owner's record
 //! knock slot i: seed, salt, enc_key  from base, epoch, i  -- a finder's knock
 //! value      = nonce (24) || XChaCha20-Poly1305(enc_key, nonce, pad(record), aad)
-//! Record     = { 0: id bstr(32), 1: version uint, 2: Candidates }
-//! Knock      = { 0: id bstr(32), 1: Candidates }
+//! Record     = { 0: id bstr(32), 1: version uint, 2: Candidates, ? 3: 1 (knocks sealed) }
+//! Knock      = { 2: eph bstr(32), 3: sealed bstr }      -- sealed to the owner
+//! sealed     = XChaCha20-Poly1305(KDF(X25519(eph, owner), eph, owner), 0, { 0: id, 1: Candidates }, aad)
+//! old Knock  = { 0: id bstr(32), 1: Candidates }        -- to owners without 3
 //! ```
 //!
 //! Anyone who knows the handle can read the record, and so learn the
 //! owner's fingerprint and addresses: that's what a handle is for. No one
 //! else can find it, and the code stops a key made up to match someone
-//! else's handle (2^40 Argon2id runs per try).
+//! else's handle (2^40 Argon2id runs per try). A knock, though, says who
+//! is looking for the owner and from where: it is sealed to the owner's
+//! identity key (as X25519), so others holding the handle can't read it.
 
 use std::fmt;
 use std::str::FromStr;
@@ -26,11 +30,14 @@ use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use const_cbor::Decoder;
 
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
+
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::crypto::kdf::derive;
 use crate::crypto::random_bytes;
 use crate::error::{Error, Result};
-use crate::identity::{CROCKFORD, PublicIdentity, crockford_value};
+use crate::identity::{CROCKFORD, Identity, PublicIdentity, crockford_value};
 use crate::rendezvous::{Candidates, RecordKeys};
 
 /// Longest name, in characters.
@@ -50,6 +57,7 @@ const SIGNING: &str = "threnody v1 2026-10-18 handle signing key";
 const SALT: &str = "threnody v1 2026-10-18 handle salt";
 const ENCRYPTION: &str = "threnody v1 2026-10-18 handle encryption";
 const PROBE_KEY: &str = "threnody v1 2026-10-18 handle probe key";
+const KNOCK_SEAL: &str = "threnody v1 2026-11-05 handle knock seal";
 const RECORD_AAD: &[u8] = b"threnody handle record v1";
 const KNOCK_AAD: &[u8] = b"threnody handle knock v1";
 
@@ -210,6 +218,9 @@ pub struct HandleRecord {
     pub id: PublicIdentity,
     pub version: u64,
     pub candidates: Candidates,
+    /// The owner opens knocks sealed to its key ([`Knock::seal_to`]);
+    /// older owners don't say so, and get readable ones.
+    pub sealed_knocks: bool,
 }
 
 /// A finder asking the owner to punch toward it.
@@ -223,10 +234,13 @@ impl HandleRecord {
     pub fn seal(&self, keys: &RecordKeys) -> Result<Vec<u8>> {
         let cand = self.candidates.encode()?;
         let pt = cbor::to_vec(PADDED_LEN, |e| {
-            e.map_len(3)?;
+            e.map_len(3 + usize::from(self.sealed_knocks))?;
             e.u8(0)?.bytes(self.id.as_bytes())?;
             e.u8(1)?.uint(self.version)?;
             e.u8(2)?.bytes(&cand)?;
+            if self.sealed_knocks {
+                e.u8(3)?.uint(1)?;
+            }
             Ok(())
         })?;
         seal(keys, pt, RECORD_AAD)
@@ -235,12 +249,13 @@ impl HandleRecord {
     pub fn open(keys: &RecordKeys, value: &[u8]) -> Result<Self> {
         let pt = open(keys, value, RECORD_AAD)?;
         let mut dec = Decoder::new(&pt);
-        let (mut id, mut version, mut cand) = (None, None, None);
+        let (mut id, mut version, mut cand, mut sealed) = (None, None, None, false);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => id = Some(fixed_bytes::<32>(d)?),
                 1 => version = Some(d.u64()?),
                 2 => cand = Some(d.bytes()?.to_vec()),
+                3 => sealed = d.u64()? == 1,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -250,25 +265,96 @@ impl HandleRecord {
             id: PublicIdentity::from_bytes(&required(id, "handle owner")?)?,
             version: required(version, "handle version")?,
             candidates: Candidates::decode(&required(cand, "handle candidates")?)?,
+            sealed_knocks: sealed,
         })
     }
 }
 
 impl Knock {
-    pub fn seal(&self, keys: &RecordKeys) -> Result<Vec<u8>> {
-        let cand = self.candidates.encode()?;
+    /// The knock as only `owner` can read it, for an owner whose record
+    /// has [`HandleRecord::sealed_knocks`].
+    pub fn seal_to(&self, keys: &RecordKeys, owner: &PublicIdentity) -> Result<Vec<u8>> {
+        let inner = self.body()?;
+        let eph = StaticSecret::from(*Zeroizing::new(random_bytes::<32>()));
+        let eph_pub = PublicKey::from(&eph);
+        let to = owner.x25519();
+        let dh = eph.diffie_hellman(&to);
+        let key = seal_key(dh.as_bytes(), eph_pub.as_bytes(), to.as_bytes());
+        let sealed = XChaCha20Poly1305::new((&*key).into())
+            .encrypt(
+                &[0u8; NONCE_LEN].into(),
+                Payload {
+                    msg: &inner,
+                    aad: KNOCK_AAD,
+                },
+            )
+            .map_err(|_| Error::Malformed("knock encryption"))?;
         let pt = cbor::to_vec(PADDED_LEN, |e| {
             e.map_len(2)?;
-            e.u8(0)?.bytes(self.id.as_bytes())?;
-            e.u8(1)?.bytes(&cand)?;
+            e.u8(2)?.bytes(eph_pub.as_bytes())?;
+            e.u8(3)?.bytes(&sealed)?;
             Ok(())
         })?;
         seal(keys, pt, KNOCK_AAD)
     }
 
-    pub fn open(keys: &RecordKeys, value: &[u8]) -> Result<Self> {
+    /// The knock readable by anyone with the handle: for owners whose
+    /// records don't ask for sealed ones (older versions).
+    pub fn seal(&self, keys: &RecordKeys) -> Result<Vec<u8>> {
+        seal(keys, self.body()?, KNOCK_AAD)
+    }
+
+    fn body(&self) -> Result<Vec<u8>> {
+        let cand = self.candidates.encode()?;
+        cbor::to_vec(PADDED_LEN, |e| {
+            e.map_len(2)?;
+            e.u8(0)?.bytes(self.id.as_bytes())?;
+            e.u8(1)?.bytes(&cand)?;
+            Ok(())
+        })
+    }
+
+    /// Opens a knock on `owner`'s handle or invite, sealed to it or not.
+    pub fn open(keys: &RecordKeys, value: &[u8], owner: &Identity) -> Result<Self> {
         let pt = open(keys, value, KNOCK_AAD)?;
         let mut dec = Decoder::new(&pt);
+        let (mut eph, mut sealed) = (None, None);
+        read_map(&mut dec, |k, d| {
+            match k {
+                2 => eph = Some(fixed_bytes::<32>(d)?),
+                3 => sealed = Some(d.bytes()?.to_vec()),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        finish(&dec)?;
+        let (Some(eph), Some(sealed)) = (eph, sealed) else {
+            return Self::decode(&pt);
+        };
+        let eph = PublicKey::from(eph);
+        let dh = owner.x25519().diffie_hellman(&eph);
+        if !dh.was_contributory() {
+            return Err(Error::Malformed("knock key"));
+        }
+        let key = seal_key(
+            dh.as_bytes(),
+            eph.as_bytes(),
+            owner.public().x25519().as_bytes(),
+        );
+        let inner = XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                &[0u8; NONCE_LEN].into(),
+                Payload {
+                    msg: &sealed,
+                    aad: KNOCK_AAD,
+                },
+            )
+            .map_err(|_| Error::Malformed("knock authentication"))?;
+        Self::decode(&inner)
+    }
+
+    fn decode(b: &[u8]) -> Result<Self> {
+        let mut dec = Decoder::new(b);
         let (mut id, mut cand) = (None, None);
         read_map(&mut dec, |k, d| {
             match k {
@@ -284,6 +370,12 @@ impl Knock {
             candidates: Candidates::decode(&required(cand, "knock candidates")?)?,
         })
     }
+}
+
+/// The one-time key a knock is sealed under: its ephemeral key is new
+/// each time, so the nonce can be zero.
+fn seal_key(dh: &[u8; 32], eph: &[u8; 32], owner: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(derive(KNOCK_SEAL, &[dh, eph, owner]))
 }
 
 fn seal(keys: &RecordKeys, mut pt: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>> {
@@ -377,6 +469,46 @@ mod tests {
     }
 
     #[test]
+    fn only_the_owner_reads_who_knocked() {
+        let h = Handle::new(&Identity::generate().public(), "larry", 0).unwrap();
+        let (owner, other) = (Identity::generate(), Identity::generate());
+        let ipv6 = Candidate {
+            kind: CandidateKind::Ipv6,
+            addr: "[2001:db8:1:2:3:4:5:6]:65535".parse().unwrap(),
+        };
+        let k = Knock {
+            id: Identity::generate().public(),
+            // The most a knock carries still fits.
+            candidates: Candidates {
+                list: vec![ipv6; crate::rendezvous::MAX_CANDIDATES],
+                issued_ms: u64::MAX,
+                flags: u64::MAX,
+                seeking_until_ms: Some(u64::MAX),
+            },
+        };
+        let rk = h.knock_keys(7, 2);
+        let v = k.seal_to(&rk, &owner.public()).unwrap();
+        assert_eq!(v.len(), RECORD_LEN);
+        assert_eq!(Knock::open(&rk, &v, &owner).unwrap(), k);
+        // Someone else with the handle opens the slot, but not the knock.
+        assert!(Knock::open(&rk, &v, &other).is_err());
+        let pt = open(&rk, &v, KNOCK_AAD).unwrap();
+        assert!(!pt.windows(32).any(|w| w == k.id.as_bytes()));
+        // A knock for an owner that doesn't ask for sealed ones (an older
+        // version) still opens, and old owners' records still parse.
+        let old = k.seal(&rk).unwrap();
+        assert_eq!(Knock::open(&rk, &old, &owner).unwrap(), k);
+        let r = HandleRecord {
+            id: owner.public(),
+            version: 0,
+            candidates: candidates(),
+            sealed_knocks: false,
+        };
+        let back = HandleRecord::open(&h.record_keys(7), &r.seal(&h.record_keys(7)).unwrap());
+        assert_eq!(back.unwrap(), r);
+    }
+
+    #[test]
     fn records_and_knocks_round_trip_and_need_the_handle() {
         let a = Identity::generate().public();
         let h = Handle::new(&a, "larry", 3).unwrap();
@@ -385,6 +517,7 @@ mod tests {
             id: a,
             version: 3,
             candidates: candidates(),
+            sealed_knocks: true,
         };
         let v = r.seal(&h.record_keys(7)).unwrap();
         assert_eq!(v.len(), RECORD_LEN);
@@ -392,14 +525,15 @@ mod tests {
         assert!(HandleRecord::open(&h.record_keys(8), &v).is_err());
         assert!(HandleRecord::open(&other.record_keys(7), &v).is_err());
 
+        let owner = Identity::generate();
         let k = Knock {
             id: Identity::generate().public(),
             candidates: candidates(),
         };
-        let v = k.seal(&h.knock_keys(7, 2)).unwrap();
+        let v = k.seal_to(&h.knock_keys(7, 2), &owner.public()).unwrap();
         assert_eq!(v.len(), RECORD_LEN);
-        assert_eq!(Knock::open(&h.knock_keys(7, 2), &v).unwrap(), k);
-        assert!(Knock::open(&h.knock_keys(7, 1), &v).is_err());
+        assert_eq!(Knock::open(&h.knock_keys(7, 2), &v, &owner).unwrap(), k);
+        assert!(Knock::open(&h.knock_keys(7, 1), &v, &owner).is_err());
         // A knock never opens as a record, or the other way round.
         assert!(HandleRecord::open(&h.knock_keys(7, 2), &v).is_err());
         assert_ne!(h.record_keys(7).salt, h.knock_keys(7, 0).salt);

@@ -27,6 +27,8 @@ async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
         tunnel_port: None,
     })
     .unwrap();
+    // Every node runs here: the push servers below are on loopback.
+    node.allow_loopback_push(true);
     let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
     N { node, rx, addr }
 }
@@ -219,4 +221,51 @@ async fn strangers_get_no_endpoint_and_bad_ones_are_refused() {
             .is_err()
     );
     let _ = &mut a.rx;
+}
+
+#[tokio::test]
+async fn endpoints_go_when_we_revoke_or_block_the_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut c) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "c").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut c).await;
+    for n in [&b, &c] {
+        n.node
+            .set_push_target(Some(target("https://push.example.org/up/x")))
+            .unwrap();
+    }
+    wait_for(10, || a.node.push_targets() == 2).await;
+    a.node.set_approval(&b.node.identity(), false).unwrap();
+    assert_eq!(a.node.push_targets(), 1, "kept after revoking approval");
+    a.node.block_contact(&c.node.identity());
+    assert_eq!(a.node.push_targets(), 0, "kept after blocking");
+    let _ = (&mut b.rx, &mut c.rx);
+}
+
+#[tokio::test]
+async fn a_contact_cannot_point_our_wake_ups_at_our_own_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b) = (spawn(&dir, "a").await, spawn(&dir, "b").await);
+    // A runs as a real node would: loopback endpoints refused.
+    a.node.allow_loopback_push(false);
+    link(&mut a, &mut b).await;
+    b.node
+        .set_push_target(Some(target("http://127.0.0.1:2375/containers/web/kill")))
+        .unwrap();
+    next(&mut a.rx, |e| {
+        matches!(e, Event::ReachNote { note } if note.contains("push endpoint") && note.contains("refused"))
+    })
+    .await;
+    assert_eq!(a.node.push_targets(), 0);
+    // Nor can we hand out one on our own network.
+    assert!(
+        a.node
+            .set_push_target(Some(target("https://192.168.1.10/up/x")))
+            .is_err()
+    );
+    let _ = &mut b.rx;
 }

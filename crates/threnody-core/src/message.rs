@@ -15,6 +15,11 @@ pub const PAD_MIN: usize = 256;
 /// Above this, padding rounds up to a multiple of this size instead of the
 /// next power of two.
 pub const PAD_STEP_MAX: usize = 64 * 1024;
+/// Smallest padded plaintext on a constant-rate link: the bucket an onion
+/// cell (`Onion`, a 2048-byte cell and its circuit header) pads to. Cover,
+/// cells and short messages on such a link are then one size, so an
+/// observer can't tell ticks that carry circuit traffic from idle ones.
+pub const PAD_LINK: usize = 4096;
 /// Largest file a single message may carry.
 pub const MAX_FILE: usize = 8 * 1024 * 1024;
 /// `File` flag (key 6): the sender marked it sensitive.
@@ -25,6 +30,10 @@ pub const FILE_VOICE: u64 = 2;
 pub const FILE_VIDEO: u64 = 4;
 /// `Text` and `File` flag (key 6): forwarded from another chat.
 pub const FORWARDED: u64 = 8;
+/// `Text` flag (key 6): the sender turned its disappearing timer off on
+/// purpose. Decoded as `expires_in_s: Some(0)`; key 4 is then left out,
+/// so a peer that doesn't know the flag reads no timer, as before it.
+pub const TIMER_OFF: u64 = 16;
 /// Longest voice or video message, in milliseconds.
 pub const MAX_CLIP_MS: u32 = 10 * 60 * 1000;
 
@@ -92,6 +101,12 @@ pub const FEATURE_LISTS: u64 = 4096;
 pub const FEATURE_TUNNEL: u64 = 8192;
 /// The peer understands `AppMessage::Push` (wake-up endpoints, Appendix R).
 pub const FEATURE_PUSH: u64 = 16384;
+/// The peer sends timed hole-punching probes and accepts only those from
+/// us (`rendezvous::timed_probe`, Appendix N).
+pub const FEATURE_TIMED_PROBES: u64 = 32768;
+/// The peer marks a disappearing timer it turned off with [`TIMER_OFF`],
+/// so a `Text` from it with no timer means it never chose one.
+pub const FEATURE_TIMER_OFF: u64 = 65536;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -106,7 +121,9 @@ pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_PIN
     | FEATURE_LISTS
     | FEATURE_TUNNEL
-    | FEATURE_PUSH;
+    | FEATURE_PUSH
+    | FEATURE_TIMED_PROBES
+    | FEATURE_TIMER_OFF;
 /// Longest quote snippet, in characters.
 pub const MAX_QUOTE_CHARS: usize = 200;
 
@@ -467,24 +484,27 @@ impl AppMessage {
                     quote,
                     forwarded,
                 } => {
+                    let expiry = expires_in_s.filter(|&s| s > 0);
+                    let flags = u64::from(*forwarded) * FORWARDED
+                        + u64::from(*expires_in_s == Some(0)) * TIMER_OFF;
                     e.map_len(
-                        3 + usize::from(expires_in_s.is_some())
+                        3 + usize::from(expiry.is_some())
                             + usize::from(*id != 0)
-                            + usize::from(*forwarded)
+                            + usize::from(flags != 0)
                             + 3 * usize::from(quote.is_some()),
                     )?
                     .u8(0)?
                     .uint(kind::TEXT)?;
                     e.u8(1)?.uint(*sent_ms)?;
                     e.u8(2)?.str(body)?;
-                    if let Some(x) = expires_in_s {
-                        e.u8(4)?.u32(*x)?;
+                    if let Some(x) = expiry {
+                        e.u8(4)?.u32(x)?;
                     }
                     if *id != 0 {
                         e.u8(5)?.uint(*id)?;
                     }
-                    if *forwarded {
-                        e.u8(6)?.uint(FORWARDED)?;
+                    if flags != 0 {
+                        e.u8(6)?.uint(flags)?;
                     }
                     if let Some(q) = quote {
                         e.u8(10)?.uint(q.id)?;
@@ -790,7 +810,7 @@ impl AppMessage {
             kind::TEXT => Self::Text {
                 sent_ms: ts.unwrap_or(0),
                 body: required(text, "text body")?,
-                expires_in_s: expiry,
+                expires_in_s: expiry.or((flags & TIMER_OFF != 0).then_some(0)),
                 id: five.unwrap_or(0),
                 forwarded: flags & FORWARDED != 0,
                 // A quote names its message's sender (and, but for messages
@@ -888,6 +908,15 @@ impl AppMessage {
 /// powers of two from [`PAD_MIN`], then multiples of [`PAD_STEP_MAX`].
 pub fn pad(mut msg: Vec<u8>) -> Vec<u8> {
     let target = padded_len(msg.len() + 1);
+    msg.push(0x80);
+    msg.resize(target, 0);
+    msg
+}
+
+/// [`pad`], to at least `min` bytes (e.g. [`PAD_LINK`]). Receivers unpad
+/// any length, so this needs nothing from the peer.
+pub fn pad_at_least(mut msg: Vec<u8>, min: usize) -> Vec<u8> {
+    let target = padded_len(msg.len() + 1).max(min);
     msg.push(0x80);
     msg.resize(target, 0);
     msg
@@ -1027,6 +1056,14 @@ mod tests {
                 id: 0,
                 quote: None,
                 forwarded: false,
+            },
+            AppMessage::Text {
+                sent_ms: 44,
+                body: "timer off on purpose".into(),
+                expires_in_s: Some(0),
+                id: 0,
+                quote: None,
+                forwarded: true,
             },
             AppMessage::File {
                 sent_ms: 1,
@@ -1209,5 +1246,23 @@ mod tests {
         assert_eq!(padded_len(PAD_STEP_MAX + 1), 2 * PAD_STEP_MAX);
         assert!(unpad(vec![0; 10]).is_err());
         assert_eq!(unpad(pad(vec![0x80, 0])).unwrap(), vec![0x80, 0]);
+    }
+
+    #[test]
+    fn link_padding_makes_cover_and_cells_one_size() {
+        let cover = AppMessage::Cover.encode().unwrap();
+        let cell = AppMessage::Onion(vec![0; crate::onion::CELL_LEN + 16])
+            .encode()
+            .unwrap();
+        assert_eq!(pad_at_least(cover.clone(), PAD_LINK).len(), PAD_LINK);
+        assert_eq!(pad_at_least(cell.clone(), PAD_LINK).len(), PAD_LINK);
+        assert_eq!(pad(cell).len(), PAD_LINK, "a cell fills the link bucket");
+        assert_eq!(
+            unpad(pad_at_least(cover.clone(), PAD_LINK)).unwrap(),
+            cover,
+            "plain unpadding reads it"
+        );
+        // Bigger messages keep their own bucket.
+        assert_eq!(pad_at_least(vec![1; 5000], PAD_LINK).len(), 8192);
     }
 }

@@ -19,7 +19,9 @@
 //! A probe is a 32-byte UDP datagram, `nonce (16) || tag (16)`, with the
 //! QUIC fixed bit (0x40) and long-header bit (0x80) of the first byte
 //! cleared, so a QUIC endpoint never takes it for a packet. Only the
-//! contact holding `D` recognises it.
+//! contact holding `D` recognises it. A timed probe also binds
+//! `unix_seconds / 300` into its tag, so a copy replayed later is ignored;
+//! it is used with contacts whose `Hello` has `FEATURE_TIMED_PROBES`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -43,6 +45,9 @@ const NONCE_LEN: usize = 24;
 /// Length of every record value: under BEP 44's 1,000-byte limit.
 pub const RECORD_LEN: usize = NONCE_LEN + PADDED_LEN + 16;
 pub const PROBE_LEN: usize = 32;
+/// Timed probes are recognised in their epoch of this many seconds and the
+/// two adjacent ones, as LAN beacons are.
+pub const PROBE_EPOCH_SECS: u64 = 300;
 /// Exporter context for a session's recovery slot: the DHT record either
 /// side writes its new addresses to if the session is lost.
 pub const RECOVERY_CONTEXT: &[u8] = b"rendezvous recovery slot";
@@ -54,6 +59,7 @@ const SIGNING: &str = "threnody v1 2026-10-05 rendezvous signing key";
 const SALT: &str = "threnody v1 2026-10-05 rendezvous salt";
 const ENCRYPTION: &str = "threnody v1 2026-10-05 rendezvous encryption";
 const PROBE: &str = "threnody v1 2026-10-05 hole punching probe";
+const TIMED_PROBE: &str = "threnody v1 2026-11-05 timed hole punching probe";
 const AAD: &[u8] = b"threnody rendezvous v1";
 
 /// The DHT keys for the records `sender` publishes for one contact.
@@ -307,14 +313,41 @@ fn probe_tag(d: &[u8; 32], sender: &PublicIdentity, nonce: &[u8]) -> [u8; 16] {
     derive(PROBE, &[d, sender.as_bytes(), nonce])
 }
 
-/// A probe from `sender` that the holder of `d` recognises.
-pub fn probe(d: &[u8; 32], sender: &PublicIdentity) -> [u8; PROBE_LEN] {
+fn timed_probe_tag(d: &[u8; 32], sender: &PublicIdentity, epoch: u64, nonce: &[u8]) -> [u8; 16] {
+    derive(
+        TIMED_PROBE,
+        &[d, sender.as_bytes(), &epoch.to_le_bytes(), nonce],
+    )
+}
+
+fn probe_nonce() -> [u8; 16] {
     let mut nonce: [u8; 16] = random_bytes();
     nonce[0] &= 0x3f;
+    nonce
+}
+
+fn assemble_probe(nonce: &[u8; 16], tag: &[u8; 16]) -> [u8; PROBE_LEN] {
     let mut out = [0u8; PROBE_LEN];
-    out[..16].copy_from_slice(&nonce);
-    out[16..].copy_from_slice(&probe_tag(d, sender, &nonce));
+    out[..16].copy_from_slice(nonce);
+    out[16..].copy_from_slice(tag);
     out
+}
+
+/// A probe from `sender` that the holder of `d` recognises.
+///
+/// Nothing in it says when it was sent, so a copy works for as long as `d`
+/// does: use [`timed_probe`] with contacts that understand it.
+pub fn probe(d: &[u8; 32], sender: &PublicIdentity) -> [u8; PROBE_LEN] {
+    let nonce = probe_nonce();
+    assemble_probe(&nonce, &probe_tag(d, sender, &nonce))
+}
+
+/// A probe bound to the current [`PROBE_EPOCH_SECS`] epoch, so a captured
+/// copy stops being recognised within minutes.
+pub fn timed_probe(d: &[u8; 32], sender: &PublicIdentity, now_secs: u64) -> [u8; PROBE_LEN] {
+    let nonce = probe_nonce();
+    let epoch = now_secs / PROBE_EPOCH_SECS;
+    assemble_probe(&nonce, &timed_probe_tag(d, sender, epoch, &nonce))
 }
 
 /// Whether a datagram could be a probe (rather than a QUIC packet).
@@ -335,6 +368,26 @@ pub fn recognise_probe<'a>(
         let want = probe_tag(d, peer, nonce);
         // Not secret-dependent timing worth guarding: the tag is public once sent.
         (want == tag).then_some(*peer)
+    })
+}
+
+/// The first candidate whose key recognises `data` as its [`timed_probe`]
+/// from the current or an adjacent epoch.
+pub fn recognise_timed_probe<'a>(
+    data: &[u8],
+    now_secs: u64,
+    candidates: impl IntoIterator<Item = (&'a PublicIdentity, &'a [u8; 32])>,
+) -> Option<PublicIdentity> {
+    if !looks_like_probe(data) {
+        return None;
+    }
+    let (nonce, tag) = data.split_at(16);
+    let epoch = now_secs / PROBE_EPOCH_SECS;
+    candidates.into_iter().find_map(|(peer, d)| {
+        [epoch.saturating_sub(1), epoch, epoch + 1]
+            .into_iter()
+            .any(|e| timed_probe_tag(d, peer, e, nonce) == tag)
+            .then_some(*peer)
     })
 }
 
@@ -431,5 +484,33 @@ mod tests {
             assert_eq!(recognise_probe(&p, [(&a, &[4; 32])]), None);
             assert_eq!(recognise_probe(&p, [(&b, &d)]), None);
         }
+    }
+
+    #[test]
+    fn timed_probes_go_stale() {
+        let (a, b) = (Identity::generate().public(), Identity::generate().public());
+        let d = [3u8; 32];
+        let now = 1_791_000_000;
+        let p = timed_probe(&d, &a, now);
+        assert!(looks_like_probe(&p));
+        assert_eq!(
+            recognise_timed_probe(&p, now, [(&b, &d), (&a, &d)]),
+            Some(a)
+        );
+        // Clocks a few minutes apart still agree.
+        assert_eq!(
+            recognise_timed_probe(&p, now + PROBE_EPOCH_SECS, [(&a, &d)]),
+            Some(a)
+        );
+        assert_eq!(
+            recognise_timed_probe(&p, now - PROBE_EPOCH_SECS, [(&a, &d)]),
+            Some(a)
+        );
+        // A capture replayed later is not recognised.
+        let later = now + 3 * PROBE_EPOCH_SECS;
+        assert_eq!(recognise_timed_probe(&p, later, [(&a, &d)]), None);
+        // The two kinds never stand in for each other.
+        assert_eq!(recognise_probe(&p, [(&a, &d)]), None);
+        assert_eq!(recognise_timed_probe(&probe(&d, &a), now, [(&a, &d)]), None);
     }
 }

@@ -11,7 +11,7 @@ The interactive handshake (Appendix A) needs both ends online at the same moment
 
 Each device keeps:
 
-- **A signed prekey (SPK).** An X-Wing key pair with id `spk_id`, rotated every 7 days. The previous one is kept for another 14 days so messages still in flight can be read.
+- **A signed prekey (SPK).** An X-Wing key pair with id `spk_id`, rotated every 7 days. Bundles advertise it as valid (`expiry_ms`) for 21 days from its creation, and a retired SPK is kept until that expiry, so messages still in flight can be read. Up to two retired SPKs can be live at once.
 - **One-time prekeys (OPKs).** X-Wing key pairs, each with an id. Each is reserved for one contact, and its secret is deleted on first use.
 
 ```
@@ -22,7 +22,7 @@ Bundle  = { 0: id_B, 1: spk_id, 2: spk_pub, 3: expiry_ms, 4: sig_spk, 5: [ { 0: 
 
 - **Distribution.** There is no directory. Once a session is mutually approved, each side sends the other a fresh bundle (`AppMessage::Prekeys`, kind 8) carrying the current SPK and 5 new OPKs reserved for that peer.
 - **Storage on the receiving side.** The receiver verifies every signature against the identity it authenticated in the session, then stores the bundle in its encrypted state. A new bundle replaces the old one.
-- **Clean-up.** A device keeps the OPK secrets it reserved for a peer for the last two bundles it sent that peer, and deletes older ones.
+- **Clean-up.** A device keeps the OPK secrets of a bundle until the bundle's `expiry_ms`, even after newer bundles replace it at the peer: a message the peer sealed to the old bundle may still be waiting at a mailbox. To bound storage, it keeps the OPK secrets of at most the last eight bundles it sent a peer and deletes older ones early. A message sealed to a deleted OPK can't be opened, so a peer whose sessions with us flap more than seven times while a message waits can still lose it.
 
 ## Sealed message
 
@@ -39,7 +39,7 @@ Sealed = { 0: spk_id, 1: ct_s, ? 2: opk_id, ? 3: ct_o, 4: AEAD(k, nonce 0, ad = 
 
 `body` is a padded `AppMessage` (Appendix C), and each sealed message uses fresh encapsulations. On receipt, B:
 
-1. **Finds the keys.** Looks up the SPK (current or previous, unexpired) and the OPK, if one was used. If anything is missing, it rejects the message.
+1. **Finds the keys.** Looks up the SPK (current or retired, unexpired) and the OPK, if one was used. If anything is missing, it rejects the message.
 2. **Derives and decrypts.** Decapsulates, derives `k` and decrypts.
 3. **Checks the sender.** Verifies `sig_A` against the claimed `id_A`, which must be a known contact.
 4. **Consumes the OPK.** Deletes the OPK secret, if one was used.
@@ -60,15 +60,18 @@ The signature means sealed messages are not deniable, the same as the interactiv
 Mailbox traffic is carried as `AppMessage::Mailbox` (kind 9):
 
 ```
-Mailbox = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status }
+Mailbox = { 0: op, ? 1: to (32), ? 2: sealed, ? 3: status, ? 4: ref (uint) }
 op: 1 deposit, 2 deliver, 3 receipt (status 0 declined, 1 held, 2 delivered now)
 ```
 
+A direct deposit carries a `ref`, a random 64-bit number, and the receipt for it repeats it, so no receipt is taken for another deposit's. Being random, refs say nothing about how many other messages the sender placed in between. Mailboxes that predate `ref` ignore it and answer without one; their receipts are matched to that sender's deposits with them, for the same recipient, in order. A receipt that names a `ref` the sender no longer waits for is ignored.
+
 - **Depositing.** If A has no session with B, A leaves the sealed message with every live, mutually approved neighbour except B. By default A deposits anonymously, as described below, and skips mailboxes that no circuit can reach. If no circuit can reach any mailbox, A sends `deposit { to: id_B, sealed }` directly.
 - **Holding.** A neighbour R accepts a direct deposit only if R is mutually approved with both A and B. It accepts an anonymous deposit only if R is mutually approved with B.
-- **Storage limits.** R holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days.
-- **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, then deletes its copy. If B gave R a wake-up endpoint, R wakes B when it starts holding the message (Appendix R).
+- **Storage limits.** R holds the sealed message in its encrypted state, capped at 100 messages and 16 MiB per recipient, for up to 14 days. A sweep every minute drops messages held longer, whether or not B ever returns, and everything held for B goes as soon as R deletes or blocks B or B's account removes it.
+- **Delivering.** If R has a live session with B, it delivers immediately. Otherwise it delivers the next time B connects, if B is still mutually approved, then deletes its copy. A copy too large for the acknowledgement state (over 64 KiB, Appendix C) is deleted only once B acknowledges it, so a restart of R in between doesn't lose it; R sends it again after a restart. If B gave R a wake-up endpoint, R wakes B when it starts holding the message (Appendix R).
 - **Receipts.** Every deposit is answered with a receipt, so the sender knows whether each mailbox holds the message, delivered it immediately, or declined it.
+- **When every mailbox declines.** For a text or group message, A keeps the sealed message's plain copy until it hears back. If every mailbox it asked declines, or a direct deposit has no receipt after 2 minutes, A sends the message over a session with B if one has come up meanwhile, and otherwise keeps it for the next one, as if it had never been sealed (Appendix C, *Acknowledgements*). A mailbox that holds or delivers it ends the wait. A deposit that timed out is taken out of A's queue to that mailbox, so it isn't sent again when the mailbox returns. The messages still waiting are kept in A's encrypted state. If A restarts before hearing back, each one waits for B the same way, and its queued deposits are withdrawn. A mailbox may still have taken a copy whose receipt was lost, so B can get a text twice, once from A and once sealed. B keeps the first copy and drops any later text from the same sender device with the same message id.
 - **Duplicates.** B ignores duplicates by `h`, so depositing with several neighbours is safe.
 
 ### Anonymous deposits
@@ -77,11 +80,11 @@ A mailbox that takes a direct deposit learns that A wrote to B. To hide A, the d
 
 1. A picks a path `R1, R2, M`. R1 is a live, mutually approved neighbour, R2 is another mutually approved contact, and neither is M or B.
 2. A builds the circuit and sends `DEPOSIT` to M: `to (32) ‖ total_len (u32 BE) ‖ first bytes`. The rest of the sealed message follows in `DATA` cells.
-3. Once `total_len` bytes have arrived, M holds or delivers the message exactly as it would a direct deposit. It answers `DEPOSITED` with the status byte, then tears the circuit down.
+3. Once `total_len` bytes have arrived, M holds or delivers the message exactly as it would a direct deposit. It answers `DEPOSITED` with the status byte, then tears the circuit down. The status is never "delivered now": M doesn't know who is asking, and that would tell them B is online. A message passed straight on is reported as held.
 
-M only sees R2, so it learns that someone sent something to B, but not who. M declines a `DEPOSIT` if the circuit already carries a stream or another deposit, if `total_len` exceeds 16 MiB, or if the neighbour carrying the circuit has already passed 30 anonymous deposits in the current minute. That neighbour is the only party M can hold responsible.
+M only sees R2, so it learns that someone sent something to B, but not who. M declines a `DEPOSIT` if the circuit already carries a stream or another deposit, if `to` isn't M's mutually approved contact, if `total_len` exceeds 16 MiB, or if the neighbour carrying the circuit has already passed 30 anonymous deposits in the current minute. That neighbour is the only party M can hold responsible. Over an anonymous link (Appendix P), where a new identity costs nothing, the neighbour's network (a /24 or a /56) counts instead. M holds deposits still arriving in memory, and counts the bytes that have actually arrived, not the `total_len` a head claims. Deposits over circuits from M's mutually approved contacts, and deposits over all other circuits, each have room for 64 MiB, and within each, one carrier (a contact, or a stranger's network) has room for 16 MiB. A deposit whose next bytes don't fit is declined and dropped, and so is one that isn't complete 120 s after the circuit's `CREATE` (Appendix I). Strangers who fill their room with bytes they really send can still make M decline other strangers' deposits for a while, and those senders then fall back to direct deposit; deposits from contacts' circuits are not affected.
 
-Anonymous deposits are on by default. With onion routing turned off (`--no-onion` or the app's toggle), deposits are direct. If every circuit to a mailbox fails, A deposits with that mailbox directly rather than lose the message. With only one mailbox and no other contacts there is no path, so the deposit is direct.
+Anonymous deposits are on by default. With onion routing turned off (`--no-onion` or the app's toggle), deposits are direct. If every circuit to a mailbox fails, A deposits with that mailbox directly rather than lose the message. With only one mailbox and no other contacts there is no path, so the deposit is direct. Either way, with onion routing on, the app is told (`Event::Fallback`, Appendix I *Fallback*) and shows a quiet notice in the chat.
 
 Mailboxes see that B received something, when, and roughly how large. A mailbox taking a direct deposit also sees that A sent it. They never see the contents or the sender's signature. A malicious mailbox can drop or delay messages, but cannot alter or forge them.
 

@@ -8,7 +8,7 @@ What it does
 * Many ways to connect: the local network, Bluetooth LE and Wi-Fi Direct between nearby phones, and the internet. Across the internet, contacts find each other through the public BitTorrent DHT and connect directly where the networks allow it, asking the router to forward a port (UPnP, PCP, NAT-PMP) when it can.
 * Relays and onion routing: when a contact can't be reached directly, approved contacts relay the encrypted session. Onion circuits through two relays keep any single relay from seeing both ends. You can also subscribe to directories of volunteer relays.
 * Offline delivery: messages for a contact who is offline are sealed to them and held by mutual contacts until they return.
-* Metadata protection, on by default: padded cover traffic hides when you send. This uses data (about 46 MB a day per connected contact on mobile data) and can be switched off.
+* Metadata protection, on by default: padded cover traffic hides when you send. This uses data (about 110 MB a day per connected contact on mobile data) and can be switched off.
 * Chats and groups with photos, files, voice and video messages, reactions, editing and deleting, read ticks, disappearing messages and message requests from people you haven't accepted.
 * Voice and video calls, carried inside the encrypted session.
 * Photo metadata (location, camera, time) is removed before sending, and photos can be marked sensitive so they arrive covered.

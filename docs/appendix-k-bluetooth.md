@@ -18,7 +18,7 @@ The beacon is the private LAN beacon of Appendix E, with two changes:
 
 A beacon does not fit a 31-byte legacy advert, so both platforms use **extended advertising**: BlueZ with `SecondaryChannel = 1M`, and Android with `AdvertisingSet` in non-legacy mode. Scanners must accept non-legacy adverts. On Android that means `ScanSettings.setLegacy(false)`.
 
-The advert carries no name and no identity. Nodes replace it at least once a minute, so the nonce, the tags and (on Android) the resolvable private address all change.
+The advert carries no name and no identity. Nodes replace it at least once a minute, so the nonce, the tags and (on Android) the random address all change. Android starts a new advertising set for each beacon and then stops the old one: the stack gives every set an address of its own, while new data in the same set keeps its address, which the stack otherwise changes only every 15 minutes or so.
 
 ## Connecting
 
@@ -48,6 +48,8 @@ The Bluetooth channel itself is **insecure** at the Bluetooth layer (no pairing,
 - **Android dialing.** A `BluetoothLeScanner` scan filtered on the service-data UUID collects adverts (`BLUETOOTH_SCAN` with `neverForLocation`), and `createInsecureL2capChannel(psm)` opens the channel. Without `BLUETOOTH_SCAN` the app still listens and advertises, so contacts can reach it. LE connection setup sometimes fails with HCI status 0x3e ("connection failed to be established"), so the app makes up to three attempts.
 - **SDU size.** Android hands an L2CAP SDU (Service Data Unit) to the app only once the whole SDU has arrived, and stalls on large ones. On a Pixel 8a a 10 KB SDU arrived and a 33 KB one never did. Both ends therefore cut writes to **4096 bytes**. Linux also offers a 4096-byte receive MTU, up from the default 672.
 - **Android writes.** `BluetoothSocket.write` on an L2CAP channel silently truncates a write larger than one packet, so the app writes packet-sized pieces.
+- **Flow control on Android.** The bridge carries each direction on its own, so a write the platform holds up (a peer that grants no credit) doesn't stop reads reaching the session. At most 64 reads wait for the session; past that `LinkHandle.receive` waits, the app stops reading, and the peer runs out of credit. Before, a stalled write stopped the bridge reading its queue while the app kept filling it, without limit.
+- **Limits.** Incoming channels share one allowance of 16 handshakes in progress (Appendix A, *Limits*); past it a channel is closed at once. Once the handshake is done, radio links count as one network among the stranger sessions: at most 4 strangers over them at once, each closed after 5 idle minutes. Contacts aren't limited.
 - **Lingering links.** When a peer's app dies, its LE link can stay up. While it does, the laptop's controller stops advertising. Every 10 s, Linux therefore disconnects LE links to devices it has run Threnody channels with that no longer carry a session, after a 30 s grace period for handshakes. Other Bluetooth devices are never touched. In testing, a link left by force-stopping the app was gone within 8 s, and the app reconnected 9 s after it restarted.
 - **Android background.** A foreground service of type `remoteMessaging` (and `microphone` during calls) keeps the process, and so the node and its Bluetooth sessions, alive while the app is in the background. Messages that arrive while no Activity is visible raise a notification.
 
@@ -64,6 +66,11 @@ A Pixel 8a (Android API 37) and a Linux laptop (BlueZ 5.87), in both directions:
 
 ## Privacy
 
-To anyone without a discovery key, the advert shows only that *a* Threnody device is nearby, plus its PSM. Beacons are unlinkable to each other, and the phone's Bluetooth address rotates. Only mutually approved contacts can recognise the device. Its presence is still visible: hiding that would mean dropping the fixed service UUID, so that scanners have to test every extended advert they hear.
+To anyone without a discovery key, the advert shows only that *a* Threnody device is nearby, plus its PSM. A beacon's contents are unlinkable to another's, and the phone's Bluetooth address changes with each beacon. Only mutually approved contacts can recognise the device. Its presence is still visible: hiding that would mean dropping the fixed service UUID, so that scanners have to test every extended advert they hear.
+
+**What still links beacons, stated honestly:**
+- **The PSM.** It is assigned when the node starts listening and stays the same for as long as the process runs, so a scanner can follow it across address changes. It is one of about 128 dynamic values, so it identifies a device only together with timing and place. Rotating it would mean reopening the listener every refresh.
+- **Linux's address.** BlueZ advertises from the adapter's own fixed address unless LE privacy is on (`Privacy = device` in `/etc/bluetooth/main.conf`, off by default). Turning it on needs root, so `threnody run --ble` can't do it; users who want their laptop's beacons unlinkable should set it.
+- **Replays.** A beacon replayed within its epochs makes nearby contacts of its sender dial the replayer, after 45 s even the ones with the larger key (Appendix E, "Replays").
 
 Android starts listening, advertising and scanning whenever the node starts, once the Bluetooth permissions have been granted, so the foreground service brings Bluetooth back without the Activity.

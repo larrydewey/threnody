@@ -989,6 +989,17 @@ impl ChatView {
                     &[("Compare", Self::safety as Action)],
                 );
             }
+            // Onion routing couldn't hide the last session or deposit:
+            // say so quietly until dismissed.
+            let notice = app.as_ref().and_then(|a| {
+                let notices = a.notices.borrow();
+                std::iter::once(&c.device)
+                    .chain(&c.devices)
+                    .find_map(|d| notices.get(&(c.chat.persona.clone(), d.clone())).cloned())
+            });
+            if let Some(n) = notice {
+                self.show_banner(&n, false, &[("OK", Self::dismiss_notice as Action)]);
+            }
         }
         if c.verified || c.group.is_some() {
             self.title.remove_css_class("warning");
@@ -998,6 +1009,17 @@ impl ChatView {
         self.composer.set_sensitive(can_send);
         self.composer.set_visible(can_send);
         self.build_menu();
+    }
+
+    fn dismiss_notice(self: &Rc<Self>) {
+        let c = self.conv.borrow().clone();
+        if let Some(app) = self.app.upgrade() {
+            let mut notices = app.notices.borrow_mut();
+            for d in std::iter::once(&c.device).chain(&c.devices) {
+                notices.remove(&(c.chat.persona.clone(), d.clone()));
+            }
+        }
+        self.header();
     }
 
     fn show_banner(self: &Rc<Self>, text: &str, warning: bool, buttons: &[(&str, Action)]) {
@@ -2760,7 +2782,12 @@ impl ChatView {
                     "gif-{}.gif",
                     if id.is_empty() { "giphy".into() } else { id }
                 );
-                core.keep(persona.as_deref(), &name, &bytes, false)
+                let how = core::Keep {
+                    clip: false,
+                    sensitive: false,
+                    disappears: false,
+                };
+                core.keep(persona.as_deref(), &name, &bytes, how)
                     .ok_or_else(|| "couldn't save it".to_owned())
             },
             move |kept: Result<String, String>| {
@@ -3487,16 +3514,30 @@ impl ChatView {
 
     fn join_group(self: &Rc<Self>) {
         let Some(g) = self.group() else { return };
+        // The invitation shown: others may invite us to the same group.
+        let from = self.conv.borrow().invite.as_ref().map(|i| i.from.clone());
         self.run(
             "join",
-            move |n| n.accept_group_invite(g),
+            move |n| match from {
+                Some(from) => n.accept_group_invite_from(g, from),
+                None => n.accept_group_invite(g),
+            },
             Some("Joined".into()),
         );
     }
 
     fn decline_group(self: &Rc<Self>) {
         let Some(g) = self.group() else { return };
-        self.run("decline", move |n| n.decline_group_invite(g), None);
+        // Only the invitation shown.
+        let from = self.conv.borrow().invite.as_ref().map(|i| i.from.clone());
+        self.run(
+            "decline",
+            move |n| match from {
+                Some(from) => n.decline_group_invite_from(g, from),
+                None => n.decline_group_invite(g),
+            },
+            None,
+        );
         if let Some(a) = self.app.upgrade() {
             a.close_chat();
         }
@@ -3847,7 +3888,9 @@ const MAX_PIXELS: i64 = 100_000_000;
 const MAX_SIDE: i32 = 4096;
 
 /// An image the node can't strip, re-encoded as JPEG (which then carries
-/// no metadata): the name and bytes to send. Others pass through.
+/// no metadata): the name and bytes to send. Others pass through. Its
+/// content decides as well as its name, so a HEIC called "photo.jpg" is
+/// converted too.
 fn prepare(
     path: &std::path::Path,
     name: String,
@@ -3857,7 +3900,7 @@ fn prepare(
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if !CONVERT.contains(&ext.as_str()) {
+    if !CONVERT.contains(&ext.as_str()) && !threnody_core::media::needs_converting(&data) {
         return Ok((name, data));
     }
     let unreadable =
@@ -3933,8 +3976,15 @@ mod tests {
         p.fill(0x3366_99ff);
         p.savev(&tiff, "tiff", &[]).unwrap();
         let data = std::fs::read(&tiff).unwrap();
-        let (name, out) = prepare(&tiff, "scan.tiff".into(), data).unwrap();
+        let (name, out) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
         assert_eq!(name, "scan.jpg");
+        assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
+
+        // Whatever it is called.
+        let misnamed = dir.join("misnamed.jpg");
+        std::fs::copy(&tiff, &misnamed).unwrap();
+        let (name, out) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
+        assert_eq!(name, "misnamed.jpg");
         assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
 
         // Formats the node strips itself pass through untouched.
