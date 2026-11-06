@@ -14,7 +14,7 @@ WebRTC ◀──TURN (loopback)── threnody-media::turn ◀── Node::call_
 
 ## Signalling
 
-`AppMessage::Call` (kind 25), sent only to peers whose `Hello` has `FEATURE_CALLS` (1024):
+`AppMessage::Call` (kind 25), sent only to peers whose `Hello` has `FEATURE_CALLS` (1024). Builds without call media (iOS, the F-Droid build) leave that bit out (Appendix C), and one that left it out doesn't ring even if an offer reaches it:
 
 ```
 CallMsg = { 0: op, 1: call uint, ? 2: secret bstr(32), ? 3: flags uint,
