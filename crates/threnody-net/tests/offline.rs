@@ -1046,6 +1046,9 @@ async fn sealed_while_away(
 
     let (b2, mut b2rx) = open(dir, "b", false);
     b2.set_receipt_delay(delay, delay);
+    // No onion circuit can reach R here: with onion routing on, no
+    // receipt would be sealed at all (see the test below).
+    b2.set_prefer_onion(false);
     b2.connect(&r.addr, None).await.unwrap();
     let Event::OfflineMessage {
         msg: AppMessage::Text { id, .. },
@@ -1315,6 +1318,7 @@ async fn duplicate_mailbox_copies_give_one_receipt() {
 
     let (b2, mut b2rx) = open(&dir, "b", false);
     b2.set_receipt_delay(60_000, 60_000);
+    b2.set_prefer_onion(false);
     b2.connect(&r1.addr, None).await.unwrap();
     b2.connect(&r2.addr, None).await.unwrap();
     next(&mut b2rx, |e| matches!(e, Event::OfflineMessage { .. })).await;
@@ -1399,4 +1403,211 @@ async fn reported_reads_are_not_reported_twice() {
         .iter()
         .any(|e| !e.outgoing && e.remote_id == id && e.read_ms != 0);
     assert!(reported);
+}
+
+#[tokio::test]
+async fn receipts_never_go_to_a_mailbox_directly_with_onion_routing_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, r) = three(&dir).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    let (b2, mut b2rx, local_id) = sealed_while_away(&dir, &a, &b, &r, 0).await;
+    // R is B's only neighbour, so no circuit reaches it: a direct deposit
+    // would tell R that B writes to A, and B never chose to.
+    b2.set_prefer_onion(true);
+    wait_for(|| r.node.held_messages() == 0).await;
+    let opks = b2.opks_for(&aid);
+    for _ in 0..3 {
+        b2.flush_receipts_now();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(r.node.held_messages(), 0);
+    assert_eq!(b2.pending_receipts(), 1, "it waits");
+    assert_eq!(b2.opks_for(&aid), opks, "no prekey spent");
+    assert!(quiet_for(&mut b2rx, 1, |e| matches!(e, Event::Fallback { .. })).await);
+
+    // It goes when A comes back to B.
+    let b2addr = b2.listen("127.0.0.1:0").await.unwrap().to_string();
+    let (a2, mut a2rx) = open(&dir, "a", false);
+    a2.connect(&b2addr, None).await.unwrap();
+    let Event::Delivered { local_id: got, .. } =
+        next(&mut a2rx, |e| matches!(e, Event::Delivered { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(got, local_id);
+    assert!(entry(&a2, &bid, local_id).delivered);
+}
+
+#[tokio::test]
+async fn a_declined_sealed_receipt_waits_for_the_next_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    // R holds for B, but not for A: it declines whatever B deposits for A.
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| b.node.can_send_offline(&aid)).await;
+    a.node.send_text(&bid, "read me").unwrap();
+    let Event::Message {
+        msg: AppMessage::Text { id, .. },
+        ..
+    } = next(&mut b.rx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: AppMessage::Text { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let local_id = a
+        .node
+        .history(a.node.conversation_for(&bid))
+        .unwrap()
+        .entries()
+        .last()
+        .unwrap()
+        .local_id;
+    a.node.shutdown();
+    wait_for(|| gone(&b.node, &aid)).await;
+
+    b.node.set_prefer_onion(false);
+    b.node.report_read(&aid, &[id]).unwrap();
+    assert_eq!(b.node.pending_receipts(), 1);
+    b.node.flush_receipts_now();
+    next(&mut b.rx, |e| {
+        matches!(
+            e,
+            Event::DepositReceipt {
+                status: DepositStatus::Declined,
+                ..
+            }
+        )
+    })
+    .await;
+    // Not lost: held for A's next session, as a declined text would be.
+    wait_for(|| b.node.unacked(&aid) == 1).await;
+    assert_eq!(r.node.held_messages(), 0);
+
+    let (a2, mut a2rx) = open(&dir, "a", false);
+    a2.connect(&b.addr, None).await.unwrap();
+    next(&mut a2rx, |e| matches!(e, Event::Read { .. })).await;
+    assert_ne!(entry(&a2, &bid, local_id).read_ms, 0);
+    let _ = &mut r.rx;
+}
+
+#[tokio::test]
+async fn no_receipts_for_message_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, r) = three(&dir).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    b.node.shutdown();
+    wait_for(|| gone(&a.node, &bid) && gone(&r.node, &bid)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // As if B had never accepted A, though A still holds B's prekeys:
+    // A's sealed text is a message request, from someone not blocked.
+    {
+        let home = Home::new(dir.path().join("b"));
+        let me = home.load_identity(None).unwrap();
+        let mut contacts = home.load_contacts(&me).unwrap();
+        let c = contacts.get_mut(&aid).unwrap();
+        c.accepted = false;
+        c.local_approved = false;
+        home.save_contacts(&me, &contacts).unwrap();
+    }
+    assert_eq!(a.node.send_text(&bid, "a request").unwrap().sealed, 1);
+    wait_for(|| r.node.held_messages() == 1).await;
+    a.node.shutdown();
+    wait_for(|| gone(&r.node, &aid)).await;
+
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    b2.set_prefer_onion(false);
+    b2.set_receipt_delay(0, 0);
+    b2.connect(&r.addr, None).await.unwrap();
+    next(
+        &mut b2rx,
+        |e| matches!(e, Event::MessageRequest { peer, .. } if *peer == aid),
+    )
+    .await;
+    assert!(!b2.is_accepted(&aid));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(b2.pending_receipts(), 0);
+    b2.flush_receipts_now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(r.node.held_messages(), 0, "nothing sealed for A");
+}
+
+#[tokio::test]
+async fn an_older_sender_gets_reads_as_read_and_no_receipts() {
+    use threnody_core::message::FEATURE_RECEIPTS;
+    let dir = tempfile::tempdir().unwrap();
+    // A is a build from before receipts: its Hello lacks the bit.
+    let older = |dir: &tempfile::TempDir, create: bool| {
+        let (node, rx) = open(dir, "a", create);
+        node.withhold_features(FEATURE_RECEIPTS);
+        (node, rx)
+    };
+    let (anode, arx) = older(&dir, true);
+    let addr = anode.listen("127.0.0.1:0").await.unwrap().to_string();
+    let mut a = N {
+        node: anode,
+        rx: arx,
+        addr,
+    };
+    let (mut b, mut r) = (spawn(&dir, "b").await, spawn(&dir, "r").await);
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid) && b.node.can_send_offline(&aid)).await;
+
+    // Live: a `Read`, and the session stays up.
+    a.node.send_text(&bid, "live").unwrap();
+    let Event::Message {
+        msg: AppMessage::Text { id, .. },
+        ..
+    } = next(&mut b.rx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: AppMessage::Text { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    b.node.report_read(&aid, &[id]).unwrap();
+    next(&mut a.rx, |e| matches!(e, Event::Read { .. })).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!gone(&a.node, &bid) && !gone(&b.node, &aid), "session kept");
+
+    // Sealed while B is away: no delivery receipt can be said to A.
+    let (b2, mut b2rx, local_id) = sealed_while_away(&dir, &a, &b, &r, 60_000).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(b2.pending_receipts(), 0, "no delivery queued for A");
+    // A read waits for it, and goes as a `Read` when it comes back.
+    b2.report_read(&aid, &[local_id]).unwrap();
+    assert_eq!(b2.pending_receipts(), 1);
+    b2.flush_receipts_now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(r.node.held_messages(), 0, "never sealed for A");
+    let b2addr = b2.listen("127.0.0.1:0").await.unwrap().to_string();
+    let (a2, mut a2rx) = older(&dir, false);
+    a2.connect(&b2addr, None).await.unwrap();
+    next(&mut a2rx, |e| matches!(e, Event::Read { .. })).await;
+    assert!(quiet_for(&mut a2rx, 3, |e| matches!(e, Event::Disconnected { .. })).await);
+    assert!(!gone(&b2, &aid));
+    assert_eq!(b2.pending_receipts(), 0);
+    let _ = &mut b2rx;
 }

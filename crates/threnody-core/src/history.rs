@@ -128,8 +128,9 @@ pub struct Entry {
     /// group, every recipient.
     pub delivered: bool,
     /// For outgoing entries: when the recipient displayed it (0 = not
-    /// yet). For incoming ones: when we reported it read (0 = not
-    /// reported), so it is reported once.
+    /// yet). For incoming ones: nonzero once we reported it read, so it is
+    /// reported once (the network layer stores 1, so no reading time is
+    /// kept at rest).
     pub read_ms: u64,
     /// For outgoing group messages: how many members it went to, and the
     /// devices that acknowledged it so far.

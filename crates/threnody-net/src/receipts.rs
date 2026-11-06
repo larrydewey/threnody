@@ -138,6 +138,32 @@ pub(crate) fn read_messages(features: u64, conversation: &[u8], ids: &[u64]) -> 
     }
 }
 
+/// Moves `r`'s read ids into its delivered ones (read implies delivered),
+/// as far as a list holds. Returns whether it had any.
+fn reads_as_delivered(r: &mut Receipt) -> bool {
+    if r.read.is_empty() {
+        return false;
+    }
+    let mut have: HashSet<u64> = r.delivered.iter().copied().collect();
+    for i in std::mem::take(&mut r.read) {
+        if r.delivered.len() < MAX_IDS && have.insert(i) {
+            r.delivered.push(i);
+        }
+    }
+    true
+}
+
+/// A `Receipt` payload with its reads made deliveries, for
+/// [`crate::delivery::Delivery::rewrite`]: `None` if it has none (or
+/// can't be read, which [`Node::receipt_ready`] drops anyway).
+fn without_reads(payload: &[u8]) -> Option<Option<AppMessage>> {
+    let mut r = Receipt::decode(payload).ok()?;
+    if !reads_as_delivered(&mut r) {
+        return None;
+    }
+    Some(r.encode().ok().map(AppMessage::Receipt))
+}
+
 fn push_new(to: &mut Vec<u64>, ids: &[u64]) {
     let mut have: HashSet<u64> = to.iter().copied().collect();
     for &i in ids {
@@ -379,9 +405,20 @@ impl Node {
     }
 
     /// Turns read receipts on or off. Off also drops every read still
-    /// waiting to be sent: nothing leaves after the user says no.
+    /// waiting to be sent: nothing leaves after the user says no. That
+    /// includes receipts already sent, tracked, whose session died before
+    /// they were acknowledged: they would go again in the next session, so
+    /// their reads become plain deliveries (read implies delivered).
     pub fn set_send_read_receipts(&self, on: bool) {
         self.shared.receipts(|o| o.set_reads(on));
+        if !on {
+            self.shared.delivery(|d| {
+                d.rewrite(|_, m| match m {
+                    AppMessage::Receipt(b) => without_reads(b),
+                    _ => None,
+                });
+            });
+        }
     }
 
     /// Tests only: how long a receipt waits before it is sealed (a random
@@ -477,6 +514,33 @@ impl Node {
         }
     }
 
+    /// A tracked `Receipt` (`payload`) about to go to `peer`, whose `Hello`
+    /// in this session said `features`. `Ok` with the payload to send:
+    /// with read receipts off by now, its reads are only deliveries. `Err`
+    /// with what to send instead, untracked: to a device without
+    /// [`FEATURE_RECEIPTS`] (an older build, though it had the bit when
+    /// this was queued), its reads as a `Read` if it takes one, else
+    /// nothing.
+    pub(crate) fn receipt_ready(
+        &self,
+        peer: &PublicIdentity,
+        features: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, Option<AppMessage>> {
+        let Ok(mut r) = Receipt::decode(&payload) else {
+            return Err(None);
+        };
+        let changed = !self.send_read_receipts() && reads_as_delivered(&mut r);
+        if features & FEATURE_RECEIPTS == 0 {
+            let conv = self.conversation_for(peer).to_bytes();
+            return Err(read_messages(features, &conv, &r.read).into_iter().next());
+        }
+        if !changed {
+            return Ok(payload);
+        }
+        r.encode().map_err(|_| None)
+    }
+
     /// Queues receipts for `device`, the device that sent the messages:
     /// at once if it is connected, else to wait for it (see
     /// [`Node::flush_receipts`]). Reads are dropped with read receipts
@@ -563,13 +627,18 @@ impl Node {
                 continue;
             }
             // Sealing spends one of our prekeys for it: only when a mailbox
-            // can take the result.
+            // can take the result. With onion routing on, only one an onion
+            // circuit reaches: a receipt goes without the user doing
+            // anything, so it must not tell a mailbox whom we write to.
             if !self
                 .known_features(&d)
                 .is_some_and(|f| f & FEATURE_RECEIPTS != 0)
                 || !self.can_send_offline(&d)
-                || self.mailbox_neighbours(&d).is_empty()
             {
+                continue;
+            }
+            let (mailboxes, hidden) = self.deposit_targets(&d);
+            if mailboxes.is_empty() || (self.prefer_onion() && hidden.is_empty()) {
                 continue;
             }
             let Some(mut p) = self.shared.receipts(|o| o.take(&d)) else {
@@ -578,22 +647,27 @@ impl Node {
             if !self.send_read_receipts() {
                 p.read.clear();
             }
-            let (mut sent, mut failed) = (false, false);
+            // Each one deposited is the placement's: if every mailbox
+            // declines it (one that doesn't hold for `d`, or whose queue
+            // for it is full), it waits, tracked, for a session with `d`.
+            let (mut sent, mut left) = (false, Pending::default());
             for m in p.messages(FEATURE_RECEIPTS, &[]) {
-                match self.send_offline(&d, &m) {
-                    Ok(_) => sent = true,
-                    Err(_) => failed = true,
+                if self.send_offline_hidden(&d, &m, Tag::NONE).is_ok() {
+                    sent = true;
+                } else if let AppMessage::Receipt(b) = &m
+                    && let Ok(r) = Receipt::decode(b)
+                {
+                    left.extend(&r.delivered, &r.read);
                 }
             }
+            left.since_ms = p.since_ms;
             let delay = self.receipt_delay();
             self.shared.receipts(|o| {
                 if sent {
                     o.sealed(d, now);
                 }
-                // Again later: a copy twice is harmless, the sender's
-                // marks are idempotent.
-                if failed {
-                    o.restore(d, p, now.saturating_add(delay));
+                if !left.is_empty() {
+                    o.restore(d, left, now.saturating_add(delay));
                 }
             });
         }

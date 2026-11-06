@@ -36,7 +36,8 @@ pub const MAX_DELIVERED_IDS: usize = 64 * 1024;
 pub const MAX_PERSISTED: usize = 64 * 1024;
 const VERSION: u8 = 4;
 
-/// Whether a message is user content worth acknowledging and resending.
+/// Whether a message is user content worth acknowledging and resending
+/// (or a receipt for some, which must reach an older peer only as `Read`).
 pub fn trackable(m: &AppMessage) -> bool {
     matches!(
         m,
@@ -44,6 +45,7 @@ pub fn trackable(m: &AppMessage) -> bool {
             | AppMessage::File { .. }
             | AppMessage::Group(_)
             | AppMessage::Mailbox(_)
+            | AppMessage::Receipt(_)
     )
 }
 
@@ -352,6 +354,32 @@ impl Delivery {
     /// The peer doesn't acknowledge: what was sent plain can't be tracked.
     pub fn forget(&mut self, peer: &PublicIdentity, id: u64) {
         self.acked(peer, &[id]);
+    }
+
+    /// Rewrites what `f` picks out, to whichever peer: `None` leaves a
+    /// message as it is, `Some(None)` drops it, `Some(Some(m))` swaps it
+    /// for `m` (same id and tag).
+    pub fn rewrite(
+        &mut self,
+        mut f: impl FnMut(&PublicIdentity, &AppMessage) -> Option<Option<AppMessage>>,
+    ) {
+        self.unacked.retain(|p, q| {
+            q.retain_mut(|(_, m, len, _)| match f(p, m) {
+                None => true,
+                Some(None) => {
+                    self.unacked_dirty |= *len <= MAX_PERSISTED;
+                    false
+                }
+                Some(Some(new)) => {
+                    let old = *len;
+                    *len = new.encoded_len_hint();
+                    *m = new;
+                    self.unacked_dirty |= old <= MAX_PERSISTED || *len <= MAX_PERSISTED;
+                    true
+                }
+            });
+            !q.is_empty()
+        });
     }
 
     /// Stops sending what `gone` picks out, to whichever peer.

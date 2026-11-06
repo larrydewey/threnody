@@ -17,6 +17,8 @@ use crate::receipts::read_messages;
 
 /// A week: the usual choice when the user turns disappearing messages on.
 pub const WEEK_S: u32 = 7 * 24 * 3600;
+/// What an incoming entry's `read_ms` holds once we reported it read.
+const REPORTED: u64 = 1;
 
 /// A random non-zero id for an outgoing history entry.
 pub fn local_id() -> u64 {
@@ -586,7 +588,7 @@ impl Node {
     /// to its connected devices, and to the device that sent each one, if
     /// it isn't connected, by a receipt that waits for it or goes sealed
     /// through mailboxes (see `receipts`). Each message is reported once
-    /// (its `read_ms` here records that). Nothing is sent with read
+    /// (its `read_ms` here is set to 1, a flag that keeps no time). Nothing is sent with read
     /// receipts off, or to someone we haven't accepted. Messages from
     /// before this version first ran, or older than a mailbox keeps
     /// anything, are reported live only. Fails with `NoRoute` when nothing
@@ -683,10 +685,12 @@ impl Node {
                 peer.fingerprint()
             )));
         }
+        // A flag, not a time: history at rest doesn't show when the user
+        // read each message.
         let _ = self
             .shared
             .home
-            .mark_read_entries(self.identity_ref(), conv, now, |e| {
+            .mark_read_entries(self.identity_ref(), conv, REPORTED, |e| {
                 !e.outgoing && done.contains(&e.remote_id)
             });
         Ok(())
