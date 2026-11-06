@@ -40,6 +40,12 @@ impl Identity {
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
         self.key.sign(msg).to_bytes()
     }
+
+    /// This key as an X25519 secret, for what is sealed to
+    /// [`PublicIdentity::x25519`]: only handle knocks (Appendix S).
+    pub(crate) fn x25519(&self) -> x25519_dalek::StaticSecret {
+        x25519_dalek::StaticSecret::from(*Zeroizing::new(self.key.to_scalar_bytes()))
+    }
 }
 
 /// A peer's long-term public verification key: the primary identity.
@@ -68,6 +74,13 @@ impl PublicIdentity {
 
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint(derive(label::FINGERPRINT, &[self.as_bytes()]))
+    }
+
+    /// This key as an X25519 public key (the birational map; on using one
+    /// key pair for both, see eprint.iacr.org/2021/509): what a handle
+    /// knock is sealed to (Appendix S).
+    pub(crate) fn x25519(&self) -> x25519_dalek::PublicKey {
+        x25519_dalek::PublicKey::from(self.0.to_montgomery().to_bytes())
     }
 }
 

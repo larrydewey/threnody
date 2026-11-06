@@ -446,7 +446,7 @@ impl Node {
         }
         // Knock, and punch while they answer.
         self.add_probe_key(peer, spot.probe_key());
-        self.knock(spot).await?;
+        self.knock(spot, &rec).await?;
         let mut symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
         let mut list = rec.candidates.list;
         let mut punching = self.punch(peer, &list, symmetric, Urge::Start);
@@ -510,8 +510,10 @@ impl Node {
         keys.insert(peer, (key, Instant::now()));
     }
 
-    /// Leaves a knock with our addresses in a random slot of `spot`.
-    async fn knock(&self, spot: &impl Meeting) -> Result<()> {
+    /// Leaves a knock with our addresses in a random slot of `spot`, whose
+    /// owner's record is `rec`: sealed to the owner when the record asks
+    /// for that, so others holding the handle can't see who knocks.
+    async fn knock(&self, spot: &impl Meeting, rec: &HandleRecord) -> Result<()> {
         let dht = self.ready_dht().await?;
         // Just after start (or a network change) our addresses may not be
         // known yet: give gathering a moment.
@@ -529,11 +531,15 @@ impl Node {
         };
         let slot = threnody_core::crypto::random_bytes::<1>()[0] % KNOCK_SLOTS;
         let rk = spot.knock_keys(epoch(now_ms() / 1000), slot);
-        let value = Knock {
+        let knock = Knock {
             id: self.identity(),
             candidates,
+        };
+        let value = if rec.sealed_knocks {
+            knock.seal_to(&rk, &rec.id)
+        } else {
+            knock.seal(&rk)
         }
-        .seal(&rk)
         .map_err(|e| NetError::NotAllowed(e.to_string()))?;
         put(&dht, &rk, &value, now_ms())
             .await
@@ -597,6 +603,7 @@ impl Node {
                 id: self.identity(),
                 version: o.version,
                 candidates,
+                sealed_knocks: true,
             };
             (o.spot.clone(), record, digest)
         };
@@ -640,15 +647,15 @@ impl Node {
             for &e in &epochs {
                 for slot in 0..KNOCK_SLOTS {
                     let (dht, rk) = (dht.clone(), spot.knock_keys(e, slot));
-                    gets.spawn(async move {
-                        let v = fetch(&dht, &rk).await?;
-                        Knock::open(&rk, &v).ok().map(|k| (i, k))
-                    });
+                    gets.spawn(async move { fetch(&dht, &rk).await.map(|v| (i, rk, v)) });
                 }
             }
         }
         while let Some(r) = gets.join_next().await {
-            let Ok(Some((i, k))) = r else { continue };
+            let Ok(Some((i, rk, v))) = r else { continue };
+            let Ok(k) = Knock::open(&rk, &v, self.identity_ref()) else {
+                continue;
+            };
             let (slot, spot) = &spots[i];
             let fresh = now.saturating_sub(k.candidates.issued_ms) < KNOCK_FRESH_MS;
             if k.id == self.identity() || !fresh || self.connected(&k.id) {
