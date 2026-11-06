@@ -48,9 +48,28 @@ object KeyVault {
     }
 
     /** The Keystore-protected passphrase that seals identities on this device. */
+    @Synchronized
     fun secret(ctx: Context): String {
         val file = File(ctx.noBackupFilesDir, FILE)
         return if (file.exists()) read(file) else create(file)
+    }
+
+    /**
+     * Forgets the sealing secret and its Keystore key: after an erase, and
+     * before every new identity (`Threnody.open`), so whatever an old
+     * identity sealed can never be opened again. Never throws.
+     */
+    @Synchronized
+    fun forget(ctx: Context) {
+        try {
+            File(ctx.noBackupFilesDir, FILE).delete()
+            File(ctx.noBackupFilesDir, "$FILE.tmp").delete()
+        } catch (_: Exception) {
+        }
+        try {
+            keyStore().deleteEntry(ALIAS)
+        } catch (_: Exception) {
+        }
     }
 
     /** Where the Keystore key lives, for the diagnostics screen. */

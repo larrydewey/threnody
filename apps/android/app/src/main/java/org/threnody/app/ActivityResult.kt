@@ -30,6 +30,8 @@ class ActivityResultLauncher(private val activity: Activity) {
     fun launch(intent: Intent, callback: (resultCode: Int, data: Intent?) -> Unit) {
         val requestCode = requestCodeGen.incrementAndGet()
         callbacks[requestCode] = callback
+        // Leaving for our own picker or camera isn't leaving the app.
+        AppLock.expectReturn()
         activity.startActivityForResult(intent, requestCode)
     }
 }

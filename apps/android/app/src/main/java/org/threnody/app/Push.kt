@@ -83,6 +83,19 @@ object Push {
     }
 
     /**
+     * After an erase: unregisters with the distributor and forgets the
+     * endpoint, without touching the (erased) node or the service.
+     */
+    fun forget(ctx: Context) {
+        try {
+            UnifiedPush.unregister(ctx, INSTANCE)
+        } catch (e: Exception) {
+            Threnody.say("! push unregister: ${e.message}")
+        }
+        prefs(ctx).edit().clear().commit()
+    }
+
+    /**
      * Hands the node our endpoint, or withdraws it; rotates an old one.
      * Main identity only: anonymous identities are never woken by push.
      */

@@ -556,7 +556,73 @@ object Threnody {
             ctx.filesDir.listFiles { f -> f.name.startsWith("media-p-") }?.forEach { it.deleteRecursively() }
             say("* restored from a backup")
         }
+        // A new identity gets a new Keystore secret, so nothing sealed under
+        // an earlier one (an erase that died part way) can be opened. After
+        // the staged restore: that identity is sealed under the current one.
+        if (!java.io.File(home, "identity.cbor").exists()) KeyVault.forget(ctx)
         return ThrenodyNode.open(home, KeyVault.passphrase(ctx, home), null)
+    }
+
+    /** Set while erasing: nothing may write files any more. */
+    @Volatile var wiping = false
+        private set
+
+    /**
+     * Erases everything ("Erase all Threnody data", the duress PIN): the
+     * node's data directory (unless [alreadyErased]), the Keystore secret,
+     * the app's files, caches and preferences, its own files in
+     * Downloads/Threnody, its notifications and the push registration.
+     * Blocks; call it off the main thread, then [restartApp]. Nothing is
+     * sent: contacts and other devices aren't told.
+     */
+    fun wipe(ctx: Context, alreadyErased: Boolean = false) {
+        val app = ctx.applicationContext
+        wiping = true
+        Push.forget(app)
+        try {
+            app.stopService(android.content.Intent(app, ThrenodyVpn::class.java))
+        } catch (_: Exception) {
+        }
+        for (n in personaNodes.values) runCatching { n.shutdown() }
+        instance?.let { runCatching { it.shutdown() } }
+        if (!alreadyErased) {
+            try {
+                uniffi.threnody_ffi.wipeHome(home(app))
+            } catch (e: Exception) {
+                say("! erasing: ${e.message}")
+            }
+        }
+        KeyVault.forget(app)
+        for (dir in listOfNotNull(app.filesDir, app.cacheDir, app.noBackupFilesDir, app.codeCacheDir)) {
+            dir.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
+        }
+        java.io.File(app.dataDir, "shared_prefs").listFiles()?.forEach {
+            runCatching { app.deleteSharedPreferences(it.name.removeSuffix(".xml")) }
+        }
+        try {
+            // Scoped storage: only rows this app made.
+            app.contentResolver.delete(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+                arrayOf(Environment.DIRECTORY_DOWNLOADS + "/Threnody/%"),
+            )
+        } catch (e: Exception) {
+            say("! erasing downloads: ${e.message}")
+        }
+        app.getSystemService(android.app.NotificationManager::class.java)?.let { nm ->
+            nm.cancelAll()
+            for (c in nm.notificationChannels) runCatching { nm.deleteNotificationChannel(c.id) }
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val asked = listOf(
+                android.Manifest.permission.POST_NOTIFICATIONS, android.Manifest.permission.CAMERA,
+                android.Manifest.permission.RECORD_AUDIO, android.Manifest.permission.BLUETOOTH_CONNECT,
+                android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_ADVERTISE,
+                android.Manifest.permission.NEARBY_WIFI_DEVICES, android.Manifest.permission.ACCESS_FINE_LOCATION,
+            ).filter { app.checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            if (asked.isNotEmpty()) runCatching { app.revokeSelfPermissionsOnKill(asked) }
+        }
+        AppLock.reset()
     }
 
     /** Starts the app afresh in a new process (after staging a restore). */
@@ -876,7 +942,7 @@ object Threnody {
     }
 
     /** Saves a received file to Downloads/Threnody; null if that fails. */
-    private fun saveDownload(ctx: Context, name: String, data: ByteArray): Uri? = try {
+    private fun saveDownload(ctx: Context, name: String, data: ByteArray): Uri? = if (wiping) null else try {
         val values = ContentValues().apply {
             // Strip any path the sender put in the name.
             put(MediaStore.Downloads.DISPLAY_NAME, name.substringAfterLast('/').ifBlank { "file" })
