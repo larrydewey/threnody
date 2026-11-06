@@ -1065,6 +1065,39 @@ fn owner_device_takes_over_the_coordinator() {
 }
 
 #[test]
+fn a_pending_handover_does_not_block_a_takeover() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a1, a2, c, d) = (p[0], p[1], p[2], p[3]);
+    let out = net
+        .node(&a1)
+        .change_roster(&g, &[RosterChange::AddOwners(vec![a2])])
+        .unwrap();
+    net.deliver(a1, out);
+    let out = net.node(&a1).promote(&g, c).unwrap();
+    net.deliver(a1, out);
+    // With the coordinator away, the other owner device asks to hand the
+    // group to Carol, and to remove Dave.
+    net.offline = vec![a1];
+    let out = net
+        .node(&a2)
+        .change_roster(&g, &[RosterChange::Transfer(vec![c])])
+        .unwrap();
+    net.deliver(a2, out);
+    let out = net.node(&a2).remove(&g, &d).unwrap();
+    net.deliver(a2, out);
+    assert_eq!(net.node(&a2).pending_changes(&g), 2);
+    // Taking over still works; the handover follows in the next commit.
+    let out = net.node(&a2).take_over_removing(&g, &[a1]).unwrap();
+    net.deliver(a2, out);
+    let r = net.node(&c).roster(&g).unwrap();
+    assert_eq!((r.lead, r.owners.clone()), (c, vec![c]));
+    assert!(!members(&mut net, &g, &c).contains(&d));
+    assert!(!members(&mut net, &g, &c).contains(&a1));
+    assert_eq!(net.node(&a2).pending_changes(&g), 0);
+}
+
+#[test]
 fn successor_claims_when_the_owner_is_gone() {
     let (ids, _) = people(3);
     let (mut net, p, g) = team(&ids);

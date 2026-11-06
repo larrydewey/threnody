@@ -269,6 +269,10 @@ impl Roster {
 
     /// The structural rules, without the members.
     fn check(&self) -> Result<()> {
+        if self.term == u32::MAX {
+            // No coordinator change could follow it.
+            return Err(not_allowed("the coordinator term is spent"));
+        }
         if self.owners.is_empty() || self.owners.len() > MAX_OWNERS {
             return Err(not_allowed("a group needs 1 to 16 owner devices"));
         }
@@ -377,7 +381,7 @@ impl Roster {
                 }
             }
         }
-        r.term = self.term + u32::from(r.lead != self.lead);
+        r.term = self.term.saturating_add(u32::from(r.lead != self.lead));
         r.check()?;
         Ok(r)
     }
@@ -395,7 +399,8 @@ impl Roster {
         sort(&mut admins);
         Roster {
             version: self.version,
-            term: self.term + 1,
+            // At u32::MAX it fails `check`, so no commit can match it.
+            term: self.term.saturating_add(1),
             lead: who,
             owners: self.successors.clone(),
             admins,
@@ -753,6 +758,20 @@ mod tests {
         let mut s = full.clone();
         s.successors = vec![admins[0]];
         assert!(s.claimed_by(admins[0]).validate(&many).is_ok());
+    }
+
+    #[test]
+    fn a_spent_term_is_refused_not_overflowed() {
+        let p = ids(3);
+        let mut r = roster(&[p[0], p[1]], &[p[2]]);
+        r.term = u32::MAX - 1;
+        let last = r.apply(&[RosterChange::Lead(p[1])]);
+        assert!(last.is_err(), "u32::MAX can't be reached");
+        r.term = u32::MAX;
+        assert!(Roster::decode(&r.encode()).is_err());
+        r.successors = vec![p[2]];
+        // No panic, and nothing valid to match.
+        assert!(r.claimed_by(p[2]).validate(&p).is_err());
     }
 
     #[test]

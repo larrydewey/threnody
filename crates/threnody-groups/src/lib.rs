@@ -63,9 +63,20 @@ pub const MAX_INTENT_ATTEMPTS: u8 = 8;
 pub const MAX_STORED_PROPOSALS: usize = 32;
 pub const MAX_PROPOSALS_PER_PROPOSER: usize = 8;
 /// Messages for a later epoch than ours, kept until the commit that gets
-/// us there: per group, by count and bytes. The oldest go first.
+/// us there: per group, by count and bytes. Past these, those from
+/// non-members go first, then the oldest.
 pub const MAX_FUTURE: usize = 64;
 pub const MAX_FUTURE_BYTES: usize = 2 << 20;
+/// Of those, at most this many from one sender (more are dropped).
+pub const MAX_FUTURE_PER_SENDER: usize = 32;
+/// And none for an epoch further ahead of ours than this.
+pub const MAX_FUTURE_EPOCHS: u64 = 32;
+/// Bytes kept for later epochs across every group (past it, non-members'
+/// go first; then nothing more is kept).
+pub const MAX_FUTURE_BYTES_ALL: usize = 8 << 20;
+/// How long messages from a branch that outranks ours may wait for the
+/// commit that explains them before we ask to be brought back in step.
+pub const FORK_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 type Pid = PublicIdentity;
 
@@ -163,6 +174,13 @@ pub enum GroupEvent {
         group: GroupId,
         member: PublicIdentity,
         role: MemberRole,
+    },
+    /// Another member's commit (`by` made it) was merged. `successor`: it
+    /// made us the group's successor. Nothing to show by itself.
+    Committed {
+        group: GroupId,
+        by: PublicIdentity,
+        successor: bool,
     },
     /// A change of ours never made it into the group.
     ChangeFailed {
@@ -350,6 +368,9 @@ struct Group {
     upgrade_epoch: Option<u64>,
     /// When we last asked to be brought back in step: (epoch, term).
     resync: Option<(u64, u32)>,
+    /// A member on a branch that outranks ours sent a message for a later
+    /// epoch, and when (not kept: see [`Groups::check_forks`]).
+    outranked: Option<(Pid, std::time::Instant)>,
 }
 
 impl Group {
@@ -363,6 +384,7 @@ impl Group {
             future: Vec::new(),
             upgrade_epoch: None,
             resync: None,
+            outranked: None,
         }
     }
 
@@ -535,7 +557,7 @@ fn membership_changes<'a>(
 }
 
 /// What the coordinator (or a takeover or claim) commits of its own.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Own {
     /// Invitees we asked ourselves: their Welcome goes straight to them.
     adds: Vec<(Pid, KeyPackage)>,
@@ -549,6 +571,8 @@ struct Own {
     self_update: bool,
     /// Install the first roster in a group without one.
     install: bool,
+    /// Only check that it would go through, without committing.
+    check_only: bool,
 }
 
 impl Own {
@@ -1305,6 +1329,11 @@ impl Groups {
             }
             own.consume = true;
         } else {
+            // A pending coordinator change or transfer of ours would leave
+            // someone else coordinating, which a takeover can't: it goes in
+            // our next commit, as the coordinator.
+            own.roster
+                .retain(|c| !matches!(c, RosterChange::Lead(_) | RosterChange::Transfer(_)));
             own.roster.insert(0, RosterChange::Lead(me));
         }
         for r in removes {
@@ -1630,12 +1659,24 @@ impl Groups {
             return Err(GroupError::Unexpected("key package ciphersuite"));
         }
         let g = self.group(&group)?;
-        let has_roster = g.roster()?.is_some();
+        let roster = g.roster()?;
+        let has_roster = roster.is_some();
         let lead = g.lead();
+        let member = g.members().contains(&from);
         // A member we're bringing back in step: removed and re-added in one
-        // commit (as openmls's fork resolution does).
-        let repair = g.members().contains(&from);
+        // commit (as openmls's fork resolution does). Only one we agreed to
+        // repair this term: anyone else already in the group (added through
+        // someone else's proposal meanwhile, say) stays as they are.
+        let repair = member
+            && roster.as_ref().is_some_and(|r| {
+                self.repairs
+                    .iter()
+                    .any(|(g, p, t)| *g == group && *p == from && *t == r.term)
+            });
         self.pending_adds.remove(pos);
+        if member && !repair {
+            return Ok(Output::default());
+        }
         if has_roster && !capable(kp.leaf_node()) {
             return Err(GroupError::NeedsUpdate(vec![
                 from.fingerprint().to_string(),
@@ -1810,18 +1851,33 @@ impl Groups {
         }
         let epoch = protocol.epoch().as_u64();
         let ours = g.mls.epoch().as_u64();
-        // A sender on a branch that outranks ours, at an epoch we're past
-        // or at ours with other secrets: we're on the losing side of a
-        // fork. (Later epochs wait below, as reordering looks alike.)
-        if let (Some(h), Some(r)) = (sync, g.roster()?)
-            && !legacy
-            && h.rank() > r.rank()
+        // A member on a branch that outranks ours (the hint is
+        // unauthenticated: only a member's counts).
+        let outranking = match (sync, g.roster()?) {
+            (Some(h), Some(r)) if !legacy && h.rank() > r.rank() => {
+                g.members().contains(&from).then_some(h)
+            }
+            _ => None,
+        };
+        // At an epoch we're past or at ours with other secrets: we're on
+        // the losing side of a fork. (Later epochs wait below, as
+        // reordering looks alike, until `check_forks`.)
+        if let Some(h) = outranking
             && h.epoch <= ours
             && (h.epoch < ours || h.auth != g.auth())
         {
             return self.ask_resync(from, &group);
         }
         if epoch > ours {
+            if epoch - ours > MAX_FUTURE_EPOCHS {
+                return Ok(Output::default());
+            }
+            if outranking.is_some()
+                && let Some(g) = self.groups.get_mut(&group)
+                && g.outranked.is_none()
+            {
+                g.outranked = Some((from, std::time::Instant::now()));
+            }
             self.buffer(
                 &group,
                 from,
@@ -1834,7 +1890,8 @@ impl Groups {
             );
             return Ok(Output::default());
         }
-        let is_proposal = protocol.content_type() == ContentType::Proposal;
+        let content_type = protocol.content_type();
+        let is_proposal = content_type == ContentType::Proposal;
         if epoch < ours && is_proposal {
             // Held or mailboxed across a commit: its proposer proposes it
             // again.
@@ -1844,9 +1901,13 @@ impl Groups {
             .groups
             .get_mut(&group)
             .ok_or(GroupError::UnknownGroup)?;
-        // The proposals a commit references come with it.
-        let snapshot: Option<Vec<QueuedProposal>> =
-            (!legacy && !proposals.is_empty() && epoch == ours).then(|| {
+        // The proposals a commit references come with it (and only a
+        // commit's are stored: nothing else would take them out again).
+        let snapshot: Option<Vec<QueuedProposal>> = (!legacy
+            && content_type == ContentType::Commit
+            && !proposals.is_empty()
+            && epoch == ours)
+            .then(|| {
                 let snap = g.mls.pending_proposals().cloned().collect();
                 for p in &proposals {
                     let Ok(m) = MlsMessageIn::tls_deserialize_exact(p) else {
@@ -1913,8 +1974,31 @@ impl Groups {
 
     /// Keeps a message for a later epoch than ours until the commit that
     /// gets us there.
+    /// Anyone who knows the group's id can send one, so within the limits
+    /// non-members' go first and no sender gets more than its share.
     fn buffer(&mut self, group: &GroupId, from: Pid, wire: GroupWire) {
         let Ok(bytes) = wire.encode() else { return };
+        let Some(g) = self.groups.get(group) else {
+            return;
+        };
+        if g.future.iter().filter(|(p, _)| *p == from).count() >= MAX_FUTURE_PER_SENDER {
+            return;
+        }
+        let size = bytes.len();
+        loop {
+            let total: usize = self
+                .groups
+                .values()
+                .flat_map(|g| &g.future)
+                .map(|(_, b)| b.len())
+                .sum();
+            if total + size <= MAX_FUTURE_BYTES_ALL {
+                break;
+            }
+            if !self.evict_stranger() {
+                return;
+            }
+        }
         let Some(g) = self.groups.get_mut(group) else {
             return;
         };
@@ -1922,8 +2006,53 @@ impl Groups {
         while g.future.len() > MAX_FUTURE
             || g.future.iter().map(|(_, b)| b.len()).sum::<usize>() > MAX_FUTURE_BYTES
         {
-            g.future.remove(0);
+            let members = g.members();
+            let i = g
+                .future
+                .iter()
+                .position(|(p, _)| !members.contains(p))
+                .unwrap_or(0);
+            g.future.remove(i);
         }
+    }
+
+    /// Drops the oldest message waiting for a later epoch from someone not
+    /// in its group, in any group; `false` if there's none.
+    fn evict_stranger(&mut self) -> bool {
+        for g in self.groups.values_mut() {
+            let members = g.members();
+            if let Some(i) = g.future.iter().position(|(p, _)| !members.contains(p)) {
+                g.future.remove(i);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Messages from a branch that outranks ours have waited
+    /// [`FORK_GRACE`] for the commit that explains them (one we missed, a
+    /// takeover say): we're on the losing side of a fork, so ask their
+    /// sender to have us brought back. Called now and then (as peers
+    /// connect).
+    pub fn check_forks(&mut self) -> Output {
+        let mut out = Output::default();
+        let stale: Vec<(GroupId, Pid)> = self
+            .groups
+            .iter()
+            .filter_map(|(id, g)| match g.outranked {
+                Some((from, at)) if at.elapsed() >= FORK_GRACE => Some((*id, from)),
+                _ => None,
+            })
+            .collect();
+        for (group, from) in stale {
+            if let Some(g) = self.groups.get_mut(&group) {
+                g.outranked = None;
+            }
+            if let Ok(o) = self.ask_resync(from, &group) {
+                out.extend(o);
+            }
+        }
+        out
     }
 
     /// Handles what waited for the epoch we're now in.
@@ -2042,10 +2171,17 @@ impl Groups {
             member: *p,
             by: Some(*by),
         }));
+        let mut successor = false;
         if let Some(after) = &after {
             events.extend(role_changes(group, &before, after, &g.members()));
             g.owner = after.lead;
+            successor = after.successors.contains(&me) && !before.successors.contains(&me);
         }
+        events.push(GroupEvent::Committed {
+            group: *group,
+            by: sender,
+            successor,
+        });
         // A commit from our coordinator: we're in step.
         if sender == before.lead {
             g.resync = None;
@@ -2209,22 +2345,47 @@ impl Groups {
     fn commit(&mut self, group: &GroupId, own: Own) -> Result<Output> {
         match self.try_commit(group, &own) {
             Ok(out) => Ok(out),
-            Err(e) if own.consume => {
+            Err(_) if own.consume => {
                 // A stored proposal clashes with ours (or with another):
-                // drop them; their proposers propose again.
+                // keep those that still go in, oldest first, and drop the
+                // rest; their proposers propose them again after our next
+                // commit.
                 let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+                let stored: Vec<QueuedProposal> = g.mls.pending_proposals().cloned().collect();
                 g.mls
                     .clear_pending_proposals(self.provider.storage())
                     .map_err(mls)?;
-                g.attachable.clear();
-                if own.is_empty() {
+                let mut kept: Vec<QueuedProposal> = Vec::new();
+                for q in stored {
+                    let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+                    g.mls
+                        .store_pending_proposal(self.provider.storage(), q.clone())
+                        .map_err(mls)?;
+                    let trial = Own {
+                        check_only: true,
+                        ..own.clone()
+                    };
+                    if self.try_commit(group, &trial).is_ok() {
+                        kept.push(q);
+                    } else {
+                        let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+                        restore_proposals(&self.provider, &mut g.mls, Some(kept.clone()));
+                    }
+                }
+                let refs: Vec<&[u8]> = kept
+                    .iter()
+                    .map(|q| q.proposal_reference_ref().as_slice())
+                    .collect();
+                let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
+                g.attachable
+                    .retain(|a| refs.contains(&a.reference.as_slice()));
+                if kept.is_empty() && own.is_empty() {
                     return Ok(Output::default());
                 }
-                let _ = e;
                 self.try_commit(
                     group,
                     &Own {
-                        consume: false,
+                        consume: !kept.is_empty(),
                         ..own
                     },
                 )
@@ -2251,6 +2412,17 @@ impl Groups {
                 let Some(proposer) = g.sender(q.sender()) else {
                     continue;
                 };
+                // Stored after the same check, but the roster may have
+                // moved on since: what's no longer allowed stays out.
+                let allowed = match &before_roster {
+                    Some(r) => {
+                        authorize_proposal(r, &proposer, &g.proposal_kind(q.proposal())).is_ok()
+                    }
+                    None => matches!(q.proposal(), Proposal::Update(_)),
+                };
+                if !allowed {
+                    continue;
+                }
                 let reference = q.proposal_reference_ref().clone();
                 match q.proposal() {
                     Proposal::Add(a) => {
@@ -2377,6 +2549,12 @@ impl Groups {
                 return Err(e);
             }
         };
+        if own.check_only {
+            g.mls
+                .clear_pending_commit(self.provider.storage())
+                .map_err(mls)?;
+            return Ok(Output::default());
+        }
         let (joined, left) = membership_changes(g, &me, staged.queued_proposals());
         let referenced: Vec<Vec<u8>> = staged
             .queued_proposals()
@@ -2480,6 +2658,8 @@ impl Groups {
         let Some(g) = self.groups.get_mut(group) else {
             return;
         };
+        // What waits is checked again as it's handled below.
+        g.outranked = None;
         let Ok(roster) = g.roster_or_legacy() else {
             return;
         };
@@ -3506,5 +3686,124 @@ mod tests {
         net.node(&c).handle(a2, w).unwrap();
         let r = net.node(&c).roster(&g).unwrap();
         assert_eq!((r.lead, r.term), (a2, 9));
+    }
+
+    #[test]
+    fn rejected_commits_leave_the_proposal_store_as_it_was() {
+        let (_, p, mut net, g) = team(4);
+        let (a, b, c, d) = (p[0], p[1], p[2], p[3]);
+        let out = net.node(&a).promote(&g, b).unwrap();
+        net.deliver(a, out);
+        // Bob (an admin) has a removal of his own waiting.
+        let bobs = net.node(&b).remove(&g, &d).unwrap();
+        assert_eq!(net.node(&b).stored_proposals(&g), 1);
+        // Carol, a member, proposes removing Dave, which she may not, and
+        // commits it herself, which she may not either.
+        let gc = net.node(&c);
+        let Groups {
+            groups,
+            provider,
+            signer,
+            ..
+        } = gc;
+        let grp = groups.get_mut(&g).unwrap();
+        let idx = grp.index_of(&d).unwrap();
+        let (proposal, _) = grp
+            .mls
+            .propose_remove_member(provider, signer, idx)
+            .unwrap();
+        let proposal = proposal.tls_serialize_detached().unwrap();
+        grp.mls.clear_pending_proposals(provider.storage()).unwrap();
+        let (commit, _, _) = grp.mls.remove_members(provider, signer, &[idx]).unwrap();
+        let commit = commit.tls_serialize_detached().unwrap();
+        grp.mls.clear_pending_commit(provider.storage()).unwrap();
+        let wire = GroupWire::Message {
+            group: g,
+            message: commit,
+            proposals: vec![proposal.clone(), vec![1, 2, 3]],
+            sync: None,
+        };
+        assert!(net.node(&b).handle(c, wire).is_err());
+        assert_eq!(net.node(&b).stored_proposals(&g), 1, "only Bob's own");
+        // Attached to a chat message, it's never stored: not by Bob, nor
+        // by the coordinator, whose next commit would carry it.
+        let out = net.node(&c).send_text(&g, "hi").unwrap();
+        let GroupWire::Message { message, sync, .. } = out.send[0].wire.clone() else {
+            panic!("a message")
+        };
+        let chat = GroupWire::Message {
+            group: g,
+            message,
+            proposals: vec![proposal],
+            sync,
+        };
+        for x in [a, b] {
+            net.node(&x).handle(c, chat.clone()).unwrap();
+        }
+        assert_eq!(net.node(&a).stored_proposals(&g), 0);
+        assert_eq!(net.node(&b).stored_proposals(&g), 1);
+        // Bob's removal goes through.
+        net.deliver(b, bobs);
+        assert!(net.errors.is_empty(), "{:?}", net.errors);
+        for x in [a, b, c] {
+            let members = net.node(&x).list()[0].3.clone();
+            assert!(!members.contains(&d));
+        }
+    }
+
+    #[test]
+    fn strangers_cannot_crowd_out_what_waits_for_the_next_epoch() {
+        let (_, p, mut net, g) = team(3);
+        let (a, b, c) = (p[0], p[1], p[2]);
+        // Carol misses a commit for now; Bob writes in the epoch after it.
+        let mut out = net.node(&a).promote(&g, b).unwrap();
+        let to_carol: Vec<Outgoing> = out.send.iter().filter(|o| o.to == c).cloned().collect();
+        out.send.retain(|o| o.to != c);
+        net.deliver(a, out);
+        let out = net.node(&b).send_text(&g, "after").unwrap();
+        let hi = out.send.iter().find(|o| o.to == c).unwrap().wire.clone();
+        net.node(&c).handle(b, hi.clone()).unwrap();
+        assert_eq!(net.node(&c).buffered(&g), 1);
+        // Two strangers who know the group's id replay it, over and over,
+        // claiming to be far ahead in a better branch.
+        let GroupWire::Message { message, .. } = hi else {
+            panic!("a message")
+        };
+        let ahead = GroupWire::Message {
+            group: g,
+            message,
+            proposals: Vec::new(),
+            sync: Some(SyncHint {
+                epoch: 0,
+                term: 99,
+                auth: [0; 8],
+                lead: [0; 8],
+            }),
+        };
+        for _ in 0..2 {
+            let x = Identity::generate().public();
+            for _ in 0..MAX_FUTURE {
+                let r = net.node(&c).handle(x, ahead.clone()).unwrap();
+                assert!(r.send.is_empty() && r.events.is_empty());
+            }
+        }
+        assert!(
+            !net.node(&c).out_of_step(&g),
+            "a stranger's hint is ignored"
+        );
+        assert_eq!(
+            net.node(&c).buffered(&g),
+            MAX_FUTURE,
+            "{MAX_FUTURE_PER_SENDER} each at most"
+        );
+        // Bob's message is still there when the commit comes.
+        let mut events = Vec::new();
+        for o in to_carol {
+            events.extend(net.node(&c).handle(a, o.wire).unwrap().events);
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GroupEvent::Text { from, text, .. } if *from == b && text == "after"
+        )));
     }
 }

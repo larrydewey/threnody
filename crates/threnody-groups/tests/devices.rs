@@ -1052,6 +1052,63 @@ async fn admins_invite_on_running_nodes() {
 }
 
 #[tokio::test]
+async fn a_new_successor_waits_the_full_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bob = spawn(&dir, "bob").await;
+    let mut alice = spawn(&dir, "alice").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let aid = approve(&mut bob, &mut alice).await;
+    let cid = approve(&mut bob, &mut carol).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &aid).unwrap();
+    bob.groups.invite(&bob.node, &g, &cid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g) && ns[1].groups.list()[0].3.len() == 3
+    })
+    .await;
+    bob.groups.promote(&bob.node, &g, aid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1].groups.roster(&g).is_ok_and(|r| r.admins == [aid])
+    })
+    .await;
+    // The group was quiet for 15 days; then Bob names Alice successor.
+    let day = 24 * 60 * 60 * 1000;
+    let now = threnody_core::now_ms();
+    alice.groups.set_owner_seen_for_testing(&g, now - 15 * day);
+    bob.groups.set_successor(&bob.node, &g, Some(aid)).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1].groups.roster(&g).is_ok_and(|r| r.successors == [aid])
+    })
+    .await;
+    let now = threnody_core::now_ms();
+    assert!(!alice.groups.can_claim(&alice.node, &g, now));
+    assert!(!alice.groups.can_claim(&alice.node, &g, now + 13 * day));
+    assert!(
+        alice
+            .groups
+            .can_claim(&alice.node, &g, now + 14 * day + 60_000)
+    );
+
+    // Any commit of the owner's, a role change of someone else's say,
+    // starts the clock over.
+    alice.groups.set_owner_seen_for_testing(&g, now - 15 * day);
+    assert!(alice.groups.can_claim(&alice.node, &g, now));
+    bob.groups.promote(&bob.node, &g, cid).unwrap();
+    until(&mut [&mut bob, &mut alice, &mut carol], |ns| {
+        ns[1]
+            .groups
+            .roster(&g)
+            .is_ok_and(|r| r.admins.contains(&cid))
+    })
+    .await;
+    assert!(
+        !alice
+            .groups
+            .can_claim(&alice.node, &g, threnody_core::now_ms())
+    );
+}
+
+#[tokio::test]
 async fn an_owners_linked_device_becomes_an_owner() {
     let dir = tempfile::tempdir().unwrap();
     let mut laptop = spawn(&dir, "laptop").await;

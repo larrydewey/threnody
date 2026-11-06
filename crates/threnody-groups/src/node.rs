@@ -245,8 +245,9 @@ struct Held {
     tag: Tag,
     /// The member whose message we forward; `None` for our own.
     origin: Option<PublicIdentity>,
-    /// A commit, proposal or Welcome: the member can't read anything later
-    /// without it, so it is kept longest.
+    /// A commit, proposal, Welcome (or one to pass on), Resync or Leave
+    /// with its proposal: the group can't move on without it, so it is
+    /// kept longest.
     handshake: bool,
 }
 
@@ -254,7 +255,15 @@ impl Held {
     fn new(to: PublicIdentity, bytes: Vec<u8>, tag: Tag, origin: Option<PublicIdentity>) -> Self {
         let handshake = match GroupWire::decode(&bytes) {
             Ok(GroupWire::Message { message, .. }) => crate::is_handshake(&message),
-            Ok(GroupWire::Welcome { .. }) => true,
+            Ok(GroupWire::Forward { message, .. }) => crate::is_handshake(&message),
+            Ok(
+                GroupWire::Welcome { .. }
+                | GroupWire::PassWelcome { .. }
+                | GroupWire::Resync { .. }
+                | GroupWire::Leave {
+                    proposal: Some(_), ..
+                },
+            ) => true,
             _ => false,
         };
         Self {
@@ -465,6 +474,13 @@ impl GroupNode {
     /// Whether we asked to be brought back in step and haven't been yet.
     pub fn out_of_step(&self, group: &GroupId) -> bool {
         self.groups.out_of_step(group)
+    }
+
+    /// Tests only: when the owner was last seen in `group`.
+    #[doc(hidden)]
+    pub fn set_owner_seen_for_testing(&mut self, group: &GroupId, ms: u64) {
+        self.owner_seen.retain(|(g, _)| g != group);
+        self.owner_seen.push((*group, ms));
     }
 
     /// Whether we are the group's successor and its owner has been silent
@@ -786,6 +802,32 @@ impl GroupNode {
     ) -> Result<Vec<Update>> {
         let devices = self.devices_in(node, group, &peer)?;
         self.change_roster(node, group, vec![RosterChange::Transfer(devices)])
+    }
+
+    /// Owner: hands the group to `peer`'s account and leaves it. Only once
+    /// the handover can go in at once (or, from an owner device that isn't
+    /// the coordinator, ahead of our leaving): in a group still waiting for
+    /// members to update, nothing changes.
+    pub fn transfer_and_leave(
+        &mut self,
+        node: &Node,
+        group: &GroupId,
+        peer: PublicIdentity,
+    ) -> Result<Vec<Update>> {
+        let me = node.identity();
+        if !self.has_roster(group) {
+            return Err(GroupError::NotAllowed(
+                "everyone must update Threnody before you can hand the group over",
+            ));
+        }
+        let mut updates = self.transfer(node, group, peer)?;
+        if self.roster(group)?.lead == me {
+            return Err(GroupError::NotAllowed(
+                "the handover hasn't gone through yet: try leaving again later",
+            ));
+        }
+        updates.extend(self.leave(node, group)?);
+        Ok(updates)
     }
 
     /// Owner: makes `peer`'s account (admins all) the successor, who may
@@ -1715,6 +1757,11 @@ impl GroupNode {
                 let _ = self.apply(node, out, true);
             }
         }
+        // Messages from a branch that outranks ours waited long enough.
+        let out = self.groups.check_forks();
+        if !out.send.is_empty() {
+            let _ = self.apply(node, out, true);
+        }
         if !self.held.iter().any(|h| h.to == *peer) {
             return;
         }
@@ -2151,21 +2198,25 @@ impl GroupNode {
                 }
                 Update::Left { group }
             }
+            GroupEvent::Committed {
+                group,
+                by,
+                successor,
+            } => {
+                // Any commit of the owner's, a role change say, is a sign
+                // of life; becoming successor starts the clock afresh.
+                if successor {
+                    self.stamp_owner_seen(&group);
+                } else {
+                    self.seen_by(&group, Some(&by));
+                }
+                return;
+            }
             GroupEvent::RoleChanged {
                 group,
                 member,
                 role,
             } => {
-                // Becoming successor starts the clock.
-                let me = node.identity();
-                if member == me
-                    && self
-                        .groups
-                        .roster(&group)
-                        .is_ok_and(|r| r.successors.contains(&me))
-                {
-                    self.stamp_owner_seen(&group);
-                }
                 if role == MemberRole::Member {
                     self.mirror_step_down(node, &group, &member, &mut extra);
                 }

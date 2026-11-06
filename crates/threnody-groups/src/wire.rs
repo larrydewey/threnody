@@ -16,7 +16,6 @@
 //! 7: the proposals a coordinator's commit references (kinds 4 and 5)
 //! 8: the sender's sync hint (kinds 4 and 5 in groups with a roster; 10)
 //! ```
-//! ```
 
 use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
