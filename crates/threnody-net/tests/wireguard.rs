@@ -364,6 +364,18 @@ async fn tunnels_survive_a_restart_without_a_session() {
         .unwrap();
     assert_eq!(back, reply);
     assert!(alice.sessions().is_empty(), "no session was needed");
+    // Bob's device saw Alice's authenticated packets come from her new
+    // port, and that is what Bob keeps for her.
+    let moved: std::net::SocketAddr = ([127, 0, 0, 1], a_port2).into();
+    assert_eq!(entry(&bob, &aid).unwrap().seen, Some(moved));
+    let home = Home::new(dir.path().join("bob"));
+    let plain = home
+        .load_state(bob.identity_ref(), threnody_core::tunnel::STATE)
+        .unwrap()
+        .unwrap();
+    let kept = threnody_core::tunnel::decode_saved(&plain).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].endpoint, moved);
 }
 
 #[tokio::test]
@@ -504,4 +516,33 @@ async fn tunnels_off_race_never_resurrects_state() {
     bob.set_tunnel_port(None).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!file.exists());
+}
+
+#[tokio::test]
+async fn network_change_reoffers_tunnels_on_live_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let Pair {
+        alice,
+        bob,
+        mut brx,
+        b_port,
+        ..
+    } = pair(&dir).await;
+    let aid = alice.identity();
+    // Bob loses Alice's tunnel; Alice took an offer this session already,
+    // so she doesn't answer his new one.
+    bob.set_tunnel_port(None).unwrap();
+    bob.set_tunnel_port(Some(b_port)).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(bob.tunnel_peers().is_empty());
+    while brx.try_recv().is_ok() {}
+    // Alice's network changes: she offers again, internet reach or not.
+    alice.network_switched(false);
+    let Some(Event::TunnelUp { peer, .. }) =
+        tunnel_up_within(&mut brx, Duration::from_secs(5)).await
+    else {
+        panic!("Bob heard Alice's offer again");
+    };
+    assert_eq!(peer, aid);
+    assert_eq!(bob.tunnel_peers(), vec![aid]);
 }

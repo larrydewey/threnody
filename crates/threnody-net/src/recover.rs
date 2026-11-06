@@ -554,9 +554,14 @@ impl Node {
     /// now the network our standby socket is bound to (Wi-Fi went and
     /// mobile data took over, or a Wi-Fi we already prepared took over):
     /// dial every approved peer through its open standby hole at once. In any case, learn our new addresses, write them to
-    /// every recovery slot and punch toward the peers we lost.
+    /// every recovery slot and punch toward the peers we lost. Tunnels are
+    /// offered again, so peers on sessions that survive learn our new
+    /// endpoint.
     pub fn network_switched(&self, to_standby: bool) {
         *lock(&self.rec().t0) = Some(Instant::now());
+        // Peers on sessions that survive the move (QUIC migrates) learn
+        // our new tunnel endpoint now, internet reachability on or off.
+        self.reoffer_tunnels();
         // Sessions from before may be dead: no first hops (see below).
         let changed = now_ms();
         self.rdv().changed_ms.store(changed, Ordering::Relaxed);

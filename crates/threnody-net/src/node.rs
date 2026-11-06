@@ -567,6 +567,9 @@ pub(crate) struct Shared {
     /// saved peers, so a save can't bring the file back once tunnels are
     /// off (see `tunnels`).
     pub(crate) tunnel_io: Mutex<()>,
+    /// When endpoints the userspace device saw were last saved (ms).
+    #[cfg(feature = "boringtun")]
+    pub(crate) tunnel_seen_saved_ms: AtomicU64,
     /// When each peer's last Wi-Fi Direct request and offer were taken
     /// (see `direct`), to take at most one of each per interval.
     pub(crate) direct_taken: Mutex<HashMap<(PublicIdentity, bool), std::time::Instant>>,
@@ -881,6 +884,8 @@ impl Node {
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
             tunnel_io: Mutex::new(()),
+            #[cfg(feature = "boringtun")]
+            tunnel_seen_saved_ms: AtomicU64::new(0),
             direct_taken: Mutex::new(HashMap::new()),
             tunnel_inbound: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),

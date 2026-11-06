@@ -20,6 +20,11 @@ use threnody_core::{AppMessage, PublicIdentity, now_ms};
 
 use crate::node::{Node, Secret, Shared, TunnelPeer, lock};
 
+/// Endpoint-only changes from the userspace device are saved at most
+/// this often (ms); in between they wait for the next save of any kind.
+#[cfg(feature = "boringtun")]
+const SEEN_SAVE_EVERY_MS: u64 = 30_000;
+
 impl Shared {
     /// Sets (or clears) our tunnel port and key, returning what it was.
     /// Turning tunnels off forgets every peer and deletes the saved ones.
@@ -156,6 +161,40 @@ impl Node {
             if s.via.is_none() && self.shared.mutual(&s.peer) {
                 let _ = self.send(&s.peer, AppMessage::TunnelOffer { wg_public, port });
             }
+        }
+    }
+
+    /// The userspace device took a packet that `peer`'s key (`wg_public`)
+    /// authenticates, over UDP from `from`: remember where the peer is, so
+    /// the saved endpoint is the last one that worked. No event: the key
+    /// and PSK are unchanged, and kernel WireGuard roams by itself.
+    #[cfg(feature = "boringtun")]
+    pub(crate) fn tunnel_endpoint_seen(
+        &self,
+        peer: &PublicIdentity,
+        wg_public: &[u8; 32],
+        from: std::net::SocketAddr,
+    ) {
+        use std::sync::atomic::Ordering;
+        let changed = {
+            let mut peers = lock(&self.shared.tunnel_peers);
+            let Some(tp) = peers.get_mut(peer).filter(|tp| tp.wg_public == *wg_public) else {
+                return;
+            };
+            let seen = (from != tp.endpoint).then_some(from);
+            std::mem::replace(&mut tp.seen, seen) != seen
+        };
+        let now = now_ms();
+        let last = self.shared.tunnel_seen_saved_ms.load(Ordering::Relaxed);
+        if changed
+            && now.saturating_sub(last) >= SEEN_SAVE_EVERY_MS
+            && self
+                .shared
+                .tunnel_seen_saved_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.shared.save_tunnels();
         }
     }
 }

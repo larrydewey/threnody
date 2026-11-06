@@ -305,6 +305,9 @@ async fn receive(
     if let Some(from) = from.filter(|_| authenticates_sender(datagram)) {
         // Authenticated over UDP: the direct path works, and this is
         // where the peer is now.
+        if peer.endpoint != from {
+            node.tunnel_endpoint_seen(&id, &peer.wg_public, from);
+        }
         peer.endpoint = from;
         peer.direct_at = Some(Instant::now());
     }
