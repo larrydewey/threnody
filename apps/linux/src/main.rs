@@ -13,6 +13,7 @@ mod folders;
 mod gifs;
 mod keyring;
 mod lists;
+mod lock;
 #[cfg(feature = "nfc")]
 mod nfc;
 mod schedule;
@@ -23,6 +24,7 @@ mod window;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -31,6 +33,16 @@ use crate::core::{Core, OpenError, Protect};
 use crate::window::App;
 
 pub const APP_ID: &str = "org.threnody.Threnody";
+
+/// Set after erasing everything: start afresh once the app has quit.
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+/// Quits and starts a new process, which finds no identity and begins as
+/// on a first run (after "Erase all Threnody data" or the duress PIN).
+pub fn restart(app: &adw::Application) {
+    RESTART.store(true, Ordering::SeqCst);
+    app.quit();
+}
 
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -73,7 +85,23 @@ fn main() -> glib::ExitCode {
             a.core.shutdown();
         }
     });
-    app.run()
+    let code = app.run();
+    if !RESTART.load(Ordering::SeqCst) {
+        return code;
+    }
+    // GApplication gives up its bus name when finalized: let it go before
+    // the new process asks for it. Files and sockets close at exec.
+    drop(app);
+    if let Ok(exe) = std::env::current_exe() {
+        use std::os::unix::process::CommandExt;
+        // Links and files given at start were handled (or erased) already.
+        let args = std::env::args_os()
+            .skip(1)
+            .filter(|a| a.to_str().is_some_and(|a| a.starts_with('-')));
+        let e = std::process::Command::new(exe).args(args).exec();
+        eprintln!("threnody-desktop: restarting: {e}");
+    }
+    code
 }
 
 fn app_actions(app: &adw::Application) {
@@ -196,13 +224,18 @@ fn start(
             let a = App::new(&app, &window, core, rx);
             APP.with_borrow_mut(|slot| *slot = Some(a.clone()));
             handle_links(&a);
+            lock::offer(&a);
         },
     );
 }
 
 /// Offers `threnody://` invites and `threnody-link://` codes that were
 /// opened (clicked links, or command-line arguments).
-fn handle_links(a: &Rc<App>) {
+pub(crate) fn handle_links(a: &Rc<App>) {
+    // Kept until unlocked: no dialog opens over the lock page.
+    if a.lock.is_locked() {
+        return;
+    }
     for link in PENDING.with_borrow_mut(std::mem::take) {
         if link.starts_with("threnody-link://") {
             a.join_account(&link);

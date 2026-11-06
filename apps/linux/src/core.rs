@@ -37,6 +37,10 @@ pub enum UiEvent {
     PersonasChanged,
 }
 
+/// Set while erasing everything: files kept outside the node's data
+/// directory handle (media, clips, downloads) mustn't be written any more.
+pub static WIPING: AtomicBool = AtomicBool::new(false);
+
 /// How a new identity is protected.
 pub enum Protect {
     /// A random key kept in the system keyring (the default).
@@ -858,6 +862,9 @@ impl Core {
 
     /// Where to record a voice or video message, beside received photos.
     pub fn clip_path(&self, persona: Option<&str>, video: bool) -> Result<PathBuf, String> {
+        if WIPING.load(Ordering::SeqCst) {
+            return Err("erasing".into());
+        }
         let dir = self.media_dir(persona);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let name = if video {
@@ -877,6 +884,9 @@ impl Core {
         data: &[u8],
         how: Keep,
     ) -> Option<String> {
+        if WIPING.load(Ordering::SeqCst) {
+            return None;
+        }
         let dir = if persona.is_some() || how.privately(name) {
             self.media_dir(persona)
         } else {
@@ -1151,6 +1161,13 @@ impl Core {
         });
     }
 
+    /// Before erasing everything: nothing writes files any more, and the
+    /// nodes stop.
+    pub fn shutdown_for_wipe(&self) {
+        WIPING.store(true, Ordering::SeqCst);
+        self.shutdown();
+    }
+
     pub fn shutdown(&self) {
         for p in lock(&self.personas).values() {
             p.alive.store(false, Ordering::Relaxed);
@@ -1357,6 +1374,9 @@ pub fn is_image(name: &str) -> bool {
 /// Writes `data` as `name` (any path in it stripped) into `dir`; its
 /// location.
 fn keep_in(dir: &Path, name: &str, data: &[u8]) -> Option<String> {
+    if WIPING.load(Ordering::SeqCst) {
+        return None;
+    }
     let path = free_path(dir, name);
     std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(&path, data))

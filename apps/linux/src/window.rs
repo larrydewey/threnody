@@ -67,6 +67,8 @@ pub struct App {
     log: RefCell<Option<gtk::TextBuffer>>,
     /// The current call, across the top of the window.
     call: Rc<CallBar>,
+    /// App lock: the lock page in front of everything.
+    pub lock: Rc<crate::lock::Lock>,
 }
 
 impl App {
@@ -175,6 +177,7 @@ impl App {
         );
         main_menu.append_section(None, &s2);
         let s3 = gio::Menu::new();
+        s3.append(Some("Lock Now"), Some("win.lock-now"));
         s3.append(Some("Preferences"), Some("win.preferences"));
         s3.append(Some("Diagnostics"), Some("win.diagnostics"));
         s3.append(Some("About Threnody"), Some("win.about"));
@@ -224,7 +227,9 @@ impl App {
         split.set_vexpand(true);
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&column));
-        window.set_content(Some(&toasts));
+        // The window's content is the app and the lock page, the lock page
+        // in front from the first frame when app lock is on.
+        let lock = crate::lock::Lock::new(&core.home, window, &toasts);
 
         // Narrow windows show one pane at a time.
         let bp = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
@@ -264,8 +269,10 @@ impl App {
             rebuilding: Cell::new(false),
             log: RefCell::new(None),
             call,
+            lock,
         });
         this.actions();
+        crate::lock::install(&this);
         this.watch(events);
         this.watch_window();
         this.watch_network();
@@ -1931,6 +1938,14 @@ impl App {
     }
 
     fn notify(&self, chat: &ChatRef, title: &str, body: &str) {
+        // With app lock on: one notification for everything, saying
+        // nothing, and naming no chat in its action.
+        if self.lock.enabled() {
+            let n = gio::Notification::new("Threnody");
+            n.set_body(Some("New message"));
+            self.app.send_notification(Some("message"), &n);
+            return;
+        }
         let private = self.core.settings().flag(settings::PRIVATE_NOTIFICATIONS);
         let n = if private {
             let n = gio::Notification::new("Threnody");
@@ -1950,6 +1965,12 @@ impl App {
 
     /// Opens a chat from a notification's target.
     pub fn open_variant(self: &Rc<Self>, v: &str) {
+        if self.lock.is_locked() {
+            // Opened once unlocked.
+            *self.lock.queued.borrow_mut() = Some(v.to_owned());
+            self.window.present();
+            return;
+        }
         let Some(chat) = parse_chat(v) else { return };
         self.window.present();
         if let Some(c) = self.conversation(&chat) {
@@ -2063,6 +2084,7 @@ impl App {
         add("about", Self::about);
         add("find", Self::find);
         add("search-all", Self::open_search_all);
+        add("lock-now", |t| t.lock.lock_now());
         self.app.set_accels_for_action("win.find", &["<Ctrl>f"]);
         self.app
             .set_accels_for_action("win.search-all", &["<Ctrl><Shift>f", "<Ctrl>k"]);
@@ -3180,6 +3202,8 @@ impl App {
         );
         page.add(&messages);
         page.add(&crate::backup::group(self));
+        page.add(&crate::lock::group(self));
+        page.add(&crate::lock::danger_group(self));
         d.add(&page);
         d.present(Some(&self.window));
     }
@@ -3703,6 +3727,17 @@ fn parse_chat(s: &str) -> Option<ChatRef> {
             _ => Target::Contact(key),
         },
     })
+}
+
+impl App {
+    /// The notification ids of every conversation, for withdrawing them.
+    pub fn conversation_ids(&self) -> Vec<String> {
+        self.convs
+            .borrow()
+            .iter()
+            .map(|c| notification_id(&c.chat))
+            .collect()
+    }
 }
 
 fn notification_id(c: &ChatRef) -> String {

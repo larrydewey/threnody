@@ -34,6 +34,8 @@ pub const SEND_TYPING: &str = "send_typing";
 pub const GIPHY: &str = "giphy_search";
 /// A GIPHY API key the user entered (it wins over the build's).
 pub const GIPHY_KEY: &str = "giphy_api_key";
+/// The offer to set up app lock was shown (once per identity).
+pub const LOCK_OFFERED: &str = "lock_offered";
 /// Which conversations the list shows: "all", "chats" or "groups".
 pub const LIST_TAB: &str = "list_tab";
 
@@ -62,6 +64,8 @@ pub fn timer_label(secs: Option<u32>) -> String {
 pub struct Settings {
     path: PathBuf,
     values: BTreeMap<String, String>,
+    /// Erased: nothing is written any more.
+    gone: bool,
 }
 
 impl Settings {
@@ -73,10 +77,37 @@ impl Settings {
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
             .collect();
-        Self { path, values }
+        Self {
+            path,
+            values,
+            gone: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn at(path: PathBuf) -> Self {
+        Self {
+            path,
+            values: BTreeMap::new(),
+            gone: false,
+        }
+    }
+
+    /// Forgets every setting and deletes the file ("Erase all Threnody
+    /// data"); later changes aren't saved, so they can't bring it back.
+    pub fn erase(&mut self) {
+        self.values.clear();
+        self.gone = true;
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 
     fn save(&self) {
+        if self.gone {
+            return;
+        }
         let body: String = self
             .values
             .iter()
@@ -148,4 +179,24 @@ pub fn default_home() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".local/share/threnody")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_erase_removes_the_file_and_stops_saving() {
+        let dir = std::env::temp_dir().join(format!("threnody-settings-{}", std::process::id()));
+        let path = dir.join("threnody").join("desktop.conf");
+        let mut s = Settings::at(path.clone());
+        s.set_flag(COVER, false);
+        assert!(path.exists());
+        s.erase();
+        assert!(!path.exists());
+        s.set_flag(COVER, false);
+        s.set_text(HANDLE_NAME, "me");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
