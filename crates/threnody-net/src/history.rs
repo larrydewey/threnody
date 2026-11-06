@@ -960,12 +960,33 @@ impl Node {
         quote: Option<Quote>,
         forwarded: bool,
     ) -> Result<SendReport> {
+        let extras = Extras {
+            quote,
+            forwarded,
+            ..Extras::default()
+        };
+        self.send_message_with(peer, body, extras, local_id())
+    }
+
+    /// [`Node::send_message`], with what it quotes and whether it's
+    /// forwarded in `extras`, recorded (and sent) under `local_id`: a
+    /// scheduled message keeps the id it was scheduled with, so it is
+    /// never sent twice (see `schedule`).
+    pub fn send_message_with(
+        &self,
+        peer: &PublicIdentity,
+        body: &str,
+        extras: Extras,
+        local_id: u64,
+    ) -> Result<SendReport> {
+        let Extras {
+            quote, forwarded, ..
+        } = extras;
         // Writing to someone accepts them.
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
         let timer = self.effective_timer(conv);
         // The message carries its history id, so we can delete it later.
-        let local_id = local_id();
         let msg = AppMessage::Text {
             sent_ms: now_ms(),
             body: body.to_owned(),
