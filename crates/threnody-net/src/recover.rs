@@ -160,6 +160,15 @@ struct Standby {
     reflected: HashMap<SocketAddr, SocketAddr>,
 }
 
+/// What a recovery slot watcher reads: the slot of the session lost last,
+/// when that was (ms), and when it began watching for it.
+#[derive(Clone, Copy)]
+struct Watch {
+    slot: [u8; 32],
+    lost_ms: u64,
+    since: Instant,
+}
+
 pub(crate) struct RecoverState {
     peers: Mutex<HashMap<PublicIdentity, PeerPaths>>,
     standby: Mutex<Option<Standby>>,
@@ -176,6 +185,8 @@ pub(crate) struct RecoverState {
     on_mobile: AtomicBool,
     /// Wakes the keepalive loop (a hole to open now).
     kick: Notify,
+    /// Recovery slots being watched, one watcher per peer.
+    watching: Mutex<HashMap<PublicIdentity, Watch>>,
     /// When a contact's `Paths` last woke it.
     paths_kick: Mutex<Option<Instant>>,
     /// A `learn_standby` is running (one at a time), and whether it was
@@ -197,6 +208,7 @@ impl RecoverState {
             force: AtomicBool::new(false),
             on_mobile: AtomicBool::new(false),
             kick: Notify::new(),
+            watching: Mutex::default(),
             paths_kick: Mutex::default(),
             learning: Mutex::default(),
             t0: Mutex::default(),
@@ -447,9 +459,26 @@ impl Node {
             self.punch(peer, &targets, false, Urge::Lost);
         }
         if let Some(slot) = paths.slot {
-            let node = self.clone();
-            tokio::spawn(async move { node.watch_slot(peer, slot, lost_ms).await });
+            self.watch(peer, slot, lost_ms);
         }
+    }
+
+    /// Watches `peer`'s recovery `slot` for [`RECOVER_FOR`]. A peer
+    /// already watched keeps its one watcher, now reading this slot for
+    /// another [`RECOVER_FOR`]: sessions lost one after another don't add
+    /// DHT reads. True if a watcher started.
+    fn watch(&self, peer: PublicIdentity, slot: [u8; 32], lost_ms: u64) -> bool {
+        let w = Watch {
+            slot,
+            lost_ms,
+            since: Instant::now(),
+        };
+        if lock(&self.rec().watching).insert(peer, w).is_some() {
+            return false;
+        }
+        let node = self.clone();
+        tokio::spawn(async move { node.watch_slot(peer).await });
+        true
     }
 
     /// A call's media stopped arriving over a session that still looks up:
@@ -469,24 +498,43 @@ impl Node {
         !targets.is_empty() && self.punch(peer, &targets, false, Urge::Moved)
     }
 
-    /// Reads `peer`'s recovery slot every [`SLOT_POLL`] until it is back or
-    /// [`RECOVER_FOR`] has passed; new addresses there go to the punch.
-    async fn watch_slot(&self, peer: PublicIdentity, slot: [u8; 32], lost_ms: u64) {
-        let start = Instant::now();
-        let rk = slot_key(&slot, &peer);
-        let key = SigningKey::from_bytes(&rk.signing_seed)
-            .verifying_key()
-            .to_bytes();
+    /// Reads `peer`'s recovery slot (see [`Node::watch`]) every
+    /// [`SLOT_POLL`] until it is back or [`RECOVER_FOR`] has passed; new
+    /// addresses there go to the punch.
+    async fn watch_slot(&self, peer: PublicIdentity) {
         let mut seen = 0;
-        while start.elapsed() < RECOVER_FOR && !self.is_closed() {
-            if self.connected(&peer) {
-                self.timed(format_args!("{} is back", peer.fingerprint()));
+        let mut current = None;
+        loop {
+            let back = self.connected(&peer);
+            let w = {
+                let mut watching = lock(&self.rec().watching);
+                let w = watching
+                    .get(&peer)
+                    .copied()
+                    .filter(|w| !back && w.since.elapsed() < RECOVER_FOR && !self.is_closed());
+                if w.is_none() {
+                    watching.remove(&peer);
+                }
+                w
+            };
+            let Some(w) = w else {
+                if back {
+                    self.timed(format_args!("{} is back", peer.fingerprint()));
+                }
                 return;
+            };
+            if current != Some(w.slot) {
+                current = Some(w.slot);
+                seen = 0;
             }
+            let rk = slot_key(&w.slot, &peer);
+            let key = SigningKey::from_bytes(&rk.signing_seed)
+                .verifying_key()
+                .to_bytes();
             if let Some(dht) = self.dht()
                 && let Some(item) = crate::reach::get_latest(&dht, &key, &rk.salt).await
                 && let Ok(rec) = rendezvous::open_record(&rk, item.value())
-                && rec.issued_ms + 10_000 >= lost_ms
+                && rec.issued_ms + 10_000 >= w.lost_ms
                 && rec.issued_ms > seen
             {
                 seen = rec.issued_ms;
@@ -1095,6 +1143,25 @@ mod tests {
             assert!(ended.is_err(), "ended at {rate:?} s: {ended:?}");
             assert!(c.sessions().iter().any(|s| s.peer == a.identity()));
         }
+    }
+
+    #[tokio::test]
+    async fn sessions_lost_one_after_another_keep_one_slot_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _arx) = test_node(&dir, "a");
+        let peer = threnody_core::Identity::generate().public();
+        assert!(a.watch(peer, [1; 32], 1));
+        for i in 2..50 {
+            assert!(!a.watch(peer, [i; 32], u64::from(i)), "a second watcher");
+        }
+        let w = lock(&a.rec().watching)[&peer];
+        assert_eq!(
+            (w.slot, w.lost_ms),
+            ([49; 32], 49),
+            "watches the latest slot"
+        );
+        // Another peer gets its own.
+        assert!(a.watch(threnody_core::Identity::generate().public(), [1; 32], 1));
     }
 
     /// The file `name` somewhere under `dir`.
