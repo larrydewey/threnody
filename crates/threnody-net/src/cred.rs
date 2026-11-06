@@ -601,8 +601,18 @@ mod tests {
         let addr = holder.listen("127.0.0.1:0").await.unwrap().to_string();
         let hid = issuer.connect(&addr, None).await.unwrap();
         holder.accept_contact(&issuer.identity());
-        // Features are exchanged in the first messages.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Features are exchanged in the first messages: wait for them (a
+        // fixed pause is too short on a busy machine).
+        let iid = issuer.identity();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !(issuer.supports(&hid, FEATURE_CREDENTIALS)
+                && holder.supports(&iid, FEATURE_CREDENTIALS))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("features exchanged");
         let attrs = vec![("member".to_owned(), "yes".to_owned())];
         let today = credential::day(now_ms());
         for tamper in [

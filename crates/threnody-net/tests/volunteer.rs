@@ -217,8 +217,22 @@ async fn credentials_are_issued_and_selectively_presented() {
     let mut verifier = spawn(&dir, "verifier").await;
     let hid = issuer.node.connect(&holder.addr, None).await.unwrap();
     next(&mut holder.rx, |e| matches!(e, Event::Connected { .. })).await;
-    // Features are exchanged in the first messages.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Features are exchanged in the first messages: wait for them (a
+    // fixed pause is too short on a busy machine).
+    let iid = issuer.node.identity();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !(issuer
+            .node
+            .supports(&hid, threnody_core::message::FEATURE_CREDENTIALS)
+            && holder
+                .node
+                .supports(&iid, threnody_core::message::FEATURE_CREDENTIALS))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("features exchanged");
     let attrs = vec![
         ("name".to_owned(), "Ada".to_owned()),
         ("over18".to_owned(), "yes".to_owned()),
