@@ -7,8 +7,10 @@
 //! each message (`AppMessage::Text::expires_in_s`) so both sides apply it.
 
 use const_cbor::Decoder;
+use zeroize::Zeroizing;
 
 use crate::cbor::{self, finish, fixed_bytes, read_map, required};
+use crate::crypto::kdf;
 use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::message::{Clip, Mention, Quote};
@@ -43,15 +45,34 @@ impl ConversationId {
         }
     }
 
-    fn state_name(&self) -> String {
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    /// The name of its history file: keyed, so a listing of the data
+    /// directory shows neither whom we talk to nor which groups we are in.
+    ///
+    /// ```text
+    /// name = "hist-" || hex(KDF("history file name", KDF("history file name key", seed), 0 ‖ account | 1 ‖ group))
+    /// ```
+    fn state_name(&self, identity: &Identity) -> String {
+        let key = Zeroizing::new(kdf::derive::<32>(
+            kdf::label::HISTORY_NAME_KEY,
+            &[&identity.seed()[..]],
+        ));
+        let name: [u8; 32] =
+            kdf::derive(kdf::label::HISTORY_FILE_NAME, &[&key[..], &self.to_bytes()]);
+        format!("{KEYED_PREFIX}{}", hex(&name))
+    }
+
+    /// The name its history file had before 0.18.0, which named the
+    /// conversation: `hist-p-<account or device>`, `hist-g-<group>`. Only
+    /// read (and moved, see [`Home::migrate_history_names`]), and written
+    /// inside backups so that older versions restore them.
+    fn legacy_state_name(&self) -> String {
         match self {
             Self::Peer(k) => format!("hist-p-{}", hex(k)),
             Self::Group(g) => format!("hist-g-{}", hex(g)),
         }
     }
 
-    fn parse_state_name(name: &str) -> Option<Self> {
+    fn parse_legacy_state_name(name: &str) -> Option<Self> {
         let unhex = |s: &str| -> Option<Vec<u8>> {
             (0..s.len())
                 .step_by(2)
@@ -66,6 +87,27 @@ impl ConversationId {
         }
         None
     }
+}
+
+const KEYED_PREFIX: &str = "hist-";
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Whether `name` is a history file's keyed name ([`ConversationId::state_name`]).
+fn is_keyed_name(name: &str) -> bool {
+    name.strip_prefix(KEYED_PREFIX).is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Whether the state file `name` holds a conversation's history, under
+/// either name.
+pub(crate) fn is_history_name(name: &str) -> bool {
+    is_keyed_name(name) || ConversationId::parse_legacy_state_name(name).is_some()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,6 +490,33 @@ impl History {
         added
     }
 
+    /// Takes in what `newer`, the copy of this conversation an older
+    /// version kept under its old name after the upgrade, holds: its new
+    /// entries and pins, and what it set of the timer, notifications and
+    /// draft. It ran after this copy was last written (it never touches
+    /// keyed files), so what it set wins; what it left at the default
+    /// (no timer, notify all, no draft) leaves ours.
+    fn absorb_newer(&mut self, newer: History, now_ms: u64) {
+        self.merge(newer.entries, now_ms);
+        if newer.timer_s.is_some() {
+            self.timer_s = newer.timer_s;
+        }
+        if !newer.draft.is_empty() {
+            self.draft = newer.draft;
+        }
+        if newer.notify != Notify::All {
+            self.notify = newer.notify;
+        }
+        self.seen_ms = self.seen_ms.max(newer.seen_ms);
+        for p in newer.pinned {
+            if !self.pinned.contains(&p) && self.entries.iter().any(|e| e.message_id() == p) {
+                self.pinned.push(p);
+            }
+        }
+        let extra = self.pinned.len().saturating_sub(MAX_PINS);
+        self.pinned.drain(..extra);
+    }
+
     /// Entries for a transcript: a conversation's (part of) history for
     /// our own other devices (Appendix J).
     pub fn transcript(entries: Vec<Entry>) -> Self {
@@ -549,6 +618,16 @@ impl History {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with(None)
+    }
+
+    /// As stored in conversation `c`'s file: with `c` in it (key 7), which
+    /// its keyed name no longer tells.
+    fn encode_stored(&self, c: ConversationId) -> Result<Vec<u8>> {
+        self.encode_with(Some(c))
+    }
+
+    fn encode_with(&self, conversation: Option<ConversationId>) -> Result<Vec<u8>> {
         let size: usize = self
             .entries
             .iter()
@@ -567,9 +646,13 @@ impl History {
                     + usize::from(!self.pinned.is_empty())
                     + usize::from(self.notify != Notify::All)
                     + usize::from(!self.draft.is_empty())
-                    + usize::from(self.seen_ms != 0),
+                    + usize::from(self.seen_ms != 0)
+                    + usize::from(conversation.is_some()),
             )?;
             enc.u8(0)?.u64(VERSION)?;
+            if let Some(c) = conversation {
+                enc.u8(7)?.bytes(&c.to_bytes())?;
+            }
             if let Some(t) = self.timer_s {
                 enc.u8(1)?.u32(t)?;
             }
@@ -708,6 +791,13 @@ impl History {
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
+        Self::decode_stored(b).map(|(h, _)| h)
+    }
+
+    /// A conversation's file: the history, and the conversation it says
+    /// it is (files from before 0.18.0 don't).
+    fn decode_stored(b: &[u8]) -> Result<(Self, Option<ConversationId>)> {
+        let mut conversation = None;
         let mut dec = Decoder::new(b);
         let (mut ver, mut timer, mut entries) = (None, None, Vec::new());
         let mut pinned = Vec::new();
@@ -817,6 +907,12 @@ impl History {
                 4 => notify = Notify::from_u8(d.u8()?),
                 5 => draft = d.str()?.to_owned(),
                 6 => seen_ms = d.u64()?,
+                7 => {
+                    conversation = Some(
+                        ConversationId::from_bytes(d.bytes()?)
+                            .ok_or(Error::Malformed("history conversation"))?,
+                    )
+                }
                 3 => {
                     for _ in 0..d.array_len()? {
                         let p = d.u64()?;
@@ -833,14 +929,17 @@ impl History {
         if ver != Some(VERSION) {
             return Err(Error::Malformed("history version"));
         }
-        Ok(Self {
-            timer_s: timer,
-            entries,
-            pinned,
-            notify,
-            draft,
-            seen_ms,
-        })
+        Ok((
+            Self {
+                timer_s: timer,
+                entries,
+                pinned,
+                notify,
+                draft,
+                seen_ms,
+            },
+            conversation,
+        ))
     }
 }
 
@@ -970,10 +1069,7 @@ impl Home {
         now_ms: u64,
     ) -> Result<History> {
         let _lock = history_lock();
-        let mut h = match self.load_state(identity, &c.state_name())? {
-            Some(b) => History::decode(&b)?,
-            None => History::default(),
-        };
+        let mut h = self.read_history(identity, c)?.unwrap_or_default();
         if h.prune(now_ms) {
             self.save_history(identity, c, &h)?;
         }
@@ -981,7 +1077,157 @@ impl Home {
     }
 
     pub fn save_history(&self, identity: &Identity, c: ConversationId, h: &History) -> Result<()> {
-        self.save_state(identity, &c.state_name(), &h.encode()?)
+        self.save_state(identity, &c.state_name(identity), &h.encode_stored(c)?)
+    }
+
+    /// `c`'s history as stored, if any, first moving it from its older
+    /// name if it is still there.
+    fn read_history(&self, identity: &Identity, c: ConversationId) -> Result<Option<History>> {
+        self.migrate_conversation(identity, c)?;
+        match self.load_state(identity, &c.state_name(identity))? {
+            Some(b) => Ok(Some(History::decode_stored(&b)?.0)),
+            None => Ok(None),
+        }
+    }
+
+    /// Moves `c`'s history from the name it had before 0.18.0 to its
+    /// keyed one ([`ConversationId::state_name`]). A file is already there
+    /// if an older version ran here after the upgrade and started the
+    /// conversation's file anew: then the two are merged. The keyed file
+    /// is written (atomically) before the old one goes, so an interruption
+    /// loses nothing and the next run finishes the move. Returns whether
+    /// there was anything to move.
+    fn migrate_conversation(&self, identity: &Identity, c: ConversationId) -> Result<bool> {
+        let old = c.legacy_state_name();
+        if !self.state_path(&old)?.exists() {
+            return Ok(false);
+        }
+        let _lock = history_lock();
+        let Some(b) = self.load_state(identity, &old)? else {
+            return Ok(false);
+        };
+        let older = History::decode(&b)?;
+        let name = c.state_name(identity);
+        let h = match self.load_state(identity, &name)? {
+            None => older,
+            Some(b) => {
+                let mut h = History::decode_stored(&b)?.0;
+                h.absorb_newer(older, crate::now_ms());
+                h
+            }
+        };
+        self.save_state(identity, &name, &h.encode_stored(c)?)?;
+        self.remove_state(&old)?;
+        Ok(true)
+    }
+
+    /// Moves every history file still under the name it had before 0.18.0
+    /// (which named the account or group) to its keyed name. Idempotent;
+    /// a file that can't be moved stays where it is, and loading that
+    /// conversation tries again. Returns how many moved.
+    pub fn migrate_history_names(&self, identity: &Identity) -> usize {
+        let Ok(names) = self.state_names() else {
+            return 0;
+        };
+        // Each move takes the history lock itself: with nothing to move,
+        // this doesn't wait for it.
+        names
+            .iter()
+            .filter_map(|n| ConversationId::parse_legacy_state_name(n))
+            .filter(|c| self.migrate_conversation(identity, *c).unwrap_or(false))
+            .count()
+    }
+
+    /// Every conversation stored under its keyed name, with its history.
+    /// Files that can't be read, or don't say which conversation they are
+    /// (or say one their name doesn't match), are skipped.
+    fn stored_histories<'a>(
+        &'a self,
+        identity: &'a Identity,
+    ) -> impl Iterator<Item = (ConversationId, History)> + 'a {
+        self.state_names()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| is_keyed_name(n))
+            .filter_map(move |name| {
+                let b = self.load_state(identity, &name).ok()??;
+                let (h, c) = History::decode_stored(&b).ok()?;
+                let c = c.filter(|c| c.state_name(identity) == name)?;
+                Some((c, h))
+            })
+    }
+
+    /// The history files a backup holds: each conversation under the name
+    /// it had before 0.18.0, so that older versions restore it too (the
+    /// backup is sealed as a whole, so its names show nothing). A
+    /// conversation found under both names goes in once, merged as the
+    /// move to the keyed name would (the old name's copy is the newer).
+    /// Files that can't be read go in as they are. `dropped` (whose
+    /// contact an older version blocked or deleted) are left out.
+    pub(crate) fn history_for_backup(
+        &self,
+        identity: &Identity,
+        dropped: &[ConversationId],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let _lock = history_lock();
+        // Each conversation's keyed copy, and its old-name one.
+        type Copies = (Option<History>, Option<History>);
+        let mut convs: Vec<(ConversationId, Copies)> = Vec::new();
+        let mut out = Vec::new();
+        for name in self.state_names()? {
+            let read = || self.load_state(identity, &name).ok().flatten();
+            let legacy = ConversationId::parse_legacy_state_name(&name);
+            let found = if let Some(c) = legacy {
+                read()
+                    .and_then(|b| History::decode(&b).ok())
+                    .map(|h| (c, h))
+            } else if is_keyed_name(&name) {
+                read()
+                    .and_then(|b| History::decode_stored(&b).ok())
+                    .and_then(|(h, c)| Some((c?, h)))
+                    .filter(|(c, _)| c.state_name(identity) == name)
+            } else {
+                continue;
+            };
+            match found {
+                Some((c, _)) if dropped.contains(&c) => {}
+                Some((c, h)) => {
+                    let i = match convs.iter().position(|(x, _)| *x == c) {
+                        Some(i) => i,
+                        None => {
+                            convs.push((c, (None, None)));
+                            convs.len() - 1
+                        }
+                    };
+                    let copies = &mut convs[i].1;
+                    if legacy.is_some() {
+                        copies.1 = Some(h);
+                    } else {
+                        copies.0 = Some(h);
+                    }
+                }
+                None => match std::fs::read(self.state_path(&name)?) {
+                    Ok(b) => out.push((name, b)),
+                    // Removed since we listed it.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
+        }
+        for (c, copies) in convs {
+            let h = match copies {
+                (Some(mut keyed), Some(older)) => {
+                    keyed.absorb_newer(older, crate::now_ms());
+                    keyed
+                }
+                (Some(h), None) | (None, Some(h)) => h,
+                (None, None) => continue,
+            };
+            let name = c.legacy_state_name();
+            let sealed = self.seal_state(identity, &name, &h.encode()?)?;
+            out.push((name, sealed));
+        }
+        Ok(out)
     }
 
     /// Appends one entry to a conversation.
@@ -1071,10 +1317,9 @@ impl Home {
         if from == into {
             return Ok(false);
         }
-        let Some(b) = self.load_state(identity, &from.state_name())? else {
+        let Some(src) = self.read_history(identity, from)? else {
             return Ok(false);
         };
-        let src = History::decode(&b)?;
         let mut dst = self.load_history(identity, into, now_ms)?;
         dst.entries.extend(src.entries);
         dst.entries.sort_by_key(|e| e.at_ms);
@@ -1083,7 +1328,7 @@ impl Home {
         }
         dst.prune(now_ms);
         self.save_history(identity, into, &dst)?;
-        self.remove_state(&from.state_name())?;
+        self.remove_state(&from.state_name(identity))?;
         Ok(true)
     }
 
@@ -1296,21 +1541,18 @@ impl Home {
     }
 
     /// Deletes a conversation's history.
-    pub fn delete_history(&self, c: ConversationId) -> Result<()> {
-        self.remove_state(&c.state_name())
+    pub fn delete_history(&self, identity: &Identity, c: ConversationId) -> Result<()> {
+        let _lock = history_lock();
+        self.remove_state(&c.legacy_state_name())?;
+        self.remove_state(&c.state_name(identity))
     }
 
-    /// Every conversation with stored history.
-    pub fn conversations(&self) -> Vec<ConversationId> {
-        let Ok(rd) = std::fs::read_dir(self.dir()) else {
-            return vec![];
-        };
-        rd.filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                ConversationId::parse_state_name(name.strip_suffix(".state")?)
-            })
-            .collect()
+    /// Every conversation with stored history. Its files' names don't say
+    /// (see [`ConversationId::state_name`]), so this reads each one.
+    pub fn conversations(&self, identity: &Identity) -> Vec<ConversationId> {
+        let _lock = history_lock();
+        self.migrate_history_names(identity);
+        self.stored_histories(identity).map(|(c, _)| c).collect()
     }
 
     /// Searches `scope` (one conversation, or every one when `None`) for
@@ -1327,26 +1569,28 @@ impl Home {
         if q.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let convs = match scope {
-            Some(c) => vec![c],
-            None => self.conversations(),
-        };
         let mut hits = Vec::new();
-        for c in convs {
-            let Some(b) = self.load_state(identity, &c.state_name())? else {
-                continue;
-            };
-            // One unreadable conversation shouldn't hide the others.
-            let mut h = match History::decode(&b) {
-                Ok(h) => h,
-                Err(e) if scope.is_some() => return Err(e),
-                Err(_) => continue,
-            };
+        let mut search = |c: ConversationId, mut h: History| {
             h.prune(now_ms);
             hits.extend(h.search(q, limit).into_iter().map(|e| Hit {
                 conversation: c,
                 entry: e.clone(),
             }));
+        };
+        match scope {
+            Some(c) => {
+                if let Some(h) = self.read_history(identity, c)? {
+                    search(c, h);
+                }
+            }
+            // One unreadable conversation shouldn't hide the others.
+            None => {
+                let _lock = history_lock();
+                self.migrate_history_names(identity);
+                for (c, h) in self.stored_histories(identity) {
+                    search(c, h);
+                }
+            }
         }
         hits.sort_by_key(|h| std::cmp::Reverse(h.entry.at_ms));
         hits.truncate(limit);
@@ -1357,16 +1601,11 @@ impl Home {
     /// conversations changed.
     pub fn sweep_history(&self, identity: &Identity, now_ms: u64) -> usize {
         let _lock = history_lock();
-        self.conversations()
-            .into_iter()
-            .filter(|c| {
-                self.load_state(identity, &c.state_name())
-                    .ok()
-                    .flatten()
-                    .and_then(|b| History::decode(&b).ok())
-                    .is_some_and(|mut h| {
-                        h.prune(now_ms) && self.save_history(identity, *c, &h).is_ok()
-                    })
+        self.migrate_history_names(identity);
+        self.stored_histories(identity)
+            .filter(|(c, h)| {
+                let mut h = h.clone();
+                h.prune(now_ms) && self.save_history(identity, *c, &h).is_ok()
             })
             .count()
     }
@@ -1413,7 +1652,7 @@ mod tests {
             .unwrap();
         let h = home.load_history(&id, c, 50).unwrap();
         assert_eq!(h.entries().len(), 2);
-        let raw = std::fs::read(dir.path().join(format!("{}.state", c.state_name()))).unwrap();
+        let raw = std::fs::read(dir.path().join(format!("{}.state", c.state_name(&id)))).unwrap();
         assert!(
             !raw.windows(6).any(|w| w == b"secret"),
             "history stored in clear"
@@ -1428,10 +1667,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["keep me"]
         );
-        let raw = home.load_state(&id, &c.state_name()).unwrap().unwrap();
+        let raw = home.load_state(&id, &c.state_name(&id)).unwrap().unwrap();
         assert!(!raw.windows(6).any(|w| w == b"secret"));
 
-        assert_eq!(home.conversations(), vec![c]);
+        assert_eq!(home.conversations(&id), vec![c]);
         let acct = ConversationId::Peer([9; 32]);
         home.append_history(&id, acct, entry(0, "earlier", None), 0)
             .unwrap();
@@ -1445,7 +1684,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["earlier", "keep me"]
         );
-        assert_eq!(home.conversations(), vec![acct]);
+        assert_eq!(home.conversations(&id), vec![acct]);
         home.merge_history(&id, acct, c, 102).unwrap();
         home.merge_history(&id, c, acct, 102).unwrap();
         home.append_history(
@@ -1810,5 +2049,372 @@ mod tests {
         e.poll = Some(p);
         let h = History::transcript(vec![e]);
         assert_eq!(History::decode(&h.encode().unwrap()).unwrap(), h);
+    }
+}
+
+#[cfg(test)]
+mod names_at_rest_tests {
+    use super::*;
+    use crate::persona::Personas;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn note(at: u64, text: &str) -> Entry {
+        Entry {
+            at_ms: at,
+            outgoing: false,
+            device: [7; 32],
+            text: text.into(),
+            offline: false,
+            expires_at_ms: None,
+            file: None,
+            local_id: 0,
+            delivered: false,
+            recipients: 0,
+            delivered_to: Vec::new(),
+            remote_id: at,
+            edited_ms: 0,
+            read_ms: 0,
+            reactions: Vec::new(),
+            quote: None,
+            mentions: Vec::new(),
+            poll: None,
+            forwarded: false,
+            list: None,
+        }
+    }
+
+    fn texts(h: &History) -> Vec<&str> {
+        h.entries().iter().map(|e| e.text.as_str()).collect()
+    }
+
+    fn file_names(home: &Home) -> Vec<String> {
+        std::fs::read_dir(home.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// Writes history the way 0.17.3 named it: `hist-p-<account id>` and
+    /// `hist-g-<group id>`.
+    fn write_old(home: &Home, id: &Identity, c: ConversationId, entries: &[Entry]) {
+        let name = match c {
+            ConversationId::Peer(k) => format!("hist-p-{}", hex(&k)),
+            ConversationId::Group(g) => format!("hist-g-{}", hex(&g)),
+        };
+        let mut h = History::default();
+        for e in entries {
+            h.push(e.clone(), 0);
+        }
+        home.save_state(id, &name, &h.encode().unwrap()).unwrap();
+    }
+
+    fn write_old_h(home: &Home, id: &Identity, c: ConversationId, h: &History) {
+        home.save_state(id, &c.legacy_state_name(), &h.encode().unwrap())
+            .unwrap();
+    }
+
+    fn assert_no_ids(home: &Home, ids: &[&[u8]]) {
+        for name in file_names(home) {
+            assert!(
+                !name.starts_with("hist-p-") && !name.starts_with("hist-g-"),
+                "old name left: {name}"
+            );
+            for id in ids {
+                assert!(!name.contains(&hex(id)), "{name} names a conversation");
+            }
+            let bytes = std::fs::read(home.dir().join(&name)).unwrap();
+            for id in ids {
+                assert!(
+                    !bytes.windows(id.len()).any(|w| w == *id),
+                    "{name} holds a conversation id in clear"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_file_names_reveal_no_account_or_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(None).unwrap();
+        let (acct, group) = ([0xa7; 32], [0x5c; 16]);
+        let (p, g) = (ConversationId::Peer(acct), ConversationId::Group(group));
+        home.append_history(&id, p, note(1, "hello"), 1).unwrap();
+        home.append_history(&id, g, note(2, "team"), 2).unwrap();
+        assert_no_ids(&home, &[&acct, &group]);
+        // One file each, both keyed, and they still list and load.
+        let hist: Vec<_> = file_names(&home)
+            .into_iter()
+            .filter(|n| n.starts_with("hist-"))
+            .collect();
+        assert_eq!(hist.len(), 2, "{hist:?}");
+        let mut convs = home.conversations(&id);
+        convs.sort_by_key(ConversationId::to_bytes);
+        assert_eq!(convs, vec![p, g]);
+        assert_eq!(texts(&home.load_history(&id, p, 3).unwrap()), ["hello"]);
+
+        // The names depend on the identity: another home's differ.
+        let dir2 = tempfile::tempdir().unwrap();
+        let other = Home::new(dir2.path());
+        let id2 = other.create_identity(None).unwrap();
+        other.append_history(&id2, p, note(1, "hello"), 1).unwrap();
+        let theirs = file_names(&other);
+        assert!(!theirs.iter().any(|n| hist.contains(n)), "unkeyed name");
+
+        home.delete_history(&id, p).unwrap();
+        assert_eq!(home.conversations(&id), vec![g]);
+    }
+
+    #[test]
+    fn old_history_names_move_on_first_load_and_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(None).unwrap();
+        let (acct, group) = ([0x11; 32], [0x22; 16]);
+        let (p, g) = (ConversationId::Peer(acct), ConversationId::Group(group));
+        write_old(&home, &id, p, &[note(1, "one"), note(2, "two")]);
+        write_old(&home, &id, g, &[note(3, "g1")]);
+
+        home.load_contacts(&id).unwrap();
+        assert_no_ids(&home, &[&acct, &group]);
+        assert_eq!(
+            texts(&home.load_history(&id, p, 9).unwrap()),
+            ["one", "two"]
+        );
+        assert_eq!(texts(&home.load_history(&id, g, 9).unwrap()), ["g1"]);
+        let mut convs = home.conversations(&id);
+        convs.sort_by_key(ConversationId::to_bytes);
+        assert_eq!(convs, vec![p, g]);
+
+        // Idempotent.
+        let before = file_names(&home);
+        home.load_contacts(&id).unwrap();
+        assert_eq!(file_names(&home).len(), before.len());
+
+        // An older version ran again and wrote the old name anew (with
+        // only what it saw): both are merged, nothing is lost.
+        write_old(&home, &id, p, &[note(2, "two"), note(4, "four")]);
+        home.load_contacts(&id).unwrap();
+        assert_no_ids(&home, &[&acct, &group]);
+        assert_eq!(
+            texts(&home.load_history(&id, p, 9).unwrap()),
+            ["one", "two", "four"]
+        );
+
+        // Even without a migration first, a conversation loads, searches
+        // and lists from its old name.
+        write_old(&home, &id, p, &[note(5, "five")]);
+        let q = Query::new("five");
+        assert_eq!(home.search_history(&id, None, &q, 9, 9).unwrap().len(), 1);
+        write_old(&home, &id, p, &[note(6, "six")]);
+        assert_eq!(home.conversations(&id).len(), 2);
+        write_old(&home, &id, p, &[note(7, "seven")]);
+        assert_eq!(
+            texts(&home.load_history(&id, p, 9).unwrap()),
+            ["one", "two", "four", "five", "six", "seven"]
+        );
+        assert_no_ids(&home, &[&acct, &group]);
+    }
+
+    /// What 0.17.3 set in a conversation after the upgrade is the newer:
+    /// its file under the old name wins over the keyed one's settings.
+    #[test]
+    fn settings_an_older_version_changed_survive_the_return() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for (dir, by_backup) in [(a, false), (b, true)] {
+            let home = Home::new(dir.path());
+            let id = home.create_identity(None).unwrap();
+            let (p, q) = (
+                ConversationId::Peer([0x81; 32]),
+                ConversationId::Peer([0x82; 32]),
+            );
+            // Before the downgrade: timer off, notify all, a draft.
+            for c in [p, q] {
+                let mut h = History::default();
+                h.push(note(1, "before"), 0);
+                h.timer_s = Some(0);
+                h.draft = "kept".into();
+                h.notify = Notify::Off;
+                home.save_history(&id, c, &h).unwrap();
+            }
+            // Under 0.17.3: p's timer set to an hour, notify to mentions,
+            // a new draft; q only gets a message.
+            let mut h = History::default();
+            h.push(note(2, "under 0.17.3"), 0);
+            h.timer_s = Some(3600);
+            h.notify = Notify::Mentions;
+            h.draft = "newer".into();
+            write_old_h(&home, &id, p, &h);
+            write_old(&home, &id, q, &[note(3, "only a message")]);
+
+            let restored = tempfile::tempdir().unwrap();
+            let home = if by_backup {
+                let backup = home.export_backup_with(&id, PW, FAST).unwrap();
+                let new = Home::new(restored.path());
+                new.restore_backup(&backup, PW, None).unwrap();
+                new
+            } else {
+                home.load_contacts(&id).unwrap();
+                home
+            };
+            let h = home.load_history(&id, p, 9).unwrap();
+            assert_eq!(texts(&h), ["before", "under 0.17.3"]);
+            assert_eq!(h.timer_s, Some(3600), "backup: {by_backup}");
+            assert_eq!(h.notify, Notify::Mentions);
+            assert_eq!(h.draft, "newer");
+            let h = home.load_history(&id, q, 9).unwrap();
+            assert_eq!(texts(&h), ["before", "only a message"]);
+            assert_eq!(h.timer_s, Some(0), "unset there: ours stands");
+            assert_eq!(h.notify, Notify::Off);
+            assert_eq!(h.draft, "kept");
+        }
+    }
+
+    /// 0.17.3 blocking or deleting a contact deletes only the history
+    /// under the old name; the keyed one goes when the contacts merge.
+    #[test]
+    fn history_of_a_contact_an_older_version_dropped_goes_on_return() {
+        for blocked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home::new(dir.path());
+            let id = home.create_identity(None).unwrap();
+            let (bob, carol) = (Identity::generate().public(), Identity::generate().public());
+            let (pb, pc) = (
+                ConversationId::Peer(*bob.as_bytes()),
+                ConversationId::Peer(*carol.as_bytes()),
+            );
+            let mut state = crate::store::Contacts::default();
+            for k in [bob, carol] {
+                state.observe(k, None, 1);
+                let c = state.get_mut(&k).unwrap();
+                c.local_approved = true;
+                c.accepted = true;
+                c.approval_changed_ms = 10;
+            }
+            home.save_contacts(&id, &state).unwrap();
+            home.append_history(&id, pb, note(1, "pre-1"), 1).unwrap();
+            home.append_history(&id, pc, note(1, "carol"), 1).unwrap();
+
+            let mut plain = crate::store::Contacts::default();
+            plain.observe(bob, None, 50);
+            if blocked {
+                let b = plain.get_mut(&bob).unwrap();
+                b.blocked = true;
+                b.accepted = false;
+            } else {
+                plain.forget(&bob, crate::now_ms());
+            }
+            home.write_contacts_file(&plain.encode().unwrap()).unwrap();
+
+            let contacts = home.load_contacts(&id).unwrap();
+            assert_eq!(contacts.get(&bob).is_some_and(|c| c.blocked), blocked);
+            assert!(
+                home.load_history(&id, pb, 9).unwrap().entries().is_empty(),
+                "history back (blocked: {blocked})"
+            );
+            assert_eq!(home.conversations(&id), vec![pc]);
+            assert_eq!(texts(&home.load_history(&id, pc, 9).unwrap()), ["carol"]);
+        }
+    }
+
+    #[test]
+    fn a_persona_home_migrates_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = Home::new(dir.path().join("main"));
+        let me = main.create_identity(None).unwrap();
+        let (_, home, id) = Personas::new(&main, &me)
+            .create("market", None, None, 1)
+            .unwrap();
+        let acct = [0x33; 32];
+        let p = ConversationId::Peer(acct);
+        write_old(&home, &id, p, &[note(1, "from pat")]);
+
+        home.load_contacts(&id).unwrap();
+        assert_no_ids(&home, &[&acct]);
+        assert_eq!(texts(&home.load_history(&id, p, 9).unwrap()), ["from pat"]);
+        // Its names are its own, not the main identity's.
+        main.append_history(&me, p, note(1, "x"), 1).unwrap();
+        let mine: Vec<_> = file_names(&main)
+            .into_iter()
+            .filter(|n| n.starts_with("hist-"))
+            .collect();
+        assert!(!file_names(&home).iter().any(|n| mine.contains(n)));
+    }
+
+    const FAST: crate::sealed::KdfParams = crate::sealed::KdfParams {
+        m_kib: 64,
+        t: 1,
+        lanes: 1,
+    };
+    const PW: &str = "correct horse battery";
+
+    #[test]
+    fn an_older_backup_restores_into_keyed_names() {
+        // A home as 0.17.3 left it (and backed it up).
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let old = Home::new(a.path());
+        let id = old.create_identity(None).unwrap();
+        let (acct, group) = ([0x44; 32], [0x55; 16]);
+        let (p, g) = (ConversationId::Peer(acct), ConversationId::Group(group));
+        write_old(&old, &id, p, &[note(1, "kept")]);
+        write_old(&old, &id, g, &[note(2, "kept too")]);
+        let backup = old.export_backup_with(&id, PW, FAST).unwrap();
+
+        let new = Home::new(b.path());
+        let r = new.restore_backup(&backup, PW, None).unwrap();
+        assert_no_ids(&new, &[&acct, &group]);
+        assert_eq!(
+            texts(&new.load_history(&r.identity, p, 9).unwrap()),
+            ["kept"]
+        );
+        assert_eq!(
+            texts(&new.load_history(&r.identity, g, 9).unwrap()),
+            ["kept too"]
+        );
+    }
+
+    #[test]
+    fn a_backup_keeps_the_names_older_versions_read() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let home = Home::new(a.path());
+        let id = home.create_identity(None).unwrap();
+        let (acct, group) = ([0x66; 32], [0x77; 16]);
+        let (p, g) = (ConversationId::Peer(acct), ConversationId::Group(group));
+        home.append_history(&id, p, note(1, "hi"), 1).unwrap();
+        home.append_history(&id, g, note(2, "all"), 2).unwrap();
+        let backup = home.export_backup_with(&id, PW, FAST).unwrap();
+
+        // Inside the sealed backup, history goes under the old names, so
+        // 0.17.3 restores it as it always did: each file as stored, read
+        // under its name.
+        let states = crate::backup::states_in(&backup, PW);
+        let old = Home::new(b.path());
+        for (name, bytes) in &states {
+            old.write_state_file(name, bytes).unwrap();
+        }
+        let read = |name: String| {
+            History::decode(&old.load_state(&id, &name).unwrap().expect(&name)).unwrap()
+        };
+        assert_eq!(texts(&read(format!("hist-p-{}", hex(&acct)))), ["hi"]);
+        assert_eq!(texts(&read(format!("hist-g-{}", hex(&group)))), ["all"]);
+        assert!(
+            !states
+                .iter()
+                .any(|(n, _)| n.starts_with("hist-") && n.len() == 69),
+            "keyed names in the backup"
+        );
+
+        // And this version restores it to keyed names.
+        let c = tempfile::tempdir().unwrap();
+        let new = Home::new(c.path());
+        new.restore_backup(&backup, PW, None).unwrap();
+        assert_no_ids(&new, &[&acct, &group]);
+        assert_eq!(texts(&new.load_history(&id, p, 9).unwrap()), ["hi"]);
+        let mut convs = new.conversations(&id);
+        convs.sort_by_key(ConversationId::to_bytes);
+        assert_eq!(convs, vec![p, g]);
     }
 }

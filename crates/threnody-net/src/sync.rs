@@ -84,7 +84,7 @@ impl Node {
         let since = lock(&self.shared.sync).synced.get(peer.as_bytes()).copied();
         let now = now_ms();
         let mut out = Vec::new();
-        for conv in self.shared.home.conversations() {
+        for conv in self.shared.home.conversations(self.identity_ref()) {
             let group = matches!(conv, ConversationId::Group(_));
             let Ok(h) = self.history(conv) else { continue };
             let entries: Vec<Entry> = h

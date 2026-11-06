@@ -908,7 +908,7 @@ fn main() -> Result<()> {
             let conv = threnody_core::history::ConversationId::Peer(
                 account.map_or(*key.as_bytes(), |a| a.0),
             );
-            home.delete_history(conv)?;
+            home.delete_history(&id, conv)?;
             println!(
                 "Deleted {} and your conversation; your other devices follow when they sync.",
                 key.fingerprint()
