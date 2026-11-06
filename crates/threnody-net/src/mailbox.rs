@@ -1026,7 +1026,10 @@ impl Node {
             // and also held for our next session: a copy that came that way
             // first is dropped, so it can't undo a newer change.
             let contact = self.is_accepted(&from);
-            if self.shared.delivery(|d| d.seen_change(&from, &msg, contact)) {
+            if self
+                .shared
+                .delivery(|d| d.seen_change(&from, &msg, contact))
+            {
                 return;
             }
             match &msg {
