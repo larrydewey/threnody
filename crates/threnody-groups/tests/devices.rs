@@ -185,6 +185,174 @@ async fn a_linked_device_joins_our_groups_with_their_history() {
     assert_eq!(phone.texts(&g).len(), 3, "no duplicates");
 }
 
+/// The laptop and phone of one account, both in Bob's group `g`.
+async fn our_devices_in_a_group(dir: &tempfile::TempDir) -> (N, N, N, threnody_groups::GroupId) {
+    let mut laptop = spawn(dir, "laptop").await;
+    let mut phone = spawn(dir, "phone").await;
+    let mut bob = spawn(dir, "bob").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[2].in_group(&g) && ns[0].groups.list()[0].3.len() == 3
+    })
+    .await;
+    (laptop, phone, bob, g)
+}
+
+/// `n`'s entry for its group message `text`.
+fn group_entry(
+    n: &N,
+    g: &threnody_groups::GroupId,
+    text: &str,
+) -> Option<threnody_core::history::Entry> {
+    n.node
+        .history(ConversationId::Group(*g))
+        .ok()?
+        .entries()
+        .iter()
+        .find(|e| e.text == text)
+        .cloned()
+}
+
+#[tokio::test]
+async fn group_receipts_reach_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, mut bob, g) = our_devices_in_a_group(&dir).await;
+    laptop
+        .groups
+        .send_text(&laptop.node, &g, "to the team")
+        .unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        group_entry(ns[1], &g, "to the team").is_some_and(|e| e.delivered)
+            && group_entry(ns[2], &g, "to the team").is_some()
+    })
+    .await;
+    let on_laptop = group_entry(&laptop, &g, "to the team").unwrap();
+    assert_eq!(on_laptop.recipients, 2);
+    // The phone received the message itself, as a member; who else has
+    // it only the laptop hears, and passes on.
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        group_entry(ns[2], &g, "to the team").is_some_and(|e| {
+            e.outgoing && e.delivered && e.delivered_to.len() == 2 && e.recipients == 2
+        })
+    })
+    .await;
+}
+
+/// Files in a directory, as an app keeps them.
+struct Files(std::path::PathBuf);
+
+impl threnody_net::FileStore for Files {
+    fn read(&self, location: &str, max: u64) -> Option<Vec<u8>> {
+        let d = std::fs::read(location).ok()?;
+        (d.len() as u64 <= max).then_some(d)
+    }
+
+    fn keep(&self, name: &str, data: &[u8], _clip: bool) -> Option<String> {
+        let p = self.0.join(format!("kept-{name}"));
+        std::fs::write(&p, data).ok()?;
+        Some(p.to_string_lossy().into_owned())
+    }
+}
+
+#[tokio::test]
+async fn pre_join_group_files_can_be_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    for (n, name) in [(&laptop, "laptop-files"), (&phone, "phone-files")] {
+        let d = dir.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        n.node.set_file_store(std::sync::Arc::new(Files(d)));
+    }
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+
+    // Bob's photo, before the phone exists; the laptop keeps it.
+    let photo = threnody_core::random_bytes_vec(20_000);
+    bob.groups
+        .send_file(
+            &bob.node,
+            &g,
+            threnody_net::history::OutgoingFile {
+                name: "team.png".into(),
+                data: photo.clone(),
+                location: None,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+                clip: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| {
+        ns[1]
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::File { .. }))
+    })
+    .await;
+    let Some(Update::File {
+        from,
+        name,
+        data,
+        id,
+        ..
+    }) = laptop
+        .updates
+        .iter()
+        .find(|u| matches!(u, Update::File { .. }))
+        .cloned()
+    else {
+        unreachable!()
+    };
+    let at = dir.path().join("laptop-files").join(&name);
+    std::fs::write(&at, &data).unwrap();
+    laptop.groups.record_file(
+        &laptop.node,
+        &g,
+        &from,
+        threnody_core::history::FileNote {
+            name: name.clone(),
+            size: data.len() as u64,
+            location: Some(at.to_string_lossy().into_owned()),
+            sensitive: false,
+            album: 0,
+            clip: None,
+            forwarded: false,
+        },
+        "",
+        id,
+    );
+
+    // Linked, the phone gets the group's history, and the photo with it.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[2]
+            .node
+            .history(ConversationId::Group(g))
+            .ok()
+            .and_then(|h| {
+                h.entries()
+                    .iter()
+                    .find_map(|e| e.file.as_ref()?.location.clone())
+            })
+            .and_then(|l| std::fs::read(l).ok())
+            .is_some_and(|d| d == photo)
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_member_offline_during_an_add_still_gets_the_commit() {
     let dir = tempfile::tempdir().unwrap();

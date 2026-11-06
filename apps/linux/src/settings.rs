@@ -8,6 +8,9 @@ use std::path::PathBuf;
 pub const COVER: &str = "cover_traffic";
 pub const ONION: &str = "onion_first";
 pub const STRIP: &str = "strip_metadata";
+/// Photos and voice and video messages from our other devices download by
+/// themselves (on unmetered networks).
+pub const AUTO_FETCH: &str = "fetch_from_own_devices";
 pub const REACH: &str = "reach_internet";
 pub const PRIVATE_NOTIFICATIONS: &str = "private_notifications";
 pub const BACKGROUND: &str = "run_in_background";

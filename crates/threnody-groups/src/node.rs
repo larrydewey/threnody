@@ -1453,6 +1453,7 @@ impl GroupNode {
                     }
                 ),
                 list: None,
+                ticked_ms: 0,
             },
         );
         Ok(())
@@ -1496,6 +1497,7 @@ impl GroupNode {
                 poll: None,
                 forwarded: false,
                 list: None,
+                ticked_ms: 0,
             },
         );
     }
@@ -2369,6 +2371,7 @@ impl GroupNode {
                         poll: Some(poll),
                         forwarded: false,
                         list: None,
+                        ticked_ms: 0,
                     },
                 );
                 Update::Text {

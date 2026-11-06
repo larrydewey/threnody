@@ -440,6 +440,7 @@ impl Node {
                 poll: None,
                 forwarded: false,
                 list: Some(l.id),
+                ticked_ms: 0,
             },
         );
     }
