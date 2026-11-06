@@ -708,15 +708,16 @@ impl Node {
         }
         let conv = self.conversation_for(from);
         let now = now_ms();
-        let ids: HashSet<u64> = ids.iter().copied().collect();
+        let set: HashSet<u64> = ids.iter().copied().collect();
         let n = self
             .shared
             .home
             .mark_read_entries(self.identity_ref(), conv, now, |e| {
-                e.outgoing && e.local_id != 0 && ids.contains(&e.local_id)
+                e.outgoing && e.local_id != 0 && set.contains(&e.local_id)
             })
             .unwrap_or(0);
         if n > 0 {
+            self.push_ticks(conv, ids);
             self.emit(Event::Read { peer: *from });
         }
     }
@@ -1146,6 +1147,7 @@ impl Node {
             *peer.as_bytes(),
             now_ms(),
         ) {
+            self.push_ticks(conv, &[tag.local_id]);
             self.emit(Event::Delivered {
                 peer: *peer,
                 local_id: tag.local_id,

@@ -185,6 +185,65 @@ async fn a_linked_device_joins_our_groups_with_their_history() {
     assert_eq!(phone.texts(&g).len(), 3, "no duplicates");
 }
 
+/// The laptop and phone of one account, both in Bob's group `g`.
+async fn our_devices_in_a_group(dir: &tempfile::TempDir) -> (N, N, N, threnody_groups::GroupId) {
+    let mut laptop = spawn(dir, "laptop").await;
+    let mut phone = spawn(dir, "phone").await;
+    let mut bob = spawn(dir, "bob").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[2].in_group(&g) && ns[0].groups.list()[0].3.len() == 3
+    })
+    .await;
+    (laptop, phone, bob, g)
+}
+
+/// `n`'s entry for its group message `text`.
+fn group_entry(
+    n: &N,
+    g: &threnody_groups::GroupId,
+    text: &str,
+) -> Option<threnody_core::history::Entry> {
+    n.node
+        .history(ConversationId::Group(*g))
+        .ok()?
+        .entries()
+        .iter()
+        .find(|e| e.text == text)
+        .cloned()
+}
+
+#[tokio::test]
+async fn group_receipts_reach_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, mut bob, g) = our_devices_in_a_group(&dir).await;
+    laptop
+        .groups
+        .send_text(&laptop.node, &g, "to the team")
+        .unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        group_entry(ns[1], &g, "to the team").is_some_and(|e| e.delivered)
+            && group_entry(ns[2], &g, "to the team").is_some()
+    })
+    .await;
+    let on_laptop = group_entry(&laptop, &g, "to the team").unwrap();
+    assert_eq!(on_laptop.recipients, 2);
+    // The phone received the message itself, as a member; who else has
+    // it only the laptop hears, and passes on.
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        group_entry(ns[2], &g, "to the team").is_some_and(|e| {
+            e.outgoing && e.delivered && e.delivered_to.len() == 2 && e.recipients == 2
+        })
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_member_offline_during_an_add_still_gets_the_commit() {
     let dir = tempfile::tempdir().unwrap();

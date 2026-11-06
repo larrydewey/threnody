@@ -940,3 +940,164 @@ async fn revoking_on_another_device_takes_our_tunnel_down() {
     assert!(!saved(&dir, "laptop").exists());
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+/// A node again from the home `name` an earlier one used.
+async fn restart(dir: &tempfile::TempDir, name: &str) -> N {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    let (node, rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
+    N { node, rx, addr }
+}
+
+/// The outgoing entry with text `t` in `n`'s chat with `peer`.
+fn sent(
+    n: &Node,
+    peer: &threnody_core::PublicIdentity,
+    t: &str,
+) -> Option<threnody_core::history::Entry> {
+    n.history(n.conversation_for(peer))
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.outgoing && e.text == t)
+        .cloned()
+}
+
+#[tokio::test]
+async fn delivery_and_read_ticks_reach_a_connected_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    laptop.node.send_text(&bid, "tick me").unwrap();
+    wait_for(|| sent(&phone.node, &bid, "tick me").is_some()).await;
+    wait_for(|| sent(&laptop.node, &bid, "tick me").unwrap().delivered).await;
+    // The phone hears of the delivery from the laptop, not from bob.
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    wait_for(|| sent(&phone.node, &bid, "tick me").unwrap().delivered).await;
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn delivery_and_read_ticks_reach_a_sibling_that_was_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    // Bob is away while the laptop sends, so the phone has the entry
+    // (pushed live) before there is anything to tick.
+    bob.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    drop(bob);
+    let _ = laptop.node.send_text(&bid, "while you were out");
+    wait_for(|| sent(&phone.node, &bid, "while you were out").is_some()).await;
+    let pid = phone.node.identity();
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+
+    // Bob comes back, receives and reads it.
+    let mut bob = restart(&dir, "bob").await;
+    bob.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut bob.rx, |e| matches!(e, Event::Message { .. })).await;
+    let id = sent(&laptop.node, &bid, "while you were out")
+        .unwrap()
+        .message_id();
+    wait_for(|| {
+        sent(&laptop.node, &bid, "while you were out")
+            .unwrap()
+            .delivered
+    })
+    .await;
+    bob.node
+        .report_read(&laptop.node.identity(), &[id])
+        .unwrap();
+    wait_for(|| {
+        sent(&laptop.node, &bid, "while you were out")
+            .unwrap()
+            .read_ms
+            != 0
+    })
+    .await;
+
+    // The phone comes back and catches up on both ticks.
+    let mut phone = restart(&dir, "phone").await;
+    let e = sent(&phone.node, &bid, "while you were out").unwrap();
+    assert!(!e.delivered && e.read_ms == 0, "not yet");
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    wait_for(|| {
+        let e = sent(&phone.node, &bid, "while you were out").unwrap();
+        e.delivered && e.read_ms != 0
+    })
+    .await;
+    let read_ms = sent(&phone.node, &bid, "while you were out")
+        .unwrap()
+        .read_ms;
+
+    // Nothing goes back on a further reconnect.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let e = sent(&phone.node, &bid, "while you were out").unwrap();
+    assert!(e.delivered);
+    assert_eq!(e.read_ms, read_ms);
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn ticks_from_before_the_upgrade_are_backfilled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    let pid = phone.node.identity();
+    bob.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    drop(bob);
+    let _ = laptop.node.send_text(&bid, "old news");
+    wait_for(|| sent(&phone.node, &bid, "old news").is_some()).await;
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+    let mut bob = restart(&dir, "bob").await;
+    bob.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| sent(&laptop.node, &bid, "old news").unwrap().delivered).await;
+
+    // Both stop; the laptop forgets how far the phone had its ticks, as
+    // a version from before ticks were synced never knew.
+    laptop.node.shutdown();
+    drop(laptop);
+    let state = dir.path().join("laptop").join("history-sync-ticks.state");
+    assert!(state.exists());
+    std::fs::remove_file(&state).unwrap();
+
+    let laptop = restart(&dir, "laptop").await;
+    let mut phone = restart(&dir, "phone").await;
+    assert!(!sent(&phone.node, &bid, "old news").unwrap().delivered);
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    assert!(sent(&phone.node, &bid, "old news").unwrap().delivered);
+    let _ = &mut bob.rx;
+}

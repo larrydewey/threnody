@@ -611,6 +611,13 @@ pub(crate) struct Shared {
     features: AtomicU64,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
+    /// How far each of our other devices has our ticks (see `sync`).
+    pub(crate) ticks_sync: Mutex<crate::sync::SyncState>,
+    /// Live ticks waiting a moment to go to our other devices together.
+    pub(crate) tick_outbox:
+        Mutex<HashMap<threnody_core::history::ConversationId, std::collections::BTreeSet<u64>>>,
+    /// Ticks from our other devices for entries not here yet.
+    pub(crate) orphan_ticks: Mutex<crate::sync::OrphanTicks>,
     /// Folders, pinned and archived chats (see `folders`).
     pub(crate) folders: Mutex<threnody_core::folders::Folders>,
     /// Lists (see `lists`).
@@ -878,6 +885,13 @@ impl Node {
                 .flatten()
                 .unwrap_or_default(),
         );
+        let ticks_sync = crate::sync::SyncState::decode(
+            &cfg.home
+                .load_state(&cfg.identity, crate::sync::TICKS_STATE)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         let delivery = {
             let load = |n| {
                 cfg.home
@@ -934,6 +948,9 @@ impl Node {
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
+            ticks_sync: Mutex::new(ticks_sync),
+            tick_outbox: Mutex::new(HashMap::new()),
+            orphan_ticks: Mutex::new(crate::sync::OrphanTicks::default()),
             folders: Mutex::new(folders),
             lists: Mutex::new(lists),
             peer_features: Mutex::new(HashMap::new()),
@@ -2348,6 +2365,7 @@ where
                             }
                         }
                         node.send_profile(&peer);
+                        node.device_sync_hello(&peer);
                         node.offer_to_late_device(&peer);
                         if let Some(addr) = observed
                             && features & FEATURE_OBSERVED != 0

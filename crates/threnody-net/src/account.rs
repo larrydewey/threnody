@@ -381,6 +381,9 @@ impl Node {
                 for m in self.transcripts_for(&p) {
                     let _ = self.send(&p, m);
                 }
+                // Its Hello came before it was ours: ticks and file
+                // fetches start now rather than next session.
+                self.device_sync_hello(&p);
             }
         }
     }
