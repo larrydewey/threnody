@@ -23,7 +23,7 @@ A link to a relay or directory isn't a contact session. Its initiator's first fr
 
 - **Clients dial with a fresh identity** for every link to a directory and every circuit's first hop. The far end learns an address, never who is dialing.
 - **Relays dial onward as themselves**, since their identity is public anyway.
-- **Limits.** A node holds at most 1024 inbound anonymous links, 16 from one address. An idle outbound link closes after 2 minutes.
+- **Limits.** A node holds at most 1024 inbound anonymous links, 16 from one address (an IPv6 address by its /64). A link counts from the moment its `MAGIC` frame arrives, while its handshake is still running. An idle outbound link closes after 2 minutes.
 
 ## Relay descriptors
 

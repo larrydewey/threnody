@@ -29,6 +29,7 @@ use threnody_core::{Fingerprint, PublicIdentity};
 use tokio::sync::mpsc;
 
 use crate::error::{NetError, Result};
+use crate::gate::{Gate, Pass, Source};
 use crate::handshake;
 use crate::node::{Event, Node, Route, lock};
 
@@ -39,9 +40,39 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a QUIC dial may take before it counts as failed.
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Inbound connections from the first packet until their Threnody
+/// handshake is done, at once and from one source. Each holds some 40 KB.
+pub(crate) const MAX_HANDSHAKING: usize = 256;
+pub(crate) const MAX_HANDSHAKING_PER_SOURCE: usize = 16;
+/// With this many in progress, a new one must first show that it gets
+/// packets at its address (a Retry round trip, which costs us nothing to
+/// send): a spoofed source can't pin memory with one packet.
+const RETRY_ABOVE: usize = 16;
+
+/// What becomes of a new inbound connection.
+enum Admit {
+    /// Ask it to show it gets packets at its address first.
+    Retry,
+    Refuse,
+    Enter(Pass),
+}
+
+/// Whether a new connection from `source` gets a place. One whose address
+/// isn't shown yet (`validated`) takes a place only as its source's first,
+/// and only while few are in progress: anyone can claim an address, and
+/// Initials claiming someone else's mustn't use up that one's places.
+fn admit(gate: &Gate, source: Source, validated: bool) -> Admit {
+    if !validated && (gate.len() >= RETRY_ABOVE || gate.held(source) > 0) {
+        return Admit::Retry;
+    }
+    gate.enter(source).map_or(Admit::Refuse, Admit::Enter)
+}
 
 /// A datagram that isn't QUIC: a probe or a DHT reply.
 pub(crate) type Foreign = (SocketAddr, Vec<u8>);
+/// Non-QUIC datagrams waiting to be looked at. Anyone can send them, so a
+/// flood beyond this is dropped, as the socket's own buffer would.
+const FOREIGN_QUEUE: usize = 256;
 
 /// Whether a datagram is something other than QUIC. Probes have the QUIC
 /// fixed bit clear (grease is off, so no QUIC peer clears it); DHT replies
@@ -54,7 +85,7 @@ fn is_foreign(data: &[u8]) -> bool {
 #[derive(Debug)]
 struct Demux {
     inner: Arc<dyn AsyncUdpSocket>,
-    foreign: mpsc::UnboundedSender<Foreign>,
+    foreign: mpsc::Sender<Foreign>,
 }
 
 impl AsyncUdpSocket for Demux {
@@ -81,7 +112,7 @@ impl AsyncUdpSocket for Demux {
                 // are never the same size as their neighbours.
                 if m.len == m.stride && is_foreign(&bufs[i][..m.len]) {
                     let src = SocketAddr::new(m.addr.ip().to_canonical(), m.addr.port());
-                    let _ = self.foreign.send((src, bufs[i][..m.len].to_vec()));
+                    let _ = self.foreign.try_send((src, bufs[i][..m.len].to_vec()));
                     continue;
                 }
                 if kept != i {
@@ -309,7 +340,7 @@ impl Node {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| NetError::Io(io::Error::other("no async runtime")))?;
         let socket = runtime.wrap_udp_socket(std_sock)?;
-        let (ftx, mut frx) = mpsc::unbounded_channel();
+        let (ftx, mut frx) = mpsc::channel(FOREIGN_QUEUE);
         let demux = Arc::new(Demux {
             inner: socket.clone(),
             foreign: ftx,
@@ -338,8 +369,23 @@ impl Node {
                     () = &mut closed => break,
                 };
                 let Some(incoming) = incoming else { break };
+                let source = Source::ip(incoming.remote_address().ip());
+                // One that already answered a Retry is never asked again.
+                let validated = incoming.remote_address_validated() || !incoming.may_retry();
+                let pass = match admit(&node.shared.quic_inbound, source, validated) {
+                    Admit::Retry => {
+                        let _ = incoming.retry();
+                        continue;
+                    }
+                    Admit::Refuse => {
+                        incoming.refuse();
+                        continue;
+                    }
+                    Admit::Enter(pass) => pass,
+                };
                 let node = node.clone();
                 tokio::spawn(async move {
+                    let _pass = pass;
                     let addr = canonical(incoming.remote_address());
                     if let Err(e) = node.run_quic_inbound(incoming).await {
                         node.emit(Event::Rejected {
@@ -369,7 +415,12 @@ impl Node {
     }
 
     async fn run_quic_inbound(&self, incoming: quinn::Incoming) -> Result<()> {
-        let conn = incoming.await.map_err(quic_error)?;
+        // The idle timeout (60 s) would otherwise bound a handshake that
+        // never finishes.
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, incoming)
+            .await
+            .map_err(|_| NetError::Io(io::ErrorKind::TimedOut.into()))?
+            .map_err(quic_error)?;
         let addr = canonical(conn.remote_address());
         let (send, recv) = tokio::time::timeout(DIAL_TIMEOUT, conn.accept_bi())
             .await
@@ -445,4 +496,133 @@ fn quic_error(e: impl std::fmt::Display) -> NetError {
         io::ErrorKind::ConnectionAborted,
         e.to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{AcceptPolicy, NodeConfig};
+    use threnody_core::store::Home;
+
+    /// QUIC handshakes that never get to the Threnody one each hold a
+    /// place; past the limit from one address, new ones are refused (after
+    /// a Retry: the limit for all has load enough by then).
+    #[tokio::test]
+    async fn quic_handshakes_past_the_limit_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let addr = node.listen_quic("127.0.0.1:0").await.unwrap();
+        let (_, client) = configs().unwrap();
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(client);
+        let dial = || async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ep.connect(addr, "threnody").unwrap(),
+            )
+            .await
+            .expect("answered")
+        };
+        let mut held = Vec::new();
+        for _ in 0..MAX_HANDSHAKING_PER_SOURCE {
+            held.push(dial().await.unwrap());
+        }
+        assert!(dial().await.is_err(), "past the limit: refused");
+        assert_eq!(node.shared.quic_inbound.len(), MAX_HANDSHAKING_PER_SOURCE);
+        // Closing them gives the places back.
+        for c in held {
+            c.close(0u8.into(), b"");
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.shared.quic_inbound.len() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("places given back");
+        assert!(dial().await.is_ok());
+        node.shutdown();
+    }
+
+    /// Initials that claim someone's address, but never answer what is
+    /// sent there, hold at most one of its places: that one still gets in.
+    #[test]
+    fn spoofed_initials_do_not_use_up_a_sources_places() {
+        let gate = Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE);
+        let victim = Source::ip("192.0.2.7".parse().unwrap());
+        let mut held = Vec::new();
+        for _ in 0..MAX_HANDSHAKING_PER_SOURCE {
+            match admit(&gate, victim, false) {
+                Admit::Enter(pass) => held.push(pass),
+                Admit::Retry => {}
+                Admit::Refuse => panic!("refused below the limit"),
+            }
+        }
+        assert_eq!(held.len(), 1, "the rest were asked to retry");
+        // The real owner answers the Retry and comes back validated.
+        for _ in 1..MAX_HANDSHAKING_PER_SOURCE {
+            match admit(&gate, victim, true) {
+                Admit::Enter(pass) => held.push(pass),
+                _ => panic!("the source's own connections get in"),
+            }
+        }
+        assert!(matches!(admit(&gate, victim, true), Admit::Refuse));
+        // Other sources: unvalidated ones take a first place while few are
+        // in progress, then must retry too.
+        let other = Source::ip("198.51.100.1".parse().unwrap());
+        assert!(matches!(admit(&gate, other, false), Admit::Retry));
+        let gate = Gate::new(MAX_HANDSHAKING, MAX_HANDSHAKING_PER_SOURCE);
+        assert!(matches!(admit(&gate, other, false), Admit::Enter(_)));
+    }
+
+    /// A flood of datagrams shaped like DHT replies fills the queue to its
+    /// bound and no further, and QUIC behind it still gets through.
+    #[tokio::test]
+    async fn foreign_datagrams_beyond_the_queue_are_dropped() {
+        let runtime = quinn::default_runtime().unwrap();
+        let sock = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let demux = Demux {
+            inner: runtime.wrap_udp_socket(sock).unwrap(),
+            foreign: tx,
+        };
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for i in 4..24 {
+            // Each a different size, so the kernel never coalesces them.
+            let mut d = b"d1:y1:r".to_vec();
+            d.extend(std::iter::repeat_n(b'x', i));
+            d.push(b'e');
+            sender.send_to(&d, addr).unwrap();
+        }
+        // The QUIC fixed bit set: not foreign.
+        sender.send_to(&[0x40; 100], addr).unwrap();
+        let mut buf = [0u8; 2048];
+        let mut meta = [RecvMeta::default()];
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                let mut bufs = [io::IoSliceMut::new(&mut buf)];
+                demux.poll_recv(cx, &mut bufs, &mut meta)
+            }),
+        )
+        .await
+        .expect("QUIC behind the flood is received")
+        .unwrap();
+        assert_eq!((n, meta[0].len), (1, 100));
+        let mut queued = 0;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 4, "the queue holds its bound, the rest is dropped");
+    }
 }

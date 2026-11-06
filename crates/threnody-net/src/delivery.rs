@@ -318,6 +318,17 @@ impl Delivery {
         }
         true
     }
+
+    /// Takes back [`Delivery::first_delivery`] for `id`: it wasn't kept
+    /// after all, so the copy the peer sends again counts as the first.
+    pub fn undeliver(&mut self, peer: &PublicIdentity, id: u64) {
+        if let Some(r) = self.delivered.get_mut(peer)
+            && r.set.remove(&id)
+        {
+            r.order.retain(|x| *x != id);
+            self.delivered_dirty = true;
+        }
+    }
 }
 
 #[cfg(test)]

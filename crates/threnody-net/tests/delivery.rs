@@ -454,3 +454,44 @@ async fn text_sent_with_no_way_through_waits_for_a_session() {
     next(&mut arx, |e| matches!(e, Event::Delivered { .. })).await;
     wait_for(|| alice.unacked(&b) == 0).await;
 }
+
+/// A text the receiver can't store (a full disk, no file descriptors
+/// left) is not acknowledged, so the sender keeps it and sends it again.
+#[tokio::test]
+async fn a_message_that_could_not_be_stored_is_not_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let (bob, mut brx) = node(&dir, "bob");
+    let b = bob.identity();
+    lossy_link(&alice, &bob).await;
+    alice.send(&b, text("warm up")).unwrap();
+    next(&mut brx, |e| is_text(e, "warm up")).await;
+    wait_for(|| alice.unacked(&b) == 0).await;
+
+    // Bob's storage fails: a directory sits where the conversation's
+    // file is written first.
+    let stuck = std::fs::read_dir(dir.path().join("bob"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .find(|n| n.starts_with("hist-p-") && n.ends_with(".state"))
+        .map(|n| dir.path().join("bob").join(n.replace(".state", ".tmp")))
+        .expect("the conversation is stored");
+    std::fs::create_dir(&stuck).unwrap();
+    alice.send(&b, text("not kept")).unwrap();
+    none(&mut brx, |e| is_text(e, "not kept")).await;
+    assert_eq!(alice.unacked(&b), 1, "unacknowledged, Alice keeps it");
+
+    // Storage works again: the next session carries it.
+    std::fs::remove_dir(&stuck).unwrap();
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    alice
+        .connect(&addr.to_string(), Some(b.fingerprint()))
+        .await
+        .unwrap();
+    next(&mut brx, |e| is_text(e, "not kept")).await;
+    wait_for(|| alice.unacked(&b) == 0).await;
+    let h = bob
+        .history(bob.conversation_for(&alice.identity()))
+        .unwrap();
+    assert!(h.entries().iter().any(|e| e.text == "not kept"));
+}

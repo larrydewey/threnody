@@ -22,12 +22,14 @@ use tokio::sync::mpsc;
 
 use crate::error::{NetError, Result};
 use crate::frame::write_frame;
+use crate::gate::{Gate, Pass, Source};
 use crate::handshake;
 use crate::node::{Inbound, Node, lock, read_inbound};
 
 /// The first frame of an anonymous link.
 pub(crate) const MAGIC: &[u8] = b"threnody anonymous link v1";
-/// Inbound anonymous links held at once, and from one address.
+/// Inbound anonymous links held at once, and from one address, counted
+/// from the moment one announces itself (handshakes in progress too).
 const MAX_INBOUND: usize = 1024;
 const MAX_PER_ADDRESS: usize = 16;
 /// An outbound link nothing has used for this long is closed.
@@ -103,10 +105,21 @@ struct Handle {
     outbound: bool,
 }
 
-#[derive(Default)]
 pub(crate) struct AnonState {
     links: HashMap<PublicIdentity, Handle>,
     next_id: u64,
+    /// Places for inbound links; each link's task holds its own.
+    inbound: Gate,
+}
+
+impl Default for AnonState {
+    fn default() -> Self {
+        Self {
+            links: HashMap::new(),
+            next_id: 0,
+            inbound: Gate::new(MAX_INBOUND, MAX_PER_ADDRESS),
+        }
+    }
 }
 
 impl Node {
@@ -142,7 +155,7 @@ impl Node {
         };
         let chan = handshake::initiate(&mut stream, &me, expect).await?;
         let peer = *chan.peer();
-        self.spawn_anon(stream, chan, remote, true);
+        self.spawn_anon(stream, chan, remote, true, None);
         Ok(peer)
     }
 
@@ -151,18 +164,14 @@ impl Node {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        {
-            let st = lock(&self.shared.anon);
-            let inbound = st.links.values().filter(|h| !h.outbound);
-            let (all, here) = inbound.fold((0, 0), |(a, h), l| {
-                (a + 1, h + usize::from(l.addr.ip() == addr.ip()))
-            });
-            if all >= MAX_INBOUND || here >= MAX_PER_ADDRESS {
-                return Err(NetError::Refused("too many anonymous links".into()));
-            }
-        }
+        // The place is taken before the handshake: counting only links
+        // already up let any number through at once.
+        let pass = lock(&self.shared.anon)
+            .inbound
+            .enter(Source::ip(addr.ip()))
+            .ok_or_else(|| NetError::Refused("too many anonymous links".into()))?;
         let chan = handshake::accept(&mut stream, self.identity_ref()).await?;
-        self.spawn_anon(stream, chan, addr, false);
+        self.spawn_anon(stream, chan, addr, false, Some(pass));
         Ok(())
     }
 
@@ -208,8 +217,15 @@ impl Node {
         lock(&self.shared.anon).links.len()
     }
 
-    fn spawn_anon<S>(&self, stream: S, chan: SecureChannel, addr: SocketAddr, outbound: bool)
-    where
+    /// Runs a link; an inbound one holds `pass` until it ends.
+    fn spawn_anon<S>(
+        &self,
+        stream: S,
+        chan: SecureChannel,
+        addr: SocketAddr,
+        outbound: bool,
+        pass: Option<Pass>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let peer = *chan.peer();
@@ -231,6 +247,7 @@ impl Node {
         };
         let node = self.clone();
         tokio::spawn(async move {
+            let _pass = pass;
             let _ = run_anon(&node, stream, chan, outbound, rx).await;
             {
                 let mut st = lock(&node.shared.anon);
@@ -365,14 +382,16 @@ async fn tick(t: &mut Option<tokio::time::Interval>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::{AcceptPolicy, NodeConfig};
+    use threnody_core::store::Home;
 
     fn test_node(dir: &tempfile::TempDir, name: &str) -> Node {
-        let home = threnody_core::store::Home::new(dir.path().join(name));
+        let home = Home::new(dir.path().join(name));
         let identity = home.create_identity(None).unwrap();
-        Node::new(crate::NodeConfig {
+        Node::new(NodeConfig {
             home,
             identity,
-            policy: crate::AcceptPolicy::Anyone,
+            policy: AcceptPolicy::Anyone,
             constant_rate: Some(Duration::from_secs(10)),
             tunnel_port: None,
         })
@@ -440,8 +459,8 @@ mod tests {
             },
         );
         let addr: SocketAddr = "192.0.2.1:7450".parse().unwrap();
-        x.spawn_anon(a, ca, addr, true);
-        y.spawn_anon(b, cb, addr, false);
+        x.spawn_anon(a, ca, addr, true, None);
+        y.spawn_anon(b, cb, addr, false, None);
         // One circuit on a slow link (a cell every 10 s) sends far more
         // than the link can carry; another sends a cell.
         let to = y.identity();
@@ -455,5 +474,46 @@ mod tests {
             1,
             "the link stays for its other circuits"
         );
+    }
+
+    /// Links whose handshakes are still running hold their places, so a
+    /// burst from one address can't all slip in before any is counted.
+    #[tokio::test]
+    async fn links_in_their_handshake_count_toward_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("n"));
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        let from: SocketAddr = "192.0.2.7:4000".parse().unwrap();
+        let mut ends = Vec::new();
+        for _ in 0..MAX_PER_ADDRESS {
+            let (x, y) = tokio::io::duplex(1 << 16);
+            ends.push(x);
+            let n = node.clone();
+            tokio::spawn(async move { n.accept_anon(y, from).await });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_x, y) = tokio::io::duplex(1 << 16);
+        let r = tokio::time::timeout(Duration::from_secs(1), node.accept_anon(y, from))
+            .await
+            .expect("refused at once");
+        assert!(matches!(r, Err(NetError::Refused(_))), "{r:?}");
+        // Another address still gets in line.
+        let (_x, y) = tokio::io::duplex(1 << 16);
+        let other: SocketAddr = "192.0.2.8:4000".parse().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), node.accept_anon(y, other))
+                .await
+                .is_err(),
+            "waiting for its handshake"
+        );
+        node.shutdown();
     }
 }

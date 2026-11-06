@@ -750,20 +750,26 @@ pub trait ByteLink: Send + Sync {
 /// The app's handle for feeding a link's received bytes into the node.
 #[derive(uniffi::Object)]
 pub struct LinkHandle {
-    tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    tx: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
+
+/// Reads from a link waiting for the session, at most. Past this
+/// [`LinkHandle::receive`] waits, so the platform stops reading and the
+/// far end, out of flow-control credit, stops sending.
+const LINK_QUEUE: usize = 64;
 
 #[uniffi::export]
 impl LinkHandle {
-    /// Bytes read from the platform socket.
+    /// Bytes read from the platform socket. Call it from the thread that
+    /// reads the socket: it waits while the session is behind.
     pub fn receive(&self, data: Vec<u8>) {
-        if let Some(tx) = self
+        let tx = self
             .tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            let _ = tx.send(data);
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.blocking_send(data);
         }
     }
 
@@ -2253,30 +2259,45 @@ PersistentKeepalive = 25\n",
             _ => "link",
         };
         let (ours, theirs) = tokio::io::duplex(1 << 18);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(LINK_QUEUE);
         let handle = Arc::new(LinkHandle {
             tx: Mutex::new(Some(tx)),
         });
-        // Pump: session bytes -> platform, platform bytes -> session.
+        // Pump: session bytes -> platform, platform bytes -> session. Each
+        // direction runs on its own: a write the platform holds up (a peer
+        // that grants no credit) must not stop what it reads reaching the
+        // session.
         let pump_link = Arc::clone(&link);
         self.rt.spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(ours);
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                tokio::select! {
-                    n = rd.read(&mut buf) => {
-                        let Ok(n) = n else { break };
-                        if n == 0 { break }
-                        let data = buf[..n].to_vec();
-                        let l = Arc::clone(&pump_link);
-                        let ok = tokio::task::spawn_blocking(move || l.send(data)).await.unwrap_or(false);
-                        if !ok { break }
+            let l = Arc::clone(&pump_link);
+            let outbound = async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let n = match rd.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    let data = buf[..n].to_vec();
+                    let l = Arc::clone(&l);
+                    let ok = tokio::task::spawn_blocking(move || l.send(data))
+                        .await
+                        .unwrap_or(false);
+                    if !ok {
+                        break;
                     }
-                    inbound = rx.recv() => match inbound {
-                        Some(d) => if wr.write_all(&d).await.is_err() { break },
-                        None => break,
-                    },
                 }
+            };
+            let inbound = async move {
+                while let Some(d) = rx.recv().await {
+                    if wr.write_all(&d).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                () = outbound => {}
+                () = inbound => {}
             }
             let l = Arc::clone(&pump_link);
             let _ = tokio::task::spawn_blocking(move || l.disconnect()).await;
@@ -3515,5 +3536,82 @@ mod tests {
         got(&bob, "to-bob");
         got(&alice, "to-alice");
         wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+    }
+
+    /// A link whose writes stall (a peer that grants no credit) still
+    /// carries what arrives into the session.
+    #[test]
+    fn a_stalled_write_does_not_stop_reading() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{Receiver, channel};
+        struct Stalling {
+            to: Mutex<Option<Arc<LinkHandle>>>,
+            stall: AtomicBool,
+            release: Mutex<Receiver<()>>,
+        }
+        impl ByteLink for Stalling {
+            fn send(&self, data: Vec<u8>) -> bool {
+                if self.stall.load(Ordering::SeqCst) {
+                    // Until the test ends.
+                    let _ = self.release.lock().unwrap().recv();
+                    return false;
+                }
+                let h = self.to.lock().unwrap().clone();
+                h.is_some_and(|h| {
+                    h.receive(data);
+                    true
+                })
+            }
+            fn disconnect(&self) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let alice =
+            ThrenodyNode::open(dir.path().join("a").display().to_string(), None, None).unwrap();
+        let bob =
+            ThrenodyNode::open(dir.path().join("b").display().to_string(), None, None).unwrap();
+        let (_release_a, ra) = channel();
+        let (release_b, rb) = channel();
+        let (to_bob, to_alice) = (
+            Arc::new(Stalling {
+                to: Mutex::new(None),
+                stall: AtomicBool::new(false),
+                release: Mutex::new(ra),
+            }),
+            Arc::new(Stalling {
+                to: Mutex::new(None),
+                stall: AtomicBool::new(false),
+                release: Mutex::new(rb),
+            }),
+        );
+        let ha = alice
+            .attach_link(to_bob.clone(), true, "ble".into(), "b".into(), None)
+            .unwrap();
+        let hb = bob
+            .attach_link(to_alice.clone(), false, "ble".into(), "a".into(), None)
+            .unwrap();
+        *to_bob.to.lock().unwrap() = Some(hb);
+        *to_alice.to.lock().unwrap() = Some(ha);
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(alice.device_fingerprint()).unwrap();
+        alice.accept_contact(bob.device_fingerprint()).unwrap();
+        // Both ways once, so each side has the other's Hello.
+        bob.send_text(alice.device_fingerprint(), "hi".into())
+            .unwrap();
+        wait(
+            &alice,
+            |e| matches!(e, NodeEvent::Message { text, .. } if text == "hi"),
+        );
+        // Bob's writes now hang; his cover traffic soon runs into that.
+        to_alice.stall.store(true, Ordering::SeqCst);
+        bob.send_text(alice.device_fingerprint(), "stuck".into())
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        alice
+            .send_text(bob.device_fingerprint(), "still heard".into())
+            .unwrap();
+        let m = wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        assert!(matches!(m, NodeEvent::Message { text, .. } if text == "still heard"));
+        drop(release_b);
     }
 }
