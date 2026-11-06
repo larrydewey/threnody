@@ -55,7 +55,7 @@ Status words:
 
 **Reader rules.**
 
-- The SELECT response must start with `"TN"` and `max_version`; the reader speaks `min(max_version, 1)`. A SELECT answered with anything but `9000`, or a malformed response, means *not an invite*. `max_version = 0` means *unsupported*.
+- The SELECT response must start with `"TN"` and `max_version`; the reader speaks `min(max_version, 1)`. A SELECT answered with anything but `9000`, or a malformed response, means *not an invite*. `max_version = 0` means *unsupported*, and so does `6A86` in answer to the first OFFER chunk: a card that has dropped the version the reader offers still names its own highest in SELECT.
 - After SELECT, any status word but `9000`, or a response that doesn't fit the step, is *garbled*.
 - The card's link must parse as an invite link (Appendix S) and name a fingerprint other than the reader's own; otherwise the tap is *garbled*.
 - The reader has the card's link once M2 opens and reports success after the GIVE's `9000`. If the tag goes away between those two points it still has the link, but the card may not have its fingerprint (a "half tap"): the apps then treat it as a scanned QR code.
@@ -86,8 +86,8 @@ The reader's user confirms the card's link (Connect) and the reader dials it wit
 
 The card's user sees the reader's fingerprint and chooses Add, which calls `Node::expect_contact(fp, name, EXPECT_FOR)`:
 
-- For ten minutes the first inbound session from that fingerprint is a contact the user wants (`accepted`, named as given if it has no name yet), not a message request. Under the `ContactsOnly` policy it is admitted.
-- Expectations are in memory only, at most 16 (the one expiring soonest makes room), and the first inbound session consumes one. A duplicate session that loses the tie-break doesn't.
+- For ten minutes the first session with that fingerprint, inbound or dialed, is a contact the user wants (`accepted`, named as given if it has no name yet), not a message request. Under the `ContactsOnly` policy it is admitted.
+- Expectations are in memory only, at most 16 (the one expiring soonest makes room), and the first session with the peer consumes one, whichever side dialed: across networks the hole punch (Appendix S) may have the card's side dial, and the name must still apply. A duplicate session that loses the tie-break doesn't consume it.
 - A contact that already sent a request is accepted at once.
 - An expectation never marks a contact verified or approved, never unblocks it, and never overrides a revocation or the `ApprovedOnly` policy. Your own fingerprint and blocked contacts are refused.
 

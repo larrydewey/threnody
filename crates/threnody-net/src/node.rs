@@ -1896,11 +1896,9 @@ impl Node {
             return;
         }
         // After the duplicate check, so a dropped session doesn't use it up.
-        let expected = if outbound {
-            None
-        } else {
-            self.take_expected(&peer)
-        };
+        // Either way round: after a tap across networks, the hole punch
+        // may have this side dial (Appendix S), and the name still applies.
+        let expected = self.take_expected(&peer);
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let new_contact = {

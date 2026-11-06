@@ -391,6 +391,11 @@ impl Reader {
                     Step::Send(fetch(0))
                 }
             }
+            // A card that has dropped our version still names its own
+            // highest in SELECT; it refuses the version on the first chunk.
+            ReaderState::Offering { next: 1, .. } if response == SW_P1P2 => {
+                Step::Failed(Failure::Unsupported)
+            }
             ReaderState::Fetching { ver, mut got } if ok => {
                 let Some((&more, chunk)) = data.split_first() else {
                     return Step::Failed(Failure::Garbled);
@@ -926,6 +931,13 @@ mod tests {
         };
         assert_eq!(offer[1], INS_OFFER);
         assert_eq!(offer[3] >> 1, 1);
+        // ...but a card that no longer does refuses the version at once.
+        assert_eq!(reader.step(&SW_P1P2), Step::Failed(Failure::Unsupported));
+        // Later in the offer, the same answer is just a broken exchange.
+        reader.start();
+        reader.step(&[0x54, 0x4E, 0x01, 0x00, 0x90, 0x00]);
+        assert!(matches!(reader.step(&SW_OK), Step::Send(_)));
+        assert_eq!(reader.step(&SW_P1P2), Step::Failed(Failure::Garbled));
         reader.start();
         assert_eq!(
             reader.step(&[0x54, 0x4E, 0x00, 0x00, 0x90, 0x00]),

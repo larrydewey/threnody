@@ -14,11 +14,36 @@ use threnody_ffi::{NfcFailure, NfcOutcome, NfcTransport, ThrenodyNode};
 /// short APDUs answer at most 256 bytes and a status word.
 const RECV: usize = 258;
 
-/// Whether `pcscd` answers and at least one reader is attached.
+/// Whether `pcscd` answers and at least one reader could be an NFC
+/// reader: one that is empty or holds a contactless card. A YubiKey or a
+/// contact card reader with a card in it always holds a contact card, so
+/// it alone doesn't show "Tap a phone".
 pub fn available() -> bool {
-    Context::establish(Scope::User)
-        .and_then(|c| c.list_readers_owned())
-        .is_ok_and(|r| !r.is_empty())
+    let Ok(ctx) = Context::establish(Scope::User) else {
+        return false;
+    };
+    let Ok(readers) = ctx.list_readers_owned() else {
+        return false;
+    };
+    let mut states: Vec<ReaderState> = readers
+        .into_iter()
+        .map(|r| ReaderState::new(r, State::UNAWARE))
+        .collect();
+    if states.is_empty() || ctx.get_status_change(Duration::ZERO, &mut states).is_err() {
+        return false;
+    }
+    states.iter().any(|s| {
+        let now = s.event_state();
+        !now.contains(State::PRESENT) || contactless(s.atr())
+    })
+}
+
+/// Whether `atr` is the one a PC/SC reader makes up for a contactless
+/// card (PC/SC Part 3: `3B 8n 80 01 ...`), as an Android phone emulating
+/// a card gets. Contact cards and tokens (a YubiKey's `3B FD ...`) never
+/// match, so a tap never sends them anything.
+fn contactless(atr: &[u8]) -> bool {
+    matches!(atr, [0x3B, t0, 0x80, 0x01, ..] if t0 & 0xF0 == 0x80)
 }
 
 /// A wait for a phone on the reader, which the GTK thread can cancel.
@@ -36,39 +61,67 @@ impl Waiter {
 }
 
 /// Waits up to `timeout` for a phone on any reader, then runs the whole
-/// exchange with it. Blocking: run it off the GTK thread.
+/// exchange with it. A contactless card that isn't a phone showing an
+/// invite (a transit card left on the reader) is passed over until it is
+/// lifted, and the wait goes on. Blocking: run it off the GTK thread.
 pub fn tap(node: &ThrenodyNode, waiter: &Waiter, timeout: Duration) -> NfcOutcome {
-    let moved = NfcOutcome::Failed {
-        why: NfcFailure::Moved,
+    let until = Instant::now() + timeout;
+    let mut last = NfcFailure::Moved;
+    let Some(mut watch) = Watch::new(&waiter.0) else {
+        return NfcOutcome::Failed { why: last };
     };
-    let Some(reader) = wait_for_card(&waiter.0, timeout) else {
-        return moved;
-    };
-    let Ok(card) = waiter.0.connect(&reader, ShareMode::Shared, Protocols::ANY) else {
-        return moved;
-    };
-    node.nfc_reader()
-        .run(Arc::new(PcscTransport(Mutex::new(card))))
+    while let Some(reader) = watch.next(&waiter.0, until) {
+        let Ok(card) = waiter.0.connect(&reader, ShareMode::Shared, Protocols::ANY) else {
+            continue;
+        };
+        match node
+            .nfc_reader()
+            .run(Arc::new(PcscTransport(Mutex::new(card))))
+        {
+            NfcOutcome::Failed {
+                why: NfcFailure::NotAnInvite,
+            } => last = NfcFailure::NotAnInvite,
+            outcome => return outcome,
+        }
+    }
+    NfcOutcome::Failed { why: last }
 }
 
-/// The first reader with a card (a phone) on it.
-fn wait_for_card(ctx: &Context, timeout: Duration) -> Option<CString> {
-    let until = Instant::now() + timeout;
-    let readers = ctx.list_readers_owned().ok()?;
-    let mut states: Vec<ReaderState> = readers
-        .into_iter()
-        .map(|r| ReaderState::new(r, State::UNAWARE))
-        .collect();
-    loop {
-        let left = until.checked_duration_since(Instant::now())?;
-        // Times out, is cancelled, or a reader went away: give up.
-        ctx.get_status_change(Some(left), &mut states).ok()?;
-        for s in &mut states {
-            let now = s.event_state();
-            if now.contains(State::PRESENT) && !now.contains(State::MUTE) {
-                return Some(s.name().to_owned());
+/// The readers, and which hold a card already tried.
+struct Watch {
+    states: Vec<ReaderState>,
+    tried: Vec<bool>,
+}
+
+impl Watch {
+    fn new(ctx: &Context) -> Option<Self> {
+        let states: Vec<ReaderState> = ctx
+            .list_readers_owned()
+            .ok()?
+            .into_iter()
+            .map(|r| ReaderState::new(r, State::UNAWARE))
+            .collect();
+        let tried = vec![false; states.len()];
+        Some(Self { states, tried })
+    }
+
+    /// The next reader with a contactless card on it not yet tried; a
+    /// card counts as new again once it has been lifted.
+    fn next(&mut self, ctx: &Context, until: Instant) -> Option<CString> {
+        loop {
+            let left = until.checked_duration_since(Instant::now())?;
+            // Times out, is cancelled, or a reader went away: give up.
+            ctx.get_status_change(Some(left), &mut self.states).ok()?;
+            for (s, tried) in self.states.iter_mut().zip(&mut self.tried) {
+                let now = s.event_state();
+                s.sync_current_state();
+                if !now.contains(State::PRESENT) {
+                    *tried = false;
+                } else if !*tried && !now.contains(State::MUTE) && contactless(s.atr()) {
+                    *tried = true;
+                    return Some(s.name().to_owned());
+                }
             }
-            s.sync_current_state();
         }
     }
 }
@@ -99,6 +152,24 @@ pub fn text(why: NfcFailure) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_contactless_cards_are_tapped() {
+        // An Android phone emulating a card, on an ACR122U.
+        assert!(contactless(&[0x3B, 0x80, 0x80, 0x01, 0x01]));
+        // ISO 14443-4 with historical bytes, and a type B card.
+        assert!(contactless(&[
+            0x3B, 0x8C, 0x80, 0x01, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2C
+        ]));
+        // A YubiKey over CCID, and a contact smartcard.
+        let yubikey = [
+            0x3B, 0xFD, 0x13, 0x00, 0x00, 0x81, 0x31, 0xFE, 0x15, 0x80, 0x73, 0xC0, 0x21, 0xC0,
+            0x57, 0x59, 0x75, 0x62, 0x69, 0x4B, 0x65, 0x79, 0x40,
+        ];
+        assert!(!contactless(&yubikey));
+        assert!(!contactless(&[0x3B, 0x9F, 0x95, 0x81, 0x31, 0xFE, 0x9F]));
+        assert!(!contactless(&[]));
+    }
 
     #[test]
     fn the_buffer_fits_the_largest_response() {

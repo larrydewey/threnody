@@ -13,7 +13,6 @@ import android.os.Handler
 import android.os.Looper
 import android.view.HapticFeedbackConstants
 import android.view.View
-import java.io.IOException
 import uniffi.threnody_ffi.NfcCard
 import uniffi.threnody_ffi.NfcFailure
 import uniffi.threnody_ffi.NfcOutcome
@@ -123,19 +122,22 @@ object NfcTap {
                 onOutcome(NfcOutcome.Failed(NfcFailure.NOT_AN_INVITE))
                 return@enableReaderMode
             }
-            try {
+            // IsoDep throws more than IOException (SecurityException for a
+            // stale Tag, IllegalStateException): any of them is the phone gone.
+            val outcome = try {
                 iso.connect()
                 iso.timeout = 3000
                 // A fresh reader (and one-time key) for every tag.
-                onOutcome(node.nfcReader().run(object : NfcTransport {
+                node.nfcReader().run(object : NfcTransport {
                     override fun transceive(apdu: ByteArray): ByteArray? =
-                        try { iso.transceive(apdu) } catch (_: IOException) { null }
-                }))
-            } catch (_: IOException) {
-                onOutcome(NfcOutcome.Failed(NfcFailure.MOVED))
+                        try { iso.transceive(apdu) } catch (_: Exception) { null }
+                })
+            } catch (_: Exception) {
+                NfcOutcome.Failed(NfcFailure.MOVED)
             } finally {
-                try { iso.close() } catch (_: IOException) {}
+                try { iso.close() } catch (_: Exception) {}
             }
+            onOutcome(outcome)
         }, flags, null)
     }
 

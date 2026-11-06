@@ -31,14 +31,19 @@ final class NfcTap: NSObject, NFCTagReaderSessionDelegate {
         done = nil
     }
 
+    /// Runs on the delegate queue (main). The pending callback is taken
+    /// here, before anything can invalidate the session, so neither the
+    /// exchange's task nor didInvalidate touches `done` or `reader` again.
     func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
-        guard let reader else { return }
+        guard let reader, let d = done else { return }
+        self.reader = nil
+        done = nil
         guard case let .iso7816(tag)? = tags.first else {
             session.invalidate(errorMessage: NfcFailure.notAnInvite.text)
-            return finish(.failed(why: .notAnInvite))
+            return Self.deliver(.failed(why: .notAnInvite), to: d)
         }
         Task {
-            let outcome = await exchange(session: session, tag: tag, reader: reader)
+            let outcome = await Self.exchange(session: session, tag: tag, reader: reader)
             switch outcome {
             case .tapped:
                 session.alertMessage = "Got their invite"
@@ -46,13 +51,13 @@ final class NfcTap: NSObject, NFCTagReaderSessionDelegate {
             case let .failed(why):
                 session.invalidate(errorMessage: why.text)
             }
-            finish(outcome)
+            Self.deliver(outcome, to: d)
         }
     }
 
     /// The whole exchange. iOS has already selected the AID listed in
     /// Info.plist; the reader's own SELECT simply selects it again.
-    private func exchange(session: NFCTagReaderSession, tag: NFCISO7816Tag, reader: NfcReader) async -> NfcOutcome {
+    private static func exchange(session: NFCTagReaderSession, tag: NFCISO7816Tag, reader: NfcReader) async -> NfcOutcome {
         do {
             try await session.connect(to: .iso7816(tag))
         } catch {
@@ -78,11 +83,8 @@ final class NfcTap: NSObject, NFCTagReaderSessionDelegate {
         }
     }
 
-    private func finish(_ outcome: NfcOutcome) {
-        let d = done
-        done = nil
-        reader = nil
-        Task { @MainActor in d?(outcome) }
+    private static func deliver(_ outcome: NfcOutcome, to d: @escaping @MainActor (NfcOutcome) -> Void) {
+        Task { @MainActor in d(outcome) }
     }
 }
 

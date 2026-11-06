@@ -1605,21 +1605,47 @@ async fn approved_only_policy_ignores_expectations() {
 }
 
 #[tokio::test]
-async fn duplicate_session_does_not_consume_expectation() {
+async fn the_expecting_side_dialing_still_gets_the_name() {
+    // Across networks the hole punch may have the expecting side dial
+    // (Appendix S): the session is outbound, and the name still applies.
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let a_addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
+    let a = alice.identity();
+    bob.expect_contact(a.fingerprint(), Some("Al".into()), EXPECT_FOR)
+        .unwrap();
+    bob.connect(&a_addr, Some(a.fingerprint())).await.unwrap();
+    assert!(bob.is_accepted(&a));
+    assert_eq!(
+        bob.contacts().get(&a).unwrap().petname.as_deref(),
+        Some("Al")
+    );
+}
+
+#[tokio::test]
+async fn crossed_dials_keep_the_expected_name() {
+    // Whichever session survives the duplicate check, the first to start
+    // took the expectation, so the name lands either way.
     let dir = tempfile::tempdir().unwrap();
     let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
     let (bob, _brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
     let a_addr = alice.listen("127.0.0.1:0").await.unwrap().to_string();
     let b_addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
-    bob.expect_contact(alice.identity().fingerprint(), None, EXPECT_FOR)
+    let a = alice.identity();
+    bob.expect_contact(a.fingerprint(), Some("Al".into()), EXPECT_FOR)
         .unwrap();
-    let (a, b) = tokio::join!(
+    let (x, y) = tokio::join!(
         alice.connect(&b_addr, Some(bob.identity().fingerprint())),
-        bob.connect(&a_addr, Some(alice.identity().fingerprint())),
+        bob.connect(&a_addr, Some(a.fingerprint())),
     );
-    a.unwrap();
-    b.unwrap();
+    x.unwrap();
+    y.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(alice.is_accepted(&bob.identity()));
-    assert!(bob.is_accepted(&alice.identity()));
+    assert!(bob.is_accepted(&a));
+    assert_eq!(
+        bob.contacts().get(&a).unwrap().petname.as_deref(),
+        Some("Al")
+    );
 }
