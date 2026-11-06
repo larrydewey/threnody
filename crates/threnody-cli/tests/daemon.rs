@@ -182,6 +182,7 @@ fn nothing_else_writes_to_a_data_directory_a_node_has_open() {
     refused(&["name", "bob", "robert"]);
     refused(&["forget", "bob"]);
     refused(&["restore", "--force", "--no-keyring", "some.backup"]);
+    refused(&["init", "--force", "--no-keyring"]);
     // A second node, interactive or not.
     refused(&[
         "run",
@@ -195,4 +196,34 @@ fn nothing_else_writes_to_a_data_directory_a_node_has_open() {
     let out = threnody(&a, &["revoke", "bob"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no contact matches"), "{err}");
+}
+
+#[test]
+fn a_replaced_identity_starts_with_nothing_of_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let old = init(&a);
+    // State sealed under the old seed.
+    assert!(threnody(&a, &["invite", "127.0.0.1:1", "--no-qr"]).status.success());
+    std::fs::create_dir_all(a.join("downloads")).unwrap();
+    std::fs::write(a.join("downloads/photo.jpg"), b"jpeg").unwrap();
+
+    let out = threnody(&a, &["init", "--force", "--no-keyring"]);
+    assert!(out.status.success(), "{out:?}");
+    let new = threnody(&a, &["id"]);
+    assert!(!String::from_utf8_lossy(&new.stdout).contains(&old));
+    let invite = threnody(&a, &["invite", "127.0.0.1:1", "--no-qr"]);
+    assert!(invite.status.success(), "{invite:?}");
+    let run = threnody(
+        &a,
+        &[
+            "run",
+            "--listen",
+            "127.0.0.1:0",
+            "--no-discover",
+            "--no-rendezvous",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+    assert!(a.join("downloads/photo.jpg").exists());
 }

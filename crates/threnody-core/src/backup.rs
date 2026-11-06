@@ -170,8 +170,9 @@ impl Home {
     }
 
     /// Removes the identity (first: without it the rest is unreadable),
-    /// contacts, state files and personas.
-    fn wipe(&self) -> Result<()> {
+    /// contacts, state files and personas. Other files, such as
+    /// downloads, stay. No node may have this home open.
+    pub fn wipe(&self) -> Result<()> {
         if !self.dir().exists() {
             return Ok(());
         }

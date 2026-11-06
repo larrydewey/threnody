@@ -59,7 +59,8 @@ struct Cli {
 enum Cmd {
     /// Create this device's identity.
     Init {
-        /// Replace an existing identity. Contacts will no longer recognise you.
+        /// Replace an existing identity, deleting its contacts, history and
+        /// anonymous identities. Contacts will no longer recognise you.
         #[arg(long)]
         force: bool,
         /// Protect the identity key with a passphrase (Argon2id) instead of
@@ -603,10 +604,14 @@ fn main() -> Result<()> {
         } => {
             if home.has_identity() && !force {
                 bail!(
-                    "identity already exists in {} (use --force to replace)",
+                    "identity already exists in {} (--force replaces it and everything it kept)",
                     home.dir().display()
                 );
             }
+            let _lock = no_node_running(&home)?;
+            // What the old identity kept is sealed under its seed and
+            // names its contacts: none of it belongs to the new one.
+            home.wipe()?;
             let pw = identity_seal(&home, passphrase, no_keyring)?;
             let id = home.create_identity(pw.as_ref().map(|p| p.as_bytes()))?;
             println!("Created identity in {}", home.dir().display());
