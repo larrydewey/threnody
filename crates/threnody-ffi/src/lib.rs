@@ -19,6 +19,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 uniffi::setup_scaffolding!();
 
+mod applock;
+pub use applock::{AppLockClock, LockKind, LockOutcome, LockSettings};
 mod calls;
 mod folders;
 mod lists;
