@@ -1286,6 +1286,35 @@ impl Home {
         Ok(true)
     }
 
+    /// Marks the outgoing 1:1 entries whose local ids are in `ids`
+    /// delivered, with one load and at most one save (a receipt names up
+    /// to 1,024). Returns the ids that changed; for a group, none.
+    pub fn mark_delivered_ids(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        ids: &[u64],
+        now_ms: u64,
+    ) -> Result<Vec<u64>> {
+        if matches!(c, ConversationId::Group(_)) || ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _lock = history_lock();
+        let wanted: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let mut changed = Vec::new();
+        for e in h.entries.iter_mut().filter(|e| {
+            e.outgoing && e.local_id != 0 && !e.delivered && wanted.contains(&e.local_id)
+        }) {
+            e.delivered = true;
+            changed.push(e.local_id);
+        }
+        if !changed.is_empty() {
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(changed)
+    }
+
     /// Merges entries from another of our devices into a conversation;
     /// returns how many were new.
     pub fn merge_entries(
@@ -2052,6 +2081,67 @@ mod tests {
         e.poll = Some(p);
         let h = History::transcript(vec![e]);
         assert_eq!(History::decode(&h.encode().unwrap()).unwrap(), h);
+    }
+
+    #[test]
+    fn mark_delivered_ids_marks_once_in_one_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([4; 32]);
+        for (at, local_id) in [(2, 10), (4, 11), (6, 12)] {
+            let e = Entry {
+                local_id,
+                ..entry(at, "ours", None)
+            };
+            home.append_history(&id, c, e, at).unwrap();
+        }
+        // Theirs, with a remote id equal to one of ours: never touched.
+        let theirs = Entry {
+            remote_id: 11,
+            local_id: 11,
+            ..entry(7, "theirs", None)
+        };
+        home.append_history(&id, c, theirs, 7).unwrap();
+        let file = dir.path().join(format!("{}.state", c.state_name(&id)));
+        let mut changed = home.mark_delivered_ids(&id, c, &[12, 10, 99], 8).unwrap();
+        changed.sort_unstable();
+        assert_eq!(changed, [10, 12]);
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(
+            home.mark_delivered_ids(&id, c, &[10, 12], 9)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            written,
+            "nothing changed, nothing saved"
+        );
+        let h = home.load_history(&id, c, 9).unwrap();
+        let delivered: Vec<(bool, bool)> = h
+            .entries()
+            .iter()
+            .map(|e| (e.outgoing, e.delivered))
+            .collect();
+        assert_eq!(
+            delivered,
+            [(true, true), (true, false), (true, true), (false, false)]
+        );
+        // Groups count members' acknowledgements instead.
+        let g = ConversationId::Group([5; 16]);
+        let e = Entry {
+            local_id: 13,
+            recipients: 2,
+            ..entry(8, "all", None)
+        };
+        home.append_history(&id, g, e, 8).unwrap();
+        assert!(
+            home.mark_delivered_ids(&id, g, &[13], 9)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!home.load_history(&id, g, 9).unwrap().entries()[0].delivered);
     }
 
     #[test]
