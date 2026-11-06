@@ -13,6 +13,7 @@ struct AddContactView: View {
     @State private var scanning = false
     @State private var busy = false
     @State private var failure: String?
+    @State private var failureTitle = "Couldn't connect"
     @State private var confirmReset = false
     /// The invite a tap gave us (Appendix T), while the field still holds it.
     @State private var tappedLink: String?
@@ -36,7 +37,7 @@ struct AddContactView: View {
                                     link = l
                                     tappedLink = l
                                 case let .failed(why):
-                                    failure = why.text
+                                    fail("Couldn't connect", why.text)
                                 }
                             }
                         }
@@ -49,7 +50,8 @@ struct AddContactView: View {
                     } label: {
                         if busy { ProgressView() } else { Text("Connect").bold() }
                     }
-                    .disabled(!link.hasPrefix("threnody://") || busy)
+                    // Only a well-formed invite (the parser all the apps share).
+                    .disabled(classifyLink(text: link)?.kind != .invite || busy)
                 } header: {
                     Text("Their invite")
                 } footer: {
@@ -80,11 +82,18 @@ struct AddContactView: View {
             .sheet(isPresented: $scanning) {
                 QRScannerView { code in
                     scanning = false
-                    link = code
+                    let info = classifyLink(text: code)
+                    if info?.kind != .invite {
+                        fail("Not an invite", "That QR code isn't a Threnody invite.")
+                    } else if isOwn(info) {
+                        fail("Not an invite", "That's your own invite.")
+                    } else if let info {
+                        link = info.link
+                    }
                 }
                 .ignoresSafeArea()
             }
-            .alert("Couldn't connect", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
+            .alert(failureTitle, isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(failure ?? "")
@@ -102,8 +111,23 @@ struct AddContactView: View {
         }
     }
 
+    private func fail(_ title: String, _ text: String) {
+        failureTitle = title
+        failure = text
+    }
+
+    /// One of this device's own invites: dialling it would reach ourselves.
+    private func isOwn(_ info: LinkInfo?) -> Bool {
+        guard let fp = info?.fingerprint, let mine = store.node?.deviceFingerprint() else { return false }
+        return fp == mine
+    }
+
     private func connect() {
         guard let n = store.node else { return }
+        if isOwn(classifyLink(text: link)) {
+            return fail("Not an invite", "That's your own invite.")
+        }
+        failureTitle = "Couldn't connect"
         let (target, petname) = (link.trimmingCharacters(in: .whitespacesAndNewlines), name.trimmingCharacters(in: .whitespaces))
         // A hand-edited link isn't the phone we tapped.
         let tapped = tappedLink == target

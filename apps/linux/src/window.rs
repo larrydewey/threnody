@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use threnody_ffi::{NodeEvent, ProfileAttr};
+use threnody_ffi::{LinkInfo, LinkKind, NodeEvent, ProfileAttr};
 
 use crate::call::CallBar;
 use crate::chat::{ChatView, Key};
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target, UiEvent};
+use crate::links::{self, LinkFrom};
 use crate::ui::{self, bg};
 use crate::{schedule, settings};
 
@@ -69,6 +70,11 @@ pub struct App {
     call: Rc<CallBar>,
     /// App lock: the lock page in front of everything.
     pub lock: Rc<crate::lock::Lock>,
+    /// The copied link last offered, so it's offered once. Memory only:
+    /// nothing read from the clipboard is written anywhere.
+    offered: RefCell<Option<String>>,
+    /// The QR scanner, while open (one at a time).
+    scanner: RefCell<Option<Rc<crate::scan::ScanDialog>>>,
     /// Kept so its power-saver signal keeps coming.
     power: RefCell<Option<gio::PowerProfileMonitor>>,
 }
@@ -101,8 +107,12 @@ impl App {
         let add = gtk::Button::with_label("Add a contact");
         add.add_css_class("pill");
         add.set_action_name(Some("win.add-contact"));
+        let scan = gtk::Button::with_label("Scan a QR code");
+        scan.add_css_class("pill");
+        scan.set_action_name(Some("win.scan"));
         empty_buttons.append(&show);
         empty_buttons.append(&add);
+        empty_buttons.append(&scan);
         empty.set_child(Some(&empty_buttons));
 
         let scroller = gtk::ScrolledWindow::builder()
@@ -156,6 +166,7 @@ impl App {
 
         let add_menu = gio::Menu::new();
         add_menu.append(Some("Add a contact"), Some("win.add-contact"));
+        add_menu.append(Some("Scan a QR code"), Some("win.scan"));
         add_menu.append(Some("New group"), Some("win.new-group"));
         add_menu.append(Some("Anonymous invite"), Some("win.anonymous-invite"));
         let add_button = gtk::MenuButton::builder()
@@ -272,6 +283,8 @@ impl App {
             log: RefCell::new(None),
             call,
             lock,
+            offered: RefCell::new(None),
+            scanner: RefCell::new(None),
             power: RefCell::new(None),
         });
         this.actions();
@@ -1999,6 +2012,18 @@ impl App {
                     this.app.withdraw_notification(&notification_id(&c.chat()));
                     c.shown();
                 }
+                if on {
+                    this.check_clipboard();
+                }
+            }
+        });
+        // On Wayland the new selection can arrive just after focus.
+        let weak = Rc::downgrade(self);
+        self.window.clipboard().connect_changed(move |_| {
+            if let Some(this) = weak.upgrade()
+                && this.window.is_active()
+            {
+                this.check_clipboard();
             }
         });
         let weak = Rc::downgrade(self);
@@ -2098,6 +2123,7 @@ impl App {
         };
         add("invite", |t| t.show_invite(None));
         add("add-contact", |t| t.add_contact(""));
+        add("scan", Self::scan);
         add("new-group", |t| t.new_group(None));
         add("anonymous-invite", Self::new_persona);
         add("profile", |t| t.edit_profile(None));
@@ -2203,7 +2229,11 @@ impl App {
             "Add a contact",
             "Paste their invite link or type their handle (name-XXXX-XXXX), and give them \
              a name you'll recognise if you like. You'll compare safety numbers together later.",
-            &[("cancel", "Cancel"), ("ok", "Connect")],
+            &[
+                ("cancel", "Cancel"),
+                ("scan", "Scan QR code"),
+                ("ok", "Connect"),
+            ],
         );
         d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
         let link = gtk::Entry::builder()
@@ -2225,7 +2255,11 @@ impl App {
         let weak = Rc::downgrade(self);
         let (l, n) = (link.clone(), name.clone());
         d.connect_response(None, move |_, r| {
-            if r == "ok"
+            if r == "scan"
+                && let Some(this) = weak.upgrade()
+            {
+                this.scan();
+            } else if r == "ok"
                 && let Some(this) = weak.upgrade()
             {
                 let target = l.text().trim().to_owned();
@@ -2236,10 +2270,23 @@ impl App {
         });
         d.present(Some(&self.window));
         // A link already filled in: naming them comes next.
-        let focus: gtk::Entry = if initial.is_empty() { link } else { name };
+        let focus: gtk::Entry = if initial.is_empty() {
+            link.clone()
+        } else {
+            name.clone()
+        };
         glib::idle_add_local_once(move || {
             focus.grab_focus();
         });
+        // A copied invite (say, from a web page) fills itself in.
+        if initial.is_empty() {
+            self.copied(LinkKind::Invite, move |l| {
+                if link.text().is_empty() {
+                    link.set_text(&l);
+                    name.grab_focus();
+                }
+            });
+        }
     }
 
     /// "Tap a phone" in *Add a contact*, with a PC/SC NFC reader attached
@@ -2325,6 +2372,201 @@ impl App {
         _: &gtk::Entry,
         _: &Rc<RefCell<Option<String>>>,
     ) {
+    }
+
+    /// Scans a QR code (camera, image file or pasted image) and acts on
+    /// what it holds.
+    pub fn scan(self: &Rc<Self>) {
+        if let Some(s) = self.scanner.borrow().as_ref().filter(|s| s.is_open()) {
+            s.present(&self.window);
+            return;
+        }
+        // Held weakly: the app holds the dialog.
+        let weak = Rc::downgrade(self);
+        let dialog = crate::scan::ScanDialog::open(&self.window, move |text| {
+            if let Some(this) = weak.upgrade() {
+                this.scanner.borrow_mut().take();
+                this.open_link(&text, LinkFrom::Scanned);
+            }
+        });
+        *self.scanner.borrow_mut() = Some(dialog);
+    }
+
+    /// Acts on a Threnody link that was clicked, scanned or copied: an
+    /// invite opens *Add a contact*, a link code *Join*, a directory link
+    /// the subscribe confirmation. Nothing happens without a click.
+    pub fn open_link(self: &Rc<Self>, text: &str, from: LinkFrom) {
+        let Some(info) = threnody_ffi::classify_link(text.to_owned()) else {
+            match from {
+                LinkFrom::Scanned => {
+                    ui::alert("Not a Threnody code", links::NOT_A_CODE, &[("ok", "OK")])
+                        .present(Some(&self.window))
+                }
+                LinkFrom::Opened => self.toast(links::NOT_A_LINK),
+            }
+            return;
+        };
+        match info.kind {
+            LinkKind::Invite => self.add_contact(&info.link),
+            LinkKind::DeviceLink => self.join_account(&info.link),
+            LinkKind::Directory => self.offer_directory(info),
+        }
+    }
+
+    /// Offers a Threnody link someone else's app put on the clipboard,
+    /// once. Our own links (any device of the account, any anonymous
+    /// identity), directories already subscribed and anything we copied
+    /// ourselves are skipped; so is any moment a dialog is open.
+    fn check_clipboard(self: &Rc<Self>) {
+        let cb = self.window.clipboard();
+        if cb.is_local() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Some(text) = read_clip(&cb).await else {
+                return;
+            };
+            let Some(info) = threnody_ffi::classify_link(text) else {
+                return;
+            };
+            let Some(core) = weak.upgrade().map(|t| t.core.clone()) else {
+                return;
+            };
+            let Ok((own, subscribed)) = gio::spawn_blocking(move || {
+                let dirs = core.main.directories().into_iter().map(|d| d.id_hex);
+                (core.own_fingerprints(), dirs.collect::<Vec<_>>())
+            })
+            .await
+            else {
+                return;
+            };
+            let Some(this) = weak.upgrade() else { return };
+            // Offered next time instead of over another dialog.
+            if this.window.visible_dialog().is_some() {
+                return;
+            }
+            let last = this.offered.borrow().clone();
+            if !links::should_offer(&info, &own, &subscribed, last.as_deref()) {
+                return;
+            }
+            *this.offered.borrow_mut() = Some(info.link.clone());
+            this.offer_copied(info);
+        });
+    }
+
+    /// Asks what to do with a copied link (Android's wording).
+    fn offer_copied(self: &Rc<Self>, info: LinkInfo) {
+        let (heading, body, action) = match info.kind {
+            LinkKind::Invite => ("Add the copied invite?", info.link.clone(), "Connect"),
+            LinkKind::DeviceLink => (
+                "Join with the copied link code?",
+                format!(
+                    "{}\n\nDevice {}\n\n{}",
+                    info.link,
+                    info.fingerprint.as_deref().unwrap_or("?"),
+                    links::OWN_DEVICES_ONLY
+                ),
+                "Continue",
+            ),
+            LinkKind::Directory => (
+                "Subscribe to the copied directory?",
+                info.link.clone(),
+                "Subscribe",
+            ),
+        };
+        let d = ui::alert(heading, &body, &[("cancel", "Not now"), ("ok", action)]);
+        d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        // The offer appears unasked, maybe while typing, and someone else
+        // may have chosen the link: Enter must not act on it.
+        d.set_default_response(Some("cancel"));
+        let weak = Rc::downgrade(self);
+        d.connect_response(None, move |_, r| {
+            let (Some(this), "ok") = (weak.upgrade(), r) else {
+                return;
+            };
+            match info.kind {
+                LinkKind::Invite => this.connect(info.link.clone()),
+                LinkKind::DeviceLink => this.join_account(&info.link),
+                LinkKind::Directory => this.subscribe(info.link.clone()),
+            }
+        });
+        d.present(Some(&self.window));
+    }
+
+    /// Calls `fill` with a copied link of `kind` that isn't one of ours,
+    /// to fill in an empty field. Unlike the offers, a link we copied
+    /// ourselves (*Copy text* on a message) counts.
+    fn copied(self: &Rc<Self>, kind: LinkKind, fill: impl FnOnce(String) + 'static) {
+        let cb = self.window.clipboard();
+        let core = self.core.clone();
+        glib::spawn_future_local(async move {
+            let Some(text) = read_clip(&cb).await else {
+                return;
+            };
+            let Some(info) = threnody_ffi::classify_link(text).filter(|i| i.kind == kind) else {
+                return;
+            };
+            let Ok(own) = gio::spawn_blocking(move || core.own_fingerprints()).await else {
+                return;
+            };
+            if !links::is_ours(&info, &own) {
+                fill(info.link);
+            }
+        });
+    }
+
+    /// Asks before subscribing to a directory from a link.
+    pub fn offer_directory(self: &Rc<Self>, info: LinkInfo) {
+        if self.subscribed(&info) {
+            self.toast("Already subscribed to this directory");
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let body = format!(
+            "Directory {}. It lists volunteer relays and gives out anonymous tokens to pay \
+             them. Subscribing shows it this computer's address, never who you are; every \
+             identity here, anonymous ones included, subscribes through links of its own.",
+            info.directory_id.as_deref().unwrap_or("?")
+        );
+        let link = info.link;
+        ui::confirm(
+            &self.window,
+            "Subscribe to this relay directory?",
+            &body,
+            "Subscribe",
+            false,
+            move || {
+                if let Some(t) = weak.upgrade() {
+                    t.subscribe(link.clone());
+                }
+            },
+        );
+    }
+
+    /// Whether a directory link is one we already subscribe to (by issuer
+    /// id: one id has many spellings in a link).
+    fn subscribed(&self, info: &LinkInfo) -> bool {
+        info.directory_id_hex
+            .as_ref()
+            .is_some_and(|id| self.core.main.directories().iter().any(|d| &d.id_hex == id))
+    }
+
+    /// Subscribes every identity to a directory, and says how it went.
+    fn subscribe(self: &Rc<Self>, link: String) {
+        self.toast("Subscribing…");
+        let (core, weak) = (self.core.clone(), Rc::downgrade(self));
+        bg(
+            move || core.subscribe_directory(&link),
+            move |r| {
+                if let Some(t) = weak.upgrade() {
+                    t.toast(&match r {
+                        Ok(d) => format!("Subscribed: {} relays, {} tokens", d.relays, d.tokens),
+                        Err(e) => format!("Couldn't subscribe: {e}"),
+                    });
+                }
+            },
+        );
     }
 
     /// Dials an invite (or offers to join for a device link code).
@@ -2801,7 +3043,7 @@ impl App {
 
     pub fn join_account(self: &Rc<Self>, initial: &str) {
         let weak = Rc::downgrade(self);
-        ui::ask_text(
+        let entry = ui::ask_text_with(
             &self.window,
             "Join another device's account",
             "Paste the link code your other device shows (its menu → Link a new device). \
@@ -2833,6 +3075,13 @@ impl App {
                 );
             },
         );
+        if initial.is_empty() {
+            self.copied(LinkKind::DeviceLink, move |l| {
+                if entry.text().is_empty() {
+                    entry.set_text(&l);
+                }
+            });
+        }
     }
 
     /// Publishes our handle for `name` at `version` (an empty name
@@ -3617,30 +3866,36 @@ impl App {
             .build();
         let weak = Rc::downgrade(self);
         let dd = d.clone();
+        // Typing a link and applying it is the confirmation: no second
+        // question. Only directory links belong here.
         entry.connect_apply(move |e| {
             let Some(this) = weak.upgrade() else { return };
-            let link = e.text().trim().to_owned();
-            if link.is_empty() {
+            let text = e.text().trim().to_owned();
+            if text.is_empty() {
                 return;
             }
-            dd.close();
-            this.toast("Subscribing…");
-            let (core, weak) = (this.core.clone(), Rc::downgrade(&this));
-            bg(
-                move || core.subscribe_directory(&link),
-                move |r| {
-                    if let Some(t) = weak.upgrade() {
-                        t.toast(&match r {
-                            Ok(d) => {
-                                format!("Subscribed: {} relays, {} tokens", d.relays, d.tokens)
-                            }
-                            Err(e) => format!("Couldn't subscribe: {e}"),
-                        });
-                    }
-                },
-            );
+            match threnody_ffi::classify_link(text) {
+                Some(info) if info.kind == LinkKind::Directory => {
+                    dd.close();
+                    this.subscribe(info.link);
+                }
+                _ => this.toast("That isn't a threnody-dir:// link"),
+            }
         });
         add.add(&entry);
+        let scan = adw::ActionRow::builder()
+            .title("Scan a QR code")
+            .activatable(true)
+            .build();
+        scan.add_prefix(&gtk::Image::from_icon_name("threnody-qr-symbolic"));
+        let (weak, dd) = (Rc::downgrade(self), d.clone());
+        scan.connect_activated(move |_| {
+            dd.close();
+            if let Some(this) = weak.upgrade() {
+                this.scan();
+            }
+        });
+        add.add(&scan);
         page.add(&add);
         let view = adw::ToolbarView::new();
         view.add_top_bar(&adw::HeaderBar::new());
@@ -4257,6 +4512,27 @@ impl App {
                 );
             },
         );
+    }
+}
+
+/// The clipboard's text, if it offers plain text and holds no more than
+/// a link can be. Reads at most [`links::CLIP_READ_MAX`] bytes: another
+/// app can put hundreds of MB there.
+async fn read_clip(cb: &gtk::gdk::Clipboard) -> Option<String> {
+    const TEXT: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
+    // Another app's clipboard advertises mime types only (no GTypes).
+    let formats = cb.formats();
+    if !TEXT.iter().any(|m| formats.contain_mime_type(m)) {
+        return None;
+    }
+    let (stream, _) = cb.read_future(&TEXT, glib::Priority::DEFAULT).await.ok()?;
+    let read = stream
+        .read_all_future(vec![0u8; links::CLIP_READ_MAX], glib::Priority::DEFAULT)
+        .await;
+    let _ = stream.close_future(glib::Priority::DEFAULT).await;
+    match read {
+        Ok((buf, n, None)) => links::clip_text(&buf, n),
+        _ => None,
     }
 }
 

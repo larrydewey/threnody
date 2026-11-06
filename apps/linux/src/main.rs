@@ -9,16 +9,21 @@ mod camera;
 mod chat;
 mod clip;
 mod core;
+mod editor;
 mod folders;
 mod gifs;
 mod keyring;
+mod links;
 mod lists;
 mod lock;
 #[cfg(feature = "nfc")]
 mod nfc;
+mod scan;
 mod schedule;
 mod settings;
+mod sketch;
 mod ui;
+mod viewer;
 mod window;
 
 use std::cell::RefCell;
@@ -229,19 +234,16 @@ fn start(
     );
 }
 
-/// Offers `threnody://` invites and `threnody-link://` codes that were
-/// opened (clicked links, or command-line arguments).
+/// Offers `threnody://` invites, `threnody-link://` codes and
+/// `threnody-dir://` directories that were opened (clicked links, or
+/// command-line arguments).
 pub(crate) fn handle_links(a: &Rc<App>) {
     // Kept until unlocked: no dialog opens over the lock page.
     if a.lock.is_locked() {
         return;
     }
     for link in PENDING.with_borrow_mut(std::mem::take) {
-        if link.starts_with("threnody-link://") {
-            a.join_account(&link);
-        } else if link.starts_with("threnody://") {
-            a.add_contact(&link);
-        }
+        a.open_link(&link, links::LinkFrom::Opened);
     }
 }
 

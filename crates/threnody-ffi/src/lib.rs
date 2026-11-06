@@ -472,6 +472,83 @@ pub fn decode_qr(width: u32, height: u32, row_stride: u32, luma: Vec<u8>) -> Opt
         .find_map(|g| g.decode().ok().map(|(_, text)| text))
 }
 
+/// What a link is, for routing it: an invite (Appendix S), a device link
+/// code (Appendix J) or a relay directory (Appendix P).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LinkKind {
+    Invite,
+    DeviceLink,
+    Directory,
+}
+
+/// A link [`classify_link`] recognised. `link` is the trimmed text as
+/// given (not re-serialised, so query fields a newer version adds
+/// survive); `fingerprint` the device it leads to (invites and link
+/// codes), formatted as `device_fingerprint()` is; `directory_id` and
+/// `directory_id_hex` a directory's short id and full issuer id, as
+/// `DirectoryRecord.id` and `.id_hex`. Compare directories by
+/// `directory_id_hex`: one issuer id has many spellings in a link.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LinkInfo {
+    pub kind: LinkKind,
+    pub link: String,
+    pub fingerprint: Option<String>,
+    pub directory_id: Option<String>,
+    pub directory_id_hex: Option<String>,
+}
+
+/// Longest text [`classify_link`] looks at (clipboards can hold anything).
+const MAX_LINK_CHARS: usize = 4096;
+
+/// Whether `text` is exactly one well-formed Threnody link, and which.
+/// Strict: it must parse in full, so `threnody://nonsense` or a sentence
+/// containing a link is not one. Apps route clicked, scanned and copied
+/// links with it.
+#[uniffi::export]
+pub fn classify_link(text: String) -> Option<LinkInfo> {
+    use threnody_core::{account::LinkCode, directory, invite};
+    let t = text.trim();
+    if t.len() > MAX_LINK_CHARS || t.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let info = |kind, fingerprint, directory_id, directory_id_hex| LinkInfo {
+        kind,
+        link: t.to_owned(),
+        fingerprint,
+        directory_id,
+        directory_id_hex,
+    };
+    // The scheme decides which parser runs, so one kind of link is never
+    // taken for another.
+    if t.starts_with(threnody_core::account::LINK_SCHEME) {
+        let c: LinkCode = t.parse().ok()?;
+        Some(info(
+            LinkKind::DeviceLink,
+            Some(c.device.to_string()),
+            None,
+            None,
+        ))
+    } else if t.starts_with(directory::LINK_SCHEME) {
+        let d: directory::DirectoryLink = t.parse().ok()?;
+        Some(info(
+            LinkKind::Directory,
+            None,
+            Some(directory::short_id(&d.issuer)),
+            Some(volunteer::hex(&d.issuer)),
+        ))
+    } else if t.starts_with(invite::SCHEME) {
+        let l: invite::InviteLink = t.parse().ok()?;
+        Some(info(
+            LinkKind::Invite,
+            Some(l.fingerprint.to_string()),
+            None,
+            None,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Whether the identity in `home` is sealed with a passphrase (false when
 /// there is no identity yet). Call before `open` to decide what to pass.
 #[uniffi::export]
@@ -3080,6 +3157,89 @@ mod tests {
         // Anything else is cut short.
         let long = describe(&vec![7u8; 1 << 20], MAX_DESCRIPTION);
         assert!(long.len() <= MAX_DESCRIPTION + '…'.len_utf8());
+    }
+
+    #[test]
+    fn links_are_classified_strictly() {
+        use threnody_core::directory::{DirectoryLink, short_id};
+        let dir = tempfile::tempdir().unwrap();
+        let node =
+            ThrenodyNode::open(dir.path().join("n").display().to_string(), None, None).unwrap();
+        let addr = node.listen("127.0.0.1:0".into()).unwrap();
+        let fp = node.device_fingerprint();
+
+        let invite = node.invite_link(addr.clone());
+        let i = classify_link(invite.clone()).unwrap();
+        assert_eq!(i.kind, LinkKind::Invite);
+        assert_eq!(i.fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(i.link, invite);
+        // Surrounding whitespace is trimmed, and `link` is the trimmed text.
+        let i = classify_link(format!("  {invite}\n")).unwrap();
+        assert_eq!(i.link, invite);
+
+        let code = node.create_link_code(addr.clone());
+        let c = classify_link(code.clone()).unwrap();
+        assert_eq!(c.kind, LinkKind::DeviceLink);
+        assert_eq!(c.fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(c.link, code);
+
+        let d = DirectoryLink {
+            issuer: [7; 32],
+            addr: "192.0.2.1:7450".into(),
+        }
+        .to_string();
+        let info = classify_link(d.clone()).unwrap();
+        assert_eq!(info.kind, LinkKind::Directory);
+        assert_eq!(info.fingerprint, None);
+        assert_eq!(info.directory_id, Some(short_id(&[7; 32])));
+        assert_eq!(info.directory_id_hex, Some("07".repeat(32)));
+        // Another spelling of the same issuer: the same hex id.
+        let (scheme, rest) = d.split_at("threnody-dir://".len());
+        let (id, at) = rest.split_once('@').unwrap();
+        let lower = format!("{scheme}{}@{at}", id.to_lowercase());
+        assert_ne!(lower, d);
+        assert_eq!(
+            classify_link(lower).unwrap().directory_id_hex,
+            Some("07".repeat(32))
+        );
+
+        // A query field a newer version adds survives in `link`.
+        let key = invite.split_once("?r=").map(|(_, k)| k.to_owned());
+        let with_key = match key {
+            Some(_) => format!("{invite}&z=1"),
+            None => format!("{invite}?z=1"),
+        };
+        let i = classify_link(with_key.clone()).unwrap();
+        assert_eq!(i.kind, LinkKind::Invite);
+        assert_eq!(i.link, with_key);
+
+        let short_secret = code
+            .rsplit_once('#')
+            .map(|(a, h)| format!("{a}#{}", &h[1..]));
+        for bad in [
+            "threnody://nonsense".to_owned(),
+            format!("threnody://{}", fp.replace('-', "")),
+            format!("see {invite} here"),
+            "https://example.org".to_owned(),
+            String::new(),
+            "x".repeat(5000),
+            format!("{invite}{}", "0".repeat(5000)),
+            short_secret.unwrap(),
+        ] {
+            assert_eq!(classify_link(bad.clone()), None, "{bad:.80}");
+        }
+    }
+
+    #[test]
+    fn classify_link_checks_the_scheme_first() {
+        // A broken link code is not taken for an invite, nor a directory.
+        for bad in [
+            "threnody-link://ABCD@192.0.2.1:7450",
+            "threnody-link://",
+            "threnody-dir://ABCD@192.0.2.1:7450",
+        ] {
+            assert_eq!(classify_link(bad.into()), None, "{bad}");
+        }
     }
 
     #[test]

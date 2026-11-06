@@ -1434,7 +1434,8 @@ class ChatActivity : Activity() {
                     .putExtra(ImageActivity.CAPTION, e.text)
             ) { resultCode, data ->
                 val path = data?.getStringExtra(AnnotateActivity.RESULT_PATH)
-                if (resultCode == RESULT_OK && path != null) sendEdited(path, data.getStringExtra(ImageActivity.NAME) ?: "photo.jpg")
+                // An edited copy of a sensitive photo starts out sensitive too.
+                if (resultCode == RESULT_OK && path != null) sendEdited(path, data.getStringExtra(ImageActivity.NAME) ?: "photo.jpg", f.sensitive)
             }
         }
         if (f.sensitive || location == null) {
@@ -2458,14 +2459,15 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** A photo edited from the viewer: ready to send, in the send sheet. */
-    private fun sendEdited(path: String, name: String) {
+    /** A photo edited from the viewer: ready to send, in the send sheet, *Sensitive* as the original was. */
+    private fun sendEdited(path: String, name: String, sensitive: Boolean) {
         Threading.background {
             val f = java.io.File(path)
             val bytes = try { f.readBytes() } catch (_: Exception) { null }
             java.io.File(cacheDir, AnnotateActivity.DIR).deleteRecursively()
             if (bytes != null) runOnUiThread {
                 sendSheet(listOf(Picked(name.substringBeforeLast('.') + "-edited.jpg", bytes, Uri.fromFile(f))))
+                sheet?.sensitive?.isChecked = sensitive
             }
         }
     }
