@@ -254,11 +254,14 @@ impl Node {
         };
         // Nothing from before the user cleared this chat.
         let cleared = self.cleared_at(conv);
+        // A location is a path or URI on the device that recorded it,
+        // never ours to open or serve, whatever a sibling sends.
         let entries: Vec<Entry> = h
             .entries()
             .iter()
             .filter(|e| e.at_ms > cleared)
             .cloned()
+            .map(portable)
             .collect();
         if let Ok(added) =
             self.shared

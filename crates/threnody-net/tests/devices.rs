@@ -1101,3 +1101,100 @@ async fn ticks_from_before_the_upgrade_are_backfilled() {
     assert!(sent(&phone.node, &bid, "old news").unwrap().delivered);
     let _ = &mut bob.rx;
 }
+
+/// An outgoing file entry from `device`, as history keeps it.
+fn file_entry(
+    device: &threnody_core::PublicIdentity,
+    name: &str,
+    size: u64,
+    location: Option<String>,
+) -> threnody_core::history::Entry {
+    threnody_core::history::Entry {
+        at_ms: threnody_core::now_ms(),
+        outgoing: true,
+        device: *device.as_bytes(),
+        text: String::new(),
+        offline: false,
+        expires_at_ms: None,
+        file: Some(threnody_core::history::FileNote {
+            name: name.into(),
+            size,
+            location,
+            sensitive: false,
+            album: 0,
+            clip: None,
+            forwarded: false,
+        }),
+        local_id: threnody_net::history::local_id(),
+        delivered: false,
+        recipients: 0,
+        delivered_to: Vec::new(),
+        remote_id: 0,
+        edited_ms: 0,
+        read_ms: 0,
+        reactions: Vec::new(),
+        quote: None,
+        mentions: Vec::new(),
+        poll: None,
+        forwarded: false,
+        list: None,
+        ticked_ms: 0,
+    }
+}
+
+/// An account message as our own device would send it.
+fn account_msg(op: u8, one: Option<&[u8]>, two: &[u8]) -> threnody_core::AppMessage {
+    let b = threnody_core::cbor::to_vec(two.len() + 128, |e| {
+        e.map_len(2 + usize::from(one.is_some()))?.u8(0)?.u8(op)?;
+        if let Some(o) = one {
+            e.u8(1)?.bytes(o)?;
+        }
+        e.u8(2)?.bytes(two)?;
+        Ok(())
+    })
+    .unwrap();
+    threnody_core::AppMessage::Account(b)
+}
+
+#[tokio::test]
+async fn transcripts_never_plant_a_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    wait_for(|| laptop.node.is_own_device(&pid)).await;
+    let bid = bob.node.identity();
+    let conv = laptop.node.conversation_for(&bid);
+    let planted = file_entry(
+        &laptop.node.identity(),
+        "id_ed25519",
+        400,
+        Some("/etc/passwd".into()),
+    );
+    let h = threnody_core::history::History::transcript(vec![planted])
+        .encode()
+        .unwrap();
+    laptop
+        .node
+        .send(
+            &phone.node.identity(),
+            account_msg(8, Some(&conv.to_bytes()), &h),
+        )
+        .unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let on_phone = phone
+        .node
+        .history(phone.node.conversation_for(&bid))
+        .unwrap()
+        .entries()
+        .iter()
+        .find_map(|e| e.file.clone())
+        .unwrap();
+    assert_eq!(on_phone.name, "id_ed25519");
+    assert_eq!(on_phone.location, None);
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
