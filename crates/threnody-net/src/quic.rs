@@ -435,8 +435,8 @@ impl Node {
             .map_err(quic_error)?;
         let mut stream = tokio::io::join(recv, send);
         let chan = handshake::accept(&mut stream, self.identity_ref()).await?;
-        self.check_policy(chan.peer())?;
-        self.spawn_session(stream, chan, addr, false, Route::Quic(conn));
+        let pass = self.admit(chan.peer(), Source::ip(addr.ip()))?;
+        self.start_session(stream, chan, addr, false, Route::Quic(conn), pass);
         Ok(())
     }
 

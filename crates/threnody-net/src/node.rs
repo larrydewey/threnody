@@ -28,7 +28,7 @@ use crate::account::LinkState;
 use crate::delivery::{Delivery, Tag, needs, trackable};
 use crate::error::{NetError, Result};
 use crate::frame::{MAX_FRAME, read_body_metered, read_len, write_frame};
-use crate::gate::Source;
+use crate::gate::{Pass, Source};
 use crate::handshake;
 use crate::history::Recorded;
 use crate::mailbox::MailboxStore;
@@ -546,6 +546,16 @@ pub(crate) struct Shared {
     pub(crate) link_inbound: crate::gate::Gate,
     /// The same for QUIC (see `quic`).
     pub(crate) quic_inbound: crate::gate::Gate,
+    /// Sessions with strangers, which unlike handshakes last (see
+    /// [`MAX_STRANGERS`]).
+    pub(crate) strangers: crate::gate::Gate,
+    /// How long a stranger's session lasts without application traffic
+    /// (see [`STRANGER_IDLE`]); tests shorten it.
+    stranger_idle: Mutex<Duration>,
+    /// Peers whose waiting messages we try to deliver again (see
+    /// `retry_held`), and the first wait between tries.
+    retrying: Mutex<HashSet<PublicIdentity>>,
+    retry_after: Mutex<Duration>,
     /// Directories, volunteering and relay tokens (see `volunteer`).
     pub(crate) volunteer: crate::volunteer::VolunteerState,
     /// Credentials held and exchanges in progress (see `cred`).
@@ -799,6 +809,10 @@ impl Node {
                 crate::quic::MAX_HANDSHAKING,
                 crate::quic::MAX_HANDSHAKING_PER_SOURCE,
             ),
+            strangers: crate::gate::Gate::new(MAX_STRANGERS, MAX_STRANGERS_PER_SOURCE),
+            stranger_idle: Mutex::new(STRANGER_IDLE),
+            retrying: Mutex::default(),
+            retry_after: Mutex::new(RETRY_AFTER),
             volunteer: crate::volunteer::VolunteerState::new(),
             creds: Mutex::default(),
             calls: Mutex::default(),
@@ -1067,8 +1081,8 @@ impl Node {
             return self.accept_anon(stream, addr).await;
         }
         let chan = handshake::accept_first(&mut stream, &self.shared.identity, &first).await?;
-        self.check_policy(chan.peer())?;
-        self.spawn_session(stream, chan, addr, false, Route::Direct(None));
+        let pass = self.admit(chan.peer(), Source::ip(addr.ip()))?;
+        self.start_session(stream, chan, addr, false, Route::Direct(None), pass);
         Ok(())
     }
 
@@ -1168,14 +1182,15 @@ impl Node {
             .enter(Source::Link)
             .ok_or_else(|| NetError::Refused("too many links in their handshake".into()))?;
         let chan = handshake::accept(&mut stream, &self.shared.identity).await?;
-        self.check_policy(chan.peer())?;
+        let pass = self.admit(chan.peer(), Source::Link)?;
         let peer = *chan.peer();
-        self.spawn_session(
+        self.start_session(
             stream,
             chan,
             SocketAddr::from(([0, 0, 0, 0], 0)),
             false,
             Route::Link { transport, remote },
+            pass,
         );
         Ok(peer)
     }
@@ -1273,6 +1288,84 @@ impl Node {
         }
     }
 
+    /// Whether `peer` is a stranger: not a contact we accepted, not one
+    /// of our devices, not mutually approved. Its message requests still
+    /// come in, but its session is capped and expires (see
+    /// [`MAX_STRANGERS`]).
+    pub(crate) fn is_stranger(&self, peer: &PublicIdentity) -> bool {
+        !self.is_accepted(peer) && !self.shared.mutual(peer)
+    }
+
+    /// [`Node::check_policy`] for a session arriving over its own
+    /// connection from `source`; a stranger also needs a place among
+    /// [`MAX_STRANGERS`], which the returned pass holds. Relay and onion
+    /// circuits don't come through here: they ride on a contact's
+    /// session, hold no socket of ours, and are capped per neighbour.
+    pub(crate) fn admit(&self, peer: &PublicIdentity, source: Source) -> Result<Option<Pass>> {
+        self.check_policy(peer)?;
+        if !self.is_stranger(peer) {
+            return Ok(None);
+        }
+        self.shared
+            .strangers
+            .enter(source)
+            .map(Some)
+            .ok_or_else(|| {
+                NetError::Refused(format!(
+                    "{} (too many strangers connected; it can try again later)",
+                    peer.fingerprint()
+                ))
+            })
+    }
+
+    /// Tests only: how long a stranger's session may go without
+    /// application traffic (normally [`STRANGER_IDLE`]).
+    #[doc(hidden)]
+    pub fn set_stranger_idle(&self, idle: Duration) {
+        *lock(&self.shared.stranger_idle) = idle;
+    }
+
+    /// Tests only: the first wait before messages held for a peer that
+    /// isn't mutually approved are tried again (normally [`RETRY_AFTER`]).
+    #[doc(hidden)]
+    pub fn set_retry_after(&self, wait: Duration) {
+        *lock(&self.shared.retry_after) = wait;
+    }
+
+    /// Messages wait for `peer`, who isn't mutually approved: nothing
+    /// else (recovery, rendezvous) will bring a session back to it, and
+    /// a stranger's node may have refused ours for want of room (see
+    /// [`MAX_STRANGERS`]). Dial it again now and then, waiting longer
+    /// each time, while anything is unacknowledged and no session is up.
+    pub(crate) fn retry_held(&self, peer: PublicIdentity) {
+        if self.shared.mutual(&peer)
+            || self.is_closed()
+            || tokio::runtime::Handle::try_current().is_err()
+            || !lock(&self.shared.retrying).insert(peer)
+        {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut wait = *lock(&node.shared.retry_after);
+            for _ in 0..RETRIES {
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = node.closed() => break,
+                }
+                wait = (wait * 2).min(RETRY_MAX);
+                if node.unacked(&peer) == 0 || node.shared.mutual(&peer) || node.is_closed() {
+                    break;
+                }
+                if node.connected(&peer) {
+                    continue;
+                }
+                let _ = tokio::time::timeout(RETRY_DIAL, node.reach_peer(&peer)).await;
+            }
+            lock(&node.shared.retrying).remove(&peer);
+        });
+    }
+
     /// Queues a message to a connected peer. User content (text, files,
     /// group and mailbox messages) is kept until the peer acknowledges it
     /// and sent again in the next session if this one dies first.
@@ -1311,6 +1404,7 @@ impl Node {
         });
         // It waits for a session: wake the peer if it sleeps (Appendix R).
         self.push_wake(peer);
+        self.retry_held(*peer);
     }
 
     /// `peer` is gone (forgotten, blocked, or removed from its account):
@@ -1525,6 +1619,22 @@ impl Node {
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.start_session(stream, chan, addr, outbound, route, None);
+    }
+
+    /// [`Node::spawn_session`], holding `stranger`'s place (see
+    /// [`Node::admit`]) for as long as the session runs as a stranger's.
+    pub(crate) fn start_session<S>(
+        &self,
+        stream: S,
+        chan: SecureChannel,
+        addr: SocketAddr,
+        outbound: bool,
+        route: Route,
+        stranger: Option<Pass>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // Over QUIC the peer's address is its outside address, worth telling it.
         let (over, datagrams) = match &route {
             Route::Quic(c) => (Over::Quic(addr), Some(c.clone())),
@@ -1619,7 +1729,8 @@ impl Node {
         let node = self.clone();
         let started = tokio::time::Instant::now();
         tokio::spawn(async move {
-            let result = run_session(&node, stream, chan, addr, via, over, rx).await;
+            let result =
+                run_session(&node, stream, chan, addr, via, over, rx, outbound, stranger).await;
             // Closed on purpose (either side) is not a loss to repair.
             let failed = result.is_err();
             let reason = match result {
@@ -1660,11 +1771,17 @@ impl Node {
                 if via.is_none() && failed {
                     node.on_session_lost(peer);
                 }
+                // Left unacknowledged (refused by a stranger's full node,
+                // say): try again later.
+                if outbound && node.unacked(&peer) > 0 {
+                    node.retry_held(peer);
+                }
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     node: &Node,
     stream: S,
@@ -1673,6 +1790,8 @@ async fn run_session<S>(
     via: Option<PublicIdentity>,
     over: Over,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
+    outbound: bool,
+    mut stranger_pass: Option<Pass>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1755,6 +1874,13 @@ where
     let mut early_chain: Option<Vec<u8>> = None;
     let mut last_rx = tokio::time::Instant::now();
     let setup_until = last_rx + SETUP_BURST;
+    // A stranger's session (one we didn't dial, from someone we haven't
+    // accepted) ends after this long without application traffic either
+    // way, and holds its place among the strangers' until then or until
+    // we accept it.
+    let mut stranger = !outbound && node.is_stranger(&peer);
+    let stranger_idle = *lock(&shared.stranger_idle);
+    let mut last_app = last_rx;
     let make_heartbeat = || {
         let mut t = tokio::time::interval(node.beat_for(inner));
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1775,6 +1901,11 @@ where
     }
     let result: Result<()> = async {
         loop {
+            // Accepted (or approved) meanwhile: a stranger no more.
+            if stranger && !node.is_stranger(&peer) {
+                stranger = false;
+                stranger_pass = None;
+            }
             // Refresh the pairwise LAN discovery key once per session.
             if !discovery_keyed && shared.mutual(&peer) {
                 let key = *chan.export(DISCOVERY_CONTEXT);
@@ -1895,6 +2026,14 @@ where
             // just some bytes of one.
             let since = last_rx.max(heard.last());
             tokio::select! {
+                () = lease_expired(stranger.then_some(stranger_idle), last_app) => {
+                    if node.is_stranger(&peer) {
+                        return Err(NetError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "stranger idle",
+                        )));
+                    }
+                }
                 () = lease_expired(lease, since) => {
                     // Bytes came in after `since`, or frames wait unread
                     // after a long write of ours: not silent. Only bytes
@@ -1925,6 +2064,9 @@ where
                     // reliable stream it can only mean tampering or a broken peer.
                     let opened = chan.open(&frame.bytes)?;
                     drop(frame);
+                    if !matches!(opened, AppMessage::Cover) {
+                        last_app = last_rx;
+                    }
                     if peer_acks.is_none() {
                         let features = match opened {
                             AppMessage::Hello { features } => features,
@@ -2159,6 +2301,9 @@ where
                         discovery_keyed = false;
                         prekeys_sent = false;
                         push_sent = false;
+                    }
+                    if out.as_ref().is_some_and(|m| !matches!(m, AppMessage::Cover)) {
+                        last_app = tokio::time::Instant::now();
                     }
                     match out {
                     // Calls can't hide behind cover traffic (their media
@@ -2407,6 +2552,26 @@ const TWIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;
+
+/// Sessions with strangers at once, and from one network (an IPv4
+/// address, an IPv6 /64; radio links count as one). Under the `Anyone`
+/// policy each fresh identity that completes a handshake would otherwise
+/// keep a session, and a socket, for good. Past the limit a stranger is
+/// refused after its handshake; what it sends waits on its side, and
+/// gets through on a later try.
+pub const MAX_STRANGERS: usize = 64;
+pub const MAX_STRANGERS_PER_SOURCE: usize = 4;
+/// A stranger's session ends after this long without application
+/// traffic (anything but cover) either way.
+pub const STRANGER_IDLE: Duration = Duration::from_secs(5 * 60);
+
+/// Messages waiting for a peer that isn't mutually approved are tried
+/// again after this, then after twice as long each time up to
+/// [`RETRY_MAX`], at most [`RETRIES`] times (about 8 hours in all).
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+const RETRIES: usize = 20;
+const RETRY_DIAL: Duration = Duration::from_secs(30);
 
 /// What a session runs over, as far as addresses go.
 #[derive(Clone, Copy)]

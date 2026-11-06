@@ -106,7 +106,7 @@ To add a device to your account, run `/device add [host:port]` on a device you a
 /policy anyone|contacts|approved   /status   /quit
 ```
 
-**Message requests.** Messages from someone you haven't accepted are kept apart as requests. You accept someone by approving them, dialing their invite, or writing to them. `/requests` lists them, `/accept <peer>` takes them in, `/block <peer>` refuses that sender from then on and deletes the conversation, and `/delete <peer>` discards the request.
+**Message requests.** Messages from someone you haven't accepted are kept apart as requests. You accept someone by approving them, dialing their invite, or writing to them. `/requests` lists them, `/accept <peer>` takes them in, `/block <peer>` refuses that sender from then on and deletes the conversation, and `/delete <peer>` discards the request. Strangers can't wear a node down: it holds at most 64 sessions with people you haven't accepted, 4 from one network, and closes each after 5 idle minutes. A request that finds the node full waits with its sender, whose node tries again later (Appendix A, *Limits*).
 
 You can also manage contacts outside a session with `threnody contacts | name | approve | revoke | verify | forget`. While a node runs on the same data directory these refuse (it would write its own contacts over the change); use `threnody ctl` or the app instead. Only one node runs on a data directory at a time.
 
