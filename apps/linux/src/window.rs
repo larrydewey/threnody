@@ -1757,6 +1757,14 @@ impl App {
         if watching.as_ref() == Some(&chat) {
             return;
         }
+        // With app lock on: like a message's, saying nothing and naming
+        // no chat.
+        if self.lock.enabled() {
+            let n = gio::Notification::new("Threnody");
+            n.set_body(Some("New message"));
+            self.app.send_notification(Some("message"), &n);
+            return;
+        }
         let title = if group {
             self.group_title(persona, about)
         } else {

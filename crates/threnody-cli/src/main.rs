@@ -1179,15 +1179,18 @@ fn wipe_command(home: &Home, yes: bool) -> Result<()> {
             bail!("not erased");
         }
     }
-    // Only sealed identities have keyring entries (the identity's, and
-    // the desktop app's app-lock pepper): don't touch the keyring for the
-    // others.
+    // Only sealed identities have an identity entry in the keyring: don't
+    // touch the keyring for the others. The desktop app's app-lock pepper
+    // outlives the seal (it is kept when the identity is re-keyed or
+    // unsealed), so it goes whenever the app lock is on too.
     let sealed = |dir: &std::path::Path| {
         let h = Home::new(dir);
         h.has_identity() && h.identity_is_sealed().unwrap_or(true)
     };
+    let main_sealed = sealed(home.dir());
+    let peppered = main_sealed || home.app_lock_enabled();
     let mut keyed = Vec::new();
-    if sealed(home.dir()) {
+    if main_sealed {
         keyed.push(home.dir().to_path_buf());
     }
     if let Ok(entries) = std::fs::read_dir(home.dir().join("personas")) {
@@ -1198,10 +1201,11 @@ fn wipe_command(home: &Home, yes: bool) -> Result<()> {
     #[cfg(windows)]
     drop(lock);
     let erased = home.erase()?;
+    if peppered {
+        keyring::delete_lock_pepper(home);
+    }
     for h in erased.homes.iter().filter(|h| keyed.contains(h)) {
-        let h = Home::new(h);
-        keyring::delete(&h);
-        keyring::delete_lock_pepper(&h);
+        keyring::delete(&Home::new(h));
     }
     #[cfg(not(windows))]
     drop(lock);

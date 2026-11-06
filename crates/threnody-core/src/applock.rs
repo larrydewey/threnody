@@ -343,6 +343,18 @@ impl Body {
     }
 }
 
+/// Held across every read-change-write of a lock file, so two entries
+/// checked at once can't both count from the same number of failures
+/// (and an erase after wrong entries come late). One for the process:
+/// lock files are rarely touched, and never by two homes at once.
+static FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn file_lock() -> std::sync::MutexGuard<'static, ()> {
+    FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn file_key(pepper: Option<&[u8]>) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(kdf::derive(
         kdf::label::APP_LOCK_KEY,
@@ -466,6 +478,7 @@ impl Home {
             check_secret(s, kind)?;
         }
         check_policy(&policy, secret.is_some())?;
+        let _held = file_lock();
         let old = self.load_lock(pepper)?;
         if let Some((_, slot)) = old.as_ref().and_then(|b| b.secret.as_ref())
             && !slot.matches(current.unwrap_or(""))?
@@ -508,6 +521,7 @@ impl Home {
     /// Changes only the policy (times, biometrics, erasing after wrong
     /// entries). Refused if it would leave neither a secret nor biometrics.
     pub fn set_lock_policy(&self, pepper: Option<&[u8]>, policy: LockPolicy) -> Result<()> {
+        let _held = file_lock();
         let mut body = self
             .load_lock(pepper)?
             .ok_or(Error::Malformed("app lock is off"))?;
@@ -520,6 +534,7 @@ impl Home {
     /// deletes the lock file, so the file exists exactly while app lock
     /// is on.
     pub fn clear_app_lock(&self, pepper: Option<&[u8]>, current: Option<&str>) -> Result<()> {
+        let _held = file_lock();
         let Some(body) = self.load_lock(pepper)? else {
             return Ok(());
         };
@@ -549,6 +564,7 @@ impl Home {
         duress: Option<&str>,
         p: KdfParams,
     ) -> Result<()> {
+        let _held = file_lock();
         let mut body = self
             .load_lock(pepper)?
             .ok_or(Error::Malformed("app lock is off"))?;
@@ -580,6 +596,7 @@ impl Home {
     /// Checks an entry on the lock screen at `now_ms` (wall clock). Does
     /// the same work for every entry, so its timing shows nothing.
     pub fn check_lock(&self, pepper: Option<&[u8]>, entered: &str, now_ms: u64) -> Result<Verdict> {
+        let _held = file_lock();
         let Some(mut body) = self.load_lock(pepper)? else {
             return Ok(Verdict::Unlock);
         };
@@ -628,6 +645,7 @@ impl Home {
 
     /// A biometric unlock succeeded: clears the failure count.
     pub fn lock_passed(&self, pepper: Option<&[u8]>) -> Result<()> {
+        let _held = file_lock();
         let Some(mut body) = self.load_lock(pepper)? else {
             return Ok(());
         };
@@ -946,6 +964,18 @@ mod tests {
         }
         assert_eq!(last, MAX_DELAY_MS);
         assert_eq!(delay_ms(u32::MAX), MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn entries_checked_at_once_all_count() {
+        let (_t, h) = home();
+        pin_lock(&h);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| check(&h, "0000", T));
+            }
+        });
+        assert_eq!(failures(&h), 4);
     }
 
     #[test]

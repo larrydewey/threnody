@@ -36,6 +36,10 @@ struct RootView: View {
     /// Stored negatively, so unset means hidden (the protected default).
     @AppStorage("showInAppSwitcher") private var showInAppSwitcher = false
 
+    /// The app-switcher cover: always while app lock is on, else unless
+    /// the user chose to show Threnody there.
+    private var cover: Bool { scenePhase != .active && (!showInAppSwitcher || AppLock.isEnabled) }
+
     var body: some View {
         ZStack {
             Group {
@@ -53,9 +57,11 @@ struct RootView: View {
             // Under the lock screen: not read out by VoiceOver, not touchable.
             .accessibilityHidden(lock.locked)
             .allowsHitTesting(!lock.locked)
-            if lock.locked { LockView() }
-            if scenePhase != .active && (!showInAppSwitcher || AppLock.isEnabled) { PrivacyCover() }
         }
+        // The lock screen and the cover are in a window of their own, above
+        // every sheet and alert (`LockWindow`).
+        .onChange(of: cover, initial: true) { _, on in lock.covered = on }
+        .onChange(of: lock.locked || cover, initial: true) { _, on in LockWindow.shared.show(on) }
         // Any touch postpones the idle lock.
         .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { _ in lock.activity() })
         .task { store.launch() }

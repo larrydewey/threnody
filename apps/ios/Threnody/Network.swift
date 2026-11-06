@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 enum LocalAddress {
     /// This device's IPv4 address on Wi-Fi (en0), else on any other up interface.
@@ -27,13 +28,14 @@ enum LocalAddress {
 final class PathWatcher {
     private let monitor = NWPathMonitor()
     private var last: NWInterface.InterfaceType?
-    private var changed: (@Sendable (_ cellular: Bool) -> Void)?
+    /// Set on the main actor, read on the monitor's queue.
+    private let changed = OSAllocatedUnfairLock<(@Sendable (_ cellular: Bool) -> Void)?>(initialState: nil)
     private var started = false
 
     /// Starts watching, or (an NWPathMonitor starts only once) swaps what
     /// it calls, after an erase and a new identity in the same process.
     func start(_ changed: @escaping @Sendable (_ cellular: Bool) -> Void) {
-        self.changed = changed
+        self.changed.withLock { $0 = changed }
         guard !started else { return }
         started = true
         monitor.pathUpdateHandler = { [weak self] path in
@@ -43,7 +45,7 @@ final class PathWatcher {
             if type == self.last { return }
             let first = self.last == nil
             self.last = type
-            if !first { self.changed?(type == .cellular) }
+            if !first, let call = self.changed.withLock({ $0 }) { call(type == .cellular) }
         }
         monitor.start(queue: DispatchQueue(label: "threnody.path"))
     }

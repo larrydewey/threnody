@@ -353,6 +353,22 @@ mod tests {
     }
 
     #[test]
+    fn erasing_again_removes_files_saved_after_the_first_erase() {
+        // An app saving a received photo outside `Home::write` (Linux's
+        // media directory) while the duress PIN erased the home: the app
+        // erases again once its nodes have stopped.
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("h");
+        let (home, _, _) = used_home(&dir);
+        home.erase().unwrap();
+        fs::create_dir_all(dir.join("media")).unwrap();
+        fs::write(dir.join("media").join("photo.jpg"), b"plain").unwrap();
+        let again = home.erase().unwrap();
+        assert_eq!(again.homes, vec![dir.clone()]);
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn clear_orphans_removes_state_left_by_an_interrupted_erase() {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("h");

@@ -93,9 +93,16 @@ object AppLock {
         // Turned off: nothing stays locked. Turned on or changed in front:
         // the idle time counts from now.
         if (!s.enabled || !clock.isLocked()) clock.unlocked(now())
+        // Every screen, not just the one that changed it: recents must not
+        // keep a snapshot of the activities under it either.
+        main.post { for (a in live.keys) Privacy.apply(a) }
     }
 
-    /** The app is about to open its own picker or camera: a few minutes' grace. */
+    /**
+     * The app is about to open another app's picker or camera: a few
+     * minutes' grace. Cleared as soon as one of ours is in front again,
+     * so it never carries over to leaving the app later.
+     */
     fun expectReturn() {
         expecting = true
     }
@@ -188,6 +195,8 @@ object AppLock {
 
         override fun onActivityResumed(a: Activity) {
             resumed = a
+            // The picker came back, or was one of our own screens.
+            expecting = false
             if (isExempt(a)) return
             if (enabled(a) && clock.tick(now())) showLock(a)
             else a.window?.decorView?.visibility = View.VISIBLE

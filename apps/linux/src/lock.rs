@@ -1005,26 +1005,66 @@ pub fn confirm_erase(app: &Rc<App>) {
 /// Erases everything: the node's data directory (with its nodes shut
 /// down), then what the app keeps elsewhere, then starts afresh.
 pub fn erase_all(app: &Rc<App>) {
+    erase(app, None);
+}
+
+/// After the duress PIN (or the last wrong entry) erased the data
+/// directory: the nodes were still running meanwhile, so stop them and
+/// erase again whatever they wrote (a received photo, say).
+fn finish_erase(app: &Rc<App>, homes: &[String]) {
+    erase(app, Some(homes.to_vec()));
+}
+
+/// Stops every node (nothing saves files from then on), erases the data
+/// directory, then what the app keeps elsewhere, then starts afresh.
+/// `erased` is the identity homes an earlier erase already removed. The
+/// erase is idempotent: when it fails, it can simply be run again.
+fn erase(app: &Rc<App>, erased: Option<Vec<String>>) {
+    crate::core::WIPING.store(true, std::sync::atomic::Ordering::SeqCst);
     let core = app.core.clone();
     let home = app.core.home.display().to_string();
     let a = app.clone();
+    let before = erased.clone();
     ui::bg(
         move || {
             core.shutdown_for_wipe();
-            threnody_ffi::wipe_home(home)
+            threnody_ffi::wipe_home(home).map(|now| before.unwrap_or(now))
         },
         move |r| match r {
-            Ok(homes) => finish_erase(&a, &homes),
-            Err(e) => a.toast(&format!("Couldn't erase everything: {e}")),
+            Ok(homes) => {
+                wipe_platform(&a, &homes);
+                crate::restart(&a.app);
+            }
+            Err(e) => erase_failed(&a, &e.to_string(), erased),
         },
     );
 }
 
-/// After the data directory is gone (an erase, or the duress PIN).
-fn finish_erase(app: &Rc<App>, homes: &[String]) {
-    crate::core::WIPING.store(true, std::sync::atomic::Ordering::SeqCst);
-    wipe_platform(app, homes);
-    crate::restart(&app.app);
+/// The nodes are stopped and the erase didn't finish: Threnody can't go
+/// on as it was. Try again, or restart (the start-up flow takes over).
+fn erase_failed(app: &Rc<App>, why: &str, erased: Option<Vec<String>>) {
+    let d = ui::alert(
+        "Couldn't erase everything",
+        &format!(
+            "{why}\n\nThrenody has stopped. Try again, or restart Threnody and erase it from \
+             there."
+        ),
+        &[("restart", "Restart"), ("retry", "Try Again")],
+    );
+    let a = app.clone();
+    d.connect_response(None, move |_, r| {
+        if r == "retry" {
+            erase(&a, erased.clone());
+        } else {
+            crate::restart(&a.app);
+        }
+    });
+    let parent: gtk::Widget = if app.lock.is_locked() {
+        app.lock.stack.clone().upcast()
+    } else {
+        app.window.clone().upcast()
+    };
+    d.present(Some(&parent));
 }
 
 /// What the files to remove besides the data directory are: the
@@ -1045,6 +1085,8 @@ fn wipe_platform(app: &Rc<App>, homes: &[String]) {
         let _ = std::fs::remove_dir_all(p);
     }
     for c in app.conversation_ids() {
+        // A message's, and a scheduled message's that wasn't sent.
+        app.app.withdraw_notification(&format!("scheduled-{c}"));
         app.app.withdraw_notification(&c);
     }
     app.app.withdraw_notification("message");

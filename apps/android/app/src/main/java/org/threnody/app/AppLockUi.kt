@@ -62,7 +62,6 @@ object AppLockUi {
                 val s = appLock(home(a), pepper)
                 AppLock.changed(s)
                 a.runOnUiThread {
-                    Privacy.apply(a)
                     done?.let { Toast.makeText(a, it, Toast.LENGTH_LONG).show() }
                     after(s)
                 }

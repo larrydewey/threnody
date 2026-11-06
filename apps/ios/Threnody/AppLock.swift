@@ -25,6 +25,10 @@ final class AppLock: ObservableObject {
     @Published private(set) var retryAt: UInt64 = 0
     /// The one-time notice that device lock came on.
     @Published var notice = false
+    /// The app-switcher cover is up (set by `RootView`).
+    @Published var covered = false
+    /// An entry is being checked: the next waits, so none goes uncounted.
+    @Published private(set) var busy = false
     private var clock: AppLockClock
     private var lastActivity: UInt64 = 0
 
@@ -121,7 +125,9 @@ final class AppLock: ObservableObject {
     /// Checks an entry on the lock screen. The duress PIN looks exactly
     /// like the right one until the app starts afresh.
     func submit(_ text: String) async {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty, !busy else { return }
+        busy = true
+        defer { busy = false }
         status = "Unlocking…"
         do {
             let outcome = try await offMain { try unlockApp(home: AppLock.home, pepper: KeyVault.secret(), entered: text) }
@@ -235,11 +241,11 @@ struct LockView: View {
                         .keyboardType(kind == .digits ? .numberPad : .default)
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.center)
-                        .disabled(waitLeft > 0)
+                        .disabled(waitLeft > 0 || lock.busy)
                         .onSubmit(submit)
                     Button("Unlock", action: submit)
                         .buttonStyle(.borderedProminent)
-                        .disabled(waitLeft > 0 || text.isEmpty)
+                        .disabled(waitLeft > 0 || text.isEmpty || lock.busy)
                 }
                 if s.kind == nil || s.biometric {
                     Button(s.kind == nil ? "Unlock with Face ID or passcode" : "Use Face ID") {
@@ -262,9 +268,71 @@ struct LockView: View {
     }
 
     private func submit() {
+        guard !lock.busy else { return }
         let t = text
         text = ""
         Task { await lock.submit(t) }
+    }
+}
+
+/// The lock screen and the app-switcher cover, in a window above the
+/// app's own. SwiftUI presents sheets, alerts and full-screen covers
+/// above anything in the root view, so an overlay there would leave an
+/// open sheet usable (and in the app-switcher snapshot) while locked.
+@MainActor
+final class LockWindow {
+    static let shared = LockWindow()
+    private var window: UIWindow?
+    /// The window that was key before the shield went up.
+    private weak var previous: UIWindow?
+
+    /// Puts the shield up (`true`) or takes it down.
+    func show(_ on: Bool) {
+        guard let scene = Self.scene() else { return }
+        if window?.windowScene !== scene {
+            window?.isHidden = true
+            let w = UIWindow(windowScene: scene)
+            w.windowLevel = .alert + 1
+            let host = UIHostingController(rootView: Shield())
+            // Opaque from the first frame, before SwiftUI draws.
+            host.view.backgroundColor = .systemBackground
+            host.view.accessibilityViewIsModal = true
+            w.rootViewController = host
+            window = w
+        }
+        guard let w = window else { return }
+        // Nothing under the shield is read out, presented sheets included
+        // (they live in the app's window).
+        for other in scene.windows where other !== w && other.windowLevel == .normal {
+            other.accessibilityElementsHidden = on
+        }
+        if on {
+            guard w.isHidden else { return }
+            previous = scene.keyWindow
+            w.makeKeyAndVisible()
+        } else if !w.isHidden {
+            w.isHidden = true
+            previous?.makeKey()
+        }
+    }
+
+    private static func scene() -> UIWindowScene? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+    }
+}
+
+/// What the shield window shows: the lock screen, under the cover when
+/// the app isn't in front.
+private struct Shield: View {
+    @ObservedObject private var lock = AppLock.shared
+
+    var body: some View {
+        ZStack {
+            Color(.systemBackground).ignoresSafeArea()
+            if lock.locked { LockView() }
+            if lock.covered || !lock.locked { PrivacyCover() }
+        }
     }
 }
 

@@ -307,7 +307,12 @@ final class NodeStore: ObservableObject {
                 if NodeStore.currentGeneration != gen { return }
                 // Received files are kept and recorded before the screens reload.
                 if case let .file(peer, name, data, id, sensitive, caption, album, clip, _, forwarded) = e {
-                    let location = Paths.save(name: name, data: data)
+                    // Saved holding the generation: an erase can't remove
+                    // the media directory between the check and the write.
+                    let saved = NodeStore.generation.withLock { now -> String?? in
+                        now == gen ? .some(Paths.save(name: name, data: data)) : .none
+                    }
+                    guard let location = saved else { return }
                     try? n.recordReceivedFile(
                         peer: peer, name: name, size: UInt64(data.count), location: location, id: id,
                         options: FileOptions(sensitive: sensitive, caption: caption, album: album, clip: clip, forwarded: forwarded)
