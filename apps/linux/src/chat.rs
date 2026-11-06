@@ -29,6 +29,10 @@ const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "�
 /// A message by its time and sending device, as search finds it.
 pub type Key = (u64, String);
 
+/// A file on screen coming from another of our devices: the entry (time
+/// and sender), its state label, and its size.
+type Fetching = ((u64, String), gtk::Label, u64);
+
 pub struct ChatView {
     app: Weak<App>,
     conv: RefCell<Conversation>,
@@ -73,7 +77,7 @@ pub struct ChatView {
     shown: RefCell<Vec<(u64, String)>>,
     /// Files on screen coming from our other devices, by time and sender:
     /// their state labels and sizes, kept current once a second.
-    fetching: RefCell<Vec<((u64, String), gtk::Label, u64)>>,
+    fetching: RefCell<Vec<Fetching>>,
     fetch_poll: RefCell<Option<glib::SourceId>>,
     /// Voice and video messages by file, kept across redraws so one
     /// playing goes on playing when a message arrives.
