@@ -2354,6 +2354,8 @@ where
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
                         AppMessage::Push(payload) => node.on_push(peer, &payload),
+                        // Handled once receipts are advertised.
+                        AppMessage::Receipt(_) => {}
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}

@@ -34,11 +34,12 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
-           / Typing / Read / Call / Media / Pin / List / Tunnel / Push
+           / Typing / Read / Call / Media / Pin / List / Tunnel / Push / Receipt
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
-                                                           ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off); absent = 0
+                                                           ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off,
+                                                           ; 131072 receipts); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded, 16 timer off)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
@@ -73,6 +74,7 @@ Pin        = { 0 => 27, 3 => bstr, 5 => uint, ? 6 => uint }  ; conversation id, 
 List       = { 0 => 28, 2 => bstr }                        ; a shared list's state, see *Lists*
 Tunnel     = { 0 => 29, 2 => bstr }                        ; one WireGuard packet, Appendix D
 Push       = { 0 => 30, 2 => bstr .cbor PushReg }         ; wake-up endpoint or its withdrawal, mutual contacts only, Appendix R
+Receipt    = { 0 => 31, 2 => bstr .cbor ReceiptMsg }      ; delivery and read receipts, live or sealed, Appendix H
 
 GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint }
           ; kind (1 key-package request, 2 key package, 3 welcome, 4 MLS message, 5 forward, 6 receipt),
@@ -81,6 +83,10 @@ GroupWire = { 0 => 1..6, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bs
 PushReg = { ? 1 => tstr, ? 2 => bstr .size 65, ? 3 => bstr .size 16, ? 4 => uint, ? 5 => uint }
           ; endpoint URL, Web Push p256dh and auth (both or neither), cover wake-ups per day (≤ 24),
           ; expires_ms; empty = withdrawn (Appendix R)
+
+ReceiptMsg = { ? 0 => bstr, ? 1 => bstr }
+          ; delivered ids, read ids: the sender's message ids, 8 bytes each (big-endian),
+          ; ≤ 512 per list, ≥ 1 in all (Appendix H, *Receipts*)
 ```
 
 `Tunnel` (`{ 0 => 29, 2 => bstr }`) carries one WireGuard packet for the tunnel with the peer (Appendix D, *Over the session*), only to devices whose `Hello` has bit 8192. It is sent at once even under cover traffic, like call media. On QUIC sessions the same packets go as QUIC datagrams when they fit, recognised by WireGuard's header (a message type from 1 to 4, then three zero bytes) rather than a call id.

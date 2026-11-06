@@ -29,6 +29,7 @@ pub mod prekey;
 pub mod preview;
 pub mod push;
 pub mod ratchet;
+pub mod receipt;
 pub mod rendezvous;
 #[cfg(test)]
 mod robustness;

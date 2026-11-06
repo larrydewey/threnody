@@ -107,6 +107,9 @@ pub const FEATURE_TIMED_PROBES: u64 = 32768;
 /// The peer marks a disappearing timer it turned off with [`TIMER_OFF`],
 /// so a `Text` from it with no timer means it never chose one.
 pub const FEATURE_TIMER_OFF: u64 = 65536;
+/// The peer understands `AppMessage::Receipt` (delivery and read receipts,
+/// live or sealed through mailboxes, Appendix H).
+pub const FEATURE_RECEIPTS: u64 = 131072;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -262,6 +265,10 @@ pub enum AppMessage {
     /// we withdrew it. Only to a mutually approved peer whose `Hello` has
     /// [`FEATURE_PUSH`].
     Push(Vec<u8>),
+    /// Delivery and read receipts ([`crate::receipt::Receipt`]). Only to
+    /// peers whose `Hello` has [`FEATURE_RECEIPTS`]; may be sealed for a
+    /// mailbox.
+    Receipt(Vec<u8>),
     /// A profile or a revealed identity ([`crate::persona::IdentityMsg`]).
     Identity(Vec<u8>),
     /// `inner`, which the receiver acknowledges by `id` and delivers once
@@ -363,6 +370,7 @@ mod kind {
     pub const LIST: u64 = 28;
     pub const TUNNEL: u64 = 29;
     pub const PUSH: u64 = 30;
+    pub const RECEIPT: u64 = 31;
 }
 
 impl AppMessage {
@@ -604,6 +612,10 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::PUSH)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Receipt(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::RECEIPT)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Identity(payload) => {
                     e.map_len(2)?.u8(0)?.uint(kind::IDENTITY)?;
                     e.u8(2)?.bytes(payload)?;
@@ -674,6 +686,7 @@ impl AppMessage {
             | Self::Media(p)
             | Self::Tunnel(p)
             | Self::Push(p)
+            | Self::Receipt(p)
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
@@ -850,6 +863,7 @@ impl AppMessage {
             | kind::DIRECTORY
             | kind::LIST
             | kind::PUSH
+            | kind::RECEIPT
             | kind::IDENTITY => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
@@ -871,6 +885,7 @@ impl AppMessage {
                     Some(kind::MEDIA) => Self::Media(p),
                     Some(kind::TUNNEL) => Self::Tunnel(p),
                     Some(kind::PUSH) => Self::Push(p),
+                    Some(kind::RECEIPT) => Self::Receipt(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -1145,6 +1160,7 @@ mod tests {
             AppMessage::Media(vec![12]),
             AppMessage::Tunnel(vec![13]),
             AppMessage::Push(vec![14]),
+            AppMessage::Receipt(vec![1, 2, 3]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }
