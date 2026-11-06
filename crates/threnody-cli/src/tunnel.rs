@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use threnody_core::tunnel::{WgKeys, base64, overlay_addr};
 use threnody_core::{Identity, PublicIdentity};
-use threnody_net::node::{Secret, has_endpoint};
+use threnody_net::node::{Secret, TunnelPeer, has_endpoint};
 
 struct Peer {
     wg_public: [u8; 32],
@@ -99,6 +99,41 @@ impl Tunnels {
         }
         self.peers.insert(*peer.as_bytes(), p);
         self.write_conf()
+    }
+
+    /// Adds peers a node restored from its last run; returns how many.
+    /// The config gets every peer even when `wg set` fails (the interface
+    /// isn't up yet); then the first error is returned.
+    pub fn restore(&mut self, peers: Vec<(PublicIdentity, TunnelPeer)>) -> Result<usize> {
+        let n = peers.len();
+        let mut keys = Vec::with_capacity(n);
+        for (peer, tp) in peers {
+            keys.push(*peer.as_bytes());
+            self.peers.insert(
+                *peer.as_bytes(),
+                Peer {
+                    wg_public: tp.wg_public,
+                    endpoint: tp.seen.unwrap_or(tp.endpoint),
+                    overlay: tp.overlay,
+                    psk: tp.psk,
+                },
+            );
+        }
+        self.write_conf()?;
+        if self.apply {
+            let mut first = None;
+            for k in &keys {
+                if let Some(p) = self.peers.get(k)
+                    && let Err(e) = self.wg_set_peer(p)
+                {
+                    first.get_or_insert(e);
+                }
+            }
+            if let Some(e) = first {
+                return Err(e);
+            }
+        }
+        Ok(n)
     }
 
     pub fn down(&mut self, peer: &PublicIdentity, wg_public: Option<[u8; 32]>) -> Result<bool> {
@@ -243,6 +278,45 @@ mod tests {
                 .contains("[Peer]")
         );
         assert!(Tunnels::new(&me, dir.path(), "bad name; rm".into(), 1, false).is_err());
+    }
+
+    fn restored(peer: &PublicIdentity) -> TunnelPeer {
+        TunnelPeer {
+            wg_public: [9; 32],
+            endpoint: "192.0.2.1:51820".parse().unwrap(),
+            overlay: overlay_addr(peer),
+            psk: Secret(Zeroizing::new([5; 32])),
+            made_ms: 1,
+            seen: None,
+        }
+    }
+
+    #[test]
+    fn restore_writes_restored_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = Identity::from_seed(&[1; 32]);
+        let peer = Identity::from_seed(&[2; 32]).public();
+        let mut t = Tunnels::new(&me, dir.path(), "thr0".into(), 51820, false).unwrap();
+        assert_eq!(t.restore(vec![(peer, restored(&peer))]).unwrap(), 1);
+        let conf = std::fs::read_to_string(t.conf_path()).unwrap();
+        assert!(conf.contains("[Peer]"));
+        assert!(conf.contains(&format!("PresharedKey = {}", base64(&[5; 32]))));
+        assert!(conf.contains(&format!("AllowedIPs = {}/128", overlay_addr(&peer))));
+        assert!(conf.contains("Endpoint = 192.0.2.1:51820"));
+    }
+
+    /// With `--wg-apply` before the interface is up, `wg set` fails, yet
+    /// the config still gets the restored peers for `wg-quick up`.
+    #[test]
+    fn restore_writes_conf_even_when_wg_set_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = Identity::from_seed(&[1; 32]);
+        let peer = Identity::from_seed(&[2; 32]).public();
+        let mut t = Tunnels::new(&me, dir.path(), "thr0-test-x".into(), 51820, true).unwrap();
+        assert!(t.restore(vec![(peer, restored(&peer))]).is_err());
+        let conf = std::fs::read_to_string(t.conf_path()).unwrap();
+        assert!(conf.contains("[Peer]"));
+        assert!(conf.contains(&format!("AllowedIPs = {}/128", overlay_addr(&peer))));
     }
 
     #[test]
