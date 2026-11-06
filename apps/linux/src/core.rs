@@ -183,6 +183,8 @@ pub struct Persona {
     pub home: PathBuf,
     pub port: u16,
     alive: Arc<AtomicBool>,
+    /// Keeps other nodes (`threnody --persona … run`) off its directory.
+    _lock: std::fs::File,
 }
 
 pub struct Core {
@@ -657,6 +659,7 @@ impl Core {
             return Ok(());
         }
         let home = PathBuf::from(&rec.home);
+        let dir_lock = crate::lock_home(&home)?;
         let sealed =
             threnody_ffi::identity_is_sealed(rec.home.clone()).map_err(|e| e.to_string())?;
         let pw = if sealed {
@@ -694,6 +697,7 @@ impl Core {
                 home,
                 port,
                 alive,
+                _lock: dir_lock,
             },
         );
         self.say(format!(
