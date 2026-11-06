@@ -50,6 +50,9 @@ fn pipeline() -> String {
 /// `(width, height, RGBA bytes)` of a preview frame.
 type OnPreview = Box<dyn Fn(u32, u32, &[u8]) + Send + Sync>;
 type OnFound = Box<dyn Fn(String) + Send + Sync>;
+/// An error the running pipeline reported (a busy or unplugged camera,
+/// say), once.
+type OnFailed = Box<dyn Fn(String) + Send + Sync>;
 
 /// A camera reading QR codes.
 pub struct Scanner {
@@ -67,8 +70,15 @@ fn sample_size(sample: &gst::Sample) -> Option<(usize, usize)> {
 impl Scanner {
     /// Starts `source` (`camera::source(which)` in the app; tests pass a
     /// still image). `preview` gets mirrored RGBA frames, `found` the
-    /// first code's text, once.
-    pub fn start(source: gst::Element, preview: OnPreview, found: OnFound) -> Result<Self, String> {
+    /// first code's text, once, and `failed` the first error reported
+    /// after the start (a camera fails late: busy, unplugged, or with no
+    /// format the pipeline takes).
+    pub fn start(
+        source: gst::Element,
+        preview: OnPreview,
+        found: OnFound,
+        failed: OnFailed,
+    ) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
         let pipeline = gst::parse::launch(&pipeline())
             .map_err(|e| e.to_string())?
@@ -124,6 +134,18 @@ impl Scanner {
                 })
                 .build(),
         );
+        // Nothing else reads the bus: errors go to `failed`, the rest is
+        // dropped rather than queued for as long as the camera runs.
+        let bus = pipeline.bus().ok_or("no bus")?;
+        let reported = AtomicBool::new(false);
+        bus.set_sync_handler(move |_, msg| {
+            if let gst::MessageView::Error(e) = msg.view()
+                && !reported.swap(true, Ordering::Relaxed)
+            {
+                failed(e.error().to_string());
+            }
+            gst::BusSyncReply::Drop
+        });
         let scanner = Self { pipeline };
         scanner
             .pipeline
@@ -176,12 +198,20 @@ pub fn decode_file(path: &Path) -> Result<Option<String>, String> {
     Ok(decode_rgb(&viewer::load_bounded(path, DECODE_MAX)?))
 }
 
-/// The QR code in pasted image bytes, if any. The loader learns the size
-/// first: an image over [`viewer::MAX_PIXELS`] is refused before it is
-/// decoded, others are scaled to at most [`DECODE_MAX`]. Blocking: run it
-/// on a worker thread.
-pub fn decode_image_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
-    let loader = PixbufLoader::new();
+/// The QR code in pasted image bytes of type `mime` (one of
+/// [`IMAGE_TYPES`]), if any. Only that type's loader reads them: the
+/// bytes aren't sniffed, so another app can't reach every image loader
+/// installed. The loader learns the size first: an image over
+/// [`viewer::MAX_PIXELS`] is refused before it is decoded, others are
+/// scaled to at most [`DECODE_MAX`]. Blocking: run it on a worker thread.
+pub fn decode_image_bytes(mime: &str, bytes: &[u8]) -> Result<Option<String>, String> {
+    // Checked here too: a gdk-pixbuf built on glycin sniffs whatever
+    // type it was told.
+    if !is_image_type(mime, bytes) {
+        return Err("not a picture this computer can read".into());
+    }
+    let loader = PixbufLoader::with_mime_type(mime)
+        .map_err(|_| "not a picture this computer can read".to_owned())?;
     let too_big = Rc::new(Cell::new(false));
     let t = too_big.clone();
     loader.connect_size_prepared(move |l, w, h| {
@@ -219,10 +249,24 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Result<Option<String>, String> {
     }))
 }
 
+/// Whether `bytes` start as an image of type `mime` (one of
+/// [`IMAGE_TYPES`]) does.
+fn is_image_type(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/bmp" => bytes.starts_with(b"BM"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        _ => false,
+    }
+}
+
 /// What the camera thread hands the dialog.
 enum Seen {
     Frame(u32, u32, Vec<u8>),
     Found(String),
+    Failed(String),
 }
 
 /// The scan dialog; `found` gets the text of the first code.
@@ -233,6 +277,10 @@ pub struct ScanDialog {
     note: gtk::Label,
     scanner: RefCell<Option<Scanner>>,
     which: Cell<usize>,
+    /// Cameras found (counted off the main thread once).
+    cameras: Cell<usize>,
+    /// Bumped by each camera start: a slower, older start is dropped.
+    started: Cell<u64>,
     /// Closed, or a code was found: no camera starts any more.
     done: Cell<bool>,
     found: Box<dyn Fn(String)>,
@@ -300,6 +348,8 @@ impl ScanDialog {
             note,
             scanner: RefCell::new(None),
             which: Cell::new(0),
+            cameras: Cell::new(1),
+            started: Cell::new(0),
             done: Cell::new(false),
             found: Box::new(found),
         });
@@ -319,8 +369,11 @@ impl ScanDialog {
         switch.connect_clicked(move |_| {
             if let Some(t) = weak.upgrade() {
                 t.stop_camera();
-                let n = camera::count().max(1);
+                let n = t.cameras.get().max(1);
                 t.which.set((t.which.get() + 1) % n);
+                t.status.set_title("Starting the camera…");
+                t.status.set_description(None);
+                t.status.set_visible(true);
                 t.start_camera();
             }
         });
@@ -350,7 +403,9 @@ impl ScanDialog {
         // Device enumeration can take a moment: off the main thread.
         let weak = Rc::downgrade(&this);
         ui::bg(camera::count, move |n| {
-            if n > 1 && weak.upgrade().is_some_and(|t| !t.done.get()) {
+            let Some(t) = weak.upgrade() else { return };
+            t.cameras.set(n);
+            if n > 1 && !t.done.get() {
                 switch.set_visible(true);
             }
         });
@@ -394,8 +449,13 @@ impl ScanDialog {
 
     fn start_camera(self: &Rc<Self>) {
         let (tx, rx) = async_channel::bounded::<Seen>(1);
-        let (frames, codes) = (tx.clone(), tx);
+        let (frames, codes, errors) = (tx.clone(), tx.clone(), tx);
         let which = self.which.get();
+        let generation = self.started.get() + 1;
+        self.started.set(generation);
+        // This start failed: a scanner arriving after its error is dropped.
+        let failed = Rc::new(Cell::new(false));
+        let failed2 = failed.clone();
         let weak = Rc::downgrade(self);
         ui::bg(
             move || {
@@ -408,12 +468,17 @@ impl ScanDialog {
                     Box::new(move |text| {
                         let _ = codes.send_blocking(Seen::Found(text));
                     }),
+                    Box::new(move |e| {
+                        let _ = errors.send_blocking(Seen::Failed(e));
+                    }),
                 )
             },
             move |r| {
                 let Some(t) = weak.upgrade() else { return };
+                let stale = t.done.get() || t.started.get() != generation || failed2.get();
                 match r {
-                    Ok(s) if t.done.get() => ui::bg_quiet(move || drop(s)),
+                    Ok(s) if stale => ui::bg_quiet(move || drop(s)),
+                    Err(_) if stale => {}
                     Ok(s) => {
                         t.status.set_visible(false);
                         *t.scanner.borrow_mut() = Some(s);
@@ -429,7 +494,7 @@ impl ScanDialog {
         glib::spawn_future_local(async move {
             while let Ok(seen) = rx.recv().await {
                 let Some(t) = weak.upgrade() else { return };
-                if t.done.get() {
+                if t.done.get() || t.started.get() != generation {
                     return;
                 }
                 match seen {
@@ -448,6 +513,16 @@ impl ScanDialog {
                     }
                     Seen::Found(text) => {
                         t.finish(text);
+                        return;
+                    }
+                    Seen::Failed(e) => {
+                        failed.set(true);
+                        t.stop_camera();
+                        t.preview.set_paintable(gdk::Paintable::NONE);
+                        t.show_status(
+                            "No camera",
+                            &format!("{e}. You can open an image of the code instead."),
+                        );
                         return;
                     }
                 }
@@ -499,9 +574,10 @@ impl ScanDialog {
         }
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let Ok((stream, _)) = cb.read_future(&types, glib::Priority::DEFAULT).await else {
+            let Ok((stream, mime)) = cb.read_future(&types, glib::Priority::DEFAULT).await else {
                 return;
             };
+            let mime = mime.to_string();
             let read = stream
                 .read_all_future(vec![0u8; PASTE_MAX + 1], glib::Priority::DEFAULT)
                 .await;
@@ -523,7 +599,7 @@ impl ScanDialog {
             };
             let weak = Rc::downgrade(&t);
             ui::bg(
-                move || decode_image_bytes(&bytes),
+                move || decode_image_bytes(&mime, &bytes),
                 move |r| {
                     if let Some(t) = weak.upgrade() {
                         t.decoded(r);
@@ -634,12 +710,21 @@ mod tests {
         let qr = dir.join("qr.png");
         qr_png(LINK, &qr);
         let bytes = std::fs::read(&qr).unwrap();
-        assert_eq!(decode_image_bytes(&bytes), Ok(Some(LINK.to_owned())));
-        assert!(decode_image_bytes(&fake_png(20_000, 20_000)).is_err());
+        assert_eq!(
+            decode_image_bytes("image/png", &bytes),
+            Ok(Some(LINK.to_owned()))
+        );
+        assert!(decode_image_bytes("image/png", &fake_png(20_000, 20_000)).is_err());
+        // Only the type asked for is read: a PNG offered as a JPEG, or
+        // an SVG offered as a PNG, isn't sniffed and decoded anyway.
+        assert!(decode_image_bytes("image/jpeg", &bytes).is_err());
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="white"/></svg>"#;
+        assert!(decode_image_bytes("image/png", svg).is_err());
+        assert!(decode_image_bytes("image/svg+xml", svg).is_err());
         let noise: Vec<u8> = (0..4096u32)
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
             .collect();
-        assert!(decode_image_bytes(&noise).is_err());
+        assert!(decode_image_bytes("image/png", &noise).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -682,6 +767,7 @@ mod tests {
             Box::new(move |text| {
                 let _ = tx.lock().unwrap().send(text);
             }),
+            Box::new(|_| {}),
         )
         .unwrap();
         let got = rx.recv_timeout(std::time::Duration::from_secs(5));
@@ -700,6 +786,44 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_failing_after_the_start_is_reported() {
+        let needed = ["videotestsrc", "identity", "videoconvert", "appsink"];
+        if gst::init().is_err()
+            || needed
+                .iter()
+                .any(|e| gst::ElementFactory::find(e).is_none())
+        {
+            eprintln!("skipped: GStreamer or one of {needed:?} is missing");
+            return;
+        }
+        // A source that fails on its streaming thread after a few
+        // frames, once the pipeline has started, as a busy or unplugged
+        // camera does.
+        let source =
+            gst::parse::bin_from_description("videotestsrc ! identity error-after=3", true)
+                .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let scanner = Scanner::start(
+            source.upcast(),
+            Box::new(|_, _, _| {}),
+            Box::new(|_| {}),
+            Box::new(move |e| {
+                let _ = tx.lock().unwrap().send(e);
+            }),
+        )
+        .unwrap();
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(got.is_ok(), "no error reported");
+        // Once, though the source fails too.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err()
+        );
+        drop(scanner);
+    }
+
+    #[test]
     #[ignore = "needs a camera"]
     fn scanner_opens_the_camera() {
         let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -709,6 +833,7 @@ mod tests {
             Box::new(move |_, _, _| {
                 f.fetch_add(1, Ordering::Relaxed);
             }),
+            Box::new(|_| {}),
             Box::new(|_| {}),
         )
         .unwrap();

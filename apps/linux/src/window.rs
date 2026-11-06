@@ -2428,6 +2428,9 @@ impl App {
         };
         let d = ui::alert(heading, &body, &[("cancel", "Not now"), ("ok", action)]);
         d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        // The offer appears unasked, maybe while typing, and someone else
+        // may have chosen the link: Enter must not act on it.
+        d.set_default_response(Some("cancel"));
         let weak = Rc::downgrade(self);
         d.connect_response(None, move |_, r| {
             let (Some(this), "ok") = (weak.upgrade(), r) else {
@@ -3897,7 +3900,6 @@ impl App {
     }
 }
 
-/// A heading between groups of search results.
 /// The clipboard's text, if it offers plain text and holds no more than
 /// a link can be. Reads at most [`links::CLIP_READ_MAX`] bytes: another
 /// app can put hundreds of MB there.
@@ -3919,6 +3921,7 @@ async fn read_clip(cb: &gtk::gdk::Clipboard) -> Option<String> {
     }
 }
 
+/// A heading between groups of search results.
 fn heading_row(text: &str) -> gtk::ListBoxRow {
     let l = gtk::Label::new(Some(text));
     l.set_xalign(0.0);

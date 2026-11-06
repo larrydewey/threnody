@@ -592,7 +592,10 @@ impl Editor {
             let Some(this) = this.upgrade() else {
                 return;
             };
-            if let Some(i) = this.sketch.borrow().selected {
+            // Copied out first: a borrow in the condition would last
+            // through the block and the borrow_mut would panic.
+            let selected = this.sketch.borrow().selected;
+            if let Some(i) = selected {
                 this.sketch.borrow_mut().begin_place(i);
             }
         });
@@ -613,7 +616,8 @@ impl Editor {
             let Some(this) = this.upgrade() else {
                 return;
             };
-            if let Some(i) = this.sketch.borrow().selected {
+            let selected = this.sketch.borrow().selected;
+            if let Some(i) = selected {
                 this.sketch.borrow_mut().end_place(i);
             }
             this.changed();
@@ -626,8 +630,9 @@ impl Editor {
             let Some(this) = this.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            let selected = this.sketch.borrow().selected;
             if key == gdk::Key::Delete
-                && let Some(i) = this.sketch.borrow().selected
+                && let Some(i) = selected
             {
                 this.sketch.borrow_mut().set_text(i, "");
                 this.changed();

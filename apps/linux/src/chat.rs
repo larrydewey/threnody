@@ -3580,7 +3580,12 @@ impl ChatView {
                     };
                     let at = Some(location.display().to_string());
                     match send_file_to(&node, &dest, name.clone(), data, at, options) {
-                        Err(e) => failed.push(format!("{name}: {e}")),
+                        Err(e) => {
+                            if draft {
+                                let _ = std::fs::remove_file(&location);
+                            }
+                            failed.push(format!("{name}: {e}"));
+                        }
                         Ok(()) if draft => {
                             if let Err(e) = core::adopt_edit(p, &location) {
                                 core.say(format!("! keeping an edited photo: {e}"));

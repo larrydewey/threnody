@@ -124,8 +124,96 @@ pub fn to_cairo_argb(
     (out, out_stride)
 }
 
-/// Thumbnails decoded so far, by file, for as long as their view lives.
-pub type Thumbs = Rc<RefCell<HashMap<PathBuf, gdk::Texture>>>;
+/// A file as it is now: a name freed by the sweeper is reused for the
+/// next file saved under it, so the size and modification time keep a
+/// new file from showing the old one's cached pixels.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct FileKey {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl FileKey {
+    /// `None` when the file can't be read.
+    pub fn of(path: &Path) -> Option<Self> {
+        let m = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            modified: m.modified().ok(),
+            len: m.len(),
+        })
+    }
+}
+
+/// A cache holding at most `budget` units (bytes of pixels here),
+/// dropping the least recently used entries first.
+pub struct Lru<K, V> {
+    map: HashMap<K, (V, usize, u64)>,
+    used: usize,
+    budget: usize,
+    tick: u64,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> Lru<K, V> {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            used: 0,
+            budget,
+            tick: 0,
+        }
+    }
+
+    pub fn get(&mut self, k: &K) -> Option<V> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(k).map(|e| {
+            e.2 = tick;
+            e.0.clone()
+        })
+    }
+
+    pub fn insert(&mut self, k: K, v: V, cost: usize) {
+        self.tick += 1;
+        if let Some(old) = self.map.insert(k, (v, cost, self.tick)) {
+            self.used -= old.1;
+        }
+        self.used += cost;
+        while self.used > self.budget && self.map.len() > 1 {
+            let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.2)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(e) = self.map.remove(&oldest) {
+                self.used -= e.1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Pixels a view's thumbnail cache may hold: 96 MB, about sixty 640 px
+/// photos or four hundred grid cells.
+const THUMB_BUDGET: usize = 96 << 20;
+
+/// Thumbnails decoded so far, for as long as their view lives.
+#[derive(Clone)]
+pub struct Thumbs(Rc<RefCell<Lru<FileKey, gdk::Texture>>>);
+
+impl Default for Thumbs {
+    fn default() -> Self {
+        Self(Rc::new(RefCell::new(Lru::new(THUMB_BUDGET))))
+    }
+}
 
 /// Fills `pic` with a picture of `path` no more than `side` pixels on its
 /// long side, decoded off the main thread. `bound` belongs to the cell
@@ -140,8 +228,10 @@ pub fn thumbnail(
     cache: Thumbs,
 ) {
     *bound.borrow_mut() = Some(path.clone());
-    if let Some(t) = cache.borrow().get(&path) {
-        pic.set_paintable(Some(t));
+    let key = FileKey::of(&path);
+    let hit = key.as_ref().and_then(|k| cache.0.borrow_mut().get(k));
+    if let Some(t) = hit {
+        pic.set_paintable(Some(&t));
         return;
     }
     pic.set_paintable(gdk::Paintable::NONE);
@@ -152,7 +242,10 @@ pub fn thumbnail(
         move |r| {
             let Ok(d) = r else { return };
             let t = d.texture();
-            cache.borrow_mut().insert(path.clone(), t.clone());
+            if let Some(k) = key {
+                let cost = (t.width().max(1) as usize) * (t.height().max(1) as usize) * 4;
+                cache.0.borrow_mut().insert(k, t.clone(), cost);
+            }
             if bound.borrow().as_ref() == Some(&path)
                 && let Some(pic) = weak.upgrade()
             {
@@ -672,6 +765,37 @@ fn edited(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_thumbnail_cache_drops_the_least_recently_used() {
+        let mut c = Lru::new(3);
+        c.insert("a", 1, 1);
+        c.insert("b", 2, 1);
+        c.insert("c", 3, 1);
+        assert_eq!(c.get(&"a"), Some(1));
+        c.insert("d", 4, 1);
+        assert_eq!(c.get(&"b"), None, "b was used least recently");
+        assert_eq!(c.get(&"a"), Some(1));
+        assert_eq!(c.len(), 3);
+        // One entry over the budget is still kept: it is being shown.
+        c.insert("big", 5, 10);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get(&"big"), Some(5));
+    }
+
+    #[test]
+    fn a_file_saved_under_a_reused_name_is_a_new_key() {
+        let dir = temp_dir("filekey");
+        let p = dir.join("photo.jpg");
+        std::fs::write(&p, b"first").unwrap();
+        let a = FileKey::of(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"second photo").unwrap();
+        let b = FileKey::of(&p).unwrap();
+        assert_ne!(a, b);
+        assert!(FileKey::of(&dir.join("gone.jpg")).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     pub fn temp_dir(what: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

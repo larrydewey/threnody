@@ -900,18 +900,18 @@ impl Core {
         self.edit_dir(persona).is_some_and(|d| path.starts_with(d))
     }
 
-    /// Where a sent edited photo is kept (with received photos). Nothing
-    /// is moved yet: see [`adopt_edit`].
+    /// Where a sent edited photo is kept (with received photos), reserved
+    /// with an empty file so a received file can't take the name while
+    /// the photo is sent. The draft moves there with [`adopt_edit`]; if
+    /// the send fails, remove the placeholder.
     pub fn edit_destination(&self, persona: Option<&str>, draft: &Path) -> Result<PathBuf, String> {
         let home = self
             .identity_home(persona)
             .ok_or("that anonymous identity isn't open")?;
-        let media = home.join("media");
-        std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
         let name = draft
             .file_name()
             .map_or_else(|| "edited.jpg".into(), |n| n.to_string_lossy().into_owned());
-        Ok(free_path(&media, &name))
+        reserve_draft(&home.join("media"), &name).map_err(|e| e.to_string())
     }
 
     /// Where to record a voice or video message, beside received photos.
@@ -942,10 +942,19 @@ impl Core {
                 .unwrap_or_else(|| self.home.join("downloads"))
                 .join("Threnody")
         };
-        let path = free_path(&dir, name);
-        let saved = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, data));
+        // A new file, never one already there (an edited photo being
+        // sent reserves its name in media/ before it is moved in).
+        let saved = std::fs::create_dir_all(&dir)
+            .and_then(|()| create_free(&dir, name, 0o666))
+            .and_then(|(path, mut f)| {
+                use std::io::Write;
+                f.write_all(data).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&path);
+                })?;
+                Ok(path)
+            });
         match saved {
-            Ok(()) => Some(path.display().to_string()),
+            Ok(path) => Some(path.display().to_string()),
             Err(e) => {
                 self.say(format!("! saving {name}: {e}"));
                 None
@@ -1441,33 +1450,46 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
 /// Creates a new file for a draft in `dir` (made 0700 if new): `name`,
 /// or a numbered one if that is taken, mode 0600.
 fn reserve_draft(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
+    create_free(dir, name, 0o600).map(|(path, _)| path)
+}
+
+/// Creates a new file in `dir`: `name`, or a numbered one if that is
+/// taken. Never opens a file that is already there, even one created
+/// between the check and the open.
+fn create_free(dir: &Path, name: &str, mode: u32) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
     for _ in 0..100 {
         let path = free_path(dir, name);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&path)
         {
-            Ok(_) => return Ok(path),
+            Ok(f) => return Ok((path, f)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::other("no free name for the edited photo"))
+    Err(std::io::Error::other(format!("no free name for {name}")))
 }
 
-/// Keeps a sent edited photo at `dest` (in `media/`) and removes the
-/// draft. A link, not a rename: it fails rather than replace a file
-/// already at `dest`.
+/// Moves a sent edited photo from its draft to `dest`, the empty file
+/// [`Core::edit_destination`] reserved in `media/`. Fails rather than
+/// replace a file with anything in it.
 pub fn adopt_edit(draft: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::hard_link(draft, dest)?;
-    std::fs::remove_file(draft)
+    if std::fs::metadata(dest)?.len() != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "another file has that name",
+        ));
+    }
+    std::fs::rename(draft, dest)
 }
 
 /// Removes the files in `dir`, ignoring errors.
@@ -1683,7 +1705,11 @@ mod tests {
         std::fs::create_dir_all(&media).unwrap();
         let draft = edited.join("a-edited.jpg");
         std::fs::write(&draft, b"jpeg").unwrap();
-        let dest = media.join("a-edited.jpg");
+        let dest = reserve_draft(&media, "a-edited.jpg").unwrap();
+        assert_eq!(dest, media.join("a-edited.jpg"));
+        // The reserved name is taken: a received file gets another.
+        let other = create_free(&media, "a-edited.jpg", 0o666).unwrap().0;
+        assert_eq!(other, media.join("a-edited (1).jpg"));
         adopt_edit(&draft, &dest).unwrap();
         assert!(!draft.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg");
