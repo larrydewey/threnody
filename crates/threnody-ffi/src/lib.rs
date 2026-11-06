@@ -4582,6 +4582,7 @@ mod tests {
                 "Nfc.kt",
                 include_str!("../../../apps/android/app/src/main/java/org/threnody/app/Nfc.kt"),
             ),
+            ("project.yml", include_str!("../../../apps/ios/project.yml")),
         ] {
             assert!(text.contains(&hex), "{file} doesn't name AID {hex}");
         }

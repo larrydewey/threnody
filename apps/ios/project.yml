@@ -26,6 +26,8 @@ targets:
       - sdk: SystemConfiguration.framework
       - sdk: CoreFoundation.framework
       - sdk: libresolv.tbd
+      # Tapping an Android phone that shows its invite (Appendix T).
+      - sdk: CoreNFC.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.threnody.app
@@ -35,6 +37,13 @@ targets:
         DEVELOPMENT_TEAM: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    # NFC tag reading (Appendix T). Signed device builds need a paid team
+    # for this capability; CI builds for the simulator, unsigned.
+    entitlements:
+      path: Threnody/Threnody.entitlements
+      properties:
+        com.apple.developer.nfc.readersession.formats:
+          - TAG
     info:
       path: Threnody/Info.plist
       properties:
@@ -46,6 +55,10 @@ targets:
           - UIInterfaceOrientationPortrait
         NSCameraUsageDescription: Threnody uses the camera to scan invite QR codes.
         NSLocalNetworkUsageDescription: Threnody connects directly to your contacts' devices on the local network.
+        NFCReaderUsageDescription: Threnody reads a nearby phone's invite when you tap phones to add a contact.
+        # The tap protocol's AID: must match threnody_core::tap::AID.
+        com.apple.developer.nfc.readersession.iso7816.select-identifiers:
+          - F0746872656E6F6479
         UIBackgroundModes:
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
