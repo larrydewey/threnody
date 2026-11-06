@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The tap protocol's AID (Appendix T): must match threnody_core::tap::AID.
+     Served only while the phone is unlocked. -->
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/nfc_invite_description"
+    android:requireDeviceUnlock="true">
+    <aid-group android:description="@string/nfc_invite_description" android:category="other">
+        <aid-filter android:name="F0746872656E6F6479" />
+    </aid-group>
+</host-apdu-service>

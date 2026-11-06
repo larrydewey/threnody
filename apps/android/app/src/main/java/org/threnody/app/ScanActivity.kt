@@ -26,12 +26,14 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
 import java.util.concurrent.atomic.AtomicBoolean
+import uniffi.threnody_ffi.NfcOutcome
 import uniffi.threnody_ffi.decodeQr
 
 /**
  * Scans a QR code with the camera (the platform camera2 API; decoding in
  * Rust) and returns its text as [RESULT]. Frames never leave the device
- * or this screen.
+ * or this screen. Meanwhile it listens for a tap from a phone showing its
+ * invite (Appendix T), which returns that invite with [TAPPED] set.
  */
 class ScanActivity : Activity() {
     private lateinit var preview: TextureView
@@ -43,14 +45,21 @@ class ScanActivity : Activity() {
     private val busy = AtomicBoolean(false)
     private val done = AtomicBoolean(false)
     private var size = Size(1280, 720)
+    private lateinit var bar: TopBar
+    /** The camera was asked for once: a refusal isn't asked again. */
+    private var asked = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Privacy.apply(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val bar = TopBar(this) { finish() }.apply {
+        bar = TopBar(this) { finish() }.apply {
             title.text = "Scan a QR code"
-            subtitle.text = "An invite or a device link code"
+            subtitle.text = when {
+                !NfcTap.available(this@ScanActivity) -> "An invite or a device link code"
+                NfcTap.enabled(this@ScanActivity) -> "An invite or a device link code · or hold your phone to theirs"
+                else -> "Turn on NFC to add by tapping phones"
+            }
             subtitle.visibility = android.view.View.VISIBLE
         }
         preview = TextureView(this)
@@ -66,8 +75,27 @@ class ScanActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // Before the camera: a tap works without it.
+        Threnody.running()?.let { node ->
+            NfcTap.start(this, node) { o ->
+                runOnUiThread {
+                    when (o) {
+                        is NfcOutcome.Tapped -> if (done.compareAndSet(false, true)) {
+                            tick(preview)
+                            found(o.peerLink, tapped = true, mutual = o.mutual)
+                        }
+                        is NfcOutcome.Failed -> if (!done.get()) {
+                            Toast.makeText(this, NfcTap.text(o.why), Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+        }
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            if (!asked) {
+                asked = true
+                requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            }
             return
         }
         whenReady { open() }
@@ -76,12 +104,18 @@ class ScanActivity : Activity() {
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
         if (results.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+            if (NfcTap.available(this)) {
+                // Still good for a tap.
+                bar.subtitle.text = "Camera off · hold your phone to theirs"
+                return
+            }
             Toast.makeText(this, "Scanning needs the camera. You can paste a link instead.", Toast.LENGTH_LONG).show()
             finish()
         }
     }
 
     override fun onPause() {
+        NfcTap.stop(this)
         close()
         super.onPause()
     }
@@ -179,8 +213,8 @@ class ScanActivity : Activity() {
         preview.setTransform(m)
     }
 
-    private fun found(text: String) {
-        setResult(RESULT_OK, Intent().putExtra(RESULT, text))
+    private fun found(text: String, tapped: Boolean = false, mutual: Boolean = true) {
+        setResult(RESULT_OK, Intent().putExtra(RESULT, text).putExtra(TAPPED, tapped).putExtra(MUTUAL, mutual))
         finish()
     }
 
@@ -200,5 +234,9 @@ class ScanActivity : Activity() {
 
     companion object {
         const val RESULT = "text"
+        /** The text came from a tap, not a QR code. */
+        const val TAPPED = "tapped"
+        /** For a tap: the other phone got our fingerprint too. */
+        const val MUTUAL = "mutual"
     }
 }

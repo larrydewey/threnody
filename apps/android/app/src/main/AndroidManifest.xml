@@ -34,6 +34,10 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <!-- Adding contacts by tapping phones (Appendix T); NFC is optional. -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
     <application
         android:name=".ThrenodyApplication"
         android:label="Threnody"
@@ -121,6 +125,16 @@
             <intent-filter>
                 <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
             </intent-filter>
+        </service>
+        <!-- Tap phones to swap invites (Appendix T). Disabled until "My
+             invite" is on screen; only the system's NFC stack binds to it. -->
+        <service android:name=".NfcInviteService" android:exported="true" android:enabled="false"
+            android:permission="android.permission.BIND_NFC_SERVICE">
+            <intent-filter>
+                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
+            </intent-filter>
+            <meta-data android:name="android.nfc.cardemulation.host_apdu_service"
+                android:resource="@xml/nfc_invite" />
         </service>
         <!-- WireGuard tunnels to approved contacts, over the overlay network only. -->
         <service android:name=".ThrenodyVpn" android:exported="false"

@@ -4564,4 +4564,26 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// The AID is written out in the platforms' manifests: they must match
+    /// `threnody_core::tap::AID`.
+    #[test]
+    fn nfc_aid_matches_platform_manifests() {
+        let hex: String = threnody_core::tap::AID
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        for (file, text) in [
+            (
+                "nfc_invite.xml",
+                include_str!("../../../apps/android/app/src/main/res/xml/nfc_invite.xml"),
+            ),
+            (
+                "Nfc.kt",
+                include_str!("../../../apps/android/app/src/main/java/org/threnody/app/Nfc.kt"),
+            ),
+        ] {
+            assert!(text.contains(&hex), "{file} doesn't name AID {hex}");
+        }
+    }
 }

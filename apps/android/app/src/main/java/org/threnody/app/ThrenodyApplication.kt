@@ -23,6 +23,10 @@ class ThrenodyApplication : Application() {
         // Warm up threading
         Threading.warmUp(this)
 
+        // A crash or kill while "My invite" showed must not leave the NFC
+        // invite service answering taps (Appendix T).
+        NfcShare.disarm(this)
+
         // Set default theme based on system setting
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
     }
