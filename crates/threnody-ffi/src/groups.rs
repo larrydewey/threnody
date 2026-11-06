@@ -567,6 +567,15 @@ impl ThrenodyNode {
         self.group_change(|gn| gn.transfer(&self.node, &g, p))
     }
 
+    /// Owner: hands the group to `peer`'s account and leaves it ("Choose a
+    /// new owner first"). Fails, changing nothing, while the group waits
+    /// for members to update.
+    pub fn transfer_group_ownership_and_leave(&self, group: String, peer: String) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let p = self.member(&g, &peer)?;
+        self.group_change(|gn| gn.transfer_and_leave(&self.node, &g, p))
+    }
+
     /// Owner: makes `peer`'s account (an admin) the successor, who may take
     /// over should the owner be silent for 14 days; `None` clears it.
     pub fn set_group_successor(&self, group: String, peer: Option<String>) -> Result<()> {

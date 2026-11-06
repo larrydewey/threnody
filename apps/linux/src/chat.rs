@@ -3875,10 +3875,7 @@ impl ChatView {
                         let fp = fp.clone();
                         t.run(
                             "hand over the group",
-                            move |n| {
-                                n.transfer_group_ownership(g.clone(), fp)?;
-                                n.leave_group(g)
-                            },
+                            move |n| n.transfer_group_ownership_and_leave(g, fp),
                             None,
                         );
                     },

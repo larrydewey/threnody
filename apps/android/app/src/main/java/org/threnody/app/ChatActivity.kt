@@ -693,10 +693,6 @@ class ChatActivity : Activity() {
                 is NodeEvent.CredentialFailed -> runOnUiThread {
                     Toast.makeText(this, "Credential: ${e.reason}", Toast.LENGTH_LONG).show()
                 }
-                is NodeEvent.GroupChangeFailed -> runOnUiThread {
-                    Toast.makeText(this, "Couldn't apply your change to ${info?.name ?: "the group"}: ${e.reason}",
-                        Toast.LENGTH_LONG).show()
-                }
                 is NodeEvent.GroupMembersChanged -> memberNotice(e)?.let { text ->
                     runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
                 }
@@ -2518,11 +2514,14 @@ class ChatActivity : Activity() {
                             .setMessage("${g.name} goes on without you. This can't be undone.")
                             .setPositiveButton("Leave") { _, _ ->
                                 Threading.background {
+                                    // Nothing changes if it can't go through
+                                    // yet (members still to update, say).
+                                    var done = false
                                     run("hand over the group") {
-                                        node.transferGroupOwnership(g.id, r.fingerprint)
-                                        node.leaveGroup(g.id)
+                                        node.transferGroupOwnershipAndLeave(g.id, r.fingerprint)
+                                        done = true
                                     }
-                                    runOnUiThread { finish() }
+                                    if (done) runOnUiThread { finish() }
                                 }
                             }
                             .setNegativeButton("Cancel", null)
