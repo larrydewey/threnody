@@ -23,6 +23,8 @@ use crate::sealed::{self, KdfParams};
 
 const FILE_VERSION: u64 = 1;
 const IDENTITY_PURPOSE: &str = "threnody v1 identity seed";
+/// The state file holding the contact book.
+pub(crate) const CONTACTS_STATE: &str = "contacts";
 
 enum IdentityFile {
     Plain(Zeroizing<[u8; 32]>),
@@ -47,6 +49,8 @@ impl Home {
         self.dir.join("identity.cbor")
     }
 
+    /// Where contacts were kept, unencrypted, before they became the
+    /// `contacts` state file (see [`Home::load_contacts`]).
     pub(crate) fn contacts_path(&self) -> PathBuf {
         self.dir.join("contacts.cbor")
     }
@@ -147,16 +151,36 @@ impl Home {
         }
     }
 
-    pub fn load_contacts(&self) -> Result<Contacts> {
+    /// Loads the contact book, kept encrypted like any state (the
+    /// `contacts` state file). A home from before that keeps it in plain
+    /// `contacts.cbor`: that is read, encrypted and deleted.
+    pub fn load_contacts(&self, identity: &Identity) -> Result<Contacts> {
+        let (contacts, legacy) = self.read_contacts(identity)?;
+        if legacy {
+            self.save_contacts(identity, &contacts)?;
+        } else {
+            secure_delete(&self.contacts_path())?;
+        }
+        Ok(contacts)
+    }
+
+    /// The contact book, and whether it came from plain `contacts.cbor`.
+    /// Writes nothing.
+    pub(crate) fn read_contacts(&self, identity: &Identity) -> Result<(Contacts, bool)> {
+        if let Some(b) = self.load_state(identity, CONTACTS_STATE)? {
+            return Ok((Contacts::decode(&b)?, false));
+        }
         match fs::read(self.contacts_path()) {
-            Ok(b) => Contacts::decode(&b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Contacts::default()),
+            Ok(b) => Ok((Contacts::decode(&b)?, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Contacts::default(), false)),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn save_contacts(&self, c: &Contacts) -> Result<()> {
-        write_private(&self.dir, &self.contacts_path(), &c.encode()?)
+    /// Stores the contact book encrypted (see [`Home::save_state`]).
+    pub fn save_contacts(&self, identity: &Identity, c: &Contacts) -> Result<()> {
+        self.save_state(identity, CONTACTS_STATE, &c.encode()?)?;
+        secure_delete(&self.contacts_path())
     }
 
     pub(crate) fn state_path(&self, name: &str) -> Result<PathBuf> {
@@ -205,7 +229,8 @@ impl Home {
         write_private(&self.dir, &self.identity_path(), bytes)
     }
 
-    /// Writes the contacts file exactly as [`Home::save_contacts`] stored it.
+    /// Writes a plain `contacts.cbor` exactly as stored (from before
+    /// contacts were encrypted).
     pub(crate) fn write_contacts_file(&self, bytes: &[u8]) -> Result<()> {
         write_private(&self.dir, &self.contacts_path(), bytes)
     }
@@ -911,7 +936,7 @@ mod tests {
         assert_eq!(home.load_identity(None).unwrap().public(), id.public());
 
         let peer = Identity::generate().public();
-        let mut c = home.load_contacts().unwrap();
+        let mut c = home.load_contacts(&id).unwrap();
         assert!(c.observe(peer, Some("10.0.0.1:7450".into()), 5));
         assert!(!c.observe(peer, None, 6));
         let ct = c.get_mut(&peer).unwrap();
@@ -923,8 +948,8 @@ mod tests {
         ct.blocked = true;
         ct.features = 1 << 16;
         assert!(!ct.accepted, "new contacts start as message requests");
-        home.save_contacts(&c).unwrap();
-        let loaded = home.load_contacts().unwrap();
+        home.save_contacts(&id, &c).unwrap();
+        let loaded = home.load_contacts(&id).unwrap();
         assert_eq!(loaded, c);
         assert!(matches!(loaded.find("alice"), Lookup::Found(_)));
         let fp = peer.fingerprint().to_string();
@@ -939,6 +964,54 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod contacts_at_rest_tests {
+    use super::*;
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn contacts_are_encrypted_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(Some(b"pw")).unwrap();
+        let peer = Identity::generate().public();
+        let mut c = Contacts::default();
+        c.observe(peer, Some("203.0.113.9:7450".into()), 5);
+        c.get_mut(&peer).unwrap().petname = Some("alice".into());
+        home.save_contacts(&id, &c).unwrap();
+
+        assert!(!home.contacts_path().exists());
+        for entry in fs::read_dir(home.dir()).unwrap() {
+            let bytes = fs::read(entry.unwrap().path()).unwrap();
+            assert!(!contains(&bytes, peer.as_bytes()));
+            assert!(!contains(&bytes, b"alice"));
+            assert!(!contains(&bytes, b"203.0.113.9"));
+        }
+        assert_eq!(home.load_contacts(&id).unwrap(), c);
+        // Someone else's seed can't read them.
+        assert!(home.load_contacts(&Identity::generate()).is_err());
+    }
+
+    #[test]
+    fn plain_contacts_from_before_are_encrypted_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = home.create_identity(None).unwrap();
+        let peer = Identity::generate().public();
+        let mut c = Contacts::default();
+        c.observe(peer, None, 5);
+        home.write_contacts_file(&c.encode().unwrap()).unwrap();
+
+        assert_eq!(home.load_contacts(&id).unwrap(), c);
+        assert!(!home.contacts_path().exists());
+        assert!(home.load_state(&id, CONTACTS_STATE).unwrap().is_some());
+        assert_eq!(home.load_contacts(&id).unwrap(), c);
     }
 }
 

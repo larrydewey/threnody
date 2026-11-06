@@ -1909,8 +1909,11 @@ PersistentKeepalive = 25\n",
     }
 
     /// Deletes a message request; they can write again as a new request.
+    /// Fails, changing nothing, if `peer` isn't a message request.
     pub fn delete_request(&self, peer: String) -> Result<()> {
-        self.node.delete_request(&self.resolve(&peer)?);
+        if !self.node.delete_request(&self.resolve(&peer)?) {
+            return Err(fail(format!("{peer:?} is not a message request")));
+        }
         Ok(())
     }
 

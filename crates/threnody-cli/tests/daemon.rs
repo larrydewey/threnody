@@ -27,10 +27,22 @@ struct Daemon {
 
 impl Daemon {
     fn start(home: &Path, extra: &[&str]) -> Self {
+        Self::start_at(home, &[], extra, None)
+    }
+
+    /// With `pre` before `run` (such as `--persona <id>`), and its control
+    /// socket at `control` (`$THRENODY_CONTROL`).
+    fn start_at(home: &Path, pre: &[&str], extra: &[&str], control: Option<&Path>) -> Self {
         let log = home.with_extension("log");
-        let child = Command::new(BIN)
+        let mut cmd = Command::new(BIN);
+        cmd.env_remove("THRENODY_CONTROL");
+        if let Some(c) = control {
+            cmd.env("THRENODY_CONTROL", c);
+        }
+        let child = cmd
             .arg("--home")
             .arg(home)
+            .args(pre)
             .args([
                 "run",
                 "--daemon",
@@ -41,13 +53,24 @@ impl Daemon {
                 "--no-cover",
             ])
             .args(extra)
-            .env_remove("THRENODY_CONTROL")
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&log).unwrap())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("start daemon");
         Self { child, log }
+    }
+
+    /// Waits for it to stop on its own; false if it doesn't in `secs`.
+    fn exits_within(&mut self, secs: u64) -> bool {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if self.child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     fn log(&self) -> String {
@@ -142,6 +165,19 @@ fn a_service_takes_commands_and_keeps_messages_out_of_its_log() {
         assert!(!log.contains("harbour"), "{log}");
         assert!(!log.contains("meet"), "{log}");
     }
+
+    // Deleting a conversation always names whose.
+    let (ok, _) = ctl(&a, &["/to", &b_fp]);
+    assert!(ok);
+    for verb in ["/block", "/delete"] {
+        let (ok, said) = ctl(&a, &[verb]);
+        assert!(!ok && said.contains("usage"), "{said}");
+    }
+    // A contact's conversation isn't a request to delete.
+    let (ok, said) = ctl(&a, &["/delete", &b_fp]);
+    assert!(!ok && said.contains("not a message request"), "{said}");
+    let (_, history) = ctl(&a, &["/history"]);
+    assert!(history.contains("meet at the harbour"), "{history}");
 }
 
 #[test]
@@ -150,4 +186,125 @@ fn ctl_without_a_service_says_so() {
     let out = threnody(dir.path(), &["ctl", "/peers"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no node running as a service"));
+}
+
+#[test]
+fn nothing_else_writes_to_a_data_directory_a_node_has_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    init(&a);
+    // Its socket elsewhere, so only the lock tells others it runs.
+    let node = Daemon::start_at(&a, &[], &[], Some(&dir.path().join("a.sock")));
+    node.wait_for("Running as a service");
+
+    let refused = |args: &[&str]| {
+        let out = threnody(&a, args);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{args:?} ran: {err}");
+        assert!(err.contains("already running"), "{args:?}: {err}");
+    };
+    // It would write its own contacts over these.
+    refused(&["revoke", "bob"]);
+    refused(&["approve", "bob"]);
+    refused(&["name", "bob", "robert"]);
+    refused(&["forget", "bob"]);
+    refused(&["restore", "--force", "--no-keyring", "some.backup"]);
+    refused(&["init", "--force", "--no-keyring"]);
+    // A second node, interactive or not.
+    refused(&[
+        "run",
+        "--listen",
+        "127.0.0.1:0",
+        "--no-discover",
+        "--no-rendezvous",
+    ]);
+
+    drop(node);
+    let out = threnody(&a, &["revoke", "bob"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no contact matches"), "{err}");
+}
+
+#[test]
+fn a_replaced_identity_starts_with_nothing_of_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let old = init(&a);
+    // State sealed under the old seed.
+    assert!(
+        threnody(&a, &["invite", "127.0.0.1:1", "--no-qr"])
+            .status
+            .success()
+    );
+    std::fs::create_dir_all(a.join("downloads")).unwrap();
+    std::fs::write(a.join("downloads/photo.jpg"), b"jpeg").unwrap();
+
+    let out = threnody(&a, &["init", "--force", "--no-keyring"]);
+    assert!(out.status.success(), "{out:?}");
+    let new = threnody(&a, &["id"]);
+    assert!(!String::from_utf8_lossy(&new.stdout).contains(&old));
+    let invite = threnody(&a, &["invite", "127.0.0.1:1", "--no-qr"]);
+    assert!(invite.status.success(), "{invite:?}");
+    let run = threnody(
+        &a,
+        &[
+            "run",
+            "--listen",
+            "127.0.0.1:0",
+            "--no-discover",
+            "--no-rendezvous",
+        ],
+    );
+    assert!(run.status.success(), "{run:?}");
+    assert!(a.join("downloads/photo.jpg").exists());
+}
+
+#[test]
+fn an_anonymous_identity_burns_itself_when_its_time_is_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    init(&a);
+    let made = threnody(
+        &a,
+        &[
+            "persona",
+            "new",
+            "brief",
+            "--burn-after",
+            "4s",
+            "--no-keyring",
+        ],
+    );
+    assert!(made.status.success(), "{made:?}");
+    let made = String::from_utf8_lossy(&made.stdout).into_owned();
+    let id = made
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or_else(|| panic!("no persona id in {made:?}"))
+        .to_owned();
+
+    let mut node = Daemon::start_at(
+        &a,
+        &["--persona", &id],
+        &[],
+        Some(&dir.path().join("p.sock")),
+    );
+    node.wait_for("Running as a service");
+    // Not under its running node.
+    let burn = threnody(&a, &["persona", "burn", &id]);
+    assert!(!burn.status.success());
+    assert!(
+        String::from_utf8_lossy(&burn.stderr).contains("already running"),
+        "{burn:?}"
+    );
+    assert!(a.join("personas").join(&id).exists());
+
+    assert!(node.exits_within(20), "still running past its time");
+    assert!(node.log().contains("time is up"), "{}", node.log());
+    assert!(!a.join("personas").join(&id).exists());
+    let list = threnody(&a, &["persona", "list"]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("No anonymous identities"),
+        "{list:?}"
+    );
 }

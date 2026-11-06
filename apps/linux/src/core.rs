@@ -183,6 +183,8 @@ pub struct Persona {
     pub home: PathBuf,
     pub port: u16,
     alive: Arc<AtomicBool>,
+    /// Keeps other nodes (`threnody --persona … run`) off its directory.
+    _lock: std::fs::File,
 }
 
 pub struct Core {
@@ -626,9 +628,18 @@ impl Core {
     // ----- Anonymous identities -----
 
     fn open_personas(self: &Arc<Self>) {
+        let homes: HashMap<String, PathBuf> = self
+            .personas()
+            .into_iter()
+            .map(|r| (r.id, PathBuf::from(r.home)))
+            .collect();
         match self.main.burn_expired_personas() {
             Ok(burned) => {
                 for id in burned {
+                    // Its keyring entry would show it existed.
+                    if let Some(h) = homes.get(&id) {
+                        keyring::delete(h);
+                    }
                     self.say(format!(
                         "* burned expired anonymous identity {}",
                         short(&id)
@@ -652,6 +663,7 @@ impl Core {
             return Ok(());
         }
         let home = PathBuf::from(&rec.home);
+        let dir_lock = crate::lock_home(&home)?;
         let sealed =
             threnody_ffi::identity_is_sealed(rec.home.clone()).map_err(|e| e.to_string())?;
         let pw = if sealed {
@@ -689,6 +701,7 @@ impl Core {
                 home,
                 port,
                 alive,
+                _lock: dir_lock,
             },
         );
         self.say(format!(
@@ -718,24 +731,23 @@ impl Core {
         Ok(())
     }
 
-    /// Makes and starts an anonymous identity, sealed with a keyring key of
-    /// its own (as the CLI does).
+    /// Makes and starts an anonymous identity, sealed from its first
+    /// write with a keyring key of its own (as the CLI does).
     pub fn create_persona(
         self: &Arc<Self>,
         label: &str,
         expires_ms: Option<u64>,
     ) -> Result<String, String> {
+        let pw = keyring::random();
         let rec = self
             .main
-            .create_persona(label.into(), expires_ms, None)
+            .create_persona(label.into(), expires_ms, Some(pw.0.clone()))
             .map_err(|e| e.to_string())?;
-        let home = PathBuf::from(&rec.home);
-        match keyring::create(&home) {
-            Ok(pw) => {
-                threnody_ffi::change_passphrase(rec.home.clone(), None, Some(pw.0.clone()))
-                    .map_err(|e| e.to_string())?;
-            }
-            Err(e) => self.say(format!("! no keyring ({e}); its key is stored unprotected")),
+        if let Err(e) = keyring::store(&PathBuf::from(&rec.home), &pw) {
+            // Nowhere to keep its key.
+            threnody_ffi::change_passphrase(rec.home.clone(), Some(pw.0.clone()), None)
+                .map_err(|e| e.to_string())?;
+            self.say(format!("! no keyring ({e}); its key is stored unprotected"));
         }
         self.open_persona(&rec)?;
         let _ = self.ui.send_blocking(UiEvent::PersonasChanged);

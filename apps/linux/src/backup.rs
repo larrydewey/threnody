@@ -208,31 +208,133 @@ fn confirm(app: &Rc<App>, data: Vec<u8>, pw: String, info: &threnody_ffi::Backup
             let home = a.core.home.clone();
             let a = a.clone();
             ui::bg(
-                move || {
-                    // Sealed like the identity it replaces; a plain one is
-                    // sealed with a keyring key when Threnody next opens it.
-                    let seal = keyring::get(&home).map(|s| s.0.clone());
-                    threnody_ffi::stage_restore(home.display().to_string(), data, pw, seal)
-                        .map_err(|e| e.to_string())
-                },
-                move |r| match r {
-                    Ok(_) => {
-                        let d = ui::alert(
-                            "Ready to restore",
-                            "Threnody will now close. Open it again to finish restoring.",
-                            &[("quit", "Close Threnody")],
-                        );
-                        let w = a.window.clone();
-                        d.connect_response(None, move |_, _| {
-                            if let Some(app) = w.application() {
-                                app.activate_action("quit", None);
-                            }
-                        });
-                        d.present(Some(&a.window));
-                    }
-                    Err(e) => a.toast(&format!("Couldn't restore: {e}")),
+                move || current_seal(&home),
+                move |seal| match seal {
+                    Seal::Keyring(key) => stage(&a, data, pw, Some(key)),
+                    Seal::Plain => stage(&a, data, pw, None),
+                    Seal::Passphrase => ask_identity_passphrase(&a, data, pw),
                 },
             );
         },
     );
+}
+
+/// How the restored identity is sealed: as the one it replaces.
+#[derive(Debug, PartialEq)]
+enum Seal {
+    /// With the keyring's key for this data directory.
+    Keyring(String),
+    /// With the user's own passphrase, which only they know: asked for.
+    Passphrase,
+    /// Not at all, as the user chose (a keyring key seals it when
+    /// Threnody next opens it, if there is a keyring by then).
+    Plain,
+}
+
+/// `sealed`: whether the current identity is sealed. `keyring`: the
+/// keyring's key for this data directory, and whether it opens it.
+fn restore_seal(sealed: bool, keyring: Option<(String, bool)>) -> Seal {
+    match keyring {
+        Some((key, opens)) if opens || !sealed => Seal::Keyring(key),
+        _ if sealed => Seal::Passphrase,
+        _ => Seal::Plain,
+    }
+}
+
+fn current_seal(home: &std::path::Path) -> Seal {
+    let store = threnody_core::store::Home::new(home);
+    let sealed = store.identity_is_sealed().unwrap_or(false);
+    let key = keyring::get(home).map(|k| {
+        let opens = sealed && store.load_identity(Some(k.0.as_bytes())).is_ok();
+        (k.0.clone(), opens)
+    });
+    restore_seal(sealed, key)
+}
+
+/// The identity is sealed with the user's own passphrase, so the
+/// restored one will be too: asks for it, checked against the identity.
+fn ask_identity_passphrase(app: &Rc<App>, data: Vec<u8>, backup_pw: String) {
+    let d = ui::alert(
+        "Your passphrase",
+        "Your identity is protected with a passphrase. Type it to protect the restored \
+         identity the same way.",
+        &[("cancel", "Cancel"), ("ok", "Restore")],
+    );
+    d.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
+    let pw = entry("Passphrase");
+    d.set_extra_child(Some(&pw));
+    let a = app.clone();
+    d.connect_response(None, move |_, r| {
+        if r != "ok" {
+            return;
+        }
+        let (pw, data, backup_pw) = (pw.text().to_string(), data.clone(), backup_pw.clone());
+        let home = a.core.home.clone();
+        let a = a.clone();
+        ui::bg(
+            move || {
+                let store = threnody_core::store::Home::new(&home);
+                store
+                    .load_identity(Some(pw.as_bytes()))
+                    .is_ok()
+                    .then_some(pw)
+            },
+            move |r| match r {
+                Some(pw) => stage(&a, data, backup_pw, Some(pw)),
+                None => a.toast("Wrong passphrase"),
+            },
+        );
+    });
+    d.present(Some(&app.window));
+}
+
+/// Stages the restore, sealed under `seal`, and closes Threnody to finish.
+fn stage(app: &Rc<App>, data: Vec<u8>, pw: String, seal: Option<String>) {
+    let home = app.core.home.clone();
+    let a = app.clone();
+    ui::bg(
+        move || {
+            threnody_ffi::stage_restore(home.display().to_string(), data, pw, seal)
+                .map_err(|e| e.to_string())
+        },
+        move |r| match r {
+            Ok(_) => {
+                let d = ui::alert(
+                    "Ready to restore",
+                    "Threnody will now close. Open it again to finish restoring.",
+                    &[("quit", "Close Threnody")],
+                );
+                let w = a.window.clone();
+                d.connect_response(None, move |_, _| {
+                    if let Some(app) = w.application() {
+                        app.activate_action("quit", None);
+                    }
+                });
+                d.present(Some(&a.window));
+            }
+            Err(e) => a.toast(&format!("Couldn't restore: {e}")),
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restore_is_sealed_like_the_identity_it_replaces() {
+        let key = || Some(("k".to_owned(), true));
+        assert_eq!(restore_seal(true, key()), Seal::Keyring("k".into()));
+        // The user's own passphrase, with no keyring entry or a stale one.
+        assert_eq!(restore_seal(true, None), Seal::Passphrase);
+        assert_eq!(
+            restore_seal(true, Some(("old".into(), false))),
+            Seal::Passphrase
+        );
+        assert_eq!(
+            restore_seal(false, Some(("k".into(), false))),
+            Seal::Keyring("k".into())
+        );
+        assert_eq!(restore_seal(false, None), Seal::Plain);
+    }
 }

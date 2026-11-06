@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use threnody_core::invite::{InviteKey, InviteLink};
+use threnody_core::persona::Personas;
 use threnody_core::store::{Contact, Home, Lookup};
 use threnody_core::{Identity, safety_number};
 use threnody_net::AcceptPolicy;
@@ -59,7 +60,8 @@ struct Cli {
 enum Cmd {
     /// Create this device's identity.
     Init {
-        /// Replace an existing identity. Contacts will no longer recognise you.
+        /// Replace an existing identity, deleting its contacts, history and
+        /// anonymous identities. Contacts will no longer recognise you.
         #[arg(long)]
         force: bool,
         /// Protect the identity key with a passphrase (Argon2id) instead of
@@ -171,8 +173,10 @@ enum Cmd {
         /// Also use Bluetooth LE: advertise a private beacon, accept sessions, and connect to approved contacts nearby.
         #[arg(long)]
         ble: bool,
-        /// Join Wi-Fi Direct groups that approved contacts offer (through
-        /// NetworkManager; the Wi-Fi interface leaves its network meanwhile).
+        /// Join Wi-Fi Direct groups that nearby approved contacts offer
+        /// (through NetworkManager; the Wi-Fi interface leaves its network
+        /// meanwhile): those asked for with /wifi-direct request, others
+        /// after /wifi-direct join.
         #[arg(long)]
         wifi_direct: bool,
         /// Do not send or listen for LAN discovery beacons.
@@ -483,25 +487,23 @@ fn backup_passphrase(new: bool) -> Result<zeroize_string::Secret> {
     )?))
 }
 
-/// Fails if a node has `home` open: the desktop app (its lock) or
-/// `run --daemon` (its control socket). Holds the app's lock until dropped.
+/// Fails if a node has `home` open, else keeps any from opening it until
+/// the returned lock is dropped. Every node holds `desktop.lock` (named
+/// for the desktop app, which took it first) while it runs: `run`, with
+/// or without `--daemon`, and the desktop app. A daemon from before that
+/// only had its control socket, so that is tried too.
 fn no_node_running(home: &Home) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
         let path = chat::control_path(home);
         if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            bail!("a node is running here ({}); stop it first", path.display());
+            bail!(
+                "a node is already running here ({}); stop it first",
+                path.display()
+            );
         }
     }
-    std::fs::create_dir_all(home.dir())?;
-    let f = std::fs::File::create(home.dir().join("desktop.lock"))?;
-    if f.try_lock().is_err() {
-        bail!(
-            "Threnody is running with {}; quit it first",
-            home.dir().display()
-        );
-    }
-    Ok(f)
+    node_lock(home)
 }
 
 /// Asks for a new passphrase twice.
@@ -563,7 +565,23 @@ pub fn describe_contact(c: &Contact) -> String {
     format!("{:<40} {approval}, {verified}, last addr {addr}", c.label())
 }
 
+/// `println!` panics once stdout is a closed pipe (`threnody id | head
+/// -0`): stop quietly instead, as other command-line tools do.
+fn quiet_on_closed_stdout() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.payload().downcast_ref::<String>().map(String::as_str);
+        if msg.is_some_and(|m| {
+            m.starts_with("failed printing to stdout") && m.contains("Broken pipe")
+        }) {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
+}
+
 fn main() -> Result<()> {
+    quiet_on_closed_stdout();
     let cli = Cli::parse();
     let main_home = Home::new(cli.home.unwrap_or_else(default_home));
     // The desktop app stages a restore and quits; finish it if it hasn't.
@@ -578,15 +596,18 @@ fn main() -> Result<()> {
     }
     // As a persona, every command works on the persona's own home; the
     // main identity is kept only to sign a reveal (`/reveal`).
-    let (home, main_identity) = match &cli.persona {
+    let main_dir = main_home.dir().to_path_buf();
+    let (home, main_identity, persona_info) = match &cli.persona {
         Some(q) => {
             let main = load_identity(&main_home)?;
-            let personas = threnody_core::persona::Personas::new(&main_home, &main);
-            personas.burn_expired(threnody_core::now_ms())?;
+            let personas = Personas::new(&main_home, &main);
+            for id in burn_expired(&personas, threnody_core::now_ms())? {
+                eprintln!("Burned expired anonymous identity {id}.");
+            }
             let info = find_persona(&personas.list()?, q)?;
-            (personas.home(&info.id)?, Some(main))
+            (personas.home(&info.id)?, Some(main), Some(info))
         }
-        None => (main_home, None),
+        None => (main_home, None, None),
     };
     match cli.cmd {
         Cmd::Persona { .. } => unreachable!(),
@@ -597,10 +618,14 @@ fn main() -> Result<()> {
         } => {
             if home.has_identity() && !force {
                 bail!(
-                    "identity already exists in {} (use --force to replace)",
+                    "identity already exists in {} (--force replaces it and everything it kept)",
                     home.dir().display()
                 );
             }
+            let _lock = no_node_running(&home)?;
+            // What the old identity kept is sealed under its seed and
+            // names its contacts: none of it belongs to the new one.
+            home.wipe()?;
             let pw = identity_seal(&home, passphrase, no_keyring)?;
             let id = home.create_identity(pw.as_ref().map(|p| p.as_bytes()))?;
             println!("Created identity in {}", home.dir().display());
@@ -672,7 +697,7 @@ fn main() -> Result<()> {
             println!(
                 "Restored {} from a backup made {}.",
                 restored.identity.public().fingerprint(),
-                about(restored.created_ms)
+                made_ago(restored.created_ms, threnody_core::now_ms())
             );
         }
         Cmd::Passphrase { remove } => {
@@ -798,7 +823,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Contacts => {
-            let contacts = home.load_contacts()?;
+            let contacts = home.load_contacts(&load_identity(&home)?)?;
             let mut any = false;
             for c in contacts.iter() {
                 any = true;
@@ -808,9 +833,12 @@ fn main() -> Result<()> {
                 println!("No contacts yet.");
             }
         }
-        Cmd::Name { peer, name } => edit_contact(&home, &peer, |c| c.petname = Some(name))?,
+        Cmd::Name { peer, name } => {
+            let id = load_identity(&home)?;
+            edit_contact(&home, &id, &peer, |c| c.petname = Some(name))?
+        }
         Cmd::Approve { peer } => {
-            edit_contact(&home, &peer, |c| {
+            edit_contact(&home, &load_identity(&home)?, &peer, |c| {
                 c.local_approved = true;
                 c.approval_changed_ms = threnody_core::now_ms();
             })?;
@@ -819,7 +847,7 @@ fn main() -> Result<()> {
         Cmd::Revoke { peer } => {
             // Dated, so our other devices follow it rather than undo it,
             // and the discovery keys go as with any revocation.
-            edit_contact(&home, &peer, |c| {
+            edit_contact(&home, &load_identity(&home)?, &peer, |c| {
                 c.local_approved = false;
                 c.approval_changed_ms = threnody_core::now_ms();
                 c.clear_discovery_keys();
@@ -828,7 +856,7 @@ fn main() -> Result<()> {
         }
         Cmd::Verify { peer } => {
             let id = load_identity(&home)?;
-            let contacts = home.load_contacts()?;
+            let contacts = home.load_contacts(&id)?;
             let c = find_contact(&contacts, &peer)?;
             println!(
                 "Safety number with {}:\n\n  {}\n",
@@ -840,7 +868,7 @@ fn main() -> Result<()> {
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line)?;
             let ok = line.trim().eq_ignore_ascii_case("y");
-            edit_contact(&home, &peer, |c| c.verified = ok)?;
+            edit_contact(&home, &id, &peer, |c| c.verified = ok)?;
             println!(
                 "{}",
                 if ok {
@@ -851,7 +879,9 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Forget { peer } => {
-            let mut contacts = home.load_contacts()?;
+            let _lock = contacts_editable(&home)?;
+            let id = load_identity(&home)?;
+            let mut contacts = home.load_contacts(&id)?;
             let c = find_contact(&contacts, &peer)?;
             let (key, account) = (c.key, c.account);
             // Every device of their account, and the conversation.
@@ -864,7 +894,7 @@ fn main() -> Result<()> {
             for k in &keys {
                 contacts.forget(k, now);
             }
-            home.save_contacts(&contacts)?;
+            home.save_contacts(&id, &contacts)?;
             let conv = threnody_core::history::ConversationId::Peer(
                 account.map_or(*key.as_bytes(), |a| a.0),
             );
@@ -900,8 +930,25 @@ fn main() -> Result<()> {
             directory_threshold,
             daemon,
         } => {
+            // Two nodes with one identity would overwrite each other's
+            // sessions, prekeys and contacts.
+            let _lock = no_node_running(&home)?;
             let identity = load_identity(&home)?;
             let persona = main_identity.is_some();
+            // The main identity's node burns its expired anonymous
+            // identities as it runs; an anonymous identity's node stops
+            // when its own time is up, and burns it below.
+            let burn_personas: Option<chat::BurnExpired> = (!persona).then(|| {
+                let (dir, main) = (main_dir.clone(), Identity::from_seed(&identity.seed()));
+                Box::new(move || {
+                    let home = Home::new(&dir);
+                    burn_expired(&Personas::new(&home, &main), threnody_core::now_ms())
+                }) as chat::BurnExpired
+            });
+            let burn_self = main_identity
+                .as_ref()
+                .map(|m| Identity::from_seed(&m.seed()))
+                .zip(persona_info.clone());
             if persona && (!volunteer_relay.is_empty() || serve_directory.is_some()) {
                 bail!(
                     "anonymous identities can't volunteer or run a directory: both publish \
@@ -954,10 +1001,27 @@ fn main() -> Result<()> {
                 use_volunteers: !no_volunteers,
                 directory_threshold,
                 control,
+                expires_ms: persona_info.as_ref().and_then(|p| p.expires_ms),
+                burn_personas,
             }));
             // Don't wait on a stdin read still pending after a signal.
             rt.shutdown_timeout(std::time::Duration::from_secs(1));
             r?;
+            if let Some((main, info)) = burn_self
+                && info
+                    .expires_ms
+                    .is_some_and(|t| t <= threnody_core::now_ms())
+            {
+                // Its node (this one) has stopped; the lock is ours.
+                let main_home = Home::new(&main_dir);
+                let personas = Personas::new(&main_home, &main);
+                keyring::delete(&personas.home(&info.id)?);
+                personas.burn(&info.id)?;
+                println!(
+                    "Burned {} ({}): its time was up, and its keys and everything it kept are gone.",
+                    info.id, info.label
+                );
+            }
         }
         Cmd::Ctl { command } => ctl(&home, &command.join(" "))?,
     }
@@ -1024,13 +1088,54 @@ fn about(ms: u64) -> String {
     }
 }
 
+/// How long before `now_ms` something made at `at_ms` was made: "3 days
+/// ago", "under a minute ago" ("just now" when the clock is behind it).
+fn made_ago(at_ms: u64, now_ms: u64) -> String {
+    match now_ms.checked_sub(at_ms) {
+        Some(d) => format!("{} ago", about(d)),
+        None => "just now".into(),
+    }
+}
+
+/// Holds `home`'s node lock (see [`no_node_running`]) until dropped, or
+/// fails if a node has it.
+fn node_lock(home: &Home) -> Result<std::fs::File> {
+    std::fs::create_dir_all(home.dir())?;
+    let f = std::fs::File::create(home.dir().join("desktop.lock"))?;
+    if f.try_lock().is_err() {
+        bail!(
+            "a node is already running with {} (threnody run, or the app); stop it first",
+            home.dir().display()
+        );
+    }
+    Ok(f)
+}
+
+/// Burns the anonymous identities whose time is up, with their keyring
+/// entries; returns their ids. One whose node is running is left to it:
+/// the node stops at that time and burns it then.
+fn burn_expired(personas: &Personas, now_ms: u64) -> Result<Vec<String>> {
+    let mut burned = Vec::new();
+    for p in personas.list()? {
+        if !p.expires_ms.is_some_and(|t| t <= now_ms) {
+            continue;
+        }
+        let home = personas.home(&p.id)?;
+        let Ok(_lock) = node_lock(&home) else {
+            continue;
+        };
+        keyring::delete(&home);
+        personas.burn(&p.id)?;
+        burned.push(p.id);
+    }
+    Ok(burned)
+}
+
 fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
-    use threnody_core::persona::Personas;
     let main = load_identity(main_home)?;
     let personas = Personas::new(main_home, &main);
     let now = threnody_core::now_ms();
-    for id in personas.burn_expired(now)? {
-        keyring::delete(&personas.home(&id)?);
+    for id in burn_expired(&personas, now)? {
         println!("Burned expired anonymous identity {id}.");
     }
     match action {
@@ -1048,15 +1153,17 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
                 }
                 None => None,
             };
-            // Sealed like the main identity: with a keyring key of its own.
-            let (info, home, identity) = personas.create(&label, expires, None, now)?;
-            if !no_keyring {
-                match keyring::create(&home) {
-                    Ok(pw) => home.change_passphrase(None, Some(pw.as_bytes()))?,
-                    Err(e) => {
-                        eprintln!("No system keyring ({e:#}); its key is stored unprotected.")
-                    }
-                }
+            // Sealed like the main identity, from its first write: with a
+            // keyring key of its own.
+            let pw = (!no_keyring).then(keyring::random);
+            let (info, home, identity) =
+                personas.create(&label, expires, pw.as_ref().map(|p| p.as_bytes()), now)?;
+            if let Some(pw) = &pw
+                && let Err(e) = keyring::store(&home, pw)
+            {
+                // Nowhere to keep its key.
+                home.change_passphrase(Some(pw.as_bytes()), None)?;
+                eprintln!("No system keyring ({e:#}); its key is stored unprotected.");
             }
             println!("Anonymous identity {} ({label})", info.id);
             println!("Fingerprint: {}", identity.public().fingerprint());
@@ -1092,6 +1199,8 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
         PersonaCmd::Burn { persona } => {
             let info = find_persona(&personas.list()?, &persona)?;
             let home = personas.home(&info.id)?;
+            // Its running node would keep it reachable and write it back.
+            let _lock = node_lock(&home)?;
             keyring::delete(&home);
             personas.burn(&info.id)?;
             println!(
@@ -1108,12 +1217,41 @@ fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
     Ok(())
 }
 
-fn edit_contact(home: &Home, peer: &str, f: impl FnOnce(&mut Contact)) -> Result<()> {
-    let mut contacts = home.load_contacts()?;
+/// [`no_node_running`]; a running node keeps contacts in memory and
+/// would write over the change, so it has to make it.
+fn contacts_editable(home: &Home) -> Result<std::fs::File> {
+    no_node_running(home).map_err(|e| {
+        anyhow::anyhow!("{e}, or make the change through it (threnody ctl, or the app)")
+    })
+}
+
+fn edit_contact(
+    home: &Home,
+    identity: &Identity,
+    peer: &str,
+    f: impl FnOnce(&mut Contact),
+) -> Result<()> {
+    // A running node keeps contacts in memory and would write over this.
+    let _lock = contacts_editable(home)?;
+    let mut contacts = home.load_contacts(identity)?;
     let key = find_contact(&contacts, peer)?.key;
     if let Some(c) = contacts.get_mut(&key) {
         f(c);
     }
-    home.save_contacts(&contacts)?;
+    home.save_contacts(identity, &contacts)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_age_is_how_long_ago_it_was_made() {
+        // 2026-11-05, and a backup made two days before.
+        let now = 1_793_923_200_000;
+        assert_eq!(made_ago(now - 2 * 86_400_000, now), "2 days ago");
+        assert_eq!(made_ago(now - 5_000, now), "under a minute ago");
+        assert_eq!(made_ago(now + 5_000, now), "just now");
+    }
 }

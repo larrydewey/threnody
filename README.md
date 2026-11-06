@@ -108,7 +108,7 @@ To add a device to your account, run `/device add [host:port]` on a device you a
 
 **Message requests.** Messages from someone you haven't accepted are kept apart as requests. You accept someone by approving them, dialing their invite, or writing to them. `/requests` lists them, `/accept <peer>` takes them in, `/block <peer>` refuses that sender from then on and deletes the conversation, and `/delete <peer>` discards the request.
 
-You can also manage contacts outside a session with `threnody contacts | name | approve | revoke | verify | forget`.
+You can also manage contacts outside a session with `threnody contacts | name | approve | revoke | verify | forget`. While a node runs on the same data directory these refuse (it would write its own contacts over the change); use `threnody ctl` or the app instead. Only one node runs on a data directory at a time.
 
 **Metadata protection is on by default.** Every message is padded. Each session also sends one padded frame every 2 s, with cover traffic in the gaps, so an observer can't tell when you send. Each frame is about 2.7 kB, so that's roughly 230 MB a day per connected contact, both ways. Contacts are also reached through two-relay onion circuits first, whenever approved relays make one possible. Messages left in mailboxes for offline contacts go over such circuits too, so the mailbox doesn't learn who sent them. `--constant-rate-ms N` changes the interval, `--no-cover` turns cover traffic off, and `--no-onion` dials directly. Photos lose their location and camera details before they're sent. HEIC, AVIF and TIFF photos, whose details the node can't remove, aren't sent until converted to JPEG; `--keep-metadata` sends photos as they are. `--policy approved` only accepts mutually approved contacts.
 

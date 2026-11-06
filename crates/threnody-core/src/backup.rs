@@ -11,6 +11,9 @@
 //! `sealed` is the Argon2id + ChaCha20-Poly1305 format that also seals
 //! identities (`sealed.rs`). State files are copied as stored: they are
 //! encrypted under a key derived from the seed, which the backup carries.
+//! The contact book, though kept as the `contacts` state file, goes in
+//! key 3 as plain CBOR (as before it was encrypted), so older versions
+//! restore it too.
 //!
 //! Left out on purpose: one-time prekeys (ours and our contacts'), since
 //! restoring used ones would let old sealed messages replay or be sealed
@@ -28,7 +31,7 @@ use crate::cbor::{self, finish, fixed_bytes, read_map, required};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::sealed::{self, KdfParams};
-use crate::store::{Contacts, Home};
+use crate::store::{CONTACTS_STATE, Contacts, Home};
 
 /// The shortest passphrase a backup accepts. A backup file may sit on a
 /// cloud drive for years, so its passphrase is all that protects it.
@@ -72,14 +75,10 @@ impl Home {
         p: KdfParams,
     ) -> Result<Vec<u8>> {
         check_passphrase(passphrase)?;
-        let contacts = match fs::read(self.contacts_path()) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Contacts::default().encode()?,
-            Err(e) => return Err(e.into()),
-        };
+        let contacts = Zeroizing::new(self.read_contacts(identity)?.0.encode()?);
         let mut states = Vec::new();
         for name in self.state_names()? {
-            if LEFT_OUT.contains(&name.as_str()) {
+            if LEFT_OUT.contains(&name.as_str()) || name == CONTACTS_STATE {
                 continue;
             }
             match fs::read(self.state_path(&name)?) {
@@ -142,9 +141,9 @@ impl Home {
         // restoring again starts over.
         let identity = &opened.restored.identity;
         self.store_identity(identity, seal, KdfParams::DEFAULT)?;
-        self.write_contacts_file(&opened.contacts)?;
+        self.save_contacts(identity, &Contacts::decode(&opened.contacts)?)?;
         for (name, bytes) in &opened.states {
-            if !LEFT_OUT.contains(&name.as_str()) {
+            if !LEFT_OUT.contains(&name.as_str()) && name != CONTACTS_STATE {
                 self.write_state_file(name, bytes)?;
             }
         }
@@ -171,8 +170,9 @@ impl Home {
     }
 
     /// Removes the identity (first: without it the rest is unreadable),
-    /// contacts, state files and personas.
-    fn wipe(&self) -> Result<()> {
+    /// contacts, state files and personas. Other files, such as
+    /// downloads, stay. No node may have this home open.
+    pub fn wipe(&self) -> Result<()> {
         if !self.dir().exists() {
             return Ok(());
         }
@@ -220,7 +220,12 @@ pub fn apply_staged_restore(home: &Home) -> Result<bool> {
     home.wipe()?;
     // The identity first, as in `restore_backup`.
     home.write_identity_file(&fs::read(staging.identity_path())?)?;
-    home.write_contacts_file(&fs::read(staging.contacts_path())?)?;
+    // Only a restore staged before contacts were encrypted has this.
+    match fs::read(staging.contacts_path()) {
+        Ok(b) => home.write_contacts_file(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     for name in staging.state_names()? {
         home.write_state_file(&name, &fs::read(staging.state_path(&name)?)?)?;
     }
@@ -307,7 +312,7 @@ mod tests {
         let peer = Identity::generate().public();
         let mut contacts = Contacts::default();
         contacts.observe(peer, None, 1);
-        old.save_contacts(&contacts).unwrap();
+        old.save_contacts(&id, &contacts).unwrap();
         old.save_state(&id, "hist-p-abc", b"history").unwrap();
         old.save_state(&id, "prekeys", b"one-time keys").unwrap();
         let backup = old.export_backup_with(&id, PW, FAST).unwrap();
@@ -326,7 +331,8 @@ mod tests {
         assert!(new.identity_is_sealed().unwrap());
         let loaded = new.load_identity(Some(b"local")).unwrap();
         assert_eq!(loaded.public(), id.public());
-        assert!(new.load_contacts().unwrap().get(&peer).is_some());
+        assert!(new.load_contacts(&loaded).unwrap().get(&peer).is_some());
+        assert!(!new.dir().join("contacts.cbor").exists());
         assert_eq!(
             &new.load_state(&loaded, "hist-p-abc").unwrap().unwrap()[..],
             b"history"

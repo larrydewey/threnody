@@ -160,7 +160,7 @@ fn unlock(
 }
 
 /// One app per data directory: two nodes with one identity would fight.
-fn lock_home(home: &std::path::Path) -> Result<std::fs::File, String> {
+pub(crate) fn lock_home(home: &std::path::Path) -> Result<std::fs::File, String> {
     std::fs::create_dir_all(home)
         .map_err(|e| format!("Couldn't create {}: {e}", home.display()))?;
     let f = std::fs::File::create(home.join("desktop.lock"))
