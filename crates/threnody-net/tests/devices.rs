@@ -544,6 +544,7 @@ async fn blocking_revokes_on_our_other_devices() {
             .is_some_and(|c| c.discovery_key.is_some())
     })
     .await;
+    wait_for(|| saved(&dir, "laptop").exists()).await;
     let code = laptop.node.create_link_code(laptop.addr.clone());
     phone.node.link_with(&code).await.unwrap();
     wait_for(|| {
@@ -567,8 +568,9 @@ async fn blocking_revokes_on_our_other_devices() {
     })
     .await;
     wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
-    // The laptop's tunnel with Bob goes too.
+    // The laptop's tunnel with Bob goes too, from memory and from disk.
     assert!(!laptop.node.tunnel_peers().contains(&bid));
+    assert!(!saved(&dir, "laptop").exists());
     // Bob hears that the laptop no longer approves him.
     let lid = laptop.node.identity();
     wait_for(|| {
@@ -890,5 +892,51 @@ async fn a_device_leaving_its_account_loses_its_tunnel() {
     )
     .await;
     assert!(!bob.node.tunnel_peers().contains(&pid));
+    assert!(!saved(&dir, "bob").exists());
     let _ = (&mut laptop.rx, &mut phone.rx);
+}
+
+/// Where a node keeps its tunnel peers (Appendix D, *Persistence*).
+fn saved(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    dir.path().join(name).join("tunnels.state")
+}
+
+/// Revoking a contact on one device reaches our others by contact sync
+/// alone, and each takes its tunnel with that contact down, saved peers
+/// included.
+#[tokio::test]
+async fn revoking_on_another_device_takes_our_tunnel_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    laptop.node.set_tunnel_port(Some(51821)).unwrap();
+    bob.node.set_tunnel_port(Some(51822)).unwrap();
+    link(&mut laptop, &mut bob).await;
+    let bid = bob.node.identity();
+    wait_for(|| laptop.node.tunnel_peers().contains(&bid)).await;
+    wait_for(|| saved(&dir, "laptop").exists()).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    wait_for(|| {
+        phone
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| c.local_approved)
+    })
+    .await;
+
+    phone.node.set_approval(&bid, false).unwrap();
+    wait_for(|| {
+        laptop
+            .node
+            .contacts()
+            .get(&bid)
+            .is_some_and(|c| !c.local_approved && !c.blocked)
+    })
+    .await;
+    wait_for(|| !laptop.node.tunnel_peers().contains(&bid)).await;
+    assert!(!saved(&dir, "laptop").exists());
+    let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }

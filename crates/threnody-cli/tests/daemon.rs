@@ -225,6 +225,21 @@ fn nothing_else_writes_to_a_data_directory_a_node_has_open() {
     assert!(err.contains("no contact matches"), "{err}");
 }
 
+/// A run without `--tunnel` deletes the tunnel peers an earlier
+/// `--tunnel` run saved, as turning tunnels off does in the apps
+/// (Appendix D, *Persistence*).
+#[test]
+fn a_run_without_tunnels_deletes_saved_tunnels() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    init(&a);
+    let saved = a.join("tunnels.state");
+    std::fs::write(&saved, b"sealed tunnel peers").unwrap();
+    let node = Daemon::start_at(&a, &[], &[], Some(&dir.path().join("a.sock")));
+    node.wait_for("Running as a service");
+    assert!(!saved.exists());
+}
+
 #[test]
 fn a_replaced_identity_starts_with_nothing_of_the_old_one() {
     let dir = tempfile::tempdir().unwrap();

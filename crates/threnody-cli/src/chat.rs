@@ -203,6 +203,10 @@ pub async fn run(opts: Options) -> Result<()> {
             Ok(n) => say!("* {n} tunnel(s) restored from the last run"),
             Err(e) => say!("! restoring {n} tunnel(s) (config written): {e:#}"),
         }
+    } else {
+        // Tunnels off for this run: peers an earlier `--tunnel` run saved
+        // don't stay on disk, as in the apps.
+        let _ = node.set_tunnel_port(None);
     }
     node.set_prefer_onion(opts.onion_first);
     node.set_use_volunteers(opts.use_volunteers);
