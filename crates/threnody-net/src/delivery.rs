@@ -16,9 +16,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use threnody_core::crypto::random_bytes;
+use threnody_core::message::{
+    FEATURE_DELETE, FEATURE_EDIT, FEATURE_LISTS, FEATURE_PIN, FEATURE_REACT,
+};
 use threnody_core::{AppMessage, PublicIdentity};
 
-/// Unacknowledged messages kept per peer; the oldest are dropped first.
+/// Unacknowledged messages kept per peer, and as many changes to
+/// conversations besides; the oldest of each are dropped first.
 pub const MAX_UNACKED: usize = 256;
 /// And at most this many bytes of them per peer.
 pub const MAX_UNACKED_BYTES: usize = 32 * 1024 * 1024;
@@ -37,6 +41,20 @@ pub fn trackable(m: &AppMessage) -> bool {
             | AppMessage::Group(_)
             | AppMessage::Mailbox(_)
     )
+}
+
+/// The `Hello` feature bit a peer needs to read `m`, or 0. A change held
+/// for a peer we haven't heard from since starting is dropped, not sent,
+/// once its `Hello` shows it lacks this.
+pub fn needs(m: &AppMessage) -> u64 {
+    match m {
+        AppMessage::Delete { .. } => FEATURE_DELETE,
+        AppMessage::Edit { .. } => FEATURE_EDIT,
+        AppMessage::React { .. } => FEATURE_REACT,
+        AppMessage::Pin { .. } => FEATURE_PIN,
+        AppMessage::List(_) => FEATURE_LISTS,
+        _ => 0,
+    }
 }
 
 /// What an acknowledgement means: our outgoing history entry `local_id`
@@ -189,9 +207,26 @@ impl Delivery {
         let len = m.encoded_len_hint();
         self.unacked_dirty |= len <= MAX_PERSISTED;
         let q = self.unacked.entry(*peer).or_default();
+        // Changes (deletions, edits, reactions, pins, lists) and other
+        // messages each have MAX_UNACKED places, so a run of changes for a
+        // device that is away can't push out the texts held for it.
+        let change = needs(&m) != 0;
         q.push_back((id, m.clone(), len, tag));
         let mut bytes: usize = q.iter().map(|(_, _, l, _)| l).sum();
-        while q.len() > MAX_UNACKED || (bytes > MAX_UNACKED_BYTES && q.len() > 1) {
+        while q
+            .iter()
+            .filter(|(_, m, ..)| (needs(m) != 0) == change)
+            .count()
+            > MAX_UNACKED
+        {
+            let Some(i) = q.iter().position(|(_, m, ..)| (needs(m) != 0) == change) else {
+                break;
+            };
+            if let Some((_, _, l, _)) = q.remove(i) {
+                bytes -= l;
+            }
+        }
+        while bytes > MAX_UNACKED_BYTES && q.len() > 1 {
             if let Some((_, _, l, _)) = q.pop_front() {
                 bytes -= l;
             }
@@ -241,6 +276,31 @@ impl Delivery {
 
     pub fn unacked(&self, peer: &PublicIdentity) -> usize {
         self.unacked.get(peer).map_or(0, VecDeque::len)
+    }
+
+    /// Notes that change `m` (a deletion, edit, reaction or pin) came from
+    /// `peer`, and returns true if this exact change came before. A change
+    /// for a device that is away is both held for its next session and
+    /// sealed for its mailboxes, and carries no version, so a mailbox copy
+    /// opened after the held one (and after newer changes) must be dropped
+    /// rather than undo them. The change's digest is kept with the
+    /// delivered ids. Anything else is never "seen".
+    pub fn seen_change(&mut self, peer: &PublicIdentity, m: &AppMessage) -> bool {
+        if !matches!(
+            m,
+            AppMessage::Delete { .. }
+                | AppMessage::Edit { .. }
+                | AppMessage::React { .. }
+                | AppMessage::Pin { .. }
+        ) {
+            return false;
+        }
+        let Ok(b) = m.encode() else {
+            return false;
+        };
+        let h = blake3::hash(&b);
+        let digest = u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap_or_default());
+        !self.first_delivery(peer, digest)
     }
 
     /// True the first time `id` arrives from `peer`.
@@ -309,6 +369,47 @@ mod tests {
             d.first_delivery(&p, 100 + i);
         }
         assert!(d.first_delivery(&p, 9), "old ids are forgotten");
+    }
+
+    #[test]
+    fn changes_are_seen_once_per_peer() {
+        let (p, q) = (Identity::generate().public(), Identity::generate().public());
+        let mut d = Delivery::default();
+        let pin = |pin| AppMessage::Pin {
+            conversation: vec![1; 16],
+            id: 7,
+            pin,
+        };
+        assert!(!d.seen_change(&p, &pin(true)));
+        assert!(d.seen_change(&p, &pin(true)), "the same change again");
+        assert!(!d.seen_change(&p, &pin(false)), "a different change");
+        assert!(!d.seen_change(&q, &pin(true)), "from another peer");
+        assert!(!d.seen_change(&p, &text("a")) && !d.seen_change(&p, &text("a")));
+    }
+
+    #[test]
+    fn held_changes_do_not_push_out_held_texts() {
+        let p = Identity::generate().public();
+        let mut d = Delivery::default();
+        for i in 0..10 {
+            d.track(&p, text(&format!("t{i}")), Tag::NONE);
+        }
+        for i in 0..MAX_UNACKED as u64 + 50 {
+            let react = AppMessage::React {
+                conversation: vec![1; 16],
+                id: i,
+                emoji: "👍".into(),
+                add: true,
+            };
+            d.track(&p, react, Tag::NONE);
+        }
+        let held = d.resend(&p);
+        let texts = held
+            .iter()
+            .filter(|m| matches!(m, AppMessage::Tracked { inner, .. } if matches!(**inner, AppMessage::Text { .. })))
+            .count();
+        assert_eq!(texts, 10, "changes pushed out texts");
+        assert_eq!(held.len(), 10 + MAX_UNACKED, "changes keep their own room");
     }
 
     #[test]

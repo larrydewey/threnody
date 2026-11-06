@@ -40,10 +40,10 @@ The account fingerprint is computed like a device fingerprint (Appendix A), as `
 
 ### Updates and forks
 
-- **Exchange.** Peers send their chain as `AppMessage::Account` (kind 11) at the start of every session, and again whenever it changes.
+- **Exchange.** Peers send their chain as `AppMessage::Account` (kind 11) at the start of every session, and again whenever it changes, but only to their own devices and to peers they accepted (or approved). The chain names every device of the account, often after its owner, so a stranger gets it only once accepted, when it is sent at once. Older peers send it to everyone; nothing depends on receiving it sooner.
 - **Accepting a chain.** A receiver accepts a chain only if it is valid, its id matches what the receiver has stored for that account (pinned at first sight), and the session's device is in its current set.
 - **Updates.** A newer chain must *extend* the stored one. A different chain at or below the stored height is a **fork**: the receiver rejects it and warns, because forking requires a compromised device.
-- **Removal.** When a chain removes a device, every peer drops its sessions with that device, revokes its approvals, deletes its discovery key and prekeys, and refuses it from then on.
+- **Removal.** When a chain removes a device, every peer drops its sessions with that device, revokes its approvals, deletes its discovery key and prekeys, and refuses it from then on. Nothing more is sealed to it, and no group message goes to it by any path. The owner of each group it is in removes it, as for any member (Appendix F, *Removal*), so later epochs are unreadable to it; the device that removed it does the same in groups it owns.
 
 ## Linking a device
 
@@ -65,14 +65,14 @@ existing device E                                  new device N
 - **Authenticating each side.** The code pins `fp(E)`, which authenticates E to N. The proof binds `s` to *this* session and *this* device, which authenticates N to E. An attacker without the code can't be added, and can't replay a proof into another session.
 - **Signing.** E sends the current chain and a proposed `Add(N)` link that E has already signed (`LinkOffer`). N checks that the proposal is exactly the next link adding N on top of that chain, then countersigns it (`LinkConsent`).
 - **Refusal.** A wrong or expired code gets an explicit `LinkRefused`, so N fails at once instead of waiting.
-- **Aftermath.** E then broadcasts the new chain to every session.
+- **Aftermath.** E then broadcasts the new chain to every session with a peer that may see it (see *Exchange*). Every device of the account tells its user that a device joined: E when the link completes, the others when the new chain reaches them. Anyone holding a leaked code can link a device without asking, so the user learns of it on whichever device they are using and can remove it.
 
-Apps name a device on creation: the CLI uses the host name, and the Android app uses the phone's model (it renames a device still called "device"). `/device rename <device> <name>` and the app's *Devices* screen rename any device of the account.
+Apps name a device on creation: the CLI uses the host name, and the Android app uses the phone's model (it renames a device still called "device"). Only our own devices and accepted contacts see these names. `/device rename <device> <name>` and the app's *Devices* screen rename any device of the account.
 
 ## Own devices
 
 - Devices in the same account approve each other automatically.
-- They exchange `ContactSync` snapshots at the start of each session and after changes. Approval and verification flags merge last-writer-wins on `approval_changed_ms`, and petnames and addresses fill in where missing.
+- They exchange `ContactSync` snapshots at the start of each session and after changes. Approval, verification and block flags merge last-writer-wins on `approval_changed_ms`, and petnames and addresses fill in where missing. Blocking moves `approval_changed_ms` like approving does, so approving a blocked contact again unblocks it on every device (only approving unblocks); at equal times a block wins, because older devices block without moving the time.
 - They share message history (below).
 
 ## History
@@ -80,7 +80,7 @@ Apps name a device on creation: the CLI uses the host name, and the Android app 
 Contacts send to every device of an account, so each device receives incoming messages itself. What a device *sends*, its siblings would never see. So devices exchange `Transcript` account messages (`{ 0 => 8, 1 => conversation, 2 => history }`). `conversation` is `0 ‖ account or device id (32)` for a 1:1 chat and `1 ‖ group id (16)` for a group, and `history` uses the history encoding (Appendix C, *Local storage*) for some of that conversation's entries.
 
 - **Live.** An outgoing 1:1 entry goes at once to every connected sibling.
-- **Catching up.** When a session with a sibling starts, a device sends its outgoing entries newer than what that sibling last had from it. Each device keeps that position per sibling, encrypted (`history-sync`).
+- **Catching up.** When a session with a sibling starts, a device sends its outgoing entries newer than what that sibling last had from it. Each device keeps that position per sibling, encrypted (`history-sync`). Deletions, edits, reactions and pins made while a sibling was away aren't in transcripts; they wait for it as tracked messages (Appendix C, *Deleting and editing messages*).
 - **New devices.** The first time, a device sends all of its history, 1:1 and group, so a newly linked device starts complete. Linking triggers this right away, without waiting for a new session.
 - **Merging.** Receivers merge entries that aren't already present, and accept transcripts only from devices of their own account. Entries match by the sender's id for the message where both have one (an outgoing entry's local id, or an incoming one's remote id). Others match by sender and content within ten minutes, because each device stamps its own receipt time.
 - **Reliability.** Transcripts are sent tracked (Appendix C, *Acknowledgements*), so one lost with a dying session is resent.

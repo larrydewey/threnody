@@ -63,6 +63,10 @@ impl N {
                 }
                 Event::Connected { peer, .. } => self.groups.connected(&self.node, &peer),
                 Event::DeviceLinked { device } => self.groups.linked(&self.node, &device),
+                Event::AccountChanged { removed, .. } => {
+                    let u = self.groups.revoked(&self.node, &removed);
+                    self.updates.extend(u);
+                }
                 _ => {}
             }
         }
@@ -601,4 +605,123 @@ async fn lists_are_shared_and_edited_together() {
         texts(ns[0]).get(1).is_some_and(|(_, done)| *done)
     })
     .await;
+}
+
+/// Pumps every node for `d`, letting traffic settle.
+async fn settle(ns: &mut [&mut N], d: Duration) {
+    let end = tokio::time::Instant::now() + d;
+    while tokio::time::Instant::now() < end {
+        for n in ns.iter_mut() {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_device_that_leaves_a_group_stays_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = approve(&mut bob, &mut laptop).await;
+    let pid = phone.node.identity();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[0].node.account_of(&pid).is_some()
+    })
+    .await;
+
+    // Bob invites the account: both devices join directly.
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+
+    // The phone leaves; everyone sees it go.
+    phone.groups.leave(&phone.node, &g).unwrap();
+    let member = |n: &N| {
+        n.groups
+            .list()
+            .iter()
+            .any(|(x, .., m)| *x == g && m.contains(&pid))
+    };
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        !ns[2].in_group(&g) && !member(ns[0]) && !member(ns[1])
+    })
+    .await;
+
+    // The phone and the laptop meet again: the phone isn't put back.
+    phone.node.disconnect(&laptop.node.identity());
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].node.sessions().iter().all(|s| s.peer != pid)
+    })
+    .await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(!phone.in_group(&g), "the phone rejoined a group it left");
+    assert!(!member(&bob) && !member(&laptop));
+}
+
+#[tokio::test]
+async fn a_removed_device_is_dropped_from_our_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let lid = approve(&mut bob, &mut laptop).await;
+    let pid = phone.node.identity();
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[0].node.account_of(&pid).is_some()
+    })
+    .await;
+    let g = bob.groups.create("club").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+
+    // The phone is lost: the laptop removes it from the account. Bob, who
+    // owns the group, removes it from the group as soon as he hears.
+    laptop.node.remove_device(&pid).unwrap();
+    let member = |n: &N| {
+        n.groups
+            .list()
+            .iter()
+            .any(|(x, .., m)| *x == g && m.contains(&pid))
+    };
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        !member(ns[0]) && !member(ns[1])
+    })
+    .await;
+    assert!(!bob.node.can_send_offline(&pid), "its prekeys are gone");
+
+    // What Bob says next reaches the laptop and never the phone.
+    bob.groups
+        .send_text(&bob.node, &g, "after removal")
+        .unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].texts(&g).iter().any(|t| t == "after removal")
+    })
+    .await;
+    let _ = phone.node.connect(&bob.addr, None).await;
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(phone.texts(&g).iter().all(|t| t != "after removal"));
+    assert_eq!(bob.groups.held_for(&pid), 0, "nothing held for it");
 }

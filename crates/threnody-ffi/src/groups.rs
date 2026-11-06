@@ -175,6 +175,14 @@ impl ThrenodyNode {
         self.group_node().linked(&self.node, device);
     }
 
+    /// Devices left their accounts: the groups we own drop them, and none
+    /// of our groups delivers to them any more.
+    pub(crate) fn group_revoked(&self, removed: &[PublicIdentity]) {
+        let _guard = self.rt.enter();
+        let updates = self.group_node().revoked(&self.node, removed);
+        self.queue_updates(updates);
+    }
+
     fn queue_updates(&self, updates: Vec<Update>) {
         self.queued().extend(updates.into_iter().map(event));
     }

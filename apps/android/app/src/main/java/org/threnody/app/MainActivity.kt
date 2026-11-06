@@ -1430,11 +1430,15 @@ class MainActivity : Activity() {
                 "It works once. Only show it to your own devices.",
             n.createLinkCode(addr),
             "Account ${n.accountFingerprint()}",
+            secret = true,
         )
     }
 
-    /** A dialog showing [code] as a QR code, with copy and share. */
-    private fun showCode(title: String, help: String, code: String, footer: String) {
+    /**
+     * A dialog showing [code] as a QR code, with copy and share. A [secret]
+     * code is copied marked sensitive, kept out of clipboard previews.
+     */
+    private fun showCode(title: String, help: String, code: String, footer: String, secret: Boolean = false) {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -1464,7 +1468,14 @@ class MainActivity : Activity() {
                     Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, code), title))
             }
             .setNeutralButton("Copy") { _, _ ->
-                getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText(title, code))
+                val clip = ClipData.newPlainText(title, code)
+                if (secret) {
+                    // ClipDescription.EXTRA_IS_SENSITIVE from Android 13; the key works before it too.
+                    clip.description.extras = android.os.PersistableBundle().apply {
+                        putBoolean("android.content.extra.IS_SENSITIVE", true)
+                    }
+                }
+                getSystemService(ClipboardManager::class.java)?.setPrimaryClip(clip)
                 Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Done", null)
@@ -1605,7 +1616,8 @@ class MainActivity : Activity() {
         SecureBuilder(this)
             .setTitle("Join another device's account")
             .setMessage("This device becomes part of that account: your contacts see both as you. " +
-                "Get the code from “Link a new device” on the other device.")
+                "Get the code from “Link a new device” on the other device. " +
+                "Only use a code you made yourself: whoever made it gets this device's contacts and history.")
             .setView(padded(field))
             .setPositiveButton("Join") { _, _ ->
                 val code = field.text.toString().trim()

@@ -1570,12 +1570,17 @@ impl Ui {
                         say!("* account {} added device {}", &a[..9], self.name(&d));
                     }
                 }
-                for d in removed {
+                for d in &removed {
                     say!(
                         "! account {} REMOVED device {} — it is no longer trusted",
                         &a[..9],
-                        self.name(&d)
+                        self.name(d)
                     );
+                }
+                if !removed.is_empty() {
+                    let node = self.node.clone();
+                    let name = |p: &PublicIdentity| name_of(&node, p);
+                    self.groups.revoked(&self.node, &name, &removed);
                 }
             }
             Event::AccountFork { device, account } => say!(

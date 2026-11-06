@@ -205,15 +205,21 @@ impl Node {
             .is_some_and(|b| self.send(to, AppMessage::Mailbox(b)).is_ok())
     }
 
-    /// True when we hold a usable prekey bundle for `peer`.
+    /// True when we hold a usable prekey bundle for `peer`, and it is
+    /// still a device of its account.
     pub fn can_send_offline(&self, peer: &PublicIdentity) -> bool {
-        lock(&self.shared.bundles).has(peer, now_ms())
+        lock(&self.shared.bundles).has(peer, now_ms()) && !self.is_revoked(peer)
     }
 
     /// Seals `msg` for `dest` and offers it to every live, mutually
     /// approved neighbour. Returns how many were asked; each answers with
     /// [`Event::DepositReceipt`].
     pub fn send_offline(&self, dest: &PublicIdentity, msg: &AppMessage) -> Result<usize> {
+        if self.is_revoked(dest) {
+            return Err(NetError::NotAllowed(
+                "that device was removed from its account".into(),
+            ));
+        }
         let sealed = {
             let mut book = lock(&self.shared.bundles);
             let sealed = book.seal(self.identity_ref(), dest, &msg.encode()?, now_ms())?;
@@ -485,18 +491,34 @@ impl Node {
         if let Ok((from, body)) = opened
             && let Ok(msg) = AppMessage::decode(&body)
         {
-            if let AppMessage::Delete { conversation, ids } = &msg {
-                self.on_delete(&from, conversation, ids);
+            // Changes to a conversation are sealed too (see `send_change`),
+            // and also held for our next session: a copy that came that way
+            // first is dropped, so it can't undo a newer change.
+            if self.shared.delivery(|d| d.seen_change(&from, &msg)) {
                 return;
             }
-            if let AppMessage::Edit {
-                conversation,
-                id,
-                body,
-            } = &msg
-            {
-                self.on_edit(&from, conversation, *id, body);
-                return;
+            match &msg {
+                AppMessage::Delete { conversation, ids } => {
+                    return self.on_delete(&from, conversation, ids);
+                }
+                AppMessage::Edit {
+                    conversation,
+                    id,
+                    body,
+                } => return self.on_edit(&from, conversation, *id, body),
+                AppMessage::React {
+                    conversation,
+                    id,
+                    emoji,
+                    add,
+                } => return self.on_react(&from, conversation, *id, emoji, *add),
+                AppMessage::Pin {
+                    conversation,
+                    id,
+                    pin,
+                } => return self.on_pin(&from, conversation, *id, *pin),
+                AppMessage::List(bytes) => return self.on_list_message(from, bytes),
+                _ => {}
             }
             self.record_incoming(&from, &msg, true);
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {

@@ -181,13 +181,16 @@ pub fn qr_texture(text: &str, scale: usize) -> Option<gdk::Texture> {
     )
 }
 
-/// Shows a QR code and the text it holds, with a copy button.
+/// Shows a QR code and the text it holds, with a copy button. A `secret`
+/// is copied with the hint clipboard managers take to leave it out of their
+/// history.
 pub fn show_code(
     parent: &impl IsA<gtk::Widget>,
     heading: &str,
     body: &str,
     text: &str,
     caption: &str,
+    secret: bool,
 ) {
     let d = alert(heading, body, &[("close", "Done")]);
     let b = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -207,7 +210,20 @@ pub fn show_code(
     copy.add_css_class("pill");
     let t = text.to_owned();
     copy.connect_clicked(move |btn| {
-        btn.clipboard().set_text(&t);
+        if secret {
+            let content = gdk::ContentProvider::new_union(&[
+                gdk::ContentProvider::for_value(&t.to_value()),
+                gdk::ContentProvider::for_bytes(
+                    "x-kde-passwordManagerHint",
+                    &glib::Bytes::from_static(b"secret"),
+                ),
+            ]);
+            if btn.clipboard().set_content(Some(&content)).is_err() {
+                btn.clipboard().set_text(&t);
+            }
+        } else {
+            btn.clipboard().set_text(&t);
+        }
         btn.set_label("Copied");
     });
     b.append(&copy);

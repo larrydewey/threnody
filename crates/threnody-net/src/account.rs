@@ -213,15 +213,25 @@ impl Node {
     }
 
     /// True for devices removed from their account (ours or a peer's).
-    pub(crate) fn is_revoked(&self, device: &PublicIdentity) -> bool {
+    pub fn is_revoked(&self, device: &PublicIdentity) -> bool {
         lock(&self.shared.account).state().removed.contains(device)
             || lock(&self.shared.accounts).is_revoked(device)
+    }
+
+    /// Whether `peer` may see our account chain: the devices of our
+    /// account and their names (a host name or phone model, often the
+    /// owner's name). Our own devices and contacts we accepted may; a
+    /// stranger only once accepted.
+    pub(crate) fn shows_account_to(&self, peer: &PublicIdentity) -> bool {
+        self.is_accepted(peer)
     }
 
     /// Messages to send when a session with `peer` starts.
     pub(crate) fn account_hello(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
         let mut out = Vec::new();
-        if let Ok(b) = self.account().encode() {
+        if self.shows_account_to(peer)
+            && let Ok(b) = self.account().encode()
+        {
             out.extend(AccountMsg::Chain(b).encode().ok().map(AppMessage::Account));
         }
         if self.is_own_device(peer) {
@@ -287,14 +297,21 @@ impl Node {
     }
 
     fn broadcast_chain(&self) {
+        let peers: Vec<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        self.send_chain(&peers);
+    }
+
+    /// Sends our account chain to those of `peers` with a session that may
+    /// see it.
+    pub(crate) fn send_chain(&self, peers: &[PublicIdentity]) {
         let Ok(b) = self.account().encode() else {
             return;
         };
         let Ok(m) = AccountMsg::Chain(b).encode() else {
             return;
         };
-        for s in self.sessions() {
-            let _ = self.send(&s.peer, AppMessage::Account(m.clone()));
+        for p in peers.iter().filter(|p| self.shows_account_to(p)) {
+            let _ = self.send(p, AppMessage::Account(m.clone()));
         }
     }
 
@@ -371,8 +388,9 @@ impl Node {
                     let left: Vec<(PublicIdentity, ConversationId)> = {
                         let c = lock(&self.shared.contacts);
                         before
-                            .into_iter()
+                            .iter()
                             .filter(|(k, _)| c.get(k).is_none() && c.forgotten_at(k).is_some())
+                            .copied()
                             .collect()
                     };
                     for (k, conv) in left {
@@ -381,11 +399,14 @@ impl Node {
                         let _ = self.shared.home.delete_history(conv);
                     }
                     // Contacts revoked or blocked on our other device lose
-                    // their tunnel here too, and blocked ones their session.
+                    // their tunnel here too; blocked ones (including ones
+                    // we first hear of already blocked) also lose their
+                    // sessions and conversation, as on that device.
                     let withdrawn: Vec<(PublicIdentity, bool)> = lock(&self.shared.contacts)
                         .iter()
                         .filter_map(|c| {
-                            let (approved, blocked) = *trust_before.get(&c.key)?;
+                            let (approved, blocked) =
+                                trust_before.get(&c.key).copied().unwrap_or((false, false));
                             let newly_blocked = c.blocked && !blocked;
                             (newly_blocked || (approved && !c.local_approved))
                                 .then_some((c.key, newly_blocked))
@@ -395,7 +416,12 @@ impl Node {
                         for (k, newly_blocked) in withdrawn {
                             self.withdraw_approval(&k);
                             if newly_blocked {
+                                let conv = before
+                                    .iter()
+                                    .find(|(b, _)| *b == k)
+                                    .map_or_else(|| self.conversation_for(&k), |(_, c)| *c);
                                 self.disconnect(&k);
+                                let _ = self.shared.home.delete_history(conv);
                             }
                         }
                         self.enforce_policy();
@@ -502,7 +528,8 @@ impl Node {
         }
     }
 
-    /// A device left its account: stop trusting it everywhere.
+    /// A device left its account: stop trusting it everywhere, and seal
+    /// nothing more to it (its prekeys go).
     fn revoke_device(&self, device: &PublicIdentity) {
         {
             let mut contacts = lock(&self.shared.contacts);
@@ -513,6 +540,12 @@ impl Node {
                 c.approval_changed_ms = now_ms();
             }
             self.shared.save_contacts(&contacts);
+        }
+        {
+            let mut bundles = lock(&self.shared.bundles);
+            if bundles.remove(device) {
+                self.shared.persist_bundles(&bundles);
+            }
         }
         self.disconnect(device);
     }
@@ -529,6 +562,16 @@ impl Node {
                 .copied()
                 .filter(|d| !own.state().removed.contains(d))
                 .collect();
+            // Devices linked through another of ours: the app tells the
+            // user here too, as the linking device does (`DeviceLinked`).
+            let me = self.identity();
+            let added: Vec<PublicIdentity> = chain
+                .state()
+                .devices
+                .iter()
+                .map(|(d, _)| *d)
+                .filter(|d| *d != me && !own.state().has(d))
+                .collect();
             *lock(&self.shared.account) = chain.clone();
             self.persist_account();
             self.tag_own_devices();
@@ -540,7 +583,7 @@ impl Node {
             }
             self.emit(Event::AccountChanged {
                 account: chain.id(),
-                added: vec![],
+                added,
                 removed,
             });
             // Pass it on so every own device converges.
@@ -797,6 +840,13 @@ impl Node {
             self.emit(Event::ThisDeviceRemoved);
         } else {
             self.revoke_device(device);
+            // As our other devices see it when the chain reaches them, so
+            // the groups this one runs drop the device too.
+            self.emit(Event::AccountChanged {
+                account: self.account().id(),
+                added: vec![],
+                removed: vec![*device],
+            });
         }
         Ok(())
     }

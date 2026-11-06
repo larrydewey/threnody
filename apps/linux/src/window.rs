@@ -1501,8 +1501,16 @@ impl App {
                 self.toast("This device was removed from your account.");
                 (None, None)
             }
+            // Linked here, or (seen as a new device of our own account)
+            // through another of our devices.
             NodeEvent::DeviceLinked { .. } => {
-                self.toast("A new device joined your account.");
+                self.toast("A new device joined your account. If you didn't link it, remove it in Devices.");
+                (None, None)
+            }
+            NodeEvent::AccountChanged { account, added, .. }
+                if !added.is_empty() && *account == self.core.main.account_fingerprint() =>
+            {
+                self.toast("A new device joined your account. If you didn't link it, remove it in Devices.");
                 (None, None)
             }
             NodeEvent::ListChanged { .. } => {
@@ -1833,7 +1841,7 @@ impl App {
                             .unwrap_or_default(),
                     ),
                 };
-                ui::show_code(&self.window, &heading, body, &link, &caption);
+                ui::show_code(&self.window, &heading, body, &link, &caption, false);
             }
             Err(e) => self.toast(&e),
         }
@@ -2337,6 +2345,7 @@ impl App {
                  It works once. Only show it to your own devices.",
                 &code,
                 &format!("Account {}", self.core.main.account_fingerprint()),
+                true,
             ),
             Err(e) => self.toast(&e),
         }
@@ -2348,7 +2357,8 @@ impl App {
             &self.window,
             "Join another device's account",
             "Paste the link code your other device shows (its menu → Link a new device). \
-             This device then shares its contacts and history.",
+             Only use a code you made yourself: whoever made it gets this device's \
+             contacts and history.",
             "threnody-link://…",
             initial,
             "Join",

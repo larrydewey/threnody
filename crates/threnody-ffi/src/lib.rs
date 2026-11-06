@@ -2394,6 +2394,9 @@ impl ThrenodyNode {
                     match &other {
                         Event::Connected { peer, .. } => self.group_connected(peer),
                         Event::DeviceLinked { device } => self.group_linked(device),
+                        Event::AccountChanged { removed, .. } if !removed.is_empty() => {
+                            self.group_revoked(removed);
+                        }
                         Event::ListChanged { .. } => {
                             let _guard = self.rt.enter();
                             for (bytes, g) in self.node.take_list_forwards() {

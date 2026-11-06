@@ -431,3 +431,81 @@ async fn a_mailbox_message_after_a_restart_keeps_our_timer() {
     assert_eq!(last.expires_at_ms.map(|t| t - last.at_ms), Some(3_600_000));
     let _ = (&mut a.rx, &mut r.rx);
 }
+
+#[tokio::test]
+async fn changes_to_a_chat_are_opened_from_a_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    a.node.send_text(&bid, "pin me").unwrap();
+    next(&mut b.rx, |e| matches!(e, Event::Message { .. })).await;
+    let conv = a.node.conversation_for(&bid);
+    let id = a.node.history(conv).unwrap().entries()[0].message_id();
+
+    // B goes away; A pins the message, sealed for R to hold, then A goes
+    // too, so only the mailbox can tell B.
+    a.node.disconnect(&bid);
+    r.node.disconnect(&bid);
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    assert!(a.node.pin(&bid, id, true));
+    wait_for(|| r.node.held_messages() == 1).await;
+    a.node.shutdown();
+
+    b.node.connect(&r.addr, None).await.unwrap();
+    wait_for(|| b.node.pinned(b.node.conversation_for(&aid)).len() == 1).await;
+}
+
+#[tokio::test]
+async fn a_mailbox_copy_of_a_change_does_not_undo_a_newer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+    a.node.send_text(&bid, "pin me").unwrap();
+    next(&mut b.rx, |e| matches!(e, Event::Message { .. })).await;
+    let conv = a.node.conversation_for(&bid);
+    let id = a.node.history(conv).unwrap().entries()[0].message_id();
+    let pinned = |n: &Node| n.pinned(n.conversation_for(&aid)).len();
+
+    // B goes away; A pins the message, held for B and sealed for R.
+    a.node.disconnect(&bid);
+    r.node.disconnect(&bid);
+    wait_for(|| {
+        a.node.sessions().iter().all(|s| s.peer != bid)
+            && r.node.sessions().iter().all(|s| s.peer != bid)
+    })
+    .await;
+    assert!(a.node.pin(&bid, id, true));
+    wait_for(|| r.node.held_messages() == 1).await;
+
+    // B meets A first and takes the held pin; A then unpins.
+    b.node.connect(&a.addr, None).await.unwrap();
+    wait_for(|| pinned(&b.node) == 1).await;
+    assert!(a.node.pin(&bid, id, false));
+    wait_for(|| pinned(&b.node) == 0).await;
+
+    // The older copy R still holds must not pin it again.
+    b.node.connect(&r.addr, None).await.unwrap();
+    wait_for(|| r.node.held_messages() == 0).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(pinned(&b.node), 0, "a stale mailbox copy pinned it again");
+}

@@ -30,11 +30,14 @@ const INVITES: &str = "group-invites";
 const HELD: &str = "group-held";
 const EXPECTED: &str = "group-expected";
 const OFFERED: &str = "group-offered";
+const LEFT: &str = "group-left";
 const VERSION: u8 = 1;
 const HELD_VERSION: u8 = 3;
 /// Messages held for one member; the oldest are dropped first. Messages
 /// from more than a few epochs back can't be read anyway.
 pub const MAX_HELD_PER_MEMBER: usize = 200;
+/// Groups remembered as left or declined; the oldest are forgotten first.
+const MAX_LEFT: usize = 256;
 
 /// An invitation waiting for the user's consent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,9 +126,12 @@ pub struct GroupNode {
     held: Vec<(PublicIdentity, Vec<u8>, Tag)>,
     /// Groups our other devices are in, whose invitations we accept.
     expected: Vec<GroupId>,
-    /// Groups we have had our own other devices added to, once each, so
-    /// one that leaves a group isn't put back.
+    /// Groups we have had our own other devices added to, once each, or
+    /// seen them leave, so one that leaves a group isn't put back.
     offered: Vec<(PublicIdentity, GroupId)>,
+    /// Groups this device left or declined. Our other devices don't add
+    /// it back, and an invitation to one needs the user's consent again.
+    left: Vec<GroupId>,
     home: Home,
     identity: Identity,
 }
@@ -150,6 +156,7 @@ impl GroupNode {
             held: decode_held(&load(HELD)),
             expected: decode_expected(&load(EXPECTED)),
             offered: decode_offered(&load(OFFERED)),
+            left: decode_expected(&load(LEFT)),
             home: Home::new(home.dir()),
             identity: Identity::from_seed(&identity.seed()),
         })
@@ -220,12 +227,31 @@ impl GroupNode {
         let inv = self.invites.remove(i);
         self.save_invites();
         let out = self.groups.accept_invite(&inv.group, inv.from)?;
+        if self.left.contains(group) {
+            self.left.retain(|g| g != group);
+            self.save_left();
+        }
         Ok(self.apply(node, out, true))
     }
 
     pub fn decline(&mut self, group: &GroupId) {
         self.invites.retain(|i| i.group != *group);
         self.save_invites();
+        self.note_left(*group);
+    }
+
+    /// Remembers that this device left (or declined) `group`.
+    fn note_left(&mut self, group: GroupId) {
+        self.left.retain(|g| *g != group);
+        self.left.push(group);
+        if let Some(extra) = self.left.len().checked_sub(MAX_LEFT) {
+            self.left.drain(..extra);
+        }
+        self.save_left();
+        if self.expected.contains(&group) {
+            self.expected.retain(|g| *g != group);
+            self.save_expected();
+        }
     }
 
     /// Removes every device of `peer`'s account that is in the group (we
@@ -300,6 +326,9 @@ impl GroupNode {
         self.held
             .retain(|(_, b, _)| GroupWire::decode(b).map_or(true, |w| w.group() != group));
         self.save_held();
+        // Leaving is per device: our other devices stay, and don't add
+        // this one back.
+        self.note_left(*group);
         Ok(self.apply(node, out, true))
     }
 
@@ -677,7 +706,7 @@ impl GroupNode {
     ) -> Result<Vec<Update>> {
         let device = PublicIdentity::from_bytes(&device)?;
         if device == node.identity() {
-            if !node.is_own_device(&from) {
+            if !node.is_own_device(&from) || self.left.contains(&group) {
                 return Ok(Vec::new());
             }
             if !self.expected.contains(&group) {
@@ -740,6 +769,40 @@ impl GroupNode {
         }
         self.save_offered();
         self.save_held();
+    }
+
+    /// Devices were removed from their accounts (`Event::AccountChanged`):
+    /// in the groups we own, they're removed as members, so later epochs
+    /// are unreadable to them, and nothing held for them is sent. Members
+    /// that don't own a group stop delivering to them, and leave the
+    /// removal to its owner.
+    pub fn revoked(&mut self, node: &Node, removed: &[PublicIdentity]) -> Vec<Update> {
+        let removed: Vec<PublicIdentity> = removed
+            .iter()
+            .copied()
+            .filter(|d| node.is_revoked(d))
+            .collect();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        let held = self.held.len();
+        self.held.retain(|(p, ..)| !removed.contains(p));
+        if self.held.len() != held {
+            self.save_held();
+        }
+        let me = node.identity();
+        let mut updates = Vec::new();
+        for (group, _, owner, members) in self.groups.list() {
+            if owner != me {
+                continue;
+            }
+            for d in members.iter().filter(|m| removed.contains(m)) {
+                if let Ok(out) = self.groups.remove(&group, d) {
+                    updates.extend(self.apply(node, out, true));
+                }
+            }
+        }
+        updates
     }
 
     /// Adds our newly linked `device` to our groups (`Event::DeviceLinked`).
@@ -833,6 +896,14 @@ impl GroupNode {
         let _ = self.home.save_state(&self.identity, OFFERED, &out);
     }
 
+    fn save_left(&self) {
+        let mut out = vec![VERSION];
+        for g in &self.left {
+            out.extend_from_slice(g);
+        }
+        let _ = self.home.save_state(&self.identity, LEFT, &out);
+    }
+
     fn save_held(&self) {
         let _ = self
             .home
@@ -873,6 +944,10 @@ impl GroupNode {
         may_forward: bool,
         t: Tag,
     ) {
+        // A device removed from its account gets nothing more, by any path.
+        if node.is_revoked(&to) {
+            return;
+        }
         let Ok(bytes) = wire.encode() else { return };
         let msg = AppMessage::Group(bytes.clone());
         if node.send_tagged(&to, msg.clone(), t).is_ok() {
@@ -944,13 +1019,14 @@ impl GroupNode {
             }
             GroupEvent::InviteRequested { group, name, peer } => {
                 // Mutually approved contacts are trusted to add us; anyone
-                // else needs explicit consent.
-                let trusted = node
-                    .contacts()
-                    .get(&peer)
-                    .is_some_and(|c| c.mutually_approved())
-                    || node.is_own_device(&peer)
-                    || self.expected.contains(&group);
+                // else needs explicit consent, and so does a group we left.
+                let trusted = !self.left.contains(&group)
+                    && (node
+                        .contacts()
+                        .get(&peer)
+                        .is_some_and(|c| c.mutually_approved())
+                        || node.is_own_device(&peer)
+                        || self.expected.contains(&group));
                 if trusted && let Ok(out) = self.groups.accept_invite(&group, peer) {
                     updates.extend(self.apply(node, out, true));
                     return;
@@ -967,7 +1043,14 @@ impl GroupNode {
                 Update::Invited(inv)
             }
             GroupEvent::MemberAdded { group, member } => Update::MemberAdded { group, member },
-            GroupEvent::MemberRemoved { group, member } => Update::MemberRemoved { group, member },
+            GroupEvent::MemberRemoved { group, member } => {
+                // One of our devices left (or was removed): it stays out.
+                if node.is_own_device(&member) && !self.offered.contains(&(member, group)) {
+                    self.offered.push((member, group));
+                    self.save_offered();
+                }
+                Update::MemberRemoved { group, member }
+            }
             GroupEvent::Left { group } => Update::Left { group },
             GroupEvent::RoleChanged {
                 group,

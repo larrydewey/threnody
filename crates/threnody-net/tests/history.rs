@@ -402,3 +402,77 @@ async fn reactions_several_per_person_both_ways() {
     assert!(!alice.react(&b, 12345, "👍", true));
     assert!(!alice.react(&b, id, "", true));
 }
+
+/// `name`'s node again, from its home (as after a restart).
+async fn restart(dir: &tempfile::TempDir, name: &str) -> (Node, UnboundedReceiver<Event>) {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    let (node, rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    node.listen("127.0.0.1:0").await.unwrap();
+    (node, rx)
+}
+
+#[tokio::test]
+async fn changes_made_while_the_contact_is_away_reach_it_when_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, aaddr) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    for t in ["secret", "draft", "pin me"] {
+        alice.send_text(&bob_id, t).unwrap();
+        next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    }
+    let entries = |n: &Node, p| n.history(n.conversation_for(p)).unwrap().entries().to_vec();
+    let id_of = |t: &str| {
+        entries(&alice, &bob_id)
+            .iter()
+            .find(|e| e.text == t)
+            .unwrap()
+            .message_id()
+    };
+    let (secret, draft, pin_me) = (id_of("secret"), id_of("draft"), id_of("pin me"));
+
+    // Bob goes away; Alice deletes, edits, pins and reacts meanwhile.
+    bob.shutdown();
+    drop(brx);
+    let gone = std::time::Instant::now();
+    while alice.sessions().iter().any(|s| s.peer == bob_id) {
+        assert!(gone.elapsed() < Duration::from_secs(10), "session stayed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(alice.delete_messages(&bob_id, &[secret], true), 1);
+    assert!(alice.edit_message(&bob_id, draft, "final"));
+    assert!(alice.pin(&bob_id, pin_me, true));
+    assert!(alice.react(&bob_id, pin_me, "👍", true));
+
+    // Bob comes back: every change reaches him.
+    let (bob, _brx) = restart(&dir, "bob").await;
+    bob.connect(&aaddr, None).await.unwrap();
+    let texts =
+        |n: &Node| -> Vec<String> { entries(n, &a_id).iter().map(|e| e.text.clone()).collect() };
+    let start = std::time::Instant::now();
+    while texts(&bob) != ["final", "pin me"]
+        || bob.pinned(bob.conversation_for(&a_id)).len() != 1
+        || entries(&bob, &a_id)
+            .last()
+            .is_none_or(|e| e.reactions.is_empty())
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "changes lost: {:?}, {} pinned",
+            texts(&bob),
+            bob.pinned(bob.conversation_for(&a_id)).len()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

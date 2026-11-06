@@ -730,8 +730,19 @@ object Threnody {
                     ThrenodyService.notifyAccount(ctx, "This device was removed from your account. " +
                         "Your contacts no longer accept it as you.")
                 }
+                is NodeEvent.DeviceLinked -> {
+                    say("* a new device joined your account")
+                    // A leaked link code adds a device without asking: say so.
+                    ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
+                        "If you didn't link it, remove it in Devices.")
+                }
                 is NodeEvent.AccountChanged -> {
                     say("· $e")
+                    if (e.added.isNotEmpty() && e.account == node.accountFingerprint()) {
+                        // Another of our devices linked one: say so here too.
+                        ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
+                            "If you didn't link it, remove it in Devices.")
+                    }
                     // A verified contact gained a device we haven't verified.
                     if (e.added.isNotEmpty() && e.account != node.accountFingerprint()) {
                         val c = conversations(node).firstOrNull { c -> e.added.any { it in c.devices } }
