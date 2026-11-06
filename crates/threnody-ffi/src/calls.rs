@@ -136,10 +136,10 @@ impl ThrenodyNode {
 
 #[uniffi::export]
 impl ThrenodyNode {
-    /// Whether this build carries call audio (else calls ring and can be
-    /// answered, but stay silent).
+    /// Whether this build carries call media. Builds without it don't
+    /// advertise calls, so contacts don't ring them (see [`calls_built_in`]).
     pub fn calls_supported(&self) -> bool {
-        cfg!(feature = "calls")
+        crate::calls_built_in()
     }
 
     /// Calls `peer` (with an app that takes calls), first reaching it if

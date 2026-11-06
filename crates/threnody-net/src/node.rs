@@ -574,6 +574,9 @@ pub(crate) struct Shared {
     /// How long a receipt waits before it is sealed: a random time in
     /// this window (ms); tests shorten it.
     pub(crate) receipt_delay: Mutex<(u64, u64)>,
+    /// Feature bits this node puts in its contact sessions' `Hello`
+    /// (`FEATURES` less any withheld with [`Node::withhold_features`]).
+    features: AtomicU64,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
     /// Folders, pinned and archived chats (see `folders`).
@@ -872,6 +875,7 @@ impl Node {
                 crate::receipts::MIN_DELAY_MS,
                 crate::receipts::MAX_DELAY_MS,
             )),
+            features: AtomicU64::new(FEATURES),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
             recover: crate::recover::RecoverState::new(),
@@ -974,6 +978,20 @@ impl Node {
 
     pub fn set_prefer_onion(&self, on: bool) {
         self.shared.prefer_onion.store(on, Ordering::Relaxed);
+    }
+
+    /// Leaves `bits` out of the `Hello` of every contact session that
+    /// starts from now on, for things this build understands but can't do:
+    /// a build without call media withholds `FEATURE_CALLS`, so contacts
+    /// don't ring it. Call before `listen`/`connect`; running sessions keep
+    /// what they said. Anonymous links always send the full `FEATURES`.
+    pub fn withhold_features(&self, bits: u64) {
+        self.shared.features.fetch_and(!bits, Ordering::Relaxed);
+    }
+
+    /// The feature bits this node advertises in contact sessions.
+    pub fn local_features(&self) -> u64 {
+        self.shared.features.load(Ordering::Relaxed)
     }
 
     /// Whether images we send lose their metadata (location, camera,
@@ -1974,7 +1992,9 @@ where
     // Each side's first message is its Hello, so the other learns its
     // features before anything else.
     let mut pending: VecDeque<AppMessage> = VecDeque::new();
-    pending.push_back(AppMessage::Hello { features: FEATURES });
+    pending.push_back(AppMessage::Hello {
+        features: node.local_features(),
+    });
     pending.push_back(AppMessage::Approval {
         approved: local_approved,
     });
