@@ -940,3 +940,699 @@ async fn revoking_on_another_device_takes_our_tunnel_down() {
     assert!(!saved(&dir, "laptop").exists());
     let _ = (&mut laptop.rx, &mut phone.rx, &mut bob.rx);
 }
+
+/// A node again from the home `name` an earlier one used.
+async fn restart(dir: &tempfile::TempDir, name: &str) -> N {
+    let home = Home::new(dir.path().join(name));
+    let identity = home.load_identity(None).unwrap();
+    let (node, rx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
+    N { node, rx, addr }
+}
+
+/// The outgoing entry with text `t` in `n`'s chat with `peer`.
+fn sent(
+    n: &Node,
+    peer: &threnody_core::PublicIdentity,
+    t: &str,
+) -> Option<threnody_core::history::Entry> {
+    n.history(n.conversation_for(peer))
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.outgoing && e.text == t)
+        .cloned()
+}
+
+#[tokio::test]
+async fn delivery_and_read_ticks_reach_a_connected_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    laptop.node.send_text(&bid, "tick me").unwrap();
+    wait_for(|| sent(&phone.node, &bid, "tick me").is_some()).await;
+    wait_for(|| sent(&laptop.node, &bid, "tick me").unwrap().delivered).await;
+    // The phone hears of the delivery from the laptop, not from bob.
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    wait_for(|| sent(&phone.node, &bid, "tick me").unwrap().delivered).await;
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn delivery_and_read_ticks_reach_a_sibling_that_was_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    // Bob is away while the laptop sends, so the phone has the entry
+    // (pushed live) before there is anything to tick.
+    bob.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    drop(bob);
+    let _ = laptop.node.send_text(&bid, "while you were out");
+    wait_for(|| sent(&phone.node, &bid, "while you were out").is_some()).await;
+    let pid = phone.node.identity();
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+
+    // Bob comes back, receives and reads it.
+    let mut bob = restart(&dir, "bob").await;
+    bob.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut bob.rx, |e| matches!(e, Event::Message { .. })).await;
+    let id = sent(&laptop.node, &bid, "while you were out")
+        .unwrap()
+        .message_id();
+    wait_for(|| {
+        sent(&laptop.node, &bid, "while you were out")
+            .unwrap()
+            .delivered
+    })
+    .await;
+    bob.node
+        .report_read(&laptop.node.identity(), &[id])
+        .unwrap();
+    wait_for(|| {
+        sent(&laptop.node, &bid, "while you were out")
+            .unwrap()
+            .read_ms
+            != 0
+    })
+    .await;
+
+    // The phone comes back and catches up on both ticks.
+    let mut phone = restart(&dir, "phone").await;
+    let e = sent(&phone.node, &bid, "while you were out").unwrap();
+    assert!(!e.delivered && e.read_ms == 0, "not yet");
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    wait_for(|| {
+        let e = sent(&phone.node, &bid, "while you were out").unwrap();
+        e.delivered && e.read_ms != 0
+    })
+    .await;
+    let read_ms = sent(&phone.node, &bid, "while you were out")
+        .unwrap()
+        .read_ms;
+
+    // Nothing goes back on a further reconnect.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let e = sent(&phone.node, &bid, "while you were out").unwrap();
+    assert!(e.delivered);
+    assert_eq!(e.read_ms, read_ms);
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn ticks_from_before_the_upgrade_are_backfilled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    let pid = phone.node.identity();
+    bob.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    drop(bob);
+    let _ = laptop.node.send_text(&bid, "old news");
+    wait_for(|| sent(&phone.node, &bid, "old news").is_some()).await;
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+    let mut bob = restart(&dir, "bob").await;
+    bob.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| sent(&laptop.node, &bid, "old news").unwrap().delivered).await;
+
+    // Both stop; the laptop forgets how far the phone had its ticks, as
+    // a version from before ticks were synced never knew.
+    laptop.node.shutdown();
+    drop(laptop);
+    let state = dir.path().join("laptop").join("history-sync-ticks.state");
+    assert!(state.exists());
+    std::fs::remove_file(&state).unwrap();
+
+    let laptop = restart(&dir, "laptop").await;
+    let mut phone = restart(&dir, "phone").await;
+    assert!(!sent(&phone.node, &bid, "old news").unwrap().delivered);
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    assert!(sent(&phone.node, &bid, "old news").unwrap().delivered);
+    let _ = &mut bob.rx;
+}
+
+/// An outgoing file entry from `device`, as history keeps it.
+fn file_entry(
+    device: &threnody_core::PublicIdentity,
+    name: &str,
+    size: u64,
+    location: Option<String>,
+) -> threnody_core::history::Entry {
+    threnody_core::history::Entry {
+        at_ms: threnody_core::now_ms(),
+        outgoing: true,
+        device: *device.as_bytes(),
+        text: String::new(),
+        offline: false,
+        expires_at_ms: None,
+        file: Some(threnody_core::history::FileNote {
+            name: name.into(),
+            size,
+            location,
+            sensitive: false,
+            album: 0,
+            clip: None,
+            forwarded: false,
+        }),
+        local_id: threnody_net::history::local_id(),
+        delivered: false,
+        recipients: 0,
+        delivered_to: Vec::new(),
+        remote_id: 0,
+        edited_ms: 0,
+        read_ms: 0,
+        reactions: Vec::new(),
+        quote: None,
+        mentions: Vec::new(),
+        poll: None,
+        forwarded: false,
+        list: None,
+        ticked_ms: 0,
+    }
+}
+
+/// An account message as our own device would send it.
+fn account_msg(op: u8, one: Option<&[u8]>, two: &[u8]) -> threnody_core::AppMessage {
+    let b = threnody_core::cbor::to_vec(two.len() + 128, |e| {
+        e.map_len(2 + usize::from(one.is_some()))?.u8(0)?.u8(op)?;
+        if let Some(o) = one {
+            e.u8(1)?.bytes(o)?;
+        }
+        e.u8(2)?.bytes(two)?;
+        Ok(())
+    })
+    .unwrap();
+    threnody_core::AppMessage::Account(b)
+}
+
+#[tokio::test]
+async fn transcripts_never_plant_a_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    wait_for(|| laptop.node.is_own_device(&pid)).await;
+    let bid = bob.node.identity();
+    let conv = laptop.node.conversation_for(&bid);
+    let planted = file_entry(
+        &laptop.node.identity(),
+        "id_ed25519",
+        400,
+        Some("/etc/passwd".into()),
+    );
+    let h = threnody_core::history::History::transcript(vec![planted])
+        .encode()
+        .unwrap();
+    laptop
+        .node
+        .send(
+            &phone.node.identity(),
+            account_msg(8, Some(&conv.to_bytes()), &h),
+        )
+        .unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let on_phone = phone
+        .node
+        .history(phone.node.conversation_for(&bid))
+        .unwrap()
+        .entries()
+        .iter()
+        .find_map(|e| e.file.clone())
+        .unwrap();
+    assert_eq!(on_phone.name, "id_ed25519");
+    assert_eq!(on_phone.location, None);
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn a_transcript_brings_ticks_for_entries_we_already_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    bob.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    let _ = laptop.node.send_text(&bid, "seen elsewhere");
+    wait_for(|| sent(&phone.node, &bid, "seen elsewhere").is_some()).await;
+    // As a third device would send it: the entry the phone has already,
+    // now delivered and read.
+    let mut e = sent(&laptop.node, &bid, "seen elsewhere").unwrap();
+    e.delivered = true;
+    e.read_ms = threnody_core::now_ms();
+    let conv = laptop.node.conversation_for(&bid);
+    let h = threnody_core::history::History::transcript(vec![e])
+        .encode()
+        .unwrap();
+    laptop
+        .node
+        .send(
+            &phone.node.identity(),
+            account_msg(8, Some(&conv.to_bytes()), &h),
+        )
+        .unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    let on_phone = sent(&phone.node, &bid, "seen elsewhere").unwrap();
+    assert!(on_phone.delivered && on_phone.read_ms != 0);
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
+/// A file store in a directory, counting reads.
+struct DirStore {
+    dir: std::path::PathBuf,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl DirStore {
+    fn new(dir: &tempfile::TempDir, name: &str) -> std::sync::Arc<Self> {
+        let dir = dir.path().join(format!("{name}-files"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::sync::Arc::new(Self {
+            dir,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Puts `data` here as `name`; its location.
+    fn put(&self, name: &str, data: &[u8]) -> String {
+        let p = self.dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+}
+
+impl threnody_net::FileStore for DirStore {
+    fn read(&self, location: &str, max: u64) -> Option<Vec<u8>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let m = std::fs::metadata(location).ok()?;
+        (m.is_file() && m.len() <= max)
+            .then(|| std::fs::read(location).ok())
+            .flatten()
+    }
+
+    fn keep(&self, name: &str, data: &[u8], _clip: bool) -> Option<String> {
+        let p = self
+            .dir
+            .join(format!("{:x}-{name}", threnody_net::history::local_id()));
+        std::fs::write(&p, data).ok()?;
+        Some(p.to_string_lossy().into_owned())
+    }
+}
+
+fn random(n: usize) -> Vec<u8> {
+    threnody_core::random_bytes_vec(n)
+}
+
+/// `n`'s newest entry for the file `name` in its chat with `peer`.
+fn file_named(
+    n: &Node,
+    peer: &threnody_core::PublicIdentity,
+    name: &str,
+) -> Option<threnody_core::history::Entry> {
+    n.history(n.conversation_for(peer))
+        .unwrap()
+        .entries()
+        .iter()
+        .rev()
+        .find(|e| e.file.as_ref().is_some_and(|f| f.name == name))
+        .cloned()
+}
+
+/// The contents `n` has of the file `name`, once it has them.
+fn contents(n: &Node, peer: &threnody_core::PublicIdentity, name: &str) -> Option<Vec<u8>> {
+    let e = file_named(n, peer, name)?;
+    std::fs::read(e.file?.location?).ok()
+}
+
+/// Sends `data` as `name` from `n`'s store to `peer`.
+fn send_photo(
+    n: &Node,
+    store: &DirStore,
+    peer: &threnody_core::PublicIdentity,
+    name: &str,
+    data: &[u8],
+    sensitive: bool,
+) {
+    let location = store.put(name, data);
+    n.send_file(
+        peer,
+        threnody_net::history::OutgoingFile {
+            name: name.into(),
+            data: data.to_vec(),
+            location: Some(location),
+            sensitive,
+            caption: String::new(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        },
+    )
+    .unwrap();
+}
+
+/// The laptop (with its store) linked to Bob, and the phone (with its
+/// store) linked to the laptop's account.
+async fn linked_with_stores(
+    dir: &tempfile::TempDir,
+) -> (N, N, N, std::sync::Arc<DirStore>, std::sync::Arc<DirStore>) {
+    let mut laptop = spawn(dir, "laptop").await;
+    let phone = spawn(dir, "phone").await;
+    let mut bob = spawn(dir, "bob").await;
+    let (ls, ps) = (DirStore::new(dir, "laptop"), DirStore::new(dir, "phone"));
+    laptop.node.set_file_store(ls.clone());
+    phone.node.set_file_store(ps.clone());
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    wait_for(|| laptop.node.is_own_device(&pid)).await;
+    (laptop, phone, bob, ls, ps)
+}
+
+async fn wait_long(cond: impl Fn() -> bool) {
+    timeout(Duration::from_secs(30), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("condition not reached");
+}
+
+#[tokio::test]
+async fn a_photo_follows_us_to_a_newly_linked_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let (ls, ps) = (DirStore::new(&dir, "laptop"), DirStore::new(&dir, "phone"));
+    laptop.node.set_file_store(ls.clone());
+    phone.node.set_file_store(ps.clone());
+    link(&mut laptop, &mut bob).await;
+    let bid = bob.node.identity();
+    let photo = random(5000);
+    send_photo(&laptop.node, &ls, &bid, "IMG_1.png", &photo, false);
+    next(&mut bob.rx, |e| matches!(e, Event::Message { .. })).await;
+    let bob_before = bob
+        .node
+        .history(bob.node.conversation_for(&laptop.node.identity()))
+        .unwrap()
+        .entries()
+        .to_vec();
+
+    // Linked within a session that started before: the history and
+    // then the photo come over.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    wait_for(|| contents(&phone.node, &bid, "IMG_1.png").as_deref() == Some(&photo[..])).await;
+    assert_eq!(ls.reads(), 1);
+    assert_eq!(
+        bob.node
+            .history(bob.node.conversation_for(&laptop.node.identity()))
+            .unwrap()
+            .entries(),
+        &bob_before[..],
+        "nothing reaches the contact"
+    );
+    let _ = &mut laptop.rx;
+}
+
+#[tokio::test]
+async fn an_outgoing_photo_reaches_a_connected_sibling_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let photo = random(70_000);
+    send_photo(&laptop.node, &ls, &bid, "now.jpg", &photo, false);
+    wait_for(|| contents(&phone.node, &bid, "now.jpg").as_deref() == Some(&photo[..])).await;
+    assert!(phone.node.file_fetches().is_empty());
+}
+
+#[tokio::test]
+async fn a_first_sync_does_not_refetch_files_we_already_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, mut phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    // Bob's photo reached both devices, and each kept it.
+    let photo = random(3000);
+    let note = |location: String| threnody_core::history::FileNote {
+        name: "from-bob.png".into(),
+        size: photo.len() as u64,
+        location: Some(location),
+        sensitive: false,
+        album: 0,
+        clip: None,
+        forwarded: false,
+    };
+    laptop
+        .node
+        .record_received_file(&bid, note(ls.put("from-bob.png", &photo)), "", 4242);
+    phone
+        .node
+        .record_received_file(&bid, note(ps.put("from-bob.png", &photo)), "", 4242);
+    let phone_copy = file_named(&phone.node, &bid, "from-bob.png").unwrap();
+
+    // The laptop forgets it ever synced the phone: the next session sends
+    // the phone everything again.
+    laptop.node.shutdown();
+    drop(laptop);
+    std::fs::remove_file(dir.path().join("laptop").join("history-sync.state")).unwrap();
+    let laptop = restart(&dir, "laptop").await;
+    laptop.node.set_file_store(ls.clone());
+    let _ = laptop.node.send_text(&bid, "something new");
+    while phone.rx.try_recv().is_ok() {}
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    assert_eq!(ls.reads(), 0, "nothing was asked for");
+    assert_eq!(
+        file_named(&phone.node, &bid, "from-bob.png")
+            .unwrap()
+            .file
+            .unwrap()
+            .location,
+        phone_copy.file.unwrap().location
+    );
+    assert!(phone.node.file_fetches().is_empty());
+}
+
+#[tokio::test]
+async fn sensitive_disappearing_and_non_media_files_wait_for_a_tap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let (a, b, c) = (random(1000), random(2000), random(3000));
+    send_photo(&laptop.node, &ls, &bid, "private.png", &a, true);
+    send_photo(&laptop.node, &ls, &bid, "report.pdf", &c, false);
+    laptop.node.set_timer(&bid, Some(3600)).unwrap();
+    send_photo(&laptop.node, &ls, &bid, "fleeting.png", &b, false);
+    for _ in 0..3 {
+        next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    }
+    wait_for(|| file_named(&phone.node, &bid, "fleeting.png").is_some()).await;
+    let r = |name: &str| {
+        threnody_core::history::file_ref(&file_named(&phone.node, &bid, name).unwrap()).unwrap()
+    };
+    for name in ["private.png", "report.pdf", "fleeting.png"] {
+        assert_eq!(
+            phone.node.fetch_state(&r(name)),
+            threnody_net::FetchState::Idle,
+            "{name}"
+        );
+    }
+    assert_eq!(ls.reads(), 0);
+
+    // A tap brings each.
+    let conv = phone.node.conversation_for(&bid);
+    for (name, data) in [
+        ("private.png", &a),
+        ("report.pdf", &c),
+        ("fleeting.png", &b),
+    ] {
+        let s = phone
+            .node
+            .fetch_file(conv, |e| e.file.as_ref().is_some_and(|f| f.name == name))
+            .unwrap();
+        assert!(
+            matches!(
+                s,
+                threnody_net::FetchState::Fetching { .. } | threnody_net::FetchState::Waiting
+            ),
+            "{s:?}"
+        );
+        wait_for(|| contents(&phone.node, &bid, name).as_deref() == Some(&data[..])).await;
+    }
+}
+
+#[tokio::test]
+async fn auto_fetch_waits_while_off_and_starts_when_turned_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    phone.node.set_auto_fetch(false);
+    let bid = bob.node.identity();
+    let photo = random(4000);
+    send_photo(&laptop.node, &ls, &bid, "later.webp", &photo, false);
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let r = threnody_core::history::file_ref(&file_named(&phone.node, &bid, "later.webp").unwrap())
+        .unwrap();
+    assert_eq!(
+        phone.node.fetch_state(&r),
+        threnody_net::FetchState::Waiting
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(ls.reads(), 0);
+    phone.node.set_auto_fetch(true);
+    wait_for(|| contents(&phone.node, &bid, "later.webp").as_deref() == Some(&photo[..])).await;
+}
+
+#[tokio::test]
+async fn a_fetch_waits_for_a_sibling_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    // 12 parts: three windows.
+    let big = random(3 * 1024 * 1024);
+    send_photo(&laptop.node, &ls, &bid, "big.bin", &big, false);
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let lid = laptop.node.identity();
+    laptop.node.shutdown();
+    drop(laptop);
+    wait_for(|| phone.node.sessions().iter().all(|s| s.peer != lid)).await;
+
+    let conv = phone.node.conversation_for(&bid);
+    let pick =
+        |e: &threnody_core::history::Entry| e.file.as_ref().is_some_and(|f| f.name == "big.bin");
+    assert_eq!(
+        phone.node.fetch_file(conv, pick).unwrap(),
+        threnody_net::FetchState::Waiting
+    );
+
+    let laptop = restart(&dir, "laptop").await;
+    laptop.node.set_file_store(ls.clone());
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    wait_long(|| contents(&phone.node, &bid, "big.bin").as_deref() == Some(&big[..])).await;
+    assert!(phone.node.file_fetches().is_empty());
+}
+
+#[tokio::test]
+async fn a_restarted_requester_keeps_its_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, mut phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let doc = random(10_000);
+    send_photo(&laptop.node, &ls, &bid, "kept.pdf", &doc, false);
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let lid = laptop.node.identity();
+    laptop.node.shutdown();
+    drop(laptop);
+    wait_for(|| phone.node.sessions().iter().all(|s| s.peer != lid)).await;
+    let conv = phone.node.conversation_for(&bid);
+    phone
+        .node
+        .fetch_file(conv, |e| {
+            e.file.as_ref().is_some_and(|f| f.name == "kept.pdf")
+        })
+        .unwrap();
+    phone.node.shutdown();
+    drop(phone);
+
+    let phone = restart(&dir, "phone").await;
+    phone.node.set_file_store(ps.clone());
+    assert_eq!(phone.node.file_fetches().len(), 1, "the queue survived");
+    let laptop = restart(&dir, "laptop").await;
+    laptop.node.set_file_store(ls.clone());
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| contents(&phone.node, &bid, "kept.pdf").as_deref() == Some(&doc[..])).await;
+}
+
+#[tokio::test]
+async fn a_sibling_without_the_file_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    send_photo(&laptop.node, &ls, &bid, "gone.pdf", &random(500), false);
+    next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    std::fs::remove_file(ls.dir.join("gone.pdf")).unwrap();
+    let conv = phone.node.conversation_for(&bid);
+    phone
+        .node
+        .fetch_file(conv, |e| {
+            e.file.as_ref().is_some_and(|f| f.name == "gone.pdf")
+        })
+        .unwrap();
+    let r = threnody_core::history::file_ref(&file_named(&phone.node, &bid, "gone.pdf").unwrap())
+        .unwrap();
+    wait_for(|| phone.node.fetch_state(&r) == threnody_net::FetchState::Unavailable).await;
+    assert_eq!(ls.reads(), 1);
+    let _ = laptop;
+}
+
+#[tokio::test]
+async fn strangers_cannot_fetch_our_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, _phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let photo = random(800);
+    // Not a photo, so our own phone doesn't fetch it.
+    send_photo(&laptop.node, &ls, &bid, "mine.pdf", &photo, false);
+    let e = file_named(&laptop.node, &bid, "mine.pdf").unwrap();
+    let want = threnody_core::devsync::FileWant {
+        request: 1,
+        file: threnody_core::history::file_ref(&e).unwrap(),
+        offset: 0,
+        hash: None,
+    }
+    .encode()
+    .unwrap();
+    let conv = laptop.node.conversation_for(&bid);
+    bob.node
+        .send(
+            &laptop.node.identity(),
+            account_msg(11, Some(&conv.to_bytes()), &want),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(ls.reads(), 0);
+}

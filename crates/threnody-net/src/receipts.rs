@@ -709,6 +709,7 @@ impl Node {
             .home
             .mark_delivered_ids(self.identity_ref(), conv, &ids, now_ms())
             .unwrap_or_default();
+        self.push_ticks(conv, &changed);
         for local_id in changed {
             self.emit(Event::Delivered {
                 peer: *from,

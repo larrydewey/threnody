@@ -175,6 +175,89 @@ pub struct HistoryEntry {
     pub forwarded: bool,
     /// A list shared here (its hex id; open it with `list`).
     pub list: Option<String>,
+    /// The ticks to show on an outgoing message (`None` for incoming
+    /// ones). Apps add "from your other device" themselves when `device`
+    /// isn't this one.
+    pub tick: TickMark,
+}
+
+/// The ticks an outgoing message shows, weakest first (so the weakest
+/// of several is the smallest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, uniffi::Enum)]
+pub enum TickMark {
+    /// Nothing to show: incoming, or a message from another of our
+    /// devices whose delivery this device hasn't heard of.
+    None,
+    /// Sent from this device.
+    Sent,
+    /// A group message some members have.
+    Partial {
+        delivered: u32,
+        recipients: u32,
+    },
+    Delivered,
+    Read,
+}
+
+/// What `e` shows as ticks, on the device `this_device`. A message sent
+/// from another of our devices never shows just "sent": this device
+/// can't know that, only what that device has told it since.
+pub(crate) fn tick_mark(e: &threnody_core::history::Entry, this_device: [u8; 32]) -> TickMark {
+    if !e.outgoing {
+        TickMark::None
+    } else if e.delivered && e.read_ms != 0 {
+        TickMark::Read
+    } else if e.delivered {
+        TickMark::Delivered
+    } else if e.recipients > 0 && !e.delivered_to.is_empty() {
+        TickMark::Partial {
+            delivered: u32::try_from(e.delivered_to.len()).unwrap_or(u32::MAX),
+            recipients: e.recipients,
+        }
+    } else if e.device == this_device {
+        TickMark::Sent
+    } else {
+        TickMark::None
+    }
+}
+
+/// Where a file's contents are, for an entry without them on this device
+/// (see `fetch_file`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FileFetch {
+    /// Nothing can bring it here (no other device, or no file store):
+    /// say it isn't on this device.
+    NotHere,
+    /// Another of our devices may have it: tap to get it.
+    Idle,
+    /// Asked for; waiting for another of our devices to connect.
+    Waiting,
+    /// Coming from another of our devices.
+    Fetching { received: u64, total: u64 },
+    /// None of our other devices has it (tapping asks again).
+    Unavailable,
+}
+
+impl From<threnody_net::FetchState> for FileFetch {
+    fn from(s: threnody_net::FetchState) -> Self {
+        use threnody_net::FetchState as S;
+        match s {
+            S::NotHere => Self::NotHere,
+            S::Idle => Self::Idle,
+            S::Waiting => Self::Waiting,
+            S::Fetching { received, total } => Self::Fetching { received, total },
+            S::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// A queued fetch: the entry it is for (by `at_ms` and `device`, as in
+/// `HistoryEntry`) and where it is.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FileProgress {
+    pub at_ms: u64,
+    pub device: String,
+    pub fetch: FileFetch,
 }
 
 /// A poll: its options with how many chose each and whether we did, and
@@ -275,6 +358,9 @@ pub struct FileInfo {
     pub album: u64,
     /// A voice or video message: play it in the chat.
     pub clip: Option<Clip>,
+    /// Without a `location`: whether and how its contents can come from
+    /// another of our devices.
+    pub fetch: FileFetch,
 }
 
 /// A voice or video message, recorded in the app: a file that plays in
@@ -765,6 +851,8 @@ pub enum NodeEvent {
         invite: Option<String>,
     },
     /// Our own device `from` shared history; reload conversations.
+    /// `added`: entries new here; 0 when existing ones changed (ticks, or
+    /// a file arrived).
     HistorySynced {
         from: String,
         added: u32,
@@ -824,6 +912,30 @@ pub enum NodeEvent {
     Other {
         description: String,
     },
+}
+
+/// Where the app keeps files, for fetching them between our own devices
+/// (Appendix J). Called from a Rust worker thread.
+#[uniffi::export(with_foreign)]
+pub trait SyncedFileStore: Send + Sync {
+    /// The bytes at `location` (as recorded in history), if still there
+    /// and at most `max` bytes.
+    fn read(&self, location: String, max: u64) -> Option<Vec<u8>>;
+    /// Keeps a file from another of our devices privately; its location.
+    fn keep(&self, name: String, data: Vec<u8>, clip: bool) -> Option<String>;
+}
+
+/// The app's [`SyncedFileStore`] as the node's file store.
+struct AppFiles(Arc<dyn SyncedFileStore>);
+
+impl threnody_net::FileStore for AppFiles {
+    fn read(&self, location: &str, max: u64) -> Option<Vec<u8>> {
+        self.0.read(location.to_owned(), max)
+    }
+
+    fn keep(&self, name: &str, data: &[u8], clip: bool) -> Option<String> {
+        self.0.keep(name.to_owned(), data.to_vec(), clip)
+    }
 }
 
 /// A platform byte pipe (e.g. an Android Bluetooth L2CAP socket),
@@ -945,9 +1057,11 @@ fn history_entries(
     entries: &[threnody_core::history::Entry],
     me: [u8; 32],
 ) -> Vec<HistoryEntry> {
+    let this_device = *node.identity().as_bytes();
     entries
         .iter()
         .map(|e| HistoryEntry {
+            tick: tick_mark(e, this_device),
             forwarded: e.forwarded || e.file.as_ref().is_some_and(|f| f.forwarded),
             list: e.list.as_ref().map(lists::list_hex),
             poll: e.poll.as_ref().map(|p| {
@@ -999,6 +1113,12 @@ fn history_entries(
                 sensitive: f.sensitive,
                 album: f.album,
                 clip: f.clip.map(Into::into),
+                fetch: if f.location.is_some() {
+                    FileFetch::NotHere
+                } else {
+                    threnody_core::history::file_ref(e)
+                        .map_or(FileFetch::NotHere, |r| node.fetch_state(&r).into())
+                },
             }),
             delivered: e.delivered,
             // On incoming entries `read_ms` records that we reported it.
@@ -1179,6 +1299,10 @@ fn convert(e: Event) -> NodeEvent {
         Event::HistorySynced { from, added } => NodeEvent::HistorySynced {
             from: fp(&from),
             added: u32::try_from(added).unwrap_or(u32::MAX),
+        },
+        Event::DeviceSync { from } => NodeEvent::HistorySynced {
+            from: fp(&from),
+            added: 0,
         },
         Event::ScheduledChanged { peer, group } => NodeEvent::ScheduledChanged {
             peer: peer.as_ref().map(fp),
@@ -1964,6 +2088,64 @@ PersistentKeepalive = 25\n",
             id,
         );
         Ok(())
+    }
+
+    /// Where this device keeps files, so it can get files' contents from
+    /// our other devices and give them ours. Set once at start.
+    pub fn set_file_store(&self, store: Arc<dyn SyncedFileStore>) {
+        let _guard = self.rt.enter();
+        self.node.set_file_store(Arc::new(AppFiles(store)));
+    }
+
+    /// Whether new photos and voice and video messages from our other
+    /// devices download by themselves (on by default): only ones neither
+    /// sensitive nor disappearing, at most 30 days old, from a device
+    /// reached directly. Apps pass `false` on metered networks too.
+    pub fn set_auto_fetch_files(&self, on: bool) {
+        let _guard = self.rt.enter();
+        self.node.set_auto_fetch(on);
+    }
+
+    pub fn auto_fetch_files(&self) -> bool {
+        self.node.auto_fetch()
+    }
+
+    /// Gets the contents of the file `device` sent at `at_ms` in our
+    /// chat with `peer` from another of our devices.
+    pub fn fetch_file(&self, peer: String, at_ms: u64, device: String) -> Result<FileFetch> {
+        let p = self.resolve(&peer)?;
+        let _guard = self.rt.enter();
+        self.node
+            .fetch_file(self.node.conversation_for(&p), entry_at(at_ms, &device))
+            .map(Into::into)
+            .map_err(fail)
+    }
+
+    /// [`ThrenodyNode::fetch_file`] for a note to self.
+    pub fn fetch_note_file(&self, at_ms: u64, device: String) -> Result<FileFetch> {
+        let _guard = self.rt.enter();
+        self.node
+            .fetch_file(self.node.notes(), entry_at(at_ms, &device))
+            .map(Into::into)
+            .map_err(fail)
+    }
+
+    /// Fetches in progress or waiting, for progress labels (cheap: no
+    /// history is read).
+    pub fn file_fetches(&self) -> Vec<FileProgress> {
+        self.node
+            .file_fetches()
+            .into_iter()
+            .filter_map(|f| {
+                Some(FileProgress {
+                    at_ms: f.file.at_ms,
+                    device: PublicIdentity::from_bytes(&f.file.device)
+                        .ok()
+                        .map(|d| fp(&d))?,
+                    fetch: f.state.into(),
+                })
+            })
+            .collect()
     }
 
     /// Whether images lose their metadata (location, camera, times)
@@ -2900,6 +3082,182 @@ mod tests {
         assert!(q.size >= 21);
         assert_eq!(q.dark.len(), (q.size * q.size) as usize);
         assert!(q.dark[0], "finder pattern corner is dark");
+    }
+
+    fn entry(outgoing: bool, device: [u8; 32]) -> threnody_core::history::Entry {
+        threnody_core::history::Entry {
+            at_ms: 1,
+            outgoing,
+            device,
+            text: "x".into(),
+            offline: false,
+            expires_at_ms: None,
+            file: None,
+            local_id: 5,
+            delivered: false,
+            recipients: 0,
+            delivered_to: Vec::new(),
+            remote_id: 0,
+            edited_ms: 0,
+            read_ms: 0,
+            reactions: Vec::new(),
+            quote: None,
+            mentions: Vec::new(),
+            poll: None,
+            forwarded: false,
+            list: None,
+            ticked_ms: 0,
+        }
+    }
+
+    #[test]
+    fn tick_mark_never_says_sent_for_a_sibling() {
+        let (me, sibling) = ([1; 32], [2; 32]);
+        let mine = entry(true, me);
+        assert_eq!(tick_mark(&mine, me), TickMark::Sent);
+        assert_eq!(tick_mark(&entry(false, sibling), me), TickMark::None);
+        assert_eq!(tick_mark(&entry(true, sibling), me), TickMark::None);
+        let delivered = threnody_core::history::Entry {
+            delivered: true,
+            ..entry(true, sibling)
+        };
+        assert_eq!(tick_mark(&delivered, me), TickMark::Delivered);
+        let read = threnody_core::history::Entry {
+            read_ms: 9,
+            ..delivered.clone()
+        };
+        assert_eq!(tick_mark(&read, me), TickMark::Read);
+        let partial = threnody_core::history::Entry {
+            recipients: 3,
+            delivered_to: vec![[7; 32]],
+            ..entry(true, sibling)
+        };
+        assert_eq!(
+            tick_mark(&partial, me),
+            TickMark::Partial {
+                delivered: 1,
+                recipients: 3
+            }
+        );
+        // Weakest first: an album shows the least of its ticks.
+        assert!(TickMark::None < TickMark::Sent);
+        assert!(
+            TickMark::Sent
+                < TickMark::Partial {
+                    delivered: 1,
+                    recipients: 2
+                }
+        );
+        assert!(
+            TickMark::Partial {
+                delivered: 1,
+                recipients: 2
+            } < TickMark::Delivered
+        );
+        assert!(TickMark::Delivered < TickMark::Read);
+    }
+
+    /// Files in a directory, as an app keeps them.
+    struct TempFiles(std::path::PathBuf);
+
+    impl SyncedFileStore for TempFiles {
+        fn read(&self, location: String, max: u64) -> Option<Vec<u8>> {
+            let d = std::fs::read(location).ok()?;
+            (d.len() as u64 <= max).then_some(d)
+        }
+
+        fn keep(&self, name: String, data: Vec<u8>, _clip: bool) -> Option<String> {
+            let p = self.0.join(format!("kept-{name}"));
+            std::fs::write(&p, data).ok()?;
+            Some(p.display().to_string())
+        }
+    }
+
+    fn file_options() -> FileOptions {
+        FileOptions {
+            sensitive: false,
+            caption: String::new(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        }
+    }
+
+    #[test]
+    fn fetch_state_is_not_here_without_a_store_or_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let me =
+            ThrenodyNode::open(dir.path().join("me").display().to_string(), None, None).unwrap();
+        me.add_note_file("a.png".into(), 10, None, file_options())
+            .unwrap();
+        let notes = me.note_history(10).unwrap();
+        let f = notes[0].file.as_ref().unwrap();
+        assert_eq!(f.fetch, FileFetch::NotHere);
+        let e = me
+            .fetch_note_file(notes[0].at_ms, notes[0].device.clone())
+            .unwrap_err();
+        assert!(e.to_string().contains("no file store"), "{e}");
+        // A store, but no other device: still nothing to fetch from.
+        me.set_file_store(Arc::new(TempFiles(dir.path().to_path_buf())));
+        let notes = me.note_history(10).unwrap();
+        assert_eq!(notes[0].file.as_ref().unwrap().fetch, FileFetch::NotHere);
+    }
+
+    #[test]
+    fn auto_fetch_files_defaults_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let me =
+            ThrenodyNode::open(dir.path().join("me").display().to_string(), None, None).unwrap();
+        assert!(me.auto_fetch_files());
+        me.set_auto_fetch_files(false);
+        assert!(!me.auto_fetch_files());
+    }
+
+    #[test]
+    fn notes_files_fetch_between_linked_devices_through_the_ffi() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            let files = dir.path().join(format!("{n}-files"));
+            std::fs::create_dir_all(&files).unwrap();
+            node.set_file_store(Arc::new(TempFiles(files.clone())));
+            // Cover traffic (on by default) paces every message.
+            node.set_cover_traffic(None);
+            (node, files)
+        };
+        let (laptop, laptop_files) = open("laptop");
+        let (phone, _) = open("phone");
+        let addr = laptop.listen("127.0.0.1:0".into()).unwrap();
+        let code = laptop.create_link_code(addr);
+        phone.link_with(code).unwrap();
+
+        let data = threnody_core::random_bytes_vec(30_000);
+        let at = laptop_files.join("notes.bin");
+        std::fs::write(&at, &data).unwrap();
+        laptop
+            .add_note_file(
+                "notes.bin".into(),
+                data.len() as u64,
+                Some(at.display().to_string()),
+                file_options(),
+            )
+            .unwrap();
+        wait(&phone, |e| matches!(e, NodeEvent::HistorySynced { .. }));
+        let n = phone.note_history(10).unwrap();
+        let e = n
+            .iter()
+            .find(|e| e.file.as_ref().is_some_and(|f| f.name == "notes.bin"))
+            .unwrap();
+        assert_eq!(e.file.as_ref().unwrap().fetch, FileFetch::Idle);
+        phone.fetch_note_file(e.at_ms, e.device.clone()).unwrap();
+        wait(&phone, |e| {
+            matches!(e, NodeEvent::HistorySynced { added: 0, .. })
+        });
+        let n = phone.note_history(10).unwrap();
+        let f = n.iter().find_map(|e| e.file.clone()).unwrap();
+        assert_eq!(std::fs::read(f.location.unwrap()).unwrap(), data);
+        assert!(phone.file_fetches().is_empty());
     }
 
     #[test]

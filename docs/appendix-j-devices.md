@@ -60,7 +60,7 @@ existing device E                                  new device N
   append the link; broadcast the new chain
 ```
 
-`s` travels in the code as 32 hex digits after `#`. Account messages (`AppMessage::Account`) are numbered: 1 chain, 2 `LinkRequest`, 3 `LinkOffer`, 4 `LinkConsent`, 5 `ContactSync`, 6 `LinkRefused`, 7 shared bundle, 8 `Transcript`, 9 `Folders`, 10 `List`.
+`s` travels in the code as 32 hex digits after `#`. Account messages (`AppMessage::Account`) are numbered: 1 chain, 2 `LinkRequest`, 3 `LinkOffer`, 4 `LinkConsent`, 5 `ContactSync`, 6 `LinkRefused`, 7 shared bundle, 8 `Transcript`, 9 `Folders`, 10 `List`, 11 `FileWant`, 12 `FilePart`, 13 `FileMissing`, 14 `Ticks` (11–14 only to siblings whose `Hello` has the device-sync bit, Appendix C).
 
 - **The secret.** `s` is 16 random bytes, good for one use and 10 minutes.
 - **Authenticating each side.** The code pins `fp(E)`, which authenticates E to N. The proof binds `s` to *this* session and *this* device, which authenticates N to E. An attacker without the code can't be added, and can't replay a proof into another session.
@@ -85,14 +85,57 @@ Contacts send to every device of an account, so each device receives incoming me
 - **New devices.** The first time, a device sends all of its history, 1:1 and group, so a newly linked device starts complete. Linking triggers this right away, without waiting for a new session.
 - **Merging.** Receivers merge entries that aren't already present, and accept transcripts only from devices of their own account. Entries match by the sender's id for the message where both have one (an outgoing entry's local id, or an incoming one's remote id). Others match by sender and content within ten minutes, because each device stamps its own receipt time.
 - **Reliability.** Transcripts are sent tracked (Appendix C, *Acknowledgements*), so one lost with a dying session is resent.
-- **Files.** A file entry travels without its location; the contents stay on the device that has them.
+- **Files.** A file entry travels without its location (a path or URI on the device that recorded it). Receivers drop any location a transcript carries anyway. The contents come on request (*Files*, below).
 - **Groups.** A device can only read a group's messages from when it joined (MLS), so its siblings transcribe the group's history to it, and have it added to the group (Appendix F, *Linked devices*). When catching up, a device sends every group entry newer than what that sibling last had, not only its own, to cover the time between linking and joining. Once a member, a device receives the group's messages itself; those a sibling sends reach it as a member and are recorded as the account's own.
 - **Notes to self.** Each account has a chat with itself, `0 ‖ account id`. A device writes notes there like outgoing messages, and they reach the other devices as transcripts (live, catching up, and on linking). A file note stays on the device that has it; the others get its record.
 - **Folders.** The user's chat folders, pinned chats and archived chats are one record (Appendix C, *Local storage*: `{ 0: version 1, 1: updated_ms, 2: [* folder], 3: [* pinned conversation], 4: [* archived conversation] }`). Each change stamps the whole record with its time (never earlier than the last stamp) and sends it to connected siblings as account message `Folders` (`{ 0 => 9, 1 => record }`); a sibling sends it as a session starts and when a device is linked. The newest stamp wins. A folder holds its picked conversations, plus, by rule, all contacts, all groups or verified contacts; "unread" and "mentions" rules keep only chats with unread messages, or unread mentions of us. A folder may set when its chats notify, and quiet slots (days of the week and a local time span, possibly overnight). A quiet folder still lets a message through when one person has written to us directly (1:1, or mentioning or replying to us) a set number of times within a set number of minutes. A chat set to "off" itself stays off. A new incoming message takes a chat out of the archive. Unread counts and quiet hours are worked out on each device.
 - **Lists.** Our devices send each other every list as it changes, and all of them as a session starts or a device is linked: account message `List` (`{ 0 => 10, 1 => { 0: list, 1: [* conversation it's shared with], ? 2: true (deleted), ? 3: ms } }`), sent tracked. Key 3 is when the device last changed whom the list is shared with (never earlier than the last such time; 0 if not known). Receivers merge the list (Appendix C, *Lists*) and take the sender's sharing if its key 3 is later than theirs, or equal with a sharing that sorts larger (comparing the conversations' bytes in order), so every device ends with the latest; a sender without key 3 (an older version) has its sharing taken as before. A deleted list goes on every device, while those it was shared with keep theirs. Each device remembers the last 200 lists it deleted; when a device that was away offers one of them, it answers with the deletion rather than taking the list back. A list deleted and then shared with us again by a contact counts as new.
 - **Conversation ids.** A device that has a contact from contact sync, but hasn't seen the contact's account chain, files the chat under the account recorded in its contact book. Its siblings do the same, so transcripts land in the right conversation.
 
-Apps show a sibling's messages as yours, without delivery ticks: the sending device collects those.
+Apps show a sibling's messages as yours, marked "from your other device", with the ticks that device passed on (*Ticks*, below). They never show a lone "sent" tick for one: only the sending device knows that.
+
+## Files
+
+A device that lacks a file's contents pulls them from a sibling that has them. All of it travels in account messages between our own devices, and only to siblings whose `Hello` has `FEATURE_DEVICE_SYNC` (Appendix C).
+
+```
+op 11 FileWant    { 1: conversation, 2: bstr .cbor Want }      requester -> own device
+op 12 FilePart    { 2: bstr .cbor Part }                       own device -> requester
+op 13 FileMissing { 2: bstr .cbor Missing }                    own device -> requester
+
+FileRef = { 0: author device (32), 1: message id uint (0 = none), 2: name tstr (≤ 255 bytes), 3: size uint, 4: at_ms uint }
+Want    = { 0: request uint, 1: FileRef, 2: offset uint, ? 3: content hash (32) }
+Part    = { 0: request uint, 1: offset uint, 2: total uint (≤ 8 MiB), 3: content hash (32), 4: data bstr (≤ 262144) }
+Missing = { 0: request uint }
+content hash = BLAKE3(the whole file as sent)
+```
+
+- **Naming a file.** A `FileRef` names a history entry the way both devices recorded it: by its author device and the sender's id for the message, or, for a message without one, by name, size and a time within ten minutes.
+- **Windows.** The source answers a `Want` with up to 4 `Part`s from `offset`, or with `Missing`. A zero-length file is one empty `Part`. After the last part of a window the requester asks for the next, under the same random `request` id. It takes a fresh id when it changes source or starts again.
+- **Integrity.** Parts are taken only from the device asked, under its request id, in order, with `total` equal to the recorded size. The requester checks the hash over the whole file before keeping it. A hash that changes partway (the file changed at the source) starts the transfer again, so a file is never stitched from two versions.
+- **Losses.** `Want`, `Part` and `Missing` are plain sends. A transfer that hears nothing for 60 s, or whose source goes away, asks again from where it got to: of another sibling, or of the same one when it is back.
+- **Who is asked.** The author device first, if it is a connected sibling; else the longest-standing session. A sibling that says `Missing` isn't asked again for that file. The file counts as unavailable only once every other device of the account has said so. A sibling that can't serve (an older version, or the CLI, which keeps no files) doesn't fail a fetch.
+- **What a source serves.** A source looks the `FileRef` up in its *own* history and reads only a location it recorded itself, never one named in a message, and at most 32 MiB. It serves the metadata-stripped form of an image if that has the recorded size, else the raw bytes if they have, else `Missing`. So a sender's original never leaves with metadata the sent copy didn't carry. Two contents are kept in memory for 2 minutes for the windows still to come.
+- **Automatic downloads.** New photos and voice and video messages in synced history come over by themselves, on by default: only those neither sensitive nor disappearing, at most 30 days old, on unmetered networks, and only from a sibling reached directly (not through a relay, an onion circuit or Bluetooth). Sensitive and disappearing ones never do. Everything else comes when the user asks. Apps turn automatic downloads off on metered networks. The conditions hold for every window, not only the first: an automatic download under way pauses, keeping what it has, when automatic downloads are turned off, the device moves to mobile data, or its sibling is no longer reached directly. It goes on from there once they hold again.
+- **The queue.** A device keeps at most 64 queued fetches (2 at a time), newest first; automatic ones make room for the user's. The queue survives restarts (state `file-fetches`, references only, never bytes). Fetches for entries since deleted, expired or cleared are dropped.
+- **Keeping.** Apps keep fetched files privately (never in Downloads), and delete them when their message goes, as they do received photos.
+
+## Ticks
+
+Only the sending device hears a contact's acknowledgements and receipts. So each device passes on what it learns of an outgoing entry's ticks to its siblings with the device-sync bit:
+
+```
+op 14 Ticks { 1: conversation, 2: bstr .cbor Ticks }
+Ticks = { 0: 1, 1: [* Tick] }                                   ; at most 128
+Tick  = { 0: message id uint, 1: author device (32), ? 2: true (delivered),
+          ? 3: read_ms uint, ? 4: recipients uint, ? 5: bstr (n x 32 delivered devices, n ≤ 1024) }
+```
+
+- **Live.** A change goes to connected siblings within a second, batched per conversation (plain sends).
+- **Catching up.** Each entry records when this device last learned something new about its ticks (`ticked_ms`, local). When a session with a sibling starts, a device sends every tick that changed since it last caught that sibling up (state `history-sync-ticks`), tracked. A first full transcript already carries every tick, so it sets that position: a receiver merges the ticks of every transcript entry, also of those it had already (from a third device, say). A sibling linked before ticks were synced gets every tick once.
+- **Merging.** Receivers merge ticks into their outgoing entries, only ever forward: delivered stays delivered, a read time once set stays (and is never in the future), delivered group devices only grow, and a group message is delivered once all its recipients have it. A device never forwards ticks it was told; its siblings get the change at their next catch-up from it. Ticks for an entry not here yet wait in memory (at most 4096) until a transcript brings it.
+- **Notes to self** have no ticks.
+- Unread counts of incoming messages stay per device.
 
 ## Contacts and messages
 
@@ -129,4 +172,3 @@ MLS leaves stay per device. `/group invite` sends a key-package request to every
 ## Not yet done
 
 - Gathering co-signatures for thresholds above 1, so removals need several devices.
-- Syncing file contents and delivery ticks between devices.

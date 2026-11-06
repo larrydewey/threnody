@@ -302,6 +302,10 @@ impl Core {
             ));
         }
         core.apply_privacy_to(&core.main, false);
+        // Only the main identity: personas are never linked to other devices.
+        core.main.set_file_store(Arc::new(LinuxFiles {
+            dir: core.media_dir(None),
+        }));
         // Radios and the relay roles can take seconds to start: the
         // window shouldn't wait.
         let weak = Arc::downgrade(&core);
@@ -773,7 +777,7 @@ impl Core {
     }
 
     fn apply_privacy_to(&self, node: &Node, persona: bool) {
-        let (onion, strip, reach, timer, volunteers, read) = {
+        let (onion, strip, reach, timer, volunteers, read, fetch) = {
             let s = self.settings();
             (
                 s.flag(settings::ONION),
@@ -782,8 +786,11 @@ impl Core {
                 s.number(settings::TIMER),
                 s.flag(settings::VOLUNTEERS),
                 s.flag(settings::SEND_READ),
+                s.flag(settings::AUTO_FETCH),
             )
         };
+        // Never on metered networks; `set_metered` applies this again.
+        node.set_auto_fetch_files(fetch && !persona && !self.metered.load(Ordering::Relaxed));
         node.set_use_volunteers(volunteers);
         node.set_cover_traffic(self.cover_ms());
         node.set_onion_first(onion);
@@ -1175,6 +1182,12 @@ impl Core {
     }
 
     // ----- Files -----
+
+    /// Keeps `data` as `name` in a node's private media directory (never
+    /// in Downloads); its location.
+    pub fn keep_private(&self, persona: Option<&str>, name: &str, data: &[u8]) -> Option<String> {
+        keep_in(&self.media_dir(persona), name, data)
+    }
 
     /// Where a node keeps received photos (and a persona everything): in
     /// its own data directory, so burning a persona takes them along.
@@ -1820,11 +1833,41 @@ pub fn describe(e: &NodeEvent) -> String {
 }
 
 pub fn is_image(name: &str) -> bool {
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif" | "heic" | "heif" | "tif" | "tiff"
-    )
+    threnody_core::media::looks_like_image(name)
+}
+
+/// Writes `data` as `name` (any path in it stripped) into `dir`; its
+/// location.
+fn keep_in(dir: &Path, name: &str, data: &[u8]) -> Option<String> {
+    let path = free_path(dir, name);
+    std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&path, data))
+        .ok()?;
+    Some(path.display().to_string())
+}
+
+/// Where the main identity keeps files, for getting them from our other
+/// devices and giving them ours (Appendix J). Files that come over go to
+/// the private media directory, never to Downloads.
+pub struct LinuxFiles {
+    pub dir: PathBuf,
+}
+
+impl threnody_ffi::SyncedFileStore for LinuxFiles {
+    fn read(&self, location: String, max: u64) -> Option<Vec<u8>> {
+        // What a sent file's path holds now may have grown, or been
+        // replaced by something else entirely.
+        let m = std::fs::metadata(&location).ok()?;
+        if !m.is_file() || m.len() > max {
+            return None;
+        }
+        let data = std::fs::read(&location).ok()?;
+        (data.len() as u64 <= max).then_some(data)
+    }
+
+    fn keep(&self, name: String, data: Vec<u8>, _clip: bool) -> Option<String> {
+        keep_in(&self.dir, &name, &data)
+    }
 }
 
 /// `dir/name` with any path the sender put in the name stripped, and a
@@ -1989,6 +2032,49 @@ mod tests {
         ] {
             assert!(private.privately("report.pdf"), "{private:?}");
         }
+    }
+
+    #[test]
+    fn synced_files_are_kept_privately() {
+        use threnody_ffi::SyncedFileStore;
+        let dir = std::env::temp_dir().join(format!("threnody-synced-{}", std::process::id()));
+        let files = LinuxFiles {
+            dir: dir.join("media"),
+        };
+        let at = files
+            .keep("../../x.png".into(), b"png".to_vec(), false)
+            .unwrap();
+        assert_eq!(PathBuf::from(&at), dir.join("media").join("x.png"));
+        assert_eq!(std::fs::read(&at).unwrap(), b"png");
+        // A second one of the same name doesn't replace the first.
+        let again = files
+            .keep("x.png".into(), b"other".to_vec(), false)
+            .unwrap();
+        assert_ne!(again, at);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_refuses_files_over_max() {
+        use threnody_ffi::SyncedFileStore;
+        let dir = std::env::temp_dir().join(format!("threnody-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = LinuxFiles { dir: dir.clone() };
+        let f = dir.join("big.bin");
+        std::fs::write(&f, vec![0u8; 100]).unwrap();
+        let at = f.display().to_string();
+        assert_eq!(files.read(at.clone(), 100).map(|d| d.len()), Some(100));
+        assert_eq!(files.read(at, 99), None);
+        assert_eq!(
+            files.read(dir.display().to_string(), 1 << 20),
+            None,
+            "not a file"
+        );
+        assert_eq!(
+            files.read(dir.join("gone").display().to_string(), 100),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -150,10 +150,48 @@ object Media {
         }
     }
 
+    /**
+     * The bytes at `location` (a `content:` or `file:` URI, or a path), if
+     * still there and at most `max` bytes; null otherwise.
+     */
+    fun read(ctx: Context, location: String, max: Long): ByteArray? = try {
+        val input = if (location.startsWith("content:") || location.startsWith("file:")) {
+            ctx.contentResolver.openInputStream(Uri.parse(location))
+        } else java.io.FileInputStream(location)
+        input?.use { s ->
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(64 * 1024)
+            var total = 0L
+            while (true) {
+                val n = s.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > max) return@use null
+                out.write(buf, 0, n)
+            }
+            out.toByteArray()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     /** Removes a privately kept image (when its message is deleted). */
     fun forget(ctx: Context, location: String?) {
         val uri = location?.let(Uri::parse) ?: return
         val path = uri.path ?: return
         if (uri.scheme == "file" && path.startsWith(ctx.filesDir.path + "/media")) File(path).delete()
     }
+}
+
+/**
+ * Where the main identity keeps files, for getting them from our other
+ * devices and giving them ours (Appendix J). Files that come over are
+ * kept privately, never in Downloads.
+ */
+class AndroidFiles(private val ctx: Context) : uniffi.threnody_ffi.SyncedFileStore {
+    override fun read(location: String, max: ULong): ByteArray? =
+        Media.read(ctx, location, max.toLong().coerceAtLeast(0))
+
+    override fun keep(name: String, data: ByteArray, clip: Boolean): String? =
+        Media.savePrivate(ctx, name, data, null)
 }

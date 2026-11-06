@@ -7,8 +7,8 @@ use std::rc::{Rc, Weak};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use threnody_ffi::{
-    Clip, FileOptions, GroupBanner, GroupInfo, GroupMemberAction, GroupMemberRow, HistoryEntry,
-    MemberRole,
+    Clip, FileFetch, FileOptions, GroupBanner, GroupInfo, GroupMemberAction, GroupMemberRow,
+    HistoryEntry, MemberRole, TickMark,
 };
 
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target};
@@ -33,6 +33,10 @@ type Review = Box<dyn Fn(&Rc<App>)>;
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 /// A message by its time and sending device, as search finds it.
 pub type Key = (u64, String);
+
+/// A file on screen coming from another of our devices: the entry (time
+/// and sender), its state label, and its size.
+type Fetching = ((u64, String), gtk::Label, u64);
 
 pub struct ChatView {
     app: Weak<App>,
@@ -78,6 +82,10 @@ pub struct ChatView {
     revealed_known: Cell<bool>,
     /// Sensitive photos the user uncovered, by time and sender.
     shown: RefCell<Vec<(u64, String)>>,
+    /// Files on screen coming from our other devices, by time and sender:
+    /// their state labels and sizes, kept current once a second.
+    fetching: RefCell<Vec<Fetching>>,
+    fetch_poll: RefCell<Option<glib::SourceId>>,
     /// Voice and video messages by file, kept across redraws so one
     /// playing goes on playing when a message arrives.
     players: RefCell<HashMap<std::path::PathBuf, gtk::MediaFile>>,
@@ -417,6 +425,8 @@ impl ChatView {
             loaded: Cell::new(false),
             revealed_known: Cell::new(true),
             shown: RefCell::new(Vec::new()),
+            fetching: RefCell::new(Vec::new()),
+            fetch_poll: RefCell::new(None),
             players: RefCell::new(HashMap::new()),
             typing_row,
             peer_typing: Cell::new(false),
@@ -1532,6 +1542,7 @@ impl ChatView {
             self.messages.remove(&child);
         }
         self.bubbles.borrow_mut().clear();
+        self.fetching.borrow_mut().clear();
         let node = self.node();
         let group = self.group().is_some();
         let mut last_day = String::new();
@@ -1679,15 +1690,24 @@ impl ChatView {
             bits.push("⏱".into());
         }
         if e.outgoing {
-            bits.push(if e.recipients > 0 && !e.delivered {
-                format!("✓ {}/{}", e.delivered_to, e.recipients)
-            } else if e.delivered && e.read {
-                "👁️".into()
-            } else if e.delivered {
-                "✓✓".into()
-            } else {
-                "✓".into()
-            });
+            // Sent from another of our devices: its ticks as that device
+            // passed them on, never a lone "sent", which only it knows.
+            if self
+                .node()
+                .is_some_and(|n| n.device_fingerprint() != e.device)
+            {
+                bits.push("from your other device".into());
+            }
+            match e.tick {
+                TickMark::Read => bits.push("👁️".into()),
+                TickMark::Delivered => bits.push("✓✓".into()),
+                TickMark::Partial {
+                    delivered,
+                    recipients,
+                } => bits.push(format!("✓ {delivered}/{recipients}")),
+                TickMark::Sent => bits.push("✓".into()),
+                TickMark::None => {}
+            }
         }
         let m = gtk::Label::new(Some(&bits.join(" ")));
         m.add_css_class("caption");
@@ -1770,6 +1790,9 @@ impl ChatView {
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         let key = (e.at_ms, e.device.clone());
+        if path.is_none() && f.location.is_none() && f.fetch != FileFetch::NotHere {
+            return self.fetch_view(e, f);
+        }
         if let (Some(c), Some(p)) = (f.clip, &path) {
             if f.sensitive && !e.outgoing && !self.shown.borrow().contains(&key) {
                 let b = gtk::Button::with_label(if c.video {
@@ -1902,6 +1925,115 @@ impl ChatView {
             row.append(&folder);
         }
         row.upcast()
+    }
+
+    /// A file whose contents another of our devices may have: what it is,
+    /// how far getting it got, and a button to get it.
+    fn fetch_view(&self, e: &HistoryEntry, f: &threnody_ffi::FileInfo) -> gtk::Widget {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.add_css_class("file-row");
+        let icon = gtk::Image::from_icon_name(match f.clip {
+            Some(c) if c.video => "camera-web-symbolic",
+            Some(_) => "audio-input-microphone-symbolic",
+            None if core::is_image(&f.name) => "image-x-generic-symbolic",
+            None => "text-x-generic-symbolic",
+        });
+        icon.set_pixel_size(32);
+        row.append(&icon);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let label = match f.clip {
+            Some(c) => core::file_label(&f.name, f.sensitive, "", Some(c)),
+            None => f.name.clone(),
+        };
+        let name = gtk::Label::builder()
+            .label(&label)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .max_width_chars(36)
+            .build();
+        name.add_css_class("heading");
+        text.append(&name);
+        let state = ui::label(&fetch_text(f.size, f.fetch), &["caption", "dim-label"]);
+        text.append(&state);
+        row.append(&text);
+        if matches!(f.fetch, FileFetch::Idle | FileFetch::Unavailable) {
+            let get = gtk::Button::with_label("Get");
+            get.set_tooltip_text(Some("Get it from your other device"));
+            get.add_css_class("pill");
+            get.set_valign(gtk::Align::Center);
+            let (weak, at, device) = (self.weak_self.clone(), e.at_ms, e.device.clone());
+            get.connect_clicked(move |b| {
+                b.set_sensitive(false);
+                if let Some(t) = weak.upgrade() {
+                    t.fetch(at, device.clone());
+                }
+            });
+            row.append(&get);
+        } else {
+            self.fetching
+                .borrow_mut()
+                .push(((e.at_ms, e.device.clone()), state, f.size));
+            self.poll_fetches();
+        }
+        row.upcast()
+    }
+
+    /// Asks our other devices for the file `device` sent at `at`.
+    fn fetch(self: &Rc<Self>, at: u64, device: String) {
+        let dest = self.dest();
+        self.run(
+            "get that file",
+            move |n| {
+                match dest {
+                    Dest::Note => n.fetch_note_file(at, device),
+                    Dest::Group(g) => n.fetch_group_file(g, at, device),
+                    Dest::Contact(d) => n.fetch_file(d, at, device),
+                }
+                .map(|_| ())
+            },
+            None,
+        );
+    }
+
+    /// Keeps the progress of files on screen current, once a second while
+    /// any is coming or waiting (cheap: no history is read). A file that
+    /// arrived, or that none of our devices has, reloads the chat.
+    fn poll_fetches(&self) {
+        if self.fetch_poll.borrow().is_some() {
+            return;
+        }
+        let weak = self.weak_self.clone();
+        let id = glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let Some(t) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let node = t.node();
+            if t.fetching.borrow().is_empty() || node.is_none() {
+                t.fetch_poll.replace(None);
+                return glib::ControlFlow::Break;
+            }
+            let (weak, node) = (weak.clone(), node.expect("checked"));
+            bg(
+                move || node.file_fetches(),
+                move |now| {
+                    let Some(t) = weak.upgrade() else { return };
+                    let mut changed = false;
+                    for ((at, device), label, size) in t.fetching.borrow().iter() {
+                        match now.iter().find(|p| p.at_ms == *at && p.device == *device) {
+                            Some(p) if p.fetch != FileFetch::Unavailable => {
+                                label.set_text(&fetch_text(*size, p.fetch));
+                            }
+                            _ => changed = true,
+                        }
+                    }
+                    if changed {
+                        t.reload();
+                    }
+                },
+            );
+            glib::ControlFlow::Continue
+        });
+        self.fetch_poll.replace(Some(id));
     }
 
     /// A voice or video message that plays in the chat.
@@ -3418,6 +3550,12 @@ impl ChatView {
             .app
             .upgrade()
             .is_none_or(|a| a.core.settings().flag(settings::STRIP));
+        let keep_private = {
+            let (core, persona) = (self.app.upgrade().map(|a| a.core.clone()), self.persona());
+            move |name: &str, data: &[u8]| {
+                core.as_ref()?.keep_private(persona.as_deref(), name, data)
+            }
+        };
         self.toast(if paths.len() == 1 {
             "Sending…"
         } else {
@@ -3439,11 +3577,13 @@ impl ChatView {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
+                    let mut converted = false;
                     let data = match std::fs::read(p) {
                         Ok(d) if !strip => d,
                         Ok(d) => match prepare(p, name.clone(), d) {
-                            Ok((n, d)) => {
+                            Ok((n, d, c)) => {
                                 name = n;
+                                converted = c;
                                 d
                             }
                             Err(e) => {
@@ -3475,7 +3615,14 @@ impl ChatView {
                         clip: None,
                         forwarded: false,
                     };
-                    let location = Some(p.display().to_string());
+                    // A converted photo can never be made again from the
+                    // original: keep what was sent, privately, so our
+                    // other devices can have it too.
+                    let location = if !converted {
+                        Some(p.display().to_string())
+                    } else {
+                        keep_private(&name, &data).or_else(|| Some(p.display().to_string()))
+                    };
                     let r = send_file_to(&node, &dest, name.clone(), data, location, options);
                     if let Err(e) = r {
                         failed.push(format!("{name}: {e}"));
@@ -4547,20 +4694,20 @@ const MAX_PIXELS: i64 = 100_000_000;
 const MAX_SIDE: i32 = 4096;
 
 /// An image the node can't strip, re-encoded as JPEG (which then carries
-/// no metadata): the name and bytes to send. Others pass through. Its
-/// content decides as well as its name, so a HEIC called "photo.jpg" is
-/// converted too.
+/// no metadata): the name and bytes to send, and whether it was converted.
+/// Others pass through. Its content decides as well as its name, so a HEIC
+/// called "photo.jpg" is converted too (and keeps its name).
 fn prepare(
     path: &std::path::Path,
     name: String,
     data: Vec<u8>,
-) -> Result<(String, Vec<u8>), String> {
+) -> Result<(String, Vec<u8>, bool), String> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     if !CONVERT.contains(&ext.as_str()) && !threnody_core::media::needs_converting(&data) {
-        return Ok((name, data));
+        return Ok((name, data, false));
     }
     let unreadable =
         || format!("{name}: can't remove its location and camera details, so it wasn't sent");
@@ -4580,7 +4727,22 @@ fn prepare(
         .save_to_bufferv("jpeg", &[("quality", "92")])
         .map_err(|_| unreadable())?;
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
-    Ok((format!("{stem}.jpg"), jpeg))
+    Ok((format!("{stem}.jpg"), jpeg, true))
+}
+
+/// What a file whose contents another of our devices may have says.
+fn fetch_text(size: u64, s: FileFetch) -> String {
+    let state = match s {
+        FileFetch::NotHere => "not on this device".into(),
+        FileFetch::Idle => "on your other device".into(),
+        FileFetch::Waiting => "waiting for your other device…".into(),
+        FileFetch::Fetching { received, total } => format!(
+            "downloading… {}%",
+            (received * 100).checked_div(total).unwrap_or(100)
+        ),
+        FileFetch::Unavailable => "not on your other devices".into(),
+    };
+    format!("{} · {state}", ui::human_size(size))
 }
 
 /// Where a chat's messages go.
@@ -4690,21 +4852,23 @@ mod tests {
         p.fill(0x3366_99ff);
         p.savev(&tiff, "tiff", &[]).unwrap();
         let data = std::fs::read(&tiff).unwrap();
-        let (name, out) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
+        let (name, out, converted) = prepare(&tiff, "scan.tiff".into(), data.clone()).unwrap();
         assert_eq!(name, "scan.jpg");
+        assert!(converted);
         assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
 
         // Whatever it is called.
         let misnamed = dir.join("misnamed.jpg");
         std::fs::copy(&tiff, &misnamed).unwrap();
-        let (name, out) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
+        let (name, out, converted) = prepare(&misnamed, "misnamed.jpg".into(), data).unwrap();
         assert_eq!(name, "misnamed.jpg");
+        assert!(converted, "though its name stayed");
         assert_eq!(&out[..2], &[0xff, 0xd8], "a JPEG");
 
         // Formats the node strips itself pass through untouched.
         let png = dir.join("a.png");
-        let (name, out) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
-        assert!(name == "a.png" && out == b"as is");
+        let (name, out, converted) = prepare(&png, "a.png".into(), b"as is".to_vec()).unwrap();
+        assert!(name == "a.png" && out == b"as is" && !converted);
 
         // One it can't read isn't sent with its metadata.
         let heic = dir.join("broken.heic");

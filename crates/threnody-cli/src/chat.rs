@@ -1460,6 +1460,8 @@ impl Ui {
                     ),
                 }
             }
+            // Ticks and files from our other devices: not shown here.
+            Event::DeviceSync { .. } => {}
             Event::HistorySynced { from, added } => {
                 say!(
                     "* {added} message(s) synced from your device {}",
