@@ -28,6 +28,8 @@ targets:
       - sdk: libresolv.tbd
       # Tapping an Android phone that shows its invite (Appendix T).
       - sdk: CoreNFC.framework
+      # App lock: Face ID, Touch ID and the passcode.
+      - sdk: LocalAuthentication.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.threnody.app
@@ -56,6 +58,7 @@ targets:
         NSCameraUsageDescription: Threnody uses the camera to scan invite QR codes.
         NSLocalNetworkUsageDescription: Threnody connects directly to your contacts' devices on the local network.
         NFCReaderUsageDescription: Threnody reads a nearby phone's invite when you tap phones to add a contact.
+        NSFaceIDUsageDescription: Threnody uses Face ID to unlock the app.
         # The tap protocol's AID: must match threnody_core::tap::AID.
         com.apple.developer.nfc.readersession.iso7816.select-identifiers:
           - F0746872656E6F6479

@@ -1,5 +1,6 @@
 import BackgroundTasks
 import Combine
+import os
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -190,20 +191,26 @@ final class NodeStore: ObservableObject {
 
     nonisolated static func short(_ fp: String) -> String { String(fp.prefix(9)) }
 
+    /// Bumped by an erase: threads of the node before it stop, and write
+    /// nothing more (received files are saved outside the node's home).
+    private nonisolated static let generation = OSAllocatedUnfairLock(initialState: 0)
+    nonisolated static var currentGeneration: Int { generation.withLock { $0 } }
+
     func launch() {
         guard !launched else { return }
         launched = true
         if Paths.hasIdentity { open(deviceName: nil) } else { phase = .onboarding }
     }
 
-    /// Opens the node, creating a sealed identity on first use.
-    func open(deviceName: String?) {
+    /// Opens the node, creating a sealed identity on first use. `lock`:
+    /// what onboarding chose for app lock (nil for an existing identity).
+    func open(deviceName: String?, lock: Bool? = nil) {
         launched = true
         phase = .starting
         Task {
             do {
                 let (n, addr) = try await offMain { try Self.openNode(deviceName: deviceName) }
-                started(n, addr)
+                started(n, addr, lock: lock)
             } catch {
                 phase = .failed(error.localizedDescription)
             }
@@ -219,6 +226,9 @@ final class NodeStore: ObservableObject {
         try home.setResourceValues(values)
         // Received files too; ones kept before this was done included.
         if FileManager.default.fileExists(atPath: Paths.media.path) { try? Paths.excludeFromBackup(Paths.media) }
+        // A new identity gets a new sealing secret, so nothing sealed under
+        // an earlier one (an erase that died part way) can be opened.
+        if !Paths.hasIdentity { KeyVault.forget() }
         let n = try ThrenodyNode.open(home: home.path, passphrase: KeyVault.passphrase(home: home), tunnelPort: nil)
         // The usual port, or any free one if it's taken.
         let addr: String
@@ -233,7 +243,7 @@ final class NodeStore: ObservableObject {
         return (n, addr)
     }
 
-    private func started(_ n: ThrenodyNode, _ addr: String) {
+    private func started(_ n: ThrenodyNode, _ addr: String, lock: Bool?) {
         node = n
         listenAddr = addr
         myDevice = n.deviceFingerprint()
@@ -242,31 +252,59 @@ final class NodeStore: ObservableObject {
         // iOS applies no settings of its own: the node's defaults are its
         // settings, so scheduled messages may go out now.
         n.startScheduledSending()
-        // The store lives as long as the process.
-        Self.pump(n) { e in Task { @MainActor in self.handle(e) } }
+        // Until an erase: then a new node gets its own.
+        let gen = Self.currentGeneration
+        Self.pump(n, gen) { e in Task { @MainActor in if Self.currentGeneration == gen { self.handle(e) } } }
         // Files of messages that are gone: a minute after start, then every five.
         Task.detached(priority: .background) {
             try? await Task.sleep(for: .seconds(60))
-            while true {
+            while Self.currentGeneration == gen {
                 Paths.sweep(n)
                 try? await Task.sleep(for: .seconds(300))
             }
         }
         path.start { cellular in
-            n.networkChanged(toStandby: false, mobile: cellular)
-            n.reconnect()
+            Task { @MainActor in
+                guard let n = NodeStore.shared.node else { return }
+                Task.detached {
+                    n.networkChanged(toStandby: false, mobile: cellular)
+                    n.reconnect()
+                }
+            }
         }
         phase = .ready
+        defaultLock(onboarding: lock)
         refresh()
         armScheduled()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
-    /// Drains the node's events on a thread of its own, for as long as the process lives.
-    private nonisolated static func pump(_ n: ThrenodyNode, _ deliver: @escaping @Sendable (NodeEvent) -> Void) {
+    /// App lock comes on by itself (device lock) where the phone has a
+    /// passcode: as onboarding chose for a new identity, and once, with a
+    /// notice and a way to turn it off, on installs from before it.
+    private func defaultLock(onboarding: Bool?) {
+        let key = "lockOffered"
+        if UserDefaults.standard.bool(forKey: key) { return }
+        UserDefaults.standard.set(true, forKey: key)
+        guard !AppLock.isEnabled, AppLock.deviceSecure else { return }
+        if let onboarding {
+            if onboarding { Task { await AppLock.shared.enableDevice() } }
+        } else {
+            Task {
+                await AppLock.shared.enableDevice()
+                AppLock.shared.notice = AppLock.isEnabled
+            }
+        }
+    }
+
+    /// Drains the node's events on a thread of its own, until an erase
+    /// bumps the generation.
+    private nonisolated static func pump(_ n: ThrenodyNode, _ gen: Int, _ deliver: @escaping @Sendable (NodeEvent) -> Void) {
         let thread = Thread {
-            while true {
+            while NodeStore.currentGeneration == gen {
                 guard let e = n.nextEvent(timeoutMs: 1000) else { continue }
+                // Erased meanwhile: nothing of the old node is kept.
+                if NodeStore.currentGeneration != gen { return }
                 // Received files are kept and recorded before the screens reload.
                 if case let .file(peer, name, data, id, sensitive, caption, album, clip, _, forwarded) = e {
                     let location = Paths.save(name: name, data: data)
@@ -335,8 +373,18 @@ final class NodeStore: ObservableObject {
         let hidden = Self.privateNotifications
         // A disappearing message's text would outlive it in the notification.
         // If it can't be told, it is taken to disappear.
-        let disappears = (try? node?.history(peer: peer, limit: 1))?.last?.disappearing ?? true
         let content = UNMutableNotificationContent()
+        // With app lock on: one notification for everything, saying
+        // nothing, and naming no chat.
+        if AppLock.isEnabled {
+            content.title = "Threnody"
+            content.body = "New message"
+            content.sound = .default
+            content.threadIdentifier = "message"
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "message", content: content, trigger: nil))
+            return
+        }
+        let disappears = (try? node?.history(peer: peer, limit: 1))?.last?.disappearing ?? true
         content.title = (anonymous || hidden) ? "Threnody" : (c?.title ?? Self.short(peer))
         content.body = anonymous ? body : ((hidden || disappears) ? "New message" : body)
         content.sound = .default
@@ -421,6 +469,41 @@ final class NodeStore: ObservableObject {
         let addr = LocalAddress.ipv4().map { "\($0):\(port)" } ?? ""
         if addr.isEmpty && !n.reachInternet() && n.reachability().addresses.isEmpty { return nil }
         return n.inviteLink(addr: addr)
+    }
+
+    // MARK: Erasing
+
+    /// Erases everything ("Erase all Threnody data", the duress PIN): the
+    /// node's data directory (unless `alreadyErased`), received files, the
+    /// Secure Enclave key and Keychain item, settings, notifications and
+    /// background tasks, then shows onboarding as a first launch does.
+    /// Nothing is sent: contacts and other devices aren't told.
+    func wipe(alreadyErased: Bool = false) async {
+        Self.generation.withLock { $0 += 1 }
+        let n = node
+        node = nil
+        _ = try? await offMain {
+            n?.shutdown()
+            if !alreadyErased { _ = try? wipeHome(home: Paths.home.path) }
+            try? FileManager.default.removeItem(at: Paths.media)
+            KeyVault.forget()
+        }
+        if let id = Bundle.main.bundleIdentifier { UserDefaults.standard.removePersistentDomain(forName: id) }
+        let center = UNUserNotificationCenter.current()
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
+        BGTaskScheduler.shared.cancelAllTaskRequests()
+        for t in typingTimeouts.values { t.cancel() }
+        typingTimeouts = [:]
+        chats = []
+        typing = []
+        openChat = nil
+        visibleChat = []
+        myDevice = ""
+        listenAddr = ""
+        launched = false
+        AppLock.shared.reset()
+        phase = .onboarding
     }
 
     // MARK: Lifecycle

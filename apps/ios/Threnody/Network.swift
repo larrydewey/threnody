@@ -27,8 +27,15 @@ enum LocalAddress {
 final class PathWatcher {
     private let monitor = NWPathMonitor()
     private var last: NWInterface.InterfaceType?
+    private var changed: (@Sendable (_ cellular: Bool) -> Void)?
+    private var started = false
 
+    /// Starts watching, or (an NWPathMonitor starts only once) swaps what
+    /// it calls, after an erase and a new identity in the same process.
     func start(_ changed: @escaping @Sendable (_ cellular: Bool) -> Void) {
+        self.changed = changed
+        guard !started else { return }
+        started = true
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self, path.status == .satisfied else { return }
             let type: NWInterface.InterfaceType = path.usesInterfaceType(.wifi) ? .wifi
@@ -36,7 +43,7 @@ final class PathWatcher {
             if type == self.last { return }
             let first = self.last == nil
             self.last = type
-            if !first { changed(type == .cellular) }
+            if !first { self.changed?(type == .cellular) }
         }
         monitor.start(queue: DispatchQueue(label: "threnody.path"))
     }
