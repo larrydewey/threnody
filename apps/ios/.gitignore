@@ -4,3 +4,4 @@ Threnody/Info.plist
 *.xcodeproj/
 build/
 DerivedData/
+Threnody/Threnody.entitlements

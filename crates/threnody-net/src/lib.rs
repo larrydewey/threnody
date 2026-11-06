@@ -48,7 +48,7 @@ pub use discovery::DiscoveryConfig;
 pub use error::{NetError, Result};
 pub use filesync::{FetchProgress, FetchState, FileStore};
 pub use groupcall::GroupCallInfo;
-pub use handle::INVITE_KEY_STATE;
+pub use handle::{EXPECT_FOR, INVITE_KEY_STATE};
 pub use node::{AcceptPolicy, Event, FallbackPath, Node, NodeConfig, SessionInfo};
 pub use push::WakeReport;
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};

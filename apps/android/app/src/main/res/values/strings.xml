@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shown by the system for the NFC service (Appendix T). -->
+    <string name="nfc_invite_description">Threnody invite</string>
+</resources>

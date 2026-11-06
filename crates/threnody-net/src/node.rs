@@ -1496,6 +1496,8 @@ impl Node {
                 peer.fingerprint()
             )));
         }
+        // Never held with the contacts lock.
+        let expected = self.is_expected(peer);
         let contacts = lock(&self.shared.contacts);
         if contacts.get(peer).is_some_and(|c| c.blocked) {
             return Err(NetError::Refused(format!(
@@ -1505,7 +1507,8 @@ impl Node {
         }
         let ok = match self.policy() {
             AcceptPolicy::Anyone => true,
-            AcceptPolicy::ContactsOnly => contacts.get(peer).is_some(),
+            // A contact, or one the user added after a tap (Appendix T).
+            AcceptPolicy::ContactsOnly => contacts.get(peer).is_some() || expected,
             AcceptPolicy::ApprovedOnly => contacts.get(peer).is_some_and(|c| c.mutually_approved()),
         };
         if ok {
@@ -1539,7 +1542,8 @@ impl Node {
         source: Source,
     ) -> Result<Option<StrangerPass>> {
         self.check_policy(peer)?;
-        if !self.is_stranger(peer) {
+        // An expected peer (Appendix T) becomes a contact as its session starts.
+        if !self.is_stranger(peer) || self.is_expected(peer) {
             return Ok(None);
         }
         if let Some(place) = self.shared.strangers.enter(source) {
@@ -1927,15 +1931,27 @@ impl Node {
             // this stream closes it).
             return;
         }
+        // After the duplicate check, so a dropped session doesn't use it up.
+        // Either way round: after a tap across networks, the hole punch
+        // may have this side dial (Appendix S), and the name still applies.
+        let expected = self.take_expected(&peer);
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let new_contact = {
             let mut contacts = lock(&self.shared.contacts);
             // Only remember dialable addresses: an inbound source port is ephemeral.
             let is_new = contacts.observe(peer, dialed, now_ms());
-            // We dialed them: we want to hear from them.
-            if outbound && let Some(c) = contacts.get_mut(&peer) {
+            // We dialed them, or the user said to add them after a tap
+            // (Appendix T): we want to hear from them.
+            if (outbound || expected.is_some())
+                && let Some(c) = contacts.get_mut(&peer)
+            {
                 c.accepted = true;
+                if let Some(Some(n)) = &expected
+                    && c.petname.is_none()
+                {
+                    c.petname = Some(n.clone());
+                }
             }
             self.shared.save_contacts(&contacts);
             is_new

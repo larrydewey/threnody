@@ -2170,13 +2170,19 @@ impl App {
         b.append(&link);
         b.append(&name);
         d.set_extra_child(Some(&b));
+        // The link a tap gave us, while the entry still holds it.
+        let tapped: Rc<RefCell<Option<String>>> = Rc::default();
+        self.add_tap_button(&d, &b, &link, &name, &tapped);
         let weak = Rc::downgrade(self);
         let (l, n) = (link.clone(), name.clone());
         d.connect_response(None, move |_, r| {
             if r == "ok"
                 && let Some(this) = weak.upgrade()
             {
-                this.connect_named(l.text().trim().to_owned(), n.text().trim().to_owned());
+                let target = l.text().trim().to_owned();
+                // A hand-edited link isn't the phone we tapped.
+                let expect = tapped.borrow().as_deref() == Some(target.as_str());
+                this.connect_named(target, n.text().trim().to_owned(), expect);
             }
         });
         d.present(Some(&self.window));
@@ -2187,14 +2193,100 @@ impl App {
         });
     }
 
+    /// "Tap a phone" in *Add a contact*, with a PC/SC NFC reader attached
+    /// (Appendix T): a phone showing its invite, held on the reader, fills
+    /// in its link and gets this computer's fingerprint.
+    #[cfg(feature = "nfc")]
+    fn add_tap_button(
+        self: &Rc<Self>,
+        d: &adw::AlertDialog,
+        b: &gtk::Box,
+        link: &gtk::Entry,
+        name: &gtk::Entry,
+        tapped: &Rc<RefCell<Option<String>>>,
+    ) {
+        use crate::nfc;
+        use threnody_ffi::NfcOutcome;
+        if !nfc::available() {
+            return;
+        }
+        let button = gtk::Button::with_label("Tap a phone");
+        let status = ui::label("", &["dim-label"]);
+        status.set_visible(false);
+        b.append(&button);
+        b.append(&status);
+        let waiter: Rc<RefCell<Option<Arc<nfc::Waiter>>>> = Rc::default();
+        let w = waiter.clone();
+        d.connect_closed(move |_| {
+            if let Some(w) = w.borrow_mut().take() {
+                w.cancel();
+            }
+        });
+        let core = self.core.clone();
+        let (link, name, tapped) = (link.clone(), name.clone(), tapped.clone());
+        button.connect_clicked(move |button| {
+            let Some(wt) = nfc::Waiter::new().map(Arc::new) else {
+                status.set_text("The NFC reader isn't available.");
+                status.set_visible(true);
+                return;
+            };
+            *waiter.borrow_mut() = Some(wt.clone());
+            button.set_sensitive(false);
+            status.set_text("Hold their phone on the reader…");
+            status.set_visible(true);
+            let node = core.main.clone();
+            let (button, status, link, name, tapped, waiter) = (
+                button.clone(),
+                status.clone(),
+                link.clone(),
+                name.clone(),
+                tapped.clone(),
+                waiter.clone(),
+            );
+            bg(
+                move || nfc::tap(&node, &wt, std::time::Duration::from_secs(30)),
+                move |outcome| {
+                    // Closed meanwhile (the wait was cancelled): nothing to show.
+                    if waiter.borrow_mut().take().is_none() {
+                        return;
+                    }
+                    button.set_sensitive(true);
+                    match outcome {
+                        NfcOutcome::Tapped { peer_link, .. } => {
+                            link.set_text(&peer_link);
+                            *tapped.borrow_mut() = Some(peer_link);
+                            status.set_text(
+                                "Got their invite. Give them a name you'll recognise, if you like.",
+                            );
+                            name.grab_focus();
+                        }
+                        NfcOutcome::Failed { why } => status.set_text(nfc::text(why)),
+                    }
+                },
+            );
+        });
+    }
+
+    #[cfg(not(feature = "nfc"))]
+    fn add_tap_button(
+        self: &Rc<Self>,
+        _: &adw::AlertDialog,
+        _: &gtk::Box,
+        _: &gtk::Entry,
+        _: &gtk::Entry,
+        _: &Rc<RefCell<Option<String>>>,
+    ) {
+    }
+
     /// Dials an invite (or offers to join for a device link code).
     pub fn connect(self: &Rc<Self>, link: String) {
-        self.connect_named(link, String::new());
+        self.connect_named(link, String::new(), false);
     }
 
     /// As [`connect`](Self::connect), calling the contact `name` (only
-    /// here) if one is given.
-    pub fn connect_named(self: &Rc<Self>, link: String, name: String) {
+    /// here) if one is given. `expect`: we tapped phones with them
+    /// (Appendix T), so they're a contact even if they reached us first.
+    pub fn connect_named(self: &Rc<Self>, link: String, name: String, expect: bool) {
         if link.is_empty() {
             return;
         }
@@ -2206,6 +2298,11 @@ impl App {
         let weak = Rc::downgrade(self);
         bg(
             move || {
+                if expect {
+                    core.main
+                        .expect_contact(link.clone(), None)
+                        .map_err(|e| e.to_string())?;
+                }
                 let peer = core.main.connect(link).map_err(|e| e.to_string())?;
                 if !name.is_empty()
                     && let Err(e) = core.main.set_name(peer.clone(), name)

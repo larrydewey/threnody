@@ -36,6 +36,7 @@ pub mod rendezvous;
 mod robustness;
 pub mod sealed;
 pub mod store;
+pub mod tap;
 pub mod tunnel;
 #[cfg(test)]
 mod vectors;

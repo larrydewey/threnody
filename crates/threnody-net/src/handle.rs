@@ -59,6 +59,11 @@ const ADDR_STAGGER: Duration = Duration::from_millis(300);
 const QUIC_AFTER: Duration = Duration::from_millis(500);
 /// Where our invite key is kept.
 pub const INVITE_KEY_STATE: &str = "invite-key";
+/// How long a contact the user added after an NFC tap (Appendix T) is
+/// expected: its first session in that time is a contact, not a request.
+pub const EXPECT_FOR: Duration = Duration::from_secs(10 * 60);
+/// Most expected contacts at once; the one expiring soonest makes room.
+const MAX_EXPECTED: usize = 16;
 
 #[derive(Default)]
 pub(crate) struct HandleState {
@@ -70,6 +75,16 @@ pub(crate) struct HandleState {
     /// was added.
     pub(crate) probe_keys: Mutex<HashMap<PublicIdentity, ([u8; 32], Instant)>>,
     pub(crate) kick: Notify,
+    /// Fingerprints the user said to add after an NFC tap: an inbound
+    /// session from one is a contact we want (named so), not a message
+    /// request. In memory only; at most [`MAX_EXPECTED`].
+    pub(crate) expected: Mutex<HashMap<Fingerprint, Expected>>,
+}
+
+/// A contact the user added after a tap, until its session arrives.
+pub(crate) struct Expected {
+    until_ms: u64,
+    name: Option<String>,
 }
 
 /// What a published record said: epoch, addresses, flags.
@@ -225,6 +240,89 @@ impl Node {
             addrs,
             key: self.reach_enabled().then(|| self.invite_key()),
         }
+    }
+
+    /// We tapped devices with `fp` in person and the user said to add it:
+    /// for `ttl`, a session from it is a contact we want (called `name`,
+    /// if given and it has no name yet), not a request. A contact we
+    /// already have is accepted and named at once. Refuses our own
+    /// fingerprint and a blocked contact (approve it to unblock it first).
+    /// Never approves or verifies anyone.
+    pub fn expect_contact(
+        &self,
+        fp: Fingerprint,
+        name: Option<String>,
+        ttl: Duration,
+    ) -> Result<()> {
+        if fp == self.identity().fingerprint() {
+            return Err(NetError::NotAllowed("that's you".into()));
+        }
+        let known = self
+            .contacts()
+            .iter()
+            .find(|c| c.fingerprint() == fp)
+            .map(|c| (c.key, c.blocked));
+        if known.is_some_and(|(_, blocked)| blocked) {
+            return Err(NetError::NotAllowed(
+                "you blocked them; approve them to unblock".into(),
+            ));
+        }
+        let name = name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        // The expectation goes in first, so that a session arriving at any
+        // moment is either caught by it or by what follows.
+        {
+            let mut expected = lock(&self.handles().expected);
+            let now = now_ms();
+            expected.retain(|_, e| e.until_ms > now);
+            expected.remove(&fp);
+            while expected.len() >= MAX_EXPECTED {
+                let Some(soonest) = expected
+                    .iter()
+                    .min_by_key(|(_, e)| e.until_ms)
+                    .map(|(f, _)| *f)
+                else {
+                    break;
+                };
+                expected.remove(&soonest);
+            }
+            let until_ms = now.saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+            expected.insert(
+                fp,
+                Expected {
+                    until_ms,
+                    name: name.clone(),
+                },
+            );
+        }
+        if let Some((key, _)) = known {
+            self.accept_contact(&key);
+            if let Some(n) = name {
+                self.update_contacts(|cs| {
+                    if let Some(c) = cs.get_mut(&key)
+                        && c.petname.is_none()
+                    {
+                        c.petname = Some(n);
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes `peer`'s expectation, if any: `Some(name to give it)`.
+    pub(crate) fn take_expected(&self, peer: &PublicIdentity) -> Option<Option<String>> {
+        let mut expected = lock(&self.handles().expected);
+        let now = now_ms();
+        expected.retain(|_, e| e.until_ms > now);
+        expected.remove(&peer.fingerprint()).map(|e| e.name)
+    }
+
+    /// Whether `peer` is expected (no side effect; for the accept policy).
+    pub(crate) fn is_expected(&self, peer: &PublicIdentity) -> bool {
+        let mut expected = lock(&self.handles().expected);
+        let now = now_ms();
+        expected.retain(|_, e| e.until_ms > now);
+        expected.contains_key(&peer.fingerprint())
     }
 
     /// The newest record at `spot`, this hour's or the last.
