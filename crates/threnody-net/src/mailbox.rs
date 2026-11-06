@@ -512,11 +512,27 @@ impl Node {
         lock(&self.shared.bundles).has(peer, now_ms()) && !self.is_revoked(peer)
     }
 
+    /// Tests only: how many of `peer`'s one-time prekeys we have left.
+    #[doc(hidden)]
+    pub fn opks_for(&self, peer: &PublicIdentity) -> usize {
+        lock(&self.shared.bundles).opks_left(peer)
+    }
+
+    /// The neighbours that could hold a sealed message for `dest`: live
+    /// direct sessions with mutually approved contacts other than `dest`.
+    pub(crate) fn mailbox_neighbours(&self, dest: &PublicIdentity) -> Vec<PublicIdentity> {
+        self.sessions()
+            .into_iter()
+            .filter(|s| s.via.is_none() && s.peer != *dest && self.shared.mutual(&s.peer))
+            .map(|s| s.peer)
+            .collect()
+    }
+
     /// Seals `msg` for `dest` and offers it to every live, mutually
     /// approved neighbour. Returns how many were asked; each answers with
     /// [`Event::DepositReceipt`].
     pub fn send_offline(&self, dest: &PublicIdentity, msg: &AppMessage) -> Result<usize> {
-        self.deposit(dest, msg, None)
+        self.deposit(dest, msg, None, false)
     }
 
     /// [`Node::send_offline`] for a message that must not be lost: if
@@ -530,32 +546,32 @@ impl Node {
         msg: &AppMessage,
         tag: Tag,
     ) -> Result<usize> {
-        self.deposit(dest, msg, Some(tag))
+        self.deposit(dest, msg, Some(tag), false)
     }
 
-    fn deposit(&self, dest: &PublicIdentity, msg: &AppMessage, keep: Option<Tag>) -> Result<usize> {
-        if self.is_revoked(dest) {
-            return Err(NetError::NotAllowed(
-                "that device was removed from its account".into(),
-            ));
-        }
-        let sealed = {
-            let mut book = lock(&self.shared.bundles);
-            let sealed = book.seal(self.identity_ref(), dest, &msg.encode()?, now_ms())?;
-            self.shared.persist_bundles(&book);
-            sealed
-        };
-        let mailboxes: Vec<PublicIdentity> = self
-            .sessions()
-            .into_iter()
-            .filter(|s| s.via.is_none() && s.peer != *dest && self.shared.mutual(&s.peer))
-            .map(|s| s.peer)
-            .collect();
-        // Hide who deposits: through an onion circuit, wherever one reaches
-        // the mailbox. Only with no circuit anywhere do we deposit directly.
-        let handle = tokio::runtime::Handle::try_current().ok();
-        let hidden: Vec<PublicIdentity> = match &handle {
-            Some(_) if self.prefer_onion() => mailboxes
+    /// [`Node::send_offline_or_hold`] for something we send unasked (a
+    /// receipt): with onion routing on, only through onion circuits, never
+    /// directly, so no mailbox learns from it whom we write to. Fails,
+    /// before sealing, when no circuit reaches a mailbox; a mailbox
+    /// whose circuits all fail counts as declining.
+    pub(crate) fn send_offline_hidden(
+        &self,
+        dest: &PublicIdentity,
+        msg: &AppMessage,
+        tag: Tag,
+    ) -> Result<usize> {
+        self.deposit(dest, msg, Some(tag), true)
+    }
+
+    /// The mailboxes a deposit for `dest` would go to now, and which of
+    /// them an onion circuit reaches (none with onion routing off).
+    pub(crate) fn deposit_targets(
+        &self,
+        dest: &PublicIdentity,
+    ) -> (Vec<PublicIdentity>, Vec<PublicIdentity>) {
+        let mailboxes = self.mailbox_neighbours(dest);
+        let hidden = if self.prefer_onion() && tokio::runtime::Handle::try_current().is_ok() {
+            mailboxes
                 .iter()
                 .filter(|m| {
                     !self
@@ -563,9 +579,43 @@ impl Node {
                         .is_empty()
                 })
                 .copied()
-                .collect(),
-            _ => Vec::new(),
+                .collect()
+        } else {
+            Vec::new()
         };
+        (mailboxes, hidden)
+    }
+
+    fn deposit(
+        &self,
+        dest: &PublicIdentity,
+        msg: &AppMessage,
+        keep: Option<Tag>,
+        hidden_only: bool,
+    ) -> Result<usize> {
+        if self.is_revoked(dest) {
+            return Err(NetError::NotAllowed(
+                "that device was removed from its account".into(),
+            ));
+        }
+        // Hide who deposits: through an onion circuit, wherever one reaches
+        // the mailbox. Only with no circuit anywhere do we deposit directly
+        // (never with `hidden_only` while onion routing is on).
+        let (mailboxes, hidden) = self.deposit_targets(dest);
+        let hidden_only = hidden_only && self.prefer_onion();
+        if hidden_only && hidden.is_empty() {
+            return Err(NetError::NoRoute(format!(
+                "{} (no onion circuit to a mailbox)",
+                dest.fingerprint()
+            )));
+        }
+        let sealed = {
+            let mut book = lock(&self.shared.bundles);
+            let sealed = book.seal(self.identity_ref(), dest, &msg.encode()?, now_ms())?;
+            self.shared.persist_bundles(&book);
+            sealed
+        };
+        let handle = tokio::runtime::Handle::try_current().ok();
         let asked = if hidden.is_empty() {
             mailboxes.len()
         } else {
@@ -597,7 +647,12 @@ impl Node {
                             }
                         }
                         // Every circuit failed: deliver it rather than lose
-                        // it, and say so.
+                        // it, and say so; unless it may only go hidden.
+                        Err(_) if hidden_only => {
+                            if let Some(r) = placement {
+                                node.placement_answer(r, DepositStatus::Declined);
+                            }
+                        }
                         Err(_) => {
                             if node.deposit_direct(&m, &dest, &sealed, placement) {
                                 node.fell_back(dest, FallbackPath::Deposit { mailbox: m });
@@ -1053,6 +1108,7 @@ impl Node {
                     pin,
                 } => return self.on_pin(&from, conversation, *id, *pin),
                 AppMessage::List(bytes) => return self.on_list_message(from, bytes),
+                AppMessage::Receipt(payload) => return self.on_receipt(&from, payload),
                 _ => {}
             }
             // A text already here (from its sender too) doesn't show
@@ -1060,6 +1116,15 @@ impl Node {
             // copy can't be asked for again.
             if self.record_incoming(&from, &msg, true) == Recorded::Duplicate {
                 return;
+            }
+            // It came through a mailbox, so its sender (very likely
+            // offline) learns it arrived from a receipt that goes the
+            // same way, or over the next session.
+            if let AppMessage::Text { id, .. } = &msg
+                && *id != 0
+                && self.is_accepted(&from)
+            {
+                self.queue_receipt(&from, &[*id], &[]);
             }
             if matches!(msg, AppMessage::Group(_)) || self.is_accepted(&from) {
                 self.emit(Event::OfflineMessage { from, via, msg });

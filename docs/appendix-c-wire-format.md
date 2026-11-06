@@ -34,11 +34,12 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
-           / Typing / Read / Call / Media / Pin / List / Tunnel / Push
+           / Typing / Read / Call / Media / Pin / List / Tunnel / Push / Receipt
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
-                                                           ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off); absent = 0
+                                                           ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off,
+                                                           ; 131072 receipts); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded, 16 timer off)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
@@ -47,7 +48,7 @@ File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms,
                                                                        ; album id, clip duration (ms)
 Approval = { 0 => 3, 2 => bool }
 Cover    = { 0 => 4 }
-TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D)
+TunnelOffer = { 0 => 5, 2 => bstr .size 32, 3 => uint }  ; WireGuard public key, UDP port (Appendix D); may repeat within a session
 Group    = { 0 => 6, 2 => bstr .cbor GroupWire }          ; Appendix F
 Relay    = { 0 => 7, 2 => bstr .cbor RelayMsg }           ; Appendix G
 Prekeys  = { 0 => 8, 2 => bstr .cbor PrekeyBundle }       ; Appendix H
@@ -73,6 +74,7 @@ Pin        = { 0 => 27, 3 => bstr, 5 => uint, ? 6 => uint }  ; conversation id, 
 List       = { 0 => 28, 2 => bstr }                        ; a shared list's state, see *Lists*
 Tunnel     = { 0 => 29, 2 => bstr }                        ; one WireGuard packet, Appendix D
 Push       = { 0 => 30, 2 => bstr .cbor PushReg }         ; wake-up endpoint or its withdrawal, mutual contacts only, Appendix R
+Receipt    = { 0 => 31, 2 => bstr .cbor ReceiptMsg }      ; delivery and read receipts, live or sealed, Appendix H
 
 GroupWire = { 0 => 1..10, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint,
               ? 6 => bstr .size 32, ? 7 => [* bstr], ? 8 => [uint, uint, bstr .size 8, bstr .size 8] }
@@ -85,6 +87,10 @@ GroupWire = { 0 => 1..10, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => b
 PushReg = { ? 1 => tstr, ? 2 => bstr .size 65, ? 3 => bstr .size 16, ? 4 => uint, ? 5 => uint }
           ; endpoint URL, Web Push p256dh and auth (both or neither), cover wake-ups per day (≤ 24),
           ; expires_ms; empty = withdrawn (Appendix R)
+
+ReceiptMsg = { ? 0 => bstr, ? 1 => bstr }
+          ; delivered ids, read ids: the sender's message ids, 8 bytes each (big-endian),
+          ; ≤ 512 per list, ≥ 1 in all (Appendix H, *Receipts*)
 ```
 
 `Tunnel` (`{ 0 => 29, 2 => bstr }`) carries one WireGuard packet for the tunnel with the peer (Appendix D, *Over the session*), only to devices whose `Hello` has bit 8192. It is sent at once even under cover traffic, like call media. On QUIC sessions the same packets go as QUIC datagrams when they fit, recognised by WireGuard's header (a message type from 1 to 4, then three zero bytes) rather than a call id.
@@ -105,7 +111,9 @@ Both lists are kept in encrypted state (`unacked`, `delivered-ids`), so a restar
 
 `Typing` (feature bit 256) tells the devices of the peer's account whether we are typing in our chat with them. It is a transient hint: never tracked, never sealed for a mailbox, never stored.
 
-`Read` (feature bit 512) tells the peer's devices that the messages with these ids, the ids it sent them with, were displayed. It goes only over live sessions, never tracked or sealed. The sender marks those outgoing entries read (history key 14, the time it learned) and emits `Read`; apps show an eye. A `Read` from one of our own devices is ignored.
+`Read` (feature bit 512) tells the peer's devices that the messages with these ids, the ids it sent them with, were displayed. It goes only over live sessions, never tracked or sealed, and only to devices whose `Hello` lacks bit 131072. The sender marks those outgoing entries read (history key 14, the time it learned) and emits `Read`; apps show an eye. A `Read` from one of our own devices is ignored.
+
+`Receipt` (`{ 0 => 31, 2 => bstr .cbor ReceiptMsg }`, feature bit 131072) replaces `Read` with devices that have that bit. It names the sender's ids that arrived and those that were displayed (read implies delivered). Live, it travels as `Tracked`, so a session that dies resends it. A reader that can't reach the sending device keeps it and sends it at the start of the next session, or seals it for mailboxes (Appendix H, *Receipts*). The sender marks the named outgoing entries delivered (key 8, emitting `Delivered` for each) and the read ones read (key 14, emitting `Read`). A `Receipt` is never sent to a device whose latest `Hello` lacks the bit, which an older build would answer by ending the session. One waiting from an earlier session for a device whose `Hello` now lacks it is not sent: its read ids go as a `Read` if the device has bit 512, and the rest are dropped. Every `Read` and `Receipt` names at most 512 ids per list; a longer report goes as several. Read receipts can be turned off (they are on by default). Nothing displayed is then reported, and reads still waiting to be sent are dropped. A `Receipt` already sent but not yet acknowledged, which would go again in the next session, keeps its read ids only as delivered ones. Delivery receipts can't be turned off, as acknowledgements can't. Neither is sent for messages from someone we haven't accepted or have blocked.
 
 ## Deleting and editing messages
 
@@ -177,6 +185,17 @@ Authentication does not make a peer trusted: anyone can make an identity, and no
 ## Local storage
 
 All local state other than the identity file is kept in `<name>.state` files. Each one is encrypted with ChaCha20-Poly1305 under `KDF("state encryption key", identity_seed)`, with the file name as associated data (`Home::save_state`). This covers the contact book (`contacts.state`, a `ContactsFile` below), groups, prekeys, bundles, mailboxes, accounts, acknowledgement state and message history (one `hist-<name>` file per conversation, named as below). Message history keeps at most 10,000 entries per conversation. A conversation's timer (key 1) is absent until chosen, in which case it follows the node's default (off unless the user chooses one). 0 means *off* on purpose, and any other value is seconds. A peer that turns its timer off on purpose sends messages without `expires_in_s` and with flag 16 in `Text` key 6 (`TIMER_OFF`), and the other side records that as 0. A message with neither, from a peer whose `Hello` has bit 65536, means it never chose a timer: the receiver keeps its own and applies it to that message too, and the peer adopts it from the receiver's next message. The bits of each contact's latest `Hello` are saved with the contact (key 20), so this holds for messages that arrive before any session, such as mailbox deliveries after a restart. Without that bit (an older peer, or one never heard from directly) it is taken as off, as older peers intend. Older receivers ignore the flag and read no timer, as before it. A file transfer is stored as an entry whose text is its caption (usually empty) and a file record (key 6: `{ 0 => name, 1 => size, ? 2 => location, ? 3 => sensitive, ? 4 => album, ? 5 => [video bool, duration_ms uint] }`, key 5 marking a voice or video message). Outgoing entries may have a local id (key 7) and a delivered flag (key 8, see *Acknowledgements*). The record keeps where the app saved the file, not the file's contents. Older readers skip the key. Disappearing messages are deleted on the first load or save after they expire, and by a sweep that runs every minute. The same sweep finds disappearing texts that expired here while still waiting for their recipient's acknowledgement (`unacked`), and replaces each with a copy sealed to the recipient (Appendix H), which goes out as a mailbox `deliver` from the sender itself. The recipient still gets it, and its timer still starts there, but the sender keeps nothing it could read back. Without prekeys for the recipient the waiting copy is dropped.
+
+History key 14 on an outgoing entry is when the recipient displayed it (see *Typing and read receipts*). On an incoming entry it is 1 once we have reported it read, so each message is reported once. It is a flag, not a time, so the history doesn't show when the user read each message. Receipts that still have to reach their sender's device are kept in `receipts-out`, with the read-receipt switch and when that state was first created (Appendix H, *Receipts*):
+
+```
+receipts-out = 1 || flags (1: read receipts off) || created_ms (u64 BE)
+               || n (u16 BE) || n × (device (32) || last sealed receipt ms (u64 BE))
+               || *(device (32) || batch since ms (u64 BE) || due ms (u64 BE)
+                    || nd (u16 BE) || nr (u16 BE) || nd × delivered id (u64 BE) || nr × read id (u64 BE))
+```
+
+A damaged tail is skipped; an unreadable file is started afresh, with read receipts on.
 
 A history file's name is keyed, so a listing of the data directory shows neither whom the user talks to nor which groups they are in:
 
@@ -258,6 +277,7 @@ A backup leaves out:
 - **One-time prekeys,** ours (`prekeys`) and those we hold for contacts (`bundles`). A restored copy would let a sealed message that was already opened be opened again, or seal a second message to a prekey a contact already used. Fresh ones are made and handed out as sessions come up. Messages sealed to the lost device's prekeys can't be opened.
 - **Relay tokens** (`relay-wallet`, Appendix P), each of which can be spent once.
 - **Anonymous identities** (Appendix M). A backup would link them to the main identity.
+- **Saved tunnel peers** (`tunnels`, Appendix D, *Persistence*). Their PSKs come from sessions with this device, so they never leave it.
 - **Received files' contents.** History keeps only where the app saved them.
 
 **Restoring** replaces the identity, contacts, state and personas in a data directory. The backup is opened and checked first, so a wrong passphrase or a damaged file changes nothing. The restored identity is sealed the way a new one would be (the keyring, a passphrase, or the Android Keystore). Apps can't stop their node while they run, so they *stage* a restore in `<data dir>.restore` and restart. The staged files replace the old ones before the node next opens. The user's other files in the data directory, such as downloads, stay.

@@ -84,9 +84,27 @@ pub fn has_endpoint(endpoint: &SocketAddr) -> bool {
 #[derive(Clone)]
 pub struct TunnelPeer {
     pub wg_public: [u8; 32],
+    /// The endpoint the node last gave: from the peer's offer, or saved
+    /// by an earlier run (Appendix D, *Persistence*).
     pub endpoint: SocketAddr,
     pub overlay: Ipv6Addr,
     pub psk: Secret,
+    /// When `psk` was exported from a session (ms); restored peers keep theirs.
+    pub made_ms: u64,
+    /// Where packets authenticated by this peer's key last came from over
+    /// UDP (userspace device only), when that differs from `endpoint`.
+    pub seen: Option<SocketAddr>,
+}
+
+/// What became of a tunnel offer (see `Shared::add_tunnel_peer`).
+enum Offered {
+    /// Tunnels are off.
+    Off,
+    /// Its key is ours or another peer's.
+    Refused,
+    /// The same key, PSK and endpoint as we hold: nothing to do.
+    Same,
+    Changed(TunnelPeer),
 }
 
 /// How something went when no circuit could hide it (see
@@ -148,8 +166,9 @@ pub enum Event {
         addr: SocketAddr,
         reason: String,
     },
-    /// A mutually approved peer offered a WireGuard tunnel. `psk` is fresh
-    /// for this session; reapply it whenever this event repeats.
+    /// A mutually approved peer offered a WireGuard tunnel. `psk` is from
+    /// this session, or from the last one when a repeated offer only moves
+    /// the endpoint; reapply it whenever this event repeats.
     TunnelUp {
         peer: PublicIdentity,
         wg_public: [u8; 32],
@@ -521,7 +540,7 @@ struct SessionHandle {
 }
 
 pub(crate) struct Shared {
-    identity: Identity,
+    pub(crate) identity: Identity,
     pub(crate) home: Home,
     pub(crate) contacts: Mutex<Contacts>,
     sessions: Mutex<HashMap<PublicIdentity, SessionHandle>>,
@@ -540,9 +559,17 @@ pub(crate) struct Shared {
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
     pub(crate) default_timer: std::sync::atomic::AtomicU32,
-    tunnel: Mutex<Option<(u16, [u8; 32])>>,
+    /// Our tunnel port and WireGuard public key, while tunnels are on.
+    pub(crate) tunnel: Mutex<Option<(u16, [u8; 32])>>,
     /// WireGuard peers offered us, for config and live apply.
-    tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    pub(crate) tunnel_peers: Mutex<HashMap<PublicIdentity, TunnelPeer>>,
+    /// Held around turning tunnels off and each read or write of the
+    /// saved peers, so a save can't bring the file back once tunnels are
+    /// off (see `tunnels`).
+    pub(crate) tunnel_io: Mutex<()>,
+    /// When endpoints the userspace device saw were last saved (ms).
+    #[cfg(feature = "boringtun")]
+    pub(crate) tunnel_seen_saved_ms: AtomicU64,
     /// When each peer's last Wi-Fi Direct request and offer were taken
     /// (see `direct`), to take at most one of each per interval.
     pub(crate) direct_taken: Mutex<HashMap<(PublicIdentity, bool), std::time::Instant>>,
@@ -568,6 +595,12 @@ pub(crate) struct Shared {
     pub(crate) delivery: Mutex<Delivery>,
     /// What each peer's latest `Hello` said it supports.
     pub(crate) peer_features: Mutex<HashMap<PublicIdentity, u64>>,
+    /// Delivery and read receipts waiting for their devices, and the
+    /// read-receipt switch (see `receipts`).
+    pub(crate) receipts: Mutex<crate::receipts::Outbox>,
+    /// How long a receipt waits before it is sealed: a random time in
+    /// this window (ms); tests shorten it.
+    pub(crate) receipt_delay: Mutex<(u64, u64)>,
     /// Feature bits this node puts in its contact sessions' `Hello`
     /// (`FEATURES` less any withheld with [`Node::withhold_features`]).
     features: AtomicU64,
@@ -636,9 +669,12 @@ impl Shared {
             .is_some_and(|c| c.mutually_approved())
     }
 
-    fn tunnel_down(&self, peer: &PublicIdentity) {
+    pub(crate) fn tunnel_down(&self, peer: &PublicIdentity) {
         if lock(&self.tunnel).is_some() {
             let removed = lock(&self.tunnel_peers).remove(peer);
+            if removed.is_some() {
+                self.save_tunnels();
+            }
             self.emit(Event::TunnelDown {
                 peer: *peer,
                 wg_public: removed.map(|tp| tp.wg_public),
@@ -664,21 +700,50 @@ impl Shared {
     /// Records `peer`'s tunnel, unless its WireGuard key is ours or
     /// already another peer's. WireGuard knows peers by key, so a contact
     /// offering someone else's key would take over that peer's entry (and,
-    /// once revoked, remove it). The first to hold a key keeps it. Returns
-    /// whether it was recorded.
-    fn add_tunnel_peer(&self, peer: PublicIdentity, tp: TunnelPeer) -> bool {
-        if lock(&self.tunnel).is_some_and(|(_, ours)| ours == tp.wg_public) {
-            return false;
-        }
+    /// once revoked, remove it). The first to hold a key keeps it.
+    ///
+    /// An offer repeated within a session (after the peer's network or
+    /// port changed) keeps the PSK's age; one identical to what we hold
+    /// changes nothing.
+    fn add_tunnel_peer(
+        &self,
+        peer: PublicIdentity,
+        wg_public: [u8; 32],
+        endpoint: SocketAddr,
+        psk: Secret,
+    ) -> Offered {
         let mut peers = lock(&self.tunnel_peers);
+        // Checked under `tunnel_peers`, which turning tunnels off clears
+        // after `tunnel`: an offer racing with that can't leave a peer.
+        let Some((_, ours)) = *lock(&self.tunnel) else {
+            return Offered::Off;
+        };
+        if ours == wg_public {
+            return Offered::Refused;
+        }
         if peers
             .iter()
-            .any(|(id, p)| *id != peer && p.wg_public == tp.wg_public)
+            .any(|(id, p)| *id != peer && p.wg_public == wg_public)
         {
-            return false;
+            return Offered::Refused;
         }
-        peers.insert(peer, tp);
-        true
+        let old = peers
+            .get(&peer)
+            .filter(|o| o.wg_public == wg_public && *o.psk.0 == *psk.0);
+        if old.is_some_and(|o| o.endpoint == endpoint) {
+            return Offered::Same;
+        }
+        let tp = TunnelPeer {
+            wg_public,
+            endpoint,
+            overlay: overlay_addr(&peer),
+            made_ms: old.map_or_else(now_ms, |o| o.made_ms),
+            // The device starts again from the offered endpoint.
+            seen: None,
+            psk,
+        };
+        peers.insert(peer, tp.clone());
+        Offered::Changed(tp)
     }
 
     pub(crate) fn save_state(&self, name: &str, bytes: threnody_core::Result<impl AsRef<[u8]>>) {
@@ -686,6 +751,16 @@ impl Shared {
         if let Err(e) = r {
             eprintln!("threnody: failed to save {name}: {e}");
         }
+    }
+
+    /// Runs `f` on the waiting receipts and saves what it changed.
+    pub(crate) fn receipts<R>(&self, f: impl FnOnce(&mut crate::receipts::Outbox) -> R) -> R {
+        let mut o = lock(&self.receipts);
+        let r = f(&mut o);
+        if std::mem::take(&mut o.dirty) {
+            self.save_state(crate::receipts::STATE, Ok(o.encode()));
+        }
+        r
     }
 
     /// Runs `f` on the acknowledgement state and saves what it changed.
@@ -808,6 +883,13 @@ impl Node {
             };
             Delivery::load(&load("unacked"), &load("delivered-ids"))
         };
+        let receipts = cfg
+            .home
+            .load_state(&cfg.identity, crate::receipts::STATE)
+            .ok()
+            .flatten()
+            .and_then(|b| crate::receipts::Outbox::load(&b))
+            .unwrap_or_else(|| crate::receipts::Outbox::new(now_ms()));
         let (tx, rx) = mpsc::unbounded_channel();
         let tunnel = cfg
             .tunnel_port
@@ -827,6 +909,9 @@ impl Node {
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
+            tunnel_io: Mutex::new(()),
+            #[cfg(feature = "boringtun")]
+            tunnel_seen_saved_ms: AtomicU64::new(0),
             direct_taken: Mutex::new(HashMap::new()),
             tunnel_inbound: Mutex::new(None),
             relay: Mutex::new(RelayState::default()),
@@ -847,6 +932,11 @@ impl Node {
             folders: Mutex::new(folders),
             lists: Mutex::new(lists),
             peer_features: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(receipts),
+            receipt_delay: Mutex::new((
+                crate::receipts::MIN_DELAY_MS,
+                crate::receipts::MAX_DELAY_MS,
+            )),
             features: AtomicU64::new(FEATURES),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
@@ -885,13 +975,17 @@ impl Node {
             .filter(|p| node.is_accepted(p))
             .collect();
         node.shared.delivery(|d| d.mark_contacts(&contacts));
+        // A fresh outbox is saved at once, so when it began stays put.
+        node.shared.receipts(|_| ());
         node.start_history_sweep();
+        node.start_receipt_flush();
         node.load_recovery();
         node.load_volunteer();
         node.load_credentials();
         node.start_directory_upkeep();
         node.load_push();
         node.resume_placements();
+        node.shared.restore_tunnels();
         Ok((node, rx))
     }
 
@@ -996,20 +1090,21 @@ impl Node {
             .collect()
     }
 
-    /// Sets the WireGuard tunnel port. Changing this restarts tunnel state.
+    /// Sets the WireGuard tunnel port. Turning tunnels on restores peers
+    /// saved by an earlier run (Appendix D, *Persistence*). Turning them
+    /// off (`None`, even when already off) forgets every peer and deletes
+    /// the saved ones. Changing the port keeps peers and offers the new
+    /// one on every direct session.
     pub fn set_tunnel_port(&self, port: Option<u16>) -> Result<()> {
         let new_tunnel = port.map(|p| (p, *WgKeys::derive(&self.shared.identity).public()));
-        *lock(&self.shared.tunnel) = new_tunnel;
-        // Clear existing tunnel peers since port changed
-        lock(&self.shared.tunnel_peers).clear();
-        // Offer at once on direct sessions with approved contacts, rather
-        // than when each session next wakes; they answer with theirs.
-        if let Some((port, wg_public)) = new_tunnel {
-            for s in self.sessions() {
-                if s.via.is_none() && self.shared.mutual(&s.peer) {
-                    let _ = self.send(&s.peer, AppMessage::TunnelOffer { wg_public, port });
-                }
+        let was = self.shared.set_tunnel(new_tunnel);
+        if new_tunnel.is_some() {
+            if was.is_none() {
+                self.shared.restore_tunnels();
             }
+            // Peers stay valid across a port change (their PSK doesn't
+            // depend on it); the offer tells them our new port.
+            self.reoffer_tunnels();
         }
         Ok(())
     }
@@ -1809,6 +1904,9 @@ impl Node {
         if let Some(conn) = &datagrams {
             self.read_datagrams(peer, conn.clone());
         }
+        // This session's own connection: `datagrams_to` would give a newer
+        // session's while this one lingers after being replaced.
+        let conn = datagrams.clone();
         let old = lock(&self.shared.sessions).insert(
             peer,
             SessionHandle {
@@ -1854,7 +1952,7 @@ impl Node {
         let started = tokio::time::Instant::now();
         tokio::spawn(async move {
             let result = run_session(
-                &node, stream, chan, addr, via, over, rx, outbound, stranger, heard_ms,
+                &node, stream, chan, addr, via, over, conn, rx, outbound, stranger, heard_ms,
             )
             .await;
             // Closed on purpose (either side) is not a loss to repair.
@@ -1915,6 +2013,7 @@ async fn run_session<S>(
     addr: SocketAddr,
     via: Option<PublicIdentity>,
     over: Over,
+    conn: Option<quinn::Connection>,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
     outbound: bool,
     mut stranger_pass: Option<StrangerPass>,
@@ -2149,7 +2248,7 @@ where
             if ticker.is_none() && chan.can_send() {
                 let mut waiting = VecDeque::new();
                 while let Some(m) = pending.pop_front() {
-                    match ready(shared, &peer, m, peer_acks) {
+                    match ready(node, &peer, m, peer_acks) {
                         Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
                         Ok(None) => {}
                         Err(m) => waiting.push_back(m),
@@ -2228,6 +2327,9 @@ where
                             }
                         }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        // Receipts waiting for it, by what it says it takes
+                        // now: after `peer_acks`, so tracked ones can go.
+                        pending.extend(node.receipts_for(&peer, features));
                         // Remembered across restarts: probes matter most
                         // when there is no session to ask in.
                         let timed = features & FEATURE_TIMED_PROBES != 0;
@@ -2329,21 +2431,29 @@ where
                             // devices, offered on direct sessions only: the
                             // address of a relayed one is the relay's.
                             if via.is_none() && lock(&shared.tunnel).is_some() && shared.mutual(&peer) {
-                                let tp = TunnelPeer {
-                                    wg_public,
-                                    endpoint: shared.tunnel_endpoint(&peer, addr, port),
-                                    overlay: overlay_addr(&peer),
-                                    psk: Secret(chan.export(PSK_CONTEXT)),
+                                // This session's current address: a QUIC
+                                // client that moves migrates its connection
+                                // (quinn updates `remote_address`), and a
+                                // repeated offer then moves the endpoint.
+                                let from = conn
+                                    .as_ref()
+                                    .map_or(addr, |c| crate::quic::canonical(c.remote_address()));
+                                let endpoint = shared.tunnel_endpoint(&peer, from, port);
+                                let psk = Secret(chan.export(PSK_CONTEXT));
+                                let changed = match shared.add_tunnel_peer(peer, wg_public, endpoint, psk) {
+                                    Offered::Refused => {
+                                        shared.emit(Event::ReachNote {
+                                            note: format!(
+                                                "tunnel offer from {} refused: its key is not its own",
+                                                peer.fingerprint()
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                    Offered::Off => continue,
+                                    Offered::Same => None,
+                                    Offered::Changed(tp) => Some(tp),
                                 };
-                                if !shared.add_tunnel_peer(peer, tp.clone()) {
-                                    shared.emit(Event::ReachNote {
-                                        note: format!(
-                                            "tunnel offer from {} refused: its key is not its own",
-                                            peer.fingerprint()
-                                        ),
-                                    });
-                                    continue;
-                                }
                                 // They may have offered while our tunnels
                                 // were off, and so ignored ours: answer
                                 // their first offer with ours.
@@ -2351,13 +2461,16 @@ where
                                     took_offer = true;
                                     offered = false;
                                 }
-                                shared.emit(Event::TunnelUp {
-                                    peer,
-                                    wg_public: tp.wg_public,
-                                    endpoint: tp.endpoint,
-                                    overlay: tp.overlay,
-                                    psk: tp.psk,
-                                });
+                                if let Some(tp) = changed {
+                                    shared.save_tunnels();
+                                    shared.emit(Event::TunnelUp {
+                                        peer,
+                                        wg_public: tp.wg_public,
+                                        endpoint: tp.endpoint,
+                                        overlay: tp.overlay,
+                                        psk: tp.psk,
+                                    });
+                                }
                             }
                         }
                         AppMessage::Paths(payload) => {
@@ -2374,6 +2487,7 @@ where
                         }
                         AppMessage::Prekeys(payload) => node.on_prekeys(peer, &payload),
                         AppMessage::Push(payload) => node.on_push(peer, &payload),
+                        AppMessage::Receipt(payload) => node.on_receipt(&peer, &payload),
                         AppMessage::Credential(payload) => node.on_credential(peer, &payload),
                         // Directory traffic belongs on anonymous links only.
                         AppMessage::Directory(_) => {}
@@ -2454,7 +2568,7 @@ where
                     // Calls can't hide behind cover traffic (their media
                     // shows anyway), and a call can't wait for ticks.
                     Some(m) if ticker.is_some() && chan.can_send() && urgent(&m) => {
-                        match ready(shared, &peer, m, peer_acks) {
+                        match ready(node, &peer, m, peer_acks) {
                             Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
                             Ok(None) => {}
                             Err(m) => pending.push_back(m),
@@ -2512,7 +2626,7 @@ where
                         let mut m = AppMessage::Cover;
                         for _ in 0..pending.len() {
                             let Some(next) = pending.pop_front() else { break };
-                            match ready(shared, &peer, next, peer_acks) {
+                            match ready(node, &peer, next, peer_acks) {
                                 Ok(Some(r)) => {
                                     m = r;
                                     break;
@@ -2578,19 +2692,31 @@ fn urgent(m: &AppMessage) -> bool {
 /// One the peer can't read (a change held before we knew its features) is
 /// dropped: `Ok(None)`.
 fn ready(
-    shared: &Shared,
+    node: &Node,
     peer: &PublicIdentity,
     m: AppMessage,
     peer_acks: Option<bool>,
 ) -> std::result::Result<Option<AppMessage>, AppMessage> {
+    let shared = &*node.shared;
     match (m, peer_acks) {
         (m @ AppMessage::Tracked { .. }, None) => Err(m),
         (AppMessage::Tracked { id, inner }, Some(acks)) => {
+            let features = lock(&shared.peer_features).get(peer).copied();
+            // A receipt as the switch and this session's `Hello` now allow.
+            let inner = match *inner {
+                AppMessage::Receipt(b) => {
+                    match node.receipt_ready(peer, features.unwrap_or(0), b) {
+                        Ok(b) => Box::new(AppMessage::Receipt(b)),
+                        Err(instead) => {
+                            shared.delivery(|d| d.forget(peer, id));
+                            return Ok(instead);
+                        }
+                    }
+                }
+                inner => Box::new(inner),
+            };
             let feature = needs(&inner);
-            let readable = feature == 0
-                || lock(&shared.peer_features)
-                    .get(peer)
-                    .is_some_and(|f| f & feature != 0);
+            let readable = feature == 0 || features.is_some_and(|f| f & feature != 0);
             if !readable {
                 shared.delivery(|d| d.forget(peer, id));
                 return Ok(None);
@@ -2841,4 +2967,129 @@ fn device_name() -> String {
         .map(|h| h.trim().to_owned())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "device".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use threnody_core::message::FEATURE_RECEIPTS;
+
+    fn test_node() -> (tempfile::TempDir, Node) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let identity = home.create_identity(None).unwrap();
+        let (node, _rx) = Node::new(NodeConfig {
+            home,
+            identity,
+            policy: AcceptPolicy::Anyone,
+            constant_rate: None,
+            tunnel_port: None,
+        })
+        .unwrap();
+        (dir, node)
+    }
+
+    fn receipt(delivered: &[u64], read: &[u64]) -> AppMessage {
+        let b = threnody_core::receipt::Receipt {
+            delivered: delivered.to_vec(),
+            read: read.to_vec(),
+        }
+        .encode()
+        .unwrap();
+        AppMessage::Receipt(b)
+    }
+
+    #[test]
+    fn ready_drops_receipts_for_a_peer_without_the_bit() {
+        let (_dir, node) = test_node();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        let track = |m| shared.delivery(|d| d.track(&p, m, Tag::NONE));
+        let text = || AppMessage::Text {
+            sent_ms: 0,
+            body: "hi".into(),
+            expires_in_s: None,
+            id: 3,
+            quote: None,
+            forwarded: false,
+        };
+
+        // A peer whose fresh Hello lacks the bit (an older build, say):
+        // the receipt left from an earlier session goes, unsent.
+        lock(&shared.peer_features).insert(p, FEATURES & !FEATURE_RECEIPTS);
+        assert!(matches!(
+            ready(&node, &p, track(receipt(&[1], &[])), Some(true)),
+            Ok(None)
+        ));
+        assert_eq!(node.unacked(&p), 0);
+        let t = track(text());
+        assert_eq!(ready(&node, &p, t.clone(), Some(true)), Ok(Some(t)));
+        shared.delivery(|d| d.forget_peer(&p));
+
+        // With the bit, it goes.
+        lock(&shared.peer_features).insert(p, FEATURES);
+        let r = track(receipt(&[1], &[]));
+        assert_eq!(ready(&node, &p, r.clone(), Some(true)), Ok(Some(r)));
+        assert_eq!(node.unacked(&p), 1);
+    }
+
+    #[test]
+    fn a_receipt_for_a_downgraded_peer_keeps_its_reads() {
+        // Queued as a Receipt by the bits of an earlier session; this
+        // session's Hello has `Read` only: the reads go as a `Read`.
+        let (_dir, node) = test_node();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        let m = shared.delivery(|d| d.track(&p, receipt(&[1], &[2, 3]), Tag::NONE));
+        lock(&shared.peer_features).insert(p, FEATURES & !FEATURE_RECEIPTS);
+        let Ok(Some(AppMessage::Read { ids, .. })) = ready(&node, &p, m, Some(true)) else {
+            panic!("expected a Read");
+        };
+        assert_eq!(ids, [2, 3]);
+        assert_eq!(node.unacked(&p), 0, "not tracked any more");
+    }
+
+    #[test]
+    fn reads_off_leave_tracked_receipts_with_deliveries_only() {
+        let (_dir, node) = test_node();
+        let shared = &node.shared;
+        let p = Identity::generate().public();
+        lock(&shared.peer_features).insert(p, FEATURES);
+        let both = shared.delivery(|d| d.track(&p, receipt(&[1], &[2]), Tag::NONE));
+        let read = shared.delivery(|d| d.track(&p, receipt(&[], &[4]), Tag::NONE));
+
+        // Switched off while one is in a session's queue: what goes then
+        // has no reads (read implies delivered).
+        shared.receipts(|o| o.reads_on = false);
+        assert_eq!(
+            ready(&node, &p, both.clone(), Some(true)),
+            Ok(Some(AppMessage::Tracked {
+                id: tracked_id(&both),
+                inner: Box::new(receipt(&[1, 2], &[])),
+            }))
+        );
+
+        // Switched off properly: what waits for the next session is
+        // rewritten too, so a later switch back on can't send it.
+        shared.receipts(|o| o.reads_on = true);
+        node.set_send_read_receipts(false);
+        node.set_send_read_receipts(true);
+        let resent = shared.delivery(|d| d.resend(&p));
+        let inner: Vec<AppMessage> = resent
+            .into_iter()
+            .map(|m| match m {
+                AppMessage::Tracked { inner, .. } => *inner,
+                m => m,
+            })
+            .collect();
+        assert_eq!(inner, [receipt(&[1, 2], &[]), receipt(&[4], &[])]);
+        let _ = read;
+    }
+
+    fn tracked_id(m: &AppMessage) -> u64 {
+        match m {
+            AppMessage::Tracked { id, .. } => *id,
+            _ => 0,
+        }
+    }
 }

@@ -391,6 +391,11 @@ impl Node {
                         }
                         changed
                     };
+                    // Whatever the merge took mutual approval from loses its
+                    // tunnel (most also go through `withdraw_approval` below).
+                    if changed {
+                        self.shared.prune_tunnels();
+                    }
                     let left: Vec<(PublicIdentity, ConversationId)> = {
                         let c = lock(&self.shared.contacts);
                         before
@@ -573,6 +578,8 @@ impl Node {
                 self.shared.persist_bundles(&bundles);
             }
         }
+        // It may have held a tunnel with us: no longer.
+        self.shared.prune_tunnels();
         self.disconnect(device);
         self.forget_peer(device);
     }
