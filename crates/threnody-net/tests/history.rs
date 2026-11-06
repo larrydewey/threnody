@@ -238,6 +238,15 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
     })
     .await;
     assert!(matches!(e, Event::Message { .. }));
+    // No longer a request: deleting one leaves the conversation alone.
+    assert!(!me.delete_request(&sid));
+    assert_eq!(
+        me.history(me.conversation_for(&sid))
+            .unwrap()
+            .entries()
+            .len(),
+        2
+    );
 
     // Blocked: the conversation goes and they can't come back.
     me.block_contact(&sid);
@@ -248,6 +257,7 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
             .is_empty()
     );
     assert!(!me.is_accepted(&sid));
+    assert!(!me.delete_request(&sid), "a block isn't a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = stranger.connect(&addr, None).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -258,6 +268,27 @@ async fn strangers_write_requests_until_accepted_and_blocked_ones_stay_out() {
     stranger.connect(&addr, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(me.sessions().iter().any(|s| s.peer == sid));
+}
+
+#[tokio::test]
+async fn deleting_a_request_takes_it_and_its_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stranger, _srx, _) = spawn(&dir, "stranger").await;
+    let (me, mut rx, addr) = spawn(&dir, "me").await;
+    let my_id = stranger.connect(&addr, None).await.unwrap();
+    let sid = stranger.identity();
+    stranger.send_text(&my_id, "hi, it's me").unwrap();
+    next(&mut rx, |e| matches!(e, Event::MessageRequest { .. })).await;
+
+    assert!(me.delete_request(&sid));
+    assert!(
+        me.history(me.conversation_for(&sid))
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    assert!(me.contacts().get(&sid).is_none());
+    assert!(!me.delete_request(&sid), "nothing left to delete");
 }
 
 #[tokio::test]

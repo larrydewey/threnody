@@ -1888,6 +1888,11 @@ impl Ui {
                 }
             }
             "accept" | "block" | "delete" => {
+                // Never the current peer by default: both delete a
+                // conversation.
+                if verb != "accept" && arg.is_none() {
+                    bail!("usage: /{verb} <peer>");
+                }
                 let p = self.resolve_peer(arg)?;
                 let who = self.name(&p);
                 match verb {
@@ -1903,7 +1908,11 @@ impl Ui {
                         );
                     }
                     _ => {
-                        self.node.delete_request(&p);
+                        if !self.node.delete_request(&p) {
+                            bail!(
+                                "{who} is not a message request; /forget deletes a contact and your conversation"
+                            );
+                        }
                         say!("* deleted the request from {who}");
                     }
                 }

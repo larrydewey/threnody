@@ -720,8 +720,17 @@ impl Node {
     }
 
     /// Deletes a message request: the contact and the conversation go, and
-    /// they can write again (as a new request).
-    pub fn delete_request(&self, peer: &PublicIdentity) {
+    /// they can write again (as a new request). Returns false, changing
+    /// nothing, when `peer` isn't a request: an accepted contact (its
+    /// conversation stays), a blocked one (it stays blocked) or a stranger.
+    pub fn delete_request(&self, peer: &PublicIdentity) -> bool {
+        let request = !self.is_accepted(peer)
+            && lock(&self.shared.contacts)
+                .get(peer)
+                .is_some_and(|c| !c.blocked);
+        if !request {
+            return false;
+        }
         let conv = self.conversation_for(peer);
         let devices = self.mark_contacts(peer, |_| {});
         self.update_contacts(|c| {
@@ -735,6 +744,7 @@ impl Node {
             self.disconnect(&d);
         }
         let _ = self.shared.home.delete_history(conv);
+        true
     }
 
     /// Deletes the conversation with `peer`: every device of its account

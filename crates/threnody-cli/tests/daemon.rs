@@ -165,6 +165,19 @@ fn a_service_takes_commands_and_keeps_messages_out_of_its_log() {
         assert!(!log.contains("harbour"), "{log}");
         assert!(!log.contains("meet"), "{log}");
     }
+
+    // Deleting a conversation always names whose.
+    let (ok, _) = ctl(&a, &["/to", &b_fp]);
+    assert!(ok);
+    for verb in ["/block", "/delete"] {
+        let (ok, said) = ctl(&a, &[verb]);
+        assert!(!ok && said.contains("usage"), "{said}");
+    }
+    // A contact's conversation isn't a request to delete.
+    let (ok, said) = ctl(&a, &["/delete", &b_fp]);
+    assert!(!ok && said.contains("not a message request"), "{said}");
+    let (_, history) = ctl(&a, &["/history"]);
+    assert!(history.contains("meet at the harbour"), "{history}");
 }
 
 #[test]
