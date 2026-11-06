@@ -1,5 +1,6 @@
 - Group calls: voice and video for up to eight people. A member who can't reach another directly is relayed by a third, who can't see the media.
 - Calls ring all your contact's devices; the first to answer takes it.
 - Car audio and headset buttons work, and a phone call puts a Threnody call on hold.
-- Fixes from a red-team security review, including your contacts encrypted on the device.
+- Security fixes: contacts are encrypted, and file names don't show who you talk to.
 - Cover traffic now also hides relay traffic, using more data.
+- Downgrading isn't supported, but loses nothing.
