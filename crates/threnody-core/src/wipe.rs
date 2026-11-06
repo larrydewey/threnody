@@ -36,6 +36,8 @@ const DIRS: &[&str] = &[
     "personas",
     // Received photos and clips (the Linux app).
     "media",
+    // Edited photos not yet sent (the Linux app's editor).
+    "edited",
     // Received files (the CLI, and the Linux app without XDG Downloads).
     "downloads",
     // WireGuard configurations (`threnody tunnel`).

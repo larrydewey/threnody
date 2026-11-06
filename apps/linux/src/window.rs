@@ -2419,7 +2419,8 @@ impl App {
     /// ourselves are skipped; so is any moment a dialog is open.
     fn check_clipboard(self: &Rc<Self>) {
         let cb = self.window.clipboard();
-        if cb.is_local() {
+        // Locked: offered once unlocked and in front again.
+        if cb.is_local() || self.lock.is_locked() {
             return;
         }
         let weak = Rc::downgrade(self);
@@ -2442,8 +2443,9 @@ impl App {
                 return;
             };
             let Some(this) = weak.upgrade() else { return };
-            // Offered next time instead of over another dialog.
-            if this.window.visible_dialog().is_some() {
+            // Offered next time instead of over another dialog (or the
+            // lock page).
+            if this.window.visible_dialog().is_some() || this.lock.is_locked() {
                 return;
             }
             let last = this.offered.borrow().clone();

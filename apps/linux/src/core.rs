@@ -1251,6 +1251,9 @@ impl Core {
     /// called about `name`. Made at once, so two editors open at the same
     /// time can't pick the same one.
     pub fn edit_draft_path(&self, persona: Option<&str>, name: &str) -> Result<PathBuf, String> {
+        if WIPING.load(Ordering::SeqCst) {
+            return Err("erasing".into());
+        }
         let dir = self
             .edit_dir(persona)
             .ok_or("that anonymous identity isn't open")?;
@@ -1267,6 +1270,9 @@ impl Core {
     /// the photo is sent. The draft moves there with [`adopt_edit`]; if
     /// the send fails, remove the placeholder.
     pub fn edit_destination(&self, persona: Option<&str>, draft: &Path) -> Result<PathBuf, String> {
+        if WIPING.load(Ordering::SeqCst) {
+            return Err("erasing".into());
+        }
         let home = self
             .identity_home(persona)
             .ok_or("that anonymous identity isn't open")?;
