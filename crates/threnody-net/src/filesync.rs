@@ -228,14 +228,29 @@ pub(crate) fn pick_source(candidates: &[SessionInfo], f: &Fetch) -> Option<Publi
     let ok: Vec<&SessionInfo> = candidates
         .iter()
         .filter(|s| !f.refused.contains(&s.peer))
-        .filter(|s| {
-            !f.auto || (s.via.is_none() && !matches!(s.transport, "ble" | "relay" | "onion"))
-        })
+        .filter(|s| !f.auto || direct(s))
         .collect();
     ok.iter()
         .find(|s| s.peer.as_bytes() == &f.file.device)
         .or_else(|| ok.iter().min_by_key(|s| s.since_ms))
         .map(|s| s.peer)
+}
+
+/// Whether `s` reaches its peer directly: not through a relay, an onion
+/// circuit or Bluetooth (the only sessions an auto fetch uses).
+pub(crate) fn direct(s: &SessionInfo) -> bool {
+    s.via.is_none() && !matches!(s.transport, "ble" | "relay" | "onion")
+}
+
+/// Whether an auto fetch from `source` may go on, given whether auto
+/// fetching is allowed now and the sessions there are: only while it is,
+/// and only over a direct session.
+pub(crate) fn auto_may_continue(
+    auto_ok: bool,
+    sessions: &[SessionInfo],
+    source: &PublicIdentity,
+) -> bool {
+    auto_ok && sessions.iter().any(|s| s.peer == *source && direct(s))
 }
 
 /// Where `f` is, given `others`, every other device of our account.
@@ -435,6 +450,23 @@ impl Node {
         let was = self.shared.auto_fetch.swap(on, Ordering::Relaxed);
         if on && !was {
             self.pump_fetches();
+        } else if !on {
+            self.pause_auto_fetches();
+        }
+    }
+
+    /// Whether auto fetches may run now: auto fetching on, and not on
+    /// mobile data.
+    fn auto_ok(&self) -> bool {
+        self.auto_fetch() && !self.on_mobile()
+    }
+
+    /// Stops asking for the next window of every auto fetch under way; what
+    /// came so far stays, and the fetch goes on once it may.
+    pub(crate) fn pause_auto_fetches(&self) {
+        let mut fs = lock(&self.shared.file_sync);
+        for f in fs.fetches.iter_mut().filter(|f| f.auto) {
+            f.source = None;
         }
     }
 
@@ -556,13 +588,35 @@ impl Node {
 
     /// Drops fetches no longer needed and starts those that can start.
     pub(crate) fn pump_fetches(&self) {
-        // Which queued files still need fetching, one history load per
-        // conversation (outside the lock).
-        let queued: Vec<(ConversationId, FileRef, bool)> = lock(&self.shared.file_sync)
-            .fetches
-            .iter()
-            .map(|f| (f.conv, f.file.clone(), f.auto))
+        let auto_ok = self.auto_ok();
+        let sessions: Vec<SessionInfo> = self
+            .sessions()
+            .into_iter()
+            .filter(|s| self.is_own_device(&s.peer) && self.supports(&s.peer, FEATURE_DEVICE_SYNC))
             .collect();
+        // Which queued files still need fetching, one history load per
+        // conversation (outside the lock); only when one of them could
+        // start now, so a queue waiting for a sibling that is away costs
+        // no history reads.
+        let queued: Vec<(ConversationId, FileRef, bool)> = {
+            let fs = lock(&self.shared.file_sync);
+            let active = fs.fetches.iter().filter(|f| f.source.is_some()).count();
+            let startable = fs.store.is_some()
+                && active < MAX_ACTIVE
+                && fs.fetches.iter().any(|f| {
+                    f.source.is_none()
+                        && (!f.auto || auto_ok)
+                        && pick_source(&sessions, f).is_some()
+                });
+            if startable {
+                fs.fetches
+                    .iter()
+                    .map(|f| (f.conv, f.file.clone(), f.auto))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
         let now = now_ms();
         let mut by_conv: HashMap<ConversationId, Vec<Entry>> = HashMap::new();
         let mut stale: HashSet<FileRef> = HashSet::new();
@@ -584,12 +638,6 @@ impl Node {
                 stale.insert(r.clone());
             }
         }
-        let auto_ok = self.auto_fetch() && !self.on_mobile();
-        let sessions: Vec<SessionInfo> = self
-            .sessions()
-            .into_iter()
-            .filter(|s| self.is_own_device(&s.peer) && self.supports(&s.peer, FEATURE_DEVICE_SYNC))
-            .collect();
         let others = self.other_devices();
         let mut sends = Vec::new();
         {
@@ -600,13 +648,17 @@ impl Node {
             fs.fetches
                 .retain(|f| !(f.auto && state_of(f, &others) == FetchState::Unavailable));
             let changed = fs.fetches.len() != before;
-            if fs.store.is_some() {
+            // Only what was just checked starts.
+            if fs.store.is_some() && !queued.is_empty() {
                 let mut active = fs.fetches.iter().filter(|f| f.source.is_some()).count();
                 for f in fs.fetches.iter_mut() {
                     if active >= MAX_ACTIVE {
                         break;
                     }
-                    if f.source.is_some() || (f.auto && !auto_ok) {
+                    if f.source.is_some()
+                        || (f.auto && !auto_ok)
+                        || !queued.iter().any(|(_, r, _)| *r == f.file)
+                    {
                         continue;
                     }
                     if let Some(p) = pick_source(&sessions, f) {
@@ -634,12 +686,22 @@ impl Node {
     }
 
     /// Asks again where a fetch's source went away or went quiet.
+    /// An auto fetch's source counts as gone once auto fetching may not
+    /// run, or once its session no longer reaches it directly (replaced by
+    /// a relay, onion or Bluetooth one).
     pub(crate) fn resume_fetches(&self) {
-        let live: HashSet<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        let sessions = self.sessions();
+        let auto_ok = self.auto_ok();
         {
             let mut fs = lock(&self.shared.file_sync);
             for f in fs.fetches.iter_mut() {
-                let gone = f.source.is_some_and(|s| !live.contains(&s));
+                let gone = f.source.is_some_and(|s| {
+                    if f.auto {
+                        !auto_may_continue(auto_ok, &sessions, &s)
+                    } else {
+                        !sessions.iter().any(|x| x.peer == s)
+                    }
+                });
                 let quiet = f.last.is_none_or(|t| t.elapsed() >= STALL);
                 if f.source.is_some() && (gone || quiet) {
                     f.source = None;
@@ -760,6 +822,9 @@ impl Node {
         let Ok(part) = FilePart::decode(part) else {
             return;
         };
+        // Whether an auto fetch from `from` may ask for its next window
+        // (read before the queue's lock).
+        let auto_ok = auto_may_continue(self.auto_ok(), &self.sessions(), &from);
         let mut fs = lock(&self.shared.file_sync);
         let Some(i) = fs
             .fetches
@@ -774,6 +839,11 @@ impl Node {
         }
         match accepted {
             Accept::Reject | Accept::Wait => {}
+            Accept::More(_) if fs.fetches[i].auto && !auto_ok => {
+                // Metered now, or no longer reached directly: the fetch
+                // keeps what it has and waits to be started again.
+                fs.fetches[i].source = None;
+            }
             Accept::More(o) => {
                 let f = &mut fs.fetches[i];
                 let (conv, want) = (f.conv, f.next_want(o));
@@ -1133,6 +1203,19 @@ mod tests {
             Some(a),
             "a tap uses any path"
         );
+    }
+
+    #[test]
+    fn an_auto_fetch_goes_on_only_directly_and_while_allowed() {
+        let (a, b) = (peer(), peer());
+        let now = [session(a, 1, "tcp", false), session(b, 2, "relay", true)];
+        assert!(auto_may_continue(true, &now, &a));
+        assert!(!auto_may_continue(false, &now, &a), "metered or turned off");
+        assert!(!auto_may_continue(true, &now, &b), "only through a relay");
+        assert!(!auto_may_continue(true, &now[1..], &a), "no session");
+        for t in ["ble", "onion"] {
+            assert!(!auto_may_continue(true, &[session(a, 1, t, false)], &a));
+        }
     }
 
     #[test]

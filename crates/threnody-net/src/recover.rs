@@ -766,8 +766,15 @@ impl Node {
     }
 
     /// Tells recovery whether the default network is mobile data.
+    /// Auto fetches from our other devices stop on mobile data and go on
+    /// off it.
     pub fn set_on_mobile(&self, on: bool) {
-        self.rec().on_mobile.store(on, Ordering::Relaxed);
+        let was = self.rec().on_mobile.swap(on, Ordering::Relaxed);
+        if on && !was {
+            self.pause_auto_fetches();
+        } else if !on && was {
+            self.pump_fetches();
+        }
     }
 
     /// The standby network went away.

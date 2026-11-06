@@ -1199,6 +1199,42 @@ async fn transcripts_never_plant_a_location() {
     let _ = (&mut laptop.rx, &mut bob.rx);
 }
 
+#[tokio::test]
+async fn a_transcript_brings_ticks_for_entries_we_already_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    bob.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+    let _ = laptop.node.send_text(&bid, "seen elsewhere");
+    wait_for(|| sent(&phone.node, &bid, "seen elsewhere").is_some()).await;
+    // As a third device would send it: the entry the phone has already,
+    // now delivered and read.
+    let mut e = sent(&laptop.node, &bid, "seen elsewhere").unwrap();
+    e.delivered = true;
+    e.read_ms = threnody_core::now_ms();
+    let conv = laptop.node.conversation_for(&bid);
+    let h = threnody_core::history::History::transcript(vec![e])
+        .encode()
+        .unwrap();
+    laptop
+        .node
+        .send(
+            &phone.node.identity(),
+            account_msg(8, Some(&conv.to_bytes()), &h),
+        )
+        .unwrap();
+    next(&mut phone.rx, |e| matches!(e, Event::DeviceSync { .. })).await;
+    let on_phone = sent(&phone.node, &bid, "seen elsewhere").unwrap();
+    assert!(on_phone.delivered && on_phone.read_ms != 0);
+    let _ = (&mut laptop.rx, &mut bob.rx);
+}
+
 /// A file store in a directory, counting reads.
 struct DirStore {
     dir: std::path::PathBuf,

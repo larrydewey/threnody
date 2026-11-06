@@ -268,6 +268,19 @@ impl Node {
             .filter(|e| e.file.is_some())
             .cloned()
             .collect();
+        // The transcript's ticks, for entries we had already (merging
+        // entries skips those): a device that got them from a third one,
+        // or whose sync state was lost, still catches up on what the
+        // sender knows of them.
+        let ticks: Vec<Tick> = if conv == self.notes() {
+            Vec::new()
+        } else {
+            entries
+                .iter()
+                .filter_map(tick_of)
+                .filter(|t| t.delivered || t.read_ms != 0 || !t.delivered_to.is_empty())
+                .collect()
+        };
         let Ok(added) =
             self.shared
                 .home
@@ -275,13 +288,16 @@ impl Node {
         else {
             return;
         };
+        if !ticks.is_empty() {
+            self.merge_ticks(from, conv, &ticks, false);
+        }
         // Queued before the event, so whoever sees it sees the queue.
         self.fetch_auto(conv, &files);
         if added > 0 {
             // Ticks that came before their entries.
             let waiting = lock(&self.shared.orphan_ticks).take(conv);
             if !waiting.is_empty() {
-                self.merge_ticks_from(from, conv, &waiting);
+                self.merge_ticks(from, conv, &waiting, true);
             }
             self.emit(Event::HistorySynced { from, added });
         }
@@ -412,10 +428,18 @@ impl Node {
         else {
             return;
         };
-        self.merge_ticks_from(from, conv, &ticks.0);
+        self.merge_ticks(from, conv, &ticks.0, true);
     }
 
-    fn merge_ticks_from(&self, from: PublicIdentity, conv: ConversationId, ticks: &[Tick]) {
+    /// Merges `ticks` from `from`; those for entries not here yet wait for
+    /// them if `keep_unmatched`.
+    fn merge_ticks(
+        &self,
+        from: PublicIdentity,
+        conv: ConversationId,
+        ticks: &[Tick],
+        keep_unmatched: bool,
+    ) {
         let Ok((n, unmatched)) =
             self.shared
                 .home
@@ -423,7 +447,7 @@ impl Node {
         else {
             return;
         };
-        if !unmatched.is_empty() {
+        if keep_unmatched && !unmatched.is_empty() {
             lock(&self.shared.orphan_ticks).add(conv, unmatched);
         }
         if n > 0 {
