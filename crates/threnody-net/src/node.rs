@@ -1423,6 +1423,8 @@ impl Node {
     /// session may end right after; its last act is to send that.
     pub(crate) fn withdraw_approval(&self, peer: &PublicIdentity) {
         self.shared.tunnel_down(peer);
+        // No longer mutual: its wake-up endpoint goes (Appendix R).
+        self.forget_push(peer);
         let _ = self.send(peer, AppMessage::Approval { approved: false });
     }
 
