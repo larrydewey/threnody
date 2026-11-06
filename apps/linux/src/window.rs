@@ -2597,6 +2597,12 @@ impl App {
         );
         toggle(
             &privacy,
+            settings::AUTO_FETCH,
+            "Get photos from my other devices automatically",
+            "Photos, voice and video messages up to 30 days old, on unmetered networks. Sensitive and disappearing ones only when you click them.",
+        );
+        toggle(
+            &privacy,
             settings::REACH,
             "Reach contacts over the internet",
             "Strangers in the public DHT see this computer's IP address, not who you talk to",

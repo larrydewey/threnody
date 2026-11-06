@@ -240,10 +240,16 @@ private struct Bubble: View {
         if entry.edited { s += " · edited" }
         if entry.disappearing { s += " · ⏱" }
         guard entry.outgoing else { return s }
-        // Sent from another of our devices: that device sees its ticks.
-        if !fromThisDevice { return s + " · from your other device" }
-        if entry.read { return s + " 👁️" }
-        return s + (entry.delivered ? " ✓✓" : " ✓")
+        // Sent from another of our devices: its ticks as that device
+        // passed them on (the node decides; never a lone "sent").
+        if !fromThisDevice { s += " · from your other device" }
+        switch entry.tick {
+        case .read: return s + " 👁️"
+        case .delivered: return s + " ✓✓"
+        case let .partial(delivered, recipients): return s + " ✓ \(delivered)/\(recipients)"
+        case .sent: return s + " ✓"
+        case .none: return s
+        }
     }
 }
 

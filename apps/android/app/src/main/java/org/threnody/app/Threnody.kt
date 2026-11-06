@@ -68,6 +68,8 @@ object Threnody {
         applyPrivacyTo(ctx, it)
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
+        // Only the main identity: personas are never linked to other devices.
+        it.setFileStore(AndroidFiles(ctx.applicationContext))
         say("listening on $listenAddr")
         pump(ctx.applicationContext, it, null)
         if (Bluetooth.canListen(ctx)) Bluetooth.start(ctx.applicationContext, it)
@@ -213,6 +215,8 @@ object Threnody {
         node.setOnionFirst(Privacy.onionFirst(ctx))
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
         node.setStripMetadata(Privacy.stripMetadata(ctx))
+        // Never on metered networks; re-applied when that changes.
+        node.setAutoFetchFiles(Privacy.autoFetchFiles(ctx) && !Privacy.metered)
         // Kept by the node too, so it holds before this runs after a
         // restart; off drops reads still waiting for their sender.
         node.setSendReadReceipts(Privacy.sendReadReceipts(ctx))
