@@ -111,6 +111,14 @@ enum Cmd {
         #[arg(long)]
         no_keyring: bool,
     },
+    /// Erase this device's identity, contacts, history, files and anonymous
+    /// identities, and their keyring keys. Nothing is sent: contacts and
+    /// your other devices aren't told.
+    Wipe {
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Join an existing account using a link code from one of its devices.
     Link {
         /// The `threnody-link://…` code shown by `/device add`.
@@ -594,6 +602,16 @@ fn main() -> Result<()> {
     quiet_on_closed_stdout();
     let cli = Cli::parse();
     let main_home = Home::new(cli.home.unwrap_or_else(default_home));
+    // Before the staged restore below, which would restore a backup only
+    // for it to be erased.
+    if let Cmd::Wipe { yes } = cli.cmd {
+        if cli.persona.is_some() {
+            bail!(
+                "wipe erases everything; to delete one anonymous identity use `threnody persona burn`"
+            );
+        }
+        return wipe_command(&main_home, yes);
+    }
     // The desktop app stages a restore and quits; finish it if it hasn't.
     if threnody_core::backup::staging_dir(main_home.dir()).is_ok_and(|d| d.exists())
         && let Ok(_lock) = no_node_running(&main_home)
@@ -620,7 +638,7 @@ fn main() -> Result<()> {
         None => (main_home, None, None),
     };
     match cli.cmd {
-        Cmd::Persona { .. } => unreachable!(),
+        Cmd::Persona { .. } | Cmd::Wipe { .. } => unreachable!(),
         Cmd::Init {
             force,
             passphrase,
@@ -1140,6 +1158,77 @@ fn burn_expired(personas: &Personas, now_ms: u64) -> Result<Vec<String>> {
         burned.push(p.id);
     }
     Ok(burned)
+}
+
+/// `threnody wipe`: erases `home` (see `Home::erase`), the keyring
+/// entries of its identities, and, for the default home the desktop app
+/// shares, the desktop app's settings.
+fn wipe_command(home: &Home, yes: bool) -> Result<()> {
+    let lock = no_node_running(home)?;
+    if !yes {
+        print!(
+            "This erases everything in {}: identity, contacts, history, received files and \
+             anonymous identities. Contacts and your other devices are not told. \
+             Type 'erase' to continue: ",
+            home.dir().display()
+        );
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if line.trim() != "erase" {
+            bail!("not erased");
+        }
+    }
+    // Only sealed identities have keyring entries (the identity's, and
+    // the desktop app's app-lock pepper): don't touch the keyring for the
+    // others.
+    let sealed = |dir: &std::path::Path| {
+        let h = Home::new(dir);
+        h.has_identity() && h.identity_is_sealed().unwrap_or(true)
+    };
+    let mut keyed = Vec::new();
+    if sealed(home.dir()) {
+        keyed.push(home.dir().to_path_buf());
+    }
+    if let Ok(entries) = std::fs::read_dir(home.dir().join("personas")) {
+        keyed.extend(entries.flatten().map(|e| e.path()).filter(|p| sealed(p)));
+    }
+    // Windows can't delete a file that is open; elsewhere the lock is
+    // held across the erase.
+    #[cfg(windows)]
+    drop(lock);
+    let erased = home.erase()?;
+    for h in erased.homes.iter().filter(|h| keyed.contains(h)) {
+        let h = Home::new(h);
+        keyring::delete(&h);
+        keyring::delete_lock_pepper(&h);
+    }
+    #[cfg(not(windows))]
+    drop(lock);
+    let abs = |p: &std::path::Path| std::path::absolute(p).ok();
+    if abs(home.dir()).is_some() && abs(home.dir()) == abs(&default_home()) {
+        let conf = desktop_config_dir();
+        let _ = std::fs::remove_file(conf.join("desktop.conf"));
+        let _ = std::fs::remove_dir(&conf);
+    }
+    for p in &erased.left {
+        println!("Kept, not Threnody's: {}", p.display());
+    }
+    println!(
+        "The desktop app's Downloads/Threnody folder isn't touched; \
+         \"Erase all Threnody data\" in the app removes it."
+    );
+    println!("Erased.");
+    Ok(())
+}
+
+/// Where the desktop app keeps its settings (`desktop.conf`).
+fn desktop_config_dir() -> PathBuf {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(x).join("threnody");
+    }
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".config/threnody")
 }
 
 fn persona_command(main_home: &Home, action: PersonaCmd) -> Result<()> {
