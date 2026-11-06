@@ -269,12 +269,14 @@ impl Node {
         self.shared.save_state(STATE_WALLET, bytes);
     }
 
+    /// Writes the directory's state while holding its lock, so a save
+    /// racing [`Node::stop_serving_directory`] can't write the file back
+    /// after it was removed (the directory would restart at next launch).
     fn save_server(&self) {
-        let bytes = lock(&self.vol().server)
-            .as_ref()
-            .map(|s| encode_server(s.review, &s.relays));
-        if let Some(b) = bytes {
-            self.shared.save_state(STATE_SERVER, b);
+        let server = lock(&self.vol().server);
+        if let Some(s) = server.as_ref() {
+            self.shared
+                .save_state(STATE_SERVER, encode_server(s.review, &s.relays));
         }
     }
 
@@ -684,6 +686,13 @@ impl Node {
                 "an anonymous identity can't volunteer: its descriptor would publish it with this address".into(),
             ));
         }
+        if let Some(a) = &addrs {
+            threnody_core::directory::check_relay_addrs(a).map_err(|_| {
+                NetError::NotAllowed(
+                    "relay addresses: host:port, at most 8, 64 characters each".into(),
+                )
+            })?;
+        }
         let on = addrs.is_some();
         *lock(&self.vol().relay) = addrs;
         if on {
@@ -856,6 +865,21 @@ impl Node {
         }
         self.save_server();
         Ok(link.to_string())
+    }
+
+    /// Stops running a directory and deletes its state, so it isn't
+    /// restarted at the next launch. Its clients get "not a directory"
+    /// from now on. Returns whether one was running.
+    pub fn stop_serving_directory(&self) -> bool {
+        let mut server = lock(&self.vol().server);
+        if server.take().is_none() {
+            return false;
+        }
+        // Under the lock: `save_server` writes under it too.
+        if let Err(e) = self.shared.home.secure_remove_state(STATE_SERVER) {
+            self.note(format!("removing the directory's state: {e}"));
+        }
+        true
     }
 
     pub fn serving_directory(&self) -> bool {
