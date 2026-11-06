@@ -3,12 +3,19 @@
 //!
 //! ```text
 //! GroupWire = { 0: kind uint, 1: group_id bstr, ? 2: payload bstr, ? 3: name tstr,
-//!               ? 4: member bstr .size 32, ? 5: reference uint, ? 6: owner bstr .size 32 }
+//!               ? 4: member bstr .size 32, ? 5: reference uint, ? 6: owner bstr .size 32,
+//!               ? 7: [* bstr], ? 8: [epoch uint, term uint, auth bstr .size 8, lead bstr .size 8] }
 //! kind: 1 key-package request, 2 key package, 3 welcome, 4 MLS message,
 //!       5 forward (an MLS message for another member),
 //!       6 receipt (that member acknowledged a forwarded message),
-//!       7 leave (a member asks the owner to remove it),
-//!       8 add device (6: the group's owner, to the device itself)
+//!       7 leave (a member asks the coordinator to remove it;
+//!         2: its own Remove proposal, in groups with a roster),
+//!       8 add device (6: the group's owner, to the device itself),
+//!       9 pass welcome (coordinator -> proposer: 2 the Welcome for 4, 3 the name),
+//!       10 resync (8: the stale device's own hint; 4: that device, when relayed)
+//! 7: the proposals a coordinator's commit references (kinds 4 and 5)
+//! 8: the sender's sync hint (kinds 4 and 5 in groups with a roster; 10)
+//! ```
 //! ```
 
 use const_cbor::Decoder;
@@ -17,8 +24,31 @@ use threnody_core::history::{MAX_POLL_OPTIONS, MAX_POLL_QUESTION};
 use threnody_core::message::{Clip, FORWARDED, MAX_MENTIONS, Mention, Quote};
 use threnody_core::{Error, Result};
 
+/// Proposals a commit may carry (the coordinator stores at most 32 an
+/// epoch).
+pub const MAX_ATTACHED: usize = 64;
+
 /// Group ids are 16 random bytes.
 pub type GroupId = [u8; 16];
+
+/// Where the sender stands in a group with a roster: its epoch, the
+/// roster's term, the first 8 bytes of its epoch authenticator (RFC 9420
+/// §8.7) and of its coordinator. Unauthenticated: it only ever prompts a
+/// request for repair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncHint {
+    pub epoch: u64,
+    pub term: u32,
+    pub auth: [u8; 8],
+    pub lead: [u8; 8],
+}
+
+impl SyncHint {
+    /// See [`crate::roster::Rank`].
+    pub fn rank(&self) -> crate::roster::Rank {
+        (self.term, std::cmp::Reverse(self.lead))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GroupWire {
@@ -33,8 +63,15 @@ pub enum GroupWire {
         name: String,
         welcome: Vec<u8>,
     },
-    /// A serialized `MlsMessageOut` (application message or commit).
-    Message { group: GroupId, message: Vec<u8> },
+    /// A serialized `MlsMessageOut` (application message, proposal or
+    /// commit). A coordinator's commit carries the proposals it references,
+    /// and in groups with a roster every message carries a sync hint.
+    Message {
+        group: GroupId,
+        message: Vec<u8>,
+        proposals: Vec<Vec<u8>>,
+        sync: Option<SyncHint>,
+    },
     /// "Deliver this MLS message to member `to` for me": sent to a member
     /// the sender can reach when it can't reach `to` itself.
     /// `reference` (if not 0) asks the forwarder to send a `Receipt`
@@ -44,6 +81,8 @@ pub enum GroupWire {
         to: [u8; 32],
         message: Vec<u8>,
         reference: u64,
+        proposals: Vec<Vec<u8>>,
+        sync: Option<SyncHint>,
     },
     /// From a forwarder: `member` acknowledged the message we forwarded
     /// with `reference`.
@@ -52,8 +91,12 @@ pub enum GroupWire {
         member: [u8; 32],
         reference: u64,
     },
-    /// To the owner: remove me (the sender) from the group.
-    Leave { group: GroupId },
+    /// To the coordinator: remove me (the sender) from the group. In a
+    /// group with a roster, with our own Remove proposal.
+    Leave {
+        group: GroupId,
+        proposal: Option<Vec<u8>>,
+    },
     /// Between devices of one account: add `device` (another device of the
     /// sender's account) to this group. To the owner, a request; to
     /// `device` itself, word to accept the invitation that follows from
@@ -63,9 +106,35 @@ pub enum GroupWire {
         device: [u8; 32],
         owner: Option<[u8; 32]>,
     },
+    /// From the coordinator to whoever proposed adding `member`: the
+    /// Welcome to pass on to it.
+    PassWelcome {
+        group: GroupId,
+        member: [u8; 32],
+        name: String,
+        welcome: Vec<u8>,
+    },
+    /// "I fell out of step with the group": to a member on the branch that
+    /// won, with our own hint; from that member to its coordinator, naming
+    /// us as `member`.
+    Resync {
+        group: GroupId,
+        member: Option<[u8; 32]>,
+        sync: SyncHint,
+    },
 }
 
 impl GroupWire {
+    /// A plain MLS message, without attachments or hint.
+    pub fn message(group: GroupId, message: Vec<u8>) -> Self {
+        Self::Message {
+            group,
+            message,
+            proposals: Vec::new(),
+            sync: None,
+        }
+    }
+
     pub fn group(&self) -> &GroupId {
         match self {
             Self::KeyPackageRequest { group, .. }
@@ -74,8 +143,10 @@ impl GroupWire {
             | Self::Message { group, .. }
             | Self::Forward { group, .. }
             | Self::Receipt { group, .. }
-            | Self::Leave { group }
-            | Self::AddDevice { group, .. } => group,
+            | Self::Leave { group, .. }
+            | Self::AddDevice { group, .. }
+            | Self::PassWelcome { group, .. }
+            | Self::Resync { group, .. } => group,
         }
     }
 
@@ -101,21 +172,43 @@ impl GroupWire {
             Self::Receipt {
                 member, reference, ..
             } => (6, None, None, Some(member), *reference),
-            Self::Leave { .. } => (7, None, None, None, 0),
+            Self::Leave { proposal, .. } => (7, proposal.as_deref(), None, None, 0),
             Self::AddDevice { device, .. } => (8, None, None, Some(device), 0),
+            Self::PassWelcome {
+                member,
+                name,
+                welcome,
+                ..
+            } => (9, Some(welcome), Some(name), Some(member), 0),
+            Self::Resync { member, .. } => (10, None, None, member.as_ref(), 0),
         };
         let owner = match self {
             Self::AddDevice { owner, .. } => owner.as_ref(),
             _ => None,
         };
-        let size = payload.map_or(0, <[u8]>::len) + name.map_or(0, str::len) + 96;
+        let (proposals, sync): (&[Vec<u8>], Option<&SyncHint>) = match self {
+            Self::Message {
+                proposals, sync, ..
+            }
+            | Self::Forward {
+                proposals, sync, ..
+            } => (proposals, sync.as_ref()),
+            Self::Resync { sync, .. } => (&[], Some(sync)),
+            _ => (&[], None),
+        };
+        let size = payload.map_or(0, <[u8]>::len)
+            + name.map_or(0, str::len)
+            + proposals.iter().map(|p| p.len() + 9).sum::<usize>()
+            + 128;
         cbor::to_vec(size, |e| {
             e.map_len(
                 2 + usize::from(payload.is_some())
                     + usize::from(name.is_some())
                     + usize::from(to.is_some())
                     + usize::from(reference != 0)
-                    + usize::from(owner.is_some()),
+                    + usize::from(owner.is_some())
+                    + usize::from(!proposals.is_empty())
+                    + usize::from(sync.is_some()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.bytes(self.group())?;
@@ -134,6 +227,20 @@ impl GroupWire {
             if let Some(o) = owner {
                 e.u8(6)?.bytes(o)?;
             }
+            if !proposals.is_empty() {
+                e.u8(7)?.array_len(proposals.len())?;
+                for p in proposals {
+                    e.bytes(p)?;
+                }
+            }
+            if let Some(h) = sync {
+                e.u8(8)?
+                    .array_len(4)?
+                    .u64(h.epoch)?
+                    .u32(h.term)?
+                    .bytes(&h.auth)?
+                    .bytes(&h.lead)?;
+            }
             Ok(())
         })
     }
@@ -143,6 +250,8 @@ impl GroupWire {
         let (mut kind, mut group, mut payload, mut name, mut to) = (None, None, None, None, None);
         let mut reference = 0;
         let mut owner = None;
+        let mut proposals = Vec::new();
+        let mut sync = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -152,6 +261,26 @@ impl GroupWire {
                 4 => to = Some(cbor::fixed_bytes::<32>(d)?),
                 5 => reference = d.u64()?,
                 6 => owner = Some(cbor::fixed_bytes::<32>(d)?),
+                7 => {
+                    let n = d.array_len()?;
+                    if n > MAX_ATTACHED {
+                        return Err(Error::Malformed("too many attached proposals"));
+                    }
+                    for _ in 0..n {
+                        proposals.push(d.bytes()?.to_vec());
+                    }
+                }
+                8 => {
+                    if d.array_len()? != 4 {
+                        return Err(Error::Malformed("sync hint"));
+                    }
+                    sync = Some(SyncHint {
+                        epoch: d.u64()?,
+                        term: d.u32()?,
+                        auth: cbor::fixed_bytes::<8>(d)?,
+                        lead: cbor::fixed_bytes::<8>(d)?,
+                    });
+                }
                 _ => return Ok(false),
             }
             Ok(true)
@@ -175,23 +304,41 @@ impl GroupWire {
             4 => Self::Message {
                 group,
                 message: required(payload, "mls message")?,
+                proposals,
+                sync,
             },
             5 => Self::Forward {
                 group,
                 to: required(to, "forward target")?,
                 message: required(payload, "mls message")?,
                 reference,
+                proposals,
+                sync,
             },
             6 => Self::Receipt {
                 group,
                 member: required(to, "receipt member")?,
                 reference,
             },
-            7 => Self::Leave { group },
+            7 => Self::Leave {
+                group,
+                proposal: payload,
+            },
             8 => Self::AddDevice {
                 group,
                 device: required(to, "device")?,
                 owner,
+            },
+            9 => Self::PassWelcome {
+                group,
+                member: required(to, "joining member")?,
+                name: name.unwrap_or_default(),
+                welcome: required(payload, "welcome")?,
+            },
+            10 => Self::Resync {
+                group,
+                member: to,
+                sync: required(sync, "sync hint")?,
             },
             other => return Err(Error::UnexpectedType(u64::from(other))),
         })
@@ -697,28 +844,32 @@ mod tests {
                 name: "team".into(),
                 welcome: vec![3],
             },
-            GroupWire::Message {
-                group: g,
-                message: vec![4, 5, 6],
-            },
+            GroupWire::message(g, vec![4, 5, 6]),
             GroupWire::Forward {
                 group: g,
                 to: [9; 32],
                 message: vec![7],
                 reference: 0,
+                proposals: Vec::new(),
+                sync: None,
             },
             GroupWire::Forward {
                 group: g,
                 to: [9; 32],
                 message: vec![7],
                 reference: u64::MAX,
+                proposals: Vec::new(),
+                sync: None,
             },
             GroupWire::Receipt {
                 group: g,
                 member: [8; 32],
                 reference: 3,
             },
-            GroupWire::Leave { group: g },
+            GroupWire::Leave {
+                group: g,
+                proposal: None,
+            },
             GroupWire::AddDevice {
                 group: g,
                 device: [7; 32],
@@ -734,13 +885,105 @@ mod tests {
         }
         assert!(GroupWire::decode(&[0xa0]).is_err());
         // A forward must name its target.
-        let mut no_target = GroupWire::Message {
-            group: g,
-            message: vec![1],
-        }
-        .encode()
-        .unwrap();
+        let mut no_target = GroupWire::message(g, vec![1]).encode().unwrap();
         no_target[2] = 5; // { 0: 5, ... }
         assert!(GroupWire::decode(&no_target).is_err());
+    }
+
+    #[test]
+    fn group_wire_round_trips_new_fields() {
+        let g = [7u8; 16];
+        let sync = SyncHint {
+            epoch: 9,
+            term: 2,
+            auth: [1; 8],
+            lead: [2; 8],
+        };
+        for m in [
+            GroupWire::Message {
+                group: g,
+                message: vec![4],
+                proposals: vec![vec![1, 2], vec![3]],
+                sync: Some(sync),
+            },
+            GroupWire::Message {
+                group: g,
+                message: vec![4],
+                proposals: Vec::new(),
+                sync: Some(sync),
+            },
+            GroupWire::Forward {
+                group: g,
+                to: [9; 32],
+                message: vec![7],
+                reference: 5,
+                proposals: vec![vec![8]],
+                sync: Some(sync),
+            },
+            GroupWire::Leave {
+                group: g,
+                proposal: Some(vec![6, 6]),
+            },
+            GroupWire::PassWelcome {
+                group: g,
+                member: [3; 32],
+                name: "team".into(),
+                welcome: vec![1, 2, 3],
+            },
+            GroupWire::Resync {
+                group: g,
+                member: None,
+                sync,
+            },
+            GroupWire::Resync {
+                group: g,
+                member: Some([4; 32]),
+                sync,
+            },
+        ] {
+            assert_eq!(GroupWire::decode(&m.encode().unwrap()).unwrap(), m);
+        }
+        // A resync needs its hint.
+        let mut bare = GroupWire::message(g, vec![1]).encode().unwrap();
+        bare[2] = 10;
+        assert!(GroupWire::decode(&bare).is_err());
+    }
+
+    #[test]
+    fn legacy_messages_encode_as_before() {
+        let g = [7u8; 16];
+        // As 0.18.0 encoded them: { 0: 4, 1: g, 2: h'040506' } and
+        // { 0: 7, 1: g }.
+        let message = [
+            &[0xa3, 0x00, 0x04, 0x01, 0x50][..],
+            &[7; 16],
+            &[0x02, 0x43, 4, 5, 6],
+        ]
+        .concat();
+        assert_eq!(
+            GroupWire::message(g, vec![4, 5, 6]).encode().unwrap(),
+            message
+        );
+        let leave = [&[0xa2, 0x00, 0x07, 0x01, 0x50][..], &[7; 16]].concat();
+        assert_eq!(
+            GroupWire::Leave {
+                group: g,
+                proposal: None
+            }
+            .encode()
+            .unwrap(),
+            leave
+        );
+        // Keys a later version adds are skipped.
+        let later = [
+            &[0xa4, 0x00, 0x04, 0x01, 0x50][..],
+            &[7; 16],
+            &[0x02, 0x43, 4, 5, 6, 0x18, 99, 0x01],
+        ]
+        .concat();
+        assert_eq!(
+            GroupWire::decode(&later).unwrap(),
+            GroupWire::message(g, vec![4, 5, 6])
+        );
     }
 }
