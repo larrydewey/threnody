@@ -307,6 +307,29 @@ async fn idle_stranger_sessions_close_and_contacts_stay() {
     assert!(has(&bob, &carol), "an accepted contact never idles out");
 }
 
+/// Cover traffic isn't application traffic: a stranger's session that
+/// carries nothing else idles out all the same.
+#[tokio::test]
+async fn cover_traffic_does_not_keep_a_stranger_session_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bob, _brx) = node(&dir, "bob");
+    let (idle, _irx) = node(&dir, "idle");
+    // A cover frame each way every 100 ms, well inside the idle time.
+    for n in [&bob, &idle] {
+        n.set_constant_rate(Some(Duration::from_millis(100)));
+    }
+    bob.set_stranger_idle(Duration::from_millis(800));
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    idle.connect(&addr, Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    assert!(until(5, || has(&bob, &idle)).await);
+    assert!(
+        until(5, || !has(&bob, &idle)).await,
+        "closed for want of messages, cover or not"
+    );
+}
+
 /// A new device of ours linking while strangers hold every place from
 /// its network still gets in. One let in past the limit that doesn't
 /// link is closed after the grace.
