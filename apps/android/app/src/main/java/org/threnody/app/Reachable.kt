@@ -16,10 +16,13 @@ import android.provider.Settings
  * - After a reboot or an update nothing had started it again until the
  *   app was opened, so contacts saw this phone as not connected. [Boot]
  *   starts it then.
- * - While the phone sleeps (Doze), Android cuts background apps off the
- *   network unless they are exempt from battery optimization, and a
- *   foreground service alone doesn't exempt them. [ask] offers the
- *   exemption once; the menu item opens it again.
+ * - Under battery optimization Android may stop the service to save
+ *   battery, and an app that isn't exempt can't start its foreground
+ *   service again from the background (a sticky restart after the system
+ *   killed it, say). [ask] offers the exemption once; the menu item opens
+ *   it again. (Doze itself doesn't cut a running foreground service off
+ *   the network: tested on a Pixel 8a in forced deep idle, with and
+ *   without the exemption.)
  *
  * Neither applies with UnifiedPush wake-ups on ([Push]): then the app is
  * meant to sleep.
@@ -28,7 +31,7 @@ object Reachable {
     private const val UI_PREFS = "ui"
     private const val ASKED = "battery_asked"
 
-    /** Whether Android lets the app use the network while the phone sleeps. */
+    /** Whether the app is exempt from battery optimization. */
     fun unrestricted(ctx: Context): Boolean =
         ctx.getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(ctx.packageName) == true
 
@@ -43,8 +46,8 @@ object Reachable {
         if (a.isFinishing) return
         SecureBuilder(a)
             .setTitle("Stay reachable when closed?")
-            .setMessage("While the phone sleeps, Android cuts Threnody off the network, so your " +
-                "contacts can't reach you until you open it. Let it run in the background " +
+            .setMessage("To save battery, Android may stop Threnody in the background, and then " +
+                "your contacts can't reach you until you open it. Let it run in the background " +
                 "without restrictions? It uses a little more battery.")
             .setPositiveButton("Allow") { _, _ -> request(a) }
             .setNegativeButton("Not now", null)
