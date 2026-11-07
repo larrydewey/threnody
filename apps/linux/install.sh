@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds Threnody for the Linux desktop and installs it for this user:
 # the binary in ~/.local/bin, a launcher in the app menu, its icons, and
-# the handler for threnody:// invite links.
+# the handler for threnody://, threnody-link:// and threnody-dir:// links.
 #
 # Closing Threnody's window keeps it running, so an old copy may still be
 # up: it is asked to quit before the new binary goes in, and started again
@@ -77,7 +77,8 @@ install -Dm644 "$here/data/icons/hicolor/symbolic/apps/threnody-qr-symbolic.svg"
     "$data/icons/hicolor/symbolic/apps/threnody-qr-symbolic.svg"
 update-desktop-database -q "$data/applications" 2>/dev/null || true
 gtk-update-icon-cache -q -t "$data/icons/hicolor" 2>/dev/null || true
-xdg-mime default "$id.desktop" x-scheme-handler/threnody x-scheme-handler/threnody-link 2>/dev/null || true
+xdg-mime default "$id.desktop" x-scheme-handler/threnody x-scheme-handler/threnody-link \
+    x-scheme-handler/threnody-dir 2>/dev/null || true
 
 if $was_running; then
     setsid -f "$exe" >/dev/null 2>&1 </dev/null

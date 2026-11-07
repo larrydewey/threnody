@@ -88,6 +88,19 @@ pub fn ask_text(
     confirm: &str,
     run: impl Fn(String) + 'static,
 ) {
+    ask_text_with(parent, heading, body, placeholder, initial, confirm, run);
+}
+
+/// As [`ask_text`], returning its entry (to fill it in later).
+pub fn ask_text_with(
+    parent: &impl IsA<gtk::Widget>,
+    heading: &str,
+    body: &str,
+    placeholder: &str,
+    initial: &str,
+    confirm: &str,
+    run: impl Fn(String) + 'static,
+) -> gtk::Entry {
     let d = alert(heading, body, &[("cancel", "Cancel"), ("ok", confirm)]);
     d.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
     let entry = gtk::Entry::builder()
@@ -96,19 +109,19 @@ pub fn ask_text(
         .activates_default(true)
         .build();
     d.set_extra_child(Some(&entry));
+    let e = entry.clone();
     d.connect_response(None, move |_, r| {
         if r == "ok" {
-            run(entry.text().trim().to_owned());
+            run(e.text().trim().to_owned());
         }
     });
     d.present(Some(parent));
     // Grab after presenting; the dialog focuses its default button otherwise.
-    let e = d.extra_child();
+    let e = entry.clone();
     glib::idle_add_local_once(move || {
-        if let Some(e) = e {
-            e.grab_focus();
-        }
+        e.grab_focus();
     });
+    entry
 }
 
 /// Offers a list of choices; `run` gets the chosen index.
@@ -243,6 +256,71 @@ pub fn show_code(
     // Not the selectable link: focusing it would select all of it.
     glib::idle_add_local_once(move || {
         copy.grab_focus();
+    });
+}
+
+/// Opens a file in the app the desktop picks for it; `on_fail` runs if
+/// none can.
+pub fn open_externally(
+    window: &impl IsA<gtk::Window>,
+    path: &std::path::Path,
+    on_fail: impl FnOnce() + 'static,
+) {
+    gtk::FileLauncher::new(Some(&gtk::gio::File::for_path(path))).launch(
+        Some(window),
+        gtk::gio::Cancellable::NONE,
+        move |r| {
+            if r.is_err() {
+                on_fail();
+            }
+        },
+    );
+}
+
+/// Asks before a link leaves for the browser: *Open*, *Copy* or *Cancel*.
+pub fn confirm_link(window: &adw::ApplicationWindow, url: &str) {
+    let d = alert(
+        "Open this link?",
+        &format!(
+            "{url}\n\nIt opens in your browser, outside Threnody. The site sees your network address."
+        ),
+        &[("cancel", "Cancel"), ("copy", "Copy"), ("open", "Open")],
+    );
+    d.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+    let (w, u) = (window.clone(), url.to_owned());
+    d.connect_response(None, move |_, r| match r {
+        "open" => gtk::UriLauncher::new(&u).launch(Some(&w), gtk::gio::Cancellable::NONE, |_| {}),
+        "copy" => w.clipboard().set_text(&u),
+        _ => {}
+    });
+    d.present(Some(window));
+}
+
+/// Plays an animated GIF in `pic` (GTK draws only its first frame) while
+/// the picture exists; it only advances while it's on screen.
+pub fn animate(pic: &gtk::Picture, path: &std::path::Path) {
+    let is_gif = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+    if !is_gif {
+        return;
+    }
+    let Ok(anim) = gdk::gdk_pixbuf::PixbufAnimation::from_file(path) else {
+        return;
+    };
+    if anim.is_static_image() {
+        return;
+    }
+    let iter = anim.iter(None);
+    let weak = pic.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+        let Some(pic) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if pic.is_mapped() && iter.advance(std::time::SystemTime::now()) {
+            pic.set_paintable(Some(&gdk::Texture::for_pixbuf(&iter.pixbuf())));
+        }
+        glib::ControlFlow::Continue
     });
 }
 
