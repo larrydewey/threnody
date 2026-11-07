@@ -35,9 +35,9 @@ RepoType: git
 Repo: https://github.com/larrydewey/threnody.git
 
 Builds:
-  - versionName: 0.19.1
-    versionCode: 19001
-    commit: v0.19.1
+  - versionName: 0.19.2
+    versionCode: 19002
+    commit: v0.19.2
     subdir: apps/android/app
     sudo:
       - apt-get update
@@ -72,5 +72,5 @@ MaintainerNotes: |-
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags ^v[0-9.]+$
-CurrentVersion: 0.19.1
-CurrentVersionCode: 19001
+CurrentVersion: 0.19.2
+CurrentVersionCode: 19002
