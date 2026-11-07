@@ -44,6 +44,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked
+      # --all-features never compiles the code builds without calls run
+      # (iOS, the F-Droid build, desktop builds from source only).
+      - name: Clippy without calls
+        run: cargo clippy -p threnody-ffi -p threnody-desktop --no-default-features --all-targets --locked
 
   test:
     name: Tests
@@ -105,12 +109,45 @@ jobs:
       - name: Build (phone and emulator ABIs)
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
-        run: apps/android/build.sh --emulator
+        run: |
+          apps/android/build.sh --emulator
+          # Only the ABIs libthrenody_ffi.so was built for, not every one JNA ships.
+          apk=apps/android/app/build/outputs/apk/debug/app-debug.apk
+          libs=$(unzip -Z1 "$apk" 'lib/*' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          [[ "$libs" == "arm64-v8a x86_64 " ]] || { echo "::error::unexpected ABIs: $libs"; exit 1; }
+      # Before the F-Droid build below, which overwrites the debug APK.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: threnody-android-debug
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
+      - name: F-Droid build (no calls)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          # Nothing in the no-calls Android tree may pull in WebRTC. (Checked
+          # on files: under pipefail, `grep -q` on a pipe can pass a match.)
+          out="$RUNNER_TEMP/nocalls"
+          mkdir -p "$out"
+          cargo tree --locked -p threnody-ffi --features boringtun --target aarch64-linux-android \
+              -e normal,build > "$out/tree.txt"
+          if grep -i 'webrtc\|livekit' "$out/tree.txt"; then
+              echo "::error::WebRTC in the no-calls dependency tree"; exit 1
+          fi
+          apps/android/build.sh --no-calls
+          apk=apps/android/app/build/outputs/apk/debug/app-debug.apk
+          libs=$(unzip -Z1 "$apk" 'lib/*' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          [[ "$libs" == "arm64-v8a " ]] || { echo "::error::unexpected ABIs: $libs"; exit 1; }
+          unzip -q -o "$apk" 'lib/*' 'classes*.dex' -d "$out/apk"
+          # WebRTC links statically into libthrenody_ffi.so (no separate .so to
+          # look for), so check its JNI symbols and the jar's classes instead.
+          test -s "$out/apk/lib/arm64-v8a/libthrenody_ffi.so"
+          if grep -aq 'Java_livekit_org_webrtc_' "$out/apk/lib/arm64-v8a/libthrenody_ffi.so"; then
+              echo "::error::WebRTC in the no-calls native library"; exit 1
+          fi
+          if grep -aq 'Llivekit/org/webrtc/PeerConnectionFactory;' "$out"/apk/classes*.dex; then
+              echo "::error::libwebrtc.jar classes in the no-calls APK"; exit 1
+          fi
 
   ios:
     name: iOS app

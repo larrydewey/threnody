@@ -1,12 +1,19 @@
-# DRAFT fdroiddata recipe for Threnody (metadata/org.threnody.app.yml).
+# fdroiddata recipe for Threnody: copy to metadata/org.threnody.app.yml.
 #
-# Not ready to submit as it stands: the build below still fetches LiveKit's
-# prebuilt libwebrtc (native library and libwebrtc.jar) for calls, which
-# F-Droid does not accept. See "Blockers" in apps/android/README.md and the
-# comments on the build entry.
+# F-Droid builds without calls: they need LiveKit's prebuilt libwebrtc,
+# which F-Droid can't use. -Pthrenody.calls=false and build.sh --no-calls
+# leave WebRTC out entirely (nothing is downloaded but crates and Gradle
+# dependencies), the call buttons disappear, and the node tells contacts it
+# doesn't take 1:1 calls. Group-call rings don't check that yet: a group call
+# still rings this build, and joining one gives no audio. Fix that before the
+# first F-Droid submission.
 #
-# The license is "Apache-2.0 OR MIT" (dual); fdroiddata takes one SPDX id
-# here, so this uses Apache-2.0, as other dual-licensed Rust apps do.
+# The license is "Apache-2.0 OR MIT" (dual); fdroiddata takes one SPDX id,
+# so this uses Apache-2.0, as other dual-licensed Rust apps do.
+#
+# Each release's "prepare" commit sets the versions below to that release.
+# 0.18.0 predates build.sh --no-calls, so the first release after it is the
+# first one to submit.
 
 AntiFeatures:
   NonFreeNet:
@@ -30,46 +37,42 @@ RepoType: git
 Repo: https://github.com/larrydewey/threnody.git
 
 Builds:
-  - versionName: 0.16.0
-    versionCode: 16000
-    commit: v0.16.0
+  - versionName: 0.18.0
+    versionCode: 18000
+    commit: v0.18.0
     subdir: apps/android/app
     sudo:
       - apt-get update
       - apt-get install -y --no-install-recommends build-essential pkg-config
     srclibs:
       - rustup@1.28.2
-    # The wrapper jar is a binary; F-Droid uses its own Gradle anyway.
+    # The wrapper jar is a binary; F-Droid uses its own Gradle.
     rm:
       - apps/android/gradle/wrapper/gradle-wrapper.jar
     prebuild:
       - $$rustup$$/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 --target aarch64-linux-android
-    # Same steps as apps/android/build.sh, minus Gradle: cross-compile
-    # libthrenody_ffi.so into jniLibs, copy libwebrtc.jar into app/libs and
-    # generate the UniFFI Kotlin bindings.
-    #
-    # BLOCKER: the `calls` feature pulls in webrtc-sys, whose build script
-    # downloads a prebuilt libwebrtc from
-    # github.com/livekit/rust-sdks/releases (tag webrtc-89d790b) unless
-    # LK_CUSTOM_WEBRTC points at a local build. Either build it from source
-    # first (webrtc-sys's libwebrtc/build_android.sh: a full Chromium WebRTC
-    # checkout through depot_tools, tens of GB, and depot_tools itself fetches
-    # prebuilt gn/ninja/clang), then set LK_CUSTOM_WEBRTC; or ship an F-Droid
-    # build without calls, which needs the app to build without
-    # libwebrtc.jar (Calls.kt calls livekit.org.webrtc.ContextUtils
-    # directly, and app/build.gradle.kts depends on libs/libwebrtc.jar).
+      - source $HOME/.cargo/env
+      - cargo fetch --locked --manifest-path ../../../Cargo.toml
+    # apps/android/build.sh minus Gradle: cross-compiles libthrenody_ffi.so
+    # (arm64-v8a, without calls) into jniLibs and generates the UniFFI
+    # Kotlin bindings.
     build:
       - source $HOME/.cargo/env
-      - ANDROID_NDK_HOME=$$NDK$$ ../build.sh --native-only
+      - ANDROID_NDK_HOME=$$NDK$$ ../build.sh --native-only --no-calls
     ndk: 28.2.13676358
     gradle:
       - yes
+    gradleprops:
+      - threnody.calls=false
+
+MaintainerNotes: |-
+  versionCode = major * 1000000 + minor * 1000 + patch; app/build.gradle.kts
+  carries it as a literal (checked against Cargo.toml at build time).
+  The Rust toolchain pin follows rust-version in the workspace Cargo.toml;
+  bump --default-toolchain when that changes.
+  Calls are off in this build (see the comment at the top).
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags ^v[0-9.]+$
-# The versionCode is computed in app/build.gradle.kts from the workspace
-# version in Cargo.toml (major * 1000000 + minor * 1000 + patch), which
-# checkupdates can't evaluate. Until there's a literal to match, new builds
-# need their versionCode filled in by hand.
-CurrentVersion: 0.16.0
-CurrentVersionCode: 16000
+CurrentVersion: 0.18.0
+CurrentVersionCode: 18000

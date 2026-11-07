@@ -10,7 +10,7 @@ What it does
 * Offline delivery: messages for a contact who is offline are sealed to them and held by mutual contacts until they return.
 * Metadata protection, on by default: padded cover traffic hides when you send. This uses data (about 110 MB a day per connected contact on mobile data) and can be switched off.
 * Chats and groups with photos, files, voice and video messages, reactions, editing and deleting, read ticks, disappearing messages and message requests from people you haven't accepted.
-* Voice and video calls, carried inside the encrypted session.
+* Voice and video calls, carried inside the encrypted session (not yet in the F-Droid build, which leaves out the prebuilt WebRTC they need; the GitHub release has them).
 * Photo metadata (location, camera, time) is removed before sending, and photos can be marked sensitive so they arrive covered.
 * Several devices can share one account, with shared contacts and history.
 * Anonymous identities with their own keys, which can burn themselves after a set time.
