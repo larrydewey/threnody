@@ -91,10 +91,13 @@ pub enum GroupWire {
         reference: u64,
     },
     /// To the coordinator: remove me (the sender) from the group. In a
-    /// group with a roster, with our own Remove proposal.
+    /// group with a roster, with our own Remove proposal; and our signed
+    /// word that we're leaving, for the commit should the coordinator
+    /// have to remove us itself (absent from older senders).
     Leave {
         group: GroupId,
         proposal: Option<Vec<u8>>,
+        signature: Option<[u8; 64]>,
     },
     /// Between devices of one account: add `device` (another device of the
     /// sender's account) to this group. To the owner, a request; to
@@ -185,6 +188,10 @@ impl GroupWire {
             Self::AddDevice { owner, .. } => owner.as_ref(),
             _ => None,
         };
+        let signature = match self {
+            Self::Leave { signature, .. } => signature.as_ref(),
+            _ => None,
+        };
         let (proposals, sync): (&[Vec<u8>], Option<&SyncHint>) = match self {
             Self::Message {
                 proposals, sync, ..
@@ -206,6 +213,7 @@ impl GroupWire {
                     + usize::from(to.is_some())
                     + usize::from(reference != 0)
                     + usize::from(owner.is_some())
+                    + usize::from(signature.is_some())
                     + usize::from(!proposals.is_empty())
                     + usize::from(sync.is_some()),
             )?;
@@ -240,6 +248,9 @@ impl GroupWire {
                     .bytes(&h.auth)?
                     .bytes(&h.lead)?;
             }
+            if let Some(s) = signature {
+                e.u8(9)?.bytes(s)?;
+            }
             Ok(())
         })
     }
@@ -251,6 +262,7 @@ impl GroupWire {
         let mut owner = None;
         let mut proposals = Vec::new();
         let mut sync = None;
+        let mut signature = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -280,6 +292,7 @@ impl GroupWire {
                         lead: cbor::fixed_bytes::<8>(d)?,
                     });
                 }
+                9 => signature = Some(cbor::fixed_bytes::<64>(d)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -322,6 +335,7 @@ impl GroupWire {
             7 => Self::Leave {
                 group,
                 proposal: payload,
+                signature,
             },
             8 => Self::AddDevice {
                 group,
@@ -868,6 +882,7 @@ mod tests {
             GroupWire::Leave {
                 group: g,
                 proposal: None,
+                signature: None,
             },
             GroupWire::AddDevice {
                 group: g,
@@ -922,6 +937,17 @@ mod tests {
             GroupWire::Leave {
                 group: g,
                 proposal: Some(vec![6, 6]),
+                signature: None,
+            },
+            GroupWire::Leave {
+                group: g,
+                proposal: Some(vec![6, 6]),
+                signature: Some([5; 64]),
+            },
+            GroupWire::Leave {
+                group: g,
+                proposal: None,
+                signature: Some([5; 64]),
             },
             GroupWire::PassWelcome {
                 group: g,
@@ -967,7 +993,8 @@ mod tests {
         assert_eq!(
             GroupWire::Leave {
                 group: g,
-                proposal: None
+                proposal: None,
+                signature: None,
             }
             .encode()
             .unwrap(),

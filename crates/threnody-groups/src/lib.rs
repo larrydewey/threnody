@@ -516,49 +516,95 @@ fn capabilities() -> Capabilities {
         .build()
 }
 
-/// Marks a commit's authenticated data: the leaves (as `u32`s, big
-/// endian) that follow it are of members the committer removed because
-/// they asked to leave. Members that predate it ignore it.
+/// Marks a commit's authenticated data: what follows it is, for each
+/// member the committer removed because it asked to leave, its leaf (a
+/// `u32`, big endian) and its signed [`leave_statement`] (64 bytes).
+/// Members that predate it ignore it.
 const LEAVE_AAD: &[u8] = b"threnody/left";
+
+/// A leave as its member signs it with its identity key (its MLS
+/// signature key too), for the coordinator to show the commit that
+/// removes it is a leave. Bound to the group and to the member's leaf
+/// encryption key, which is new each time it joins, so it doesn't count
+/// for a later stay in the group.
+fn leave_statement(mls_group: &[u8], encryption_key: &[u8]) -> Vec<u8> {
+    let mut s = b"threnody/group-leave\0".to_vec();
+    for part in [mls_group, encryption_key] {
+        s.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        s.extend_from_slice(part);
+    }
+    s
+}
+
+/// Our own signed leave statement, while we're still a member.
+fn sign_leave(mls: &MlsGroup, identity: &Identity) -> Option<[u8; 64]> {
+    let leaf = mls.member_at(mls.own_leaf_index())?;
+    let statement = leave_statement(mls.group_id().as_slice(), &leaf.encryption_key);
+    Some(identity.sign(&statement))
+}
+
+/// Whether `signature` is the leave statement of the member at `leaf`.
+fn signed_leave(mls: &MlsGroup, leaf: LeafNodeIndex, signature: &[u8; 64]) -> bool {
+    let Some(m) = mls.member_at(leaf) else {
+        return false;
+    };
+    let Ok(p) = identity_of(&m.credential, &m.signature_key) else {
+        return false;
+    };
+    p.verify(
+        &leave_statement(mls.group_id().as_slice(), &m.encryption_key),
+        signature,
+    )
+    .is_ok()
+}
 
 /// The authenticated data for a commit that removes the members at
 /// `leaving` because they asked to leave (none: no data).
-fn leave_aad(leaving: &[LeafNodeIndex]) -> Vec<u8> {
+fn leave_aad(leaving: &[(LeafNodeIndex, [u8; 64])]) -> Vec<u8> {
     if leaving.is_empty() {
         return Vec::new();
     }
     let mut aad = LEAVE_AAD.to_vec();
-    for i in leaving {
+    for (i, sig) in leaving {
         aad.extend_from_slice(&i.u32().to_be_bytes());
+        aad.extend_from_slice(sig);
     }
     aad
 }
 
-/// The leaves a commit's authenticated data says left (see [`leave_aad`]);
+/// The leaves a commit's authenticated data says left, each with its
+/// member's signed statement (see [`leave_aad`]), still to be checked;
 /// none for anything else.
-fn leaving_from_aad(aad: &[u8]) -> Vec<LeafNodeIndex> {
+fn leaving_from_aad(aad: &[u8]) -> Vec<(LeafNodeIndex, [u8; 64])> {
     let Some(rest) = aad.strip_prefix(LEAVE_AAD) else {
         return Vec::new();
     };
-    let (leaves, []) = rest.as_chunks::<4>() else {
+    let (leaves, []) = rest.as_chunks::<68>() else {
         return Vec::new();
     };
     leaves
         .iter()
-        .map(|c| LeafNodeIndex::new(u32::from_be_bytes(*c)))
+        .map(|c| {
+            let (leaf, sig) = c.split_first_chunk::<4>().expect("68 bytes");
+            (
+                LeafNodeIndex::new(u32::from_be_bytes(*leaf)),
+                sig.try_into().expect("64 bytes"),
+            )
+        })
         .collect()
 }
 
 /// Who joined and left in a commit, each with who brought it about: a
 /// proposal's sender (a member that proposed removing itself left), or
-/// for the committer's own proposals the committer, unless the commit says
-/// the member at that leaf asked to leave (`leaving`).
+/// for the committer's own proposals the committer, unless the commit
+/// carries that member's own signed word that it asked to leave
+/// (`leaving`).
 #[allow(clippy::type_complexity)]
 fn membership_changes<'a>(
     g: &Group,
     committer: &Pid,
     queued: impl Iterator<Item = &'a QueuedProposal>,
-    leaving: &[LeafNodeIndex],
+    leaving: &[(LeafNodeIndex, [u8; 64])],
 ) -> (Vec<(Pid, Pid)>, Vec<(Pid, Pid)>) {
     let (mut added, mut removed) = (Vec::new(), Vec::new());
     for q in queued {
@@ -577,7 +623,10 @@ fn membership_changes<'a>(
             }
             Proposal::Remove(r) => {
                 if let Some(p) = g.at(r.removed()) {
-                    let left = by_value && leaving.contains(&r.removed());
+                    let left = by_value
+                        && leaving
+                            .iter()
+                            .any(|(i, sig)| *i == r.removed() && signed_leave(&g.mls, *i, sig));
                     removed.push((p, if left { p } else { by }));
                 }
             }
@@ -601,9 +650,10 @@ struct Own {
     /// Invitees we asked ourselves: their Welcome goes straight to them.
     adds: Vec<(Pid, KeyPackage)>,
     removes: Vec<Pid>,
-    /// Those of `removes` who asked to leave: the commit says so (see
-    /// [`leave_aad`]), so members show they left rather than were removed.
-    leavers: Vec<Pid>,
+    /// Those of `removes` who asked to leave, each with its signed
+    /// [`leave_statement`]: the commit carries it (see [`leave_aad`]), so
+    /// members show they left rather than were removed.
+    leavers: Vec<(Pid, [u8; 64])>,
     roster: Vec<RosterChange>,
     /// The roster after, instead of applying `roster` (a claim).
     set_roster: Option<Roster>,
@@ -1439,6 +1489,13 @@ impl Groups {
         }
         let g = self.groups.get_mut(group).ok_or(GroupError::UnknownGroup)?;
         let lead = g.lead();
+        // Signed now, as `forget` drops our leaf: the coordinator shows
+        // members we left, even when it has to remove us itself.
+        let signature = if self.legacy {
+            None
+        } else {
+            sign_leave(&g.mls, &self.signer.0)
+        };
         let proposal = if g.roster()?.is_some() {
             let msg = g
                 .mls
@@ -1454,6 +1511,7 @@ impl Groups {
             wire: GroupWire::Leave {
                 group: *group,
                 proposal,
+                signature,
             },
         });
         out.events.push(GroupEvent::Left { group: *group });
@@ -1633,7 +1691,11 @@ impl Groups {
             } => self.on_forward(from, group, to, message, proposals, sync),
             // Delivery bookkeeping, not group state: see `node::GroupNode`.
             GroupWire::Receipt { .. } | GroupWire::AddDevice { .. } => Ok(Output::default()),
-            GroupWire::Leave { group, proposal } => self.on_leave(from, group, proposal),
+            GroupWire::Leave {
+                group,
+                proposal,
+                signature,
+            } => self.on_leave(from, group, proposal, signature),
             GroupWire::PassWelcome {
                 group,
                 member,
@@ -2138,7 +2200,7 @@ impl Groups {
         sender: Pid,
         staged: StagedCommit,
         snapshot: Option<Vec<QueuedProposal>>,
-        leaving: &[LeafNodeIndex],
+        leaving: &[(LeafNodeIndex, [u8; 64])],
     ) -> Result<Output> {
         let me = self.me;
         let legacy = self.legacy;
@@ -2538,8 +2600,8 @@ impl Groups {
                 .index_of(r)
                 .ok_or_else(|| GroupError::NotMember(r.fingerprint().to_string()))?;
             indices.push(index);
-            if own.leavers.contains(r) {
-                leaving.push(index);
+            if let Some((_, sig)) = own.leavers.iter().find(|(p, _)| p == r) {
+                leaving.push((index, *sig));
             }
         }
         // Set for this commit alone (openmls clears it once the commit is
@@ -3056,7 +3118,13 @@ impl Groups {
         })
     }
 
-    fn on_leave(&mut self, from: Pid, group: GroupId, proposal: Option<Vec<u8>>) -> Result<Output> {
+    fn on_leave(
+        &mut self,
+        from: Pid,
+        group: GroupId,
+        proposal: Option<Vec<u8>>,
+        signature: Option<[u8; 64]>,
+    ) -> Result<Output> {
         let me = self.me;
         let g = self.group(&group)?;
         let roster = g.roster()?;
@@ -3075,7 +3143,15 @@ impl Groups {
         if roster.is_some() && epoch.is_some_and(|e| e > ours) {
             // The leaver merged a commit we haven't yet (which may make us
             // its coordinator).
-            self.buffer(&group, from, GroupWire::Leave { group, proposal });
+            self.buffer(
+                &group,
+                from,
+                GroupWire::Leave {
+                    group,
+                    proposal,
+                    signature,
+                },
+            );
             return Ok(Output::default());
         }
         if lead != me {
@@ -3106,13 +3182,20 @@ impl Groups {
             return Ok(out);
         }
         // Its own Remove can't go in (a group without a roster, or it was
-        // a step behind): we remove it, and say it left. The leaver has
-        // already forgotten the group.
+        // a step behind): we remove it, and pass on its signed word that it
+        // left (none from older versions: members see we removed it). The
+        // leaver has already forgotten the group.
+        let g = self.group(&group)?;
+        let signature = signature.filter(|_| !self.legacy);
+        let leavers = match (signature, g.index_of(&from)) {
+            (Some(sig), Some(i)) if signed_leave(&g.mls, i, &sig) => vec![(from, sig)],
+            _ => Vec::new(),
+        };
         let mut out = self.commit(
             &group,
             Own {
                 removes: vec![from],
-                leavers: vec![from],
+                leavers,
                 consume: roster.is_some(),
                 ..Own::default()
             },
@@ -3401,7 +3484,10 @@ mod tests {
 
     #[test]
     fn leave_marks_round_trip_and_nothing_else_reads_as_one() {
-        let leaves = [LeafNodeIndex::new(3), LeafNodeIndex::new(70_000)];
+        let leaves = [
+            (LeafNodeIndex::new(3), [1; 64]),
+            (LeafNodeIndex::new(70_000), [2; 64]),
+        ];
         assert_eq!(leaving_from_aad(&leave_aad(&leaves)), leaves);
         assert!(leave_aad(&[]).is_empty());
         assert!(leaving_from_aad(&[]).is_empty());
@@ -3409,6 +3495,64 @@ mod tests {
         torn.pop();
         assert!(leaving_from_aad(&torn).is_empty());
         assert!(leaving_from_aad(b"something else\0\0\0\x03").is_empty());
+        // The unsigned form never went out, but reads as nothing.
+        assert!(leaving_from_aad(b"threnody/left\0\0\0\x03").is_empty());
+    }
+
+    #[test]
+    fn only_a_members_own_signed_word_reads_as_a_leave() {
+        let (ids, p, mut net, g) = team(3);
+        let (a, b, c) = (p[0], p[1], p[2]);
+        // Who Alice's commit removing Carol says did it, to Alice and Bob.
+        let removed_by = |net: &mut Mini, sig: [u8; 64]| -> Vec<Option<Pid>> {
+            let out = net
+                .node(&a)
+                .commit(
+                    &g,
+                    Own {
+                        removes: vec![c],
+                        leavers: vec![(c, sig)],
+                        ..Own::default()
+                    },
+                )
+                .unwrap();
+            let mut events = out.events.clone();
+            for o in out.send.iter().filter(|o| o.to == b) {
+                events.extend(net.node(&b).handle(a, o.wire.clone()).unwrap().events);
+            }
+            let mut rest = out;
+            rest.send.retain(|o| o.to != b);
+            net.deliver(a, rest);
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    GroupEvent::MemberRemoved { member, by, .. } if member == c => Some(by),
+                    _ => None,
+                })
+                .collect()
+        };
+        let statement = |net: &mut Mini| {
+            let grp = &net.node(&a).groups[&g];
+            let m = grp.mls.member_at(grp.index_of(&c).unwrap()).unwrap();
+            leave_statement(grp.mls.group_id().as_slice(), &m.encryption_key)
+        };
+        let rejoin = |net: &mut Mini| {
+            let out = net.node(&a).invite(&g, c).unwrap();
+            net.deliver(a, out);
+            assert!(net.node(&a).groups[&g].members().contains(&c));
+        };
+
+        // Her own word reads as a leave, to Alice and Bob alike.
+        let sig = ids[2].sign(&statement(&mut net));
+        assert_eq!(removed_by(&mut net, sig), vec![Some(c), Some(c)]);
+        rejoin(&mut net);
+        // Her word from that last stay doesn't count for this one.
+        assert_eq!(removed_by(&mut net, sig), vec![Some(a), Some(a)]);
+        rejoin(&mut net);
+        // Nor does Alice's own signature passed off as hers.
+        let forged = ids[0].sign(&statement(&mut net));
+        assert_eq!(removed_by(&mut net, forged), vec![Some(a), Some(a)]);
+        assert!(net.errors.is_empty(), "{:?}", net.errors);
     }
 
     /// Groups by identity, delivering everything until quiet (invitations

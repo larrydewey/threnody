@@ -153,7 +153,20 @@ impl GroupUi {
                     member,
                     role,
                 } => {
-                    let who = (member != node.identity()).then(|| name(&member));
+                    let account = node.account();
+                    let who = role_subject(
+                        &member,
+                        |p| *p == node.identity(),
+                        |p| {
+                            node.is_own_device(p).then(|| {
+                                account
+                                    .state()
+                                    .name_of(p)
+                                    .map_or_else(|| p.fingerprint().to_string(), str::to_owned)
+                            })
+                        },
+                        name,
+                    );
                     say!(
                         "* {}",
                         role_notice(who.as_deref(), role, &self.label(&group))
@@ -763,6 +776,24 @@ fn removed_notice(member: &str, group: &str, by: Actor<&str>) -> String {
     }
 }
 
+/// Whose role changed, as its notice names them: `None` for this device
+/// (`me`), "your other device <its name>" for another of our account's
+/// (`own_device` names it; a promotion promotes all of them), else `name`.
+fn role_subject(
+    member: &PublicIdentity,
+    me: impl Fn(&PublicIdentity) -> bool,
+    own_device: impl Fn(&PublicIdentity) -> Option<String>,
+    name: impl Fn(&PublicIdentity) -> String,
+) -> Option<String> {
+    if me(member) {
+        None
+    } else if let Some(device) = own_device(member) {
+        Some(format!("your other device {device}"))
+    } else {
+        Some(name(member))
+    }
+}
+
 /// `member`: `None` for this device.
 fn role_notice(member: Option<&str>, role: MemberRole, group: &str) -> String {
     let role = match role {
@@ -825,6 +856,27 @@ mod tests {
 
     #[test]
     fn role_notices_say_you() {
+        let ids: Vec<PublicIdentity> = (0..3).map(|_| Identity::generate().public()).collect();
+        let (me, laptop, carol) = (ids[0], ids[1], ids[2]);
+        let subject = |p: &PublicIdentity| {
+            role_subject(
+                p,
+                |q| *q == me,
+                |q| (*q == laptop).then(|| "laptop".to_owned()),
+                |_| "carol".to_owned(),
+            )
+        };
+        assert_eq!(subject(&me), None);
+        // A promotion promotes our other devices too: not by fingerprint.
+        assert_eq!(
+            subject(&laptop).as_deref(),
+            Some("your other device laptop")
+        );
+        assert_eq!(subject(&carol).as_deref(), Some("carol"));
+        assert_eq!(
+            role_notice(Some("your other device laptop"), MemberRole::Admin, "G"),
+            "your other device laptop is now an admin in G"
+        );
         assert_eq!(
             role_notice(None, MemberRole::Admin, "G"),
             "you are now an admin in G"

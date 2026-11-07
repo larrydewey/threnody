@@ -505,7 +505,8 @@ fn members_leave_and_owners_delete() {
                 pa,
                 GroupWire::Leave {
                     group: g,
-                    proposal: None
+                    proposal: None,
+                    signature: None,
                 }
             )
             .is_err()
@@ -516,7 +517,8 @@ fn members_leave_and_owners_delete() {
                 pc,
                 GroupWire::Leave {
                     group: g,
-                    proposal: None
+                    proposal: None,
+                    signature: None,
                 }
             )
             .is_err()
@@ -1332,6 +1334,33 @@ fn leaves_committed_by_the_coordinator_still_read_as_leaves() {
 }
 
 #[test]
+fn a_leave_without_its_members_signature_reads_as_a_removal() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    for x in &p {
+        net.take(x);
+    }
+    // Carol runs a version that doesn't sign her leave: nothing tells
+    // Alice's commit from a removal.
+    let mut out = net.node(&c).leave(&g).unwrap();
+    for o in &mut out.send {
+        if let GroupWire::Leave { signature, .. } = &mut o.wire {
+            assert!(signature.take().is_some(), "signed");
+        }
+    }
+    net.deliver(c, out);
+    for x in [a, b] {
+        assert!(net.take(&x).contains(&GroupEvent::MemberRemoved {
+            group: g,
+            member: c,
+            by: Some(a)
+        }));
+    }
+    assert_eq!(members(&mut net, &g, &b), vec![a, b]);
+}
+
+#[test]
 fn members_without_roles_take_a_leave_marked_as_one() {
     let (ids, _) = people(3);
     let refs: Vec<&Identity> = ids.iter().collect();
@@ -1376,7 +1405,7 @@ fn legacy_leave_is_bare() {
     let out = net.node(&b).leave(&g).unwrap();
     assert!(matches!(
         &out.send[..],
-        [o] if o.wire == GroupWire::Leave { group: g, proposal: None }
+        [o] if matches!(o.wire, GroupWire::Leave { group, proposal: None, .. } if group == g)
     ));
     net.deliver(b, out);
     assert_eq!(members(&mut net, &g, &a), vec![a]);
