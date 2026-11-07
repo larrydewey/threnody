@@ -241,14 +241,14 @@ class CallActivity : Activity() {
         }
         setContentView(frame)
         fitSystemBars(frame, content, content)
-        // Answer, from the ringing notification.
-        if (intent.action == ANSWER) Calls.answer(this)
+        // Answer, from the ringing notification (with video, from its video button).
+        if (intent.action == ANSWER) Calls.answer(this, intent.getBooleanExtra(VIDEO, false))
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == ANSWER) Calls.answer(this)
+        if (intent.action == ANSWER) Calls.answer(this, intent.getBooleanExtra(VIDEO, false))
     }
 
     override fun onStart() {
@@ -516,6 +516,8 @@ class CallActivity : Activity() {
 
     companion object {
         const val ANSWER = "org.threnody.app.ANSWER"
+        /** With [ANSWER]: answer with our camera on too. */
+        const val VIDEO = "org.threnody.app.VIDEO"
         private const val FLOAT_MS = 2800L
         private const val MAX_FLOATING = 24
         private val QUICK = listOf("❤️", "😂", "👍", "😮", "😢", "🎉", "🔥", "😘")

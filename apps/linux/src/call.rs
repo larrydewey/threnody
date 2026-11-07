@@ -444,8 +444,10 @@ impl CallBar {
         let weak = Rc::downgrade(self);
         d.connect_response(None, move |_, r| {
             let Some(this) = weak.upgrade() else { return };
-            if let Some(s) = this.shown.borrow_mut().as_mut() {
-                s.dialog = None;
+            // Answered (or declined) from the notification, or ended, first:
+            // the dialog's closing is no answer.
+            if !this.took_dialog() {
+                return;
             }
             match r {
                 "answer" => this.answer(id, false),
@@ -574,8 +576,10 @@ impl CallBar {
         let weak = Rc::downgrade(self);
         d.connect_response(None, move |_, r| {
             let Some(this) = weak.upgrade() else { return };
-            if let Some(s) = this.shown.borrow_mut().as_mut() {
-                s.dialog = None;
+            // Answered (or declined) from the notification, or ended, first:
+            // the dialog's closing is no answer.
+            if !this.took_dialog() {
+                return;
             }
             match r {
                 "answer" => this.answer(id, false),
@@ -586,6 +590,35 @@ impl CallBar {
         d.present(Some(parent));
         if let Some(s) = self.shown.borrow_mut().as_mut() {
             s.dialog = Some(d);
+        }
+    }
+
+    /// Takes the ringing dialog off the call on screen; whether it was there.
+    fn took_dialog(&self) -> bool {
+        self.shown
+            .borrow_mut()
+            .as_mut()
+            .and_then(|s| s.dialog.take())
+            .is_some()
+    }
+
+    /// Answered (with video or not), or declined (`None`), from the
+    /// desktop notification: as from the dialog, which then closes.
+    pub fn respond(self: &Rc<Self>, id: u64, answer: Option<bool>) {
+        if !self.is(id) || self.joined(id) {
+            return;
+        }
+        let dialog = self
+            .shown
+            .borrow_mut()
+            .as_mut()
+            .and_then(|s| s.dialog.take());
+        if let Some(d) = dialog {
+            d.force_close();
+        }
+        match answer {
+            Some(video) => self.answer(id, video),
+            None => self.hang_up(),
         }
     }
 
