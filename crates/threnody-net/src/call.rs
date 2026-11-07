@@ -219,6 +219,7 @@ impl Node {
     /// the call id; [`Event::CallRinging`], [`Event::CallStarted`] or
     /// [`Event::CallEnded`] follow.
     pub fn start_call(&self, peer: &PublicIdentity, video: bool) -> Result<u64> {
+        self.can_call()?;
         let live: Vec<PublicIdentity> = {
             let sessions = self.sessions();
             self.call_devices(peer)

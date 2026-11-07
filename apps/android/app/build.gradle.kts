@@ -70,10 +70,14 @@ android {
     }
 }
 
-// Without calls, a stand-in for the one WebRTC class Calls.kt names.
+// Without calls, a stand-in for the one WebRTC class Calls.kt names, and
+// a manifest overlay that drops what only calls need.
 androidComponents {
     onVariants { variant ->
-        if (!calls) variant.sources.kotlin?.addStaticSourceDirectory("src/nocalls/java")
+        if (!calls) {
+            variant.sources.kotlin?.addStaticSourceDirectory("src/nocalls/java")
+            variant.sources.manifests.addStaticManifestFile("src/nocalls/AndroidManifest.xml")
+        }
     }
 }
 

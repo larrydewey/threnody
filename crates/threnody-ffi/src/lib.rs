@@ -3875,6 +3875,9 @@ mod tests {
                     .node
                     .supports(&b_id, threnody_core::message::FEATURE_CALLS)
             );
+            // Neither side can call: this build has no call media.
+            assert!(alice.start_call(bob_fp.clone(), false).is_err());
+            assert!(alice.node.call().is_none());
         }
         let h = alice.history(bob_fp.clone(), 10).unwrap();
         assert_eq!(

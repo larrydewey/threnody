@@ -147,6 +147,9 @@ impl ThrenodyNode {
     /// off the UI thread. Events follow: `CallRinging`, then `CallStarted`
     /// or `CallEnded`.
     pub fn start_call(&self, peer: String, video: bool) -> Result<u64> {
+        if !crate::calls_built_in() {
+            return Err(fail("this build has no calls"));
+        }
         let p = self.resolve(&peer)?;
         self.rt
             .block_on(self.node.reach_for_call(&p))

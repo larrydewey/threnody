@@ -58,6 +58,14 @@ else
     # jniLibs and app-debug.apk.
     step "Android build without calls (as F-Droid builds it)"
     apps/android/build.sh --no-calls
+    aapt2=$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/build-tools/*/ | sort -V | tail -1)aapt2
+    manifest=$("$aapt2" dump xmltree --file AndroidManifest.xml apps/android/app/build/outputs/apk/debug/app-debug.apk)
+    for want in USE_FULL_SCREEN_INTENT FOREGROUND_SERVICE_MICROPHONE MANAGE_OWN_CALLS CallConnectionService; do
+        if grep -q "$want" <<<"$manifest"; then
+            echo "$want in the no-calls manifest" >&2
+            exit 1
+        fi
+    done
     step "Android build (phone and emulator ABIs)"
     apps/android/build.sh --emulator
 fi
