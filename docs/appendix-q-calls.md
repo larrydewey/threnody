@@ -108,6 +108,7 @@ flags: 1 = video
 - **Links.** `join` and `update` carry the sender's **links**: the participants it has a live session with. A participant sends an `update` whenever its links change. Links say who can carry a leg for whom.
 - **Leg signalling.** Session descriptions and ICE candidates for the leg between A and B go over A and B's own ratchet when they have a session (`CallMsg::Signal` under the leg's id). Otherwise they go in a group message addressed to B alone (op 4). Either way they never pass through a relay as anything it could change, so no relay can stand in the middle of a leg's DTLS.
 - **The hub.** The participant linked to the most others (ties: the smaller key) is shown as the call's hub. It carries the most legs, but nothing depends on agreeing who it is.
+- **Builds without calls.** A device that leaves bit 1024 out of its `Hello` (a build without call media) isn't rung by a group call's `Start`, and can't start or join one; it stays out of the roster, so no leg goes to it or through it.
 - **Busy.** One-to-one and group calls exclude each other: an offer during a group call gets `busy`, and a group call doesn't ring during a one-to-one call.
 
 ### Legs

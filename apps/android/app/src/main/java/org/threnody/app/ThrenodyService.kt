@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import uniffi.threnody_ffi.callsBuiltIn
 
 /**
  * Keeps the process, and so the node, alive while the app is in the
@@ -105,7 +106,10 @@ class ThrenodyService : Service() {
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
             var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
-            if (call && Calls.hasMicrophone(this)) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            // A build without calls declares no microphone type.
+            if (call && callsBuiltIn() && Calls.hasMicrophone(this)) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
             try {
                 startForeground(ID_SERVICE, n, types)
             } catch (e: Exception) {

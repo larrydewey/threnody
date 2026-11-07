@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Without calls (the F-Droid build): nothing rings full screen, the
+     background service never records, and Telecom has no account to hold. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" tools:node="remove" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" tools:node="remove" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" tools:node="remove" />
+    <application>
+        <service android:name=".ThrenodyService"
+            android:foregroundServiceType="remoteMessaging"
+            tools:replace="android:foregroundServiceType" />
+        <service android:name=".CallConnectionService" tools:node="remove" />
+    </application>
+</manifest>
