@@ -619,7 +619,9 @@ fn a_welcome_built_from_the_first_of_several_answers_still_opens() {
         .wire
         .clone();
     let out = net.node(&pa).handle(pb, first).unwrap();
-    assert!(net.node(&pa).handle(pb, second).is_err());
+    // The second answer, from a member by now, changes nothing.
+    let again = net.node(&pa).handle(pb, second).unwrap();
+    assert!(again.send.is_empty() && again.events.is_empty());
     let w = out.send.into_iter().find(|o| o.to == pb).unwrap().wire;
     let res = net.node(&pb).handle(pa, w).unwrap();
     assert!(res.events.contains(&GroupEvent::Joined {

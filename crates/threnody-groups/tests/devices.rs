@@ -1417,3 +1417,207 @@ async fn a_persona_owned_group_lists_only_the_persona() {
     until(&mut [&mut anon, &mut bob], |ns| ns[1].groups.has_roster(&g)).await;
     assert_eq!(bob.groups.roster(&g).unwrap().owners, [aid]);
 }
+
+/// Links a new device `name` into `existing`'s account the way
+/// `threnody link` does: a node that takes part in the link but runs no
+/// groups, so whatever group traffic reaches it then is lost; then it
+/// stops. `others` keep running meanwhile.
+async fn link_without_groups(
+    dir: &tempfile::TempDir,
+    name: &str,
+    existing: &mut N,
+    others: &mut [&mut N],
+) -> PublicIdentity {
+    let phone = spawn(dir, name).await;
+    let code = existing.node.create_link_code(existing.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let pid = phone.node.identity();
+    let end = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < end {
+        existing.pump();
+        for n in others.iter_mut() {
+            n.pump();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(existing.node.is_own_device(&pid));
+    phone.node.shutdown();
+    drop(phone);
+    pid
+}
+
+#[tokio::test]
+async fn a_device_linked_while_stopped_joins_the_owners_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut laptop, &mut bob).await;
+    let g = laptop.groups.create("ours").unwrap();
+    laptop.groups.invite(&laptop.node, &g, &bid).unwrap();
+    until(&mut [&mut laptop, &mut bob], |ns| ns[1].in_group(&g)).await;
+
+    let pid = link_without_groups(&dir, "phone", &mut laptop, &mut [&mut bob]).await;
+
+    // The phone runs and meets the laptop: it joins without anyone
+    // doing anything.
+    let mut phone = restart(&dir, "phone").await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[2].in_group(&g)
+            && ns[0]
+                .groups
+                .list()
+                .iter()
+                .any(|(x, .., m)| *x == g && m.contains(&pid))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_device_linked_while_stopped_joins_after_the_existing_one_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let bid = approve(&mut laptop, &mut bob).await;
+    let g = laptop.groups.create("ours").unwrap();
+    laptop.groups.invite(&laptop.node, &g, &bid).unwrap();
+    until(&mut [&mut laptop, &mut bob], |ns| ns[1].in_group(&g)).await;
+
+    link_without_groups(&dir, "phone", &mut laptop, &mut [&mut bob]).await;
+
+    // The laptop restarts before the phone first runs.
+    laptop.node.shutdown();
+    drop(laptop);
+    let mut laptop = restart(&dir, "laptop").await;
+    laptop.node.connect(&bob.addr, None).await.unwrap();
+    let mut phone = restart(&dir, "phone").await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[2].in_group(&g)
+    })
+    .await;
+
+    // And it reads the group from then on.
+    bob.groups.send_text(&bob.node, &g, "hello phone").unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[2].texts(&g).last().map(String::as_str) == Some("hello phone")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_members_device_linked_while_stopped_joins_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+
+    let pid = link_without_groups(&dir, "phone", &mut laptop, &mut [&mut bob]).await;
+
+    // The phone runs and meets the laptop, then Bob (the owner).
+    let mut phone = restart(&dir, "phone").await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    settle(
+        &mut [&mut laptop, &mut bob, &mut phone],
+        Duration::from_millis(500),
+    )
+    .await;
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[2].in_group(&g)
+            && ns[1]
+                .groups
+                .list()
+                .iter()
+                .any(|(x, .., m)| *x == g && m.contains(&pid))
+    })
+    .await;
+    assert!(phone.groups.invites().is_empty(), "nothing to consent to");
+}
+
+#[tokio::test]
+async fn a_group_made_after_linking_reaches_our_connected_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = approve(&mut laptop, &mut bob).await;
+    settle(
+        &mut [&mut laptop, &mut bob, &mut phone],
+        Duration::from_millis(500),
+    )
+    .await;
+
+    // The phone stays connected while the laptop starts a group.
+    let g = laptop.groups.create("later").unwrap();
+    laptop.groups.invite(&laptop.node, &g, &bid).unwrap();
+    until(&mut [&mut laptop, &mut bob, &mut phone], |ns| {
+        ns[1].in_group(&g) && ns[2].in_group(&g)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_device_that_declined_a_group_is_not_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+
+    // Before it is linked, the phone turns down Bob's invitation.
+    let pid = bob.node.connect(&phone.addr, None).await.unwrap();
+    bob.groups.invite(&bob.node, &g, &pid).unwrap();
+    until(&mut [&mut bob, &mut phone], |ns| {
+        !ns[1].groups.invites().is_empty()
+    })
+    .await;
+    phone.groups.decline(&g);
+    phone.updates.clear();
+
+    // Linked, it is offered the group, says it stays out, and isn't
+    // asked about it, then or when it meets the laptop again.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].wires.iter().any(|(from, w)| {
+            *from == pid && matches!(w, GroupWire::Leave { group, proposal: None } if *group == g)
+        })
+    })
+    .await;
+    phone.node.disconnect(&laptop.node.identity());
+    let lid2 = laptop.node.identity();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[2].node.sessions().iter().all(|s| s.peer != lid2)
+    })
+    .await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(!phone.in_group(&g));
+    assert!(phone.groups.invites().is_empty(), "asked again");
+    assert!(
+        !phone
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::Invited { .. })),
+        "asked again"
+    );
+    let leaves = laptop
+        .wires
+        .iter()
+        .filter(|(from, w)| *from == pid && matches!(w, GroupWire::Leave { .. }))
+        .count();
+    assert_eq!(leaves, 1, "offered again after it said no");
+}
