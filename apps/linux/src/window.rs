@@ -1923,7 +1923,13 @@ impl App {
     /// Tells the desktop someone is calling (not who, with private
     /// notifications on).
     fn notify_call(&self, title: &str) {
-        let n = if self.core.settings().flag(settings::PRIVATE_NOTIFICATIONS) {
+        // With app lock on: that there's a call, not who. It is answered
+        // after unlocking (the call bar is under the lock page).
+        let n = if self.lock.enabled() {
+            let n = gio::Notification::new("Threnody");
+            n.set_body(Some("Incoming call. Unlock Threnody to answer."));
+            n
+        } else if self.core.settings().flag(settings::PRIVATE_NOTIFICATIONS) {
             let n = gio::Notification::new("Threnody");
             n.set_body(Some("Incoming call"));
             n

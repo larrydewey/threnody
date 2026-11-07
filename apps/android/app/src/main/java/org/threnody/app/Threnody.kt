@@ -579,6 +579,7 @@ object Threnody {
         val app = ctx.applicationContext
         wiping = true
         Push.forget(app)
+        runCatching { Calls.forget(app) }
         try {
             app.stopService(android.content.Intent(app, ThrenodyVpn::class.java))
         } catch (_: Exception) {
