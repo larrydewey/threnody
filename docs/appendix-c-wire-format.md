@@ -211,7 +211,7 @@ receipts-out = 1 || flags (1: read receipts off) || created_ms (u64 BE)
 
 A damaged tail is skipped; an unreadable file is started afresh, with read receipts on.
 
-History key 20 on an outgoing entry is when this device last learned something new about its ticks (`ticked_ms`; absent = never). It is local: transcripts carry none, and a receiver drops any it is sent. A device keeps how far each sibling has its ticks in `history-sync-ticks`, in the same layout as `history-sync` (`1 || *(device (32) || until ms (u64 BE))`). Its queue of file contents to fetch from its siblings is `file-fetches` (`1 || cbor [* { 0: conversation, 1: bstr .cbor FileRef, ? 2: true (automatic) }]`, at most 64; references only, never contents). See Appendix J, *Files* and *Ticks*. Older readers skip key 20 and ignore both files.
+History key 20 on an outgoing entry is when this device last learned something new about its ticks (`ticked_ms`; absent = never). It is local: transcripts carry none, and a receiver drops any it is sent. A device keeps how far each sibling has its ticks in `history-sync-ticks`, and how far it has the records of files contacts sent this device in `history-sync-files`, in the same layout as `history-sync` (`1 || *(device (32) || until ms (u64 BE))`). Its queue of file contents to fetch from its siblings is `file-fetches` (`1 || cbor [* { 0: conversation, 1: bstr .cbor FileRef, ? 2: true (automatic) }]`, at most 64; references only, never contents). See Appendix J, *History* (*Received files*), *Files* and *Ticks*. Older readers skip key 20 and ignore these files.
 
 A history file's name is keyed, so a listing of the data directory shows neither whom the user talks to nor which groups they are in:
 

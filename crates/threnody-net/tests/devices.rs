@@ -1636,3 +1636,207 @@ async fn strangers_cannot_fetch_our_files() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(ls.reads(), 0);
 }
+
+/// Bob sends `to` the file `name`; `to`'s app keeps it in `store` and
+/// records it, as the apps do. The id Bob sent it under.
+async fn receive_file(
+    bob: &N,
+    to: &mut N,
+    store: &DirStore,
+    name: &str,
+    data: &[u8],
+    sensitive: bool,
+) -> u64 {
+    bob.node
+        .send_file(
+            &to.node.identity(),
+            threnody_net::history::OutgoingFile {
+                name: name.into(),
+                data: data.to_vec(),
+                location: None,
+                sensitive,
+                caption: String::new(),
+                album: 0,
+                clip: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    let Event::Message {
+        peer,
+        msg:
+            threnody_core::AppMessage::File {
+                name,
+                data,
+                id,
+                sensitive,
+                caption,
+                album,
+                clip,
+                forwarded,
+                ..
+            },
+    } = next(&mut to.rx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: threnody_core::AppMessage::File { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    to.node.record_received_file(
+        &peer,
+        threnody_core::history::FileNote {
+            name: name.clone(),
+            size: data.len() as u64,
+            location: Some(store.put(&name, &data)),
+            sensitive,
+            album,
+            clip,
+            forwarded,
+        },
+        &caption,
+        id,
+    );
+    id
+}
+
+#[tokio::test]
+async fn a_file_a_contact_sends_reaches_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    // Bob's files go to the laptop only.
+    let photo = random(6000);
+    receive_file(&bob, &mut laptop, &ls, "from-bob.jpg", &photo, false).await;
+    let doc = random(2000);
+    receive_file(&bob, &mut laptop, &ls, "notes.pdf", &doc, false).await;
+    let private = random(1500);
+    receive_file(&bob, &mut laptop, &ls, "private.png", &private, true).await;
+    laptop.node.set_timer(&bid, Some(3600)).unwrap();
+    let fleeting = random(1700);
+    receive_file(&bob, &mut laptop, &ls, "fleeting.png", &fleeting, false).await;
+
+    // The phone shows each; the photo comes over by itself.
+    wait_for(|| contents(&phone.node, &bid, "from-bob.jpg").as_deref() == Some(&photo[..])).await;
+    wait_for(|| file_named(&phone.node, &bid, "fleeting.png").is_some()).await;
+    let e = file_named(&phone.node, &bid, "from-bob.jpg").unwrap();
+    assert!(!e.outgoing);
+    assert_eq!(e.device, *bid.as_bytes());
+    // The rest wait for a tap: not a photo, sensitive, disappearing.
+    for name in ["notes.pdf", "private.png", "fleeting.png"] {
+        let r = threnody_core::history::file_ref(&file_named(&phone.node, &bid, name).unwrap())
+            .unwrap();
+        assert_eq!(
+            phone.node.fetch_state(&r),
+            threnody_net::FetchState::Idle,
+            "{name}"
+        );
+    }
+    // A disappearing one goes on the phone when it goes on the laptop.
+    let expires = file_named(&laptop.node, &bid, "fleeting.png")
+        .unwrap()
+        .expires_at_ms;
+    assert!(expires.is_some());
+    assert_eq!(
+        file_named(&phone.node, &bid, "fleeting.png")
+            .unwrap()
+            .expires_at_ms,
+        expires
+    );
+    assert!(
+        file_named(&phone.node, &bid, "private.png")
+            .unwrap()
+            .file
+            .unwrap()
+            .sensitive
+    );
+    // A tap brings the others.
+    let conv = phone.node.conversation_for(&bid);
+    phone
+        .node
+        .fetch_file(conv, |e| {
+            e.file.as_ref().is_some_and(|f| f.name == "notes.pdf")
+        })
+        .unwrap();
+    wait_for(|| contents(&phone.node, &bid, "notes.pdf").as_deref() == Some(&doc[..])).await;
+}
+
+#[tokio::test]
+async fn a_file_a_contact_sent_while_a_sibling_was_away_reaches_it_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    let pid = phone.node.identity();
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+
+    let photo = random(9000);
+    receive_file(&bob, &mut laptop, &ls, "while-away.jpg", &photo, false).await;
+
+    let mut phone = restart(&dir, "phone").await;
+    phone.node.set_file_store(ps.clone());
+    assert!(file_named(&phone.node, &bid, "while-away.jpg").is_none());
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| contents(&phone.node, &bid, "while-away.jpg").as_deref() == Some(&photo[..])).await;
+
+    // Once caught up, a new session brings nothing again.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    while phone.rx.try_recv().is_ok() {}
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    let again = timeout(
+        Duration::from_millis(1000),
+        next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })),
+    )
+    .await;
+    assert!(again.is_err(), "nothing new to merge");
+}
+
+#[tokio::test]
+async fn a_file_that_reached_two_of_our_devices_is_recorded_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    let doc = random(3000);
+    let note = |location: String| threnody_core::history::FileNote {
+        name: "twice.pdf".into(),
+        size: doc.len() as u64,
+        location: Some(location),
+        sensitive: false,
+        album: 0,
+        clip: None,
+        forwarded: false,
+    };
+    laptop
+        .node
+        .record_received_file(&bid, note(ls.put("twice.pdf", &doc)), "", 77);
+    wait_for(|| file_named(&phone.node, &bid, "twice.pdf").is_some()).await;
+    // The phone gets its own copy after hearing of the laptop's.
+    let mine = ps.put("twice.pdf", &doc);
+    phone
+        .node
+        .record_received_file(&bid, note(mine.clone()), "", 77);
+    let conv = phone.node.conversation_for(&bid);
+    let copies: Vec<_> = phone
+        .node
+        .history(conv)
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|e| e.file.as_ref().is_some_and(|f| f.name == "twice.pdf"))
+        .cloned()
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].file.as_ref().unwrap().location, Some(mine));
+    assert_eq!(ls.reads(), 0, "nothing was fetched");
+}

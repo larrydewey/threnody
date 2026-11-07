@@ -1418,32 +1418,80 @@ impl Node {
         } else {
             *peer.as_bytes()
         };
-        self.append(
-            conv,
-            Entry {
-                at_ms: now,
-                outgoing,
-                device,
-                text: caption.to_owned(),
-                offline: false,
-                expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
-                file: Some(file),
-                local_id,
-                delivered: false,
-                recipients: 0,
-                delivered_to: Vec::new(),
-                remote_id,
-                edited_ms: 0,
-                read_ms: 0,
-                reactions: Vec::new(),
-                quote: None,
-                mentions: Vec::new(),
-                poll: None,
-                forwarded: false,
-                list: None,
-                ticked_ms: 0,
-            },
-        );
+        if !outgoing && remote_id != 0 && self.fill_in_received(conv, device, remote_id, &file) {
+            return;
+        }
+        let entry = Entry {
+            at_ms: now,
+            outgoing,
+            device,
+            text: caption.to_owned(),
+            offline: false,
+            expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
+            file: Some(file),
+            local_id,
+            delivered: false,
+            recipients: 0,
+            delivered_to: Vec::new(),
+            remote_id,
+            edited_ms: 0,
+            read_ms: 0,
+            reactions: Vec::new(),
+            quote: None,
+            mentions: Vec::new(),
+            poll: None,
+            forwarded: false,
+            list: None,
+            ticked_ms: 0,
+        };
+        // A contact's file reaches only this device: our others hear of
+        // it from us. A message request's stays here, as its texts do.
+        let received = (!outgoing && !self.is_own_device(peer) && self.is_accepted(peer))
+            .then(|| entry.clone());
+        self.append(conv, entry);
+        if let Some(e) = received {
+            self.push_received_file(conv, &e);
+        }
+    }
+
+    /// For a file `device` sent us under `remote_id`: if another of our
+    /// devices told us of it already, fills in where this copy is (when
+    /// it has one) rather than recording it twice. True if it was here.
+    fn fill_in_received(
+        &self,
+        conv: ConversationId,
+        device: [u8; 32],
+        remote_id: u64,
+        file: &FileNote,
+    ) -> bool {
+        let r = threnody_core::devsync::FileRef {
+            device,
+            id: remote_id,
+            name: file.name.clone(),
+            size: file.size,
+            at_ms: now_ms(),
+        };
+        let here = self.history(conv).is_ok_and(|h| {
+            h.entries()
+                .iter()
+                .any(|e| !e.outgoing && threnody_core::history::file_matches(&r, e))
+        });
+        if !here {
+            return false;
+        }
+        if let Some(location) = &file.location
+            && let Ok(true) = self.shared.home.set_file_location(
+                self.identity_ref(),
+                conv,
+                &r,
+                location,
+                now_ms(),
+            )
+        {
+            // A fetch for it is no longer needed.
+            self.pump_fetches();
+        }
+        true
     }
 
     /// Records an incoming text, adopting the sender's timer setting.
