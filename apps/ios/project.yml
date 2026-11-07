@@ -82,7 +82,6 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: org.threnody.app.tests
-        # The app's module refers to the bindings' C module, which the tests
-        # must find too (only the app links the XCFramework).
-        SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated/headers
-        HEADER_SEARCH_PATHS: $(SRCROOT)/Generated/headers
+        # The bindings' C module, which the app's module refers to, is found
+        # where the app's XCFramework puts it (the products' include
+        # directory): naming Generated/headers too would define it twice.

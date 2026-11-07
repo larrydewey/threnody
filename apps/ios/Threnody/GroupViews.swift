@@ -129,7 +129,7 @@ struct GroupInfoView: View {
                 Section("Notifications") {
                     Picker("Notify", selection: Binding(get: { level }, set: { l in
                         level = l
-                        act { try $0.setGroupNotifyLevel(group: id, level: l) }
+                        act { [id] n in try n.setGroupNotifyLevel(group: id, level: l) }
                     })) {
                         Text("All messages").tag(NotifyLevel.all)
                         Text("Mentions and replies").tag(NotifyLevel.mentions)
@@ -139,7 +139,7 @@ struct GroupInfoView: View {
                 Section("Disappearing messages") {
                     Picker("Timer", selection: Binding(get: { timer }, set: { t in
                         timer = t
-                        act { try $0.setGroupDisappearing(group: id, seconds: t) }
+                        act { [id] n in try n.setGroupDisappearing(group: id, seconds: t) }
                     })) {
                         ForEach(Privacy.timers.indices, id: \.self) { i in
                             Text(Privacy.timers[i].0).tag(Privacy.timers[i].1)
@@ -177,14 +177,14 @@ struct GroupInfoView: View {
         }
         .confirmationDialog("Delete \(group?.name ?? "the group")?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
-                act { try $0.deleteGroup(group: id) }
+                act { [id] n in try n.deleteGroup(group: id) }
                 dismiss()
             }
         } message: {
             Text("Everyone is removed and the group ends. Its history stays on your devices.")
         }
         .confirmationDialog("Clear this chat?", isPresented: $confirmClear, titleVisibility: .visible) {
-            Button("Clear", role: .destructive) { act { try $0.clearGroupConversation(group: id) } }
+            Button("Clear", role: .destructive) { act { [id] n in try n.clearGroupConversation(group: id) } }
         } message: {
             Text("Its messages are deleted from this device. Other members keep theirs.")
         }
