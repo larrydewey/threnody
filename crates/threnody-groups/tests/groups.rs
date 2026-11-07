@@ -486,11 +486,15 @@ fn members_leave_and_owners_delete() {
     assert!(out.events.contains(&GroupEvent::Left { group: g }));
     assert!(net.node(&pc).list().is_empty(), "forgotten at once");
     net.deliver(pc, out);
-    assert!(net.take(&pb).contains(&GroupEvent::MemberRemoved {
-        group: g,
-        member: pc,
-        by: Some(pa)
-    }));
+    // In a group without a roster the owner commits the removal itself,
+    // but the commit says Carol left: no one sees the owner removed her.
+    for p in [pa, pb] {
+        assert!(net.take(&p).contains(&GroupEvent::MemberRemoved {
+            group: g,
+            member: pc,
+            by: Some(pc)
+        }));
+    }
     let members = |n: &mut Net, p: &PublicIdentity| n.node(p).list()[0].3.len();
     assert_eq!(members(&mut net, &pa), 2);
     assert_eq!(members(&mut net, &pb), 2);
@@ -501,7 +505,8 @@ fn members_leave_and_owners_delete() {
                 pa,
                 GroupWire::Leave {
                     group: g,
-                    proposal: None
+                    proposal: None,
+                    signature: None,
                 }
             )
             .is_err()
@@ -512,7 +517,8 @@ fn members_leave_and_owners_delete() {
                 pc,
                 GroupWire::Leave {
                     group: g,
-                    proposal: None
+                    proposal: None,
+                    signature: None,
                 }
             )
             .is_err()
@@ -1287,6 +1293,109 @@ fn leaves_reach_the_lead_in_any_order() {
 }
 
 #[test]
+fn leaves_committed_by_the_coordinator_still_read_as_leaves() {
+    let (ids, _) = people(4);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c, d) = (p[0], p[1], p[2], p[3]);
+    let out = net.node(&a).promote(&g, b).unwrap();
+    net.deliver(a, out);
+    assert!(net.node(&a).has_roster(&g).unwrap());
+    // Dave misses a commit, so his own Remove is for an epoch gone by:
+    // Alice removes him herself.
+    net.offline.push(d);
+    let out = net.node(&a).promote(&g, c).unwrap();
+    net.deliver(a, out);
+    for x in &p {
+        net.take(x);
+    }
+    let out = net.node(&d).leave(&g).unwrap();
+    net.deliver(d, out);
+    for x in [a, b, c] {
+        let ev = net.take(&x);
+        assert!(
+            ev.contains(&GroupEvent::MemberRemoved {
+                group: g,
+                member: d,
+                by: Some(d)
+            }),
+            "{x:?}: {ev:?}"
+        );
+    }
+    assert_eq!(members(&mut net, &g, &b), vec![a, b, c]);
+
+    // A removal is still one.
+    let out = net.node(&a).remove(&g, &c).unwrap();
+    net.deliver(a, out);
+    for x in [a, b] {
+        assert!(net.take(&x).contains(&GroupEvent::MemberRemoved {
+            group: g,
+            member: c,
+            by: Some(a)
+        }));
+    }
+}
+
+#[test]
+fn a_leave_without_its_members_signature_reads_as_a_removal() {
+    let (ids, _) = people(3);
+    let (mut net, p, g) = team(&ids);
+    let (a, b, c) = (p[0], p[1], p[2]);
+    for x in &p {
+        net.take(x);
+    }
+    // Carol runs a version that doesn't sign her leave: nothing tells
+    // Alice's commit from a removal.
+    let mut out = net.node(&c).leave(&g).unwrap();
+    for o in &mut out.send {
+        if let GroupWire::Leave { signature, .. } = &mut o.wire {
+            assert!(signature.take().is_some(), "signed");
+        }
+    }
+    net.deliver(c, out);
+    for x in [a, b] {
+        assert!(net.take(&x).contains(&GroupEvent::MemberRemoved {
+            group: g,
+            member: c,
+            by: Some(a)
+        }));
+    }
+    assert_eq!(members(&mut net, &g, &b), vec![a, b]);
+}
+
+#[test]
+fn members_without_roles_take_a_leave_marked_as_one() {
+    let (ids, _) = people(3);
+    let refs: Vec<&Identity> = ids.iter().collect();
+    let mut net = Net::new(&refs);
+    let p: Vec<PublicIdentity> = ids.iter().map(Identity::public).collect();
+    let (a, b, c) = (p[0], p[1], p[2]);
+    // Bob runs a version without roles: the marked commit is a plain
+    // owner commit to him.
+    net.nodes.insert(b, Groups::legacy_for_tests(&ids[1]));
+    let g = net.node(&a).create("team").unwrap();
+    for x in [b, c] {
+        let out = net.node(&a).invite(&g, x).unwrap();
+        net.deliver(a, out);
+    }
+    let out = net.node(&c).leave(&g).unwrap();
+    net.deliver(c, out);
+    assert!(net.take(&b).iter().any(|e| matches!(
+        e,
+        GroupEvent::MemberRemoved { member, .. } if *member == c
+    )));
+    assert!(in_step(&mut net, &g, &[a, b]));
+    assert_eq!(members(&mut net, &g, &b), vec![a, b]);
+    // And the next message goes through as ever.
+    let out = net.node(&a).send_text(&g, "still here").unwrap();
+    net.deliver(a, out);
+    assert!(
+        net.take(&b)
+            .iter()
+            .any(|e| matches!(e, GroupEvent::Text { .. }))
+    );
+}
+
+#[test]
 fn legacy_leave_is_bare() {
     let (ids, _) = people(2);
     let mut net = Net::new(&[&ids[0], &ids[1]]);
@@ -1298,7 +1407,7 @@ fn legacy_leave_is_bare() {
     let out = net.node(&b).leave(&g).unwrap();
     assert!(matches!(
         &out.send[..],
-        [o] if o.wire == GroupWire::Leave { group: g, proposal: None }
+        [o] if matches!(o.wire, GroupWire::Leave { group, proposal: None, .. } if group == g)
     ));
     net.deliver(b, out);
     assert_eq!(members(&mut net, &g, &a), vec![a]);
