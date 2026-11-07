@@ -647,15 +647,22 @@ object Calls {
             ctx, 0, Intent(ctx, CallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val answer = PendingIntent.getActivity(
-            ctx, 1,
-            Intent(ctx, CallActivity::class.java).setAction(CallActivity.ANSWER).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        // Distinct request codes, so the voice and video answers stay two intents.
+        fun answering(code: Int, video: Boolean) = PendingIntent.getActivity(
+            ctx, code,
+            Intent(ctx, CallActivity::class.java).setAction(CallActivity.ANSWER)
+                .putExtra(CallActivity.VIDEO, video).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val answer = answering(1, false)
         val decline = PendingIntent.getBroadcast(
             ctx, 2, Intent(ctx, Decline::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        // They call with video: answering from here turns our camera on too
+        // (voice only stays one tap away).
+        val video = c.group == null && c.peerVideo
+        val answerVideo = answering(5, true)
         val hide = AppLock.enabled(ctx)
         val n = Notification.Builder(ctx, CHANNEL_RING)
             .setSmallIcon(R.drawable.ic_notification)
@@ -664,12 +671,25 @@ object Calls {
                 c.group != null -> "Group call in ${c.title}"
                 else -> "${c.title} is calling"
             })
-            .setContentText(if (c.group != null) "Threnody group call" else "Threnody voice call")
+            .setContentText(when {
+                c.group != null -> "Threnody group call"
+                video -> "Threnody video call"
+                else -> "Threnody voice call"
+            })
             .apply {
                 // A call notification (Android 12+): the system rings it as
-                // a call, with Answer and Decline (on the lock screen too).
+                // a call, with Answer and Decline (on the lock screen too);
+                // for a video call, Answer is the video one.
                 if (Build.VERSION.SDK_INT >= 31) {
-                    setStyle(Notification.CallStyle.forIncomingCall(person(c, hide), decline, answer))
+                    setStyle(
+                        Notification.CallStyle.forIncomingCall(person(c, hide), decline, if (video) answerVideo else answer)
+                            .setIsVideo(video),
+                    )
+                    if (video) addAction(action(ctx, R.drawable.ic_call, "Voice only", answer))
+                } else {
+                    addAction(action(ctx, R.drawable.ic_call_end, "Decline", decline))
+                    addAction(action(ctx, R.drawable.ic_call, if (video) "Voice only" else "Answer", answer))
+                    if (video) addAction(action(ctx, R.drawable.ic_videocam, "Video", answerVideo))
                 }
             }
             .setVisibility(Notification.VISIBILITY_PRIVATE)
@@ -758,6 +778,9 @@ object Calls {
             .build()
         post(ctx, ID_MISSED, n)
     }
+
+    private fun action(ctx: Context, icon: Int, label: String, intent: PendingIntent) =
+        Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(ctx, icon), label, intent).build()
 
     /**
      * Who a call notification names: with app lock on, no one (the
