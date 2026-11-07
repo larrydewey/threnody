@@ -1,0 +1,2 @@
+- Threnody starts again after the phone restarts or the app updates, so contacts can reach you without opening it first.
+- It asks once to run without battery restrictions, so Android doesn't stop it in the background.
