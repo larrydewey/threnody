@@ -35,6 +35,8 @@ const INVITES: &str = "group-invites";
 const HELD: &str = "group-held";
 const EXPECTED: &str = "group-expected";
 const OFFERED: &str = "group-offered";
+const OFFERS: &str = "group-offers";
+const REFUSED: &str = "group-refused";
 const LEFT: &str = "group-left";
 const OWNER_SEEN: &str = "group-owner-seen";
 const VERSION: u8 = 1;
@@ -43,10 +45,6 @@ const HELD_VERSION: u8 = 4;
 const HELD_VERSION_NO_ORIGIN: u8 = 3;
 /// `group-expected` with each group's owner.
 const EXPECTED_VERSION: u8 = 2;
-/// `group-offered` holding only devices that were in the group once or
-/// said they stay out. Version 1 also held every device offered a group,
-/// joined or not.
-const OFFERED_VERSION: u8 = 2;
 /// Messages held for one member. Messages from more than a few epochs
 /// back can't be read anyway.
 pub const MAX_HELD_PER_MEMBER: usize = 200;
@@ -65,9 +63,17 @@ pub const MAX_INVITES: usize = 32;
 /// After a stranger's invitation, others from strangers in this long
 /// come quietly: new identities cost nothing.
 pub const STRANGER_INVITE_QUIET: std::time::Duration = std::time::Duration::from_secs(600);
-/// How long after our own device offers us a group we left its
-/// invitation is turned down without asking; later ones ask again.
-const REFUSED_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long after our own device offers us a group we left the
+/// invitation that offer sets off is turned down without asking (it may
+/// wait for the group's coordinator to connect); later ones ask again.
+const REFUSED_FOR_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+/// How many times one of our own devices is offered a group on
+/// connecting (besides when it is linked) while it neither joins nor says
+/// it stays out. An older device that left the group ignores the offer,
+/// and the invitation it sets off asks its user again.
+const MAX_OFFERS: u8 = 2;
+/// How long after one of those offers the next may follow.
+const OFFER_RETRY_MS: u64 = 60 * 60 * 1000;
 /// How long the owner must have been silent in a group before its
 /// successor is offered to take over (client policy: the protocol takes a
 /// claim from the successor at any time).
@@ -376,6 +382,26 @@ pub enum Update {
     },
 }
 
+/// A group offered to one of our own devices on connecting, that it
+/// neither joined nor said it stays out of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Offer {
+    device: PublicIdentity,
+    group: GroupId,
+    /// How many times so far.
+    times: u8,
+    /// When last (ms).
+    last_ms: u64,
+}
+
+impl Offer {
+    /// Whether it may be offered again at `now` (ms).
+    fn due(&self, now: u64) -> bool {
+        self.times == 0
+            || self.times < MAX_OFFERS && now.saturating_sub(self.last_ms) >= OFFER_RETRY_MS
+    }
+}
+
 pub struct GroupNode {
     groups: Groups,
     invites: Vec<Invite>,
@@ -384,18 +410,19 @@ pub struct GroupNode {
     /// Groups our other devices are in, with their owner (if the device
     /// said) whose invitation we accept.
     expected: Vec<(GroupId, Option<PublicIdentity>)>,
-    /// Groups our own other devices were in once (and may have left since)
-    /// or said they stay out of: one that leaves a group isn't put back.
+    /// Groups our own other devices were in once (and may have left since),
+    /// said they stay out of, or were offered on connecting: one that
+    /// leaves a group isn't put back. Those in `offers` are still offered.
     offered: Vec<(PublicIdentity, GroupId)>,
-    /// Groups offered to our own other devices on connecting, since this
-    /// node started: once each per run, so a device that ignores the
-    /// offer (an older one that left the group, say) isn't asked at every
-    /// reconnect.
-    offering: Vec<(PublicIdentity, GroupId)>,
-    /// Groups we left that our own device just offered us again, with the
-    /// owner it named and when: the invitation that follows is turned down
-    /// quietly.
-    refused: Vec<(GroupId, Option<PublicIdentity>, std::time::Instant)>,
+    /// Groups offered to our own other devices on connecting that they
+    /// neither joined nor said they stay out of: how many times, and when
+    /// last (ms). Offered again up to [`MAX_OFFERS`] times, the offer
+    /// may have been lost.
+    offers: Vec<Offer>,
+    /// Groups we left that our own device offered us again, with the
+    /// owner it named and when (ms): the invitation that follows is turned
+    /// down quietly.
+    refused: Vec<(GroupId, Option<PublicIdentity>, u64)>,
     /// Groups this device left or declined. Our other devices don't add
     /// it back, and an invitation to one needs the user's consent again.
     left: Vec<GroupId>,
@@ -430,15 +457,19 @@ impl GroupNode {
                 .flatten()
                 .unwrap_or_default()
         };
-        let offered = decode_offered(&load(OFFERED), &groups.list());
+        let offered = decode_offered(&load(OFFERED));
+        let offers = match home.load_state(identity, OFFERS).ok().flatten() {
+            Some(b) => decode_offers(&b),
+            None => migrate_offers(&offered, &groups.list()),
+        };
         Ok(Self {
             groups,
             invites: decode_invites(&load(INVITES)),
             held: decode_held(&load(HELD)),
             expected: decode_expected(&load(EXPECTED)),
             offered,
-            offering: Vec::new(),
-            refused: Vec::new(),
+            offers,
+            refused: decode_refused(&load(REFUSED)),
             left: decode_left(&load(LEFT)),
             stranger_invited: None,
             owner_seen: decode_owner_seen(&load(OWNER_SEEN)),
@@ -1583,10 +1614,7 @@ impl GroupNode {
             } if node.is_own_device(&from)
                 && self.members(&group).is_ok_and(|m| !m.contains(&from)) =>
             {
-                if !self.offered.contains(&(from, group)) {
-                    self.offered.push((from, group));
-                    self.save_offered();
-                }
+                self.settle(from, group);
                 Ok(Vec::new())
             }
             wire => {
@@ -1617,9 +1645,11 @@ impl GroupNode {
                 // We stay out: say so, so our device stops offering it, and
                 // turn down the invitation it set off without asking the
                 // user again.
+                let now = threnody_core::now_ms();
                 self.refused
-                    .retain(|(g, _, at)| *g != group && at.elapsed() < REFUSED_FOR);
-                self.refused.push((group, owner, std::time::Instant::now()));
+                    .retain(|(g, _, at)| *g != group && now.saturating_sub(*at) < REFUSED_FOR_MS);
+                self.refused.push((group, owner, now));
+                self.save_refused();
                 let held = self.held.len();
                 let stay_out = GroupWire::Leave {
                     group,
@@ -1664,44 +1694,65 @@ impl GroupNode {
     /// it ourselves if we may (an owner or admin), otherwise ask the
     /// coordinator; and tell it to accept the invitation.
     ///
-    /// Until it is in, it is offered the group again: the device that was
-    /// just linked may be a process that runs no groups (`threnody link`)
-    /// and drops the offer. Only once it has been in the group, or says it
-    /// stays out, is it never offered that group again. On connecting
-    /// (`connecting`), each group is offered once per run.
+    /// Once it has been in the group, or says it stays out, it is never
+    /// offered that group again. Until then, an offer may have been lost:
+    /// the device that was just linked may be a process that runs no
+    /// groups (`threnody link`). So the offer made on linking doesn't
+    /// count, and those made otherwise (`count`) are repeated up to
+    /// [`MAX_OFFERS`] times, [`OFFER_RETRY_MS`] apart: an older device that
+    /// left the group ignores them, and its user is asked each time.
     fn add_sibling(
         &mut self,
         node: &Node,
         sibling: &PublicIdentity,
         only: Option<GroupId>,
-        connecting: bool,
+        count: bool,
     ) {
         let me = node.identity();
-        let mut joined = false;
+        let now = threnody_core::now_ms();
+        let mut counted = false;
         let mut todo = Vec::new();
         for (group, _, owner, members, roles) in self.groups.list_with_roles() {
             if only.is_some_and(|o| o != group) {
                 continue;
             }
-            let pair = (*sibling, group);
             if members.contains(sibling) {
                 // It's in: should it leave, it stays out.
+                self.settle(*sibling, group);
+                continue;
+            }
+            let pair = (*sibling, group);
+            let offer = self
+                .offers
+                .iter()
+                .position(|o| o.device == *sibling && o.group == group);
+            if offer.is_none() && self.offered.contains(&pair) {
+                continue;
+            }
+            if count {
+                match offer {
+                    Some(i) if !self.offers[i].due(now) => continue,
+                    Some(i) => {
+                        self.offers[i].times += 1;
+                        self.offers[i].last_ms = now;
+                    }
+                    None => self.offers.push(Offer {
+                        device: *sibling,
+                        group,
+                        times: 1,
+                        last_ms: now,
+                    }),
+                }
                 if !self.offered.contains(&pair) {
                     self.offered.push(pair);
-                    joined = true;
                 }
-                continue;
-            }
-            if self.offered.contains(&pair) || connecting && self.offering.contains(&pair) {
-                continue;
-            }
-            if connecting {
-                self.offering.push(pair);
+                counted = true;
             }
             todo.push((group, owner, members, roles));
         }
-        if joined {
+        if counted {
             self.save_offered();
+            self.save_offers();
         }
         if todo.is_empty() {
             return;
@@ -1735,6 +1786,21 @@ impl GroupNode {
         self.save_held();
     }
 
+    /// Our own `device` is in `group`, or says it stays out: should it
+    /// leave, or once it did, it isn't offered the group again.
+    fn settle(&mut self, device: PublicIdentity, group: GroupId) {
+        if !self.offered.contains(&(device, group)) {
+            self.offered.push((device, group));
+            self.save_offered();
+        }
+        let before = self.offers.len();
+        self.offers
+            .retain(|o| o.device != device || o.group != group);
+        if self.offers.len() != before {
+            self.save_offers();
+        }
+    }
+
     /// Our own devices connected now join `group`, which we just started
     /// adding people to.
     fn offer_to_siblings(&mut self, node: &Node, group: &GroupId) {
@@ -1747,7 +1813,7 @@ impl GroupNode {
         siblings.sort_by_key(|p| *p.as_bytes());
         siblings.dedup();
         for s in siblings {
-            self.add_sibling(node, &s, Some(*group), false);
+            self.add_sibling(node, &s, Some(*group), true);
         }
     }
 
@@ -1829,8 +1895,8 @@ impl GroupNode {
     /// Adds our newly linked `device` to our groups (`Event::DeviceLinked`).
     pub fn linked(&mut self, node: &Node, device: &PublicIdentity) {
         if node.is_own_device(device) {
-            // Not counted as this run's offer: the device being linked may
-            // not run groups yet, and is offered them again when it does.
+            // Not counted: the process being linked may run no groups,
+            // and the device is offered them again when it connects.
             self.add_sibling(node, device, None, false);
         }
     }
@@ -1930,12 +1996,24 @@ impl GroupNode {
     }
 
     fn save_offered(&self) {
-        let mut out = vec![OFFERED_VERSION];
+        let mut out = vec![VERSION];
         for (d, g) in &self.offered {
             out.extend_from_slice(d.as_bytes());
             out.extend_from_slice(g);
         }
         let _ = self.home.save_state(&self.identity, OFFERED, &out);
+    }
+
+    fn save_offers(&self) {
+        let _ = self
+            .home
+            .save_state(&self.identity, OFFERS, &encode_offers(&self.offers));
+    }
+
+    fn save_refused(&self) {
+        let _ = self
+            .home
+            .save_state(&self.identity, REFUSED, &encode_refused(&self.refused));
     }
 
     fn save_left(&self) {
@@ -2232,16 +2310,22 @@ impl GroupNode {
                     return;
                 }
                 // Our own device offered us a group we left, and we said
-                // we stay out: this is the invitation that set off.
-                self.refused.retain(|(.., at)| at.elapsed() < REFUSED_FOR);
-                if self.left.contains(&group)
-                    && let Some(i) = self.refused.iter().position(|(g, owner, _)| {
-                        *g == group
-                            && (owner.is_none_or(|o| o == peer) || node.is_own_device(&peer))
-                    })
-                {
+                // we stay out: this is the invitation that set off, from
+                // our device or the owner it named.
+                let now = threnody_core::now_ms();
+                let before = self.refused.len();
+                self.refused
+                    .retain(|(.., at)| now.saturating_sub(*at) < REFUSED_FOR_MS);
+                let set_off = self.refused.iter().position(|(g, owner, _)| {
+                    *g == group && (*owner == Some(peer) || node.is_own_device(&peer))
+                });
+                if let (true, Some(i)) = (self.left.contains(&group), set_off) {
                     self.refused.remove(i);
+                    self.save_refused();
                     return;
+                }
+                if self.refused.len() != before {
+                    self.save_refused();
                 }
                 // Mutually approved contacts are trusted to add us, and so
                 // is the owner of a group our own device says to join;
@@ -2312,9 +2396,8 @@ impl GroupNode {
             GroupEvent::MemberAdded { group, member, by } => {
                 self.seen_by(&group, by.as_ref());
                 // One of our devices is in: should it leave, it stays out.
-                if node.is_own_device(&member) && !self.offered.contains(&(member, group)) {
-                    self.offered.push((member, group));
-                    self.save_offered();
+                if node.is_own_device(&member) {
+                    self.settle(member, group);
                 }
                 if let Some(by) = by {
                     self.sibling_role(node, &group, &member, &by, &mut extra);
@@ -2768,21 +2851,10 @@ fn decode_left(b: &[u8]) -> Vec<GroupId> {
     }
 }
 
-/// `group-offered`. Version 1 couldn't tell a device that was offered a
-/// group but never got the offer (it was linked by a process that runs no
-/// groups) from one that left: of those, only devices still in the group
-/// are kept, so the rest are offered again, and one that left says so.
-#[allow(clippy::type_complexity)]
-fn decode_offered(
-    b: &[u8],
-    groups: &[(GroupId, String, PublicIdentity, Vec<PublicIdentity>)],
-) -> Vec<(PublicIdentity, GroupId)> {
-    let Some((&version, rest)) = b.split_first() else {
+fn decode_offered(b: &[u8]) -> Vec<(PublicIdentity, GroupId)> {
+    let Some((&VERSION, rest)) = b.split_first() else {
         return Vec::new();
     };
-    if version != VERSION && version != OFFERED_VERSION {
-        return Vec::new();
-    }
     rest.as_chunks::<48>()
         .0
         .iter()
@@ -2790,11 +2862,93 @@ fn decode_offered(
             let d = PublicIdentity::from_bytes(c[..32].try_into().ok()?).ok()?;
             Some((d, c[32..].try_into().ok()?))
         })
+        .collect()
+}
+
+/// `group-offers` for a home that has none yet: up to 0.19.0,
+/// `group-offered` also listed devices offered a group that never got the
+/// offer (they were linked by a process that runs no groups), with no way
+/// to tell them from those that left it. Each listed device not in the
+/// group now is offered it once more: a stuck one joins, one that left
+/// says it stays out (or, if older, asks its user once).
+#[allow(clippy::type_complexity)]
+fn migrate_offers(
+    offered: &[(PublicIdentity, GroupId)],
+    groups: &[(GroupId, String, PublicIdentity, Vec<PublicIdentity>)],
+) -> Vec<Offer> {
+    offered
+        .iter()
         .filter(|(d, g)| {
-            version == OFFERED_VERSION
-                || groups
-                    .iter()
-                    .any(|(x, .., members)| x == g && members.contains(d))
+            groups
+                .iter()
+                .any(|(x, .., members)| x == g && !members.contains(d))
+        })
+        .map(|&(device, group)| Offer {
+            device,
+            group,
+            times: MAX_OFFERS - 1,
+            last_ms: 0,
+        })
+        .collect()
+}
+
+fn encode_offers(offers: &[Offer]) -> Vec<u8> {
+    let mut out = vec![VERSION];
+    for o in offers {
+        out.extend_from_slice(o.device.as_bytes());
+        out.extend_from_slice(&o.group);
+        out.push(o.times);
+        out.extend_from_slice(&o.last_ms.to_le_bytes());
+    }
+    out
+}
+
+fn decode_offers(b: &[u8]) -> Vec<Offer> {
+    let Some((&VERSION, rest)) = b.split_first() else {
+        return Vec::new();
+    };
+    rest.as_chunks::<57>()
+        .0
+        .iter()
+        .filter_map(|c| {
+            Some(Offer {
+                device: PublicIdentity::from_bytes(c[..32].try_into().ok()?).ok()?,
+                group: c[32..48].try_into().ok()?,
+                times: c[48],
+                last_ms: u64::from_le_bytes(c[49..].try_into().ok()?),
+            })
+        })
+        .collect()
+}
+
+fn encode_refused(refused: &[(GroupId, Option<PublicIdentity>, u64)]) -> Vec<u8> {
+    let mut out = vec![VERSION];
+    for (g, owner, at) in refused {
+        out.extend_from_slice(g);
+        out.push(u8::from(owner.is_some()));
+        out.extend_from_slice(owner.as_ref().map_or(&[0; 32], |o| o.as_bytes()));
+        out.extend_from_slice(&at.to_le_bytes());
+    }
+    out
+}
+
+fn decode_refused(b: &[u8]) -> Vec<(GroupId, Option<PublicIdentity>, u64)> {
+    let Some((&VERSION, rest)) = b.split_first() else {
+        return Vec::new();
+    };
+    rest.as_chunks::<57>()
+        .0
+        .iter()
+        .filter_map(|c| {
+            let owner = match c[16] {
+                0 => None,
+                _ => Some(PublicIdentity::from_bytes(c[17..49].try_into().ok()?).ok()?),
+            };
+            Some((
+                c[..16].try_into().ok()?,
+                owner,
+                u64::from_le_bytes(c[49..].try_into().ok()?),
+            ))
         })
         .collect()
 }
@@ -3022,17 +3176,75 @@ mod tests {
         assert_eq!(decode_owner_seen(&b), seen);
         assert_eq!(decode_owner_seen(&b[..b.len() - 1]), seen[..1]);
         assert!(decode_owner_seen(&[9, 1]).is_empty());
-        // Offered groups: all kept as saved now; as first saved, only
-        // devices still in the group, so the rest are offered again.
+        // Offered groups, in the layout 0.19.0 reads too.
         let q = Identity::generate().public();
-        let groups = vec![([1; 16], "a".to_owned(), p, vec![p, q])];
-        let file = |v: u8| [&[v][..], q.as_bytes(), &[1; 16], q.as_bytes(), &[2; 16]].concat();
+        let file = [
+            &[VERSION][..],
+            q.as_bytes(),
+            &[1; 16],
+            q.as_bytes(),
+            &[2; 16],
+        ]
+        .concat();
+        let offered = decode_offered(&file);
+        assert_eq!(offered, [(q, [1; 16]), (q, [2; 16])]);
+        assert!(decode_offered(&[&[9][..], &file[1..]].concat()).is_empty());
+        // A home from 0.19.0 or earlier: a device offered a group it isn't
+        // in (group 2, say) is offered it once more; one in it, or offered
+        // a group we're no longer in, isn't.
+        let groups = vec![
+            ([1; 16], "a".to_owned(), p, vec![p, q]),
+            ([2; 16], "b".to_owned(), p, vec![p]),
+        ];
+        let migrated = migrate_offers(&[offered[0], offered[1], (q, [3; 16])], &groups);
         assert_eq!(
-            decode_offered(&file(OFFERED_VERSION), &groups),
-            [(q, [1; 16]), (q, [2; 16])]
+            migrated,
+            [Offer {
+                device: q,
+                group: [2; 16],
+                times: MAX_OFFERS - 1,
+                last_ms: 0
+            }]
         );
-        assert_eq!(decode_offered(&file(VERSION), &groups), [(q, [1; 16])]);
-        assert!(decode_offered(&file(9), &groups).is_empty());
+        assert!(migrated[0].due(threnody_core::now_ms()));
+        // Offers in progress.
+        let offers = vec![
+            migrated[0],
+            Offer {
+                device: p,
+                group: [4; 16],
+                times: 1,
+                last_ms: u64::MAX - 1,
+            },
+        ];
+        let b = encode_offers(&offers);
+        assert_eq!(decode_offers(&b), offers);
+        assert_eq!(decode_offers(&b[..b.len() - 1]), offers[..1]);
+        assert!(decode_offers(&[9]).is_empty());
+        // Invitations to turn down, with and without the owner.
+        let refused = vec![([1; 16], Some(q), 7), ([2; 16], None, u64::MAX)];
+        let b = encode_refused(&refused);
+        assert_eq!(decode_refused(&b), refused);
+        assert_eq!(decode_refused(&b[..b.len() - 1]), refused[..1]);
+        assert!(decode_refused(&[9]).is_empty());
+    }
+
+    #[test]
+    fn a_sibling_is_offered_a_group_a_bounded_number_of_times() {
+        let p = Identity::generate().public();
+        let mut o = Offer {
+            device: p,
+            group: [1; 16],
+            times: 0,
+            last_ms: 0,
+        };
+        assert!(o.due(0));
+        o.times = 1;
+        o.last_ms = 1_000;
+        assert!(!o.due(1_000 + OFFER_RETRY_MS - 1));
+        assert!(o.due(1_000 + OFFER_RETRY_MS));
+        o.times = MAX_OFFERS;
+        assert!(!o.due(u64::MAX));
     }
 
     #[test]

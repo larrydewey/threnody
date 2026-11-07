@@ -22,6 +22,9 @@ struct N {
     updates: Vec<Update>,
     /// Every group message that arrived, as sent.
     wires: Vec<(PublicIdentity, GroupWire)>,
+    /// Acts as 0.19.0 and earlier did: ignores, without answering, its
+    /// own device's offer of a group it left.
+    old: bool,
 }
 
 async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
@@ -55,6 +58,7 @@ async fn start(home: Home, identity: threnody_core::Identity) -> N {
         groups,
         updates: Vec::new(),
         wires: Vec::new(),
+        old: false,
     }
 }
 
@@ -73,7 +77,13 @@ impl N {
                     ..
                 } => {
                     if let Ok(w) = GroupWire::decode(&b) {
+                        let me = self.node.identity();
+                        let ignored = self.old
+                            && matches!(&w, GroupWire::AddDevice { device, .. } if device == me.as_bytes());
                         self.wires.push((peer, w));
+                        if ignored {
+                            continue;
+                        }
                     }
                     if let Ok(u) = self.groups.incoming(&self.node, peer, &b) {
                         self.updates.extend(u);
@@ -1620,4 +1630,170 @@ async fn a_device_that_declined_a_group_is_not_asked_again() {
         .filter(|(from, w)| *from == pid && matches!(w, GroupWire::Leave { .. }))
         .count();
     assert_eq!(leaves, 1, "offered again after it said no");
+}
+
+/// Key-package requests for `group` that reached `n` from `from`.
+fn asked(n: &N, from: &PublicIdentity, group: &threnody_groups::GroupId) -> usize {
+    n.wires
+        .iter()
+        .filter(|(f, w)| {
+            f == from && matches!(w, GroupWire::KeyPackageRequest { group: x, .. } if x == group)
+        })
+        .count()
+}
+
+/// Bob's group `g` with the laptop in it, and the phone (not linked yet)
+/// having turned down Bob's invitation to it.
+async fn a_group_the_phone_declined(
+    dir: &tempfile::TempDir,
+) -> (N, N, N, threnody_groups::GroupId) {
+    let mut laptop = spawn(dir, "laptop").await;
+    let mut phone = spawn(dir, "phone").await;
+    let mut bob = spawn(dir, "bob").await;
+    let lid = approve(&mut bob, &mut laptop).await;
+    let g = bob.groups.create("team").unwrap();
+    bob.groups.invite(&bob.node, &g, &lid).unwrap();
+    until(&mut [&mut bob, &mut laptop], |ns| ns[1].in_group(&g)).await;
+    let pid = bob.node.connect(&phone.addr, None).await.unwrap();
+    bob.groups.invite(&bob.node, &g, &pid).unwrap();
+    until(&mut [&mut bob, &mut phone], |ns| {
+        !ns[1].groups.invites().is_empty()
+    })
+    .await;
+    phone.groups.decline(&g);
+    phone.updates.clear();
+    (laptop, phone, bob, g)
+}
+
+#[tokio::test]
+async fn an_older_device_that_declined_a_group_is_not_offered_it_at_every_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, mut bob, g) = a_group_the_phone_declined(&dir).await;
+    let bid = bob.node.identity();
+    phone.old = true;
+
+    // Linked, the older phone ignores the laptop's offer, and Bob's
+    // invitation that follows asks its user.
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        asked(ns[2], &bid, &g) == 2
+    })
+    .await;
+
+    // The laptop restarts again and again: it offers the group once more
+    // (the first offer may have been lost), not every time.
+    for _ in 0..3 {
+        laptop.node.shutdown();
+        drop(laptop);
+        laptop = restart(&dir, "laptop").await;
+        laptop.node.connect(&bob.addr, None).await.unwrap();
+        laptop.node.connect(&phone.addr, None).await.unwrap();
+        settle(
+            &mut [&mut bob, &mut laptop, &mut phone],
+            Duration::from_millis(1500),
+        )
+        .await;
+    }
+    assert_eq!(asked(&phone, &bid, &g), 3, "asked at every restart");
+    assert!(!phone.in_group(&g));
+}
+
+#[tokio::test]
+async fn a_device_that_left_turns_down_an_invitation_that_comes_after_it_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, bob, g) = a_group_the_phone_declined(&dir).await;
+    let pid = phone.node.identity();
+
+    // Bob (the owner) is away when the phone is linked: the laptop's
+    // request to add it waits for him.
+    bob.node.shutdown();
+    drop(bob);
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    until(&mut [&mut laptop, &mut phone], |ns| {
+        ns[0].wires.iter().any(|(from, w)| {
+            *from == pid && matches!(w, GroupWire::Leave { group, proposal: None } if *group == g)
+        })
+    })
+    .await;
+
+    // The phone restarts; then Bob comes back and acts on the request.
+    phone.node.shutdown();
+    drop(phone);
+    let mut phone = restart(&dir, "phone").await;
+    let mut bob = restart(&dir, "bob").await;
+    let bid = bob.node.identity();
+    // Bob hears of the phone (from the phone) before the request.
+    phone.node.connect(&bob.addr, None).await.unwrap();
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_millis(500),
+    )
+    .await;
+    bob.node.connect(&laptop.addr, None).await.unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        asked(ns[2], &bid, &g) == 1
+    })
+    .await;
+    settle(
+        &mut [&mut bob, &mut laptop, &mut phone],
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(phone.groups.invites().is_empty(), "asked again");
+    assert!(
+        !phone
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::Invited { .. })),
+        "asked again"
+    );
+}
+
+#[tokio::test]
+async fn an_offer_naming_no_owner_does_not_hide_anothers_invitation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let g = bob.groups.create("team").unwrap();
+    let pid = bob.node.connect(&phone.addr, None).await.unwrap();
+    bob.groups.invite(&bob.node, &g, &pid).unwrap();
+    until(&mut [&mut bob, &mut phone], |ns| {
+        !ns[1].groups.invites().is_empty()
+    })
+    .await;
+    phone.groups.decline(&g);
+    phone.updates.clear();
+
+    // An older laptop offers the phone the group without naming its
+    // owner; the phone says it stays out.
+    let offer = GroupWire::AddDevice {
+        group: g,
+        device: *pid.as_bytes(),
+        owner: None,
+    };
+    laptop
+        .node
+        .send(&pid, AppMessage::Group(offer.encode().unwrap()))
+        .unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[1].wires.iter().any(|(from, w)| {
+            *from == pid && matches!(w, GroupWire::Leave { group, proposal: None } if *group == g)
+        })
+    })
+    .await;
+
+    // Bob invites the phone again himself: the user is asked.
+    bob.groups.invite(&bob.node, &g, &pid).unwrap();
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        ns[2]
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::Invited { invite, .. } if invite.group == g))
+    })
+    .await;
 }
