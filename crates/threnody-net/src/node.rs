@@ -628,6 +628,9 @@ pub(crate) struct Shared {
     pub(crate) sync: Mutex<crate::sync::SyncState>,
     /// How far each of our other devices has our ticks (see `sync`).
     pub(crate) ticks_sync: Mutex<crate::sync::SyncState>,
+    /// How far each of our other devices has the records of files
+    /// contacts sent us (see `sync`).
+    pub(crate) files_sync: Mutex<crate::sync::SyncState>,
     /// Fetching file contents from our other devices, and serving ours
     /// (see `filesync`).
     pub(crate) file_sync: Mutex<crate::filesync::FileSync>,
@@ -930,6 +933,13 @@ impl Node {
                 .flatten()
                 .unwrap_or_default(),
         );
+        let files_sync = crate::sync::SyncState::decode(
+            &cfg.home
+                .load_state(&cfg.identity, crate::sync::FILES_STATE)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         let delivery = {
             let load = |n| {
                 cfg.home
@@ -987,6 +997,7 @@ impl Node {
             delivery: Mutex::new(delivery),
             sync: Mutex::new(sync),
             ticks_sync: Mutex::new(ticks_sync),
+            files_sync: Mutex::new(files_sync),
             file_sync: Mutex::new(file_sync),
             auto_fetch: std::sync::atomic::AtomicBool::new(true),
             tick_outbox: Mutex::new(HashMap::new()),

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use threnody_core::message::FEATURE_DEVICE_SYNC;
 use threnody_core::store::Home;
 use threnody_net::{AcceptPolicy, Event, Node, NodeConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1635,4 +1636,458 @@ async fn strangers_cannot_fetch_our_files() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(ls.reads(), 0);
+}
+
+/// Bob sends `to` the file `name`; `to`'s app keeps it in `store` and
+/// records it, as the apps do. The id Bob sent it under.
+async fn receive_file(
+    bob: &N,
+    to: &mut N,
+    store: &DirStore,
+    name: &str,
+    data: &[u8],
+    sensitive: bool,
+) -> u64 {
+    bob.node
+        .send_file(
+            &to.node.identity(),
+            threnody_net::history::OutgoingFile {
+                name: name.into(),
+                data: data.to_vec(),
+                location: None,
+                sensitive,
+                caption: String::new(),
+                album: 0,
+                clip: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    let Event::Message {
+        peer,
+        msg:
+            threnody_core::AppMessage::File {
+                name,
+                data,
+                id,
+                sensitive,
+                caption,
+                album,
+                clip,
+                forwarded,
+                ..
+            },
+    } = next(&mut to.rx, |e| {
+        matches!(
+            e,
+            Event::Message {
+                msg: threnody_core::AppMessage::File { .. },
+                ..
+            }
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    to.node.record_received_file(
+        &peer,
+        threnody_core::history::FileNote {
+            name: name.clone(),
+            size: data.len() as u64,
+            location: Some(store.put(&name, &data)),
+            sensitive,
+            album,
+            clip,
+            forwarded,
+        },
+        &caption,
+        id,
+    );
+    id
+}
+
+#[tokio::test]
+async fn a_file_a_contact_sends_reaches_our_other_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let pid = phone.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    // The session's start (and its catch-up) is over: what follows comes
+    // live.
+    wait_for(|| laptop.node.supports(&pid, FEATURE_DEVICE_SYNC)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while phone.rx.try_recv().is_ok() {}
+    // Bob's files go to the laptop only.
+    let photo = random(6000);
+    receive_file(&bob, &mut laptop, &ls, "from-bob.jpg", &photo, false).await;
+    let doc = random(2000);
+    receive_file(&bob, &mut laptop, &ls, "notes.pdf", &doc, false).await;
+    let private = random(1500);
+    receive_file(&bob, &mut laptop, &ls, "private.png", &private, true).await;
+    laptop.node.set_timer(&bid, Some(3600)).unwrap();
+    let fleeting = random(1700);
+    receive_file(&bob, &mut laptop, &ls, "fleeting.png", &fleeting, false).await;
+
+    // The phone shows each; the photo comes over by itself.
+    wait_for(|| contents(&phone.node, &bid, "from-bob.jpg").as_deref() == Some(&photo[..])).await;
+    wait_for(|| file_named(&phone.node, &bid, "fleeting.png").is_some()).await;
+    let e = file_named(&phone.node, &bid, "from-bob.jpg").unwrap();
+    assert!(!e.outgoing);
+    assert_eq!(e.device, *bid.as_bytes());
+    // The rest wait for a tap: not a photo, sensitive, disappearing.
+    for name in ["notes.pdf", "private.png", "fleeting.png"] {
+        let r = threnody_core::history::file_ref(&file_named(&phone.node, &bid, name).unwrap())
+            .unwrap();
+        assert_eq!(
+            phone.node.fetch_state(&r),
+            threnody_net::FetchState::Idle,
+            "{name}"
+        );
+    }
+    // A disappearing one goes on the phone when it goes on the laptop.
+    let expires = file_named(&laptop.node, &bid, "fleeting.png")
+        .unwrap()
+        .expires_at_ms;
+    assert!(expires.is_some());
+    assert_eq!(
+        file_named(&phone.node, &bid, "fleeting.png")
+            .unwrap()
+            .expires_at_ms,
+        expires
+    );
+    assert!(
+        file_named(&phone.node, &bid, "private.png")
+            .unwrap()
+            .file
+            .unwrap()
+            .sensitive
+    );
+    // A tap brings the others.
+    let conv = phone.node.conversation_for(&bid);
+    phone
+        .node
+        .fetch_file(conv, |e| {
+            e.file.as_ref().is_some_and(|f| f.name == "notes.pdf")
+        })
+        .unwrap();
+    wait_for(|| contents(&phone.node, &bid, "notes.pdf").as_deref() == Some(&doc[..])).await;
+    // All within the one session.
+    while let Ok(e) = phone.rx.try_recv() {
+        assert!(!matches!(e, Event::Connected { .. }), "no new session");
+    }
+}
+
+#[tokio::test]
+async fn a_file_a_contact_sent_while_a_sibling_was_away_reaches_it_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    let pid = phone.node.identity();
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+
+    let photo = random(9000);
+    receive_file(&bob, &mut laptop, &ls, "while-away.jpg", &photo, false).await;
+
+    let mut phone = restart(&dir, "phone").await;
+    phone.node.set_file_store(ps.clone());
+    assert!(file_named(&phone.node, &bid, "while-away.jpg").is_none());
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| contents(&phone.node, &bid, "while-away.jpg").as_deref() == Some(&photo[..])).await;
+
+    // Once caught up, a new session brings nothing again.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    while phone.rx.try_recv().is_ok() {}
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    let again = timeout(
+        Duration::from_millis(1000),
+        next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })),
+    )
+    .await;
+    assert!(again.is_err(), "nothing new to merge");
+}
+
+#[tokio::test]
+async fn a_file_that_reached_two_of_our_devices_is_recorded_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    let doc = random(3000);
+    let note = |location: String| threnody_core::history::FileNote {
+        name: "twice.pdf".into(),
+        size: doc.len() as u64,
+        location: Some(location),
+        sensitive: false,
+        album: 0,
+        clip: None,
+        forwarded: false,
+    };
+    laptop
+        .node
+        .record_received_file(&bid, note(ls.put("twice.pdf", &doc)), "", 77);
+    wait_for(|| file_named(&phone.node, &bid, "twice.pdf").is_some()).await;
+    // The phone gets its own copy after hearing of the laptop's.
+    let mine = ps.put("twice.pdf", &doc);
+    phone
+        .node
+        .record_received_file(&bid, note(mine.clone()), "", 77);
+    let conv = phone.node.conversation_for(&bid);
+    let copies: Vec<_> = phone
+        .node
+        .history(conv)
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|e| e.file.as_ref().is_some_and(|f| f.name == "twice.pdf"))
+        .cloned()
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].file.as_ref().unwrap().location, Some(mine));
+    assert_eq!(ls.reads(), 0, "nothing was fetched");
+}
+
+/// An incoming file entry from `device` under `id`, as history keeps it.
+fn received_entry(
+    device: &threnody_core::PublicIdentity,
+    name: &str,
+    size: u64,
+    location: Option<String>,
+    id: u64,
+) -> threnody_core::history::Entry {
+    threnody_core::history::Entry {
+        outgoing: false,
+        local_id: 0,
+        remote_id: id,
+        ..file_entry(device, name, size, location)
+    }
+}
+
+#[tokio::test]
+async fn received_files_from_before_the_upgrade_reach_a_sibling_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (laptop, phone, bob, ls, ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let pid = phone.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    let conv = laptop.node.conversation_for(&bid);
+    phone.node.shutdown();
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != pid)).await;
+    drop(phone);
+    laptop.node.shutdown();
+    drop(laptop);
+
+    // While both were down, the laptop got a photo from Bob as a version
+    // from before received files were passed on records it (no mark), and
+    // has a bare record of another from a third device of ours.
+    let photo = random(4000);
+    let home = Home::new(dir.path().join("laptop"));
+    let me = home.load_identity(None).unwrap();
+    home.merge_entries(
+        &me,
+        conv,
+        vec![
+            received_entry(
+                &bid,
+                "old.jpg",
+                photo.len() as u64,
+                Some(ls.put("old.jpg", &photo)),
+                31,
+            ),
+            received_entry(&bid, "bare.pdf", 10, None, 32),
+        ],
+        threnody_core::now_ms(),
+    )
+    .unwrap();
+    // That version never kept how far the phone had them.
+    let state = dir.path().join("laptop").join("history-sync-files.state");
+    assert!(state.exists());
+    std::fs::remove_file(&state).unwrap();
+    drop(home);
+
+    let laptop = restart(&dir, "laptop").await;
+    laptop.node.set_file_store(ls.clone());
+    let mut phone = restart(&dir, "phone").await;
+    phone.node.set_file_store(ps.clone());
+    assert!(file_named(&phone.node, &bid, "old.jpg").is_none());
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| contents(&phone.node, &bid, "old.jpg").as_deref() == Some(&photo[..])).await;
+    // Only what it received itself: the bare record came in the same
+    // transcript if at all.
+    assert!(file_named(&phone.node, &bid, "bare.pdf").is_none());
+
+    // Once.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    while phone.rx.try_recv().is_ok() {}
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    let again = timeout(
+        Duration::from_millis(1000),
+        next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })),
+    )
+    .await;
+    assert!(again.is_err(), "nothing new to merge");
+    let _ = bob;
+}
+
+#[tokio::test]
+async fn a_sibling_passes_on_only_the_files_it_received_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    let tablet = spawn(&dir, "tablet").await;
+    let ts = DirStore::new(&dir, "tablet");
+    tablet.node.set_file_store(ts.clone());
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    tablet.node.link_with(&code).await.unwrap();
+    let tid = tablet.node.identity();
+    wait_for(|| phone.node.is_own_device(&tid) && tablet.node.contacts().get(&bid).is_some()).await;
+    // The phone catches the tablet up too: once the tablet has what the
+    // phone writes next, the phone has.
+    tablet.node.connect(&phone.addr, None).await.unwrap();
+    let _ = phone.node.send_text(&bid, "from the phone");
+    wait_for(|| texts(&tablet.node, &bid).contains(&(true, "from the phone".into()))).await;
+    tablet.node.shutdown();
+    wait_for(|| {
+        laptop.node.sessions().iter().all(|s| s.peer != tid)
+            && phone.node.sessions().iter().all(|s| s.peer != tid)
+    })
+    .await;
+    drop(tablet);
+
+    // Bob's photo reaches the laptop, which tells the phone; the phone
+    // fetches it.
+    let photo = random(5000);
+    receive_file(&bob, &mut laptop, &ls, "via-laptop.jpg", &photo, false).await;
+    wait_for(|| contents(&phone.node, &bid, "via-laptop.jpg").as_deref() == Some(&photo[..])).await;
+    let lid = laptop.node.identity();
+    laptop.node.shutdown();
+    wait_for(|| phone.node.sessions().iter().all(|s| s.peer != lid)).await;
+    drop(laptop);
+
+    // The tablet meets only the phone: it doesn't get the laptop's record
+    // from it.
+    let mut tablet = restart(&dir, "tablet").await;
+    tablet.node.set_file_store(ts.clone());
+    tablet.node.connect(&phone.addr, None).await.unwrap();
+    wait_for(|| phone.node.supports(&tid, FEATURE_DEVICE_SYNC)).await;
+    let _ = phone.node.send_text(&bid, "still the phone");
+    wait_for(|| texts(&tablet.node, &bid).contains(&(true, "still the phone".into()))).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(file_named(&tablet.node, &bid, "via-laptop.jpg").is_none());
+
+    // From the laptop, which received it, it does.
+    let laptop = restart(&dir, "laptop").await;
+    laptop.node.set_file_store(ls.clone());
+    tablet.node.connect(&laptop.addr, None).await.unwrap();
+    wait_for(|| contents(&tablet.node, &bid, "via-laptop.jpg").as_deref() == Some(&photo[..]))
+        .await;
+    let _ = (&mut tablet.rx, &mut phone.rx, bob);
+}
+
+#[tokio::test]
+async fn a_file_from_a_message_request_stays_on_the_device_that_got_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    // Carol isn't a contact: her file is a request's.
+    let carol = spawn(&dir, "carol").await;
+    let cid = carol.node.identity();
+    let data = random(800);
+    laptop.node.record_received_file(
+        &cid,
+        threnody_core::history::FileNote {
+            name: "request.png".into(),
+            size: data.len() as u64,
+            location: Some(ls.put("request.png", &data)),
+            sensitive: false,
+            album: 0,
+            clip: None,
+            forwarded: false,
+        },
+        "",
+        5,
+    );
+    assert!(file_named(&laptop.node, &cid, "request.png").is_some());
+    // Bob's, after it, reaches the phone; Carol's never does.
+    let photo = random(900);
+    receive_file(&bob, &mut laptop, &ls, "after.png", &photo, false).await;
+    wait_for(|| file_named(&phone.node, &bid, "after.png").is_some()).await;
+    assert!(file_named(&phone.node, &cid, "request.png").is_none());
+    // Nor at the next session's start.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    while phone.rx.try_recv().is_ok() {}
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    let again = timeout(
+        Duration::from_millis(1000),
+        next(&mut phone.rx, |e| matches!(e, Event::HistorySynced { .. })),
+    )
+    .await;
+    assert!(again.is_err(), "nothing to merge");
+    assert!(file_named(&phone.node, &cid, "request.png").is_none());
+    let _ = carol;
+}
+
+#[tokio::test]
+async fn a_sibling_without_device_sync_gets_no_received_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    // As a 0.18.0 phone: it can't fetch file contents from us.
+    phone.node.withhold_features(FEATURE_DEVICE_SYNC);
+    let ls = DirStore::new(&dir, "laptop");
+    laptop.node.set_file_store(ls.clone());
+    link(&mut laptop, &mut bob).await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let bid = bob.node.identity();
+    let pid = phone.node.identity();
+    wait_for(|| laptop.node.is_own_device(&pid) && phone.node.contacts().get(&bid).is_some()).await;
+    assert!(!laptop.node.supports(&pid, FEATURE_DEVICE_SYNC));
+    let photo = random(1200);
+    receive_file(&bob, &mut laptop, &ls, "not-for-old.jpg", &photo, false).await;
+    // What the laptop writes next reaches the phone; the file didn't.
+    laptop.node.send_text(&bid, "after the file").unwrap();
+    wait_for(|| texts(&phone.node, &bid).contains(&(true, "after the file".into()))).await;
+    assert!(file_named(&phone.node, &bid, "not-for-old.jpg").is_none());
+    // Nor at the next session's start.
+    phone.node.disconnect(&laptop.node.identity());
+    wait_for(|| phone.node.sessions().is_empty()).await;
+    phone.node.connect(&laptop.addr, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(file_named(&phone.node, &bid, "not-for-old.jpg").is_none());
+    let _ = (&mut phone.rx, &mut bob.rx);
+}
+
+#[tokio::test]
+async fn a_contacts_deletion_of_a_file_reaches_our_other_devices_through_us() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, phone, bob, ls, _ps) = linked_with_stores(&dir).await;
+    let bid = bob.node.identity();
+    wait_for(|| phone.node.contacts().get(&bid).is_some()).await;
+    let doc = random(700);
+    let id = receive_file(&bob, &mut laptop, &ls, "take-back.pdf", &doc, false).await;
+    wait_for(|| file_named(&phone.node, &bid, "take-back.pdf").is_some()).await;
+    // Bob takes it back; the deletion reaches the laptop only (as when
+    // the phone took Bob's before it had the record).
+    let conv = bob.node.conversation_for(&laptop.node.identity());
+    bob.node
+        .send(
+            &laptop.node.identity(),
+            threnody_core::AppMessage::Delete {
+                conversation: conv.to_bytes(),
+                ids: vec![id],
+            },
+        )
+        .unwrap();
+    wait_for(|| file_named(&laptop.node, &bid, "take-back.pdf").is_none()).await;
+    wait_for(|| file_named(&phone.node, &bid, "take-back.pdf").is_none()).await;
 }

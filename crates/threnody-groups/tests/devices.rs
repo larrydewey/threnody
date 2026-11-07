@@ -254,6 +254,39 @@ async fn group_receipts_reach_our_other_devices() {
     .await;
 }
 
+#[tokio::test]
+async fn a_members_group_file_reaches_each_of_our_devices_itself() {
+    // Unlike a 1:1 file (one device, which tells the others), a group
+    // file goes to every member device: nothing to pass on.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut laptop, mut phone, mut bob, g) = our_devices_in_a_group(&dir).await;
+    bob.groups
+        .send_file(
+            &bob.node,
+            &g,
+            threnody_net::history::OutgoingFile {
+                name: "team.pdf".into(),
+                data: threnody_core::random_bytes_vec(4000),
+                location: None,
+                sensitive: false,
+                caption: String::new(),
+                album: 0,
+                clip: None,
+                forwarded: false,
+            },
+        )
+        .unwrap();
+    let got = |n: &N| {
+        n.updates
+            .iter()
+            .any(|u| matches!(u, Update::File { name, .. } if name == "team.pdf"))
+    };
+    until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
+        got(ns[1]) && got(ns[2])
+    })
+    .await;
+}
+
 /// Files in a directory, as an app keeps them.
 struct Files(std::path::PathBuf);
 
