@@ -35,6 +35,9 @@
          only if the user allows it), and after a reboot. -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Asks once to be left off battery optimization, so Doze doesn't cut the
+         background service off the network (contacts couldn't reach this phone). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <!-- Adding contacts by tapping phones (Appendix T); NFC is optional. -->
     <uses-permission android:name="android.permission.NFC" />
@@ -110,6 +113,14 @@
         <receiver android:name=".Calls$Decline" android:exported="false" />
         <!-- Scheduled messages: the alarm, and setting it again after a
              reboot or an update, or once exact alarms are allowed. -->
+        <!-- Starts the background service after a reboot or an update, so the
+             phone stays reachable without the app being opened first. -->
+        <receiver android:name=".Reachable$Boot" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <receiver android:name=".Scheduled$Alarm" android:exported="false" />
         <receiver android:name=".Scheduled$Boot" android:exported="false">
             <intent-filter>

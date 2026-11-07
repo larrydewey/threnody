@@ -131,7 +131,8 @@ class MainActivity : Activity() {
                 node = Threnody.start(this)
                 refresh()
                 // App lock comes on by itself where the phone has a screen lock.
-                runOnUiThread { AppLockUi.firstRun(this) }
+                // Then, on a later start, staying reachable while closed.
+                runOnUiThread { if (!AppLockUi.firstRun(this)) Reachable.ask(this) }
             } catch (e: Exception) {
                 runOnUiThread { failed("Couldn't start: ${e.message}") }
             }
@@ -1032,6 +1033,13 @@ class MainActivity : Activity() {
 
         // Network & Connectivity
         val networkSection = menu.addSubMenu("Network & Connectivity")
+        if (!Push.active(this@MainActivity)) {
+            networkSection.add("Stay reachable when closed…").apply {
+                isCheckable = true
+                isChecked = Reachable.unrestricted(this@MainActivity)
+                setOnMenuItemClickListener { Reachable.request(this@MainActivity); true }
+            }
+        }
         toggle("Reach contacts over the internet", Privacy.reachInternet(this@MainActivity),
             { Privacy.setReachInternet(this@MainActivity, it) }) {
             if (it) "Contacts can be reached on mobile data and other networks. " +

@@ -350,12 +350,13 @@ object AppLockUi {
      * Once per identity (and once for installs from before app lock), after
      * the node started: turns device lock on where the phone has a screen
      * lock and says so, with a way to turn it off; else offers an app PIN.
+     * Returns whether it may show something now.
      */
-    fun firstRun(a: Activity) {
+    fun firstRun(a: Activity): Boolean {
         val prefs = a.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE)
-        if (prefs.getBoolean(OFFERED, false)) return
+        if (prefs.getBoolean(OFFERED, false)) return false
         prefs.edit().putBoolean(OFFERED, true).apply()
-        if (AppLock.enabled(a)) return
+        if (AppLock.enabled(a)) return false
         if (deviceSecure(a)) {
             change(a, null, { p -> setAppLock(home(a), p, null, null, null, true, 0u, 300u, false) }) { s ->
                 if (a.isFinishing) return@change
@@ -379,5 +380,6 @@ object AppLockUi {
                     .show()
             }
         }
+        return true
     }
 }

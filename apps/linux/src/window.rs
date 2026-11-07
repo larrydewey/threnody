@@ -3527,6 +3527,21 @@ impl App {
             "Keep running when closed",
             "Closing the window keeps you reachable; quit from the menu",
         );
+        let login = adw::SwitchRow::builder()
+            .title("Start when you log in")
+            .subtitle("Opens in the background, so contacts can reach you before you open it")
+            .active(self.core.settings().flag(settings::START_AT_LOGIN))
+            .build();
+        let this = Rc::downgrade(self);
+        login.connect_active_notify(move |r| {
+            let on = r.is_active();
+            let Some(this) = this.upgrade() else { return };
+            this.core.settings().set_flag(settings::START_AT_LOGIN, on);
+            if let Err(e) = crate::autostart::set(on) {
+                this.toast(&format!("Couldn't change starting at login: {e}"));
+            }
+        });
+        messages.add(&login);
         page.add(&messages);
         page.add(&crate::backup::group(self));
         page.add(&crate::lock::group(self));

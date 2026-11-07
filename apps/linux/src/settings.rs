@@ -14,6 +14,8 @@ pub const AUTO_FETCH: &str = "fetch_from_own_devices";
 pub const REACH: &str = "reach_internet";
 pub const PRIVATE_NOTIFICATIONS: &str = "private_notifications";
 pub const BACKGROUND: &str = "run_in_background";
+/// Starting hidden at login (`crate::autostart`): on unless switched off.
+pub const START_AT_LOGIN: &str = "start_at_login";
 pub const TIMER: &str = "default_timer";
 pub const VOLUNTEERS: &str = "use_volunteers";
 /// The always-on relay: the fingerprint of a contact (a relay node run on

@@ -3,6 +3,7 @@
 //! directory and keyring entry, so an identity made with `threnody init`
 //! opens here as it is.
 
+mod autostart;
 mod backup;
 mod call;
 mod camera;
@@ -55,7 +56,16 @@ thread_local! {
     static PENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Started at login ([`autostart::FLAG`]): the window stays hidden unless
+/// something needs the user.
+static START_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 fn main() -> glib::ExitCode {
+    // Our own flag, kept from GApplication, which would take it for a file.
+    START_HIDDEN.store(
+        std::env::args_os().skip(1).any(|a| a == autostart::FLAG),
+        Ordering::SeqCst,
+    );
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::CAN_OVERRIDE_APP_ID)
@@ -90,7 +100,12 @@ fn main() -> glib::ExitCode {
             a.core.shutdown();
         }
     });
-    let code = app.run();
+    let code = if START_HIDDEN.load(Ordering::SeqCst) {
+        // Started at login, with nothing else to open.
+        app.run_with_args(&[std::env::args().next().unwrap_or_default()])
+    } else {
+        app.run()
+    };
     if !RESTART.load(Ordering::SeqCst) {
         return code;
     }
@@ -102,7 +117,7 @@ fn main() -> glib::ExitCode {
         // Links and files given at start were handled (or erased) already.
         let args = std::env::args_os()
             .skip(1)
-            .filter(|a| a.to_str().is_some_and(|a| a.starts_with('-')));
+            .filter(|a| a.to_str().is_some_and(|a| a.starts_with('-')) && a != autostart::FLAG);
         let e = std::process::Command::new(exe).args(args).exec();
         eprintln!("threnody-desktop: restarting: {e}");
     }
@@ -137,6 +152,8 @@ fn activate(app: &adw::Application) {
     if let Some(a) = APP.with_borrow(Clone::clone) {
         a.window.present();
         handle_links(&a);
+        // Started hidden at login: the offer waited for the window.
+        lock::offer(&a);
         return;
     }
     if let Some(w) = app.active_window() {
@@ -161,7 +178,9 @@ fn activate(app: &adw::Application) {
     view.add_top_bar(&adw::HeaderBar::new());
     view.set_content(Some(&status));
     window.set_content(Some(&view));
-    window.present();
+    if !hidden() {
+        window.present();
+    }
     // Keeps running for messages while the window is hidden.
     std::mem::forget(app.hold());
     unlock(app, &window, None, None);
@@ -187,16 +206,29 @@ fn unlock(
         move || core::open_main(&h, protect, passphrase),
         move |r| match r {
             Ok(node) => start(&app, &window, home, node, lock),
-            Err(OpenError::NeedPassphrase) => ask_passphrase(&app, &window, false),
-            Err(OpenError::NoKeyring(e)) => no_keyring(&app, &window, &e),
-            Err(OpenError::Failed(e)) if e == "Wrong passphrase" => {
-                ask_passphrase(&app, &window, true)
-            }
-            Err(OpenError::Failed(e)) => {
-                fatal(&window, &format!("Couldn't open your identity: {e}"))
+            Err(e) => {
+                // Asking, or saying it failed: the user has to see it.
+                window.present();
+                not_opened(&app, &window, e);
             }
         },
     );
+}
+
+/// Whether to keep the window hidden: started at login, and closing the
+/// window keeps Threnody running (else hidden would mean unreachable
+/// controls).
+fn hidden() -> bool {
+    START_HIDDEN.load(Ordering::SeqCst) && settings::Settings::load().flag(settings::BACKGROUND)
+}
+
+fn not_opened(app: &adw::Application, window: &adw::ApplicationWindow, e: OpenError) {
+    match e {
+        OpenError::NeedPassphrase => ask_passphrase(app, window, false),
+        OpenError::NoKeyring(e) => no_keyring(app, window, &e),
+        OpenError::Failed(e) if e == "Wrong passphrase" => ask_passphrase(app, window, true),
+        OpenError::Failed(e) => fatal(window, &format!("Couldn't open your identity: {e}")),
+    }
 }
 
 /// One app per data directory: two nodes with one identity would fight.
@@ -229,7 +261,14 @@ fn start(
             let a = App::new(&app, &window, core, rx);
             APP.with_borrow_mut(|slot| *slot = Some(a.clone()));
             handle_links(&a);
-            lock::offer(&a);
+            // Hidden at login: offered once the window is opened.
+            if a.window.is_visible() {
+                lock::offer(&a);
+            }
+            let at_login = a.core.settings().flag(settings::START_AT_LOGIN);
+            if let Err(e) = autostart::set(at_login) {
+                eprintln!("threnody-desktop: start at login: {e}");
+            }
         },
     );
 }
