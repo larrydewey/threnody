@@ -368,6 +368,18 @@ impl GroupUi {
         if n == 0 {
             return;
         }
+        if self.groups.is_lead(g) {
+            // We coordinate: they wait only for members to update, if at all.
+            let outdated = self.groups.outdated(g);
+            if !outdated.is_empty() {
+                let names: Vec<String> = outdated.iter().map(name).collect();
+                say!(
+                    "    {n} change(s) waiting for {} to update Threnody",
+                    names.join(", ")
+                );
+            }
+            return;
+        }
         if let Ok(r) = self.groups.roster(g) {
             say!(
                 "    {n} change(s) waiting for {} to come online (/group coordinate to apply them from an owner device)",
