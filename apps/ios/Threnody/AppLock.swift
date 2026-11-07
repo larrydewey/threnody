@@ -405,8 +405,6 @@ struct AppLockSection: View {
     @ObservedObject private var lock = AppLock.shared
     @State private var asking: LockAsk?
     @State private var error: String?
-    /// Stored negatively, so unset means hidden (the protected default).
-    @AppStorage("showInAppSwitcher") private var showInAppSwitcher = false
 
     var body: some View {
         Section {
@@ -419,8 +417,6 @@ struct AppLockSection: View {
                 Button("Lock with an app PIN…") { asking = .turnOn(.digits) }
                 Button("Lock with an app passphrase…") { asking = .turnOn(.passphrase) }
             }
-            Toggle("Hide in app switcher", isOn: Binding(get: { !showInAppSwitcher }, set: { showInAppSwitcher = !$0 }))
-                .disabled(AppLock.isEnabled)
             if let error { Text(error).foregroundStyle(.red).font(.footnote) }
         } header: {
             Text("App lock")

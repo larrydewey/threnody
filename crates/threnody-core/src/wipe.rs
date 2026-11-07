@@ -29,6 +29,8 @@ const FILES: &[&str] = &[
     "control.sock",
     // A staged restore's completion marker (`backup.rs`).
     "restore-ready",
+    // The iOS app's settings, kept beside the identity, out of backups.
+    "ios-settings.plist",
 ];
 
 /// Directories Threnody makes in a data directory, removed whole.

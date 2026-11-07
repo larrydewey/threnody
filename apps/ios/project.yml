@@ -59,6 +59,9 @@ targets:
         NSLocalNetworkUsageDescription: Threnody connects directly to your contacts' devices on the local network.
         NFCReaderUsageDescription: Threnody reads a nearby phone's invite when you tap phones to add a contact.
         NSFaceIDUsageDescription: Threnody uses Face ID to unlock the app.
+        # QuickLook's share sheet offers "Save Image". No read access is
+        # asked for: the photo picker runs outside the app.
+        NSPhotoLibraryAddUsageDescription: Threnody saves the photos you choose to your library.
         # The tap protocol's AID: must match threnody_core::tap::AID.
         com.apple.developer.nfc.readersession.iso7816.select-identifiers:
           - F0746872656E6F6479

@@ -23,7 +23,7 @@ struct AddContactView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("threnody://…", text: $link, axis: .vertical)
+                    TextField("Invite link or handle", text: $link, axis: .vertical)
                         .font(.footnote.monospaced())
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -48,14 +48,26 @@ struct AddContactView: View {
                     Button {
                         connect()
                     } label: {
-                        if busy { ProgressView() } else { Text("Connect").bold() }
+                        if busy {
+                            HStack {
+                                ProgressView()
+                                if isHandle { Text("Looking for \(link.trimmingCharacters(in: .whitespacesAndNewlines))… (up to two minutes)") }
+                            }
+                        } else {
+                            Text("Connect").bold()
+                        }
                     }
-                    // Only a well-formed invite (the parser all the apps share).
-                    .disabled(classifyLink(text: link)?.kind != .invite || busy)
+                    // Only a well-formed invite (the parser all the apps
+                    // share), or a handle when the DHT can be asked.
+                    .disabled(busy || !(classifyLink(text: link)?.kind == .invite || (isHandle && reach)))
+                    if isHandle && !reach {
+                        Text("Looking for a handle needs “Reach contacts over the internet” (Settings).")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
                 } header: {
-                    Text("Their invite")
+                    Text("Their invite or handle")
                 } footer: {
-                    Text("Scan their QR code, paste the link they sent you, or tap their Android phone.")
+                    Text("Scan their QR code, paste the link they sent you, type their handle (name-XXXX-XXXX), or tap their Android phone.")
                 }
                 Section {
                     if let invite {
@@ -83,8 +95,17 @@ struct AddContactView: View {
                 QRScannerView { code in
                     scanning = false
                     let info = classifyLink(text: code)
-                    if info?.kind != .invite {
-                        fail("Not an invite", "That QR code isn't a Threnody invite.")
+                    if info?.kind == .deviceLink, let info {
+                        // A link code: this device joins that account.
+                        store.joinCode = info.link
+                        dismiss()
+                        // Once this sheet is gone: one sheet at a time.
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(700))
+                            store.pendingJoin = true
+                        }
+                    } else if info?.kind != .invite {
+                        fail("Not an invite", "That QR code isn't a Threnody invite or link code.")
                     } else if isOwn(info) {
                         fail("Not an invite", "That's your own invite.")
                     } else if let info {
@@ -110,6 +131,12 @@ struct AddContactView: View {
             .onAppear { invite = store.invite() }
         }
     }
+
+    /// The field holds a handle (Appendix S) rather than an invite.
+    private var isHandle: Bool { looksLikeHandle(text: link) }
+
+    /// Finding a handle asks the DHT, which needs this.
+    private var reach: Bool { store.node?.reachInternet() ?? false }
 
     private func fail(_ title: String, _ text: String) {
         failureTitle = title
@@ -142,7 +169,7 @@ struct AddContactView: View {
                     return peer
                 }
                 store.refresh()
-                store.openChat = peer
+                store.openChat = ChatRef(persona: nil, target: .contact(peer))
                 dismiss()
             } catch {
                 failure = error.localizedDescription
