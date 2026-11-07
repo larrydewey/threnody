@@ -51,13 +51,15 @@ cargo build -p threnody-cli -p threnody-ffi --locked
 if [[ "${THRENODY_SKIP_ANDROID:-0}" == 1 ]]; then
     step "Android build SKIPPED (THRENODY_SKIP_ANDROID=1)"
 else
-    step "Android build (phone and emulator ABIs)"
     for t in aarch64-linux-android x86_64-linux-android; do
         rustup target list --installed | grep -qx "$t" || rustup target add "$t"
     done
-    apps/android/build.sh --emulator
+    # Without calls first, so the tree ends with the default (calls) build in
+    # jniLibs and app-debug.apk.
     step "Android build without calls (as F-Droid builds it)"
     apps/android/build.sh --no-calls
+    step "Android build (phone and emulator ABIs)"
+    apps/android/build.sh --emulator
 fi
 
 # audit job
