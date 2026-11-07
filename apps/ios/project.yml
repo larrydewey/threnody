@@ -16,7 +16,8 @@ targets:
   Threnody:
     type: application
     platform: iOS
-    scheme: {}
+    scheme:
+      testTargets: [ThrenodyTests]
     sources:
       - path: Threnody
     dependencies:
@@ -69,3 +70,19 @@ targets:
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
           - org.threnody.app.refresh
+  # Unit tests, hosted by the app (which then opens no node of its own).
+  ThrenodyTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: ThrenodyTests
+    dependencies:
+      - target: Threnody
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: org.threnody.app.tests
+        # The app's module refers to the bindings' C module, which the tests
+        # must find too (only the app links the XCFramework).
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated/headers
+        HEADER_SEARCH_PATHS: $(SRCROOT)/Generated/headers
