@@ -7,7 +7,7 @@ import android.net.Uri
 import android.util.LruCache
 import java.io.ByteArrayOutputStream
 import java.io.File
-import uniffi.threnody_ffi.needsConverting
+import uniffi.threnody_ffi.imageNeedsConversion
 
 /**
  * Pictures: which files are images, where received ones are kept, and
@@ -19,8 +19,6 @@ import uniffi.threnody_ffi.needsConverting
  */
 object Media {
     private val IMAGE = setOf("jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "bmp")
-    /** Formats whose metadata the node strips; others are converted to JPEG. */
-    private val STRIPPABLE = setOf("jpg", "jpeg", "png", "webp")
     /** Larger images are refused rather than decoded (decompression bombs). */
     private const val MAX_PIXELS = 100_000_000L
 
@@ -34,14 +32,12 @@ object Media {
     /**
      * Makes a picked file ready to send: an image the node can't strip
      * metadata from (HEIC, AVIF, DNG, …) is re-encoded as JPEG, which
-     * carries none. Its content decides as well as its name, so a HEIC
-     * called "file" or "photo.jpg" is converted too. Returns the name and
-     * bytes to send.
+     * carries none. Its content decides before its name, so a HEIC called
+     * "file" or "photo.jpg" is converted too, and a video called
+     * "clip.heic" isn't. Returns the name and bytes to send.
      */
     fun prepare(ctx: Context, name: String, data: ByteArray): Pair<String, ByteArray> {
-        val ext = name.substringAfterLast('.', "").lowercase()
-        val byName = isImage(name) && ext !in STRIPPABLE && ext != "gif"
-        if (!byName && !needsConverting(data.copyOf(minOf(data.size, 32)))) return name to data
+        if (!imageNeedsConversion(name, data.copyOf(minOf(data.size, 32)))) return name to data
         val bitmap = decode(ImageDecoder.createSource(java.nio.ByteBuffer.wrap(data)), 4096)
             ?: throw IllegalArgumentException("couldn't read $name")
         val out = ByteArrayOutputStream()
@@ -138,11 +134,10 @@ object Media {
     fun sweep(ctx: Context, node: uniffi.threnody_ffi.ThrenodyNode, persona: String? = null) {
         val dir = dir(ctx, persona)
         val files = dir.listFiles() ?: return
+        // Every conversation's files, message requests included; nothing is
+        // deleted if some history can't be read.
         val used = try {
-            val chats = Threnody.conversations(node, persona).flatMap { node.history(it.device, 10_000u) }
-            val groups = node.groups().flatMap { node.groupHistory(it.id, 10_000u) }
-            val notes = node.noteHistory(10_000u)
-            (chats + groups + notes).mapNotNull { it.file?.location }.toSet()
+            node.fileLocations().toSet()
         } catch (_: Exception) {
             return
         }

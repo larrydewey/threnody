@@ -179,6 +179,15 @@ jobs:
           xcodebuild build -project Threnody.xcodeproj -scheme Threnody -configuration Debug \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO
+      # Required: a runner without an iOS simulator fails here rather than
+      # skipping the tests. Any available iPhone will do.
+      - name: Run the unit tests in a simulator
+        working-directory: apps/ios
+        run: |
+          sim=$(xcrun simctl list devices available -j | python3 -c 'import json,sys;d=json.load(sys.stdin)["devices"];print(next(x["udid"] for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")))')
+          xcodebuild test -project Threnody.xcodeproj -scheme Threnody -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$sim" \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO
 
   portability:
     name: Build on ${{ matrix.os }}

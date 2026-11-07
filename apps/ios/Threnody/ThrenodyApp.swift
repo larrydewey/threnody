@@ -32,13 +32,21 @@ struct ThrenodyApp: App {
 struct RootView: View {
     @EnvironmentObject private var store: NodeStore
     @ObservedObject private var lock = AppLock.shared
+    @ObservedObject private var capture = ScreenCapture.shared
     @Environment(\.scenePhase) private var scenePhase
-    /// Stored negatively, so unset means hidden (the protected default).
+    /// Screen security, stored negatively, so unset means on (the
+    /// protected default).
     @AppStorage("showInAppSwitcher") private var showInAppSwitcher = false
 
-    /// The app-switcher cover: always while app lock is on, else unless
-    /// the user chose to show Threnody there.
-    private var cover: Bool { scenePhase != .active && (!showInAppSwitcher || AppLock.isEnabled) }
+    /// The privacy cover, in the app switcher and while the screen is
+    /// recorded, mirrored or AirPlayed: always while app lock is on, else
+    /// unless the user turned screen security off.
+    private var cover: Bool {
+        (scenePhase != .active || capture.captured) && (!showInAppSwitcher || AppLock.isEnabled)
+    }
+
+    /// Under XCTest the app only hosts the tests: no node of its own.
+    private static var testing: Bool { ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil }
 
     var body: some View {
         ZStack {
@@ -58,13 +66,17 @@ struct RootView: View {
             .accessibilityHidden(lock.locked)
             .allowsHitTesting(!lock.locked)
         }
+        .background { CaptureProbe().frame(width: 0, height: 0) }
+        .sheet(isPresented: $store.pendingJoin) {
+            NavigationStack { JoinAccountView() }
+        }
         // The lock screen and the cover are in a window of their own, above
         // every sheet and alert (`LockWindow`).
         .onChange(of: cover, initial: true) { _, on in lock.covered = on }
         .onChange(of: lock.locked || cover, initial: true) { _, on in LockWindow.shared.show(on) }
         // Any touch postpones the idle lock.
         .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { _ in lock.activity() })
-        .task { store.launch() }
+        .task { if !Self.testing { store.launch() } }
         .alert("App lock", isPresented: $lock.notice) {
             Button("OK", role: .cancel) {}
             Button("Turn off", role: .destructive) { Task { await lock.disableDevice() } }
@@ -106,6 +118,15 @@ struct OnboardingView: View {
                 Text("Create identity").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            // A new device of an existing account: its identity is made
+            // here, then joined to the account with a link code.
+            Button {
+                store.pendingJoin = true
+                store.open(deviceName: deviceName.trimmingCharacters(in: .whitespaces), lock: lock)
+            } label: {
+                Text("I already use Threnody: link this iPhone").frame(maxWidth: .infinity)
+            }
             .controlSize(.large)
         }
         .padding(24)

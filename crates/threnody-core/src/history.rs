@@ -1761,6 +1761,67 @@ impl Home {
         self.stored_histories(identity).map(|(c, _)| c).collect()
     }
 
+    /// Where the app saved every file still in some stored history (chats,
+    /// message requests, groups and the notes to self), sorted, expired
+    /// entries left out. Apps delete their own copies of files not listed:
+    /// ones whose messages were deleted or disappeared. Unlike
+    /// [`Home::conversations`], a history that can't be read is an error,
+    /// so a caller never deletes files on a partial answer.
+    ///
+    /// The history lock is held for one file at a time, so a message being
+    /// recorded meanwhile (by any node in the process) waits for one file,
+    /// not the whole scan. History that moves between files meanwhile (a
+    /// device's conversation merged into its account's) shows as a file
+    /// gone; then the scan runs again, the last time under the lock
+    /// throughout. A file added meanwhile is newer than the apps' grace.
+    pub fn file_locations(&self, identity: &Identity, now_ms: u64) -> Result<Vec<String>> {
+        for _ in 0..3 {
+            if let Some(found) = self.scan_file_locations(identity, now_ms, false)? {
+                return Ok(found);
+            }
+        }
+        let _lock = history_lock();
+        Ok(self
+            .scan_file_locations(identity, now_ms, true)?
+            .unwrap_or_default())
+    }
+
+    /// One pass of [`Home::file_locations`]; `None` if a file went while
+    /// it ran (`locked`: the caller holds the history lock, so none can).
+    fn scan_file_locations(
+        &self,
+        identity: &Identity,
+        now_ms: u64,
+        locked: bool,
+    ) -> Result<Option<Vec<String>>> {
+        self.migrate_history_names(identity);
+        let mut out = std::collections::BTreeSet::new();
+        for name in self.state_names()? {
+            if !is_history_name(&name) {
+                continue;
+            }
+            let b = {
+                let _lock = history_lock();
+                self.load_state(identity, &name)?
+            };
+            let Some(b) = b else {
+                // Its entries may have moved into a file already read.
+                if locked {
+                    continue;
+                }
+                return Ok(None);
+            };
+            let mut h = History::decode(&b)?;
+            h.prune(now_ms);
+            out.extend(
+                h.entries
+                    .iter()
+                    .filter_map(|e| e.file.as_ref()?.location.clone()),
+            );
+        }
+        Ok(Some(out.into_iter().collect()))
+    }
+
     /// Searches `scope` (one conversation, or every one when `None`) for
     /// `q`; returns at most `limit` hits, newest first. Expired messages
     /// never match, and nothing is written back.

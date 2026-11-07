@@ -2,7 +2,7 @@ import SwiftUI
 
 @MainActor
 struct ContactInfoView: View {
-    let key: String
+    let ref: ChatRef
     @EnvironmentObject private var store: NodeStore
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
@@ -11,14 +11,16 @@ struct ContactInfoView: View {
     @State private var failure: String?
     @State private var confirmBlock = false
     @State private var confirmRevoke = false
+    @State private var confirmClear = false
+    @State private var level: NotifyLevel = .all
 
-    private static let timers: [(String, UInt32?)] = [
-        ("Off", nil), ("5 minutes", 300), ("1 hour", 3600), ("1 day", 86400), ("1 week", 604_800),
-    ]
+    private var key: String { ref.chatKey }
+    private var conversation: Conversation? { store.conversation(key, persona: ref.persona) }
+    private var node: ThrenodyNode? { store.node(for: ref.persona) }
 
     var body: some View {
         Form {
-            if let c = store.conversation(key) {
+            if let c = conversation {
                 Section("Name") {
                     TextField("What you call them", text: $name)
                         .onSubmit {
@@ -73,10 +75,39 @@ struct ContactInfoView: View {
                         timer = t
                         act { try $0.setDisappearing(peer: c.device, seconds: t) }
                     })) {
-                        ForEach(Self.timers.indices, id: \.self) { i in
-                            Text(Self.timers[i].0).tag(Self.timers[i].1)
+                        ForEach(Privacy.timers.indices, id: \.self) { i in
+                            Text(Privacy.timers[i].0).tag(Privacy.timers[i].1)
                         }
                     }
+                }
+                Section("Notifications") {
+                    Picker("Notify", selection: Binding(get: { level }, set: { l in
+                        level = l
+                        act { try $0.setNotifyLevel(peer: c.device, level: l) }
+                    })) {
+                        Text("All messages").tag(NotifyLevel.all)
+                        Text("Off").tag(NotifyLevel.off)
+                    }
+                }
+                Section("Chat") {
+                    let row = store.row(ChatRef(persona: ref.persona, target: .contact(c.key)))
+                    Toggle("Pin chat", isOn: Binding(get: { row?.pinned != nil }, set: { on in
+                        let k = c.key
+                        act { n in
+                            try n.setChatPinned(chat: k, pinned: on)
+                            if on && !n.pinnedChats().contains(k) { throw AppError("At most ten chats can be pinned.") }
+                        }
+                    }))
+                    Toggle("Archive chat", isOn: Binding(get: { row?.archived ?? false }, set: { on in
+                        let k = c.key
+                        act { try $0.setChatArchived(chat: k, archived: on) }
+                    }))
+                    Button("Clear chat on this device", role: .destructive) { confirmClear = true }
+                }
+                .confirmationDialog("Clear this chat?", isPresented: $confirmClear, titleVisibility: .visible) {
+                    Button("Clear", role: .destructive) { act { try $0.clearConversation(peer: c.device) } }
+                } message: {
+                    Text("Its messages are deleted from this device. \(c.title) keeps theirs.")
                 }
                 Section {
                     Button("Block \(c.title)", role: .destructive) { confirmBlock = true }
@@ -94,14 +125,14 @@ struct ContactInfoView: View {
                 }
             }
         }
-        .navigationTitle(store.conversation(key)?.title ?? "Contact")
+        .navigationTitle(conversation?.title ?? "Contact")
         .navigationBarTitleDisplayMode(.inline)
         .alert("Failed", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(failure ?? "")
         }
-        .task(id: store.conversation(key)?.unverified) { await load() }
+        .task(id: conversation?.unverified) { await load() }
     }
 
     /// Twelve groups of five digits, three per line.
@@ -114,7 +145,7 @@ struct ContactInfoView: View {
     }
 
     private func load() async {
-        guard let n = store.node, let c = store.conversation(key) else { return }
+        guard let n = node, let c = conversation else { return }
         if name.isEmpty { name = c.name ?? "" }
         // An unverified device first.
         let target = c.unverified.first ?? c.device
@@ -123,10 +154,11 @@ struct ContactInfoView: View {
         }
         let d = c.device
         timer = (try? await offMain { try n.disappearing(peer: d) }) ?? nil
+        level = (try? await offMain { try n.notifyLevel(peer: d) }) ?? .all
     }
 
     private func act(_ f: @escaping @Sendable (ThrenodyNode) throws -> Void) {
-        guard let n = store.node else { return }
+        guard let n = node else { return }
         Task {
             do {
                 try await offMain { try f(n) }

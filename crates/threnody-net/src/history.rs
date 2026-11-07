@@ -1271,6 +1271,21 @@ impl Node {
             .map_err(NetError::from)
     }
 
+    /// Where the app saved every file still in some conversation's
+    /// history: contacts, message requests, groups and the notes to self,
+    /// expired entries left out. Apps delete their own copies of files not
+    /// listed (deleted or disappeared messages). An error if any history
+    /// can't be read, so callers never delete on a partial answer: files
+    /// are kept rather than lost. A left group's history stays, and so do
+    /// its files, until the chat is cleared. Each identity (a persona has
+    /// its own home) answers only for itself.
+    pub fn file_locations(&self) -> Result<Vec<String>> {
+        self.shared
+            .home
+            .file_locations(self.identity_ref(), now_ms())
+            .map_err(NetError::from)
+    }
+
     /// Searches one conversation, or all of them (`None`), for `query`;
     /// at most `limit` hits, newest first.
     pub fn search(

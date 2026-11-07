@@ -1,38 +1,149 @@
-import ImageIO
+import PhotosUI
+import QuickLook
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
+
+/// One row of a chat: a message, or photos and files sent together.
+struct ChatItem: Identifiable {
+    let entries: [HistoryEntry]
+    var first: HistoryEntry { entries[0] }
+    var id: String { ChatItem.key(first) }
+
+    /// A stable id for an entry, to scroll to it.
+    static func key(_ e: HistoryEntry) -> String { "\(e.atMs)/\(e.device)" }
+
+    /// Groups consecutive entries of one album.
+    static func group(_ entries: [HistoryEntry]) -> [ChatItem] {
+        var items: [ChatItem] = []
+        var run: [HistoryEntry] = []
+        func flush() {
+            if !run.isEmpty { items.append(ChatItem(entries: run)) }
+            run = []
+        }
+        for e in entries {
+            let album = e.file?.album ?? 0
+            if album != 0, let last = run.last, last.file?.album == album, last.device == e.device {
+                run.append(e)
+            } else {
+                flush()
+                run = [e]
+                if album == 0 { flush() }
+            }
+        }
+        flush()
+        return items
+    }
+}
+
+/// Which messages to delete, and for whom.
+private struct Deleting: Identifiable {
+    let entries: [HistoryEntry]
+    let everyone: Bool
+    var id: String { (everyone ? "e" : "m") + ChatItem.key(entries[0]) }
+}
+
+/// Files picked to send, before the send sheet.
+struct PickedFile: Identifiable, Sendable {
+    let id = UUID()
+    let name: String
+    let data: Data
+}
 
 @MainActor
 struct ChatView: View {
-    /// The conversation's key, or a device of it (before its account is known).
-    let key: String
+    let ref: ChatRef
     @EnvironmentObject private var store: NodeStore
     @State private var entries: [HistoryEntry] = []
     @State private var pending: [String] = []
     @State private var text = ""
+    @State private var replyTo: HistoryEntry?
+    @State private var editing: HistoryEntry?
+    @State private var editText = ""
+    @State private var deleting: Deleting?
+    @State private var reactingTo: Reacting?
+    /// Sensitive photos the user uncovered (by "atMs/device").
+    @State private var revealed: Set<String> = []
     @State private var sentRead: Set<UInt64> = []
     @State private var typingSent = false
     @State private var typingSentAt = Date.distantPast
     @State private var failure: String?
+    @State private var notice: String?
     /// This chat's scheduled messages, soonest first.
     @State private var scheduled: [ScheduledInfo] = []
     @State private var showLater = false
     @State private var showScheduled = false
+    // Search in this chat.
+    @State private var searching = false
+    @State private var query = ""
+    @State private var hits: [HistoryEntry] = []
+    @State private var hitIndex = 0
+    /// A message to bring into view (a quoted one, a search hit).
+    @State private var jump: HistoryEntry?
+    @State private var scrollTarget: String?
+    // Sending files.
+    @State private var pickingPhotos = false
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var pickingFiles = false
+    @State private var picked: [PickedFile] = []
+    @State private var sending = false
+    @State private var previewURL: URL?
     @FocusState private var focused: Bool
     @Environment(\.scenePhase) private var scenePhase
 
-    private var convo: Conversation? { store.conversation(key) }
-    private var device: String { convo?.device ?? key }
-    private var devices: Set<String> { Set(convo?.devices ?? [key]).union([key]) }
+    private var node: ThrenodyNode? { store.node(for: ref.persona) }
+    private var convo: Conversation? {
+        guard case let .contact(k) = ref.target else { return nil }
+        return store.conversation(k, persona: ref.persona)
+    }
+    private var group: GroupInfo? { store.row(ref)?.group }
+    private var contactKey: String? {
+        if case let .contact(k) = ref.target { return k }
+        return nil
+    }
+    private var device: String { convo?.device ?? contactKey ?? "" }
+    private var devices: Set<String> {
+        guard let k = contactKey else { return [] }
+        return Set(convo?.devices ?? [k]).union([k])
+    }
+    private var target: ChatTarget? { node.map { ChatTarget(node: $0, ref: ref, device: device) } }
+    private var title: String {
+        switch ref.target {
+        case .contact: convo?.title ?? NodeStore.short(contactKey ?? "")
+        case .group: group?.name ?? "Group"
+        case .notes: "Note to self"
+        case .groupInvite: store.row(ref)?.title ?? "Invitation"
+        }
+    }
 
     var body: some View {
+        Group {
+            if node != nil {
+                chat
+            } else if ref.persona != nil && (!store.personasReady || store.personaLabels[ref.persona ?? ""] != nil) {
+                ProgressView("Opening anonymous identity…")
+            } else {
+                ContentUnavailableView("This anonymous identity was burned.", systemImage: "flame")
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// The chat, in parts the type checker takes one at a time.
+    private var chat: some View {
+        withEvents(withDialogs(withSheets(layout)))
+    }
+
+    private var layout: some View {
         VStack(spacing: 0) {
             if let c = convo { banner(c) }
+            if searching { searchBar }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 6) {
-                        ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
-                            Bubble(entry: e, fromThisDevice: e.device == store.myDevice)
+                        ForEach(ChatItem.group(entries)) { item in
+                            itemView(item).id(item.id)
                         }
                         ForEach(Array(pending.enumerated()), id: \.offset) { _, body in
                             PendingBubble(text: body)
@@ -46,43 +157,203 @@ struct ChatView: View {
                     .padding(.vertical, 8)
                 }
                 .defaultScrollAnchor(.bottom)
-                .onChange(of: entries.count + pending.count) { proxy.scrollTo("bottom") }
+                .onChange(of: entries.count + pending.count) { if jump == nil { proxy.scrollTo("bottom") } }
+                .onChange(of: scrollTarget) { _, id in
+                    guard let id else { return }
+                    withAnimation { proxy.scrollTo(id, anchor: .center) }
+                    scrollTarget = nil
+                }
             }
             if !scheduled.isEmpty { scheduledBar }
+            if let r = replyTo { replyStrip(r) }
             compose
         }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    searching.toggle()
+                    if !searching { endSearch() }
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .accessibilityLabel("Search this chat")
+                switch ref.target {
+                case .contact:
+                    NavigationLink { ContactInfoView(ref: ref) } label: { Image(systemName: "info.circle") }
+                case .group:
+                    NavigationLink { GroupInfoView(ref: ref) } label: { Image(systemName: "info.circle") }
+                default:
+                    EmptyView()
+                }
+            }
+        }
+    }
+
+    private func withSheets(_ content: some View) -> some View {
+        content
         .sheet(isPresented: $showLater) {
             LaterSheet(initial: nil, text: nil) { date, _ in if let date { sendLater(date) } }
         }
         .sheet(isPresented: $showScheduled) {
             ScheduledList(items: scheduled) { item, action in scheduledAction(item, action) }
         }
-        .navigationTitle(convo?.title ?? NodeStore.short(key))
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                NavigationLink {
-                    ContactInfoView(key: key)
-                } label: {
-                    Image(systemName: "info.circle")
-                }
+        .sheet(isPresented: Binding(get: { !picked.isEmpty }, set: { if !$0 { picked = [] } })) {
+            SendSheet(files: picked, caption: text, strip: node?.stripMetadata() ?? true) { caption, sensitive in
+                let files = picked
+                picked = []
+                sendFiles(files, caption: caption, sensitive: sensitive)
             }
         }
+        .sheet(item: $reactingTo) { r in
+            EmojiInputSheet { emoji in react(r.entry, emoji) }
+        }
+        .photosPicker(isPresented: $pickingPhotos, selection: $photoItems, maxSelectionCount: 10,
+                      matching: .images, preferredItemEncoding: .current)
+        .onChange(of: photoItems) { _, items in
+            guard !items.isEmpty else { return }
+            photoItems = []
+            Task { await loadPhotos(items) }
+        }
+        .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            if case let .success(urls) = result { loadFiles(urls) }
+        }
+        .quickLookPreview($previewURL)
+    }
+
+    private func withDialogs(_ content: some View) -> some View {
+        content
         .alert("Couldn't send", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(failure ?? "")
         }
+        .alert("Threnody", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(notice ?? "")
+        }
+        .alert("Edit message", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } }),
+               presenting: editing) { e in
+            TextField("Message", text: $editText)
+            Button("Save") { edit(e, editText) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("They see it marked as edited, if they're running a current version.")
+        }
+        .confirmationDialog(
+            deleting?.everyone == true ? "Delete for everyone?" : "Delete for you?",
+            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+            titleVisibility: .visible,
+            presenting: deleting
+        ) { d in
+            Button("Delete", role: .destructive) { delete(d) }
+        } message: { d in
+            Text(d.everyone
+                ? "Their devices delete it too, if they're running a current version."
+                : "It's deleted from this device. Others keep their copies.")
+        }
+    }
+
+    private func withEvents(_ content: some View) -> some View {
+        content
         .task { await appear() }
         .onDisappear(perform: close)
-        .onReceive(store.events) { e in
-            if let peer = e.peer, devices.contains(peer) { Task { await load() } }
-            if case .historySynced = e { Task { await load() } }
+        .onReceive(store.events) { se in
+            if concerns(se) { Task { await load() } }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await load() } }
         }
         .onChange(of: text) { _, t in sendTyping(focused && !t.isEmpty) }
+        .task(id: query) { await runSearch() }
+        .onChange(of: jump) { _, e in
+            guard let e else { return }
+            Task {
+                await load()
+                scrollTarget = ChatItem.key(item(containing: e) ?? e)
+            }
+        }
+    }
+
+    /// Whether an event may change what this chat shows.
+    private func concerns(_ se: StoreEvent) -> Bool {
+        guard se.persona == ref.persona else { return false }
+        if case .historySynced = se.event { return true }
+        switch ref.target {
+        case .contact: return se.event.peer.map { devices.contains($0) } ?? false
+        case let .group(g): return se.event.group == g
+        case .notes, .groupInvite: return false
+        }
+    }
+
+    // MARK: Rows
+
+    @ViewBuilder private func itemView(_ item: ChatItem) -> some View {
+        let e = item.first
+        let fromGroupMember = ref.isGroup && !e.outgoing
+        Bubble(
+            item: item,
+            sender: fromGroupMember ? store.name(e.device, persona: ref.persona) : nil,
+            fromThisDevice: e.device == node?.deviceFingerprint(),
+            quoteAuthor: e.quote.map { store.name($0.author, persona: ref.persona) },
+            names: e.mentions.map { store.name($0.device, persona: ref.persona) },
+            query: searching ? query : "",
+            revealed: revealed,
+            persona: ref.persona,
+            onReveal: { revealed.insert(ChatItem.key($0)) },
+            onOpen: { previewURL = $0 },
+            onQuote: { q in
+                if let original = entries.first(where: { $0.id == q.id && $0.id != 0 }) { jump = original }
+            },
+            onReact: { reaction in
+                guard let t = target, t.canReact(e) else { return }
+                toggle(e, reaction.emoji, add: !reaction.mine)
+            }
+        )
+        .contextMenu { menu(item) }
+    }
+
+    @ViewBuilder private func menu(_ item: ChatItem) -> some View {
+        let e = item.first
+        let canReact = target?.canReact(e) ?? false
+        let mine = ref.isGroup == false && contactKey != nil && e.outgoing
+            && e.device == node?.deviceFingerprint() && item.entries.allSatisfy { $0.id != 0 }
+        if canReact {
+            ControlGroup {
+                ForEach(["👍", "❤️", "😂", "😮", "😢", "🙏"], id: \.self) { emoji in
+                    Button(emoji) { toggle(e, emoji, add: !e.reactions.contains { $0.emoji == emoji && $0.mine }) }
+                }
+            }
+            Button("More reactions…", systemImage: "face.smiling") { reactingTo = Reacting(entry: e) }
+        }
+        Button("Reply", systemImage: "arrowshape.turn.up.left") {
+            replyTo = e
+            focused = true
+        }
+        if !e.text.isEmpty {
+            Button("Copy", systemImage: "doc.on.doc") {
+                UIPasteboard.general.setItems([[UTType.plainText.identifier: e.text]], options: [.localOnly: true])
+            }
+        }
+        if mine && e.file == nil && e.poll == nil {
+            Button("Edit", systemImage: "pencil") {
+                editText = e.text
+                editing = e
+            }
+        }
+        Button("Delete for me", systemImage: "trash", role: .destructive) {
+            deleting = Deleting(entries: item.entries, everyone: false)
+        }
+        if mine {
+            Button("Delete for everyone", systemImage: "trash.fill", role: .destructive) {
+                deleting = Deleting(entries: item.entries, everyone: true)
+            }
+        }
+    }
+
+    /// The album row an entry is in (its first entry), if any.
+    private func item(containing e: HistoryEntry) -> HistoryEntry? {
+        ChatItem.group(entries).first { $0.entries.contains { $0.atMs == e.atMs && $0.device == e.device } }?.first
     }
 
     @ViewBuilder private func banner(_ c: Conversation) -> some View {
@@ -93,22 +364,71 @@ struct ChatView: View {
             }
         } else if !c.verified && c.anyVerified {
             Banner(text: "⚠ \(c.title) added a device you haven't verified. Until you compare its safety number, someone else could be reading as them.", warning: true) {
-                NavigationLink("Compare") { ContactInfoView(key: key) }
+                NavigationLink("Compare") { ContactInfoView(ref: ref) }
             }
         } else if !c.approved {
             Banner(text: "Approve \(c.title) once you trust them, and compare safety numbers to make sure no one is in the middle. Mutually approved contacts relay for each other and hold each other's messages while offline.") {
                 Button("Approve") { act { try $0.setApproval(peer: c.device, approved: true) } }
-                NavigationLink("Compare") { ContactInfoView(key: key) }
+                NavigationLink("Compare") { ContactInfoView(ref: ref) }
             }
         } else if !c.verified {
             Banner(text: "⚠ Not verified. Compare safety numbers with \(c.title) to make sure no one is in the middle.", warning: true) {
-                NavigationLink("Compare") { ContactInfoView(key: key) }
+                NavigationLink("Compare") { ContactInfoView(ref: ref) }
             }
         }
     }
 
+    private var searchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search this chat", text: $query)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            if !hits.isEmpty {
+                Text("\(hitIndex + 1) of \(hits.count)").font(.caption).foregroundStyle(.secondary)
+            } else if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                Text("No results").font(.caption).foregroundStyle(.secondary)
+            }
+            Button { step(1) } label: { Image(systemName: "chevron.up") }
+                .disabled(hitIndex + 1 >= hits.count)
+                .accessibilityLabel("Older")
+            Button { step(-1) } label: { Image(systemName: "chevron.down") }
+                .disabled(hitIndex == 0 || hits.isEmpty)
+                .accessibilityLabel("Newer")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private func replyStrip(_ r: HistoryEntry) -> some View {
+        HStack {
+            Rectangle().fill(Color.accentColor).frame(width: 3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Replying to \(store.name(r.device, persona: ref.persona))").font(.caption.bold())
+                Text(entryPreview(entry: r)).font(.caption).lineLimit(1).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { replyTo = nil } label: { Image(systemName: "xmark.circle.fill") }
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Cancel reply")
+        }
+        .frame(height: 40)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .background(.bar)
+    }
+
     private var compose: some View {
         HStack(alignment: .bottom, spacing: 8) {
+            Menu {
+                Button("Photos", systemImage: "photo.on.rectangle") { pickingPhotos = true }
+                Button("File", systemImage: "doc") { pickingFiles = true }
+            } label: {
+                Image(systemName: sending ? "hourglass" : "paperclip").font(.system(size: 22))
+            }
+            .disabled(sending)
+            .accessibilityLabel("Attach")
             TextField("Message", text: $text, axis: .vertical)
                 .lineLimit(1...6)
                 .focused($focused)
@@ -121,8 +441,10 @@ struct ChatView: View {
             .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityHint("Touch and hold to send later")
             .contextMenu {
-                Button("Send Later…", systemImage: "clock") { showLater = true }
-                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if !(ref.target == .notes) {
+                    Button("Send Later…", systemImage: "clock") { showLater = true }
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -149,60 +471,124 @@ struct ChatView: View {
         .background(.bar)
     }
 
+    // MARK: Loading
+
     private func appear() async {
-        store.visibleChat = devices
+        store.visibleChat = ref
+        store.visibleDevices = devices
         // Not connected: look for them across the internet now.
-        if let n = store.node {
+        if let n = node, contactKey != nil {
             let d = device
             Task.detached { try? n.seek(peer: d) }
         }
-        if let n = store.node, text.isEmpty {
-            let d = device
-            text = (try? await offMain { try n.draft(peer: d) }) ?? ""
+        if let t = target, text.isEmpty {
+            text = (try? await offMain { t.draft() }) ?? ""
+        }
+        if let p = store.pendingJump, p.ref == ref {
+            store.pendingJump = nil
+            query = p.query
+            searching = !p.query.isEmpty
+            jump = p.entry
         }
         await load()
     }
 
     private func close() {
-        store.visibleChat = []
+        if store.visibleChat == ref {
+            store.visibleChat = nil
+            store.visibleDevices = []
+        }
         sendTyping(false)
-        guard let n = store.node else { return }
-        let (d, t) = (device, text)
-        Task.detached { try? n.setDraft(peer: d, text: t) }
+        guard let t = target else { return }
+        let draft = text
+        Task.detached { t.setDraft(draft) }
     }
 
     private func load() async {
-        guard let n = store.node else { return }
-        let d = device
-        let k = convo?.key ?? key
-        guard let h = try? await offMain({ try n.history(peer: d, limit: 300) }) else { return }
+        guard let t = target else { return }
+        let want = jump
+        guard let h = try? await offMain({ () -> [HistoryEntry] in
+            var limit: UInt32 = 300
+            var h = try t.history(limit: limit)
+            // An older message to show: load more until it's there.
+            if let want {
+                while !h.contains(where: { $0.atMs == want.atMs && $0.device == want.device })
+                    && h.count >= Int(limit) && limit < 10_000 {
+                    limit *= 2
+                    h = try t.history(limit: limit)
+                }
+            }
+            return h
+        }) else { return }
         entries = h
-        scheduled = (try? await offMain { try n.scheduled(peer: d) }) ?? []
+        scheduled = (try? await offMain { try t.scheduled() }) ?? []
         guard scenePhase == .active else { return }
-        _ = try? await offMain { try n.markSeen(chat: k) }
-        // Incoming messages now on screen are read.
+        _ = try? await offMain { t.markSeen() }
+        // Incoming messages now on screen are read: reported to contacts
+        // we accepted, unless read receipts are off.
+        guard t.isContact, Prefs.flag(Prefs.sendRead), convo?.accepted != false, let n = node else { return }
         let ids = h.filter { !$0.outgoing && $0.id != 0 && !sentRead.contains($0.id) }.map(\.id)
-        guard !ids.isEmpty, convo?.accepted != false else { return }
+        guard !ids.isEmpty else { return }
+        let d = device
         // Without a session now, they're reported on a later load.
         if (try? await offMain { try n.reportRead(peer: d, ids: ids) }) != nil {
             sentRead.formUnion(ids)
         }
     }
 
+    // MARK: Search
+
+    private func runSearch() async {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard searching, !q.isEmpty, let t = target else {
+            hits = []
+            hitIndex = 0
+            return
+        }
+        try? await Task.sleep(for: .milliseconds(300))
+        guard !Task.isCancelled else { return }
+        let found = (try? await offMain { try t.search(q, limit: 500) }) ?? []
+        guard !Task.isCancelled else { return }
+        hits = found
+        hitIndex = 0
+        if let first = found.first { jump = first }
+    }
+
+    /// One hit older (+1) or newer (-1).
+    private func step(_ by: Int) {
+        let i = hitIndex + by
+        guard hits.indices.contains(i) else { return }
+        hitIndex = i
+        jump = hits[i]
+    }
+
+    private func endSearch() {
+        query = ""
+        hits = []
+        hitIndex = 0
+        jump = nil
+    }
+
+    // MARK: Sending
+
     private func send() {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty, let n = store.node else { return }
+        guard !body.isEmpty, let t = target else { return }
+        let quoted = replyTo
         text = ""
+        replyTo = nil
         pending.append(body)
         sendTyping(false)
-        let d = device
         Task {
             do {
-                _ = try await offMain { try n.sendText(peer: d, text: body) }
+                if let warning = try await offMain({ try t.send(body, replyTo: quoted) }) { failure = warning }
             } catch {
+                // Back in the box, unless something else was typed meanwhile.
+                if text.isEmpty { text = body }
                 failure = error.localizedDescription
             }
             if let i = pending.firstIndex(of: body) { pending.remove(at: i) }
+            jump = nil
             await load()
             store.refresh()
         }
@@ -211,15 +597,14 @@ struct ChatView: View {
     /// Schedules what's in the message box for `date`, as `send` sends it now.
     private func sendLater(_ date: Date) {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty, let n = store.node else { return }
+        guard !body.isEmpty, let t = target else { return }
         let due = UInt64(max(0, date.timeIntervalSince1970 * 1000))
         // Clearing it also saves an empty draft on leaving, as after a send.
         text = ""
         sendTyping(false)
-        let d = device
         Task {
             do {
-                _ = try await offMain { try n.scheduleText(peer: d, text: body, dueMs: due, quoteAtMs: nil, quoteDevice: nil) }
+                try await offMain { try t.schedule(body, dueMs: due) }
             } catch {
                 if text.isEmpty { text = body }
                 failure = error.localizedDescription
@@ -254,10 +639,129 @@ struct ChatView: View {
         Task { await load() }
     }
 
+    /// Picked photos: their bytes, under neutral names (a time in a name
+    /// is metadata too).
+    private func loadPhotos(_ items: [PhotosPickerItem]) async {
+        var files: [PickedFile] = []
+        for (i, item) in items.enumerated() {
+            guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+            let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
+            files.append(PickedFile(name: items.count > 1 ? "photo-\(i + 1).\(ext)" : "photo.\(ext)", data: data))
+        }
+        if files.isEmpty { failure = "Couldn't read the photos." } else { picked = files }
+    }
+
+    private func loadFiles(_ urls: [URL]) {
+        let limit = node?.maxFileSize() ?? UInt64.max
+        var files: [PickedFile] = []
+        var refused: [String] = []
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if UInt64(max(0, size)) > limit {
+                refused.append("\(url.lastPathComponent) is too large to send")
+            } else if let data = try? Data(contentsOf: url) {
+                files.append(PickedFile(name: url.lastPathComponent, data: data))
+            } else {
+                refused.append("Couldn't read \(url.lastPathComponent)")
+            }
+        }
+        if !refused.isEmpty { failure = refused.joined(separator: "\n") }
+        if !files.isEmpty { picked = files }
+    }
+
+    /// Sends picked files: prepared (photo metadata removed), kept for
+    /// ourselves, and sent; several go as an album, captioned once.
+    private func sendFiles(_ files: [PickedFile], caption: String, sensitive: Bool) {
+        guard let t = target, let n = node else { return }
+        if !caption.isEmpty && caption == text.trimmingCharacters(in: .whitespacesAndNewlines) { text = "" }
+        let persona = ref.persona
+        sending = true
+        Task {
+            let errors = (try? await offMain { () -> [String] in
+                let strip = n.stripMetadata()
+                let limit = n.maxFileSize()
+                let album = files.count > 1 ? albumId() : 0
+                var errors: [String] = []
+                for (i, f) in files.enumerated() {
+                    do {
+                        let (name, data) = try Media.prepare(name: f.name, data: f.data, strip: strip, max: limit)
+                        let location = Media.save(name: name, data: data, persona: persona)
+                        do {
+                            let options = FileOptions(sensitive: sensitive, caption: i == 0 ? caption : "", album: album)
+                            try t.sendFile(name: name, data: data, location: location, options: options)
+                        } catch {
+                            Media.forget(location)
+                            throw error
+                        }
+                    } catch {
+                        errors.append(error.localizedDescription)
+                    }
+                }
+                return errors
+            }) ?? []
+            sending = false
+            if !errors.isEmpty { failure = errors.joined(separator: "\n") }
+            jump = nil
+            await load()
+            store.refresh()
+        }
+    }
+
+    // MARK: Message actions
+
+    private func toggle(_ e: HistoryEntry, _ emoji: String, add: Bool) {
+        guard let t = target else { return }
+        Task {
+            do {
+                _ = try await offMain { try t.react(e, emoji, add: add) }
+            } catch {
+                failure = error.localizedDescription
+            }
+            await load()
+        }
+    }
+
+    private func react(_ e: HistoryEntry, _ emoji: String) {
+        let add = !e.reactions.contains { $0.emoji == emoji && $0.mine }
+        toggle(e, emoji, add: add)
+    }
+
+    private func edit(_ e: HistoryEntry, _ body: String) {
+        let new = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let t = target, !new.isEmpty, new != e.text else { return }
+        Task {
+            do {
+                let edited = try await offMain { try t.edit(e, new) }
+                if !edited { failure = "It can't be edited any more." }
+            } catch {
+                failure = error.localizedDescription
+            }
+            await load()
+        }
+    }
+
+    private func delete(_ d: Deleting) {
+        guard let t = target else { return }
+        Task {
+            do {
+                try await offMain { try t.delete(d.entries, everyone: d.everyone) }
+                if d.everyone { notice = "Deleted. Their devices delete it too, if they're running a current version." }
+            } catch {
+                failure = error.localizedDescription
+            }
+            await load()
+            store.refresh()
+        }
+    }
+
     /// Tells the contact we started or stopped typing: on a change, and
-    /// again now and then while typing goes on.
+    /// again now and then while typing goes on. Starts only with typing
+    /// indicators on; a stop always goes.
     private func sendTyping(_ on: Bool) {
-        guard let n = store.node, convo?.accepted != false else { return }
+        guard let n = node, contactKey != nil, convo?.accepted != false else { return }
+        if on && !Prefs.flag(Prefs.sendTyping) { return }
         if typingSent == on && !(on && Date().timeIntervalSince(typingSentAt) > 4) { return }
         typingSent = on
         typingSentAt = Date()
@@ -266,7 +770,7 @@ struct ChatView: View {
     }
 
     private func act(_ f: @escaping @Sendable (ThrenodyNode) throws -> Void) {
-        guard let n = store.node else { return }
+        guard let n = node else { return }
         Task {
             do {
                 try await offMain { try f(n) }
@@ -274,8 +778,60 @@ struct ChatView: View {
                 failure = error.localizedDescription
             }
             store.refresh()
+            await load()
         }
     }
+}
+
+/// "More reactions…": any one emoji from the keyboard.
+struct EmojiInputSheet: View {
+    let pick: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Type one emoji", text: $text)
+                    .focused($focused)
+                    .font(.largeTitle)
+                    .multilineTextAlignment(.center)
+            }
+            .navigationTitle("React")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("React") {
+                        let e = text.trimmingCharacters(in: .whitespaces)
+                        dismiss()
+                        pick(e)
+                    }
+                    .disabled(!Emoji.isSingle(text.trimmingCharacters(in: .whitespaces)))
+                }
+            }
+            .onAppear { focused = true }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+enum Emoji {
+    /// Whether `s` is exactly one emoji (a flag, a skin tone and a ZWJ
+    /// sequence included), not a letter or digit.
+    static func isSingle(_ s: String) -> Bool {
+        guard s.count == 1, let c = s.first else { return false }
+        let scalars = Array(c.unicodeScalars)
+        if scalars.contains(where: { $0.properties.isEmojiPresentation }) { return true }
+        return scalars.count > 1 && scalars[0].properties.isEmoji
+    }
+}
+
+/// A message to react to with any emoji.
+private struct Reacting: Identifiable {
+    let entry: HistoryEntry
+    var id: String { ChatItem.key(entry) }
 }
 
 struct Banner<Actions: View>: View {
@@ -291,107 +847,6 @@ struct Banner<Actions: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .background(warning ? Color.orange.opacity(0.15) : Color.accentColor.opacity(0.12))
-    }
-}
-
-private struct Bubble: View {
-    let entry: HistoryEntry
-    let fromThisDevice: Bool
-
-    var body: some View {
-        let out = entry.outgoing
-        HStack {
-            if out { Spacer(minLength: 48) }
-            VStack(alignment: .trailing, spacing: 2) {
-                if let file = entry.file {
-                    FileContent(file: file, caption: entry.text)
-                } else {
-                    Text(entry.text).frame(maxWidth: .infinity, alignment: .leading).fixedSize(horizontal: false, vertical: true)
-                }
-                Text(meta)
-                    .font(.caption2)
-                    .foregroundStyle(out ? Color.white.opacity(0.8) : Color.secondary)
-                    .accessibilityLabel(meta.replacingOccurrences(of: "✓✓", with: "delivered").replacingOccurrences(of: "✓", with: "sent").replacingOccurrences(of: "👁️", with: "read"))
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .foregroundStyle(out ? Color.white : Color.primary)
-            .background(out ? Color.accentColor : Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
-            .fixedSize(horizontal: false, vertical: true)
-            if !out { Spacer(minLength: 48) }
-        }
-    }
-
-    private var meta: String {
-        var s = Date(ms: entry.atMs).formatted(date: .omitted, time: .shortened)
-        if entry.edited { s += " · edited" }
-        if entry.disappearing { s += " · ⏱" }
-        guard entry.outgoing else { return s }
-        // Sent from another of our devices: its ticks as that device
-        // passed them on (the node decides; never a lone "sent").
-        if !fromThisDevice { s += " · from your other device" }
-        switch entry.tick {
-        case .read: return s + " 👁️"
-        case .delivered: return s + " ✓✓"
-        case let .partial(delivered, recipients): return s + " ✓ \(delivered)/\(recipients)"
-        case .sent: return s + " ✓"
-        case .none: return s
-        }
-    }
-}
-
-private struct FileContent: View {
-    let file: FileInfo
-    let caption: String
-    @State private var image: UIImage?
-
-    var body: some View {
-        let url = Paths.resolve(file.location)
-        let label = file.sensitive ? "Sensitive file" : (caption.isEmpty ? file.name : caption)
-        VStack(alignment: .leading, spacing: 6) {
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 240, maxHeight: 320)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
-            if let url {
-                ShareLink(item: url) { Label(label, systemImage: "paperclip") }
-            } else {
-                Label(label, systemImage: "paperclip")
-            }
-        }
-        .task(id: file.location) {
-            guard !file.sensitive, let url else { return }
-            image = try? await offMain { Thumbnail.load(url, maxSide: 960) }
-        }
-    }
-}
-
-/// Pictures for chat bubbles: decoded small, off the main thread, and
-/// refused when too large, as on Android.
-enum Thumbnail {
-    /// Larger images are refused rather than decoded (decompression bombs).
-    static let maxPixels = 100_000_000.0
-
-    /// The image at `url`, at most `maxSide` pixels on its longer side, or
-    /// nil if it isn't one, can't be read, or is too large to decode.
-    static func load(_ url: URL, maxSide: Int) -> UIImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
-              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let w = props[kCGImagePropertyPixelWidth] as? Int,
-              let h = props[kCGImagePropertyPixelHeight] as? Int,
-              w > 0, h > 0, Double(w) * Double(h) <= maxPixels
-        else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxSide,
-        ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-        return UIImage(cgImage: cg)
     }
 }
 

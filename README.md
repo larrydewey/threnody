@@ -31,7 +31,7 @@ All downloads are on the [latest release](https://github.com/larrydewey/threnody
 - **Linux desktop**: clone this repository and run `apps/linux/install.sh`. It builds the app (you need Rust, GTK 4 and libadwaita; see [the Linux app's README](apps/linux/README.md)) and adds it to your app menu.
 - **Command line** for Linux, macOS and Windows: `threnody-<version>-<platform>.tar.gz` (or `.zip`). See [Quick start](#quick-start).
 
-Every release has a `SHA256SUMS` file, and every file carries signed build provenance: `gh attestation verify <file> -R larrydewey/threnody` checks that this repository's release workflow built it. There's no iOS release yet; a first iOS app builds from source in [`apps/ios`](apps/ios/README.md).
+Every release has a `SHA256SUMS` file, and every file carries signed build provenance: `gh attestation verify <file> -R larrydewey/threnody` checks that this repository's release workflow built it. There's no iOS release yet; the iOS app builds from source in [`apps/ios`](apps/ios/README.md).
 
 ## How it compares
 
@@ -193,7 +193,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 3. **Tunnels (remaining).** The userspace data plane on iOS and unprivileged desktops (Android has it).
 4. **Mesh (remaining).** Upgrading to Wi-Fi Direct automatically for large transfers, and a phone-to-phone Wi-Fi Direct test.
 5. **Metadata (remaining).** Relays that hold a connection for a device behind NAT, as onion services do (Appendix N, "Later"), and cover traffic inside circuits.
-6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service, or, if the user chooses, sleeps and is woken through UnifiedPush by the contacts holding its messages ([Appendix R](docs/appendix-r-push.md)). A first iOS app is in [`apps/ios`](apps/ios) (SwiftUI): 1:1 chat with receipts and typing, invites by QR code and link, approval and safety numbers; not yet groups, files out or calls. Still to do: the rest of Android's features on iOS, push wake-ups on iOS (it receives only while open), a field test of push wake-ups between two phones, and sending wake-ups through circuits so the push server doesn't see contacts' addresses.
+6. **Mobile (remaining).** An Android app is in [`apps/android`](apps/android), with conversations, chat, files, groups, invites by QR code and link, approval and safety numbers. Its transports have been tested on a Pixel 8a, and it keeps sessions alive in the background with a foreground service, or, if the user chooses, sleeps and is woken through UnifiedPush by the contacts holding its messages ([Appendix R](docs/appendix-r-push.md)). An iOS app is in [`apps/ios`](apps/ios) (SwiftUI) with Android's features except calls, tunnels, Bluetooth and Wi-Fi Direct links, and recording voice and video messages; it receives only while open, as iOS push would need a server that sees every wake-up ([why](apps/ios/README.md#why-no-push-on-ios)). Still to do: calls on iOS, a field test of push wake-ups between two phones, and sending wake-ups through circuits so the push server doesn't see contacts' addresses.
 
 ### Development
 
@@ -206,7 +206,7 @@ crates/threnody-ffi/bindings.sh    # generate bindings, run the Python binding t
 
 ### CI and releases
 
-Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, Android builds with and without calls (the second as F-Droid builds it), an iOS simulator build and a dependency advisory check (`.github/workflows/ci.yml`). It also builds and tests on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
+Every push and pull request runs formatting, clippy, the full test suite, the Python binding test, Android builds with and without calls (the second as F-Droid builds it), an iOS simulator build with its unit tests and a dependency advisory check (`.github/workflows/ci.yml`). It also builds and tests on macOS and Windows. Fuzzing and the Tamarin proofs run weekly, and the proofs also run whenever they change.
 
 To release, bump `version` in the workspace `Cargo.toml` and the matching `versionCode` and `versionName` literals in `apps/android/app/build.gradle.kts` (the Android build fails if they differ), add the Android changelog `fastlane/metadata/android/en-US/changelogs/<versionCode>.txt` (500 characters at most) and set the version in the F-Droid recipe (`apps/android/fdroid/org.threnody.app.yml`), then push a matching tag:
 
