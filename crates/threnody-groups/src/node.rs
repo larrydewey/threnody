@@ -1611,6 +1611,7 @@ impl GroupNode {
             GroupWire::Leave {
                 group,
                 proposal: None,
+                ..
             } if node.is_own_device(&from)
                 && self.members(&group).is_ok_and(|m| !m.contains(&from)) =>
             {
@@ -1654,6 +1655,7 @@ impl GroupNode {
                 let stay_out = GroupWire::Leave {
                     group,
                     proposal: None,
+                    signature: None,
                 };
                 self.deliver(node, from, stay_out, false, Tag::NONE);
                 if self.held.len() != held {

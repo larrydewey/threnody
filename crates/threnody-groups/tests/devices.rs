@@ -1632,7 +1632,8 @@ async fn a_device_that_declined_a_group_is_not_asked_again() {
     phone.node.link_with(&code).await.unwrap();
     until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
         ns[1].wires.iter().any(|(from, w)| {
-            *from == pid && matches!(w, GroupWire::Leave { group, proposal: None } if *group == g)
+            *from == pid
+                && matches!(w, GroupWire::Leave { group, proposal: None, .. } if *group == g)
         })
     })
     .await;
@@ -1746,7 +1747,8 @@ async fn a_device_that_left_turns_down_an_invitation_that_comes_after_it_restart
     phone.node.link_with(&code).await.unwrap();
     until(&mut [&mut laptop, &mut phone], |ns| {
         ns[0].wires.iter().any(|(from, w)| {
-            *from == pid && matches!(w, GroupWire::Leave { group, proposal: None } if *group == g)
+            *from == pid
+                && matches!(w, GroupWire::Leave { group, proposal: None, .. } if *group == g)
         })
     })
     .await;
@@ -1815,7 +1817,8 @@ async fn an_offer_naming_no_owner_does_not_hide_anothers_invitation() {
         .unwrap();
     until(&mut [&mut bob, &mut laptop, &mut phone], |ns| {
         ns[1].wires.iter().any(|(from, w)| {
-            *from == pid && matches!(w, GroupWire::Leave { group, proposal: None } if *group == g)
+            *from == pid
+                && matches!(w, GroupWire::Leave { group, proposal: None, .. } if *group == g)
         })
     })
     .await;
