@@ -153,6 +153,8 @@ final class NodeStore: ObservableObject {
     /// Started by a background refresh: anonymous identities and the
     /// handle wait for the app to come to the front.
     private var launchedInBackground = false
+    /// The app came to the front while the node was still opening.
+    private var wantsForeground = false
     private var foregroundDone = false
     private var sweeper: Task<Void, Never>?
     private let path = PathWatcher()
@@ -267,7 +269,7 @@ final class NodeStore: ObservableObject {
         refresh()
         armScheduled()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
-        if !launchedInBackground { foregroundSetup() }
+        if !launchedInBackground || wantsForeground { foregroundSetup() }
     }
 
     /// Once per process, the first time the app is in front with a node:
@@ -371,9 +373,7 @@ final class NodeStore: ObservableObject {
                 notifyGroup(group, from: from, persona: persona, node: n, body: label, quiet: quiet)
             }
         case let .groupInvited(group, name, from, quiet):
-            let who = conversation(from, persona: persona)?.title ?? Self.short(from)
-            notify(ChatRef(persona: persona, target: .groupInvite(group)), title: name,
-                   body: "\(who) invites you to join", quiet: quiet, disappears: false)
+            groupInvited(group, name: name, from: from, persona: persona, node: n, quiet: quiet)
         case let .disconnected(peer, _):
             if conversation(peer, persona: persona)?.mutual == true { n.reconnect() }
         case .scheduledChanged:
@@ -420,6 +420,25 @@ final class NodeStore: ObservableObject {
             notify(ChatRef(persona: persona, target: .contact(c.key)), title: "Safety alert: \(c.title)",
                    body: "\(c.title) added a device you haven't verified. Compare safety numbers.",
                    quiet: false, disappears: false, safety: true)
+        }
+    }
+
+    /// From a contact we accepted: the group's name and who invites. From
+    /// anyone else, not even the group's name: a stranger's can be a
+    /// message in itself (as on Android).
+    private func groupInvited(_ group: String, name: String, from: String, persona: String?, node n: ThrenodyNode, quiet: Bool) {
+        guard !quiet else { return }
+        let ref = ChatRef(persona: persona, target: .groupInvite(group))
+        let gen = Self.currentGeneration
+        Task {
+            let accepted = (try? await offMain { n.contacts().contains { $0.fingerprint == from && $0.accepted } }) ?? false
+            guard Self.currentGeneration == gen else { return }
+            if accepted {
+                let who = conversation(from, persona: persona)?.title ?? Self.short(from)
+                notify(ref, title: name, body: "\(who) invites you to join", quiet: false, disappears: false)
+            } else {
+                notify(ref, title: nil, body: "New group invitation", quiet: false, anonymous: true, disappears: false)
+            }
         }
     }
 
@@ -606,7 +625,7 @@ final class NodeStore: ObservableObject {
         let gen = Self.currentGeneration
         Task {
             let burned = (try? await offMain { try main.burnExpiredPersonas() }) ?? []
-            for id in burned { forgetPersona(id) }
+            for id in burned { forgetPersona(id, gen: gen) }
             let records = (try? await offMain { try main.personas() }) ?? []
             for r in records where Self.currentGeneration == gen {
                 personaLabels[r.id] = r.label
@@ -631,8 +650,9 @@ final class NodeStore: ObservableObject {
             } else {
                 addr = try n.listen(addr: "0.0.0.0:0")
             }
+            // Not if an erase came meanwhile: the port would say it existed.
             if let port = addr.split(separator: ":").last.flatMap({ UInt64($0) }) {
-                Prefs.setNumber(Prefs.portKey(id), port)
+                Prefs.setNumber(Prefs.portKey(id), port, generation: gen)
             }
             return n
         }
@@ -674,6 +694,7 @@ final class NodeStore: ObservableObject {
     /// Deletes an anonymous identity and everything it kept.
     func burnPersona(_ id: String) async throws {
         guard let main = node else { return }
+        let gen = Self.currentGeneration
         pumps.removeValue(forKey: id)?.stop()
         let n = personas.removeValue(forKey: id)
         if visibleChat?.persona == id { visibleChat = nil }
@@ -681,13 +702,15 @@ final class NodeStore: ObservableObject {
             n?.shutdown()
             try main.burnPersona(id: id)
         }
-        forgetPersona(id)
+        forgetPersona(id, gen: gen)
         refresh()
     }
 
-    private func forgetPersona(_ id: String) {
+    /// `gen`: when the burn began. After an erase there is nothing to forget.
+    private func forgetPersona(_ id: String, gen: Int) {
+        guard Self.currentGeneration == gen else { return }
         Media.remove(persona: id)
-        Prefs.setNumber(Prefs.portKey(id), nil)
+        Prefs.setNumber(Prefs.portKey(id), nil, generation: gen)
         personaLabels.removeValue(forKey: id)
     }
 
@@ -726,7 +749,10 @@ final class NodeStore: ObservableObject {
     /// background tasks, then shows onboarding as a first launch does.
     /// Nothing is sent: contacts and other devices aren't told.
     func wipe(alreadyErased: Bool = false) async {
-        Self.generation.withLock { $0 += 1 }
+        let gen = Self.generation.withLock { g -> Int in
+            g += 1
+            return g
+        }
         sweeper?.cancel()
         sweeper = nil
         for flag in pumps.values { flag.stop() }
@@ -740,7 +766,8 @@ final class NodeStore: ObservableObject {
             Media.removeAll()
             KeyVault.forget()
         }
-        Prefs.reset()
+        // After the node's erase: a settings write that landed since goes too.
+        Prefs.erased(generation: gen)
         if let id = Bundle.main.bundleIdentifier { UserDefaults.standard.removePersistentDomain(forName: id) }
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()
@@ -767,6 +794,7 @@ final class NodeStore: ObservableObject {
         listenAddr = ""
         launched = false
         launchedInBackground = false
+        wantsForeground = false
         foregroundDone = false
         AppLock.shared.reset()
         phase = .onboarding
@@ -792,6 +820,9 @@ final class NodeStore: ObservableObject {
             if node != nil {
                 foregroundSetup()
                 startSweeper()
+            } else {
+                // Opened during a background refresh's cold start: once the node is up.
+                wantsForeground = true
             }
             refresh()
             // Sends what's due, and replaces a stale reminder.

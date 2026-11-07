@@ -118,7 +118,7 @@ struct SettingsView: View {
                         LabeledContent("Device", value: NodeStore.short(n.deviceFingerprint()))
                         LabeledContent("Account", value: NodeStore.short(n.accountFingerprint()))
                         LabeledContent("Listening on", value: store.listenAddr)
-                        Text("Identity \(KeyVault.describe). Settings are kept with it, out of backups.")
+                        Text("Identity \(KeyVault.describe). Its privacy settings, handle and anonymous identities are kept with it, out of backups. Screen security and private notifications stay with the app, so they apply before the identity opens.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }

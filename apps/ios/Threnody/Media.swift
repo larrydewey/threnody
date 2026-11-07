@@ -131,6 +131,17 @@ enum Media {
         return decodable(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
     }
 
+    /// Whether QuickLook may open the file at `url`. Whatever its name
+    /// (.psd, .tga, .exr, .ico, …), anything ImageIO reads as an image is
+    /// decoded whole by QuickLook, so it must be `decodable`. Call it off
+    /// the main thread.
+    static func previewable(_ url: URL) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              CGImageSourceGetType(source) != nil
+        else { return true }
+        return decodable(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+    }
+
     private static let thumbs: NSCache<NSString, CGImage> = {
         let c = NSCache<NSString, CGImage>()
         c.totalCostLimit = 24 * 1024 * 1024

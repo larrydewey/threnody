@@ -199,9 +199,11 @@ struct FolderEditorView: View {
         }))
     }
 
-    /// Today at `minutes` after midnight, for the time pickers.
+    /// Today at `minutes` after midnight on the clock, for the time
+    /// pickers (by the clock, as `minutes` reads it back: on a
+    /// daylight-saving day, elapsed time would be an hour off).
     private static func date(_ minutes: UInt16) -> Date {
-        Calendar.current.startOfDay(for: Date()).addingTimeInterval(TimeInterval(minutes) * 60)
+        Calendar.current.date(bySettingHour: Int(minutes) / 60 % 24, minute: Int(minutes) % 60, second: 0, of: Date()) ?? Date()
     }
 
     private static func minutes(_ d: Date) -> UInt16 {

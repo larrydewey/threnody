@@ -189,6 +189,8 @@ struct FileContent: View {
     let onOpen: (URL) -> Void
     @State private var image: UIImage?
     @State private var unshowable = false
+    /// A file that turned out to be an image too large for QuickLook.
+    @State private var refused = false
 
     var body: some View {
         if let file = entry.file {
@@ -230,8 +232,11 @@ struct FileContent: View {
                         .fill(Color.secondary.opacity(0.2))
                         .frame(width: compact ? 120 : 220, height: compact ? 120 : 160)
                         .overlay(ProgressView())
+                } else if refused, let url {
+                    Label("\(label) · Too large to preview", systemImage: "paperclip")
+                    ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
                 } else if let url {
-                    Button { onOpen(url) } label: {
+                    Button { open(url, clip: file.clip != nil) } label: {
                         Label(label, systemImage: file.clip == nil ? "paperclip" : (file.clip?.video == true ? "video" : "waveform"))
                     }
                     .buttonStyle(.plain)
@@ -247,6 +252,19 @@ struct FileContent: View {
                     unshowable = true
                 }
             }
+        }
+    }
+
+    /// Opens a file in QuickLook, unless its bytes are an image too large
+    /// to decode, whatever its name says.
+    private func open(_ url: URL, clip: Bool) {
+        if clip {
+            onOpen(url)
+            return
+        }
+        Task {
+            let safe = (try? await offMain { Media.previewable(url) }) ?? false
+            if safe { onOpen(url) } else { refused = true }
         }
     }
 }

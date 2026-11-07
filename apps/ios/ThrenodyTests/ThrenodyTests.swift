@@ -46,6 +46,34 @@ final class PrefsTests: TempDirTestCase {
         XCTAssertFalse(Prefs.flag(Prefs.cover), "read back from the file")
     }
 
+    func testWritesFromBeforeAnEraseAreDropped() throws {
+        Prefs.setText(Prefs.handleName, "larry")
+        Prefs.setNumber(Prefs.portKey("ab12"), 40000)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Prefs.file.path))
+        let now = NodeStore.currentGeneration
+
+        // Between the node's erase and the bump the app still writes to
+        // the old generation: the file is deleted again after the bump.
+        Prefs.erased(generation: now)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Prefs.file.path))
+        XCTAssertNil(Prefs.text(Prefs.handleName))
+        // Work that began before the erase writes nothing.
+        Prefs.setNumber(Prefs.portKey("ab12"), 40000, generation: now - 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Prefs.file.path))
+        // Nor does anything while Prefs still belongs to another generation.
+        Prefs.erased(generation: now - 1)
+        Prefs.setFlag(Prefs.cover, false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Prefs.file.path))
+
+        // The new identity's settings are kept.
+        Prefs.erased(generation: now)
+        Prefs.setFlag(Prefs.cover, false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Prefs.file.path))
+        Prefs.reset()
+        XCTAssertFalse(Prefs.flag(Prefs.cover))
+        XCTAssertNil(Prefs.number(Prefs.portKey("ab12")))
+    }
+
     func testSettingsFileIsOutsideBackups() throws {
         XCTAssertFalse(FileManager.default.fileExists(atPath: Paths.home.path))
         Prefs.setFlag(Prefs.onion, false)
@@ -203,6 +231,34 @@ final class MediaTests: TempDirTestCase {
         try Self.encode(Self.image(64, 64), as: .png).write(to: url)
         let thumb = try XCTUnwrap(Media.thumbnail(url, maxSide: 32))
         XCTAssertLessThanOrEqual(max(thumb.width, thumb.height), 32)
+    }
+
+    func testImagesUnderOtherNamesAreCheckedBeforeQuickLook() throws {
+        // A PNG whose header claims 30000 × 30000, saved as .psd: QuickLook
+        // would decode it whole, whatever the name.
+        var png = try Self.encode(Self.image(8, 8), as: .png)
+        png.replaceSubrange(16..<24, with: [0, 0, 0x75, 0x30, 0, 0, 0x75, 0x30])
+        let crc = Self.crc32(png[12..<29])
+        png.replaceSubrange(29..<33, with: [UInt8(crc >> 24), UInt8(crc >> 16 & 0xff), UInt8(crc >> 8 & 0xff), UInt8(crc & 0xff)])
+        let huge = dir.appendingPathComponent("huge.psd")
+        try png.write(to: huge)
+        XCTAssertFalse(Media.previewable(huge))
+
+        let small = dir.appendingPathComponent("small.tga")
+        try Self.encode(Self.image(8, 8), as: .png).write(to: small)
+        XCTAssertTrue(Media.previewable(small))
+        let text = dir.appendingPathComponent("notes.txt")
+        try Data("just words".utf8).write(to: text)
+        XCTAssertTrue(Media.previewable(text))
+    }
+
+    static func crc32<C: Collection>(_ bytes: C) -> UInt32 where C.Element == UInt8 {
+        var crc: UInt32 = 0xffff_ffff
+        for b in bytes {
+            crc ^= UInt32(b)
+            for _ in 0..<8 { crc = crc & 1 == 1 ? (crc >> 1) ^ 0xedb8_8320 : crc >> 1 }
+        }
+        return ~crc
     }
 
     func testConvertedImagesCarryNoMetadata() throws {

@@ -16,19 +16,22 @@ enum Handles {
     }
 
     /// Publishes `name` at `version`; returns the handle.
+    /// Nothing is kept if an erase came meanwhile.
     static func publish(_ n: ThrenodyNode, name: String, version: UInt64) async throws -> String? {
+        let gen = NodeStore.currentGeneration
         let h = try await offMain { try n.setHandle(name: name, version: version) }
         if h != nil {
-            Prefs.setText(Prefs.handleName, name)
-            Prefs.setNumber(Prefs.handleVersion, version)
+            Prefs.setText(Prefs.handleName, name, generation: gen)
+            Prefs.setNumber(Prefs.handleVersion, version, generation: gen)
         }
         return h
     }
 
     /// Stops publishing it; it stops working within the hour.
     static func remove(_ n: ThrenodyNode) async {
+        let gen = NodeStore.currentGeneration
         _ = try? await offMain { try n.setHandle(name: nil, version: 0) }
-        Prefs.setText(Prefs.handleName, nil)
+        Prefs.setText(Prefs.handleName, nil, generation: gen)
     }
 }
 
