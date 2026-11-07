@@ -471,6 +471,11 @@ impl GroupNode {
         self.groups.outdated(group).unwrap_or_default()
     }
 
+    /// Whether this device coordinates the group.
+    pub fn is_lead(&self, group: &GroupId) -> bool {
+        self.groups.is_lead(group)
+    }
+
     /// Whether we asked to be brought back in step and haven't been yet.
     pub fn out_of_step(&self, group: &GroupId) -> bool {
         self.groups.out_of_step(group)
@@ -576,7 +581,10 @@ impl GroupNode {
         banner(
             self.out_of_step(group),
             self.can_claim(node, group, now_ms).then_some(roster.lead),
-            (pending > 0 && outdated.is_empty()).then_some((pending, roster.lead)),
+            // Ours wait for no one when we coordinate: only, at most, for
+            // members to update (`outdated`).
+            (pending > 0 && outdated.is_empty() && roster.lead != me)
+                .then_some((pending, roster.lead)),
             &outdated,
             members.len() <= 1,
         )
