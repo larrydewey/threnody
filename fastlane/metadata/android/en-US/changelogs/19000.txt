@@ -1,0 +1,8 @@
+- App lock with your phone's lock or a PIN; a duress PIN erases everything. Calls ring without showing who.
+- Schedule messages to send later.
+- Group admins.
+- Photos sync between your own devices on Wi-Fi.
+- Read receipts reach you after you were offline.
+- Add a contact by tapping phones (NFC).
+- Tunnels come back after a restart.
+- Linux: QR scan, photo editor and viewer, Bluetooth, Wi-Fi Direct and relay settings.
