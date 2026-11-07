@@ -11,7 +11,7 @@
 # so this uses Apache-2.0, as other dual-licensed Rust apps do.
 #
 # Each release's "prepare" commit sets the versions below to that release.
-# 0.19.0 is the first release built this way, and the first to submit.
+# 0.19.0 was the first release built this way.
 
 AntiFeatures:
   NonFreeNet:
@@ -35,9 +35,9 @@ RepoType: git
 Repo: https://github.com/larrydewey/threnody.git
 
 Builds:
-  - versionName: 0.19.0
-    versionCode: 19000
-    commit: v0.19.0
+  - versionName: 0.19.1
+    versionCode: 19001
+    commit: v0.19.1
     subdir: apps/android/app
     sudo:
       - apt-get update
@@ -72,5 +72,5 @@ MaintainerNotes: |-
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags ^v[0-9.]+$
-CurrentVersion: 0.19.0
-CurrentVersionCode: 19000
+CurrentVersion: 0.19.1
+CurrentVersionCode: 19001

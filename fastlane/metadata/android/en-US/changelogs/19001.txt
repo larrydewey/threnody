@@ -1,0 +1,3 @@
+- A newly linked device now joins the groups your account is already in.
+- Files a contact sends now show on all your devices, ready to get from the one that received them.
+- Group notices say who removed whom, and that someone left when they left.
