@@ -130,6 +130,8 @@ class MainActivity : Activity() {
             try {
                 node = Threnody.start(this)
                 refresh()
+                // App lock comes on by itself where the phone has a screen lock.
+                runOnUiThread { AppLockUi.firstRun(this) }
             } catch (e: Exception) {
                 runOnUiThread { failed("Couldn't start: ${e.message}") }
             }
@@ -145,6 +147,7 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         Threnody.visible++
+        ThrenodyService.clearLocked(this)
         unsubscribe = Threnody.subscribe { refreshSoon() }
         refreshSoon()
         // "My invite" still showing: serve it to a tapping phone again.
@@ -1016,6 +1019,14 @@ class MainActivity : Activity() {
             isCheckable = true
             isChecked = Push.enabled(this@MainActivity)
             setOnMenuItemClickListener { togglePush(); true }
+        }
+        privacySection.add("App lock…").setOnMenuItemClickListener { AppLockUi.show(this@MainActivity); true }
+        if (AppLock.enabled(this@MainActivity)) {
+            privacySection.add("Lock now").setOnMenuItemClickListener { AppLock.lockNow(this@MainActivity); true }
+        }
+        privacySection.add("Erase all Threnody data…").setOnMenuItemClickListener {
+            AppLockUi.eraseAll(this@MainActivity)
+            true
         }
 
         // Network & Connectivity

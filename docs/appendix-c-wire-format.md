@@ -284,6 +284,53 @@ ScheduledItem = {
 }
 ```
 
+### App lock
+
+The apps can lock their user interface behind an app PIN or passphrase, the device's own authentication, or both (`threnody-core::applock`). App lock is a gate on the screen, not encryption at rest: the node keeps running behind it so messages still arrive, and the identity stays protected as it was (sealed under a keystore-held secret). Its settings live in `lock.cbor` in the data directory, which exists exactly while app lock is on, so the apps can check that synchronously and fail closed before reading it (for example when the background service posts a notification at boot).
+
+The file holds Argon2id verifiers of the secrets, never the secrets, and is encrypted under a key derived from a *pepper* the platform passes in: the Keystore-protected secret on Android, the Secure Enclave-protected one on iOS, and a separate keyring entry (account `"<absolute home> app-lock"`) for keyring-sealed homes on Linux. A copy of the data directory then shows neither whether a duress secret is set nor anything to guess the PIN against offline. Linux homes sealed with a passphrase, or not sealed, have no pepper (`peppered` false, key from the empty string): the file is then protected only by the Argon2id cost, and a short PIN can be guessed offline.
+
+```
+key = KDF("app lock file key", pepper or "")
+ct  = ChaCha20-Poly1305(key, nonce, ad = "threnody lock", LockBody)
+```
+
+```cddl
+LockFile = { 0 => 1,                 ; version
+             1 => bool,              ; peppered
+             2 => bstr .size 12,     ; nonce
+             3 => bstr }             ; ct
+LockBody = { 0 => 1,
+             1 => [uint, uint / null],  ; lock after leaving (s, 0 = at once), lock when idle (s, null = never)
+             2 => bool,              ; unlock with biometrics / the device lock
+             ? 3 => [uint, PinSlot], ; the lock secret: 0 digits (4 to 16), 1 passphrase (6 or more characters)
+             4 => PinSlot,           ; the duress secret, or a random decoy
+             5 => bool,              ; duress secret set
+             6 => uint,              ; wrong entries in a row
+             7 => uint,              ; entries refused before (wall ms), 0 = none
+             8 => uint,              ; last wrong entry (wall ms), 0 = none
+             ? 9 => bool,            ; erase after 10 wrong entries in a row (absent = false)
+             15 => bstr }            ; zero padding: the body is always 512 bytes
+PinSlot  = { 0 => bstr .size 16,     ; salt
+             1 => bstr .size 32,     ; Argon2id(secret, salt)
+             2 => [uint, uint, uint] }  ; m KiB, t, lanes (19 MiB, 2, 1)
+```
+
+Without a key 3 the lock is the device's own (biometrics with the device credential as fallback), and key 2 must be true. Every entry on the lock screen is hashed under both slots and compared in constant time, so its timing doesn't show whether the duress secret was entered or whether one is set. The lock secret unlocks and resets the count. The duress secret, when set, erases the data directory (*Erasing*) and the app opens as newly installed. After 5 wrong entries in a row, entries are refused unchecked, duress secret included, for 30 s, doubling with each further wrong entry up to an hour; the refusal is kept in the file, so restarting doesn't end it. A clock set back before the last wrong entry restarts the current delay from the new time instead of keeping the user out for as long as the clock moved. Setting the clock forward skips a running delay; the Argon2id cost still bounds guessing. With key 9 set, the 10th wrong entry in a row erases everything, as the duress secret does. Changing or removing the lock secret, setting the duress secret and turning app lock off need the current secret. Readers skip unknown keys. Older versions ignore the file, so after a downgrade the lock doesn't apply.
+
+### Erasing
+
+The apps' "Erase all Threnody data", the duress secret and `threnody wipe` erase a data directory (`Home::erase`). Nothing is sent: contacts, linked devices and the network aren't told.
+
+1. Every `Home` handle opened on the directory before the erase (a node still shutting down, its groups node, its personas) is revoked. Its writes fail from then on and can't create the directory again. A handle opened later writes normally.
+2. The identity files go first, overwritten and then deleted: the main identity, then each persona's. Every other file is encrypted under them, so an erase interrupted after this step leaves nothing readable.
+3. Then the names Threnody writes there: `contacts.cbor`, `lock.cbor`, every `*.state` and `*.tmp`, `persona`, `desktop.lock`, `control.sock`, `restore-ready`, and the directories `personas/`, `media/`, `edited/`, `downloads/` and `wireguard/`. Anything else in the directory is kept and reported (a data directory set to the user's home by mistake must not lose their files). The directory itself is removed if it is then empty, and a data directory that is a symbolic link loses the link too.
+4. The staged restore beside it (`<home>.restore`) is removed.
+
+Before a new identity is created in a directory that has none, what an interrupted erase left there (contacts, state files, personas, `lock.cbor`) is removed, since it is encrypted under the old identity.
+
+Each platform also removes what it keeps outside the data directory: the keystore key and sealed passphrase (Android Keystore, iOS Secure Enclave and Keychain, the Linux keyring entries for every identity and the app-lock pepper), preferences and the desktop app's `desktop.conf`, caches and received media, the app's own files in `Downloads/Threnody`, posted notifications and their channels, and the UnifiedPush registration. On Android 13 and later the runtime permissions are revoked so the restarted app asks again; on older versions they stay granted, as does the VPN consent everywhere. On phones, deleting the keystore key is what makes the erase final, since overwriting isn't reliable on flash storage. A passphrase-sealed or unsealed identity on Linux depends on the file system freeing the data.
+
 ## Backups
 
 A backup (spec §6.4) holds everything needed to bring an identity back on a new device after the old one is lost. It is sealed under a passphrase the user chooses, at least 12 characters long (`threnody-core::backup`):

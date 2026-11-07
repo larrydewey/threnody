@@ -8,6 +8,8 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use const_cbor::Decoder;
 use zeroize::Zeroizing;
@@ -32,14 +34,77 @@ enum IdentityFile {
     Sealed(Vec<u8>),
 }
 
+/// Counts erases in this process (see [`revoke`]).
+static WIPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Directories erased in this process, each with the generation of its
+/// erase. Read-locked across every check-and-write, write-locked to
+/// revoke, so no write that passed its check can finish after an erase
+/// starts.
+static ERASED: RwLock<Vec<(PathBuf, u64)>> = RwLock::new(Vec::new());
+
+/// Marks `dir` (and everything under it) erased: every [`Home`] opened
+/// on it before now refuses to write from here on ([`Error::Wiped`]).
+/// Homes made later with [`Home::new`] write normally. Returns once no
+/// write to it is in progress.
+pub(crate) fn revoke(dir: &Path) {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut erased = ERASED.write().unwrap_or_else(|e| e.into_inner());
+    let at = WIPE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    erased.push((dir, at));
+}
+
 /// The per-user Threnody directory.
 pub struct Home {
     dir: PathBuf,
+    /// The erase generation when this handle (or the one it was derived
+    /// from) was opened; erases after it revoke it.
+    born: u64,
 }
 
 impl Home {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            born: WIPE_GENERATION.load(Ordering::SeqCst),
+        }
+    }
+
+    /// A home at `dir` that an erase of this one revokes too: what this
+    /// home's node opens beneath it (personas, a staged restore).
+    pub(crate) fn child(&self, dir: PathBuf) -> Home {
+        Home {
+            dir,
+            born: self.born,
+        }
+    }
+
+    /// Another handle on this directory, revoked with this one.
+    pub fn reopen(&self) -> Home {
+        self.child(self.dir.clone())
+    }
+
+    fn revoked_in(&self, list: &[(PathBuf, u64)]) -> bool {
+        let Ok(me) = std::path::absolute(&self.dir) else {
+            return false;
+        };
+        list.iter()
+            .any(|(d, at)| *at > self.born && me.starts_with(d))
+    }
+
+    /// Whether an erase since this handle was opened covers it.
+    pub fn is_revoked(&self) -> bool {
+        let list = ERASED.read().unwrap_or_else(|e| e.into_inner());
+        self.revoked_in(&list)
+    }
+
+    /// Writes `bytes` to `path` in this home ([`write_private`]), unless
+    /// the home was erased since this handle was opened.
+    pub(crate) fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let list = ERASED.read().unwrap_or_else(|e| e.into_inner());
+        if self.revoked_in(&list) {
+            return Err(Error::Wiped);
+        }
+        write_private(&self.dir, path, bytes)
     }
 
     pub fn dir(&self) -> &Path {
@@ -71,6 +136,9 @@ impl Home {
         passphrase: Option<&[u8]>,
         p: KdfParams,
     ) -> Result<Identity> {
+        // What an interrupted erase left is encrypted under the old
+        // identity and would trip up the new one.
+        self.clear_orphans()?;
         let id = Identity::generate();
         self.store_identity(&id, passphrase, p)?;
         Ok(id)
@@ -95,7 +163,7 @@ impl Home {
             };
             Ok(())
         })?);
-        write_private(&self.dir, &self.identity_path(), &bytes)
+        self.write(&self.identity_path(), &bytes)
     }
 
     /// True when the identity file is passphrase-sealed.
@@ -224,7 +292,7 @@ impl Home {
     /// ```
     pub fn save_state(&self, identity: &Identity, name: &str, data: &[u8]) -> Result<()> {
         let out = self.seal_state(identity, name, data)?;
-        write_private(&self.dir, &self.state_path(name)?, &out)
+        self.write(&self.state_path(name)?, &out)
     }
 
     /// The bytes [`Home::save_state`] would store for `name`.
@@ -258,18 +326,18 @@ impl Home {
 
     /// Writes a state file exactly as [`Home::save_state`] stored it.
     pub(crate) fn write_state_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        write_private(&self.dir, &self.state_path(name)?, bytes)
+        self.write(&self.state_path(name)?, bytes)
     }
 
     /// Writes the identity file exactly as stored.
     pub(crate) fn write_identity_file(&self, bytes: &[u8]) -> Result<()> {
-        write_private(&self.dir, &self.identity_path(), bytes)
+        self.write(&self.identity_path(), bytes)
     }
 
     /// Writes a plain `contacts.cbor` exactly as stored (from before
     /// contacts were encrypted).
     pub(crate) fn write_contacts_file(&self, bytes: &[u8]) -> Result<()> {
-        write_private(&self.dir, &self.contacts_path(), bytes)
+        self.write(&self.contacts_path(), bytes)
     }
 
     /// Deletes a state file (no error if absent).
@@ -1152,6 +1220,71 @@ fn decode_contact(d: &mut Decoder<'_>) -> Result<Contact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sealed::TEST_PARAMS;
+
+    #[test]
+    fn an_erased_home_refuses_writes_from_handles_opened_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = Home::new(dir.path().join("main"));
+        let id = main.create_identity_with(None, TEST_PARAMS).unwrap();
+        let persona = main.child(main.dir().join("personas").join("ab"));
+        let pid = persona.create_identity_with(None, TEST_PARAMS).unwrap();
+        // The erase (as `Home::erase` does it: revoke, then remove).
+        revoke(main.dir());
+        fs::remove_dir_all(main.dir()).unwrap();
+        assert!(matches!(main.save_state(&id, "x", b"1"), Err(Error::Wiped)));
+        assert!(matches!(
+            main.save_contacts(&id, &Contacts::default()),
+            Err(Error::Wiped)
+        ));
+        assert!(matches!(
+            persona.save_state(&pid, "x", b"1"),
+            Err(Error::Wiped)
+        ));
+        assert!(main.is_revoked() && persona.is_revoked());
+        assert!(!main.dir().exists());
+    }
+
+    #[test]
+    fn a_home_opened_after_the_erase_writes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Home::new(dir.path().join("h"));
+        old.create_identity_with(None, TEST_PARAMS).unwrap();
+        revoke(old.dir());
+        fs::remove_dir_all(old.dir()).unwrap();
+        let new = Home::new(dir.path().join("h"));
+        let id = new.create_identity_with(None, TEST_PARAMS).unwrap();
+        new.save_state(&id, "x", b"1").unwrap();
+        assert_eq!(&new.load_state(&id, "x").unwrap().unwrap()[..], b"1");
+        // Handles derived from the new one write too.
+        new.reopen().save_state(&id, "y", b"2").unwrap();
+    }
+
+    #[test]
+    fn homes_derived_from_a_revoked_home_are_revoked_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Home::new(dir.path().join("h"));
+        let id = old.create_identity_with(None, TEST_PARAMS).unwrap();
+        revoke(old.dir());
+        fs::remove_dir_all(old.dir()).unwrap();
+        let child = old.child(old.dir().join("personas").join("cd"));
+        assert!(matches!(
+            child.create_identity_with(None, TEST_PARAMS),
+            Err(Error::Wiped)
+        ));
+        assert!(matches!(
+            old.reopen().save_state(&id, "x", b"1"),
+            Err(Error::Wiped)
+        ));
+        // A node's `create_persona` after the erase.
+        let personas = crate::persona::Personas::new(&old, &id);
+        assert!(matches!(
+            personas.create("p", None, None, 1),
+            Err(Error::Wiped)
+        ));
+        assert!(!old.dir().join("personas").exists());
+        assert!(!old.dir().exists());
+    }
 
     #[test]
     fn identity_and_contacts_persist() {
