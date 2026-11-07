@@ -2081,19 +2081,11 @@ impl Keep {
 /// no message yet.
 const MEDIA_GRACE: Duration = Duration::from_secs(10 * 60);
 
-/// Every file location a node's messages refer to: its chats, its groups
-/// and its notes to self. `None` if some history can't be read, so nothing
-/// is swept on a guess.
+/// Every file location a node's messages refer to: its chats, message
+/// requests, groups and notes to self. `None` if some history can't be
+/// read, so nothing is swept on a guess.
 fn media_in_use(node: &ThrenodyNode) -> Option<HashSet<String>> {
-    let mut all = Vec::new();
-    for c in node.contacts() {
-        all.extend(node.history(c.fingerprint, u32::MAX).ok()?);
-    }
-    for g in node.groups() {
-        all.extend(node.group_history(g.id, u32::MAX).ok()?);
-    }
-    all.extend(node.note_history(u32::MAX).ok()?);
-    Some(all.into_iter().filter_map(|e| e.file?.location).collect())
+    Some(node.file_locations().ok()?.into_iter().collect())
 }
 
 /// Deletes the files in `dir` that nothing in `kept` refers to, once they

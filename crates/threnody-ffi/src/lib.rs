@@ -2290,6 +2290,16 @@ PersistentKeepalive = 25\n",
         threnody_core::message::MAX_FILE as u64
     }
 
+    /// Where the app saved every file still in this identity's histories
+    /// (chats, message requests, groups and notes to self). Apps delete
+    /// their own copies of files not listed, once they are a few minutes
+    /// old (their message may not be recorded yet). Fails rather than
+    /// answer partially, when a history can't be read: then nothing is
+    /// deleted.
+    pub fn file_locations(&self) -> Result<Vec<String>> {
+        self.node.file_locations().map_err(fail)
+    }
+
     /// The last `limit` messages with `peer` (oldest first).
     pub fn history(&self, peer: String, limit: u32) -> Result<Vec<HistoryEntry>> {
         let p = self.resolve(&peer)?;
@@ -5410,5 +5420,69 @@ mod tests {
         assert!(a.seek("UNKNOWN".into()).is_err());
         let p = a.resolve(&b_fp).unwrap();
         assert_eq!(a.account_devices(&p), vec![p]);
+    }
+
+    /// The files apps keep, through the bindings: a group's and a
+    /// contact's both, and a deleted group entry's no longer.
+    #[test]
+    fn file_locations_through_the_bindings_include_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            let node =
+                ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap();
+            node.set_cover_traffic(None);
+            node
+        };
+        let (alice, bob) = (open("a"), open("b"));
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let a_fp = alice.device_fingerprint();
+        bob.connect(alice.invite_link(addr)).unwrap();
+        let b_fp = bob.device_fingerprint();
+        let mut all = Pump::new(&[&*alice, &*bob]);
+        all.until(
+            0,
+            |e| matches!(e, NodeEvent::Connected { peer, .. } if *peer == b_fp),
+        );
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp.clone(), true).unwrap();
+        all.until(1, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+        let g = alice.create_group("files".into()).unwrap();
+        alice.invite_to_group(g.clone(), b_fp.clone()).unwrap();
+        all.until(1, |e| matches!(e, NodeEvent::GroupJoined { .. }));
+
+        alice
+            .send_group_file(
+                g.clone(),
+                "a.txt".into(),
+                b"x".to_vec(),
+                Some("media/g-a.txt".into()),
+                FileOptions::default(),
+            )
+            .unwrap();
+        alice
+            .send_file(
+                b_fp.clone(),
+                "b.txt".into(),
+                b"y".to_vec(),
+                Some("media/p-b.txt".into()),
+                FileOptions::default(),
+            )
+            .unwrap();
+        let kept = alice.file_locations().unwrap();
+        assert!(kept.contains(&"media/g-a.txt".to_string()), "{kept:?}");
+        assert!(kept.contains(&"media/p-b.txt".to_string()), "{kept:?}");
+
+        let sent = alice
+            .group_history(g.clone(), 10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.file.is_some())
+            .unwrap();
+        alice
+            .delete_group_entry(g, sent.at_ms, sent.device)
+            .unwrap();
+        assert_eq!(alice.file_locations().unwrap(), ["media/p-b.txt"]);
     }
 }

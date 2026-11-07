@@ -134,11 +134,10 @@ object Media {
     fun sweep(ctx: Context, node: uniffi.threnody_ffi.ThrenodyNode, persona: String? = null) {
         val dir = dir(ctx, persona)
         val files = dir.listFiles() ?: return
+        // Every conversation's files, message requests included; nothing is
+        // deleted if some history can't be read.
         val used = try {
-            val chats = Threnody.conversations(node, persona).flatMap { node.history(it.device, 10_000u) }
-            val groups = node.groups().flatMap { node.groupHistory(it.id, 10_000u) }
-            val notes = node.noteHistory(10_000u)
-            (chats + groups + notes).mapNotNull { it.file?.location }.toSet()
+            node.fileLocations().toSet()
         } catch (_: Exception) {
             return
         }

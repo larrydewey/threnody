@@ -507,3 +507,78 @@ async fn changes_made_while_the_contact_is_away_reach_it_when_it_returns() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+fn file_note(location: &str) -> threnody_core::history::FileNote {
+    threnody_core::history::FileNote {
+        name: "f.jpg".into(),
+        size: 1,
+        location: Some(location.into()),
+        sensitive: false,
+        album: 0,
+        clip: None,
+        forwarded: false,
+    }
+}
+
+/// The files apps may keep: every conversation's, message requests and
+/// notes to self included; deleted and disappeared ones not.
+#[tokio::test]
+async fn file_locations_list_every_conversation_and_forget_deleted_and_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _arx, _) = spawn(&dir, "a").await;
+    let (b, mut brx, baddr) = spawn(&dir, "b").await;
+    let bid = a.connect(&baddr, None).await.unwrap();
+    let aid = a.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    // b doesn't accept a: a's chat is a message request on b.
+
+    a.record_file(&bid, true, file_note("loc/keep"));
+    a.write_note("", None, Some(file_note("loc/note")));
+    b.record_received_file(&aid, file_note("loc/request"), "", 7);
+
+    let conv = a.conversation_for(&bid);
+    // Entries are deleted by time and device: not in the same millisecond
+    // as the one kept.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    a.record_file(&bid, true, file_note("loc/gone"));
+    let gone = a
+        .history(conv)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.file.as_ref().and_then(|f| f.location.as_deref()) == Some("loc/gone"))
+        .cloned()
+        .unwrap();
+    assert_eq!(a.delete_entry(conv, gone.at_ms, gone.device), 1);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    a.set_timer(&bid, Some(1)).unwrap();
+    a.record_file(&bid, true, file_note("loc/expires"));
+    assert!(a.file_locations().unwrap().contains(&"loc/expires".into()));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(a.file_locations().unwrap(), ["loc/keep", "loc/note"]);
+    assert!(
+        b.file_locations()
+            .unwrap()
+            .contains(&"loc/request".to_string())
+    );
+}
+
+/// One history that can't be read: no answer at all, so an app's sweep
+/// never deletes files on a partial one.
+#[tokio::test]
+async fn file_locations_fail_rather_than_answer_partially() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _arx, _) = spawn(&dir, "a").await;
+    a.write_note("", None, Some(file_note("loc/note")));
+    assert_eq!(a.file_locations().unwrap(), ["loc/note"]);
+    std::fs::write(
+        dir.path()
+            .join("a")
+            .join(format!("hist-{}.state", "ab".repeat(32))),
+        b"garbage that no key opens",
+    )
+    .unwrap();
+    assert!(a.file_locations().is_err());
+}

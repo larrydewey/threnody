@@ -1761,6 +1761,35 @@ impl Home {
         self.stored_histories(identity).map(|(c, _)| c).collect()
     }
 
+    /// Where the app saved every file still in some stored history (chats,
+    /// message requests, groups and the notes to self), sorted, expired
+    /// entries left out. Apps delete their own copies of files not listed:
+    /// ones whose messages were deleted or disappeared. Unlike
+    /// [`Home::conversations`], a history that can't be read is an error,
+    /// so a caller never deletes files on a partial answer.
+    pub fn file_locations(&self, identity: &Identity, now_ms: u64) -> Result<Vec<String>> {
+        let _lock = history_lock();
+        self.migrate_history_names(identity);
+        let mut out = std::collections::BTreeSet::new();
+        for name in self.state_names()? {
+            if !is_history_name(&name) {
+                continue;
+            }
+            // Gone meanwhile (we hold the lock, so it was never there).
+            let Some(b) = self.load_state(identity, &name)? else {
+                continue;
+            };
+            let mut h = History::decode(&b)?;
+            h.prune(now_ms);
+            out.extend(
+                h.entries
+                    .iter()
+                    .filter_map(|e| e.file.as_ref()?.location.clone()),
+            );
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// Searches `scope` (one conversation, or every one when `None`) for
     /// `q`; returns at most `limit` hits, newest first. Expired messages
     /// never match, and nothing is written back.
