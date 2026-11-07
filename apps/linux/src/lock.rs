@@ -1099,6 +1099,7 @@ fn wipe_platform(app: &Rc<App>, homes: &[String]) {
         keyring::delete_lock_pepper(Path::new(h));
     }
     app.core.settings().erase();
+    crate::autostart::remove();
     let downloads = glib::user_special_dir(glib::UserDirectory::Downloads);
     for p in erase_targets(downloads.as_deref()) {
         let _ = std::fs::remove_dir_all(p);
