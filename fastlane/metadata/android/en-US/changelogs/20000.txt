@@ -1,0 +1,2 @@
+- A video call rings with Answer with video right on the notification, and Voice only beside it.
+- Linux: answer or decline a call from its desktop notification, with video too.
