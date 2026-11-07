@@ -1752,6 +1752,11 @@ impl Groups {
     ) -> Result<Output> {
         // Only complete adds we asked for, for the peer we asked.
         let Some(pos) = self.pending_adds.iter().position(|p| *p == (group, from)) else {
+            // Asked twice (its own device offered it the group too, say),
+            // it answered both, and the first answer got it in.
+            if self.group(&group)?.members().contains(&from) {
+                return Ok(Output::default());
+            }
             return Err(GroupError::Unexpected("unsolicited key package"));
         };
         let kp = parse_key_package(&self.provider, bytes)?;

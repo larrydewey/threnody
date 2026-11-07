@@ -156,7 +156,10 @@ pub struct Entry {
     /// A list shared here (see `crate::lists`): the entry opens it.
     pub list: Option<[u8; 16]>,
     /// When this device last learned something new about this outgoing
-    /// entry's ticks (0 = never). Local: transcripts carry 0.
+    /// entry's ticks (0 = never). On an incoming file: when this device
+    /// received it from the contact itself (0 = merged from another of
+    /// our devices, or recorded before this was kept), so it passes the
+    /// record on to the others. Local: transcripts carry 0.
     pub ticked_ms: u64,
 }
 

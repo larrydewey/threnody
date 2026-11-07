@@ -1,8 +1,9 @@
 //! Message history across our own devices (Appendix J, "History").
 //!
-//! Contacts send to every device of our account, so each device receives
-//! incoming messages itself. What one device *sends* the others never see
-//! unless told. So:
+//! Contacts send texts to every device of our account, so each device
+//! receives incoming texts itself (files reach one device: see *Received
+//! files* below). What one device *sends* the others never see unless
+//! told. So:
 //!
 //! - an outgoing 1:1 entry is pushed at once to our other devices that are
 //!   connected (`AccountMsg::Transcript`);
@@ -30,6 +31,29 @@
 //!
 //! Merges only move forward and are never forwarded on; a tick for an
 //! entry not here yet waits in memory until a transcript brings it.
+//!
+//! Received files (Appendix J, *Received files*): a contact's file reaches
+//! only the device it was sent to (files go live to one device, unlike
+//! texts), so that device tells our other devices of it, by transcript,
+//! to those whose `Hello` has `FEATURE_DEVICE_SYNC` (an older one could
+//! show it but never fetch it):
+//!
+//! - live, as it is recorded, to connected ones;
+//! - at session start, every record of a file a contact sent this device
+//!   that it recorded since it last caught that device up (state
+//!   `history-sync-files`, against the entry's `ticked_ms`, which marks
+//!   the records a device received itself, by its own clock). A first
+//!   full transcript already carries them, so it sets that position. A
+//!   device caught up before this gets every one whose contents are here,
+//!   once.
+//!
+//! Only the device that received a file passes it on: like any merge, a
+//! record from a sibling is never forwarded. Each carries the record
+//! only; the contents come as for any synced file (`filesync`), so
+//! sensitive and disappearing ones wait for a tap, and the entry's expiry
+//! goes with it. When the contact deletes such a file for everyone, the
+//! device that received it passes the deletion on too (`on_delete`), so a
+//! sibling that took the deletion before the record drops it as well.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -44,6 +68,8 @@ use crate::node::{Event, Node, lock};
 
 /// Where the ticks watermark per device is kept.
 pub(crate) const TICKS_STATE: &str = "history-sync-ticks";
+/// Where the received-files watermark per device is kept.
+pub(crate) const FILES_STATE: &str = "history-sync-files";
 /// How long live ticks wait to go together.
 pub(crate) const TICK_BATCH: Duration = Duration::from_secs(1);
 /// Most ticks kept for entries not here yet.
@@ -108,6 +134,30 @@ pub(crate) fn ticks_since(notes: bool, entries: &[Entry], since: Option<u64>) ->
             Some(t) => e.ticked_ms > t,
         })
         .filter_map(tick_of)
+        .collect()
+}
+
+/// The records among `entries` (a chat with a contact) of files the
+/// contact sent this device that a sibling whose received-files watermark
+/// is `since` lacks: those this device recorded after it (`ticked_ms`, by
+/// this device's clock, which only a file received here has). Never one
+/// merged from a sibling: that sibling passes it on itself.
+///
+/// With no watermark (a sibling caught up before received files were
+/// passed on), every one this device has the contents of, once: those
+/// from then carry no mark, but one received here has its contents here.
+pub(crate) fn received_files_since(entries: &[Entry], since: Option<u64>) -> Vec<Entry> {
+    entries
+        .iter()
+        .filter(|e| !e.outgoing)
+        .filter(|e| {
+            e.file.as_ref().is_some_and(|f| match since {
+                None => e.ticked_ms != 0 || f.location.is_some(),
+                Some(t) => e.ticked_ms > t,
+            })
+        })
+        .cloned()
+        .map(portable)
         .collect()
 }
 
@@ -177,10 +227,15 @@ impl Node {
         let now = now_ms();
         if since.is_none() {
             // The full transcript carries every entry's ticks as they are
-            // now: nothing to catch up on beyond it.
+            // now, and every file a contact sent us: nothing to catch up
+            // on beyond it.
             let mut t = lock(&self.shared.ticks_sync);
             t.synced.insert(*peer.as_bytes(), now);
             self.shared.save_state(TICKS_STATE, Ok(t.encode()));
+            drop(t);
+            let mut f = lock(&self.shared.files_sync);
+            f.synced.insert(*peer.as_bytes(), now);
+            self.shared.save_state(FILES_STATE, Ok(f.encode()));
         }
         let mut out = Vec::new();
         for conv in self.shared.home.conversations(self.identity_ref()) {
@@ -236,6 +291,49 @@ impl Node {
             }
         }
         self.save_sync(&s);
+    }
+
+    /// Whether `conv` is a chat with a contact: not our notes, nor a chat
+    /// between our own devices (which each device files under the other).
+    fn with_contact(&self, conv: ConversationId) -> bool {
+        let ConversationId::Peer(k) = conv else {
+            return false;
+        };
+        // An account id need not be a device key at all.
+        conv != self.notes()
+            && PublicIdentity::from_bytes(&k)
+                .map_or(true, |p| p != self.identity() && !self.is_own_device(&p))
+    }
+
+    /// Tells our connected other devices that take file fetches of a file
+    /// a contact just sent us (`entry`, recorded in `conv`), so they show
+    /// it and fetch it as they would one of ours.
+    pub(crate) fn push_received_file(&self, conv: ConversationId, entry: &Entry) {
+        if entry.outgoing || entry.file.is_none() || !self.with_contact(conv) {
+            return;
+        }
+        // Devices that never synced get everything when they next connect.
+        let peers: Vec<PublicIdentity> = self
+            .device_sync_peers()
+            .into_iter()
+            .filter(|p| self.has_synced(p))
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+        let Some(m) = self.transcript_message(conv, vec![portable(entry.clone())]) else {
+            return;
+        };
+        // Past it for those, so a session start doesn't send it again (and
+        // bring back a copy deleted there meanwhile).
+        let mut s = lock(&self.shared.files_sync);
+        for p in peers {
+            if self.send_tracked(&p, m.clone()).is_ok() {
+                let t = s.synced.entry(*p.as_bytes()).or_default();
+                *t = (*t).max(entry.ticked_ms);
+            }
+        }
+        self.shared.save_state(FILES_STATE, Ok(s.encode()));
     }
 
     fn transcript_message(&self, conv: ConversationId, entries: Vec<Entry>) -> Option<AppMessage> {
@@ -313,8 +411,8 @@ impl Node {
     }
 
     /// At the start of a session with our own device `peer` (once its
-    /// `Hello` says what it takes): the ticks it lacks, and our file
-    /// fetches it may serve.
+    /// `Hello` says what it takes): the ticks and the records of files
+    /// contacts sent us it lacks, and our file fetches it may serve.
     pub(crate) fn device_sync_hello(&self, peer: &PublicIdentity) {
         if !(self.is_own_device(peer) && self.supports(peer, FEATURE_DEVICE_SYNC)) {
             return;
@@ -323,7 +421,7 @@ impl Node {
         // Loads every conversation: off the session task, which reads
         // frames.
         let work = move || {
-            for m in node.ticks_for(&peer) {
+            for m in node.catch_up_for(&peer) {
                 let _ = node.send_tracked(&peer, m);
             }
             node.resume_fetches();
@@ -336,11 +434,16 @@ impl Node {
         }
     }
 
-    /// Ticks messages for our own device `peer`: what it lacks since we
-    /// last caught it up, every conversation's.
-    pub(crate) fn ticks_for(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
+    /// Messages for our own device `peer` that takes device sync: the
+    /// ticks it lacks, and the records of files contacts sent us it lacks
+    /// (transcripts), since we last caught it up, every conversation's.
+    pub(crate) fn catch_up_for(&self, peer: &PublicIdentity) -> Vec<AppMessage> {
         let now = now_ms();
         let since = lock(&self.shared.ticks_sync)
+            .synced
+            .get(peer.as_bytes())
+            .copied();
+        let files_since = lock(&self.shared.files_sync)
             .synced
             .get(peer.as_bytes())
             .copied();
@@ -348,13 +451,30 @@ impl Node {
         let mut out = Vec::new();
         for conv in self.shared.home.conversations(self.identity_ref()) {
             let Ok(h) = self.history(conv) else { continue };
+            if self.with_contact(conv) {
+                // As live: never a message request's.
+                let files: Vec<Entry> = received_files_since(h.entries(), files_since)
+                    .into_iter()
+                    .filter(|e| {
+                        PublicIdentity::from_bytes(&e.device).is_ok_and(|d| self.is_accepted(&d))
+                    })
+                    .collect();
+                for chunk in files.chunks(CHUNK) {
+                    out.extend(self.transcript_message(conv, chunk.to_vec()));
+                }
+            }
             let ticks = ticks_since(conv == notes, h.entries(), since);
             out.extend(self.ticks_messages(conv, ticks));
         }
-        let mut s = lock(&self.shared.ticks_sync);
-        let t = s.synced.entry(*peer.as_bytes()).or_default();
-        *t = (*t).max(now);
-        self.shared.save_state(TICKS_STATE, Ok(s.encode()));
+        for (state, name) in [
+            (&self.shared.ticks_sync, TICKS_STATE),
+            (&self.shared.files_sync, FILES_STATE),
+        ] {
+            let mut s = lock(state);
+            let t = s.synced.entry(*peer.as_bytes()).or_default();
+            *t = (*t).max(now);
+            self.shared.save_state(name, Ok(s.encode()));
+        }
         out
     }
 
@@ -543,6 +663,65 @@ mod tests {
         assert!(ticks_since(true, &all, None).is_empty());
         let t = &ticks_since(false, &all, Some(25))[0];
         assert_eq!((t.id, t.delivered, t.read_ms), (3, true, 5));
+    }
+
+    #[test]
+    fn received_files_since_takes_only_files_received_here_after_the_watermark() {
+        let note = |location: Option<&str>| threnody_core::history::FileNote {
+            name: "a.png".into(),
+            size: 1,
+            location: location.map(Into::into),
+            sensitive: false,
+            album: 0,
+            clip: None,
+            forwarded: false,
+        };
+        // Received here at `ticked` (by our clock; `at_ms` is someone's).
+        let here = |at, ticked, id| Entry {
+            file: Some(note(Some("/home/me/a.png"))),
+            ticked_ms: ticked,
+            ..entry(at, false, id)
+        };
+        // Merged from a sibling (no mark), its contents fetched or not.
+        let merged = |at, location, id| Entry {
+            file: Some(note(location)),
+            ..entry(at, false, id)
+        };
+        // Received here before the mark was kept: the contents are here.
+        let older = merged(2, Some("/home/me/b.png"), 7);
+        let ours = Entry {
+            file: Some(note(Some("/home/me/a.png"))),
+            ticked_ms: 6,
+            ..entry(5, true, 3)
+        };
+        let text = entry(6, false, 4);
+        let all = [
+            here(1, 1, 1),
+            here(10, 10, 2),
+            merged(50, Some("/home/me/c.png"), 5),
+            merged(60, None, 6),
+            older,
+            ours,
+            text,
+        ];
+        let ids = |v: Vec<Entry>| v.into_iter().map(|e| e.remote_id).collect::<Vec<_>>();
+        // Once, every one whose contents are here, but never a bare record
+        // from a sibling.
+        assert_eq!(ids(received_files_since(&all, None)), [1, 2, 5, 7]);
+        // Then only what was received here after, by our clock: never a
+        // merged one, whatever its time says.
+        assert_eq!(ids(received_files_since(&all, Some(5))), [2]);
+        assert!(received_files_since(&all, Some(10)).is_empty());
+        // Records only: where it is here stays here, and so does the mark.
+        assert!(
+            received_files_since(&all, None).iter().all(|e| e
+                .file
+                .as_ref()
+                .unwrap()
+                .location
+                .is_none()
+                && e.ticked_ms == 0)
+        );
     }
 
     #[test]
