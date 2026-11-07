@@ -30,6 +30,9 @@ class ActivityResultLauncher(private val activity: Activity) {
     fun launch(intent: Intent, callback: (resultCode: Int, data: Intent?) -> Unit) {
         val requestCode = requestCodeGen.incrementAndGet()
         callbacks[requestCode] = callback
+        // Leaving for another app's picker or camera isn't leaving the
+        // app. Our own screens never take it out of the foreground.
+        if (intent.component?.packageName != activity.packageName) AppLock.expectReturn()
         activity.startActivityForResult(intent, requestCode)
     }
 }

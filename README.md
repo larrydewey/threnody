@@ -97,6 +97,8 @@ Inside `run`, any line you type goes to the current peer. The available commands
 
 `threnody backup <file>` saves your identity, contacts and history to a file sealed under a passphrase you choose. After losing a device, `threnody restore <file>` puts them on a new one; the apps do the same from their menus (Account & Identity on Android, Preferences on Linux). Anonymous identities and received files' contents aren't in a backup.
 
+`threnody wipe` erases this device's identity, contacts, history, received files and anonymous identities, and their keyring keys. It asks you to type `erase` (or takes `--yes`), refuses while a node runs on the data directory, and keeps any files in it that Threnody didn't write. Nothing is sent: contacts and your other devices aren't told, and your other devices keep listing this one until you remove it there. The apps do the same from "Erase all Threnody data", and can lock behind a PIN, passphrase or the phone's own lock, with an optional duress PIN that erases everything when typed on the lock screen.
+
 To add a device to your account, run `/device add [host:port]` on a device you already have. It prints a one-time code (and a QR code) with this machine's LAN address, or the one given. Then run `threnody link '<code>'` on the new device. `/devices` lists your devices, `/device rename <name> <new name>` renames one, and `/device remove <name>` revokes one. Your contacts see device changes, and refuse removed devices. Messages to a contact go to all of their devices. Your devices share your message history, and a new device gets it all when linked.
 
 ```

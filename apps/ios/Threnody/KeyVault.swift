@@ -58,6 +58,18 @@ enum KeyVault {
         return pw
     }
 
+    /// Forgets the sealing secret, its Secure Enclave key and Keychain item:
+    /// after an erase, and before every new identity, so whatever an old
+    /// identity sealed can never be opened again. Errors are ignored.
+    static func forget() {
+        try? FileManager.default.removeItem(at: file)
+        try? FileManager.default.removeItem(at: file.appendingPathExtension("tmp"))
+        let key: [CFString: Any] = [kSecClass: kSecClassKey, kSecAttrApplicationTag: tag]
+        SecItemDelete(key as CFDictionary)
+        let item: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service]
+        SecItemDelete(item as CFDictionary)
+    }
+
     private static var file: URL {
         URL.applicationSupportDirectory.appendingPathComponent("identity-passphrase.bin")
     }

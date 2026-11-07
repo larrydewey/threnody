@@ -50,6 +50,22 @@ pub fn store(home: &Home, pw: &Secret) -> Result<()> {
     }
 }
 
+/// The desktop app's app-lock pepper for `home` (Appendix C, *App
+/// lock*): its own entry, so re-keying the identity can't orphan the
+/// lock file.
+fn lock_pepper_entry(home: &Home) -> Result<keyring::Entry> {
+    let dir = std::path::absolute(home.dir()).context("resolving the data directory")?;
+    keyring::Entry::new(SERVICE, &format!("{} app-lock", dir.display()))
+        .map_err(|e| anyhow!("no keyring available: {e}"))
+}
+
+/// Forgets the app-lock pepper for `home` (no error if there is none).
+pub fn delete_lock_pepper(home: &Home) {
+    if let Ok(e) = lock_pepper_entry(home) {
+        let _ = e.delete_credential();
+    }
+}
+
 /// Forgets the keyring entry for `home` (no error if there is none).
 pub fn delete(home: &Home) {
     if let Ok(e) = entry(home) {

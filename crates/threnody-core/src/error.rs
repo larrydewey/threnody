@@ -35,6 +35,10 @@ pub enum Error {
     WeakPassphrase(usize),
     #[error("invalid fingerprint")]
     InvalidFingerprint,
+    #[error("wrong PIN")]
+    WrongPin,
+    #[error("this data directory was erased")]
+    Wiped,
     #[error("storage: {0}")]
     Io(#[from] std::io::Error),
 }

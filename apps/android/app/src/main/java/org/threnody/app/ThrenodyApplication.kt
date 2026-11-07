@@ -23,6 +23,9 @@ class ThrenodyApplication : Application() {
         // Warm up threading
         Threading.warmUp(this)
 
+        // App lock's gate, before any screen starts: locked at once when on.
+        AppLock.init(this)
+
         // A crash or kill while "My invite" showed must not leave the NFC
         // invite service answering taps (Appendix T).
         NfcShare.disarm(this)

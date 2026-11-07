@@ -19,6 +19,12 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 uniffi::setup_scaffolding!();
 
+mod applock;
+pub use applock::{
+    AppLockClock, LockKind, LockOutcome, LockSettings, app_lock, app_lock_enabled,
+    biometric_unlocked, clear_app_lock, lock_secret_ok, set_app_lock, set_duress_pin,
+    set_lock_policy, unlock_app, wipe_home,
+};
 mod calls;
 mod folders;
 mod lists;

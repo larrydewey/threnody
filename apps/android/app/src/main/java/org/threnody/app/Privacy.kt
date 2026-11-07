@@ -170,21 +170,33 @@ object Privacy {
         apply(activity)
     }
 
-    /** Call from every Activity's onCreate. */
+    /**
+     * Whether windows get FLAG_SECURE: with screen security, and while app
+     * lock is on where recents can't be blanked otherwise (before API 33).
+     */
+    private fun secureWindows(ctx: Context): Boolean =
+        screenSecurity(ctx) || (android.os.Build.VERSION.SDK_INT < 33 && AppLock.enabled(ctx))
+
     /**
      * A dialog's window is separate from its activity's, so it needs its
      * own FLAG_SECURE: without it, screenshots and the recents screen
      * show dialogs and trays while the screen behind them stays blank.
      */
     fun secure(dialog: android.app.Dialog) {
-        if (screenSecurity(dialog.context)) dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        if (secureWindows(dialog.context)) dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     }
 
+    /** Call from every Activity's onCreate (and again when these settings change). */
     fun apply(activity: Activity) {
-        if (screenSecurity(activity)) {
+        if (secureWindows(activity)) {
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         } else {
             activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        // While app lock is on, recents never shows the app, even with
+        // screenshots allowed.
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            activity.setRecentsScreenshotEnabled(!AppLock.enabled(activity) && !screenSecurity(activity))
         }
     }
 }

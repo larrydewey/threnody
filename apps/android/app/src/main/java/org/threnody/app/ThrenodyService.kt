@@ -215,6 +215,9 @@ class ThrenodyService : Service() {
          */
         private fun post(ctx: Context, key: String, title: String, text: String, open: Intent) {
             channels(ctx)
+            // With app lock on, one notification for everything, saying
+            // nothing and opening only the app: not even how many wrote.
+            if (AppLock.enabled(ctx)) return postLocked(ctx)
             val hidden = Privacy.privateNotifications(ctx)
             // On the lock screen: only that something arrived, not who or what.
             val public = Notification.Builder(ctx, CHANNEL_MESSAGES)
@@ -244,6 +247,25 @@ class ThrenodyService : Service() {
             }
         }
 
+        /** The tag of the one notification shown while app lock is on. */
+        private const val LOCKED_TAG = "message"
+
+        private fun postLocked(ctx: Context) {
+            val n = Notification.Builder(ctx, CHANNEL_MESSAGES)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Threnody")
+                .setContentText(NEW)
+                .setVisibility(Notification.VISIBILITY_SECRET)
+                .setContentIntent(PendingIntent.getActivity(ctx, LOCKED_TAG.hashCode(),
+                    Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+                .setAutoCancel(true)
+                .build()
+            try {
+                ctx.getSystemService(NotificationManager::class.java)?.notify(LOCKED_TAG, ID_MESSAGE, n)
+            } catch (_: SecurityException) {
+            }
+        }
+
         /** A group message or invitation; opens the group. As for [notifyMessage]. */
         fun notifyGroup(
             ctx: Context, group: String, title: String, text: String, persona: String? = null,
@@ -255,8 +277,15 @@ class ThrenodyService : Service() {
             post(ctx, notificationKey(group, persona), titled(title, persona), if (disappearing) NEW else text, open)
         }
 
+        /** The app was opened: the one notification shown while locked goes. */
+        fun clearLocked(ctx: Context) {
+            ctx.getSystemService(NotificationManager::class.java)?.cancel(LOCKED_TAG, ID_MESSAGE)
+        }
+
         fun clearNotification(ctx: Context, key: String) {
-            ctx.getSystemService(NotificationManager::class.java)?.cancel(key, ID_MESSAGE)
+            val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            nm.cancel(key, ID_MESSAGE)
+            nm.cancel(LOCKED_TAG, ID_MESSAGE)
         }
 
         private fun channels(ctx: Context) {

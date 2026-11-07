@@ -54,7 +54,9 @@ object Media {
         File(ctx.filesDir, if (persona == null) "media" else "media-p-$persona")
 
     /** Keeps a file privately; returns its location for history. */
-    fun savePrivate(ctx: Context, name: String, data: ByteArray, persona: String? = null): String? = try {
+    fun savePrivate(ctx: Context, name: String, data: ByteArray, persona: String? = null): String? = if (Threnody.wiping) {
+        null
+    } else try {
         val dir = dir(ctx, persona).apply { mkdirs() }
         val safe = name.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_").takeLast(80)
         val f = File(dir, "${System.currentTimeMillis()}-${(1000..9999).random()}-$safe")

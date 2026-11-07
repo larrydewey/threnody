@@ -27,6 +27,9 @@ CI (`.github/workflows/ci.yml`, job `ios`) runs the same steps and builds for th
 - **Trust.** Approve and revoke, compare safety numbers device by device and mark them verified, with the same banners as Android (approval, unverified, new unverified device). Per-chat disappearing timers.
 - **Scheduled messages (1:1).** Long-press the send button for *Send Later…*. They are sent while the app is open, or during a background refresh; a local notification, without sender or text, reminds you to open the app when one is due.
 - **Network changes.** `NWPathMonitor` tells the node when the path moves between Wi-Fi and cellular, and it redials approved contacts.
+- **App lock.** Onboarding offers *Lock Threnody with Face ID / passcode*, on by default where the phone has a passcode; existing installs get it once after updating, with a notice and *Turn off*. *Settings* → *App lock* switches to an app PIN or passphrase (optionally also Face ID, never the passcode, which could get around it), sets when it locks after leaving and when idle, *Lock now*, a *duress PIN* that erases everything and shows onboarding again, and *Erase after 10 wrong PINs* (off unless chosen). Wrong entries wait 30 s after five, doubling to at most an hour. While it is on, notifications say only "New message" and name no chat, and the lock screen sits in a window of its own above any open sheet or alert, so nothing under it can be used or read out by VoiceOver.
+- **App switcher.** A cover hides the app in the app switcher (*Settings* → *Hide in app switcher*, on by default; always while app lock is on).
+- **Erasing.** *Settings* → *Erase all Threnody data…*, after you type `erase`, erases the identity, its Secure Enclave key and Keychain item, history, received files, settings and notifications, and shows onboarding (Appendix C, *Erasing*). Nothing is sent. iOS keeps the notification permission.
 - **Notifications.** Local notifications for messages that arrive while the app runs, except for the chat on screen. They say only "New message", without sender or text, unless *Settings* → *Private notifications* is turned off; even then a disappearing message's text is left out, as it would outlive the message.
 
 ## Receiving in the background
@@ -48,7 +51,7 @@ To be reachable while the phone sleeps, use an always-on relay (a mutually appro
 - Anonymous identities (personas), profiles and credentials, directories.
 - Linking more devices to the account, backups and restores.
 - Bluetooth and Wi-Fi Direct links; local discovery by multicast needs Apple's `com.apple.developer.networking.multicast` entitlement, which must be requested.
-- Privacy settings: everything stays at the node's defaults (cover traffic, onion-first, read receipts and typing indicators on). No settings to turn them off yet, nor screen-capture protection.
+- Privacy settings: everything stays at the node's defaults (cover traffic, onion-first, read receipts and typing indicators on). No settings to turn them off yet.
 - Always-on relay choice, standby path, the diagnostics log.
 
 ## TestFlight

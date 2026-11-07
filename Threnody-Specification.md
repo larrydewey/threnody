@@ -352,7 +352,7 @@ Key residual risks that implementers must address:
 
 - Side-channel resistance of the cryptographic implementations.
 - Secure deletion of keys and message material.
-- Protection against physical seizure of devices.
+- Protection against physical seizure of devices. The apps can lock behind an app PIN, passphrase or the device's own authentication (a gate on the screen, not encryption at rest), with an optional duress secret that erases everything, and can erase all local data on request ([Appendix C](docs/appendix-c-wire-format.md), *App lock* and *Erasing*).
 - Correct implementation of revocation.
 
 ---

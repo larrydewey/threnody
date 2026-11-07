@@ -129,9 +129,15 @@ struct SettingsView: View {
                         ? "Notifications say only “New message”, without sender or text."
                         : "Notifications show who wrote and what they said, except for disappearing messages.")
                 }
+                AppLockSection()
                 Section("Background") {
                     Text("iOS suspends Threnody shortly after you leave it. Messages sent to you meanwhile wait with mutually approved contacts (mailboxes) and arrive when you open the app again, or during the occasional background refresh iOS allows.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section {
+                    EraseAllButton()
+                } footer: {
+                    Text("Erases everything Threnody keeps on this iPhone and starts afresh. Nothing is sent: your contacts and other devices aren't told.")
                 }
             }
             .navigationTitle("Settings")

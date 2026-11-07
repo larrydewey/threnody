@@ -53,9 +53,57 @@ pub fn store(home: &Path, pw: &Secret) -> Result<(), String> {
     }
 }
 
+/// The keyring account of `home`'s app-lock pepper: its own entry, so
+/// re-keying the identity (`threnody keyring`) can't orphan the lock file.
+fn lock_account(abs: &Path) -> String {
+    format!("{} app-lock", abs.display())
+}
+
+fn lock_entry(home: &Path) -> Result<keyring::Entry, String> {
+    let dir =
+        std::path::absolute(home).map_err(|e| format!("resolving {}: {e}", home.display()))?;
+    keyring::Entry::new(SERVICE, &lock_account(&dir))
+        .map_err(|e| format!("no keyring available: {e}"))
+}
+
+/// The pepper that keys `home`'s app-lock file (Appendix C, *App lock*):
+/// read, or with `create` made when there is none.
+pub fn lock_pepper(home: &Path, create: bool) -> Option<Secret> {
+    let e = lock_entry(home).ok()?;
+    if let Ok(p) = e.get_password() {
+        return Some(Secret(p));
+    }
+    if !create {
+        return None;
+    }
+    let pw = random();
+    e.set_password(&pw.0).ok()?;
+    // Only rely on it once it reads back.
+    (e.get_password().ok()? == pw.0).then_some(pw)
+}
+
+/// Forgets `home`'s app-lock pepper (no error if there is none).
+pub fn delete_lock_pepper(home: &Path) {
+    if let Ok(e) = lock_entry(home) {
+        let _ = e.delete_credential();
+    }
+}
+
 /// Forgets the keyring entry for `home` (no error if there is none).
 pub fn delete(home: &Path) {
     if let Ok(e) = entry(home) {
         let _ = e.delete_credential();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_pepper_account_differs_from_the_identity_account() {
+        let abs = Path::new("/home/u/.local/share/threnody");
+        assert_eq!(lock_account(abs), "/home/u/.local/share/threnody app-lock");
+        assert_ne!(lock_account(abs), abs.display().to_string());
     }
 }

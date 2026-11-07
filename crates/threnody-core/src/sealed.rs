@@ -37,6 +37,15 @@ impl KdfParams {
         lanes: 4,
     };
 
+    /// For app-lock PIN verifiers (`applock.rs`): the OWASP minimum for
+    /// Argon2id, about 100–200 ms on a mid-range phone. Each entry on the
+    /// lock screen runs it twice (the PIN and the duress slot).
+    pub const LOCK: Self = Self {
+        m_kib: 19 * 1024,
+        t: 2,
+        lanes: 1,
+    };
+
     /// Upper bounds accepted when opening, so a tampered file cannot make
     /// us allocate unbounded memory or spin for hours.
     const MAX: Self = Self {
@@ -45,7 +54,7 @@ impl KdfParams {
         lanes: 16,
     };
 
-    fn derive(&self, passphrase: &[u8], salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
+    pub(crate) fn derive(&self, passphrase: &[u8], salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
         if self.m_kib > Self::MAX.m_kib || self.t > Self::MAX.t || self.lanes > Self::MAX.lanes {
             return Err(Error::Malformed("passphrase KDF cost out of range"));
         }
