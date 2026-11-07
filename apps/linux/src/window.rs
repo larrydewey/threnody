@@ -21,6 +21,16 @@ use crate::{schedule, settings};
 /// The most messages the app-wide search shows.
 const SEARCH_ALL: u32 = 200;
 
+/// What rings, for the call notification's buttons.
+#[derive(Clone, Copy)]
+enum Ring {
+    /// A contact, with video or not.
+    Contact {
+        video: bool,
+    },
+    Group,
+}
+
 /// What a row of the app-wide search's results opens.
 #[derive(Clone)]
 enum Pick {
@@ -1556,7 +1566,7 @@ impl App {
                 self.call
                     .incoming(persona.clone(), *call, &title, *video, &self.window);
                 if !self.window.is_active() {
-                    self.notify_call(&title);
+                    self.notify_call(&title, *call, Ring::Contact { video: *video });
                 }
                 (None, None)
             }
@@ -1572,7 +1582,7 @@ impl App {
                     &self.window,
                 );
                 if !self.window.is_active() {
-                    self.notify_call(&format!("A group call in {title}"));
+                    self.notify_call(&format!("A group call in {title}"), *call, Ring::Group);
                 }
                 (None, None)
             }
@@ -1936,8 +1946,9 @@ impl App {
     }
 
     /// Tells the desktop someone is calling (not who, with private
-    /// notifications on).
-    fn notify_call(&self, title: &str) {
+    /// notifications on), with buttons to answer (with video too, for a
+    /// video call) or decline.
+    fn notify_call(&self, title: &str, call: u64, ring: Ring) {
         // With app lock on: that there's a call, not who. It is answered
         // after unlocking (the call bar is under the lock page).
         let n = if self.lock.enabled() {
@@ -1953,8 +1964,45 @@ impl App {
             n.set_body(Some("Open Threnody to answer."));
             n
         };
+        if !self.lock.enabled() {
+            let id = call.to_variant();
+            let buttons: &[(&str, &str)] = match ring {
+                Ring::Contact { video: true } => &[
+                    ("Decline", "app.call-decline"),
+                    ("Voice", "app.call-voice"),
+                    ("Video", "app.call-video"),
+                ],
+                Ring::Contact { video: false } => &[
+                    ("Decline", "app.call-decline"),
+                    ("Answer", "app.call-voice"),
+                ],
+                Ring::Group => &[
+                    ("Not Now", "app.call-decline"),
+                    ("Join", "app.call-voice"),
+                    ("Join with Video", "app.call-video"),
+                ],
+            };
+            for (label, action) in buttons {
+                n.add_button_with_target_value(label, action, Some(&id));
+            }
+        }
         n.set_priority(gio::NotificationPriority::Urgent);
         self.app.send_notification(Some("call"), &n);
+    }
+
+    /// Answered (`Some(video)`) or declined (`None`) from the call's
+    /// notification. Answering brings the window up, for the call bar.
+    pub fn respond_call(&self, call: u64, answer: Option<bool>) {
+        self.app.withdraw_notification("call");
+        if self.lock.enabled() {
+            // App lock turned on since it rang: answered after unlocking.
+            self.window.present();
+            return;
+        }
+        if answer.is_some() {
+            self.window.present();
+        }
+        self.call.respond(call, answer);
     }
 
     /// Whether the message an event brought disappears, so its text stays

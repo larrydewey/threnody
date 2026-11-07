@@ -146,6 +146,24 @@ fn app_actions(app: &adw::Application) {
         }
     });
     app.add_action(&open);
+
+    // The call notification's buttons, with the call's id.
+    for (name, answer) in [
+        ("call-voice", Some(false)),
+        ("call-video", Some(true)),
+        ("call-decline", None),
+    ] {
+        let a = gio::SimpleAction::new(name, Some(glib::VariantTy::UINT64));
+        a.connect_activate(move |_, v| {
+            let Some(call) = v.and_then(glib::Variant::get::<u64>) else {
+                return;
+            };
+            if let Some(app) = APP.with_borrow(Clone::clone) {
+                app.respond_call(call, answer);
+            }
+        });
+        app.add_action(&a);
+    }
 }
 
 fn activate(app: &adw::Application) {
