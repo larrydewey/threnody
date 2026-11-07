@@ -39,14 +39,21 @@
 //! show it but never fetch it):
 //!
 //! - live, as it is recorded, to connected ones;
-//! - at session start, every record of a file a contact sent us that this
-//!   device has since it last caught that device up (state
-//!   `history-sync-files`): all of them, once, the first time. A first
-//!   full transcript already carries them, so it sets that position.
+//! - at session start, every record of a file a contact sent this device
+//!   that it recorded since it last caught that device up (state
+//!   `history-sync-files`, against the entry's `ticked_ms`, which marks
+//!   the records a device received itself, by its own clock). A first
+//!   full transcript already carries them, so it sets that position. A
+//!   device caught up before this gets every one whose contents are here,
+//!   once.
 //!
-//! Each carries the record only; the contents come as for any synced file
-//! (`filesync`), so sensitive and disappearing ones wait for a tap, and
-//! the entry's expiry goes with it.
+//! Only the device that received a file passes it on: like any merge, a
+//! record from a sibling is never forwarded. Each carries the record
+//! only; the contents come as for any synced file (`filesync`), so
+//! sensitive and disappearing ones wait for a tap, and the entry's expiry
+//! goes with it. When the contact deletes such a file for everyone, the
+//! device that received it passes the deletion on too (`on_delete`), so a
+//! sibling that took the deletion before the record drops it as well.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -131,12 +138,24 @@ pub(crate) fn ticks_since(notes: bool, entries: &[Entry], since: Option<u64>) ->
 }
 
 /// The records among `entries` (a chat with a contact) of files the
-/// contact sent us that a device whose received-files watermark is `since`
-/// lacks: all of them when it has none, else those recorded after it.
+/// contact sent this device that a sibling whose received-files watermark
+/// is `since` lacks: those this device recorded after it (`ticked_ms`, by
+/// this device's clock, which only a file received here has). Never one
+/// merged from a sibling: that sibling passes it on itself.
+///
+/// With no watermark (a sibling caught up before received files were
+/// passed on), every one this device has the contents of, once: those
+/// from then carry no mark, but one received here has its contents here.
 pub(crate) fn received_files_since(entries: &[Entry], since: Option<u64>) -> Vec<Entry> {
     entries
         .iter()
-        .filter(|e| !e.outgoing && e.file.is_some() && since.is_none_or(|t| e.at_ms > t))
+        .filter(|e| !e.outgoing)
+        .filter(|e| {
+            e.file.as_ref().is_some_and(|f| match since {
+                None => e.ticked_ms != 0 || f.location.is_some(),
+                Some(t) => e.ticked_ms > t,
+            })
+        })
         .cloned()
         .map(portable)
         .collect()
@@ -311,7 +330,7 @@ impl Node {
         for p in peers {
             if self.send_tracked(&p, m.clone()).is_ok() {
                 let t = s.synced.entry(*p.as_bytes()).or_default();
-                *t = (*t).max(entry.at_ms);
+                *t = (*t).max(entry.ticked_ms);
             }
         }
         self.shared.save_state(FILES_STATE, Ok(s.encode()));
@@ -647,39 +666,61 @@ mod tests {
     }
 
     #[test]
-    fn received_files_since_takes_contacts_files_after_the_watermark() {
-        let note = || threnody_core::history::FileNote {
+    fn received_files_since_takes_only_files_received_here_after_the_watermark() {
+        let note = |location: Option<&str>| threnody_core::history::FileNote {
             name: "a.png".into(),
             size: 1,
-            location: Some("/home/me/a.png".into()),
+            location: location.map(Into::into),
             sensitive: false,
             album: 0,
             clip: None,
             forwarded: false,
         };
-        let theirs = |at, id| Entry {
-            file: Some(note()),
+        // Received here at `ticked` (by our clock; `at_ms` is someone's).
+        let here = |at, ticked, id| Entry {
+            file: Some(note(Some("/home/me/a.png"))),
+            ticked_ms: ticked,
             ..entry(at, false, id)
         };
+        // Merged from a sibling (no mark), its contents fetched or not.
+        let merged = |at, location, id| Entry {
+            file: Some(note(location)),
+            ..entry(at, false, id)
+        };
+        // Received here before the mark was kept: the contents are here.
+        let older = merged(2, Some("/home/me/b.png"), 7);
         let ours = Entry {
-            file: Some(note()),
+            file: Some(note(Some("/home/me/a.png"))),
+            ticked_ms: 6,
             ..entry(5, true, 3)
         };
         let text = entry(6, false, 4);
-        let all = [theirs(1, 1), theirs(10, 2), ours, text];
+        let all = [
+            here(1, 1, 1),
+            here(10, 10, 2),
+            merged(50, Some("/home/me/c.png"), 5),
+            merged(60, None, 6),
+            older,
+            ours,
+            text,
+        ];
         let ids = |v: Vec<Entry>| v.into_iter().map(|e| e.remote_id).collect::<Vec<_>>();
-        // Once, everything; then only what came after.
-        assert_eq!(ids(received_files_since(&all, None)), [1, 2]);
+        // Once, every one whose contents are here, but never a bare record
+        // from a sibling.
+        assert_eq!(ids(received_files_since(&all, None)), [1, 2, 5, 7]);
+        // Then only what was received here after, by our clock: never a
+        // merged one, whatever its time says.
         assert_eq!(ids(received_files_since(&all, Some(5))), [2]);
         assert!(received_files_since(&all, Some(10)).is_empty());
-        // Records only: where it is here stays here.
+        // Records only: where it is here stays here, and so does the mark.
         assert!(
             received_files_since(&all, None).iter().all(|e| e
                 .file
                 .as_ref()
                 .unwrap()
                 .location
-                .is_none())
+                .is_none()
+                && e.ticked_ms == 0)
         );
     }
 

@@ -189,15 +189,41 @@ impl Node {
                     .collect(),
                 None => vec![*from.as_bytes()],
             };
-            self.shared
-                .home
-                .delete_entries(self.identity_ref(), conv, now_ms(), |e| {
-                    !e.outgoing
-                        && senders.contains(&e.device)
-                        && e.remote_id != 0
-                        && ids.contains(&e.remote_id)
+            let theirs = |e: &Entry| {
+                !e.outgoing
+                    && senders.contains(&e.device)
+                    && e.remote_id != 0
+                    && ids.contains(&e.remote_id)
+            };
+            // Files among them: a file reached only one of our devices,
+            // which passed its record on (see `sync`). A sibling that took
+            // this deletion before that record would keep it, so ours
+            // goes to them too.
+            let files: Vec<u64> = self
+                .history(conv)
+                .map(|h| {
+                    h.entries()
+                        .iter()
+                        .filter(|e| theirs(e) && e.file.is_some())
+                        .map(|e| e.remote_id)
+                        .collect()
                 })
-                .unwrap_or(0)
+                .unwrap_or_default();
+            let gone = self
+                .shared
+                .home
+                .delete_entries(self.identity_ref(), conv, now_ms(), theirs)
+                .unwrap_or(0);
+            if gone > 0 && !files.is_empty() {
+                let msg = AppMessage::Delete {
+                    conversation: conv.to_bytes(),
+                    ids: files,
+                };
+                for d in self.own_devices() {
+                    self.send_change(&d, &msg);
+                }
+            }
+            gone
         };
         if gone > 0 {
             self.emit(Event::MessagesDeleted {
@@ -1421,6 +1447,12 @@ impl Node {
         if !outgoing && remote_id != 0 && self.fill_in_received(conv, device, remote_id, &file) {
             return;
         }
+        // A contact's file reaches only this device: our others hear of
+        // it from us. A message request's stays here, as its texts do.
+        // `ticked_ms` marks the records this device received itself (see
+        // `sync`): only those are passed on, never ones merged from a
+        // sibling.
+        let received = !outgoing && !self.is_own_device(peer) && self.is_accepted(peer);
         let entry = Entry {
             at_ms: now,
             outgoing,
@@ -1442,12 +1474,9 @@ impl Node {
             poll: None,
             forwarded: false,
             list: None,
-            ticked_ms: 0,
+            ticked_ms: if received { now } else { 0 },
         };
-        // A contact's file reaches only this device: our others hear of
-        // it from us. A message request's stays here, as its texts do.
-        let received = (!outgoing && !self.is_own_device(peer) && self.is_accepted(peer))
-            .then(|| entry.clone());
+        let received = received.then(|| entry.clone());
         self.append(conv, entry);
         if let Some(e) = received {
             self.push_received_file(conv, &e);
