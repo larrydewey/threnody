@@ -47,6 +47,8 @@ class CallActivity : Activity() {
     private val tileViews = mutableMapOf<String, ImageView>()
     /** Whether each tile's participant sent video at the last refresh. */
     private val tileVideo = mutableMapOf<String, Boolean>()
+    /** Whether the tiles were built without names (app lock was closed). */
+    private var tilesHidden = false
     private lateinit var local: TextureView
     private var unlisten: (() -> Unit)? = null
     private var unlistenReactions: (() -> Unit)? = null
@@ -345,13 +347,21 @@ class CallActivity : Activity() {
             ticker.postDelayed({ finish() }, 1200)
             return
         }
-        who.text = c.title
+        // Ringing past app lock: say there's a call, not who (nor who's in it).
+        val hide = AppLock.locked()
+        who.text = when {
+            !hide -> c.title
+            c.group != null -> "Group call"
+            else -> "Threnody call"
+        }
         val group = c.group != null
         status.text = when (c.state) {
-            "reaching" -> "Reaching ${c.title}…"
+            "reaching" -> if (hide) "Reaching…" else "Reaching ${c.title}…"
             "calling" -> if (group) "Waiting for others to join…" else if (c.video) "Video calling…" else "Calling…"
             "ringing" -> "Ringing…"
-            "incoming" -> if (group) {
+            "incoming" -> if (group && hide) {
+                "Incoming group call"
+            } else if (group) {
                 "Group call from ${c.members.keys.firstOrNull()?.let { Threnody.nameOf(c.node, it) } ?: "a member"}"
             } else if (c.peerVideo) "Incoming video call" else "Incoming voice call"
             "connecting" -> "Connecting…"
@@ -371,7 +381,7 @@ class CallActivity : Activity() {
         reactions.visibility = if (talking && !group) View.VISIBLE else View.GONE
         if (!talking || group) picks.visibility = View.GONE
         remote.visibility = if (c.peerVideo && !ringing && !group) View.VISIBLE else View.GONE
-        showTiles(c, group && !ringing)
+        showTiles(c, group && !ringing, hide)
         local.visibility = if (c.video && !ringing) View.VISIBLE else View.GONE
         flip.visibility = if (c.video && !ringing && CallCamera.canSwitch(this)) View.VISIBLE else View.GONE
         mute.alpha = if (c.muted) 1f else 0.6f
@@ -386,11 +396,12 @@ class CallActivity : Activity() {
      * A group call's participants as a grid: their video when they send it,
      * else their name. Rebuilt only when who's there changes.
      */
-    private fun showTiles(c: Calls.Call, visible: Boolean) {
+    private fun showTiles(c: Calls.Call, visible: Boolean, hide: Boolean) {
         tiles.visibility = if (visible && c.members.isNotEmpty()) View.VISIBLE else View.GONE
         if (!visible) return
         val who = c.members.keys.sorted()
-        if (who != tileViews.keys.sorted()) {
+        if (who != tileViews.keys.sorted() || hide != tilesHidden) {
+            tilesHidden = hide
             tiles.removeAllViews()
             tileViews.clear()
             tileVideo.clear()
@@ -406,7 +417,7 @@ class CallActivity : Activity() {
             }
             for (d in who) {
                 val picture = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-                val name = label(Threnody.nameOf(c.node, d), Design.typeSubtitle, R.color.text).apply {
+                val name = label(if (hide) "" else Threnody.nameOf(c.node, d), Design.typeSubtitle, R.color.text).apply {
                     setShadowLayer(4f, 0f, 1f, Color.BLACK)
                 }
                 val tile = FrameLayout(this).apply {

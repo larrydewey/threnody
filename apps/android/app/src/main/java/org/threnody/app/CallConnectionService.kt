@@ -127,6 +127,17 @@ object Telecom {
         false
     }
 
+    /** Erasing: ends any call Telecom holds and removes the account. */
+    fun forget(ctx: Context) {
+        ended(DisconnectCause.LOCAL)
+        refused = false
+        try {
+            manager(ctx)?.unregisterPhoneAccount(handle(ctx))
+        } catch (e: Exception) {
+            Threnody.say("! telecom: ${e.javaClass.simpleName}")
+        }
+    }
+
     /** Whether Telecom will take a call now (the permission is granted at install). */
     private fun usable(ctx: Context) = try {
         ctx.checkSelfPermission(android.Manifest.permission.MANAGE_OWN_CALLS) ==
