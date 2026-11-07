@@ -16,7 +16,8 @@ targets:
   Threnody:
     type: application
     platform: iOS
-    scheme: {}
+    scheme:
+      testTargets: [ThrenodyTests]
     sources:
       - path: Threnody
     dependencies:
@@ -59,6 +60,9 @@ targets:
         NSLocalNetworkUsageDescription: Threnody connects directly to your contacts' devices on the local network.
         NFCReaderUsageDescription: Threnody reads a nearby phone's invite when you tap phones to add a contact.
         NSFaceIDUsageDescription: Threnody uses Face ID to unlock the app.
+        # QuickLook's share sheet offers "Save Image". No read access is
+        # asked for: the photo picker runs outside the app.
+        NSPhotoLibraryAddUsageDescription: Threnody saves the photos you choose to your library.
         # The tap protocol's AID: must match threnody_core::tap::AID.
         com.apple.developer.nfc.readersession.iso7816.select-identifiers:
           - F0746872656E6F6479
@@ -66,3 +70,18 @@ targets:
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
           - org.threnody.app.refresh
+  # Unit tests, hosted by the app (which then opens no node of its own).
+  ThrenodyTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: ThrenodyTests
+    dependencies:
+      - target: Threnody
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: org.threnody.app.tests
+        # The bindings' C module, which the app's module refers to, is found
+        # where the app's XCFramework puts it (the products' include
+        # directory): naming Generated/headers too would define it twice.

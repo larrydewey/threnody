@@ -5129,24 +5129,21 @@ fn linkify(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Image formats the node can't strip metadata from (it does JPEG, PNG
-/// and WebP; GIFs carry none worth the name): they're sent as JPEG.
-const CONVERT: [&str; 6] = ["heic", "heif", "avif", "bmp", "tif", "tiff"];
-
 /// An image the node can't strip, re-encoded as JPEG (which then carries
 /// no metadata): the name and bytes to send, and whether it was converted.
-/// Others pass through. Its content decides as well as its name, so a HEIC
-/// called "photo.jpg" is converted too (and keeps its name).
+/// Others pass through. Its content decides before its name
+/// (`image_needs_conversion`), so a HEIC called "photo.jpg" is converted
+/// too, and a video called "clip.heic" isn't.
 fn prepare(
     path: &std::path::Path,
     name: String,
     data: Vec<u8>,
 ) -> Result<(String, Vec<u8>, bool), String> {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if !CONVERT.contains(&ext.as_str()) && !threnody_core::media::needs_converting(&data) {
+    if !threnody_ffi::image_needs_conversion(file, data[..data.len().min(32)].to_vec()) {
         return Ok((name, data, false));
     }
     let unreadable =

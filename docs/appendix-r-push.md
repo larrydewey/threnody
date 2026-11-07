@@ -48,6 +48,8 @@ An empty map withdraws the endpoint. Keys 2 and 3 come together or not at all, a
 - **Storage.** In the node's encrypted state, keyed by the device's identity key, like mailbox contents.
 - **Anonymous identities never take part.** A persona node refuses to set an endpoint and ignores `Push` from its contacts. One distributor serving both the main identity and a persona would tie them together: the push server sees one phone with two endpoints, each woken by the other's contacts. A persona's messages arrive whenever the main identity's node wakes (the app opens every identity's node when it starts) or when the app is opened.
 
+*Non-normative.* iOS has no UnifiedPush: one app can't wake another, and only Apple's push service (APNs) can wake an app, driven by whoever holds that app's APNs key, which for a published app is its publisher. By this appendix's reasoning about FCM, that is a provider-held record of every wake-up, so the iOS app doesn't use push; it relies on mailboxes and senders' queues until it is opened (see `apps/ios/README.md`). Nothing on the wire changes.
+
 ### Rotation
 
 The endpoint is an identifier: every contact that has it can ask the push server about it, or recognise it. The Android app gets a new one (unregisters and registers again) every 30 days, and whenever the setting is turned off and on. Contacts get the new one at their next session, and the old one stops working at once (the push server answers 404 or 410 and contacts forget it).
