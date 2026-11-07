@@ -594,7 +594,8 @@ class MainActivity : Activity() {
         scroll.scrollTo(0, 0)
     }
 
-    private fun preview(e: HistoryEntry) = e.file?.let { Threnody.fileLabel(it.name, it.sensitive, e.text, it.clip) } ?: e.text
+    /** One line for the chat list: shared with the other apps (polls 📊, lists 📋). */
+    private fun preview(e: HistoryEntry) = uniffi.threnody_ffi.entryPreview(e)
 
     private fun status(c: Conversation) = when {
         c.approved && c.verified -> "Approved · verified"

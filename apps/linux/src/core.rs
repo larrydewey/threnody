@@ -1925,7 +1925,7 @@ pub fn describe(e: &NodeEvent) -> String {
 }
 
 pub fn is_image(name: &str) -> bool {
-    threnody_core::media::looks_like_image(name)
+    threnody_ffi::is_image_name(name.to_owned())
 }
 
 /// Writes `data` as `name` (any path in it stripped) into `dir`; its
@@ -2118,32 +2118,12 @@ fn sweep_media(dir: &Path, kept: &HashSet<String>) {
 
 /// What the list or a notification says for a file.
 pub fn file_label(name: &str, sensitive: bool, caption: &str, clip: Option<Clip>) -> String {
-    if let Some(c) = clip {
-        let (icon, what) = if c.video {
-            ("🎥", "Video message")
-        } else {
-            ("🎤", "Voice message")
-        };
-        return match (sensitive, c.duration_ms) {
-            (true, _) => format!("{icon} Sensitive {}", what.to_lowercase()),
-            (false, 0) => format!("{icon} {what}"),
-            (false, ms) => format!("{icon} {what} ({})", crate::clip::clock(u64::from(ms))),
-        };
-    }
-    match (sensitive, is_image(name)) {
-        (true, true) => "📷 Sensitive photo".into(),
-        (true, false) => "📎 Sensitive file".into(),
-        (false, true) => format!("📷 {}", if caption.is_empty() { "Photo" } else { caption }),
-        (false, false) => format!("📎 {}", if caption.is_empty() { name } else { caption }),
-    }
+    threnody_ffi::file_label(name.to_owned(), sensitive, caption.to_owned(), clip)
 }
 
 /// A one-line preview of a stored message.
 pub fn preview(e: &HistoryEntry) -> String {
-    match &e.file {
-        Some(f) => file_label(&f.name, f.sensitive, &e.text, f.clip),
-        None => e.text.lines().next().unwrap_or("").to_owned(),
-    }
+    threnody_ffi::entry_preview(e.clone())
 }
 
 /// Writes `data` to `path` (and its directory) readable only by the user:
@@ -2282,6 +2262,23 @@ mod tests {
         assert!(note.exists() && recording.exists());
         assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn labels_come_from_the_bindings() {
+        assert_eq!(
+            file_label("a.png", false, "", None),
+            threnody_ffi::file_label("a.png".into(), false, String::new(), None)
+        );
+        assert_eq!(file_label("a.png", false, "", None), "📷 Photo");
+        let node_dir = temp("preview");
+        let node =
+            ThrenodyNode::open(node_dir.join("node").display().to_string(), None, None).unwrap();
+        node.write_note("first line\nsecond".into(), None, None)
+            .unwrap();
+        let e = node.note_history(1).unwrap().pop().unwrap();
+        assert_eq!(preview(&e), "first line");
+        let _ = std::fs::remove_dir_all(&node_dir);
     }
 
     fn temp(what: &str) -> PathBuf {
