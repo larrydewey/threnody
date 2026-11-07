@@ -257,3 +257,37 @@ async fn group_call_legs_over_tcp_move_to_quic() {
     .await
     .expect("the leg's session moved to QUIC");
 }
+
+/// A build without call media (it withholds the calls bit) isn't rung and
+/// can't start or join a call; a caller is told it can't reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn builds_without_calls_are_not_rung_and_cannot_join() {
+    use threnody_core::message::FEATURE_CALLS;
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _arx) = node(&dir, "a");
+    let (b, mut brx) = node(&dir, "b");
+    b.withhold_features(FEATURE_CALLS);
+    connect(&b, &a).await;
+    let (ai, bi) = (a.identity(), b.identity());
+    timeout(Duration::from_secs(10), async {
+        while !a.supports(&bi, threnody_core::message::FEATURE_ACKS) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("b's Hello arrives");
+
+    a.start_group_call(GROUP, CALL, BASE, false).unwrap();
+    assert!(!b.group_call_rang(GROUP, CALL, ai, BASE, false));
+    assert!(b.group_call().is_none());
+    assert!(b.join_group_call(CALL, false).is_err());
+    assert!(b.start_group_call(GROUP, CALL + 1, BASE, false).is_err());
+    assert!(b.start_call(&ai, false).is_err());
+    // Nothing rang on b.
+    while let Ok(e) = brx.try_recv() {
+        assert!(!matches!(e, Event::GroupCallRinging { .. }), "{e:?}");
+    }
+    // A one-to-one call to it finds no device to ring.
+    a.leave_group_call(CALL);
+    assert!(a.start_call(&bi, false).is_err());
+}

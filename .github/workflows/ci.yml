@@ -148,6 +148,14 @@ jobs:
           if grep -aq 'Llivekit/org/webrtc/PeerConnectionFactory;' "$out"/apk/classes*.dex; then
               echo "::error::libwebrtc.jar classes in the no-calls APK"; exit 1
           fi
+          # What only calls need stays out of its manifest.
+          aapt2=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
+          "$aapt2" dump xmltree --file AndroidManifest.xml "$apk" > "$out/manifest.txt"
+          for want in USE_FULL_SCREEN_INTENT FOREGROUND_SERVICE_MICROPHONE MANAGE_OWN_CALLS CallConnectionService; do
+              if grep -q "$want" "$out/manifest.txt"; then
+                  echo "::error::$want in the no-calls manifest"; exit 1
+              fi
+          done
 
   ios:
     name: iOS app

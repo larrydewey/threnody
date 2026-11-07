@@ -4,9 +4,8 @@
 # which F-Droid can't use. -Pthrenody.calls=false and build.sh --no-calls
 # leave WebRTC out entirely (nothing is downloaded but crates and Gradle
 # dependencies), the call buttons disappear, and the node tells contacts it
-# doesn't take 1:1 calls. Group-call rings don't check that yet: a group call
-# still rings this build, and joining one gives no audio. Fix that before the
-# first F-Droid submission.
+# doesn't take calls. A group call doesn't ring this build, and it can't
+# start or join one.
 #
 # The license is "Apache-2.0 OR MIT" (dual); fdroiddata takes one SPDX id,
 # so this uses Apache-2.0, as other dual-licensed Rust apps do.

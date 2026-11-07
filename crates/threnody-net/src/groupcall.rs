@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use threnody_core::call::{self, MAX_GROUP_CALL, MediaKeys};
+use threnody_core::message::FEATURE_CALLS;
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -161,6 +162,15 @@ impl Node {
         mine
     }
 
+    /// Refuses calls on a build without call media (it withholds
+    /// [`FEATURE_CALLS`] from its `Hello`).
+    pub(crate) fn can_call(&self) -> Result<()> {
+        if self.local_features() & FEATURE_CALLS == 0 {
+            return Err(NetError::NotAllowed("this build has no calls".into()));
+        }
+        Ok(())
+    }
+
     /// Whether any call, one-to-one or group, rings or runs here.
     pub(crate) fn in_group_call(&self) -> bool {
         lock(&self.shared.group_calls)
@@ -178,6 +188,7 @@ impl Node {
         base: [u8; 32],
         video: bool,
     ) -> Result<()> {
+        self.can_call()?;
         if self.call().is_some() {
             return Err(NetError::NotAllowed("already in a call".into()));
         }
@@ -216,7 +227,9 @@ impl Node {
         base: [u8; 32],
         video: bool,
     ) -> bool {
-        if self.call().is_some() {
+        // A build without call media doesn't ring, as for a call with one
+        // contact: it couldn't join.
+        if self.can_call().is_err() || self.call().is_some() {
             return false;
         }
         let mut gc = lock(&self.shared.group_calls);
@@ -251,6 +264,7 @@ impl Node {
     /// `GroupCallMsg::Join`, and the media layer opens a leg to every
     /// participant ([`Node::group_leg_media`]).
     pub fn join_group_call(&self, call: u64, video: bool) -> Result<()> {
+        self.can_call()?;
         if self.call().is_some() {
             return Err(NetError::NotAllowed("already in a call".into()));
         }
