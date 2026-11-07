@@ -156,6 +156,12 @@ impl Home {
             }
         }
         let (_, left) = sort_entries(&real)?;
+        // Named under the directory as given, not its canonical path
+        // (macOS's /private/var, Windows's \\?\ prefix).
+        let left: Vec<PathBuf> = left
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| dir.join(n)))
+            .collect();
         if left.is_empty() {
             match fs::remove_dir(&real) {
                 Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
