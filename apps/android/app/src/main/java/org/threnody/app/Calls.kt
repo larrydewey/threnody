@@ -289,6 +289,20 @@ object Calls {
         cancelRinging(ctx)
     }
 
+    /**
+     * Erasing: the node is going away, so no event will end the call. Ends
+     * it here, and Telecom's account with it, as on a fresh install.
+     */
+    fun forget(ctx: Context) {
+        current?.let { c -> runCatching { if (c.group != null) c.node.leaveGroupCall() else c.node.hangupCall(c.id) } }
+        current = null
+        ended = null
+        cancelRinging(ctx)
+        inCall(ctx, false)
+        Telecom.forget(ctx)
+        changed()
+    }
+
     fun setMuted(muted: Boolean) {
         val c = current ?: return
         current = c.copy(muted = muted)
@@ -642,15 +656,20 @@ object Calls {
             ctx, 2, Intent(ctx, Decline::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val hide = AppLock.enabled(ctx)
         val n = Notification.Builder(ctx, CHANNEL_RING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(if (c.group != null) "Group call in ${c.title}" else "${c.title} is calling")
+            .setContentTitle(when {
+                hide -> if (c.group != null) "Incoming group call" else "Incoming call"
+                c.group != null -> "Group call in ${c.title}"
+                else -> "${c.title} is calling"
+            })
             .setContentText(if (c.group != null) "Threnody group call" else "Threnody voice call")
             .apply {
                 // A call notification (Android 12+): the system rings it as
                 // a call, with Answer and Decline (on the lock screen too).
                 if (Build.VERSION.SDK_INT >= 31) {
-                    setStyle(Notification.CallStyle.forIncomingCall(Person.Builder().setName(c.title).build(), decline, answer))
+                    setStyle(Notification.CallStyle.forIncomingCall(person(c, hide), decline, answer))
                 }
             }
             .setVisibility(Notification.VISIBILITY_PRIVATE)
@@ -687,9 +706,14 @@ object Calls {
             ctx, 4, Intent(ctx, Decline::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val hide = AppLock.enabled(ctx)
         return Notification.Builder(ctx, CHANNEL_ONGOING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(if (c.group != null) "Group call in ${c.title}" else "Call with ${c.title}")
+            .setContentTitle(when {
+                hide -> if (c.group != null) "Group call" else "Call in progress"
+                c.group != null -> "Group call in ${c.title}"
+                else -> "Call with ${c.title}"
+            })
             .setContentText("Tap to return to the call")
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .setPublicVersion(public(ctx, "Call in progress"))
@@ -702,7 +726,7 @@ object Calls {
                     setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - c.since))
                 }
                 if (Build.VERSION.SDK_INT >= 31) {
-                    setStyle(Notification.CallStyle.forOngoingCall(Person.Builder().setName(c.title).build(), hangUp))
+                    setStyle(Notification.CallStyle.forOngoingCall(person(c, hide), hangUp))
                 } else {
                     addAction(Notification.Action.Builder(null, "Hang up", hangUp).build())
                 }
@@ -722,7 +746,11 @@ object Calls {
     private fun missed(ctx: Context, c: Call) {
         val n = Notification.Builder(ctx, CHANNEL_MISSED)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(if (c.group != null) "Missed group call in ${c.title}" else "Missed call from ${c.title}")
+            .setContentTitle(when {
+                AppLock.enabled(ctx) -> if (c.group != null) "Missed group call" else "Missed call"
+                c.group != null -> "Missed group call in ${c.title}"
+                else -> "Missed call from ${c.title}"
+            })
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .setPublicVersion(public(ctx, "Missed call"))
             .setAutoCancel(true)
@@ -730,6 +758,13 @@ object Calls {
             .build()
         post(ctx, ID_MISSED, n)
     }
+
+    /**
+     * Who a call notification names: with app lock on, no one (the
+     * notification shows past the lock, so it says only that there's a call).
+     */
+    private fun person(c: Call, hide: Boolean) =
+        Person.Builder().setName(if (hide) "Threnody" else c.title).build()
 
     /** On the lock screen: only that there's a call, not who. */
     private fun public(ctx: Context, text: String) = Notification.Builder(ctx, CHANNEL_MISSED)
