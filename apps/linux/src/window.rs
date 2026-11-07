@@ -1448,25 +1448,41 @@ impl App {
                 removed,
                 by,
             } => {
-                // "Carol was added by Bob", while the group is open.
-                if let Some(by) = by
-                    && self.showing_group(group)
+                // "Carol was removed by Bob", "Carol left", while the group
+                // is open.
+                if self.showing_group(group)
+                    && let Ok(n) = self.core.node(persona.as_deref())
+                    && let Some(who) = added.iter().chain(removed).next()
+                {
+                    let me = n.device_fingerprint();
+                    let ours: Vec<String> =
+                        n.devices().into_iter().map(|d| d.fingerprint).collect();
+                    let actor = match by.as_deref() {
+                        Some(b) if b == who => Actor::Itself,
+                        Some(b) if b == me => Actor::ThisDevice,
+                        Some(b) if ours.iter().any(|o| o == b) => Actor::Us,
+                        Some(b) => Actor::Other(self.name(persona.as_deref(), b)),
+                        None => Actor::Itself,
+                    };
+                    let who = self.name(persona.as_deref(), who);
+                    if let Some(text) = member_notice(!added.is_empty(), &who, actor) {
+                        self.toast(&text);
+                    }
+                }
+                (Some(group.clone()), None)
+            }
+            NodeEvent::GroupRoleChanged {
+                group,
+                member,
+                role,
+            } => {
+                if self.showing_group(group)
                     && self
                         .core
                         .node(persona.as_deref())
-                        .is_ok_and(|n| n.device_fingerprint() != *by)
-                    && let Some(who) = added.iter().chain(removed).next()
-                    && who != by
+                        .is_ok_and(|n| n.device_fingerprint() == *member)
                 {
-                    let (who, by) = (
-                        self.name(persona.as_deref(), who),
-                        self.name(persona.as_deref(), by),
-                    );
-                    self.toast(&if added.is_empty() {
-                        format!("{who} was removed by {by}")
-                    } else {
-                        format!("{who} was added by {by}")
-                    });
+                    self.toast(role_notice(*role));
                 }
                 (Some(group.clone()), None)
             }
@@ -1476,7 +1492,6 @@ impl App {
                 (Some(group.clone()), None)
             }
             NodeEvent::GroupJoined { group, .. }
-            | NodeEvent::GroupRoleChanged { group, .. }
             | NodeEvent::GroupOutOfStep { group }
             | NodeEvent::GroupUpgradePending { group, .. }
             | NodeEvent::GroupLeft { group } => (Some(group.clone()), None),
@@ -4665,5 +4680,67 @@ impl Tab {
             Self::Groups => group,
             _ => true,
         }
+    }
+}
+
+/// Who made a membership change, as its notice names them.
+#[derive(Debug, PartialEq)]
+enum Actor {
+    /// The member itself (it joined or left), or no one said.
+    Itself,
+    /// This device: the screen already shows it.
+    ThisDevice,
+    /// Another of our devices.
+    Us,
+    Other(String),
+}
+
+/// "Carol was removed by Bob", "Carol left", "You removed Carol"; nothing
+/// for a change made on this device.
+fn member_notice(added: bool, who: &str, by: Actor) -> Option<String> {
+    Some(match (by, added) {
+        (Actor::ThisDevice, _) => return None,
+        (Actor::Itself, true) => format!("{who} joined"),
+        (Actor::Itself, false) => format!("{who} left"),
+        (Actor::Us, true) => format!("You added {who}"),
+        (Actor::Us, false) => format!("You removed {who}"),
+        (Actor::Other(by), true) => format!("{who} was added by {by}"),
+        (Actor::Other(by), false) => format!("{who} was removed by {by}"),
+    })
+}
+
+/// When this device's role changes (`role`: 0 owner, 1 admin, 2 member).
+fn role_notice(role: u8) -> &'static str {
+    match role {
+        0 => "You are now an owner",
+        1 => "You are now an admin",
+        _ => "You are now a member",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_notices_name_who_did_it() {
+        assert_eq!(member_notice(false, "Carol", Actor::ThisDevice), None);
+        assert_eq!(
+            member_notice(false, "Carol", Actor::Us).as_deref(),
+            Some("You removed Carol")
+        );
+        assert_eq!(
+            member_notice(false, "Carol", Actor::Other("Bob".into())).as_deref(),
+            Some("Carol was removed by Bob")
+        );
+        assert_eq!(
+            member_notice(false, "Carol", Actor::Itself).as_deref(),
+            Some("Carol left")
+        );
+        assert_eq!(
+            member_notice(true, "Carol", Actor::Other("Bob".into())).as_deref(),
+            Some("Carol was added by Bob")
+        );
+        assert_eq!(role_notice(1), "You are now an admin");
     }
 }

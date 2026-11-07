@@ -516,19 +516,57 @@ fn capabilities() -> Capabilities {
         .build()
 }
 
-/// Who joined and left in a commit, each with who brought it about.
+/// Marks a commit's authenticated data: the leaves (as `u32`s, big
+/// endian) that follow it are of members the committer removed because
+/// they asked to leave. Members that predate it ignore it.
+const LEAVE_AAD: &[u8] = b"threnody/left";
+
+/// The authenticated data for a commit that removes the members at
+/// `leaving` because they asked to leave (none: no data).
+fn leave_aad(leaving: &[LeafNodeIndex]) -> Vec<u8> {
+    if leaving.is_empty() {
+        return Vec::new();
+    }
+    let mut aad = LEAVE_AAD.to_vec();
+    for i in leaving {
+        aad.extend_from_slice(&i.u32().to_be_bytes());
+    }
+    aad
+}
+
+/// The leaves a commit's authenticated data says left (see [`leave_aad`]);
+/// none for anything else.
+fn leaving_from_aad(aad: &[u8]) -> Vec<LeafNodeIndex> {
+    let Some(rest) = aad.strip_prefix(LEAVE_AAD) else {
+        return Vec::new();
+    };
+    let (leaves, []) = rest.as_chunks::<4>() else {
+        return Vec::new();
+    };
+    leaves
+        .iter()
+        .map(|c| LeafNodeIndex::new(u32::from_be_bytes(*c)))
+        .collect()
+}
+
+/// Who joined and left in a commit, each with who brought it about: a
+/// proposal's sender (a member that proposed removing itself left), or
+/// for the committer's own proposals the committer, unless the commit says
+/// the member at that leaf asked to leave (`leaving`).
 #[allow(clippy::type_complexity)]
 fn membership_changes<'a>(
     g: &Group,
     committer: &Pid,
     queued: impl Iterator<Item = &'a QueuedProposal>,
+    leaving: &[LeafNodeIndex],
 ) -> (Vec<(Pid, Pid)>, Vec<(Pid, Pid)>) {
     let (mut added, mut removed) = (Vec::new(), Vec::new());
     for q in queued {
-        let by = if q.proposal_or_ref_type() == ProposalOrRefType::Reference {
-            g.sender(q.sender()).unwrap_or(*committer)
-        } else {
+        let by_value = q.proposal_or_ref_type() != ProposalOrRefType::Reference;
+        let by = if by_value {
             *committer
+        } else {
+            g.sender(q.sender()).unwrap_or(*committer)
         };
         match q.proposal() {
             Proposal::Add(a) => {
@@ -539,7 +577,8 @@ fn membership_changes<'a>(
             }
             Proposal::Remove(r) => {
                 if let Some(p) = g.at(r.removed()) {
-                    removed.push((p, by));
+                    let left = by_value && leaving.contains(&r.removed());
+                    removed.push((p, if left { p } else { by }));
                 }
             }
             _ => {}
@@ -562,6 +601,9 @@ struct Own {
     /// Invitees we asked ourselves: their Welcome goes straight to them.
     adds: Vec<(Pid, KeyPackage)>,
     removes: Vec<Pid>,
+    /// Those of `removes` who asked to leave: the commit says so (see
+    /// [`leave_aad`]), so members show they left rather than were removed.
+    leavers: Vec<Pid>,
     roster: Vec<RosterChange>,
     /// The roster after, instead of applying `roster` (a claim).
     set_roster: Option<Roster>,
@@ -1948,12 +1990,13 @@ impl Groups {
                 return Err(e);
             }
         };
+        let leaving = leaving_from_aad(processed.aad());
         let event = match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app) => {
                 application_event(group, sender, &app.into_bytes())?
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
-                return self.on_commit(&group, sender, *staged, snapshot);
+                return self.on_commit(&group, sender, *staged, snapshot, &leaving);
             }
             ProcessedMessageContent::ProposalMessage(q) => {
                 return self.on_proposal(&group, sender, *q, bytes);
@@ -2095,6 +2138,7 @@ impl Groups {
         sender: Pid,
         staged: StagedCommit,
         snapshot: Option<Vec<QueuedProposal>>,
+        leaving: &[LeafNodeIndex],
     ) -> Result<Output> {
         let me = self.me;
         let legacy = self.legacy;
@@ -2143,7 +2187,7 @@ impl Groups {
                 return Err(e);
             }
         };
-        let (added, removed) = membership_changes(g, &sender, staged.queued_proposals());
+        let (added, removed) = membership_changes(g, &sender, staged.queued_proposals(), leaving);
         g.mls
             .merge_staged_commit(&self.provider, staged)
             .map_err(mls)?;
@@ -2488,47 +2532,58 @@ impl Groups {
         }
         // Build it.
         let mut indices = Vec::new();
+        let mut leaving = Vec::new();
         for r in &own.removes {
-            indices.push(
-                g.index_of(r)
-                    .ok_or_else(|| GroupError::NotMember(r.fingerprint().to_string()))?,
-            );
+            let index = g
+                .index_of(r)
+                .ok_or_else(|| GroupError::NotMember(r.fingerprint().to_string()))?;
+            indices.push(index);
+            if own.leavers.contains(r) {
+                leaving.push(index);
+            }
         }
+        // Set for this commit alone (openmls clears it once the commit is
+        // built; we clear it too, should building fail).
+        g.mls.set_aad(leave_aad(&leaving));
         let mut builder = g
             .mls
             .commit_builder()
             .consume_proposal_store(own.consume)
             .propose_adds(own.adds.iter().map(|(_, kp)| kp.clone()))
             .propose_removals(indices);
-        if let Some(r) = &gce {
-            builder = builder
-                .propose_group_context_extensions(roster_extensions(r)?)
-                .map_err(mls)?;
-        }
-        if own.self_update {
-            builder = builder
-                .leaf_node_parameters(
-                    LeafNodeParameters::builder()
-                        .with_capabilities(capabilities())
-                        .build(),
+        let bundle = (|| {
+            if let Some(r) = &gce {
+                builder = builder
+                    .propose_group_context_extensions(roster_extensions(r)?)
+                    .map_err(mls)?;
+            }
+            if own.self_update {
+                builder = builder
+                    .leaf_node_parameters(
+                        LeafNodeParameters::builder()
+                            .with_capabilities(capabilities())
+                            .build(),
+                    )
+                    .force_self_update(true);
+            }
+            builder
+                .load_psks(self.provider.storage())
+                .map_err(mls)?
+                .build(
+                    self.provider.rand(),
+                    self.provider.crypto(),
+                    &self.signer,
+                    |q| {
+                        q.proposal_or_ref_type() == ProposalOrRefType::Proposal
+                            || include.contains(q.proposal_reference_ref())
+                    },
                 )
-                .force_self_update(true);
-        }
-        let bundle = builder
-            .load_psks(self.provider.storage())
-            .map_err(mls)?
-            .build(
-                self.provider.rand(),
-                self.provider.crypto(),
-                &self.signer,
-                |q| {
-                    q.proposal_or_ref_type() == ProposalOrRefType::Proposal
-                        || include.contains(q.proposal_reference_ref())
-                },
-            )
-            .map_err(mls)?
-            .stage_commit(&self.provider)
-            .map_err(mls)?;
+                .map_err(mls)?
+                .stage_commit(&self.provider)
+                .map_err(mls)
+        })();
+        g.mls.set_aad(Vec::new());
+        let bundle = bundle?;
         // Check our own commit as every member will, before it's final.
         let staged = g
             .mls
@@ -2555,7 +2610,7 @@ impl Groups {
                 .map_err(mls)?;
             return Ok(Output::default());
         }
-        let (joined, left) = membership_changes(g, &me, staged.queued_proposals());
+        let (joined, left) = membership_changes(g, &me, staged.queued_proposals(), &leaving);
         let referenced: Vec<Vec<u8>> = staged
             .queued_proposals()
             .filter(|q| q.proposal_or_ref_type() == ProposalOrRefType::Reference)
@@ -3050,11 +3105,14 @@ impl Groups {
             out.send.retain(|o| o.to != from);
             return Ok(out);
         }
-        // The leaver has already forgotten the group.
+        // Its own Remove can't go in (a group without a roster, or it was
+        // a step behind): we remove it, and say it left. The leaver has
+        // already forgotten the group.
         let mut out = self.commit(
             &group,
             Own {
                 removes: vec![from],
+                leavers: vec![from],
                 consume: roster.is_some(),
                 ..Own::default()
             },
@@ -3340,6 +3398,18 @@ fn invisible(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leave_marks_round_trip_and_nothing_else_reads_as_one() {
+        let leaves = [LeafNodeIndex::new(3), LeafNodeIndex::new(70_000)];
+        assert_eq!(leaving_from_aad(&leave_aad(&leaves)), leaves);
+        assert!(leave_aad(&[]).is_empty());
+        assert!(leaving_from_aad(&[]).is_empty());
+        let mut torn = leave_aad(&leaves);
+        torn.pop();
+        assert!(leaving_from_aad(&torn).is_empty());
+        assert!(leaving_from_aad(b"something else\0\0\0\x03").is_empty());
+    }
 
     /// Groups by identity, delivering everything until quiet (invitations
     /// accepted, errors noted).

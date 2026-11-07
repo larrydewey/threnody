@@ -116,24 +116,20 @@ impl GroupUi {
                     i.name,
                     self.groups.invites().len()
                 ),
-                Update::MemberAdded { group, member, by } => match by {
-                    Some(by) if by != member && by != node.identity() => say!(
-                        "* {} was added to {} by {}",
-                        name(&member),
-                        self.label(&group),
-                        name(&by)
-                    ),
-                    _ => say!("* {} joined {}", name(&member), self.label(&group)),
-                },
-                Update::MemberRemoved { group, member, by } => match by {
-                    Some(by) if by != member && by != node.identity() => say!(
-                        "* {} was removed from {} by {}",
-                        name(&member),
-                        self.label(&group),
-                        name(&by)
-                    ),
-                    _ => say!("* {} left {}", name(&member), self.label(&group)),
-                },
+                Update::MemberAdded { group, member, by } => {
+                    let by = actor(node, &member, by).map(|p| name(&p));
+                    say!(
+                        "* {}",
+                        added_notice(&name(&member), &self.label(&group), by.as_deref())
+                    );
+                }
+                Update::MemberRemoved { group, member, by } => {
+                    let by = actor(node, &member, by).map(|p| name(&p));
+                    say!(
+                        "* {}",
+                        removed_notice(&name(&member), &self.label(&group), by.as_deref())
+                    );
+                }
                 Update::ChangeFailed { group, reason } => {
                     say!(
                         "! couldn't apply your change to {}: {reason}",
@@ -157,11 +153,10 @@ impl GroupUi {
                     member,
                     role,
                 } => {
+                    let who = (member != node.identity()).then(|| name(&member));
                     say!(
-                        "* {} is now {} in {}",
-                        name(&member),
-                        role_name(role),
-                        self.label(&group)
+                        "* {}",
+                        role_notice(who.as_deref(), role, &self.label(&group))
                     );
                 }
                 Update::Left { group } => {
@@ -698,10 +693,153 @@ impl GroupUi {
     }
 }
 
+/// Who made a membership change of `member`'s, as its notice names them:
+/// `Actor::Itself` for the member itself (it joined or left, or no one
+/// said), `Actor::Us` for this device or another of our own.
+#[derive(Debug, PartialEq)]
+enum Actor<P> {
+    Itself,
+    Us,
+    Other(P),
+}
+
+impl<P> Actor<P> {
+    fn map<Q>(self, f: impl FnOnce(P) -> Q) -> Actor<Q> {
+        match self {
+            Actor::Itself => Actor::Itself,
+            Actor::Us => Actor::Us,
+            Actor::Other(p) => Actor::Other(f(p)),
+        }
+    }
+
+    fn as_deref(&self) -> Actor<&str>
+    where
+        P: AsRef<str>,
+    {
+        match self {
+            Actor::Itself => Actor::Itself,
+            Actor::Us => Actor::Us,
+            Actor::Other(p) => Actor::Other(p.as_ref()),
+        }
+    }
+}
+
+fn actor(
+    node: &Node,
+    member: &PublicIdentity,
+    by: Option<PublicIdentity>,
+) -> Actor<PublicIdentity> {
+    classify(member, by, |p| {
+        *p == node.identity() || node.is_own_device(p)
+    })
+}
+
+fn classify(
+    member: &PublicIdentity,
+    by: Option<PublicIdentity>,
+    ours: impl Fn(&PublicIdentity) -> bool,
+) -> Actor<PublicIdentity> {
+    match by {
+        Some(by) if by == *member => Actor::Itself,
+        Some(by) if ours(&by) => Actor::Us,
+        Some(by) => Actor::Other(by),
+        None => Actor::Itself,
+    }
+}
+
+fn added_notice(member: &str, group: &str, by: Actor<&str>) -> String {
+    match by {
+        Actor::Itself => format!("{member} joined {group}"),
+        Actor::Us => format!("you added {member} to {group}"),
+        Actor::Other(by) => format!("{member} was added to {group} by {by}"),
+    }
+}
+
+fn removed_notice(member: &str, group: &str, by: Actor<&str>) -> String {
+    match by {
+        Actor::Itself => format!("{member} left {group}"),
+        Actor::Us => format!("you removed {member} from {group}"),
+        Actor::Other(by) => format!("{member} was removed from {group} by {by}"),
+    }
+}
+
+/// `member`: `None` for this device.
+fn role_notice(member: Option<&str>, role: MemberRole, group: &str) -> String {
+    let role = match role {
+        MemberRole::Owner => "an owner",
+        MemberRole::Admin => "an admin",
+        MemberRole::Member => "a member",
+    };
+    match member {
+        Some(m) => format!("{m} is now {role} in {group}"),
+        None => format!("you are now {role} in {group}"),
+    }
+}
+
 fn role_name(role: MemberRole) -> &'static str {
     match role {
         MemberRole::Owner => "owner",
         MemberRole::Admin => "admin",
         MemberRole::Member => "member",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_notices_name_who_did_it() {
+        let ids: Vec<PublicIdentity> = (0..3).map(|_| Identity::generate().public()).collect();
+        let (me, carol, dave) = (ids[0], ids[1], ids[2]);
+        let ours = |p: &PublicIdentity| *p == me;
+        // Removed by us (the device that removed her used to say she left).
+        assert_eq!(classify(&carol, Some(me), ours), Actor::Us);
+        assert_eq!(
+            removed_notice("carol", "G", Actor::Us),
+            "you removed carol from G"
+        );
+        // Removed by someone else.
+        assert_eq!(classify(&carol, Some(dave), ours), Actor::Other(dave));
+        assert_eq!(
+            removed_notice("carol", "G", Actor::Other("dave")),
+            "carol was removed from G by dave"
+        );
+        // Her own leave, even when we committed it.
+        assert_eq!(classify(&carol, Some(carol), ours), Actor::Itself);
+        assert_eq!(classify(&carol, None, ours), Actor::Itself);
+        assert_eq!(removed_notice("carol", "G", Actor::Itself), "carol left G");
+        // Our own device leaving is a leave too.
+        assert_eq!(classify(&me, Some(me), ours), Actor::Itself);
+
+        assert_eq!(
+            added_notice("carol", "G", Actor::Us),
+            "you added carol to G"
+        );
+        assert_eq!(
+            added_notice("carol", "G", Actor::Other("dave")),
+            "carol was added to G by dave"
+        );
+        assert_eq!(added_notice("carol", "G", Actor::Itself), "carol joined G");
+    }
+
+    #[test]
+    fn role_notices_say_you() {
+        assert_eq!(
+            role_notice(None, MemberRole::Admin, "G"),
+            "you are now an admin in G"
+        );
+        assert_eq!(
+            role_notice(Some("carol"), MemberRole::Admin, "G"),
+            "carol is now an admin in G"
+        );
+        assert_eq!(
+            role_notice(Some("carol"), MemberRole::Member, "G"),
+            "carol is now a member in G"
+        );
+        assert_eq!(
+            role_notice(None, MemberRole::Owner, "G"),
+            "you are now an owner in G"
+        );
     }
 }

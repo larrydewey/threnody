@@ -725,6 +725,9 @@ class ChatActivity : Activity() {
                 is NodeEvent.GroupMembersChanged -> memberNotice(e)?.let { text ->
                     runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
                 }
+                is NodeEvent.GroupRoleChanged -> roleNotice(e)?.let { text ->
+                    runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
+                }
                 else -> {}
             }
             refreshSoon()
@@ -1082,16 +1085,39 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** "Carol was added by Bob", for a change someone else made. */
+    /**
+     * "Carol was removed by Bob", "Carol left", or "You removed Carol" for a
+     * change made on another of our devices; nothing for one made on this
+     * device (the screen shows it).
+     */
     private fun memberNotice(e: NodeEvent.GroupMembersChanged): String? {
-        val by = e.by ?: return null
-        val me = try { node.deviceFingerprint() } catch (_: Exception) { return null }
-        if (by == me) return null
         val who = (e.added + e.removed).firstOrNull() ?: return null
-        if (who == by) return null
+        val added = e.added.isNotEmpty()
         val name = Threnody.nameOf(node, who)
-        val byName = Threnody.nameOf(node, by)
-        return if (e.added.isNotEmpty()) "$name was added by $byName" else "$name was removed by $byName"
+        val by = e.by
+        // No one said, or the member itself: it joined or left.
+        if (by == null || by == who) return if (added) "$name joined" else "$name left"
+        val ours = try {
+            if (by == node.deviceFingerprint()) return null
+            node.devices().any { it.fingerprint == by }
+        } catch (_: Exception) { return null }
+        return when {
+            ours && added -> "You added $name"
+            ours -> "You removed $name"
+            added -> "$name was added by ${Threnody.nameOf(node, by)}"
+            else -> "$name was removed by ${Threnody.nameOf(node, by)}"
+        }
+    }
+
+    /** "You are now an admin", when this device's role changes. */
+    private fun roleNotice(e: NodeEvent.GroupRoleChanged): String? {
+        val me = try { node.deviceFingerprint() } catch (_: Exception) { return null }
+        if (e.member != me) return null
+        return when (e.role.toInt()) {
+            0 -> "You are now an owner"
+            1 -> "You are now an admin"
+            else -> "You are now a member"
+        }
     }
 
     private fun claimGroup() {
