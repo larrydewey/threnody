@@ -12,4 +12,12 @@ ignore = [
     # traits. No secret arithmetic runs through crypto-bigint. Drop this
     # once zkryptium moves to a fixed crypto-bigint (>= 0.7.6).
     "RUSTSEC-2026-0387",
+    # libsqlite3-sys 0.35.0 (bundled SQLite CVE-2026-119375): it is in
+    # Cargo.lock only because openmls 0.9 has an optional dependency on
+    # openmls_sqlite_storage -> rusqlite 0.37, which pins it below the fix
+    # (0.39). Nothing here enables that storage; `cargo tree --workspace
+    # --all-features --target all -e normal,build,dev -i libsqlite3-sys`
+    # finds nothing, so SQLite is never compiled into any build. Drop this
+    # once openmls moves to rusqlite >= 0.39.
+    "RUSTSEC-2026-0459",
 ]
