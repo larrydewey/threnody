@@ -154,6 +154,8 @@ class ChatActivity : Activity() {
     private val texts = mutableMapOf<String, MutableList<Pair<TextView, String>>>()
     /** Messages with mentions, by [mark]: their text as shown, and where the mentions are. */
     private val mentionRanges = mutableMapOf<String, Pair<String, List<Triple<Int, Int, Boolean>>>>()
+    /** Links in bubbles' texts, by text. */
+    private val linkCache = HashMap<String, List<uniffi.threnody_ffi.TextLink>>()
     /** A message to bring into view once loaded: its [mark] and time. */
     private var jump: Pair<String, ULong>? = null
     /**
@@ -1165,6 +1167,7 @@ class ChatActivity : Activity() {
         messages.removeAllViews()
         bubbles.clear()
         mentionRanges.clear()
+        linkCache.clear()
         fetchLabels.clear()
         onScreen = items.map { it.entry }
         texts.clear()
@@ -1366,14 +1369,19 @@ class ChatActivity : Activity() {
     private fun marked(k: String, raw: String): CharSequence {
         val base = if (terms.isEmpty()) raw else Search.highlight(raw, terms, k == hits.getOrNull(hit)?.let(::mark))
         val m = mentionRanges[k]
-        return if (m != null && m.first == raw) Mentions.style(base, m.second, color(R.color.accent)) else base
+        val styled = if (m != null && m.first == raw) Mentions.style(base, m.second, color(R.color.accent)) else base
+        return Links.clickable(this, styled, links(raw))
     }
 
-    /** A bubble's text, kept so search can mark matches in it. */
+    /** The links in a bubble's text, found once (search repaints often). */
+    private fun links(raw: String) = linkCache.getOrPut(raw) { Links.of(raw) }
+
+    /** A bubble's text, kept so search can mark matches in it; its links take taps. */
     private fun TextView.searchable(e: HistoryEntry, raw: String): TextView {
         val k = mark(e)
         texts.getOrPut(k) { mutableListOf() }.add(this to raw)
         text = marked(k, raw)
+        if (links(raw).isNotEmpty()) Links.enable(this)
         return this
     }
 
@@ -1655,7 +1663,7 @@ class ChatActivity : Activity() {
             text = metaText
         }, matchWrap)
         if (!item.sending) {
-            val longPress = View.OnLongClickListener { deleteMessage(run.map { it.entry }); true }
+            val longPress = View.OnLongClickListener { Links.longPressed(); deleteMessage(run.map { it.entry }); true }
             body.setOnLongClickListener(longPress)
             // Photos take the long press too, not just the bubble's edge.
             fun all(v: View) {

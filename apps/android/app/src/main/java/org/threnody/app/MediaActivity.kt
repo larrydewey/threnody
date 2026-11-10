@@ -6,7 +6,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.text.format.DateFormat
 import android.text.format.Formatter
-import android.util.Patterns
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -87,11 +86,8 @@ class MediaActivity : Activity() {
     private val files get() = entries.filter { e -> e.file?.let { !Media.isImage(it.name) } == true }
 
     /** Every link in the messages' text, with the message it came from. */
-    private val links: List<Pair<String, HistoryEntry>>
-        get() = entries.flatMap { e ->
-            val m = Patterns.WEB_URL.matcher(e.text)
-            buildList { while (m.find()) add(m.group() to e) }
-        }
+    private val links: List<Pair<uniffi.threnody_ffi.TextLink, HistoryEntry>>
+        get() = entries.flatMap { e -> Links.of(e.text).map { it to e } }
 
     private fun show() {
         val counts = listOf(photos.size, files.size, links.size)
@@ -187,27 +183,9 @@ class MediaActivity : Activity() {
     private fun linkList() {
         val list = links
         if (list.isEmpty()) return empty("links")
-        for ((url, e) in list) {
-            row(url, date(e) + if (e.outgoing) " · you" else "") { openLink(url) }
+        for ((l, e) in list) {
+            row(l.url, date(e) + if (e.outgoing) " · you" else "") { Links.confirm(this, l.url, l.host) }
         }
-    }
-
-    /** Links leave the app (and show your address to that site), so ask first. */
-    private fun openLink(url: String) {
-        val uri = Uri.parse(if (url.contains("://")) url else "https://$url")
-        SecureBuilder(this)
-            .setTitle("Open this link?")
-            .setMessage("${uri}\n\nIt opens in your browser, outside Threnody. The site sees your network address.")
-            .setPositiveButton("Open") { _, _ ->
-                try { startActivity(Intent(Intent.ACTION_VIEW, uri)) } catch (_: Exception) { toast("No app can open this link") }
-            }
-            .setNeutralButton("Copy") { _, _ ->
-                getSystemService(android.content.ClipboardManager::class.java)
-                    ?.setPrimaryClip(android.content.ClipData.newPlainText("link", url))
-                toast("Copied")
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     private fun row(title: String, detail: String, onClick: () -> Unit) {

@@ -5044,7 +5044,11 @@ fn media_lists(entries: &[HistoryEntry]) -> MediaLists {
                 out.files.push(i);
             }
         }
-        out.links.extend(urls(&e.text).into_iter().map(|u| (u, i)));
+        out.links.extend(
+            threnody_core::find_links(&e.text)
+                .into_iter()
+                .map(|l| (l.url, i)),
+        );
     }
     out
 }
@@ -5099,33 +5103,24 @@ fn center(scroll: &gtk::ScrolledWindow, w: &impl IsA<gtk::Widget>) {
     adj.set_value(adj.value() + f64::from(p.y()) - (adj.page_size() - h) / 2.0);
 }
 
-/// The http(s) links in `text`.
-fn urls(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter(|w| w.starts_with("https://") || w.starts_with("http://"))
-        .map(|w| {
-            w.trim_end_matches(['.', ',', ')', '!', '?', ';', ':'])
-                .to_owned()
-        })
-        .collect()
-}
-
-/// Pango markup for `text` with its links clickable, or None without links.
+/// Pango markup for `text` with its links clickable, or None without
+/// links. Links are found as on every platform (`find_links`); each opens
+/// its normalized URL.
 fn linkify(text: &str) -> Option<String> {
-    let links = urls(text);
+    let links = threnody_core::find_links(text);
     if links.is_empty() {
         return None;
     }
     let mut out = String::new();
-    let mut rest = text;
-    for url in links {
-        let Some(at) = rest.find(&url) else { continue };
-        out.push_str(&glib::markup_escape_text(&rest[..at]));
-        let esc = glib::markup_escape_text(&url);
-        out.push_str(&format!("<a href=\"{esc}\">{esc}</a>"));
-        rest = &rest[at + url.len()..];
+    let mut from = 0;
+    for l in links {
+        out.push_str(&glib::markup_escape_text(&text[from..l.range.start]));
+        let href = glib::markup_escape_text(&l.url);
+        let shown = glib::markup_escape_text(&text[l.range.clone()]);
+        out.push_str(&format!("<a href=\"{href}\">{shown}</a>"));
+        from = l.range.end;
     }
-    out.push_str(&glib::markup_escape_text(rest));
+    out.push_str(&glib::markup_escape_text(&text[from..]));
     Some(out)
 }
 
@@ -5386,12 +5381,13 @@ mod tests {
         // b.png isn't on this computer: a photo all the same.
         assert_eq!(l.photos, vec![4, 0]);
         assert_eq!(l.files, vec![3, 2]);
+        // Links are listed as they open (normalized).
         assert_eq!(
             l.links,
             vec![
                 ("https://example.org/b".to_owned(), 4),
                 ("https://example.org/a".to_owned(), 1),
-                ("http://x.test".to_owned(), 1),
+                ("http://x.test/".to_owned(), 1),
             ]
         );
     }

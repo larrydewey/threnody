@@ -61,6 +61,8 @@ struct ChatView: View {
     @State private var editing: HistoryEntry?
     @State private var editText = ""
     @State private var deleting: Deleting?
+    /// A tapped link, waiting for the user to say whether to open it.
+    @State private var openingLink: TextLink?
     @State private var reactingTo: Reacting?
     /// Sensitive photos the user uncovered (by "atMs/device").
     @State private var revealed: Set<String> = []
@@ -240,6 +242,21 @@ struct ChatView: View {
         } message: { _ in
             Text("They see it marked as edited, if they're running a current version.")
         }
+        // Links leave the app (and show your address to that site), so ask first.
+        .confirmationDialog(
+            "Open this link?",
+            isPresented: Binding(get: { openingLink != nil }, set: { if !$0 { openingLink = nil } }),
+            titleVisibility: .visible,
+            presenting: openingLink
+        ) { l in
+            Button("Open") { if let url = URL(string: l.url) { UIApplication.shared.open(url) } }
+            Button("Copy") {
+                UIPasteboard.general.setItems([[UTType.plainText.identifier: l.url]], options: [.localOnly: true])
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { l in
+            Text("Goes to \(l.host)\n\n\(l.url)\n\nIt opens in your browser, outside Threnody. The site sees your network address.")
+        }
         .confirmationDialog(
             deleting?.everyone == true ? "Delete for everyone?" : "Delete for you?",
             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
@@ -302,6 +319,7 @@ struct ChatView: View {
             persona: ref.persona,
             onReveal: { revealed.insert(ChatItem.key($0)) },
             onOpen: { previewURL = $0 },
+            onLink: { openingLink = $0 },
             onQuote: { q in
                 if let original = entries.first(where: { $0.id == q.id && $0.id != 0 }) { jump = original }
             },

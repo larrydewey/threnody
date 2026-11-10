@@ -36,6 +36,36 @@ pub struct ShownText {
     pub mentions: Vec<MentionSpan>,
 }
 
+/// A web link in message text: a UTF-16 range of it, the URL to open, and
+/// the host it goes to in ASCII (punycode for international names), to
+/// show before leaving the app.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TextLink {
+    pub start: u32,
+    pub len: u32,
+    pub url: String,
+    pub host: String,
+}
+
+/// The http(s) links in `text` (as `threnody_core::find_links` finds
+/// them), with UTF-16 ranges.
+#[uniffi::export]
+pub fn text_links(text: String) -> Vec<TextLink> {
+    threnody_core::find_links(&text)
+        .into_iter()
+        .map(|l| {
+            let units = |s: &str| s.encode_utf16().count() as u32;
+            let start = units(&text[..l.range.start]);
+            TextLink {
+                start,
+                len: units(&text[l.range]),
+                url: l.url,
+                host: l.host,
+            }
+        })
+        .collect()
+}
+
 /// Whether `name` looks like an image by its extension (jpg, jpeg, png,
 /// gif, webp, bmp, avif, heic, heif, tif, tiff; any case).
 #[uniffi::export]
@@ -337,6 +367,16 @@ mod tests {
 
     fn r(start: u32, len: u32) -> TextRange {
         TextRange { start, len }
+    }
+
+    #[test]
+    fn links_count_utf16_units() {
+        let links = text_links("😀 see https://a.example/x.".into());
+        assert_eq!(links.len(), 1);
+        let l = &links[0];
+        assert_eq!((l.start, l.len), (7, 19));
+        assert_eq!(l.url, "https://a.example/x");
+        assert_eq!(l.host, "a.example");
     }
 
     #[test]
