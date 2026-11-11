@@ -220,6 +220,7 @@ object Threnody {
 
     private fun applyPrivacyTo(ctx: Context, node: ThrenodyNode) {
         node.setCoverTraffic(Privacy.coverMs(ctx))
+        node.setPaceMessages(Privacy.paceMessages(ctx))
         node.setOnionFirst(Privacy.onionFirst(ctx))
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
         node.setStripMetadata(Privacy.stripMetadata(ctx))

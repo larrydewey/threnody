@@ -37,6 +37,7 @@ enum Privacy {
     static func apply(to n: ThrenodyNode, persona: Bool) {
         n.setUseVolunteers(on: Prefs.flag(Prefs.volunteers))
         n.setCoverTraffic(intervalMs: coverMs)
+        n.setPaceMessages(on: Prefs.flag(Prefs.pace))
         n.setOnionFirst(on: Prefs.flag(Prefs.onion))
         n.setStripMetadata(on: Prefs.flag(Prefs.strip))
         n.setSendReadReceipts(on: Prefs.flag(Prefs.sendRead))

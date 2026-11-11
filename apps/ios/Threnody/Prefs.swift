@@ -10,6 +10,7 @@ import Foundation
 /// Linux, whose keys these are. Safe from any thread.
 enum Prefs {
     static let cover = "cover_traffic"
+    static let pace = "pace_messages"
     static let onion = "onion_first"
     static let strip = "strip_metadata"
     static let reach = "reach_internet"
@@ -22,7 +23,7 @@ enum Prefs {
     static let handleVersion = "handle_version"
 
     /// The switches that are on unless turned off.
-    static let protective = [cover, onion, strip, reach, volunteers, sendRead, sendTyping]
+    static let protective = [cover, pace, onion, strip, reach, volunteers, sendRead, sendTyping]
 
     /// The port an anonymous identity listens on, kept so its invites
     /// keep working across launches.

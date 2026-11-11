@@ -302,6 +302,33 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
     );
 }
 
+/// Under slow cover traffic a text waits for a tick; with pacing off it
+/// goes at once.
+#[tokio::test]
+async fn unpaced_texts_skip_the_cover_ticks() {
+    let dir = tempfile::tempdir().unwrap();
+    let rate = Some(Duration::from_secs(30));
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, rate);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, rate);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
+    bob.accept_contact(&alice.identity());
+    assert!(alice.pace_messages(), "paced by default");
+    alice.set_pace_messages(false);
+    let started = std::time::Instant::now();
+    alice.send_text(&bob_id, "now").unwrap();
+    next(
+        &mut brx,
+        |e| matches!(e, Event::Message { msg: AppMessage::Text { body, .. }, .. } if body == "now"),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn cover_traffic_can_be_switched_on_and_off_live() {
     let dir = tempfile::tempdir().unwrap();

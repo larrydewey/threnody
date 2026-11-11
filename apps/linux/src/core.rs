@@ -820,6 +820,7 @@ impl Core {
         node.set_auto_fetch_files(fetch && !persona && !self.metered.load(Ordering::Relaxed));
         node.set_use_volunteers(volunteers);
         node.set_cover_traffic(self.cover_ms());
+        node.set_pace_messages(self.settings().flag(settings::PACE));
         node.set_onion_first(onion);
         node.set_strip_metadata(strip);
         // Off also drops reads still waiting for their sender.

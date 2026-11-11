@@ -54,6 +54,9 @@ struct SettingsView: View {
                     PrefToggle(title: "Cover traffic", key: Prefs.cover,
                                on: "Traffic no longer shows when you send. On mobile data and Low Data Mode it slows to every ten seconds.",
                                off: "An observer can see when messages are sent.")
+                    PrefToggle(title: "Hide when I send", key: Prefs.pace,
+                               on: "With cover traffic, messages wait for its next beat, so sending looks like idling.",
+                               off: "Messages go at once and arrive faster, but an observer can see when you send.")
                     PrefToggle(title: "Onion routing first", key: Prefs.onion,
                                on: "Contacts are reached through onion circuits when possible.",
                                off: "Contacts are dialed directly: the network sees who you talk to.")

@@ -993,6 +993,11 @@ class MainActivity : Activity() {
             if (it) "Cover traffic on: traffic no longer shows when you send"
             else "Cover traffic off: an observer can see when messages are sent"
         }
+        toggle("Hide when I send", Privacy.paceMessages(this@MainActivity),
+            { Privacy.setPaceMessages(this@MainActivity, it) }) {
+            if (it) "Messages wait for the next cover-traffic beat (up to 2 s on Wi-Fi, 10 s on mobile data), so sending looks like idling"
+            else "Messages go at once and arrive faster, but an observer can see when you send"
+        }
         toggle("Onion routing first", Privacy.onionFirst(this@MainActivity),
             { Privacy.setOnionFirst(this@MainActivity, it) }) {
             if (it) "Contacts are reached through onion circuits when possible"

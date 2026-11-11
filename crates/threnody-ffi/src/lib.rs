@@ -2359,6 +2359,17 @@ PersistentKeepalive = 25\n",
         self.node.strip_metadata()
     }
 
+    /// Whether, under cover traffic, messages wait for the next cover tick
+    /// so sending can't be told from idling (on by default). Off, they go
+    /// at once and arrive faster, but an observer sees when you send.
+    pub fn set_pace_messages(&self, on: bool) {
+        self.node.set_pace_messages(on);
+    }
+
+    pub fn pace_messages(&self) -> bool {
+        self.node.pace_messages()
+    }
+
     /// Read receipts (on unless turned off): whether displayed messages
     /// are reported to their sender, live or through mailboxes. Kept by
     /// the node, so it holds from the moment it starts; turning it off
