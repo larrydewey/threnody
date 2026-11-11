@@ -362,6 +362,7 @@ mod tests {
             forwarded: false,
             list: None,
             tick: TickMark::None,
+            preview: None,
         }
     }
 

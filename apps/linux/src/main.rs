@@ -14,6 +14,7 @@ mod editor;
 mod folders;
 mod gifs;
 mod keyring;
+mod linkcard;
 mod links;
 mod lists;
 mod lock;

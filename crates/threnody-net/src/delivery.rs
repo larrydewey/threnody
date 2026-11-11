@@ -536,6 +536,7 @@ mod tests {
             id: 0,
             quote: None,
             forwarded: false,
+            preview: None,
         }
     }
 
@@ -786,6 +787,7 @@ mod tests {
             id: 1,
             quote: None,
             forwarded: false,
+            preview: None,
         };
         let AppMessage::Tracked { id, .. } = d.track(&p, gone.clone(), Tag::NONE) else {
             panic!()

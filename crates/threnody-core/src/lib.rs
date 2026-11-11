@@ -49,7 +49,9 @@ pub use crypto::random_bytes_vec;
 pub use error::{Error, Result};
 pub use identity::{Fingerprint, Identity, PublicIdentity, safety_number};
 pub use message::AppMessage;
-pub use preview::{TextLink, UrlPreview, fetch_preview, find_links};
+pub use preview::{
+    LinkPreview, TextLink, UrlPreview, fetch_link_preview, fetch_preview, find_links,
+};
 
 /// Milliseconds since the Unix epoch, saturating at zero for clocks set
 /// before 1970.

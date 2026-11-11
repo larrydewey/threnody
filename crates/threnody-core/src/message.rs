@@ -9,6 +9,7 @@ use const_cbor::Decoder;
 
 use crate::cbor::{self, finish, read_map, required};
 use crate::error::{Error, Result};
+use crate::preview::LinkPreview;
 
 /// Smallest padded plaintext size.
 pub const PAD_MIN: usize = 256;
@@ -212,6 +213,9 @@ pub enum AppMessage {
         quote: Option<Quote>,
         /// Forwarded from another chat.
         forwarded: bool,
+        /// The sender's card for a link in `body` (key 13). Receivers keep
+        /// it only if [`LinkPreview::for_text`] does.
+        preview: Option<Box<LinkPreview>>,
     },
     File {
         sent_ms: u64,
@@ -467,6 +471,13 @@ impl AppMessage {
             }
             _ => {}
         }
+        // A text's link card goes encoded, as its own CBOR.
+        let text_preview = match self {
+            Self::Text {
+                preview: Some(p), ..
+            } => Some(p.encode()?),
+            _ => None,
+        };
         cbor::to_vec(self.size_hint(), |e| {
             match self {
                 Self::Hello { features } => {
@@ -496,7 +507,9 @@ impl AppMessage {
                     id,
                     quote,
                     forwarded,
+                    preview: _,
                 } => {
+                    let preview = &text_preview;
                     let expiry = expires_in_s.filter(|&s| s > 0);
                     let flags = u64::from(*forwarded) * FORWARDED
                         + u64::from(*expires_in_s == Some(0)) * TIMER_OFF;
@@ -504,7 +517,8 @@ impl AppMessage {
                         3 + usize::from(expiry.is_some())
                             + usize::from(*id != 0)
                             + usize::from(flags != 0)
-                            + 3 * usize::from(quote.is_some()),
+                            + 3 * usize::from(quote.is_some())
+                            + usize::from(preview.is_some()),
                     )?
                     .u8(0)?
                     .uint(kind::TEXT)?;
@@ -523,6 +537,9 @@ impl AppMessage {
                         e.u8(10)?.uint(q.id)?;
                         e.u8(11)?.bytes(&q.author)?;
                         e.u8(12)?.str(&q.text)?;
+                    }
+                    if let Some(p) = preview {
+                        e.u8(13)?.bytes(p)?;
                     }
                 }
                 Self::File {
@@ -669,8 +686,19 @@ impl AppMessage {
 
     fn size_hint(&self) -> usize {
         match self {
-            Self::Text { body, quote, .. } => {
-                body.len() + quote.as_ref().map_or(0, |q| q.text.len() + 48) + 32
+            Self::Text {
+                body,
+                quote,
+                preview,
+                ..
+            } => {
+                body.len()
+                    + quote.as_ref().map_or(0, |q| q.text.len() + 48)
+                    + preview.as_ref().map_or(0, |p| {
+                        p.url.len() + p.title.len() + p.description.len() + p.site.len()
+                    })
+                    + preview.as_ref().map_or(0, |p| p.image.len() + 48)
+                    + 32
             }
             Self::File {
                 name,
@@ -716,6 +744,7 @@ impl AppMessage {
         let mut flags = 0;
         let (mut caption, mut album, mut duration) = (None, 0, 0);
         let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
+        let mut preview = None;
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -739,6 +768,7 @@ impl AppMessage {
                 10 => quote_id = d.u64()?,
                 11 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
                 12 => quote_text = Some(d.str()?.to_owned()),
+                13 => preview = Some(d.bytes()?.to_vec()),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -825,17 +855,27 @@ impl AppMessage {
                 }
             }
             kind::COVER => Self::Cover,
-            kind::TEXT => Self::Text {
-                sent_ms: ts.unwrap_or(0),
-                body: required(text, "text body")?,
-                expires_in_s: expiry.or((flags & TIMER_OFF != 0).then_some(0)),
-                id: five.unwrap_or(0),
-                forwarded: flags & FORWARDED != 0,
-                // A quote names its message's sender (and, but for messages
-                // from before ids, its id); one that doesn't is dropped.
-                quote: quote_author
-                    .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
-            },
+            kind::TEXT => {
+                let body = required(text, "text body")?;
+                // A card that doesn't decode or doesn't fit the text is
+                // dropped; the message stands.
+                let preview = preview
+                    .and_then(|p| LinkPreview::decode(&p).ok())
+                    .and_then(|p| p.for_text(&body))
+                    .map(Box::new);
+                Self::Text {
+                    sent_ms: ts.unwrap_or(0),
+                    body,
+                    preview,
+                    expires_in_s: expiry.or((flags & TIMER_OFF != 0).then_some(0)),
+                    id: five.unwrap_or(0),
+                    forwarded: flags & FORWARDED != 0,
+                    // A quote names its message's sender (and, but for messages
+                    // from before ids, its id); one that doesn't is dropped.
+                    quote: quote_author
+                        .map(|a| Quote::new(quote_id, a, quote_text.as_deref().unwrap_or(""))),
+                }
+            }
             kind::FILE => {
                 let data = required(bytes, "file data")?;
                 if data.len() > MAX_FILE {
@@ -968,6 +1008,35 @@ pub fn unpad(mut msg: Vec<u8>) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A text's link card round-trips; one that doesn't fit the text is
+    /// dropped and the text stands.
+    #[test]
+    fn texts_carry_link_cards() {
+        let card = |url: &str| {
+            Box::new(LinkPreview {
+                url: url.into(),
+                title: "Title".into(),
+                ..LinkPreview::default()
+            })
+        };
+        let text = |preview| AppMessage::Text {
+            sent_ms: 1,
+            body: "go to https://a.example/".into(),
+            expires_in_s: None,
+            id: 3,
+            quote: None,
+            forwarded: false,
+            preview,
+        };
+        let m = text(Some(card("https://a.example/")));
+        assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
+        let elsewhere = text(Some(card("https://b.example/")));
+        assert_eq!(
+            AppMessage::decode(&elsewhere.encode().unwrap()).unwrap(),
+            text(None)
+        );
+    }
+
     #[test]
     fn feature_bits_are_distinct_powers_of_two() {
         let bits = [
@@ -1014,6 +1083,7 @@ mod tests {
             id: 2,
             quote: Some(Quote::new(0, [1; 32], "nothing")),
             forwarded: false,
+            preview: None,
         };
         // Messages from before ids are quoted by sender and text alone.
         assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
@@ -1069,6 +1139,7 @@ mod tests {
                 id: 9,
                 quote: Some(Quote::new(5, [4; 32], "shall we?")),
                 forwarded: false,
+                preview: None,
             },
             AppMessage::Pin {
                 conversation: vec![0; 33],
@@ -1100,6 +1171,7 @@ mod tests {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
             AppMessage::Text {
                 sent_ms: 43,
@@ -1108,6 +1180,7 @@ mod tests {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
             AppMessage::Text {
                 sent_ms: 44,
@@ -1116,6 +1189,7 @@ mod tests {
                 id: 0,
                 quote: None,
                 forwarded: true,
+                preview: None,
             },
             AppMessage::File {
                 sent_ms: 1,

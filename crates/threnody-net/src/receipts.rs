@@ -521,6 +521,8 @@ impl Node {
     /// [`FEATURE_RECEIPTS`] (an older build, though it had the bit when
     /// this was queued), its reads as a `Read` if it takes one, else
     /// nothing.
+    // `Err` is what to send instead, not an error value.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn receipt_ready(
         &self,
         peer: &PublicIdentity,

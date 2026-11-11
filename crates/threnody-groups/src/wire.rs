@@ -21,7 +21,7 @@ use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, read_map, required};
 use threnody_core::history::{MAX_POLL_OPTIONS, MAX_POLL_QUESTION};
 use threnody_core::message::{Clip, FORWARDED, MAX_MENTIONS, Mention, Quote};
-use threnody_core::{Error, Result};
+use threnody_core::{Error, LinkPreview, Result};
 
 /// Proposals a commit may carry (the coordinator stores at most 32 an
 /// epoch).
@@ -367,7 +367,8 @@ impl GroupWire {
 ///                     ? 5: album uint, ? 6: message id uint,
 ///                     ? 7: clip duration_ms uint, ? 8: quoted id uint,
 ///                     ? 9: quoted author bstr, ? 10: quoted text tstr,
-///                     ? 11: mentions [* [start uint, len uint, who bstr]] }
+///                     ? 11: mentions [* [start uint, len uint, who bstr]],
+///                     ? 14: link card bstr (`threnody_core::LinkPreview`) }
 /// kind: 1 text, 2 file, 3 reaction, 4 pin, 5 poll (1: question,
 /// 12: options, flag 1 multiple choice), 6 vote (13: choices), 7 close poll,
 /// 8 list (2: the list), 9 call (2: `threnody_core::call::GroupCallMsg`)
@@ -390,6 +391,9 @@ pub enum Content {
         mentions: Vec<Mention>,
         /// Forwarded from another chat.
         forwarded: bool,
+        /// The sender's card for a link in `text`; receivers keep it only
+        /// if `LinkPreview::for_text` does.
+        preview: Option<LinkPreview>,
     },
     File {
         name: String,
@@ -448,6 +452,7 @@ impl Content {
                 quote: None,
                 mentions,
                 forwarded: false,
+                preview: None,
             } if mentions.is_empty() => return Ok(text.as_bytes().to_vec()),
             Self::Text {
                 text,
@@ -509,6 +514,12 @@ impl Content {
             } => (quote.as_ref(), mentions.as_slice()),
             _ => (None, &[][..]),
         };
+        let preview = match self {
+            Self::Text {
+                preview: Some(p), ..
+            } => Some(p.encode()?),
+            _ => None,
+        };
         let size = text.len()
             + data.map_or(0, <[u8]>::len)
             + caption.len()
@@ -516,6 +527,7 @@ impl Content {
             + mentions.len() * 48
             + options.iter().map(|o| o.len() + 4).sum::<usize>()
             + choices.len() * 5
+            + preview.as_ref().map_or(0, |p| p.len() + 8)
             + 48;
         let body = cbor::to_vec(size, |e| {
             e.map_len(
@@ -528,7 +540,8 @@ impl Content {
                     + 3 * usize::from(quote.is_some())
                     + usize::from(!mentions.is_empty())
                     + usize::from(!options.is_empty())
-                    + usize::from(!choices.is_empty()),
+                    + usize::from(!choices.is_empty())
+                    + usize::from(preview.is_some()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.str(text)?;
@@ -573,6 +586,9 @@ impl Content {
                     e.array_len(3)?.u32(m.start)?.u32(m.len)?.bytes(&m.who)?;
                 }
             }
+            if let Some(p) = &preview {
+                e.u8(14)?.bytes(p)?;
+            }
             Ok(())
         })?;
         let mut out = Vec::with_capacity(body.len() + 1);
@@ -589,6 +605,7 @@ impl Content {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             });
         };
         let mut dec = Decoder::new(rest);
@@ -598,6 +615,7 @@ impl Content {
         let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
         let mut mentions = Vec::new();
         let (mut options, mut choices) = (Vec::new(), Vec::new());
+        let mut preview = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -611,6 +629,7 @@ impl Content {
                 8 => quote_id = d.u64()?,
                 9 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
                 10 => quote_text = Some(d.str()?.to_owned()),
+                14 => preview = Some(d.bytes()?.to_vec()),
                 12 => {
                     for _ in 0..d.array_len()? {
                         let o = d.str()?.to_owned();
@@ -646,6 +665,10 @@ impl Content {
         finish(&dec)?;
         Ok(match required(kind, "content kind")? {
             1 => Self::Text {
+                // A card that doesn't decode or fit the text is dropped.
+                preview: preview
+                    .and_then(|p| LinkPreview::decode(&p).ok())
+                    .and_then(|p| p.for_text(text.as_deref().unwrap_or(""))),
                 mentions: Mention::valid(mentions, text.as_deref().unwrap_or("")),
                 text: text.unwrap_or_default(),
                 id,
@@ -701,6 +724,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn group_texts_carry_link_cards() {
+        let card = LinkPreview {
+            url: "https://a.example/".into(),
+            title: "Title".into(),
+            ..LinkPreview::default()
+        };
+        let text = |preview: Option<LinkPreview>| Content::Text {
+            text: "go to https://a.example/".into(),
+            id: 4,
+            quote: None,
+            mentions: Vec::new(),
+            forwarded: false,
+            preview,
+        };
+        let m = text(Some(card.clone()));
+        assert_eq!(Content::decode(&m.encode().unwrap()).unwrap(), m);
+        let elsewhere = text(Some(LinkPreview {
+            url: "https://b.example/".into(),
+            ..card
+        }));
+        assert_eq!(
+            Content::decode(&elsewhere.encode().unwrap()).unwrap(),
+            text(None)
+        );
+    }
+
+    #[test]
     fn content_round_trips_and_plain_text_still_reads() {
         for c in [
             Content::Text {
@@ -709,6 +759,7 @@ mod tests {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             },
             Content::Text {
                 text: String::new(),
@@ -716,6 +767,7 @@ mod tests {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             },
             Content::Text {
                 text: "with an id".into(),
@@ -723,6 +775,7 @@ mod tests {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             },
             Content::Text {
                 text: "a reply".into(),
@@ -730,6 +783,7 @@ mod tests {
                 quote: Some(Quote::new(42, [3; 32], "with an id")),
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             },
             Content::Text {
                 text: "@Bo and @Al".into(),
@@ -748,6 +802,7 @@ mod tests {
                     },
                 ],
                 forwarded: false,
+                preview: None,
             },
             Content::React {
                 id: 42,
@@ -822,6 +877,7 @@ mod tests {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             }
         );
         // A tagged text, as a later sender might write it.
@@ -834,6 +890,7 @@ mod tests {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             }
         );
         assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());

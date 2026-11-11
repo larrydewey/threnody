@@ -63,6 +63,13 @@ struct ChatView: View {
     @State private var deleting: Deleting?
     /// A tapped link, waiting for the user to say whether to open it.
     @State private var openingLink: TextLink?
+    /// The link in the message box on offer for a preview, its card once
+    /// fetched (only when asked: the site sees this device's address), and
+    /// links not to offer again.
+    @State private var linkOffer: String?
+    @State private var linkCard: LinkPreviewInfo?
+    @State private var linkFetching = false
+    @State private var linkDropped: Set<String> = []
     @State private var reactingTo: Reacting?
     /// Sensitive photos the user uncovered (by "atMs/device").
     @State private var revealed: Set<String> = []
@@ -168,6 +175,7 @@ struct ChatView: View {
             }
             if !scheduled.isEmpty { scheduledBar }
             if let r = replyTo { replyStrip(r) }
+            if let u = linkOffer { previewStrip(u) }
             compose
         }
         .toolbar {
@@ -281,7 +289,10 @@ struct ChatView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await load() } }
         }
-        .onChange(of: text) { _, t in sendTyping(focused && !t.isEmpty) }
+        .onChange(of: text) { _, t in
+            sendTyping(focused && !t.isEmpty)
+            offerPreview(t)
+        }
         .task(id: query) { await runSearch() }
         .onChange(of: jump) { _, e in
             guard let e else { return }
@@ -435,6 +446,67 @@ struct ChatView: View {
         .padding(.horizontal, 12)
         .padding(.top, 6)
         .background(.bar)
+    }
+
+    /// Above the message box: "Add a preview of host", then the card.
+    private func previewStrip(_ url: String) -> some View {
+        let host = textLinks(text: url).first?.host ?? url
+        return HStack {
+            if let c = linkCard {
+                Label(c.title.isEmpty ? (c.description.isEmpty ? host : c.description) : c.title, systemImage: "link")
+                    .font(.callout).lineLimit(1)
+            } else if linkFetching {
+                ProgressView().controlSize(.small)
+                Text("Getting a preview of \(host)…").font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            } else {
+                Button("Add a preview of \(host)") { fetchPreview(url) }
+                    .font(.callout).lineLimit(1)
+                    .accessibilityHint("The site sees your network address.")
+            }
+            Spacer()
+            Button {
+                linkDropped.insert(url)
+                linkOffer = nil
+                linkCard = nil
+                linkFetching = false
+            } label: { Image(systemName: "xmark.circle.fill") }
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(linkCard == nil ? "Don't add a preview" : "Remove the preview")
+        }
+        .frame(minHeight: 36)
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .background(.bar)
+    }
+
+    /// Follows the message box: offers the first link not dropped.
+    private func offerPreview(_ t: String) {
+        let first = textLinks(text: t).map(\.url).first { !linkDropped.contains($0) }
+        guard first != linkOffer else { return }
+        linkOffer = first
+        linkCard = nil
+        linkFetching = false
+    }
+
+    private func fetchPreview(_ url: String) {
+        guard let n = node else { return }
+        linkFetching = true
+        Task {
+            let got = try? await offMain { () -> LinkPreviewInfo? in
+                guard var p = n.fetchLinkPreview(url: url) else { return nil }
+                p.image = LinkThumbnail.shrink(p.image)
+                return p
+            }
+            guard linkOffer == url else { return }
+            linkFetching = false
+            if let p = got ?? nil {
+                linkCard = p
+            } else {
+                notice = "No preview for \(textLinks(text: url).first?.host ?? url)"
+                linkDropped.insert(url)
+                linkOffer = nil
+            }
+        }
     }
 
     private var compose: some View {
@@ -593,13 +665,18 @@ struct ChatView: View {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, let t = target else { return }
         let quoted = replyTo
+        // The card goes if its link is still in the text.
+        let card = linkCard.flatMap { c in textLinks(text: body).contains { $0.url == c.url } ? c : nil }
         text = ""
         replyTo = nil
+        linkOffer = nil
+        linkCard = nil
+        linkDropped = []
         pending.append(body)
         sendTyping(false)
         Task {
             do {
-                if let warning = try await offMain({ try t.send(body, replyTo: quoted) }) { failure = warning }
+                if let warning = try await offMain({ try t.send(body, replyTo: quoted, preview: card) }) { failure = warning }
             } catch {
                 // Back in the box, unless something else was typed meanwhile.
                 if text.isEmpty { text = body }

@@ -15,6 +15,7 @@ use crate::devsync::{FileRef, MAX_TICK_DEVICES, Tick};
 use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::message::{Clip, Mention, Quote};
+use crate::preview::LinkPreview;
 use crate::store::Home;
 
 /// Entries kept per conversation; the oldest are dropped first.
@@ -161,6 +162,8 @@ pub struct Entry {
     /// our devices, or recorded before this was kept), so it passes the
     /// record on to the others. Local: transcripts carry 0.
     pub ticked_ms: u64,
+    /// The sender's card for a link in the text.
+    pub preview: Option<LinkPreview>,
 }
 
 /// Most options a poll has, and longest question and option, in
@@ -777,7 +780,8 @@ impl History {
                         + usize::from(e.poll.is_some())
                         + usize::from(e.forwarded)
                         + usize::from(e.list.is_some())
-                        + usize::from(e.ticked_ms != 0),
+                        + usize::from(e.ticked_ms != 0)
+                        + usize::from(e.preview.is_some()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -850,6 +854,11 @@ impl History {
                 if e.ticked_ms != 0 {
                     enc.u8(20)?.u64(e.ticked_ms)?;
                 }
+                if let Some(p) = &e.preview {
+                    // Encoding a card only fails past the encoder's limit.
+                    let p = p.encode().map_err(|_| const_cbor::Error::TYPE_MISMATCH)?;
+                    enc.u8(21)?.bytes(&p)?;
+                }
                 if let Some(p) = &e.poll {
                     enc.u8(17)?.array_len(4)?;
                     enc.array_len(p.options.len())?;
@@ -914,6 +923,7 @@ impl History {
                         let mut forwarded = false;
                         let mut list = None;
                         let mut ticked_ms = 0;
+                        let mut preview = None;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -940,6 +950,8 @@ impl History {
                                 18 => forwarded = d.bool()?,
                                 19 => list = Some(fixed_bytes::<16>(d)?),
                                 20 => ticked_ms = d.u64()?,
+                                // Kept as stored; one that no longer decodes is dropped.
+                                21 => preview = LinkPreview::decode(d.bytes()?).ok(),
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -996,6 +1008,7 @@ impl History {
                             forwarded,
                             list,
                             ticked_ms,
+                            preview,
                         });
                     }
                 }
@@ -1908,6 +1921,7 @@ mod tests {
             forwarded: false,
             list: None,
             ticked_ms: 0,
+            preview: None,
         }
     }
 
@@ -2719,6 +2733,7 @@ mod names_at_rest_tests {
             forwarded: false,
             list: None,
             ticked_ms: 0,
+            preview: None,
         }
     }
 

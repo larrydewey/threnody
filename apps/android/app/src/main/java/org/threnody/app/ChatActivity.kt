@@ -99,6 +99,8 @@ class ChatActivity : Activity() {
     /** The message the next one replies to, shown above the compose bar. */
     private var replyTo: HistoryEntry? = null
     private lateinit var replyBar: LinearLayout
+    /** Offers, and holds, a card for a link being written. */
+    private val previewBar by lazy { PreviewBar(this) { if (::node.isInitialized) node else null } }
     /** "🕓 2 scheduled · next Tue 08:00" above the compose bar; opens the list. */
     private lateinit var scheduledBar: TextView
     /** This chat's scheduled messages, soonest first. */
@@ -267,6 +269,7 @@ class ChatActivity : Activity() {
         }
         root.addView(scheduledBar, matchWrap)
         root.addView(replyBar, matchWrap)
+        root.addView(previewBar.view, matchWrap)
         root.addView(composeBar, matchWrap)
         setContentView(root)
         fitSystemBars(root, bar, composeBar)
@@ -323,6 +326,7 @@ class ChatActivity : Activity() {
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
                 override fun afterTextChanged(s: Editable?) {
                     typingHandler.removeCallbacks(stopTyping)
+                    previewBar.onText(s.toString())
                     if (::sendButton.isInitialized) {
                         // A microphone until there's text to send.
                         val blank = s.toString().isBlank()
@@ -1602,6 +1606,7 @@ class ChatActivity : Activity() {
                 textSize = 16f
                 setTextColor(fg)
             })
+            e.preview?.let { body.addView(Links.card(this, it, fg)) }
             time
         } else {
             for (r in run) {
@@ -1953,6 +1958,7 @@ class ChatActivity : Activity() {
         val to = replyTo
         val quote = to?.let { QuoteInfo(it.id, it.device, snippet(it).take(MAX_QUOTE_CHARS)) }
         val item = text to quote
+        val card = previewBar.take(text)
         replyingTo(null)
         typingHandler.removeCallbacks(stopTyping)
         compose.setText("") // also says we stopped typing
@@ -1963,13 +1969,19 @@ class ChatActivity : Activity() {
             val g = group
             val error = try {
                 if (note) {
-                    node.writeNote(text, to?.atMs, to?.device)
+                    if (card != null) node.writeNoteWithPreview(text, to?.atMs, to?.device, card)
+                    else node.writeNote(text, to?.atMs, to?.device)
                     null
                 } else if (g != null) {
-                    if (to != null || mentions.isNotEmpty()) node.sendGroupMessage(g, text, to?.atMs, to?.device, mentions)
+                    if (card != null) node.sendGroupTextWithPreview(g, text, to?.atMs, to?.device, mentions, card)
+                    else if (to != null || mentions.isNotEmpty()) node.sendGroupMessage(g, text, to?.atMs, to?.device, mentions)
                     else node.sendGroupText(g, text)
                     null
-                } else if ((if (to != null) node.sendReply(device, text, to.atMs, to.device) else node.sendText(device, text)) == 0u) {
+                } else if ((when {
+                        card != null -> node.sendTextWithPreview(device, text, to?.atMs, to?.device, card)
+                        to != null -> node.sendReply(device, text, to.atMs, to.device)
+                        else -> node.sendText(device, text)
+                    }) == 0u) {
                     // Reaches the contact directly, by relay, or sealed for mailboxes.
                     "Not delivered: they're offline and no mutual contact can hold it."
                 } else null

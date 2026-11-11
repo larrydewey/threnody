@@ -42,7 +42,10 @@ Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 ack
                                                            ; 131072 receipts, 262144 device sync); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded, 16 timer off)
-             ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr }    ; quoted message id, its sender's device, its text (≤ 200 chars)
+             ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr,    ; quoted message id, its sender's device, its text (≤ 200 chars)
+             ? 13 => bstr .cbor LinkPreview }                      ; a card for a link in the body (*Link previews*)
+LinkPreview = { 0 => tstr, ? 1 => tstr, ? 2 => tstr,                ; URL, title (≤ 200 chars), description (≤ 300),
+                ? 3 => tstr, ? 4 => bstr }                         ; site name (≤ 100), JPEG thumbnail (≤ 24 KiB)
 File     = { 0 => 2, 1 => uint, 2 => bstr, 3 => tstr, ? 5 => uint,    ; sent_ms, data (≤ 8 MiB), name, sender's message id,
              ? 6 => uint, ? 7 => tstr, ? 8 => uint, ? 9 => uint }      ; flags (1 sensitive, 2 voice, 4 video, 8 forwarded), caption,
                                                                        ; album id, clip duration (ms)
@@ -137,6 +140,12 @@ Texts and files carry the sender's message id (its history entry's local id). Th
 A reply quotes an earlier message, as `Text` keys 10 to 12: the quoted message's id (as `Delete` names it), the device that sent it, and at most 200 characters of its text (a file's name, if it has no text). The snippet travels with the reply, so it reads even where the original doesn't exist: deleted, expired, or sent before a group member joined. A message from before ids existed is quoted with id 0, and matched by sender and text instead. A quote without a sender is ignored. Older receivers ignore the keys and see the reply alone, so no feature bit is needed.
 
 Receivers store the quote with the entry (history key 15: `[id, device (32), text]`). A quote must not outlive what it quotes. When a message is deleted (for me or for everyone) or disappears, the text of every quote of it is blanked, and apps show "Original message not found". In groups, replies travel inside MLS (Appendix F).
+
+### Link previews
+
+A sender may attach a card for a link in a text's body (key 13): the page's title, description and site name, and a small JPEG, as the sender's device found them. Receivers never fetch anything, so a link sent to them tells its site nothing about them. The sender fetches only when its user asks (apps offer it for the first link being written), from that device directly, so the site sees the sender's address. Its app shrinks the page's picture to a JPEG of at most 24 KiB (at most 400 pixels on its longer side), and the sender removes its metadata before sending.
+
+A card stands only for a link the message has: its URL, normalized as links in text are (an `http` or `https` URL with a host, lowercase scheme and host, international names in punycode), must equal one of the links in the body. Texts are cut to their limits, put on one line, and lose control characters and bidirectional overrides; a picture that isn't a JPEG within 24 KiB is dropped, and a card left with no title, description or picture is no card. Receivers apply the same rules, and drop a card that fails them or doesn't decode, keeping the message. Opening a card's link asks first, as opening any link does, and names the host it goes to. The card is stored with the entry (history key 21, the encoded `LinkPreview`) and travels in transcripts to our other devices with it. Older receivers ignore key 13 and show the text alone, so no feature bit is needed. In groups the card travels inside MLS (Appendix F, `Content` key 14).
 
 ### Forwarding and drafts
 

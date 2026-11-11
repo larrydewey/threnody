@@ -1,5 +1,6 @@
-//! Links in message text, and URL previews: fetches Open Graph meta tags
-//! from URLs.
+//! Links in message text, and link previews: the card a sender attaches
+//! to a message with a link (fetched by the sender, from the Open Graph
+//! tags of the page, so receivers never contact the site).
 
 use std::io::Read;
 use std::ops::Range;
@@ -28,6 +29,183 @@ pub struct UrlPreview {
     pub site_name: Option<String>,
     /// The content type (from og:type).
     pub content_type: Option<String>,
+}
+
+/// Longest preview title, description and site name, in characters.
+pub const MAX_PREVIEW_TITLE: usize = 200;
+pub const MAX_PREVIEW_DESCRIPTION: usize = 300;
+pub const MAX_PREVIEW_SITE: usize = 100;
+/// Largest preview image (a JPEG thumbnail the sender's app makes).
+pub const MAX_PREVIEW_IMAGE: usize = 24 * 1024;
+/// Largest image [`fetch_link_preview`] downloads for the app to shrink.
+const MAX_FETCHED_IMAGE: usize = 2 * 1024 * 1024;
+
+/// The card a message shows for a link in its text: what the sender's
+/// device found at `url`, with an optional JPEG thumbnail.
+///
+/// ```text
+/// LinkPreview = { 0: url tstr, ? 1: title tstr, ? 2: description tstr,
+///                 ? 3: site tstr, ? 4: image bstr (JPEG) }
+/// ```
+///
+/// Messages carry it encoded (key 13 of a `Text`, key 14 of a group
+/// text); receivers keep it only if [`LinkPreview::for_text`] accepts it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub site: String,
+    /// A JPEG of at most [`MAX_PREVIEW_IMAGE`] bytes, or empty.
+    pub image: Vec<u8>,
+}
+
+impl LinkPreview {
+    /// This preview, cleaned up for `text`: kept only if its URL is one of
+    /// the links in `text` (as [`find_links`] normalizes them), so the card
+    /// can't send its reader somewhere the message doesn't. Texts are cut
+    /// to their limits, on one line, without control characters or
+    /// bidirectional overrides, and an image that
+    /// isn't a JPEG within [`MAX_PREVIEW_IMAGE`] is dropped. None if
+    /// nothing is left to show.
+    pub fn for_text(self, text: &str) -> Option<Self> {
+        let url = find_links(&self.url).into_iter().next()?.url;
+        if !find_links(text).iter().any(|l| l.url == url) {
+            return None;
+        }
+        let clean = |s: &str, max: usize| -> String {
+            let words: Vec<&str> = s.split_whitespace().collect();
+            words
+                .join(" ")
+                .chars()
+                .filter(|c| !c.is_control() && !is_bidi_control(*c))
+                .take(max)
+                .collect()
+        };
+        let image = if self.image.len() <= MAX_PREVIEW_IMAGE
+            && crate::media::kind(&self.image) == Some(crate::media::Kind::Jpeg)
+        {
+            self.image
+        } else {
+            Vec::new()
+        };
+        let p = Self {
+            url,
+            title: clean(&self.title, MAX_PREVIEW_TITLE),
+            description: clean(&self.description, MAX_PREVIEW_DESCRIPTION),
+            site: clean(&self.site, MAX_PREVIEW_SITE),
+            image,
+        };
+        (!p.title.is_empty() || !p.description.is_empty() || !p.image.is_empty()).then_some(p)
+    }
+
+    pub fn encode(&self) -> crate::Result<Vec<u8>> {
+        let size = self.url.len()
+            + self.title.len()
+            + self.description.len()
+            + self.site.len()
+            + self.image.len()
+            + 32;
+        crate::cbor::to_vec(size, |e| {
+            e.map_len(
+                1 + usize::from(!self.title.is_empty())
+                    + usize::from(!self.description.is_empty())
+                    + usize::from(!self.site.is_empty())
+                    + usize::from(!self.image.is_empty()),
+            )?;
+            e.u8(0)?.str(&self.url)?;
+            if !self.title.is_empty() {
+                e.u8(1)?.str(&self.title)?;
+            }
+            if !self.description.is_empty() {
+                e.u8(2)?.str(&self.description)?;
+            }
+            if !self.site.is_empty() {
+                e.u8(3)?.str(&self.site)?;
+            }
+            if !self.image.is_empty() {
+                e.u8(4)?.bytes(&self.image)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn decode(b: &[u8]) -> crate::Result<Self> {
+        let mut dec = const_cbor::Decoder::new(b);
+        let mut p = Self::default();
+        let mut url = None;
+        crate::cbor::read_map(&mut dec, |k, d| {
+            match k {
+                0 => url = Some(d.str()?.to_owned()),
+                1 => p.title = d.str()?.to_owned(),
+                2 => p.description = d.str()?.to_owned(),
+                3 => p.site = d.str()?.to_owned(),
+                4 => p.image = d.bytes()?.to_vec(),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        crate::cbor::finish(&dec)?;
+        p.url = crate::cbor::required(url, "preview url")?;
+        Ok(p)
+    }
+}
+
+/// Bidirectional overrides and isolates, which could make a card's text
+/// read differently from what it says.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Fetches a preview of `url` for the sender to attach: the page's title,
+/// description and site name, and its image as downloaded (any format, up
+/// to 2 MB) for the app to shrink to a JPEG thumbnail of at most
+/// [`MAX_PREVIEW_IMAGE`] bytes before sending ([`LinkPreview::for_text`]
+/// drops anything else). Blocks; None if the page has nothing to show.
+///
+/// Like [`fetch_preview`], it goes straight from this device: only fetch
+/// a link the user chose to preview.
+pub fn fetch_link_preview(url: &str) -> Option<LinkPreview> {
+    let page = fetch_preview(url)?;
+    let image = page
+        .image_url
+        .as_deref()
+        .and_then(|i| reqwest::Url::parse(url).ok()?.join(i).ok())
+        .filter(|i| matches!(i.scheme(), "http" | "https"))
+        .and_then(|i| fetch_image(i.as_str()))
+        .unwrap_or_default();
+    Some(LinkPreview {
+        url: page.url,
+        title: page.title.unwrap_or_default(),
+        description: page.description.unwrap_or_default(),
+        site: page.site_name.unwrap_or_default(),
+        image,
+    })
+}
+
+/// An image's bytes, if `url` answers with an image of at most
+/// [`MAX_FETCHED_IMAGE`] bytes.
+fn fetch_image(url: &str) -> Option<Vec<u8>> {
+    let client = Client::builder()
+        .timeout(PREVIEW_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .ok()?;
+    let response = client.get(url).send().ok()?;
+    let is_image = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t.to_ascii_lowercase().starts_with("image/"));
+    if !response.status().is_success() || !is_image {
+        return None;
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_FETCHED_IMAGE as u64 + 1)
+        .read_to_end(&mut body)
+        .ok()?;
+    (body.len() <= MAX_FETCHED_IMAGE).then_some(body)
 }
 
 /// A web link found in message text.
@@ -304,6 +482,68 @@ mod tests {
         let l = &find_links(t)[0];
         assert_eq!(&t[l.range.clone()], "https://a.example/ü");
         assert_eq!(l.url, "https://a.example/%C3%BC");
+    }
+
+    fn card(url: &str) -> LinkPreview {
+        LinkPreview {
+            url: url.into(),
+            title: "Title".into(),
+            ..LinkPreview::default()
+        }
+    }
+
+    #[test]
+    fn previews_round_trip() {
+        let p = LinkPreview {
+            url: "https://a.example/".into(),
+            title: "T".into(),
+            description: "D".into(),
+            site: "S".into(),
+            image: vec![0xFF, 0xD8, 0xFF, 0xE0],
+        };
+        assert_eq!(LinkPreview::decode(&p.encode().unwrap()).unwrap(), p);
+        let bare = card("https://a.example/");
+        assert_eq!(LinkPreview::decode(&bare.encode().unwrap()).unwrap(), bare);
+    }
+
+    /// A card only stands for a link the message has.
+    #[test]
+    fn previews_must_match_a_link_in_the_text() {
+        let text = "look at https://a.example/x.";
+        let p = card("https://A.example/x").for_text(text).unwrap();
+        assert_eq!(p.url, "https://a.example/x");
+        assert!(card("https://evil.example/").for_text(text).is_none());
+        assert!(card("javascript:alert(1)").for_text(text).is_none());
+        assert!(card("https://a.example/x").for_text("no link").is_none());
+    }
+
+    #[test]
+    fn previews_are_cleaned_and_bounded() {
+        let p = LinkPreview {
+            url: "https://a.example/".into(),
+            title: format!("  a\n\tb\u{202e}{}", "x".repeat(500)),
+            description: String::new(),
+            site: String::new(),
+            image: b"\x89PNG\r\n\x1a\n".to_vec(),
+        }
+        .for_text("https://a.example/")
+        .unwrap();
+        assert!(p.title.starts_with("a b"));
+        assert_eq!(p.title.chars().count(), MAX_PREVIEW_TITLE);
+        assert!(!p.title.contains('\u{202e}'));
+        // Not a JPEG: dropped.
+        assert!(p.image.is_empty());
+        let big = LinkPreview {
+            image: [&[0xFF, 0xD8, 0xFF][..], &vec![0; MAX_PREVIEW_IMAGE]].concat(),
+            ..card("https://a.example/")
+        };
+        assert!(big.for_text("https://a.example/").unwrap().image.is_empty());
+        // Nothing to show: no card.
+        let empty = LinkPreview {
+            url: "https://a.example/".into(),
+            ..LinkPreview::default()
+        };
+        assert!(empty.for_text("https://a.example/").is_none());
     }
 
     #[test]

@@ -212,8 +212,24 @@ struct ChatTarget: Sendable {
         }
     }
 
-    /// Sends `text`, quoting `replyTo`; a warning to show, if any.
-    func send(_ text: String, replyTo: HistoryEntry?) throws -> String? {
+    /// Sends `text`, quoting `replyTo`, with `preview` (a card for a link
+    /// in it) if there is one; a warning to show, if any.
+    func send(_ text: String, replyTo: HistoryEntry?, preview: LinkPreviewInfo? = nil) throws -> String? {
+        if let p = preview {
+            switch ref.target {
+            case .contact:
+                let reached = try node.sendTextWithPreview(peer: device, text: text, quoteAtMs: replyTo?.atMs,
+                                                           quoteDevice: replyTo?.device, preview: p)
+                return reached == 0 ? Self.notDelivered : nil
+            case let .group(g), let .groupInvite(g):
+                try node.sendGroupTextWithPreview(group: g, text: text, quoteAtMs: replyTo?.atMs,
+                                                  quoteDevice: replyTo?.device, mentions: [], preview: p)
+                return nil
+            case .notes:
+                try node.writeNoteWithPreview(text: text, quoteAtMs: replyTo?.atMs, quoteDevice: replyTo?.device, preview: p)
+                return nil
+            }
+        }
         switch ref.target {
         case .contact:
             let reached: UInt32

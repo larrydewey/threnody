@@ -79,6 +79,7 @@ fn text(s: &str) -> AppMessage {
         id: 0,
         quote: None,
         forwarded: false,
+        preview: None,
     }
 }
 
