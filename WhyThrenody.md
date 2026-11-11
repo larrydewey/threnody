@@ -30,7 +30,7 @@ Threnody’s stance is unapologetic: if your threat model includes sophisticated
 
 **Be real about the current state**
 
-It is early (release 0.17.1, late October 2026). It is not audited. Do not bet lives on it yet. There are Android and Linux desktop apps, a CLI, and a first iOS beta built from source; they are young and have rough edges, and are not a polished consumer app for your entire contact list tomorrow. Cover traffic and multi-hop paths cost bandwidth and latency. With no server in the middle, two people who are both behind VPNs (symmetric NAT) and share no contact to relay through may not connect at all. Adoption requires your counterparties (or a critical mass of relays) to run it.
+It is young (release 1.0.0, November 2026), and it is not audited. Do not bet lives on it yet. There are Android and Linux desktop apps, a CLI, and a first iOS beta built from source; they are young and have rough edges, and are not a polished consumer app for your entire contact list tomorrow. Cover traffic and multi-hop paths cost bandwidth and latency. With no server in the middle, two people who are both behind VPNs (symmetric NAT) and share no contact to relay through may not connect at all. Adoption requires your counterparties (or a critical mass of relays) to run it.
 
 That is the honest trade-off. Threnody is not trying to be the next mass-market chat app. It is trying to be the protocol you reach for when the existing ones still leave you exposed on the axes that actually matter against serious adversaries: metadata, central points of failure, and long-term cryptographic strength.
 

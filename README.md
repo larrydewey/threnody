@@ -6,7 +6,7 @@ Threnody is a private messenger that works without a company in the middle. Ther
 
 **Website:** <https://larrydewey.github.io/threnody/>
 
-> **Status: early and not audited.** Threnody works day to day on Android and Linux, but nobody outside the project has reviewed its security yet. Don't rely on it where your safety depends on it.
+> **Status: 1.0, not audited.** Threnody works day to day on Android and Linux, but nobody outside the project has reviewed its security yet. Don't rely on it where your safety depends on it.
 
 ## Why it's different
 
