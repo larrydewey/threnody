@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Query};
-use threnody_core::{AppMessage, PublicIdentity, now_ms};
+use threnody_core::{AppMessage, LinkPreview, PublicIdentity, now_ms};
 
 use threnody_core::message::{
     Clip, FEATURE_READ, FEATURE_RECEIPTS, FEATURE_TIMER_OFF, FEATURE_TYPING, Mention, Quote,
@@ -62,6 +62,9 @@ pub struct Extras {
     pub quote: Option<Quote>,
     pub mentions: Vec<Mention>,
     pub forwarded: bool,
+    /// A card for a link in the text (sent only if it fits the text, see
+    /// [`LinkPreview::for_text`]).
+    pub preview: Option<LinkPreview>,
 }
 
 /// A fresh album id for files sent together.
@@ -317,6 +320,18 @@ impl Node {
     /// Writes a note to self, optionally quoting an earlier one, or with a
     /// file (kept where it is on this device; the others get its record).
     pub fn write_note(&self, text: &str, quote: Option<Quote>, file: Option<FileNote>) {
+        self.write_note_with(text, quote, file, None);
+    }
+
+    /// [`Node::write_note`], with a card for a link in `text`.
+    pub fn write_note_with(
+        &self,
+        text: &str,
+        quote: Option<Quote>,
+        file: Option<FileNote>,
+        preview: Option<LinkPreview>,
+    ) {
+        let preview = self.sendable_preview(preview, text);
         let now = now_ms();
         let conv = self.notes();
         self.append(
@@ -346,6 +361,7 @@ impl Node {
                 forwarded: false,
                 list: None,
                 ticked_ms: 0,
+                preview,
             },
         );
     }
@@ -1013,8 +1029,12 @@ impl Node {
         local_id: u64,
     ) -> Result<SendReport> {
         let Extras {
-            quote, forwarded, ..
+            quote,
+            forwarded,
+            preview,
+            ..
         } = extras;
+        let preview = self.sendable_preview(preview, body);
         // Writing to someone accepts them.
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
@@ -1027,6 +1047,7 @@ impl Node {
             id: local_id,
             quote: quote.clone(),
             forwarded,
+            preview: preview.clone().map(Box::new),
         };
         let devices: Vec<PublicIdentity> = match self.account_of(peer) {
             Some(a) if !self.is_own_device(peer) => {
@@ -1079,9 +1100,28 @@ impl Node {
                 forwarded,
                 list: None,
                 ticked_ms: 0,
+                preview,
             },
         );
         Ok(r)
+    }
+
+    /// A link card ready to send with `body`: only if it fits the text
+    /// ([`LinkPreview::for_text`]), its image without metadata, whatever
+    /// the setting (a thumbnail has no use for any).
+    pub fn sendable_preview(
+        &self,
+        preview: Option<LinkPreview>,
+        body: &str,
+    ) -> Option<LinkPreview> {
+        let mut p = preview?.for_text(body)?;
+        if !p.image.is_empty() {
+            p.image = match threnody_core::media::strip(std::mem::take(&mut p.image)) {
+                Ok(threnody_core::media::Stripped::Image(i)) => i,
+                _ => Vec::new(),
+            };
+        }
+        (!p.title.is_empty() || !p.description.is_empty() || !p.image.is_empty()).then_some(p)
     }
 
     /// Makes file contents ready to send: images lose their metadata
@@ -1394,6 +1434,7 @@ impl Node {
             forwarded: extras.forwarded,
             list: None,
             ticked_ms: 0,
+            preview: extras.preview,
         };
         if let Err(e) = self
             .shared
@@ -1475,6 +1516,7 @@ impl Node {
             forwarded: false,
             list: None,
             ticked_ms: if received { now } else { 0 },
+            preview: None,
         };
         let received = received.then(|| entry.clone());
         self.append(conv, entry);
@@ -1541,6 +1583,7 @@ impl Node {
             id,
             quote,
             forwarded,
+            preview,
             ..
         } = msg
         else {
@@ -1592,6 +1635,7 @@ impl Node {
             Extras {
                 quote: quote.clone(),
                 forwarded: *forwarded,
+                preview: preview.as_deref().cloned(),
                 ..Extras::default()
             },
         );

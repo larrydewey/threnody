@@ -68,6 +68,7 @@ async fn chat_and_mutual_approval_over_tcp() {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
         )
         .unwrap();
@@ -87,6 +88,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             id: 0,
             quote: None,
             forwarded: false,
+            preview: None,
         }
     );
 
@@ -99,6 +101,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             id: 0,
             quote: None,
             forwarded: false,
+            preview: None,
         },
     )
     .unwrap();
@@ -277,6 +280,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
         )
         .unwrap();
@@ -293,6 +297,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
             id: 0,
             quote: None,
             forwarded: false,
+            preview: None,
         }
     );
 }
@@ -312,6 +317,7 @@ async fn cover_traffic_can_be_switched_on_and_off_live() {
         id: 0,
         quote: None,
         forwarded: false,
+        preview: None,
     };
     for (rate, body) in [
         (Some(Duration::from_millis(20)), "at a constant rate"),
@@ -689,6 +695,7 @@ async fn no_tunnel_without_mutual_approval() {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
         )
         .unwrap();
@@ -865,6 +872,7 @@ async fn sessions_run_over_any_byte_stream() {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
         )
         .unwrap();
@@ -1347,6 +1355,7 @@ async fn constant_rate_frames_are_all_one_size() {
                 id: 0,
                 quote: None,
                 forwarded: false,
+                preview: None,
             },
         )
         .unwrap();
@@ -1652,4 +1661,78 @@ async fn crossed_dials_keep_the_expected_name() {
         bob.contacts().get(&a).unwrap().petname.as_deref(),
         Some("Al")
     );
+}
+
+/// A link card the sender attaches arrives with the text and is kept on
+/// both sides; one for a link the text doesn't have isn't sent.
+#[tokio::test]
+async fn link_previews_travel_with_their_text() {
+    use threnody_core::LinkPreview;
+    use threnody_net::history::{Extras, local_id};
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice", AcceptPolicy::Anyone, None);
+    let (bob, mut brx) = node(&dir, "bob", AcceptPolicy::Anyone, None);
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    let bob_id = alice
+        .connect(&addr, Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    // A contact, so its texts arrive as messages rather than a request.
+    bob.accept_contact(&alice.identity());
+    let card = |url: &str| LinkPreview {
+        url: url.into(),
+        title: "A page".into(),
+        description: "About it".into(),
+        site: "Example".into(),
+        image: Vec::new(),
+    };
+    let with = |url: &str| Extras {
+        preview: Some(card(url)),
+        ..Extras::default()
+    };
+    let text = "see https://a.example/page";
+    alice
+        .send_message_with(&bob_id, text, with("https://a.example/page"), local_id())
+        .unwrap();
+    let got = |e: &Event| match e {
+        Event::Message {
+            msg: AppMessage::Text { preview, .. },
+            ..
+        } => Some(preview.clone()),
+        _ => None,
+    };
+    let e = next(&mut brx, |e| got(e).is_some()).await;
+    assert_eq!(
+        got(&e).unwrap().as_deref(),
+        Some(&card("https://a.example/page"))
+    );
+    let kept = |n: &Node, conv| {
+        n.history(conv)
+            .unwrap()
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| e.text.starts_with("see"))
+            .and_then(|e| e.preview.clone())
+    };
+    assert_eq!(
+        kept(&bob, bob.conversation_for(&alice.identity())),
+        Some(card("https://a.example/page"))
+    );
+    assert_eq!(
+        kept(&alice, alice.conversation_for(&bob_id)),
+        Some(card("https://a.example/page"))
+    );
+
+    // A card for somewhere else stays home.
+    alice
+        .send_message_with(
+            &bob_id,
+            "see https://a.example/other",
+            with("https://evil.example/"),
+            local_id(),
+        )
+        .unwrap();
+    let e = next(&mut brx, |e| got(e).is_some()).await;
+    assert_eq!(got(&e).unwrap(), None);
 }

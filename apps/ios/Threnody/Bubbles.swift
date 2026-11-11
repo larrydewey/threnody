@@ -90,6 +90,7 @@ struct Bubble: View {
                 })
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
+            if let p = entry.preview { LinkCard(preview: p, out: out, onLink: onLink) }
         }
     }
 
@@ -281,5 +282,55 @@ struct FileContent: View {
             let safe = (try? await offMain { Media.previewable(url) }) ?? false
             if safe { onOpen(url) } else { refused = true }
         }
+    }
+}
+
+/// A message's link card: picture, title, description and site. Tapping
+/// it asks before opening, as the link itself does.
+struct LinkCard: View {
+    let preview: LinkPreviewInfo
+    let out: Bool
+    let onLink: (TextLink) -> Void
+
+    var body: some View {
+        let link = textLinks(text: preview.url).first
+        Button { if let l = link { onLink(l) } } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                if !preview.image.isEmpty, let img = UIImage(data: Data(preview.image)) {
+                    Image(uiImage: img).resizable().scaledToFill()
+                        .frame(maxWidth: .infinity, maxHeight: 160).clipped()
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    if !preview.title.isEmpty { Text(preview.title).font(.subheadline.bold()).lineLimit(2) }
+                    if !preview.description.isEmpty {
+                        Text(preview.description).font(.caption).lineLimit(3).opacity(0.85)
+                    }
+                    Text(preview.site.isEmpty ? (link?.host ?? "") : preview.site).font(.caption2).opacity(0.7)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background((out ? Color.white : Color.primary).opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Link preview: \(preview.title.isEmpty ? (link?.host ?? "") : preview.title)")
+    }
+}
+
+/// Fetched pictures as card thumbnails.
+enum LinkThumbnail {
+    /// At most 400 points on the longer side, a JPEG within what a message
+    /// carries; empty if it can't be made that small or isn't a picture.
+    static func shrink(_ raw: Data) -> Data {
+        // Decoded at that size, so a huge picture never decodes whole.
+        guard !raw.isEmpty, let cg = Media.thumbnail(data: raw, maxSide: 400) else { return Data() }
+        let small = UIImage(cgImage: cg)
+        let limit = Int(maxPreviewImage())
+        for q in [0.8, 0.65, 0.5, 0.35] {
+            if let d = small.jpegData(compressionQuality: q), d.count <= limit { return d }
+        }
+        return Data()
     }
 }

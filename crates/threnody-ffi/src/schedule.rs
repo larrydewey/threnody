@@ -126,7 +126,7 @@ impl ThrenodyNode {
                     let extras = Extras {
                         quote: s.quote.clone(),
                         mentions: s.mentions.clone(),
-                        forwarded: false,
+                        ..Extras::default()
                     };
                     // A member: any failure is not "left the group".
                     self.group_node()

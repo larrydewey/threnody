@@ -208,6 +208,8 @@ pub enum GroupEvent {
         /// Who it mentions.
         mentions: Vec<Mention>,
         forwarded: bool,
+        /// The sender's card for a link in `text`.
+        preview: Option<threnody_core::LinkPreview>,
     },
     File {
         group: GroupId,
@@ -1618,6 +1620,7 @@ impl Groups {
                 quote: None,
                 mentions: Vec::new(),
                 forwarded: false,
+                preview: None,
             },
         )
     }
@@ -3365,6 +3368,7 @@ fn application_event(group: GroupId, sender: Pid, plain: &[u8]) -> Result<GroupE
             quote,
             mentions,
             forwarded,
+            preview,
         } => GroupEvent::Text {
             group,
             from: sender,
@@ -3373,6 +3377,7 @@ fn application_event(group: GroupId, sender: Pid, plain: &[u8]) -> Result<GroupE
             quote,
             mentions,
             forwarded,
+            preview,
         },
         Content::File {
             name,

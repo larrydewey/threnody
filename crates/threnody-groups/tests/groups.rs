@@ -232,6 +232,7 @@ fn create_invite_chat_and_remove() {
             quote: None,
             mentions: Vec::new(),
             forwarded: false,
+            preview: None,
         }));
     }
 
@@ -269,6 +270,7 @@ fn create_invite_chat_and_remove() {
         quote: None,
         mentions: Vec::new(),
         forwarded: false,
+        preview: None,
     }));
 }
 
@@ -371,6 +373,7 @@ fn groups_survive_export_and_restore() {
         quote: None,
         mentions: Vec::new(),
         forwarded: false,
+        preview: None,
     }));
     let (_, name, owner, members) = net.node(&pb).list().pop().unwrap();
     assert_eq!((name.as_str(), owner, members.len()), ("persist", pa, 2));
@@ -425,6 +428,7 @@ fn members_forward_messages_for_each_other() {
         quote: None,
         mentions: Vec::new(),
         forwarded: false,
+        preview: None,
     }));
 
     // Only members forward, only to members, and never to themselves.
@@ -566,6 +570,7 @@ fn removed_members_can_be_invited_again() {
         quote: None,
         mentions: Vec::new(),
         forwarded: false,
+        preview: None,
     }));
 }
 

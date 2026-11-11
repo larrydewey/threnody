@@ -2782,6 +2782,8 @@ fn urgent(m: &AppMessage) -> bool {
 /// the peer acknowledges them, and go out plain (untracked) if it doesn't.
 /// One the peer can't read (a change held before we knew its features) is
 /// dropped: `Ok(None)`.
+// `Err` hands the message back to wait, as it came; it's no error value.
+#[allow(clippy::result_large_err)]
 fn ready(
     node: &Node,
     peer: &PublicIdentity,
@@ -3103,6 +3105,7 @@ mod tests {
             id: 3,
             quote: None,
             forwarded: false,
+            preview: None,
         };
 
         // A peer whose fresh Hello lacks the bit (an older build, say):

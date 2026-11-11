@@ -331,6 +331,7 @@ async fn already_sent_items_are_not_sent_twice() {
             forwarded: false,
             list: None,
             ticked_ms: 0,
+            preview: None,
         },
     );
     a.node.start_scheduled_sending();

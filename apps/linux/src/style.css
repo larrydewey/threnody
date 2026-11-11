@@ -42,6 +42,28 @@
   padding: 6px 16px;
   border-bottom: 1px solid alpha(currentColor, 0.1);
 }
+.preview-bar {
+  padding: 2px 4px 2px 12px;
+  margin: 0 10px;
+}
+.link-card {
+  margin-top: 6px;
+  border-radius: 8px;
+  background: alpha(currentColor, 0.08);
+}
+.link-card-title {
+  font-weight: bold;
+  padding: 6px 10px 0 10px;
+}
+.link-card-description {
+  padding: 0 10px;
+  opacity: 0.85;
+}
+.link-card-site {
+  font-size: smaller;
+  padding: 0 10px 8px 10px;
+  opacity: 0.7;
+}
 .reply-bar {
   padding: 6px 12px 0 12px;
   border-left: 3px solid @accent_color;

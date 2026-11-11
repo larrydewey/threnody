@@ -1042,7 +1042,7 @@ impl GroupNode {
             Extras {
                 quote,
                 mentions,
-                forwarded: false,
+                ..Extras::default()
             },
         )
     }
@@ -1077,6 +1077,7 @@ impl GroupNode {
             quote: extras.quote,
             mentions: Mention::valid(extras.mentions, text),
             forwarded: extras.forwarded,
+            preview: node.sendable_preview(extras.preview, text),
         };
         self.send(node, group, &content, None, id)
     }
@@ -1514,6 +1515,10 @@ impl GroupNode {
                 ),
                 list: None,
                 ticked_ms: 0,
+                preview: match content {
+                    Content::Text { preview, .. } => preview.clone(),
+                    _ => None,
+                },
             },
         );
         Ok(())
@@ -1558,6 +1563,7 @@ impl GroupNode {
                 forwarded: false,
                 list: None,
                 ticked_ms: 0,
+                preview: None,
             },
         );
     }
@@ -2466,6 +2472,7 @@ impl GroupNode {
                 quote,
                 mentions,
                 forwarded,
+                preview,
             } => {
                 self.seen_by(&group, Some(&from));
                 // What our other devices send to the group is ours too.
@@ -2491,6 +2498,7 @@ impl GroupNode {
                         quote,
                         mentions,
                         forwarded,
+                        preview,
                     },
                 );
                 Update::Text {
@@ -2580,6 +2588,7 @@ impl GroupNode {
                         forwarded: false,
                         list: None,
                         ticked_ms: 0,
+                        preview: None,
                     },
                 );
                 Update::Text {

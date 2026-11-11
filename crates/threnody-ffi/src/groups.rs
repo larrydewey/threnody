@@ -906,6 +906,36 @@ impl ThrenodyNode {
             .map_err(fail)
     }
 
+    /// `send_group_message` with a card for a link in `text` (as
+    /// `send_text_with_preview`).
+    pub fn send_group_text_with_preview(
+        &self,
+        group: String,
+        text: String,
+        quote_at_ms: Option<u64>,
+        quote_device: Option<String>,
+        mentions: Vec<MentionInfo>,
+        preview: crate::LinkPreviewInfo,
+    ) -> Result<()> {
+        let g = self.group_id(&group)?;
+        let conv = ConversationId::Group(g);
+        let quote = match (quote_at_ms, &quote_device) {
+            (Some(at), Some(d)) => self.node.quote_of(conv, crate::entry_at(at, d)),
+            _ => None,
+        };
+        let mentions = self.group_mentions(&g, &mentions);
+        let _guard = self.rt.enter();
+        let extras = threnody_net::history::Extras {
+            quote,
+            mentions,
+            preview: Some(preview.into()),
+            ..Default::default()
+        };
+        self.group_node()
+            .send_text_with(&self.node, &g, &text, extras)
+            .map_err(fail)
+    }
+
     /// Whether we may pin messages in `group` (we're an owner or admin, as
     /// every member agrees).
     pub fn may_pin_in_group(&self, group: String) -> Result<bool> {

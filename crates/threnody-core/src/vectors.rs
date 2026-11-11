@@ -135,6 +135,7 @@ fn generate() -> String {
         id: 0,
         quote: None,
         forwarded: false,
+        preview: None,
     };
     let m1 = cb.seal(&text).unwrap();
     assert_eq!(ca.open(&m1).unwrap(), text);

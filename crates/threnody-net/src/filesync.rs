@@ -1070,6 +1070,7 @@ mod tests {
             forwarded: false,
             list: None,
             ticked_ms: 0,
+            preview: None,
         }
     }
 

@@ -114,6 +114,8 @@ pub struct ChatView {
     peer_quiet: RefCell<Option<glib::SourceId>>,
     /// Above the composer while replying: what the reply quotes.
     reply_bar: gtk::Box,
+    /// Above the composer: offers, and holds, a card for a link.
+    preview_bar: Rc<crate::linkcard::PreviewBar>,
     /// Above the composer: how many messages are scheduled here, and
     /// when the next goes; clicking lists them.
     scheduled_bar: gtk::Button,
@@ -402,6 +404,13 @@ impl ChatView {
                 .child(&reply_bar)
                 .build(),
         );
+        let preview_bar = crate::linkcard::PreviewBar::new();
+        root.add_bottom_bar(
+            &adw::Clamp::builder()
+                .maximum_size(860)
+                .child(&preview_bar.widget)
+                .build(),
+        );
         root.add_bottom_bar(&composer_clamp);
 
         let this = Rc::new_cyclic(|weak_self| Self {
@@ -445,6 +454,7 @@ impl ChatView {
             typing_timeout: RefCell::new(None),
             sending_typing: Cell::new(false),
             reply_bar,
+            preview_bar,
             scheduled_bar,
             scheduled: RefCell::new(Vec::new()),
             timer_on: Cell::new(false),
@@ -585,6 +595,12 @@ impl ChatView {
         });
         this.root.add_controller(drop);
 
+        // Previews are fetched with this chat's node, as it is then.
+        {
+            let weak = Rc::downgrade(&this);
+            this.preview_bar
+                .set_node(move || weak.upgrade().and_then(|t| t.node()));
+        }
         // Connect text buffer changed signal for typing notifications.
         {
             let weak = Rc::downgrade(&this);
@@ -592,6 +608,7 @@ impl ChatView {
                 let Some(t) = weak.upgrade() else { return };
                 let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
                 placeholder.set_visible(text.is_empty());
+                t.preview_bar.on_text(&text);
                 t.offer_mentions(buf);
                 if let Some(id) = t.typing_timeout.borrow_mut().take() {
                     id.remove();
@@ -1708,6 +1725,9 @@ impl ChatView {
                 });
             }
             bubble.append(&text);
+            if let (Some(p), Some(app)) = (&e.preview, self.app.upgrade()) {
+                bubble.append(&crate::linkcard::card(&app.window, p));
+            }
         }
 
         let meta = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -3401,6 +3421,7 @@ impl ChatView {
         }
         let Some(node) = self.node() else { return };
         let mentions = self.take_mentions(&buf);
+        let card = self.preview_bar.take(&text);
         // Clearing the composer also says we stopped typing.
         buf.set_text("");
         let (group, device) = (self.group(), self.device());
@@ -3417,24 +3438,33 @@ impl ChatView {
             move || match group {
                 _ if note => {
                     let (at, d) = quote.unzip();
-                    node.write_note(sent, at, d)
-                        .map(|()| None)
-                        .map_err(|e| e.to_string())
-                }
-                Some(g) if quote.is_some() || !mentions.is_empty() => {
-                    let (at, d) = quote.unzip();
-                    node.send_group_message(g, sent, at, d, mentions)
-                        .map(|()| None)
-                        .map_err(|e| e.to_string())
-                }
-                Some(g) => node
-                    .send_group_text(g, sent)
+                    match card {
+                        Some(c) => node.write_note_with_preview(sent, at, d, c),
+                        None => node.write_note(sent, at, d),
+                    }
                     .map(|()| None)
-                    .map_err(|e| e.to_string()),
+                    .map_err(|e| e.to_string())
+                }
+                Some(g) => {
+                    let (at, d) = quote.unzip();
+                    match card {
+                        Some(c) => node.send_group_text_with_preview(g, sent, at, d, mentions, c),
+                        None if at.is_some() || !mentions.is_empty() => {
+                            node.send_group_message(g, sent, at, d, mentions)
+                        }
+                        None => node.send_group_text(g, sent),
+                    }
+                    .map(|()| None)
+                    .map_err(|e| e.to_string())
+                }
                 // It reaches the contact directly, by relay, or sealed for mailboxes.
-                None => match match quote {
-                    Some((at, d)) => node.send_reply(device, sent, at, d),
-                    None => node.send_text(device, sent),
+                None => match match (card, quote) {
+                    (Some(c), q) => {
+                        let (at, d) = q.unzip();
+                        node.send_text_with_preview(device, sent, at, d, c)
+                    }
+                    (None, Some((at, d))) => node.send_reply(device, sent, at, d),
+                    (None, None) => node.send_text(device, sent),
                 } {
                     Ok(0) => Ok(Some(
                         "Not delivered: they're offline and no mutual contact can hold it.",
@@ -5312,6 +5342,7 @@ mod tests {
             forwarded: false,
             list: None,
             tick: threnody_ffi::TickMark::None,
+            preview: None,
         }
     }
 

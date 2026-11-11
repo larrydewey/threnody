@@ -441,6 +441,7 @@ impl Node {
                 forwarded: false,
                 list: Some(l.id),
                 ticked_ms: 0,
+                preview: None,
             },
         );
     }

@@ -126,6 +126,51 @@ pub struct WireguardInfo {
     pub overlay: String,
 }
 
+/// A link card: on a message (what its sender's device found at `url`),
+/// or one to send with a message whose text has that link. `image` is a
+/// JPEG thumbnail of at most [`max_preview_image`] bytes, or empty; from
+/// `fetch_link_preview` it is the site's image as downloaded, for the app
+/// to shrink first.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LinkPreviewInfo {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub site: String,
+    pub image: Vec<u8>,
+}
+
+impl From<threnody_core::LinkPreview> for LinkPreviewInfo {
+    fn from(p: threnody_core::LinkPreview) -> Self {
+        Self {
+            url: p.url,
+            title: p.title,
+            description: p.description,
+            site: p.site,
+            image: p.image,
+        }
+    }
+}
+
+impl From<LinkPreviewInfo> for threnody_core::LinkPreview {
+    fn from(p: LinkPreviewInfo) -> Self {
+        Self {
+            url: p.url,
+            title: p.title,
+            description: p.description,
+            site: p.site,
+            image: p.image,
+        }
+    }
+}
+
+/// The largest preview image a message carries: apps shrink the fetched
+/// one to a JPEG within this.
+#[uniffi::export]
+pub fn max_preview_image() -> u32 {
+    threnody_core::preview::MAX_PREVIEW_IMAGE as u32
+}
+
 /// A URL preview with Open Graph meta tags.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct UrlPreview {
@@ -191,6 +236,9 @@ pub struct HistoryEntry {
     /// ones). Apps add "from your other device" themselves when `device`
     /// isn't this one.
     pub tick: TickMark,
+    /// The sender's card for a link in `text`.
+    #[uniffi(default = None)]
+    pub preview: Option<LinkPreviewInfo>,
 }
 
 /// The ticks an outgoing message shows, weakest first (so the weakest
@@ -1151,6 +1199,7 @@ fn history_entries(
         .iter()
         .map(|e| HistoryEntry {
             tick: tick_mark(e, this_device),
+            preview: e.preview.clone().map(Into::into),
             forwarded: e.forwarded || e.file.as_ref().is_some_and(|f| f.forwarded),
             list: e.list.as_ref().map(lists::list_hex),
             poll: e.poll.as_ref().map(|p| {
@@ -1972,6 +2021,69 @@ PersistentKeepalive = 25\n",
             site_name: p.site_name,
             content_type: p.content_type,
         })
+    }
+
+    /// Fetches a card for `url` to send with a message: the page's title,
+    /// description and site name, and its image as downloaded (shrink it
+    /// to a JPEG within [`max_preview_image`] bytes, or clear it). Blocks;
+    /// `None` if the page has nothing to show. It goes straight from this
+    /// device, so the site sees its address: only for a link the user
+    /// chose to preview.
+    pub fn fetch_link_preview(&self, url: String) -> Option<LinkPreviewInfo> {
+        threnody_core::fetch_link_preview(&url).map(Into::into)
+    }
+
+    /// `send_reply` (or `send_text`, without `quote_at_ms` and
+    /// `quote_device`) with a card for a link in `text`. The card goes
+    /// only if its URL is a link in `text`; its image loses any metadata.
+    pub fn send_text_with_preview(
+        &self,
+        peer: String,
+        text: String,
+        quote_at_ms: Option<u64>,
+        quote_device: Option<String>,
+        preview: LinkPreviewInfo,
+    ) -> Result<u32> {
+        let p = self.resolve(&peer)?;
+        let quote = match (quote_at_ms, &quote_device) {
+            (Some(at), Some(d)) => self
+                .node
+                .quote_of(self.node.conversation_for(&p), entry_at(at, d)),
+            _ => None,
+        };
+        self.node.seek(&p);
+        self.try_reach(&p);
+        let _guard = self.rt.enter();
+        let extras = threnody_net::history::Extras {
+            quote,
+            preview: Some(preview.into()),
+            ..Default::default()
+        };
+        let r = self
+            .node
+            .send_message_with(&p, &text, extras, threnody_net::history::local_id())
+            .map_err(fail)?;
+        Ok(u32::try_from(r.live + r.sealed + r.queued).unwrap_or(u32::MAX))
+    }
+
+    /// `write_note` with a card for a link in `text` (as
+    /// `send_text_with_preview`).
+    pub fn write_note_with_preview(
+        &self,
+        text: String,
+        quote_at_ms: Option<u64>,
+        quote_device: Option<String>,
+        preview: LinkPreviewInfo,
+    ) -> Result<()> {
+        let conv = self.node.notes();
+        let quote = match (quote_at_ms, &quote_device) {
+            (Some(at), Some(d)) => self.node.quote_of(conv, entry_at(at, d)),
+            _ => None,
+        };
+        let _guard = self.rt.enter();
+        self.node
+            .write_note_with(&text, quote, None, Some(preview.into()));
+        Ok(())
     }
 
     /// We want to reach `peer` (its chat is open): look for it across the
@@ -3317,6 +3429,7 @@ mod tests {
             forwarded: false,
             list: None,
             ticked_ms: 0,
+            preview: None,
         }
     }
 
