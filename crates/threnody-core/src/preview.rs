@@ -1,6 +1,8 @@
-//! URL preview functionality: fetches Open Graph meta tags from URLs.
+//! Links in message text, and URL previews: fetches Open Graph meta tags
+//! from URLs.
 
 use std::io::Read;
+use std::ops::Range;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -26,6 +28,94 @@ pub struct UrlPreview {
     pub site_name: Option<String>,
     /// The content type (from og:type).
     pub content_type: Option<String>,
+}
+
+/// A web link found in message text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextLink {
+    /// Where it is in the text, in bytes.
+    pub range: Range<usize>,
+    /// The link as a browser would open it (normalized: lowercased scheme
+    /// and host, international hosts in punycode).
+    pub url: String,
+    /// The host it goes to, in ASCII (punycode for international names),
+    /// so a look-alike can't pass for the real one.
+    pub host: String,
+}
+
+/// The http(s) links in `text`, in order. A link starts with `http://` or
+/// `https://` (any case) not glued to a letter or digit before it, and
+/// runs to whitespace or one of `<>"` and backtick; trailing punctuation
+/// (`.,!?;:'*~`) and closing brackets without an opening one inside the
+/// link are left out, so "(see https://a.example/x)." links only the
+/// address. Anything that isn't a valid URL with a host written out
+/// after the `//` is skipped.
+pub fn find_links(text: &str) -> Vec<TextLink> {
+    let mut out = Vec::new();
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(at) = next_scheme(&lower, from) {
+        let start = from + at;
+        let glued = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let len = text[start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
+            .unwrap_or(text.len() - start);
+        let end = start + trimmed_len(&text[start..start + len]);
+        from = start + len.max(1);
+        // "https:///x" would parse with "x" as its host.
+        let after = text[start..end].split_once("//").map_or("", |(_, a)| a);
+        if glued || after.starts_with(['/', '\\']) {
+            continue;
+        }
+        let Ok(url) = reqwest::Url::parse(&text[start..end]) else {
+            continue;
+        };
+        let Some(host) = url.host_str().filter(|h| !h.is_empty()) else {
+            continue;
+        };
+        out.push(TextLink {
+            range: start..end,
+            host: host.to_owned(),
+            url: url.into(),
+        });
+    }
+    out
+}
+
+/// Where the next "http://" or "https://" starts in `lower` at or after
+/// `from`, relative to `from`.
+fn next_scheme(lower: &str, from: usize) -> Option<usize> {
+    let rest = &lower[from..];
+    [rest.find("http://"), rest.find("https://")]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// How much of `link` to keep: without trailing punctuation, nor closing
+/// brackets that close nothing in the link.
+fn trimmed_len(link: &str) -> usize {
+    let mut s = link;
+    loop {
+        let Some(last) = s.chars().next_back() else {
+            return 0;
+        };
+        let unopened = |open: char| s.matches(open).count() < s.matches(last).count();
+        let drop = match last {
+            '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '*' | '~' => true,
+            ')' => unopened('('),
+            ']' => unopened('['),
+            '}' => unopened('{'),
+            _ => false,
+        };
+        if !drop {
+            return s.len();
+        }
+        s = &s[..s.len() - last.len_utf8()];
+    }
 }
 
 /// Fetches and parses a URL preview from the given URL.
@@ -136,6 +226,85 @@ pub fn fetch_preview(url: &str) -> Option<UrlPreview> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn links(text: &str) -> Vec<(&str, String, String)> {
+        find_links(text)
+            .into_iter()
+            .map(|l| (&text[l.range], l.url, l.host))
+            .collect()
+    }
+
+    fn shown(text: &str) -> Vec<&str> {
+        find_links(text)
+            .into_iter()
+            .map(|l| &text[l.range])
+            .collect()
+    }
+
+    #[test]
+    fn finds_links_in_text() {
+        assert_eq!(
+            links("see https://example.com/a?b=1#c ok"),
+            vec![(
+                "https://example.com/a?b=1#c",
+                "https://example.com/a?b=1#c".into(),
+                "example.com".into()
+            )]
+        );
+        assert_eq!(
+            shown("http://a.example and HTTPS://B.example/x"),
+            vec!["http://a.example", "HTTPS://B.example/x"]
+        );
+        assert_eq!(links("HTTPS://B.example/x")[0].1, "https://b.example/x");
+        assert!(find_links("no links here, nor ftp://a.example").is_empty());
+    }
+
+    #[test]
+    fn leaves_out_punctuation_around_links() {
+        assert_eq!(shown("Look: https://a.example."), vec!["https://a.example"]);
+        assert_eq!(
+            shown("(see https://a.example/x)."),
+            vec!["https://a.example/x"]
+        );
+        assert_eq!(
+            shown("https://en.wikipedia.org/wiki/Rust_(language)"),
+            vec!["https://en.wikipedia.org/wiki/Rust_(language)"]
+        );
+        assert_eq!(shown("<https://a.example/x>"), vec!["https://a.example/x"]);
+        assert_eq!(shown("\"https://a.example\""), vec!["https://a.example"]);
+        assert_eq!(shown("**https://a.example**"), vec!["https://a.example"]);
+        assert_eq!(shown("https://a.example/?!?"), vec!["https://a.example/"]);
+    }
+
+    #[test]
+    fn skips_what_is_not_a_link() {
+        assert!(find_links("https://").is_empty());
+        assert!(find_links("https:///path").is_empty());
+        assert!(find_links("xhttps://a.example").is_empty());
+        assert_eq!(shown("https://exa mple.com"), vec!["https://exa"]);
+        assert_eq!(
+            shown("1https://a.example 2https://b.example"),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// The host shown is the one the browser goes to, in ASCII.
+    #[test]
+    fn hosts_are_the_real_destination() {
+        assert_eq!(
+            links("https://bank.example@evil.example/")[0].2,
+            "evil.example"
+        );
+        assert_eq!(links("https://аpple.com/")[0].2, "xn--pple-43d.com");
+    }
+
+    #[test]
+    fn ranges_are_bytes_of_the_text() {
+        let t = "é → https://a.example/ü ok";
+        let l = &find_links(t)[0];
+        assert_eq!(&t[l.range.clone()], "https://a.example/ü");
+        assert_eq!(l.url, "https://a.example/%C3%BC");
+    }
 
     #[test]
     fn test_fetch_preview_invalid_url() {

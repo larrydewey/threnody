@@ -35,9 +35,9 @@ mod groups;
 mod persona;
 mod present;
 pub use present::{
-    METERED_COVER_MS, MentionSpan, ShownText, TextRange, cover_interval_ms, entry_preview,
-    file_label, image_needs_conversion, is_image_name, looks_like_handle, safe_file_name,
-    search_matches, search_ranges, show_mentions,
+    METERED_COVER_MS, MentionSpan, ShownText, TextLink, TextRange, cover_interval_ms,
+    entry_preview, file_label, image_needs_conversion, is_image_name, looks_like_handle,
+    safe_file_name, search_matches, search_ranges, show_mentions, text_links,
 };
 mod push;
 #[cfg(all(feature = "radio", target_os = "linux"))]

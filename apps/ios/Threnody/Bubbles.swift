@@ -4,6 +4,7 @@ import UIKit
 /// A message in a chat: who sent it (in groups), what it replies to, its
 /// text (mentions by name, search matches marked), photos and files,
 /// polls and lists, reactions, and when it was sent with its ticks.
+/// Links in the text take taps, which `onLink` confirms before opening.
 struct Bubble: View {
     let item: ChatItem
     /// The sender's name, above incoming group messages.
@@ -18,6 +19,7 @@ struct Bubble: View {
     let persona: String?
     let onReveal: (HistoryEntry) -> Void
     let onOpen: (URL) -> Void
+    let onLink: (TextLink) -> Void
     let onQuote: (QuoteInfo) -> Void
     let onReact: (ReactionInfo) -> Void
 
@@ -80,14 +82,21 @@ struct Bubble: View {
             .buttonStyle(.plain)
         } else {
             Text(styled(out: out))
+                .tint(out ? Color.white : Color.accentColor)
+                .environment(\.openURL, OpenURLAction { url in
+                    // Never straight to the browser: the chat asks first.
+                    if let l = textLinks(text: url.absoluteString).first { onLink(l) }
+                    return .handled
+                })
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    /// The text with mentions by name (ours marked) and search matches
-    /// highlighted. Mentions are placed in Rust (`showMentions`), which
-    /// counts as senders do; both ranges are UTF-16, as NSRange is.
+    /// The text with mentions by name (ours marked), links underlined and
+    /// tappable, and search matches highlighted. Mentions and links are
+    /// placed in Rust (`showMentions`, `textLinks`); the ranges are UTF-16,
+    /// as NSRange is.
     private func styled(out: Bool) -> AttributedString {
         let shown = showMentions(text: entry.text, mentions: entry.mentions, names: names)
         var a = AttributedString(shown.text)
@@ -95,6 +104,12 @@ struct Bubble: View {
             guard let r = Range(NSRange(location: Int(m.start), length: Int(m.len)), in: a) else { continue }
             a[r].font = .body.bold()
             if m.mine { a[r].backgroundColor = (out ? Color.white : Color.accentColor).opacity(0.25) }
+        }
+        for l in textLinks(text: shown.text) {
+            guard let r = Range(NSRange(location: Int(l.start), length: Int(l.len)), in: a),
+                  let url = URL(string: l.url) else { continue }
+            a[r].link = url
+            a[r].underlineStyle = .single
         }
         if !query.isEmpty {
             for h in searchRanges(text: shown.text, query: query) {

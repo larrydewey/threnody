@@ -278,11 +278,17 @@ pub fn open_externally(
 }
 
 /// Asks before a link leaves for the browser: *Open*, *Copy* or *Cancel*.
+/// It names the host the link really goes to (in ASCII, so a look-alike
+/// shows as punycode).
 pub fn confirm_link(window: &adw::ApplicationWindow, url: &str) {
+    let goes = threnody_core::find_links(url)
+        .first()
+        .map(|l| format!("Goes to {}\n\n", l.host))
+        .unwrap_or_default();
     let d = alert(
         "Open this link?",
         &format!(
-            "{url}\n\nIt opens in your browser, outside Threnody. The site sees your network address."
+            "{goes}{url}\n\nIt opens in your browser, outside Threnody. The site sees your network address."
         ),
         &[("cancel", "Cancel"), ("copy", "Copy"), ("open", "Open")],
     );
