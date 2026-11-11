@@ -577,6 +577,9 @@ pub(crate) struct Shared {
     pub(crate) profile: Mutex<threnody_core::persona::Profile>,
     /// Strip identifying metadata from images we send.
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
+    /// Under cover traffic, what we write waits for the next tick, so
+    /// sending looks like idling (on by default).
+    pub(crate) pace_messages: std::sync::atomic::AtomicBool,
     /// Disappearing timer (s) for conversations without one; 0 = off.
     pub(crate) default_timer: std::sync::atomic::AtomicU32,
     /// Our tunnel port and WireGuard public key, while tunnels are on.
@@ -973,6 +976,7 @@ impl Node {
             persona,
             profile: Mutex::new(profile),
             strip_metadata: std::sync::atomic::AtomicBool::new(true),
+            pace_messages: std::sync::atomic::AtomicBool::new(true),
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
@@ -1139,6 +1143,19 @@ impl Node {
 
     pub fn set_strip_metadata(&self, on: bool) {
         self.shared.strip_metadata.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether, under cover traffic, what we write waits for the next tick
+    /// like everything else (on by default), so someone watching the
+    /// network can't tell sending from idling. Off, texts and other
+    /// messages go at once (padded like a tick) and arrive faster, but
+    /// their timing shows.
+    pub fn pace_messages(&self) -> bool {
+        self.shared.pace_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pace_messages(&self, on: bool) {
+        self.shared.pace_messages.store(on, Ordering::Relaxed);
     }
 
     /// WireGuard listen port, when tunnels are enabled.
@@ -2417,6 +2434,16 @@ where
                             }
                         }
                         peer_acks = Some(features & FEATURE_ACKS != 0);
+                        // Unpaced, what someone wrote while we waited to
+                        // learn this goes now rather than at the next tick.
+                        if ticker.is_some()
+                            && chan.can_send()
+                            && !shared.pace_messages.load(Ordering::Relaxed)
+                        {
+                            while let Some(m) = next_personal(node, &peer, &mut pending, peer_acks) {
+                                write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?;
+                            }
+                        }
                         // Receipts waiting for it, by what it says it takes
                         // now: after `peer_acks`, so tracked ones can go.
                         pending.extend(node.receipts_for(&peer, features));
@@ -2665,6 +2692,22 @@ where
                             Err(m) => pending.push_back(m),
                         }
                     }
+                    // Unpaced, what someone wrote goes at once, padded as a
+                    // tick is (its size still hides), once nothing it must
+                    // follow is waiting.
+                    Some(m)
+                        if ticker.is_some()
+                            && chan.can_send()
+                            && personal(&m)
+                            && !shared.pace_messages.load(Ordering::Relaxed)
+                            && !pending.iter().any(personal) =>
+                    {
+                        match ready(node, &peer, m, peer_acks) {
+                            Ok(Some(m)) => write_frame(&mut wr, &seal_link(&mut chan, &m, true)?).await?,
+                            Ok(None) => {}
+                            Err(m) => pending.push_back(m),
+                        }
+                    }
                     Some(m) => pending.push_back(m),
                     None => {
                         // Replaced or disconnected locally. A revocation
@@ -2713,9 +2756,15 @@ where
                 }
                 () = tick(&mut ticker) => {
                     if chan.can_send() {
-                        // The first message that can go now, else cover.
-                        let mut m = AppMessage::Cover;
+                        // What someone wrote goes before background traffic
+                        // (receipts, sync, acks), each kind in its order;
+                        // then the first message that can go now; else cover.
+                        let mut m = next_personal(node, &peer, &mut pending, peer_acks)
+                            .unwrap_or(AppMessage::Cover);
                         for _ in 0..pending.len() {
+                            if !matches!(m, AppMessage::Cover) {
+                                break;
+                            }
                             let Some(next) = pending.pop_front() else { break };
                             match ready(node, &peer, next, peer_acks) {
                                 Ok(Some(r)) => {
@@ -2766,6 +2815,51 @@ pub(crate) fn seal_link(chan: &mut SecureChannel, m: &AppMessage, paced: bool) -
     } else {
         chan.seal(m)?
     })
+}
+
+/// Messages a person wrote and waits to see arrive: texts, files, group
+/// messages (MLS keeps them, commits included, in their own order), and
+/// changes to messages. Under cover traffic they take the next tick ahead
+/// of background traffic.
+fn personal(m: &AppMessage) -> bool {
+    match m {
+        AppMessage::Text { .. }
+        | AppMessage::File { .. }
+        | AppMessage::Group(_)
+        | AppMessage::Edit { .. }
+        | AppMessage::Delete { .. }
+        | AppMessage::React { .. }
+        | AppMessage::Pin { .. } => true,
+        AppMessage::Tracked { inner, .. } => personal(inner),
+        _ => false,
+    }
+}
+
+/// Takes the first [`personal`] message in `pending` that can go now (see
+/// [`ready`]) out of it, leaving the rest in their order.
+fn next_personal(
+    node: &Node,
+    peer: &PublicIdentity,
+    pending: &mut VecDeque<AppMessage>,
+    peer_acks: Option<bool>,
+) -> Option<AppMessage> {
+    let mut i = 0;
+    while i < pending.len() {
+        if !personal(&pending[i]) {
+            i += 1;
+            continue;
+        }
+        let m = pending.remove(i)?;
+        match ready(node, peer, m, peer_acks) {
+            Ok(Some(r)) => return Some(r),
+            Ok(None) => {}
+            Err(w) => {
+                pending.insert(i, w);
+                i += 1;
+            }
+        }
+    }
+    None
 }
 
 /// Call signalling and media, and tunnel packets: sent at once even under

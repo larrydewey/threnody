@@ -39,7 +39,8 @@ final class PrefsTests: TempDirTestCase {
         for key in Prefs.protective {
             XCTAssertTrue(Prefs.flag(key), key)
         }
-        XCTAssertEqual(Prefs.protective.count, 7)
+        XCTAssertEqual(Prefs.protective.count, 8)
+        XCTAssertTrue(Prefs.protective.contains(Prefs.pace), "hiding when you send is a protection")
         XCTAssertNil(Prefs.number(Prefs.timer))
         Prefs.setFlag(Prefs.cover, false)
         Prefs.reset()

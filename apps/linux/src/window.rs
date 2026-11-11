@@ -3215,6 +3215,12 @@ impl App {
         );
         toggle(
             &privacy,
+            settings::PACE,
+            "Hide when I send",
+            "With cover traffic, messages wait for its next beat, so sending looks like idling. Off, they go at once and arrive faster, but an observer can see when you send.",
+        );
+        toggle(
+            &privacy,
             settings::ONION,
             "Onion routing first",
             "Contacts are reached through two-relay onion circuits when approved relays allow",

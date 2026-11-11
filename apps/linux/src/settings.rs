@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const COVER: &str = "cover_traffic";
+/// Under cover traffic, messages wait for the next beat (on unless off).
+pub const PACE: &str = "pace_messages";
 pub const ONION: &str = "onion_first";
 pub const STRIP: &str = "strip_metadata";
 /// Photos and voice and video messages from our other devices download by

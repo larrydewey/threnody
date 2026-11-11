@@ -31,6 +31,7 @@ object Privacy {
     private const val PREFS = "privacy"
     private const val SCREEN = "screen_security"
     private const val COVER = "cover_traffic"
+    private const val PACE = "pace_messages"
     private const val ONION = "onion_first"
     private const val STRIP = "strip_metadata"
     private const val REACH = "reach_internet"
@@ -69,6 +70,8 @@ object Privacy {
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)
+    /** Messages wait for the next cover tick (on unless turned off). */
+    fun paceMessages(ctx: Context) = prefs(ctx).getBoolean(PACE, true)
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
     fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
     /**
@@ -147,6 +150,11 @@ object Privacy {
 
     fun setCoverTraffic(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(COVER, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
+
+    fun setPaceMessages(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(PACE, on).apply()
         Threnody.applyPrivacy(ctx)
     }
 
