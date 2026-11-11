@@ -17,8 +17,8 @@ android {
         // the workspace version in Cargo.toml (checked below; the code is
         // major * 1000000 + minor * 1000 + patch, so a build from the laptop
         // installs over a release); each release's "prepare" commit bumps both.
-        versionCode = 20000
-        versionName = "0.20.0"
+        versionCode = 1000000
+        versionName = "1.0.0"
         val workspace = workspaceVersion()
         check(versionName == workspace && versionCode == codeOf(workspace)) {
             "app/build.gradle.kts has $versionName ($versionCode) but Cargo.toml has $workspace " +

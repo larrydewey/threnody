@@ -1,0 +1,5 @@
+- Threnody 1.0.
+- Links in messages open with a tap, after showing where they really go.
+- Link previews: tap "Add a preview" above the message box. Only your device fetches it; whoever you send it to never contacts the site.
+- Texts you write go ahead of background traffic, so they arrive sooner.
+- New "Hide when I send" switch: turn it off and texts go at once, faster, but someone watching the network can see when you send.
