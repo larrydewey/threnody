@@ -407,7 +407,10 @@ fn apply(st: &mut AccountState, link: &Link) -> Result<()> {
     }
     let signers = link.valid_signers()?;
     let members = signers.iter().filter(|d| st.has(d)).count();
-    if members < usize::from(st.threshold) {
+    // Raising the threshold takes as many signatures as the new one: else
+    // a single device could raise it out of reach and freeze the chain,
+    // so that it could never be removed.
+    if members < usize::from(st.threshold.max(link.threshold)) {
         return Err(Error::BadSignature);
     }
     match &link.action {
@@ -441,6 +444,10 @@ fn apply(st: &mut AccountState, link: &Link) -> Result<()> {
             };
             n.clone_from(name);
         }
+    }
+    // The devices left must still be able to sign the next link.
+    if usize::from(link.threshold) > st.devices.len() {
+        return Err(Error::Malformed("account threshold above its devices"));
     }
     st.threshold = link.threshold;
     st.seq = link.seq;
@@ -691,6 +698,40 @@ mod tests {
     }
 
     #[test]
+    fn one_device_cannot_raise_the_threshold_out_of_reach() {
+        let (owner, thief) = (Identity::generate(), Identity::generate());
+        let mut chain = AccountChain::genesis(&owner, "phone").unwrap();
+        add(&mut chain, &[&owner], &thief, "laptop").unwrap();
+        // A stolen device signs a harmless rename that raises the
+        // threshold beyond what the account could ever sign: refused, so
+        // the owner can still remove it.
+        for threshold in [2, 255] {
+            let mut l = chain.propose(Action::Rename {
+                device: thief.public(),
+                name: "laptop".into(),
+            });
+            l.threshold = threshold;
+            l.sign(&thief).unwrap();
+            assert!(chain.clone().append(l).is_err(), "threshold {threshold}");
+        }
+        // Two devices may agree on 2, but not on more than they are.
+        let mut l = chain.propose(Action::Rename {
+            device: owner.public(),
+            name: "phone".into(),
+        });
+        l.threshold = 3;
+        l.sign(&owner).unwrap();
+        l.sign(&thief).unwrap();
+        assert!(chain.clone().append(l).is_err(), "above the device count");
+        let mut rm = chain.propose(Action::Remove {
+            device: thief.public(),
+        });
+        rm.sign(&owner).unwrap();
+        chain.append(rm).unwrap();
+        assert!(chain.state().removed.contains(&thief.public()));
+    }
+
+    #[test]
     fn genesis_add_remove_and_round_trip() {
         let (a, b, c) = (
             Identity::generate(),
@@ -780,6 +821,9 @@ mod tests {
         raise.threshold = 2;
         raise.sign(&a).unwrap();
         raise.sign(&c).unwrap();
+        // Raising it to 2 takes two of the devices already in.
+        assert!(chain.clone().append(raise.clone()).is_err());
+        raise.sign(&b).unwrap();
         chain.append(raise).unwrap();
         let mut rm = chain.propose(Action::Remove { device: b.public() });
         rm.sign(&a).unwrap();

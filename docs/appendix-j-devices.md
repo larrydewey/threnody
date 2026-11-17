@@ -26,7 +26,7 @@ A chain is valid if, applying links in order:
 
 1. **The genesis link** (seq 0, zero `prev`) adds exactly one device and is signed by that device. Its threshold is the initial threshold.
 2. **Every later link** has `seq = previous + 1` and `prev = H(previous body)`.
-3. **Authorisation.** Every later link is signed by at least `threshold` distinct devices in the device set *before* the link. The threshold is the one stated in the previous link.
+3. **Authorisation.** Every later link is signed by at least `threshold` distinct devices in the device set *before* the link. The threshold is the one stated in the previous link. A link that raises the threshold needs as many signatures as its new threshold, and no link may set a threshold above the number of devices it leaves: otherwise one device could raise it out of reach, so that nothing, its own removal included, could ever be signed again.
 4. **Add** also needs a signature from the device being added (proof of possession and consent), and that device must not already be in the set.
 5. **Remove** names a current device and may not leave the set empty.
 6. **No re-adding.** A device that has been removed can never be added again.
