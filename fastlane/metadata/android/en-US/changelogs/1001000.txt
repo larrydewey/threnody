@@ -1,0 +1,6 @@
+- Photos, clips and files you receive are kept encrypted on the device.
+- Meeting points: phones behind a VPN or strict NAT can still be reached.
+- Videos lose location tracks, and file names are made neutral.
+- New Settings page and a shorter menu; a contact details page.
+- Connecting to someone says what it's doing.
+- Many security fixes from a red-team review.

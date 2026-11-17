@@ -453,7 +453,7 @@ fn passphrase_file() -> Option<PathBuf> {
 
 /// How a new or restored identity is sealed: by default with a key in
 /// the system keyring. Without one it is refused, unless `--no-keyring`
-/// says unprotected is what the user wants: before 1.0.1 it was stored
+/// says unprotected is what the user wants: before 1.1.0 it was stored
 /// unprotected with only a line on stderr, easy to miss on a server.
 fn identity_seal(
     home: &Home,

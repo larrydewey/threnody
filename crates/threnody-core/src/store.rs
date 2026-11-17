@@ -435,7 +435,7 @@ pub fn secure_delete(path: &Path) -> Result<()> {
     }
 
     // Overwrite in place, three random passes and one of zeros. Opening
-    // with truncate (as before 1.0.1) let the filesystem free the old
+    // with truncate (as before 1.1.0) let the filesystem free the old
     // blocks first, so the passes went to new ones and never touched the
     // data. Even in place, copy-on-write filesystems and flash wear
     // levelling may keep old blocks; what this deletes was written sealed
