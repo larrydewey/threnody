@@ -194,6 +194,8 @@ impl RelayState {
         let searching = self.opening.get(&from).copied().unwrap_or(0);
         let ok = self.circuits_with(&from) + searching < MAX_CIRCUITS_PER_PEER
             && !self.hops.contains_key(&(from, circ))
+            // An id we gave `from` for an OPEN of ours still waiting.
+            && !self.pending.contains_key(&(from, circ))
             && self.first_sighting(nonce);
         if ok {
             *self.opening.entry(from).or_default() += 1;

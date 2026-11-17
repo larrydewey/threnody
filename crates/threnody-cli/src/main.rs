@@ -452,7 +452,9 @@ fn passphrase_file() -> Option<PathBuf> {
 }
 
 /// How a new or restored identity is sealed: by default with a key in
-/// the system keyring; without one, it is stored unprotected.
+/// the system keyring. Without one it is refused, unless `--no-keyring`
+/// says unprotected is what the user wants: before 1.0.1 it was stored
+/// unprotected with only a line on stderr, easy to miss on a server.
 fn identity_seal(
     home: &Home,
     passphrase: bool,
@@ -469,11 +471,11 @@ fn identity_seal(
             println!("The identity key is sealed with a key kept in the system keyring.");
             Ok(Some(pw))
         }
-        Err(e) => {
-            eprintln!("No system keyring ({e:#}); the identity key is stored unprotected.");
-            eprintln!("Use `threnody passphrase` to protect it with a passphrase.");
-            Ok(None)
-        }
+        Err(e) => bail!(
+            "no system keyring ({e:#}) to seal the identity key with. \
+             Use --passphrase (or THRENODY_PASSPHRASE, or a systemd credential) to seal it \
+             with a passphrase, or --no-keyring to store it unprotected"
+        ),
     }
 }
 
@@ -521,6 +523,9 @@ fn no_node_running(home: &Home) -> Result<std::fs::File> {
     node_lock(home)
 }
 
+/// The shortest new identity passphrase accepted.
+const MIN_PASSPHRASE_CHARS: usize = 8;
+
 /// Asks for a new passphrase twice.
 fn new_passphrase() -> Result<zeroize_string::Secret> {
     let a = read_passphrase("New passphrase: ")?;
@@ -532,6 +537,10 @@ fn new_passphrase() -> Result<zeroize_string::Secret> {
     }
     if a.as_bytes().is_empty() {
         bail!("empty passphrase; use --remove to store the key unprotected");
+    }
+    // Argon2id slows guessing, but a few characters still fall fast.
+    if a.0.chars().count() < MIN_PASSPHRASE_CHARS {
+        bail!("a passphrase needs at least {MIN_PASSPHRASE_CHARS} characters");
     }
     Ok(a)
 }

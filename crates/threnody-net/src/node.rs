@@ -2998,6 +2998,12 @@ const UNTRUSTED_BUDGET: usize = 4 * MAX_FRAME;
 /// each onion hop adds its own spacing, so a live transfer never pauses
 /// this long.
 const UNTRUSTED_STALL: Duration = Duration::from_secs(120);
+/// The slowest average an untrusted peer's frame may arrive at (bytes per
+/// second), past the first [`UNTRUSTED_STALL`]: a 16 MiB frame then has
+/// about 70 minutes, so holding the whole budget costs a sender about
+/// 16 KiB/s for as long as it holds it. Low enough for a message request
+/// through an onion circuit paced by cover traffic on mobile data.
+const UNTRUSTED_MIN_RATE: usize = 4 * 1024;
 
 /// A frame a session's reader has read, keeping its share of the untrusted
 /// budget until handled.
@@ -3044,12 +3050,23 @@ pub(crate) async fn read_inbound<R: AsyncRead + Unpin>(
         shared: shared.clone(),
         n: 0,
     };
-    let bytes = read_body_metered(rd, len, UNTRUSTED_STALL, |step| {
-        let taken = shared.untrusted_held.fetch_add(step, Ordering::Relaxed) + step;
-        held.n += step;
-        taken <= UNTRUSTED_BUDGET
-    })
-    .await?;
+    // A whole frame must also come at a minimum average rate: with only
+    // the stall limit, one byte every couple of minutes kept a frame's
+    // share of the budget held for as long as the sender liked, and a few
+    // such frames shut every other stranger out.
+    let whole = UNTRUSTED_STALL.max(Duration::from_secs(
+        u64::try_from(len / UNTRUSTED_MIN_RATE).unwrap_or(u64::MAX),
+    ));
+    let bytes = tokio::time::timeout(
+        whole,
+        read_body_metered(rd, len, UNTRUSTED_STALL, |step| {
+            let taken = shared.untrusted_held.fetch_add(step, Ordering::Relaxed) + step;
+            held.n += step;
+            taken <= UNTRUSTED_BUDGET
+        }),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "frame too slow"))??;
     Ok(Some(Inbound {
         bytes,
         _held: Some(held),

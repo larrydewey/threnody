@@ -29,7 +29,7 @@ code   = Crockford Base32 of the first 40 bits of
 
 `id` is the owner's 32-byte identity key and `version` a counter the owner raises to get a new code. Parsing ignores case, spaces, a leading `@` and the dash inside the code, and folds the usual Crockford confusables (O→0, I/L→1). Names have no dashes, so the code is whatever follows the first one.
 
-The code binds the handle to its owner's key. Making up a key whose code matches someone else's handle takes about 2^40 Argon2id runs, thousands of CPU-years at these parameters. A finder checks the code against the key in the record before connecting, and the session's handshake then proves the key. Safety numbers (Section 5) remain the way to be sure.
+The code binds the handle to its owner's key. Making up a key whose code matches someone else's handle takes about 2^40 Argon2id runs: about 7,000 CPU-years at these parameters, which rented hardware does for something like $100,000 to $1,000,000, and the attacker may try every `version` for free. That is out of reach of most, but not of a well-funded attacker after one particular handle. A finder checks the code against the key in the record before connecting, and the session's handshake then proves the key. Safety numbers (Section 5) remain the way to be sure.
 
 ## Records in the DHT
 

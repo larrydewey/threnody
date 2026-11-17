@@ -47,6 +47,9 @@ const DOCUMENT_EVERY_MS: u64 = 30 * 60_000;
 const DOCUMENT_LIFE_MS: u64 = 6 * 3_600_000;
 /// Relay-access credentials a directory issues per network per day.
 pub const TOKENS_PER_NETWORK: u32 = 8;
+/// And per wider network (an IPv6 /40, an IPv4 /16): someone holding a
+/// /48 has 256 /56s, each good for [`TOKENS_PER_NETWORK`].
+pub const TOKENS_PER_WIDE_NETWORK: u32 = 64;
 /// Registrations a directory accepts per network per day.
 const REGISTRATIONS_PER_NETWORK: u32 = 8;
 /// Directory requests wait this long (cover traffic slows every message).
@@ -201,6 +204,24 @@ pub(crate) fn network(ip: IpAddr) -> [u8; 16] {
             None => {
                 out[0] = 6;
                 out[1..8].copy_from_slice(&v6.octets()[..7]);
+            }
+        },
+    }
+    out
+}
+
+/// The wider network `ip` is in, for [`TOKENS_PER_WIDE_NETWORK`]: an IPv4
+/// /16 or an IPv6 /40, marked apart from [`network`]'s keys.
+pub(crate) fn wide_network(ip: IpAddr) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[15] = 0xff;
+    match ip {
+        IpAddr::V4(v4) => out[..2].copy_from_slice(&v4.octets()[..2]),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => out[..2].copy_from_slice(&v4.octets()[..2]),
+            None => {
+                out[0] = 6;
+                out[1..6].copy_from_slice(&v6.octets()[..5]);
             }
         },
     }
@@ -983,6 +1004,9 @@ impl Node {
             return self.dir_reply(&peer, &refuse("not a directory"));
         }
         let net = self.anon_addr(&peer).map_or([0; 16], |a| network(a.ip()));
+        let wide = self
+            .anon_addr(&peer)
+            .map_or([0; 16], |a| wide_network(a.ip()));
         let today = credential::day(now_ms());
         let answer = match msg {
             DirMsg::GetKey { .. } => {
@@ -1003,8 +1027,9 @@ impl Node {
                         refuse("tokens are for today or tomorrow")
                     }
                     Some(s) => {
+                        let w = s.issued.get(&(epoch, wide)).copied().unwrap_or(0);
                         let n = s.issued.entry((epoch, net)).or_insert(0);
-                        if *n >= TOKENS_PER_NETWORK {
+                        if *n >= TOKENS_PER_NETWORK || w >= TOKENS_PER_WIDE_NETWORK {
                             refuse("this network has had its tokens for that day")
                         } else {
                             match s
@@ -1014,6 +1039,9 @@ impl Node {
                             {
                                 Ok(issued) => {
                                     *n += 1;
+                                    if wide != net {
+                                        *s.issued.entry((epoch, wide)).or_insert(0) += 1;
+                                    }
                                     s.issued.retain(|(e, _), _| *e + 1 >= today);
                                     DirMsg::Token { id, issued }
                                 }
