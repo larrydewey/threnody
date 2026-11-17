@@ -1432,8 +1432,9 @@ impl GroupNode {
         let data = node
             .prepare_file(file.data)
             .map_err(|e| GroupError::File(e.to_string()))?;
+        let name = node.prepare_name(file.name, &data);
         let note = FileNote {
-            name: file.name.clone(),
+            name: name.clone(),
             size: data.len() as u64,
             location: file.location,
             sensitive: file.sensitive,
@@ -1443,7 +1444,7 @@ impl GroupNode {
         };
         let id = threnody_net::history::local_id();
         let content = Content::File {
-            name: file.name,
+            name,
             data,
             sensitive: file.sensitive,
             caption: file.caption,

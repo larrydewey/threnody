@@ -611,6 +611,14 @@ pub(crate) struct Shared {
     pub(crate) linking: Mutex<LinkState>,
     /// Shared prekey bundles of our own other devices, to forward.
     pub(crate) siblings: Mutex<HashMap<[u8; 32], PrekeyBundle>>,
+    /// Our mailbox's deposit key, the same for every mutually approved
+    /// contact, and replaced when one stops being one (see `mailbox`).
+    pub(crate) deposit_key: Mutex<[u8; 32]>,
+    /// The deposit keys our mutually approved contacts gave us. In memory:
+    /// each session hands it over again.
+    pub(crate) deposit_keys: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
+    /// Meeting points: ours, and those we listen for as a relay.
+    pub(crate) meeting: crate::meeting::MeetingState,
     pub(crate) ble: Mutex<crate::discovery::BleState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
@@ -873,6 +881,19 @@ impl Node {
                 chain
             }
         };
+        let deposit_key = match cfg
+            .home
+            .load_state(&cfg.identity, crate::mailbox::DEPOSIT_KEY_STATE)?
+        {
+            Some(b) if b.len() == 32 => <[u8; 32]>::try_from(b.as_slice())
+                .unwrap_or_else(|_| threnody_core::crypto::random_bytes()),
+            _ => {
+                let k: [u8; 32] = threnody_core::crypto::random_bytes();
+                cfg.home
+                    .save_state(&cfg.identity, crate::mailbox::DEPOSIT_KEY_STATE, &k)?;
+                k
+            }
+        };
         let siblings = match cfg.home.load_state(&cfg.identity, "siblings")? {
             Some(b) => crate::mailbox::decode_bundle_list(&b)?,
             None => HashMap::new(),
@@ -996,6 +1017,9 @@ impl Node {
             accounts: Mutex::new(accounts),
             linking: Mutex::new(LinkState::default()),
             siblings: Mutex::new(siblings),
+            deposit_key: Mutex::new(deposit_key),
+            deposit_keys: Mutex::default(),
+            meeting: crate::meeting::MeetingState::default(),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),
@@ -1497,11 +1521,12 @@ impl Node {
         chan: SecureChannel,
         via: PublicIdentity,
         outbound: bool,
+        stranger: Option<StrangerPass>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let addr = self.relay_addr(&via);
-        self.spawn_session(stream, chan, addr, outbound, Route::Relay(via));
+        self.start_session(stream, chan, addr, outbound, Route::Relay(via), stranger);
     }
 
     pub(crate) fn spawn_onion_session<S>(
@@ -1510,11 +1535,49 @@ impl Node {
         chan: SecureChannel,
         via: PublicIdentity,
         outbound: bool,
+        stranger: Option<StrangerPass>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let addr = self.relay_addr(&via);
-        self.spawn_session(stream, chan, addr, outbound, Route::Onion(via));
+        self.start_session(stream, chan, addr, outbound, Route::Onion(via), stranger);
+    }
+
+    /// Keeps message requests to [`MAX_REQUESTS`], deleting those least
+    /// recently heard from (never `keep`, the one just arrived). Requests
+    /// with a session up go last.
+    fn evict_requests(&self, keep: &PublicIdentity) {
+        let live: HashSet<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        let mut requests: Vec<(bool, u64, PublicIdentity)> = lock(&self.shared.contacts)
+            .iter()
+            .filter(|c| !c.accepted && !c.blocked && !c.local_approved && c.key != *keep)
+            .map(|c| (live.contains(&c.key), c.last_seen_ms, c.key))
+            .collect();
+        // A device of an account we accepted counts as accepted.
+        requests.retain(|(_, _, k)| !self.is_accepted(k));
+        // One place for the newcomer.
+        let over = (requests.len() + 1).saturating_sub(MAX_REQUESTS);
+        if over == 0 {
+            return;
+        }
+        requests.sort_unstable_by_key(|(live, seen, _)| (*live, *seen));
+        for (_, _, key) in requests.into_iter().take(over) {
+            self.delete_request(&key);
+        }
+    }
+
+    /// [`Node::admit`] for a session arriving through a circuit whose last
+    /// hop before us is `via`: a stranger there takes one of the same
+    /// places a direct one would, counted against the network it came
+    /// from (an anonymous link's address, else the neighbour's). Without
+    /// this, circuits let any number of fresh identities hold sessions.
+    pub(crate) fn admit_via(
+        &self,
+        peer: &PublicIdentity,
+        via: &PublicIdentity,
+    ) -> Result<Option<StrangerPass>> {
+        let addr = self.anon_addr(via).unwrap_or_else(|| self.relay_addr(via));
+        self.admit(peer, Source::ip(addr.ip()))
     }
 
     pub(crate) fn check_policy(&self, peer: &PublicIdentity) -> Result<()> {
@@ -1556,9 +1619,9 @@ impl Node {
 
     /// [`Node::check_policy`] for a session arriving over its own
     /// connection from `source`; a stranger also needs a place among
-    /// [`MAX_STRANGERS`], which the returned pass holds. Relay and onion
-    /// circuits don't come through here: they ride on a contact's
-    /// session, hold no socket of ours, and are capped per neighbour.
+    /// [`MAX_STRANGERS`], which the returned pass holds. Sessions through
+    /// relay and onion circuits take their place through
+    /// [`Node::admit_via`].
     ///
     /// A new device of ours, linking with a code we issued, is a stranger
     /// until it shows the code inside its session: while a code is out,
@@ -1842,6 +1905,9 @@ impl Node {
     /// session may end right after; its last act is to send that.
     pub(crate) fn withdraw_approval(&self, peer: &PublicIdentity) {
         self.shared.tunnel_down(peer);
+        // It knew our deposit key: a new one for those still approved.
+        self.rotate_deposit_key();
+        lock(&self.shared.deposit_keys).remove(peer);
         // No longer mutual: its wake-up endpoint goes (Appendix R).
         self.forget_push(peer);
         let _ = self.send(peer, AppMessage::Approval { approved: false });
@@ -1984,6 +2050,9 @@ impl Node {
             self.shared.save_contacts(&contacts);
             is_new
         };
+        if new_contact {
+            self.evict_requests(&peer);
+        }
         let since_ms = now_ms();
         let heard_ms = Arc::new(AtomicU64::new(since_ms));
         let info = SessionInfo {
@@ -2932,6 +3001,12 @@ const UNTRUSTED_BUDGET: usize = 4 * MAX_FRAME;
 /// each onion hop adds its own spacing, so a live transfer never pauses
 /// this long.
 const UNTRUSTED_STALL: Duration = Duration::from_secs(120);
+/// The slowest average an untrusted peer's frame may arrive at (bytes per
+/// second), past the first [`UNTRUSTED_STALL`]: a 16 MiB frame then has
+/// about 70 minutes, so holding the whole budget costs a sender about
+/// 16 KiB/s for as long as it holds it. Low enough for a message request
+/// through an onion circuit paced by cover traffic on mobile data.
+const UNTRUSTED_MIN_RATE: usize = 4 * 1024;
 
 /// A frame a session's reader has read, keeping its share of the untrusted
 /// budget until handled.
@@ -2978,12 +3053,23 @@ pub(crate) async fn read_inbound<R: AsyncRead + Unpin>(
         shared: shared.clone(),
         n: 0,
     };
-    let bytes = read_body_metered(rd, len, UNTRUSTED_STALL, |step| {
-        let taken = shared.untrusted_held.fetch_add(step, Ordering::Relaxed) + step;
-        held.n += step;
-        taken <= UNTRUSTED_BUDGET
-    })
-    .await?;
+    // A whole frame must also come at a minimum average rate: with only
+    // the stall limit, one byte every couple of minutes kept a frame's
+    // share of the budget held for as long as the sender liked, and a few
+    // such frames shut every other stranger out.
+    let whole = UNTRUSTED_STALL.max(Duration::from_secs(
+        u64::try_from(len / UNTRUSTED_MIN_RATE).unwrap_or(u64::MAX),
+    ));
+    let bytes = tokio::time::timeout(
+        whole,
+        read_body_metered(rd, len, UNTRUSTED_STALL, |step| {
+            let taken = shared.untrusted_held.fetch_add(step, Ordering::Relaxed) + step;
+            held.n += step;
+            taken <= UNTRUSTED_BUDGET
+        }),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "frame too slow"))??;
     Ok(Some(Inbound {
         bytes,
         _held: Some(held),
@@ -3007,6 +3093,14 @@ const LAST_WORDS: Duration = Duration::from_secs(1);
 /// How long a young session that ended waits for a twin (see
 /// `spawn_session`) before it counts as a disconnection.
 const TWIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Message requests (contacts nobody accepted, approved or blocked) kept
+/// at once. Every fresh identity that completes a handshake becomes one,
+/// so without a bound a stranger could grow the contact book, and the
+/// work every probe and beacon does with it, for as long as it liked.
+/// Past it the request least recently heard from goes, with its
+/// conversation, as if the user had deleted it.
+pub const MAX_REQUESTS: usize = 256;
 
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;

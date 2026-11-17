@@ -47,6 +47,9 @@ const DOCUMENT_EVERY_MS: u64 = 30 * 60_000;
 const DOCUMENT_LIFE_MS: u64 = 6 * 3_600_000;
 /// Relay-access credentials a directory issues per network per day.
 pub const TOKENS_PER_NETWORK: u32 = 8;
+/// And per wider network (an IPv6 /40, an IPv4 /16): someone holding a
+/// /48 has 256 /56s, each good for [`TOKENS_PER_NETWORK`].
+pub const TOKENS_PER_WIDE_NETWORK: u32 = 64;
 /// Registrations a directory accepts per network per day.
 const REGISTRATIONS_PER_NETWORK: u32 = 8;
 /// Directory requests wait this long (cover traffic slows every message).
@@ -129,6 +132,9 @@ struct DirServer {
     registered: HashMap<(u32, [u8; 16]), u32>,
     doc: Option<DirectoryDoc>,
     dirty: bool,
+    /// Where we serve the directory (see [`crate::onion::dial_target`]):
+    /// set each time it is served, empty after a restart until then.
+    own: Vec<std::net::IpAddr>,
 }
 
 pub(crate) struct VolunteerState {
@@ -204,6 +210,24 @@ pub(crate) fn network(ip: IpAddr) -> [u8; 16] {
     out
 }
 
+/// The wider network `ip` is in, for [`TOKENS_PER_WIDE_NETWORK`]: an IPv4
+/// /16 or an IPv6 /40, marked apart from [`network`]'s keys.
+pub(crate) fn wide_network(ip: IpAddr) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[15] = 0xff;
+    match ip {
+        IpAddr::V4(v4) => out[..2].copy_from_slice(&v4.octets()[..2]),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => out[..2].copy_from_slice(&v4.octets()[..2]),
+            None => {
+                out[0] = 6;
+                out[1..6].copy_from_slice(&v6.octets()[..5]);
+            }
+        },
+    }
+    out
+}
+
 fn new_id() -> u64 {
     u64::from_le_bytes(random_bytes())
 }
@@ -255,6 +279,7 @@ impl Node {
                 registered: HashMap::new(),
                 doc: None,
                 dirty: true,
+                own: Vec::new(),
             });
         }
     }
@@ -367,6 +392,7 @@ impl Node {
         self.save_subs();
         let _ = self.fetch_tokens(&link.issuer).await;
         self.start_directory_upkeep();
+        self.kick_meeting();
         // A volunteer registers with a new directory at once.
         if self.volunteering() {
             let node = self.clone();
@@ -566,6 +592,8 @@ impl Node {
             return;
         };
         let node = self.clone();
+        handle.spawn(async move { node.meeting_loop().await });
+        let node = self.clone();
         handle.spawn(async move {
             let closed = node.closed();
             tokio::pin!(closed);
@@ -675,6 +703,16 @@ impl Node {
 
     pub fn volunteering(&self) -> bool {
         lock(&self.vol().relay).is_some()
+    }
+
+    /// The literal IP addresses we volunteer at (none when we don't).
+    pub(crate) fn volunteer_addrs(&self) -> Vec<std::net::IpAddr> {
+        lock(&self.vol().relay)
+            .iter()
+            .flatten()
+            .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+            .map(|a| a.ip())
+            .collect()
     }
 
     /// Volunteers as a relay reachable at `addrs` (public `host:port`s), or
@@ -846,10 +884,17 @@ impl Node {
             issuer: issuer.key().id(),
             addr: addr.to_owned(),
         };
+        let own: Vec<std::net::IpAddr> = addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| vec![a.ip()])
+            .unwrap_or_default();
         {
             let mut server = lock(&self.vol().server);
             match server.as_mut() {
-                Some(s) => s.review = review,
+                Some(s) => {
+                    s.review = review;
+                    s.own = own;
+                }
                 None => {
                     *server = Some(DirServer {
                         issuer,
@@ -859,6 +904,7 @@ impl Node {
                         registered: HashMap::new(),
                         doc: None,
                         dirty: true,
+                        own,
                     })
                 }
             }
@@ -961,6 +1007,9 @@ impl Node {
             return self.dir_reply(&peer, &refuse("not a directory"));
         }
         let net = self.anon_addr(&peer).map_or([0; 16], |a| network(a.ip()));
+        let wide = self
+            .anon_addr(&peer)
+            .map_or([0; 16], |a| wide_network(a.ip()));
         let today = credential::day(now_ms());
         let answer = match msg {
             DirMsg::GetKey { .. } => {
@@ -981,8 +1030,9 @@ impl Node {
                         refuse("tokens are for today or tomorrow")
                     }
                     Some(s) => {
+                        let w = s.issued.get(&(epoch, wide)).copied().unwrap_or(0);
                         let n = s.issued.entry((epoch, net)).or_insert(0);
-                        if *n >= TOKENS_PER_NETWORK {
+                        if *n >= TOKENS_PER_NETWORK || w >= TOKENS_PER_WIDE_NETWORK {
                             refuse("this network has had its tokens for that day")
                         } else {
                             match s
@@ -992,6 +1042,9 @@ impl Node {
                             {
                                 Ok(issued) => {
                                     *n += 1;
+                                    if wide != net {
+                                        *s.issued.entry((epoch, wide)).or_insert(0) += 1;
+                                    }
                                     s.issued.retain(|(e, _), _| *e + 1 >= today);
                                     DirMsg::Token { id, issued }
                                 }
@@ -1031,9 +1084,18 @@ impl Node {
     /// identity.
     async fn probe_and_list(&self, peer: PublicIdentity, id: u64, d: RelayDescriptor) {
         let mut reachable = false;
+        let own = lock(&self.vol().server)
+            .as_ref()
+            .map(|s| s.own.clone())
+            .unwrap_or_default();
         for addr in &d.addrs {
+            // Only where a relay can be listed: never our LAN or loopback
+            // on a stranger's say-so.
+            let Some(sa) = crate::onion::dial_target(addr, &own).await else {
+                continue;
+            };
             if self
-                .anon_dial(addr, Some(d.identity.fingerprint()), true)
+                .anon_dial(&sa.to_string(), Some(d.identity.fingerprint()), true)
                 .await
                 .is_ok()
             {

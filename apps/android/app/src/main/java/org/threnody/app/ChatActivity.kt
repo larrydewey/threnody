@@ -494,11 +494,14 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** Sends a recorded voice or video message from where it was recorded. */
+    /**
+     * Sends a recorded voice or video message, kept sealed with the chat's
+     * files; the plain recording is deleted either way.
+     */
     private fun sendClip(file: java.io.File, measured: Long, video: Boolean) {
         Threnody.touch()
         Threading.background {
-            val location = Uri.fromFile(file).toString()
+            var location: String? = null
             // The file's own length when it says, else as timed.
             val ms = try {
                 android.media.MediaMetadataRetriever().use {
@@ -514,12 +517,16 @@ class ChatActivity : Activity() {
                     "it's larger than " + Formatter.formatShortFileSize(this, node.maxFileSize().toLong())
                 } else {
                     val options = FileOptions(false, "", 0uL, Clip(video, ms.coerceIn(0, Int.MAX_VALUE.toLong()).toUInt()))
-                    val g = group
-                    sendFileTo(file.name, data, location, options)
+                    val kept = Media.savePrivate(this, file.name, data, persona)
+                        ?: throw IllegalStateException("couldn't keep it")
+                    location = kept
+                    sendFileTo(file.name, data, kept, options)
                     null
                 }
             } catch (e: Exception) {
                 e.message ?: "error"
+            } finally {
+                Media.dropPlain(file)
             }
             if (error != null) {
                 Media.forget(this, location)
@@ -662,17 +669,43 @@ class ChatActivity : Activity() {
             setOnClickListener { dialog.dismiss() }
         }
         video.setMediaController(android.widget.MediaController(this).apply { setAnchorView(box) })
-        video.setVideoURI(Uri.parse(location))
         video.setOnPreparedListener { video.start() }
         video.setOnErrorListener { _, _, _ ->
             Toast.makeText(this, "Couldn't play this video", Toast.LENGTH_SHORT).show()
             dialog.dismiss()
             true
         }
+        // VideoView plays files: a sealed one from a decrypted copy in the
+        // cache, deleted when the player closes.
+        var plain: java.io.File? = null
+        var closed = false
         dialog.setContentView(box)
-        dialog.setOnDismissListener { video.stopPlayback() }
+        dialog.setOnDismissListener {
+            video.stopPlayback()
+            closed = true
+            plain?.let { f -> Threading.background { Media.dropPlain(f) } }
+        }
         Privacy.secure(dialog)
         dialog.show()
+        Threading.background {
+            val copy = try {
+                Media.plainCopy(this, location)
+            } catch (_: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, "Couldn't play this video", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                }
+                return@background
+            }
+            runOnUiThread {
+                if (closed) {
+                    copy?.let { f -> Threading.background { Media.dropPlain(f) } }
+                } else {
+                    plain = copy
+                    if (copy != null) video.setVideoPath(copy.path) else video.setVideoURI(Uri.parse(location))
+                }
+            }
+        }
     }
 
     /** Whether the contact was last told we are typing, and when. */
@@ -1849,8 +1882,17 @@ class ChatActivity : Activity() {
                 return
             }
             if (option == "Copy text") {
-                getSystemService(android.content.ClipboardManager::class.java)
-                    ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
+                val clip = android.content.ClipData.newPlainText("message", e.text)
+                // Disappearing messages (and every copy with screen security
+                // on) are marked sensitive: Android 13+ then doesn't show
+                // the text in its clipboard preview, and keyboards with a
+                // clipboard history are asked not to keep it.
+                if (android.os.Build.VERSION.SDK_INT >= 33 && (e.disappearing || Privacy.screenSecurity(this))) {
+                    clip.description.extras = android.os.PersistableBundle().apply {
+                        putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+                    }
+                }
+                getSystemService(android.content.ClipboardManager::class.java)?.setPrimaryClip(clip)
                 return
             }
             if (option == "Select text") return selectText(e.text)
@@ -2668,43 +2710,9 @@ class ChatActivity : Activity() {
         val c = convo
         PopupMenu(this, anchor).apply {
             menu.add("Media, files and links").setOnMenuItemClickListener { media(c?.title); true }
-            menu.add("Rename").setOnMenuItemClickListener { rename(); true }
-            menu.add("Safety number").setOnMenuItemClickListener { safety(); true }
-            if (c?.approved == true) {
-                menu.add("Revoke approval").setOnMenuItemClickListener { setApproval(false); true }
-            } else {
-                menu.add("Approve").setOnMenuItemClickListener { setApproval(true); true }
-            }
             menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
             menu.add("Notifications").setOnMenuItemClickListener { notifications(); true }
-            menu.add("Offer a credential…").setOnMenuItemClickListener {
-                CredentialUi.offer(this@ChatActivity, node, device, c?.title ?: "They"); true
-            }
-            menu.add("Ask for a credential…").setOnMenuItemClickListener {
-                CredentialUi.ask(this@ChatActivity, node, device, c?.title ?: "They"); true
-            }
-            menu.add("Share your profile…").setOnMenuItemClickListener {
-                ProfileUi.share(this@ChatActivity, node, device, c?.title ?: "They",
-                    if (persona != null) "This identity's profile" else "Your profile")
-                true
-            }
-            if (persona != null && c != null) {
-                menu.add("Reveal who you are…").setOnMenuItemClickListener { reveal(c); true }
-            }
-            // Not for an anonymous identity: a group shows a nearby contact the phone.
-            if (persona == null && c?.connected == true && c.approved) {
-                menu.add("Faster link (Wi-Fi Direct)").setOnMenuItemClickListener { wifiDirect(); true }
-            }
-            if (c != null) {
-                menu.add("Clear chat…").setOnMenuItemClickListener {
-                    Chats.clear(this@ChatActivity, node, c.title, c.device, null) { refresh() }
-                    true
-                }
-                menu.add("Delete contact…").setOnMenuItemClickListener {
-                    Chats.delete(this@ChatActivity, node, c.title, c.device) { finish() }
-                    true
-                }
-            }
+            menu.add("Contact details").setOnMenuItemClickListener { details(); true }
             show()
         }
     }
@@ -2763,6 +2771,54 @@ class ChatActivity : Activity() {
             }
             refresh()
         }
+    }
+
+    /**
+     * Everything about this contact that the chat's menu used to list:
+     * who they are, trust, what you share with them, and at the bottom,
+     * clearing and deleting.
+     */
+    private fun details() {
+        val c = convo ?: return
+        val who = c.title
+        SettingsPage(this, who).apply {
+            section("Contact")
+            link("Rename", "Only you see the name you give them") { rename() }
+            link("Safety number", "Compare it with them to be sure it's them") { safety() }
+            toggle("Approved", { convo?.approved == true }, {
+                if (it) "Your devices find each other nearby and over the internet, relay for each other, " +
+                    "and can hold each other's messages"
+                else "Only chat: no relaying, tunnels or messages held for them"
+            }) { setApproval(it) }
+
+            section("Share")
+            link("Share your profile\u2026", "Choose which details $who sees") {
+                ProfileUi.share(this@ChatActivity, node, device, who,
+                    if (persona != null) "This identity's profile" else "Your profile")
+            }
+            link("Offer a credential\u2026", "Vouch for something about them") {
+                CredentialUi.offer(this@ChatActivity, node, device, who)
+            }
+            link("Ask for a credential\u2026", "Ask them to prove something") {
+                CredentialUi.ask(this@ChatActivity, node, device, who)
+            }
+            if (persona != null) {
+                link("Reveal who you are\u2026", "Prove this anonymous identity is you. Can't be undone") { reveal(c) }
+            }
+            // Not for an anonymous identity: a group shows a nearby contact the phone.
+            if (persona == null && c.connected && c.approved) {
+                section("Connection")
+                link("Faster link (Wi-Fi Direct)", "For big files when you're near each other") { wifiDirect() }
+            }
+
+            section("Delete")
+            link("Clear chat\u2026", "Deletes the messages; keeps the contact", danger = true) {
+                Chats.clear(this@ChatActivity, node, who, c.device, null) { refresh() }
+            }
+            link("Delete contact\u2026", danger = true) {
+                Chats.delete(this@ChatActivity, node, who, c.device) { finish() }
+            }
+        }.show()
     }
 
     private fun groupMenu(anchor: View) {

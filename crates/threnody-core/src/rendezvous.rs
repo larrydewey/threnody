@@ -137,6 +137,77 @@ pub struct Candidates {
     pub flags: u64,
     /// The sender wants to reach the reader until then.
     pub seeking_until_ms: Option<u64>,
+    /// Volunteer relays the sender listens at (Appendix N, *Meeting
+    /// points*): reachable there through any NAT. At most
+    /// [`MAX_MEETINGS`]; older readers skip them.
+    pub meetings: Vec<MeetingPoint>,
+}
+
+/// A volunteer relay that splices circuits naming `cookie` onto the link
+/// the sender keeps with it (Appendix N, *Meeting points*). The cookie is
+/// all it takes to reach the sender there, so it travels only inside
+/// records, links and handles meant for whoever may reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeetingPoint {
+    pub relay: crate::identity::Fingerprint,
+    pub addr: SocketAddr,
+    pub cookie: [u8; 16],
+}
+
+/// Most meeting points one record carries.
+pub const MAX_MEETINGS: usize = 2;
+/// Most candidates beside meeting points, so a record still fits.
+pub const MAX_CANDIDATES_WITH_MEETINGS: usize = 8;
+
+fn encode_meetings(
+    e: &mut const_cbor::Encoder<'_>,
+    list: &[MeetingPoint],
+) -> core::result::Result<(), const_cbor::Error> {
+    let list = &list[..list.len().min(MAX_MEETINGS)];
+    e.array_len(list.len())?;
+    for m in list {
+        e.array_len(4)?.bytes(&m.relay.0)?;
+        match m.addr.ip() {
+            IpAddr::V4(a) => e.bytes(&a.octets())?,
+            IpAddr::V6(a) => e.bytes(&a.octets())?,
+        };
+        e.u16(m.addr.port())?.bytes(&m.cookie)?;
+    }
+    Ok(())
+}
+
+fn decode_meetings(d: &mut Decoder<'_>) -> Result<Vec<MeetingPoint>> {
+    let n = d.array_len()?;
+    if n > MAX_MEETINGS {
+        return Err(Error::Malformed("too many meeting points"));
+    }
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        if d.array_len()? != 4 {
+            return Err(Error::Malformed("meeting point"));
+        }
+        let relay = crate::identity::Fingerprint(
+            <[u8; 20]>::try_from(d.bytes()?).map_err(|_| Error::Malformed("meeting relay"))?,
+        );
+        let ip = match d.bytes()? {
+            b if b.len() == 4 => {
+                IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(b).unwrap_or_default()))
+            }
+            b if b.len() == 16 => {
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(b).unwrap_or_default()))
+            }
+            _ => return Err(Error::Malformed("meeting address")),
+        };
+        let port = d.u16()?;
+        let cookie =
+            <[u8; 16]>::try_from(d.bytes()?).map_err(|_| Error::Malformed("meeting cookie"))?;
+        v.push(MeetingPoint {
+            relay,
+            addr: SocketAddr::new(ip, port),
+            cookie,
+        });
+    }
+    Ok(v)
 }
 
 fn encode_list(
@@ -239,14 +310,24 @@ impl Paths {
 
 impl Candidates {
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let meet = !self.meetings.is_empty();
+        let list = if meet {
+            &self.list[..self.list.len().min(MAX_CANDIDATES_WITH_MEETINGS)]
+        } else {
+            &self.list[..]
+        };
         cbor::to_vec(PADDED_LEN, |e| {
-            e.map_len(3 + usize::from(self.seeking_until_ms.is_some()))?;
+            e.map_len(3 + usize::from(self.seeking_until_ms.is_some()) + usize::from(meet))?;
             e.u8(0)?;
-            encode_list(e, &self.list)?;
+            encode_list(e, list)?;
             e.u8(1)?.uint(self.issued_ms)?;
             e.u8(2)?.uint(self.flags)?;
             if let Some(t) = self.seeking_until_ms {
                 e.u8(3)?.uint(t)?;
+            }
+            if meet {
+                e.u8(4)?;
+                encode_meetings(e, &self.meetings)?;
             }
             Ok(())
         })
@@ -254,13 +335,15 @@ impl Candidates {
 
     pub(crate) fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
-        let (mut list, mut issued, mut flags, mut seeking) = (None, None, 0, None);
+        let (mut list, mut issued, mut flags, mut seeking, mut meetings) =
+            (None, None, 0, None, Vec::new());
         read_map(&mut dec, |key, d| {
             match key {
                 0 => list = Some(decode_list(d)?),
                 1 => issued = Some(d.u64()?),
                 2 => flags = d.u64()?,
                 3 => seeking = Some(d.u64()?),
+                4 => meetings = decode_meetings(d)?,
                 _ => return Ok(false),
             }
             Ok(true)
@@ -271,6 +354,7 @@ impl Candidates {
             issued_ms: required(issued, "issued time")?,
             flags,
             seeking_until_ms: seeking,
+            meetings,
         })
     }
 }
@@ -366,8 +450,8 @@ pub fn recognise_probe<'a>(
     let (nonce, tag) = data.split_at(16);
     candidates.into_iter().find_map(|(peer, d)| {
         let want = probe_tag(d, peer, nonce);
-        // Not secret-dependent timing worth guarding: the tag is public once sent.
-        (want == tag).then_some(*peer)
+        // The sender of a probe picks its nonce: compared in constant time.
+        crate::crypto::ct_eq(&want, tag).then_some(*peer)
     })
 }
 
@@ -386,7 +470,7 @@ pub fn recognise_timed_probe<'a>(
     candidates.into_iter().find_map(|(peer, d)| {
         [epoch.saturating_sub(1), epoch, epoch + 1]
             .into_iter()
-            .any(|e| timed_probe_tag(d, peer, e, nonce) == tag)
+            .any(|e| crate::crypto::ct_eq(&timed_probe_tag(d, peer, e, nonce), tag))
             .then_some(*peer)
     })
 }
@@ -411,6 +495,7 @@ mod tests {
             issued_ms: 1_700_000_000_000,
             flags: FLAG_SYMMETRIC,
             seeking_until_ms: Some(1_700_000_120_000),
+            meetings: Vec::new(),
         }
     }
 
@@ -438,6 +523,7 @@ mod tests {
             issued_ms: 1,
             flags: 0,
             seeking_until_ms: None,
+            meetings: Vec::new(),
         };
         assert_eq!(seal_record(&keys, &empty).unwrap().len(), RECORD_LEN);
         let full = Candidates {

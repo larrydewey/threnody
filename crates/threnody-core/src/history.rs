@@ -655,6 +655,20 @@ impl History {
         self.entries.len() != before
     }
 
+    /// Drops every disappearing entry, expired or not, and what quotes
+    /// of them keep: for copies that outlive this device, such as backups,
+    /// where a timer would no longer run.
+    pub fn drop_disappearing(&mut self) {
+        let timed: Vec<Entry> = self
+            .entries
+            .iter()
+            .filter(|e| e.expires_at_ms.is_some())
+            .cloned()
+            .collect();
+        self.entries.retain(|e| e.expires_at_ms.is_none());
+        self.forget_quotes(&timed);
+    }
+
     /// Incoming messages since the user last looked. History from before
     /// this was kept (`seen_ms` 0) counts as read.
     pub fn unread(&self) -> impl Iterator<Item = &Entry> {
@@ -1331,6 +1345,10 @@ impl Home {
                 (Some(h), None) | (None, Some(h)) => h,
                 (None, None) => continue,
             };
+            // Disappearing messages stay on this device until their time;
+            // a backup could be read long after, so they never go in one.
+            let mut h = h;
+            h.drop_disappearing();
             let name = c.legacy_state_name();
             let sealed = self.seal_state(identity, &name, &h.encode()?)?;
             out.push((name, sealed));
@@ -1897,6 +1915,43 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backups_leave_disappearing_messages_out() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let old = crate::store::Home::new(a.path());
+        let id = old.create_identity(None).unwrap();
+        old.save_contacts(&id, &crate::store::Contacts::default())
+            .unwrap();
+        let c = ConversationId::Peer([3; 32]);
+        let now = crate::now_ms();
+        old.append_history(&id, c, entry(now, "kept", None), now)
+            .unwrap();
+        // One still running, one past its time but not yet pruned.
+        old.append_history(&id, c, entry(now + 1, "secret", Some(now + 3_600_000)), now)
+            .unwrap();
+        let mut h = old.load_history(&id, c, now).unwrap();
+        h.entries.push(entry(now + 2, "gone", Some(now - 1)));
+        old.save_history(&id, c, &h).unwrap();
+
+        let backup = old
+            .export_backup_with(
+                &id,
+                "correct horse battery",
+                crate::sealed::KdfParams {
+                    m_kib: 64,
+                    t: 1,
+                    lanes: 1,
+                },
+            )
+            .unwrap();
+        let new = crate::store::Home::new(b.path());
+        new.restore_backup(&backup, "correct horse battery", None)
+            .unwrap();
+        let restored = new.load_history(&id, c, 0).unwrap();
+        let texts: Vec<&str> = restored.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["kept"]);
+    }
 
     fn entry(at: u64, text: &str, exp: Option<u64>) -> Entry {
         Entry {

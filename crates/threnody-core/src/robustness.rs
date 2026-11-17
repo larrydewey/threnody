@@ -204,6 +204,7 @@ fn credential_and_directory_parsers_survive_mutated_input() {
         e_pub,
         addr: Some("192.0.2.1:7450".into()),
         token: Some(token_bytes.clone()),
+        meet: None,
     }
     .encode()
     .unwrap();
@@ -350,6 +351,7 @@ fn tap_card_survives_mutated_apdus() {
         fingerprint: Identity::from_seed(&[1; 32]).public().fingerprint(),
         addrs: vec!["198.51.100.4:7450".into()],
         key: Some(InviteKey::from_bytes(&[9; 16]).unwrap()),
+        meet: None,
     };
     let fp_b = Identity::from_seed(&[2; 32]).public().fingerprint();
     let card = || Card::with_seed(&link, [5; 64]).unwrap();

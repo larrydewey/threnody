@@ -273,6 +273,7 @@ impl Core {
             .ok()
             .and_then(|a| a.rsplit(':').next()?.parse().ok())
             .unwrap_or(0);
+        set_media_node(&main, &home);
         let core = Arc::new(Self {
             home,
             main,
@@ -309,6 +310,7 @@ impl Core {
         // Only the main identity: personas are never linked to other devices.
         core.main.set_file_store(Arc::new(LinuxFiles {
             dir: core.media_dir(None),
+            node: Arc::downgrade(&core.main),
         }));
         // Radios and the relay roles can take seconds to start: the
         // window shouldn't wait.
@@ -330,10 +332,10 @@ impl Core {
         core.pump(core.main.clone(), None, Arc::new(AtomicBool::new(true)));
         core.open_personas();
         core.main.reconnect();
-        // Edited photos a crash left unsent.
-        if let Some(d) = core.edit_dir(None) {
-            clear_dir(&d);
-        }
+        // Decrypted copies, recordings and edited photos a crash left; and
+        // edited photos older versions kept in the data directory.
+        clear_scratch();
+        wipe_dir(&core.home.join("edited"));
         core.sweeper();
         core
     }
@@ -819,6 +821,7 @@ impl Core {
         // Never on metered networks; `set_metered` applies this again.
         node.set_auto_fetch_files(fetch && !persona && !self.metered.load(Ordering::Relaxed));
         node.set_use_volunteers(volunteers);
+        node.set_meeting_point(self.settings().opted_in(settings::MEETING));
         node.set_cover_traffic(self.cover_ms());
         node.set_pace_messages(self.settings().flag(settings::PACE));
         node.set_onion_first(onion);
@@ -883,6 +886,21 @@ impl Core {
 
     /// The invite link for the main identity or a persona.
     pub fn invite(&self, persona: Option<&str>) -> Result<String, String> {
+        // An anonymous identity's invite carries no address, only its
+        // meeting point at a volunteer relay (Appendix N, section 6).
+        if let Some(id) = persona {
+            let node = self.node(Some(id))?;
+            // Asks for one if it has none yet, without waiting.
+            if !node.wait_meeting_point(0) {
+                return Err(
+                    "This anonymous identity can't be reached yet: it meets people at a \
+                     volunteer relay, and has none so far. Subscribe to a relay directory in \
+                     Preferences, or try again in a few seconds."
+                        .into(),
+                );
+            }
+            return Ok(node.invite_link(String::new()));
+        }
         let ip = Self::lan_ip();
         let (node, port) = match persona {
             None => (self.main.clone(), self.port),
@@ -1056,6 +1074,8 @@ impl Core {
                     if let Some(h) = homes.get(&id) {
                         keyring::delete(h);
                     }
+                    // And so would its port in our settings.
+                    self.settings().set_number(&format!("port_{id}"), None);
                     self.say(format!(
                         "* burned expired anonymous identity {}",
                         short(&id)
@@ -1123,8 +1143,9 @@ impl Core {
                 _lock: dir_lock,
             },
         );
-        if let Some(d) = self.edit_dir(Some(&rec.id)) {
-            clear_dir(&d);
+        // Edited photos older versions kept in its data directory.
+        if let Some(h) = self.identity_home(Some(&rec.id)) {
+            wipe_dir(&h.join("edited"));
         }
         self.say(format!(
             "anonymous identity {} listening on port {port}",
@@ -1166,10 +1187,14 @@ impl Core {
             .create_persona(label.into(), expires_ms, Some(pw.0.clone()))
             .map_err(|e| e.to_string())?;
         if let Err(e) = keyring::store(&PathBuf::from(&rec.home), &pw) {
-            // Nowhere to keep its key.
-            threnody_ffi::change_passphrase(rec.home.clone(), Some(pw.0.clone()), None)
-                .map_err(|e| e.to_string())?;
-            self.say(format!("! no keyring ({e}); its key is stored unprotected"));
+            // Nowhere to keep its key, and an anonymous identity whose key
+            // sits unprotected on disk is one anyone with the disk can be.
+            // It goes again rather than live that way.
+            let _ = self.main.burn_persona(rec.id.clone());
+            return Err(format!(
+                "No system keyring ({e}) to protect an anonymous identity's key with. \
+                 Start a keyring (GNOME Keyring, KWallet) and try again."
+            ));
         }
         self.open_persona(&rec)?;
         let _ = self.ui.send_blocking(UiEvent::PersonasChanged);
@@ -1217,7 +1242,7 @@ impl Core {
     /// Keeps `data` as `name` in a node's private media directory (never
     /// in Downloads); its location.
     pub fn keep_private(&self, persona: Option<&str>, name: &str, data: &[u8]) -> Option<String> {
-        keep_in(&self.media_dir(persona), name, data)
+        keep_in(&self.main, &self.media_dir(persona), name, data)
     }
 
     /// Where a node keeps received photos (and a persona everything): in
@@ -1242,10 +1267,12 @@ impl Core {
         }
     }
 
-    /// Where edited photos wait to be sent or saved: beside, not in,
-    /// `media/`, so the sweep can't take one still being edited.
+    /// Where edited photos wait to be sent or saved: in the scratch
+    /// directory (see [`scratch_dir`]), not in `media/`, so the sweep can't
+    /// take one still being edited. One per identity.
     fn edit_dir(&self, persona: Option<&str>) -> Option<PathBuf> {
-        Some(self.identity_home(persona)?.join("edited"))
+        self.identity_home(persona)?;
+        Some(scratch_dir().join(format!("edited-{}", persona.unwrap_or("main"))))
     }
 
     /// A new, empty file (only the user can read it) for an edited photo
@@ -1283,13 +1310,14 @@ impl Core {
         reserve_draft(&home.join("media"), &name).map_err(|e| e.to_string())
     }
 
-    /// Where to record a voice or video message, beside received photos.
+    /// Where to record a voice or video message: in the scratch directory,
+    /// sealed into `media/` once sent ([`Core::keep_private`]).
     pub fn clip_path(&self, persona: Option<&str>, video: bool) -> Result<PathBuf, String> {
         if WIPING.load(Ordering::SeqCst) {
             return Err("erasing".into());
         }
-        let dir = self.media_dir(persona);
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dir = scratch_dir().join(format!("clips-{}", persona.unwrap_or("main")));
+        private_dir(&dir).map_err(|e| e.to_string())?;
         let name = if video {
             format!("video-{}.webm", threnody_core::now_ms())
         } else {
@@ -1310,14 +1338,15 @@ impl Core {
         if WIPING.load(Ordering::SeqCst) {
             return None;
         }
-        let dir = if persona.is_some() || how.privately(name) {
-            self.media_dir(persona)
+        let written = if persona.is_some() || how.privately(name) {
+            write_sealed(&self.main, &self.media_dir(persona), name, data)
         } else {
-            gtk::glib::user_special_dir(gtk::glib::UserDirectory::Downloads)
+            let dir = gtk::glib::user_special_dir(gtk::glib::UserDirectory::Downloads)
                 .unwrap_or_else(|| self.home.join("downloads"))
-                .join("Threnody")
+                .join("Threnody");
+            write_new(&dir, name, data)
         };
-        match write_new(&dir, name, data) {
+        match written {
             Ok(path) => Some(path.display().to_string()),
             Err(e) => {
                 self.say(format!("! saving {name}: {e}"));
@@ -1326,13 +1355,31 @@ impl Core {
         }
     }
 
-    /// Removes kept photos whose messages were deleted or disappeared, and
-    /// burns anonymous identities whose time is up. Every five minutes.
+    /// Seals media kept before media was sealed; then removes kept photos
+    /// whose messages were deleted or disappeared, and burns anonymous
+    /// identities whose time is up: at start, then every five minutes.
     fn sweeper(self: &Arc<Self>) {
         let core = Arc::downgrade(self);
         std::thread::spawn(move || {
+            if let Some(core) = core.upgrade() {
+                let personas = core.persona_ids().into_iter().map(Some);
+                for persona in std::iter::once(None).chain(personas) {
+                    let dir = core.media_dir(persona.as_deref());
+                    match core.main.seal_media_dir(dir.display().to_string()) {
+                        Ok(0) => {}
+                        Ok(n) => core.say(format!("* sealed {n} media files kept unsealed")),
+                        Err(e) => core.say(format!("! sealing kept media: {e}")),
+                    }
+                    if dir.exists() {
+                        let _ = private_dir(&dir);
+                    }
+                }
+            }
+            let mut first = true;
             loop {
-                std::thread::sleep(Duration::from_secs(300));
+                if !std::mem::take(&mut first) {
+                    std::thread::sleep(Duration::from_secs(300));
+                }
                 let Some(core) = core.upgrade() else { return };
                 let now = threnody_core::now_ms();
                 for p in core.personas() {
@@ -1629,6 +1676,7 @@ impl Core {
             p.node.shutdown();
         }
         self.main.shutdown();
+        clear_scratch();
     }
 }
 
@@ -1929,20 +1977,21 @@ pub fn is_image(name: &str) -> bool {
     threnody_ffi::is_image_name(name.to_owned())
 }
 
-/// Writes `data` as `name` (any path in it stripped) into `dir`; its
+/// Seals `data` as `name` (any path in it stripped) into `dir`; its
 /// location.
-fn keep_in(dir: &Path, name: &str, data: &[u8]) -> Option<String> {
+fn keep_in(node: &ThrenodyNode, dir: &Path, name: &str, data: &[u8]) -> Option<String> {
     if WIPING.load(Ordering::SeqCst) {
         return None;
     }
-    write_new(dir, name, data)
+    write_sealed(node, dir, name, data)
         .ok()
         .map(|p| p.display().to_string())
 }
 
 /// Writes `data` to a new file in `dir` named `name`, or numbered if that
 /// is taken: never into a file already there (an edited photo being
-/// sent reserves its name in media/ before it is moved in).
+/// sent reserves its name in media/ before it is moved in). Plain, for
+/// Downloads: private files go through [`write_sealed`].
 fn write_new(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
@@ -1953,11 +2002,44 @@ fn write_new(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Seals `data` (under `node`'s identity: the main one's) into a new file
+/// in `dir` (made 0700) named `name`, or numbered if that is taken; 0600.
+fn write_sealed(
+    node: &ThrenodyNode,
+    dir: &Path,
+    name: &str,
+    data: &[u8],
+) -> std::io::Result<PathBuf> {
+    private_dir(dir)?;
+    // The empty file holds the name while the sealed copy is written
+    // beside it, then replaced by it.
+    let (path, _) = create_free(dir, name, 0o600)?;
+    node.seal_media(data.to_vec(), path.display().to_string())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            std::io::Error::other(e.to_string())
+        })?;
+    Ok(path)
+}
+
+/// Makes `dir` (and its parents) if needed, and only the user's.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // Made by an older version with the umask's permissions.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Where the main identity keeps files, for getting them from our other
-/// devices and giving them ours (Appendix J). Files that come over go to
-/// the private media directory, never to Downloads.
+/// devices and giving them ours (Appendix J). Files that come over are
+/// sealed into the private media directory, never put in Downloads.
 pub struct LinuxFiles {
     pub dir: PathBuf,
+    /// The main node, whose identity seals them.
+    pub node: std::sync::Weak<ThrenodyNode>,
 }
 
 impl threnody_ffi::SyncedFileStore for LinuxFiles {
@@ -1965,16 +2047,150 @@ impl threnody_ffi::SyncedFileStore for LinuxFiles {
         // What a sent file's path holds now may have grown, or been
         // replaced by something else entirely.
         let m = std::fs::metadata(&location).ok()?;
-        if !m.is_file() || m.len() > max {
+        let len = threnody_ffi::media_size(location.clone()).ok()?;
+        if !m.is_file() || len > max {
             return None;
         }
-        let data = std::fs::read(&location).ok()?;
+        let node = self.node.upgrade()?;
+        let data = read_with(&node, Path::new(&location)).ok()?;
         (data.len() as u64 <= max).then_some(data)
     }
 
     fn keep(&self, name: String, data: Vec<u8>, _clip: bool) -> Option<String> {
-        keep_in(&self.dir, &name, &data)
+        keep_in(&*self.node.upgrade()?, &self.dir, &name, &data)
     }
+}
+
+// ----- Media at rest -----
+//
+// Private media (received photos, voice and video messages, anything a
+// persona or a disappearing chat receives) is sealed under the main
+// identity (`seal_media`), so it is protected as the identity is. Reading
+// decrypts in memory; players and other apps get a decrypted copy in the
+// scratch directory, emptied at start, on lock and at exit. Downloads stay
+// plain: the user put them where any app can read them.
+
+/// The node whose identity seals private media (the main one), for code
+/// with no `Core` at hand: decoding, players, *Open*.
+static MEDIA_NODE: Mutex<Option<std::sync::Weak<ThrenodyNode>>> = Mutex::new(None);
+/// See [`scratch_dir`].
+static SCRATCH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Decrypted copies made so far: sealed file to copy.
+static OPENED: Mutex<Option<HashMap<PathBuf, PathBuf>>> = Mutex::new(None);
+
+fn set_media_node(main: &Node, home: &Path) {
+    *lock(&MEDIA_NODE) = Some(Arc::downgrade(main));
+    // One per data directory (two can run at once), the same every run so
+    // a crash's leftovers are found.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut h);
+    let dir = gtk::glib::user_runtime_dir().join(format!("threnody-{:016x}", h.finish()));
+    *lock(&SCRATCH) = Some(dir);
+}
+
+/// Where plaintext waits while it must be a file: decrypted copies for a
+/// player or another app, recordings until sent, edited photos until sent
+/// or saved. In the user's runtime directory (in memory on most systems,
+/// never backed up), owner-only.
+pub fn scratch_dir() -> PathBuf {
+    lock(&SCRATCH)
+        .clone()
+        .unwrap_or_else(|| gtk::glib::user_runtime_dir().join("threnody"))
+}
+
+/// Empties the scratch directory (at start and at exit).
+fn clear_scratch() {
+    lock(&OPENED).take();
+    let _ = std::fs::remove_dir_all(scratch_dir());
+}
+
+/// Deletes the decrypted copies made for players and other apps (on lock).
+pub fn wipe_plain_copies() {
+    lock(&OPENED).take();
+    let _ = std::fs::remove_dir_all(scratch_dir().join("open"));
+}
+
+/// Securely deletes the files in `dir`, then `dir` if empty; ignoring errors.
+fn wipe_dir(dir: &Path) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for f in files.flatten() {
+        if f.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = threnody_ffi::secure_delete_file(f.path().display().to_string());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+fn media_node() -> std::io::Result<Node> {
+    lock(&MEDIA_NODE)
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .ok_or_else(|| std::io::Error::other("the identity isn't open"))
+}
+
+/// Whether the file at `path` is sealed media.
+pub fn is_sealed(path: &Path) -> bool {
+    threnody_ffi::is_sealed_media(path.display().to_string())
+}
+
+fn read_with(node: &ThrenodyNode, path: &Path) -> std::io::Result<Vec<u8>> {
+    if !is_sealed(path) {
+        return std::fs::read(path);
+    }
+    node.open_media(path.display().to_string())
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// What the file at `path` holds: decrypted in memory if sealed, as it is
+/// otherwise (a download, or media kept before sealing). Blocking.
+pub fn read_media(path: &Path) -> std::io::Result<Vec<u8>> {
+    if !is_sealed(path) {
+        return std::fs::read(path);
+    }
+    read_with(&*media_node()?, path)
+}
+
+/// A file with what `path` holds, for a player or another app: `path`
+/// itself if it isn't sealed, otherwise a decrypted copy in the scratch
+/// directory under the same name (so apps are picked by its extension),
+/// made once and deleted on lock and at exit. Blocking.
+pub fn plain_path(path: &Path) -> std::io::Result<PathBuf> {
+    if !is_sealed(path) {
+        return Ok(path.to_owned());
+    }
+    if let Some(p) = lock(&OPENED).as_ref().and_then(|m| m.get(path))
+        && p.exists()
+    {
+        return Ok(p.clone());
+    }
+    let node = media_node()?;
+    let dir = scratch_dir().join("open");
+    private_dir(&dir)?;
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let (dst, _) = create_free(&dir, &name, 0o600)?;
+    node.open_media_file(path.display().to_string(), dst.display().to_string())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&dst);
+            std::io::Error::other(e.to_string())
+        })?;
+    lock(&OPENED)
+        .get_or_insert_with(HashMap::new)
+        .insert(path.to_owned(), dst.clone());
+    Ok(dst)
+}
+
+/// Copies what `from` holds to `to` (where the user chose: plain),
+/// decrypting it if sealed.
+pub fn save_plain(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !is_sealed(from) {
+        return std::fs::copy(from, to).map(|_| ());
+    }
+    std::fs::write(to, read_media(from)?)
 }
 
 /// `dir/name` with any path the sender put in the name stripped, and a
@@ -1999,14 +2215,10 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or(candidate)
 }
 
-/// Creates a new file for a draft in `dir` (made 0700 if new): `name`,
-/// or a numbered one if that is taken, mode 0600.
+/// Creates a new file for a draft in `dir` (made 0700): `name`, or a
+/// numbered one if that is taken, mode 0600.
 fn reserve_draft(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    private_dir(dir)?;
     create_free(dir, name, 0o600).map(|(path, _)| path)
 }
 
@@ -2031,29 +2243,20 @@ fn create_free(dir: &Path, name: &str, mode: u32) -> std::io::Result<(PathBuf, s
     Err(std::io::Error::other(format!("no free name for {name}")))
 }
 
-/// Moves a sent edited photo from its draft to `dest`, the empty file
-/// [`Core::edit_destination`] reserved in `media/`. Fails rather than
-/// replace a file with anything in it.
-pub fn adopt_edit(draft: &Path, dest: &Path) -> std::io::Result<()> {
+/// Seals a sent edited photo from its draft into `dest`, the empty file
+/// [`Core::edit_destination`] reserved in `media/`, and deletes the draft.
+/// Fails rather than replace a file with anything in it.
+pub fn adopt_edit(node: &ThrenodyNode, draft: &Path, dest: &Path) -> std::io::Result<()> {
     if std::fs::metadata(dest)?.len() != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "another file has that name",
         ));
     }
-    std::fs::rename(draft, dest)
-}
-
-/// Removes the files in `dir`, ignoring errors.
-fn clear_dir(dir: &Path) {
-    let Ok(files) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for f in files.flatten() {
-        if f.file_type().is_ok_and(|t| t.is_file()) {
-            let _ = std::fs::remove_file(f.path());
-        }
-    }
+    node.seal_media_file(draft.display().to_string(), dest.display().to_string())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    threnody_ffi::secure_delete_file(draft.display().to_string())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// What decides where a received file is kept.
@@ -2172,16 +2375,26 @@ mod tests {
 
     #[test]
     fn synced_files_are_kept_privately() {
+        use std::os::unix::fs::PermissionsExt;
         use threnody_ffi::SyncedFileStore;
-        let dir = std::env::temp_dir().join(format!("threnody-synced-{}", std::process::id()));
+        let dir = temp("synced");
+        let node = ThrenodyNode::open(dir.join("node").display().to_string(), None, None).unwrap();
         let files = LinuxFiles {
             dir: dir.join("media"),
+            node: Arc::downgrade(&node),
         };
         let at = files
             .keep("../../x.png".into(), b"png".to_vec(), false)
             .unwrap();
         assert_eq!(PathBuf::from(&at), dir.join("media").join("x.png"));
-        assert_eq!(std::fs::read(&at).unwrap(), b"png");
+        // Sealed, only the user's, and read back through the node.
+        let raw = std::fs::read(&at).unwrap();
+        assert!(raw.starts_with(b"thr-media1") && !raw.ends_with(b"png"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(Path::new(&at)), 0o600);
+        assert_eq!(mode(&dir.join("media")), 0o700);
+        assert_eq!(files.read(at.clone(), 3).unwrap(), b"png");
+        assert_eq!(read_with(&node, Path::new(&at)).unwrap(), b"png");
         // A second one of the same name doesn't replace the first.
         let again = files
             .keep("x.png".into(), b"other".to_vec(), false)
@@ -2193,12 +2406,19 @@ mod tests {
     #[test]
     fn read_refuses_files_over_max() {
         use threnody_ffi::SyncedFileStore;
-        let dir = std::env::temp_dir().join(format!("threnody-read-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let files = LinuxFiles { dir: dir.clone() };
+        let dir = temp("read");
+        let node = ThrenodyNode::open(dir.join("node").display().to_string(), None, None).unwrap();
+        let files = LinuxFiles {
+            dir: dir.clone(),
+            node: Arc::downgrade(&node),
+        };
         let f = dir.join("big.bin");
         std::fs::write(&f, vec![0u8; 100]).unwrap();
         let at = f.display().to_string();
+        assert_eq!(files.read(at.clone(), 100).map(|d| d.len()), Some(100));
+        assert_eq!(files.read(at.clone(), 99), None);
+        // Sealed: its plaintext size counts.
+        node.seal_media(vec![0u8; 100], at.clone()).unwrap();
         assert_eq!(files.read(at.clone(), 100).map(|d| d.len()), Some(100));
         assert_eq!(files.read(at, 99), None);
         assert_eq!(
@@ -2284,6 +2504,7 @@ mod tests {
     #[test]
     fn edit_drafts_move_into_media() {
         let dir = temp("adopt");
+        let node = ThrenodyNode::open(dir.join("node").display().to_string(), None, None).unwrap();
         let (edited, media) = (dir.join("edited"), dir.join("media"));
         std::fs::create_dir_all(&edited).unwrap();
         std::fs::create_dir_all(&media).unwrap();
@@ -2294,15 +2515,16 @@ mod tests {
         // The reserved name is taken: a received file gets another.
         let other = create_free(&media, "a-edited.jpg", 0o666).unwrap().0;
         assert_eq!(other, media.join("a-edited (1).jpg"));
-        adopt_edit(&draft, &dest).unwrap();
+        adopt_edit(&node, &draft, &dest).unwrap();
         assert!(!draft.exists());
-        assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg");
+        assert!(is_sealed(&dest));
+        assert_eq!(read_with(&node, &dest).unwrap(), b"jpeg");
 
         // Never over a file already there.
         std::fs::write(&draft, b"new").unwrap();
-        assert!(adopt_edit(&draft, &dest).is_err());
+        assert!(adopt_edit(&node, &draft, &dest).is_err());
         assert_eq!(std::fs::read(&draft).unwrap(), b"new");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg");
+        assert_eq!(read_with(&node, &dest).unwrap(), b"jpeg");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2329,12 +2551,13 @@ mod tests {
     #[test]
     fn edit_drafts_are_cleared() {
         let dir = temp("clear");
-        std::fs::write(dir.join("a.jpg"), b"a").unwrap();
-        std::fs::write(dir.join("b.jpg"), b"b").unwrap();
-        clear_dir(&dir);
-        assert!(dir.exists());
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        clear_dir(&dir.join("missing"));
+        let edited = dir.join("edited");
+        std::fs::create_dir(&edited).unwrap();
+        std::fs::write(edited.join("a.jpg"), b"a").unwrap();
+        std::fs::write(edited.join("b.jpg"), b"b").unwrap();
+        wipe_dir(&edited);
+        assert!(!edited.exists());
+        wipe_dir(&dir.join("missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

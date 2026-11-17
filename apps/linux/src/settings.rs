@@ -20,6 +20,9 @@ pub const BACKGROUND: &str = "run_in_background";
 pub const START_AT_LOGIN: &str = "start_at_login";
 pub const TIMER: &str = "default_timer";
 pub const VOLUNTEERS: &str = "use_volunteers";
+/// Keep a meeting point at a volunteer relay whatever the NAT looks like
+/// (Appendix N, section 6): for someone behind a VPN. Off unless chosen.
+pub const MEETING: &str = "meeting_point";
 /// The always-on relay: the fingerprint of a contact (a relay node run on
 /// a server) the main identity keeps a session with. None unless chosen.
 pub const ANCHOR: &str = "always_on_relay";

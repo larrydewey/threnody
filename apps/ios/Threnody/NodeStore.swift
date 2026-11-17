@@ -157,6 +157,10 @@ final class NodeStore: ObservableObject {
     private var wantsForeground = false
     private var foregroundDone = false
     private var sweeper: Task<Void, Never>?
+    /// Whether this node's first sweep has run: decrypted copies a
+    /// previous run left are deleted and files kept unsealed sealed once,
+    /// not on every return to the foreground (QuickLook may have one open).
+    private var mediaPrepared = false
     private let path = PathWatcher()
     private var typingTimeouts: [String: Task<Void, Never>] = [:]
     private var refreshing = false
@@ -227,6 +231,8 @@ final class NodeStore: ObservableObject {
 
     private func started(_ n: ThrenodyNode, _ addr: String, lock: Bool?) {
         node = n
+        // Kept files are sealed under the main identity, personas' too.
+        Media.sealer = n
         listenAddr = addr
         myDevice = n.deviceFingerprint()
         n.setForeground(on: active)
@@ -716,13 +722,22 @@ final class NodeStore: ObservableObject {
 
     // MARK: Files
 
-    /// Deletes files no message refers to any more, every five minutes
-    /// while the app is in front; then burns anonymous identities whose
-    /// time is up.
+    /// Deletes decrypted copies a previous run left and seals files kept
+    /// before media was sealed; then deletes files no message refers to
+    /// any more, at once and every five minutes while the app is in front,
+    /// and burns anonymous identities whose time is up.
     private func startSweeper() {
         sweeper?.cancel()
         let gen = Self.currentGeneration
+        let first = !mediaPrepared
+        mediaPrepared = true
         sweeper = Task { [weak self] in
+            if first {
+                _ = try? await offMain {
+                    Media.wipePlain()
+                    Media.sealAll()
+                }
+            }
             while !Task.isCancelled && Self.currentGeneration == gen {
                 guard let self, let main = self.node else { return }
                 let nodes: [(String?, ThrenodyNode)] = [(nil, main)] + self.personas.map { (Optional($0.key), $0.value) }
@@ -758,6 +773,8 @@ final class NodeStore: ObservableObject {
         for flag in pumps.values { flag.stop() }
         let all = [node].compactMap { $0 } + personaNodes
         node = nil
+        Media.sealer = nil
+        mediaPrepared = false
         personas = [:]
         pumps = [:]
         _ = try? await offMain {

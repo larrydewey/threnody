@@ -65,6 +65,12 @@ struct GroupCall {
     info: GroupCallInfo,
     base: Zeroizing<[u8; 32]>,
     legs: HashMap<PublicIdentity, Leg>,
+    /// Keys of legs to participants who left, kept for the rest of the
+    /// call: a leg's keys come only from the call and the two devices, so
+    /// a leg built again for one who rejoins must carry on from where its
+    /// sequence numbers and replay window stood. Starting afresh reused
+    /// every nonce and let old packets in again.
+    retired: HashMap<PublicIdentity, MediaKeys>,
     /// Who each participant says it has sessions with.
     links: HashMap<PublicIdentity, Vec<PublicIdentity>>,
     /// Our own links as we last told the others.
@@ -208,6 +214,7 @@ impl Node {
             },
             base: Zeroizing::new(base),
             legs: HashMap::new(),
+            retired: HashMap::new(),
             links: HashMap::new(),
             told: Vec::new(),
             rang_ms: 0,
@@ -250,6 +257,7 @@ impl Node {
             },
             base: Zeroizing::new(base),
             legs: HashMap::new(),
+            retired: HashMap::new(),
             links: HashMap::new(),
             told: Vec::new(),
             rang_ms: now_ms(),
@@ -352,7 +360,9 @@ impl Node {
             return;
         }
         c.info.participants.retain(|(p, _)| *p != device);
-        c.legs.remove(&device);
+        if let Some(leg) = c.legs.remove(&device) {
+            c.retired.insert(device, leg.keys);
+        }
         c.links.remove(&device);
         let group = c.info.group;
         // Nobody left to ring with: it stops ringing here.
@@ -642,7 +652,9 @@ impl Node {
 }
 
 fn add_leg(c: &mut GroupCall, me: &PublicIdentity, peer: PublicIdentity) {
-    let keys = MediaKeys::for_leg(&c.base, c.info.call, me.as_bytes(), peer.as_bytes());
+    let keys = c.retired.remove(&peer).unwrap_or_else(|| {
+        MediaKeys::for_leg(&c.base, c.info.call, me.as_bytes(), peer.as_bytes())
+    });
     let (tx, rx) = mpsc::channel(MEDIA_QUEUE);
     c.legs.insert(
         peer,

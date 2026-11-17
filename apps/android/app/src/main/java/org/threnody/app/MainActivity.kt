@@ -949,155 +949,132 @@ class MainActivity : Activity() {
             .putExtra(ChatActivity.JUMP_QUERY, query)
     }
 
+    /** The main menu: the few things people look for, then Settings. */
     private fun more(anchor: View) {
-        val popup = PopupMenu(this, anchor)
-        val menu = popup.menu
-
-        // Account & Identity
-        val accountSection = menu.addSubMenu("Account & Identity")
-        accountSection.add("Devices").setOnMenuItemClickListener { devices(); true }
-        accountSection.add("Your profile").setOnMenuItemClickListener {
-            node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile") }
-            true
-        }
-        accountSection.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
-        accountSection.add("Credentials").setOnMenuItemClickListener {
-            node?.let { CredentialUi.list(this@MainActivity, it) }
-            true
-        }
-        accountSection.add("Link a new device").setOnMenuItemClickListener { linkDevice(); true }
-        accountSection.add("Join another device's account").setOnMenuItemClickListener { joinAccount(null); true }
-        accountSection.add("Back up…").setOnMenuItemClickListener {
-            node?.let { BackupUi.backUp(this@MainActivity, it) }
-            true
-        }
-        accountSection.add("Restore from a backup…").setOnMenuItemClickListener {
-            node?.let { BackupUi.restore(this@MainActivity, it) }
-            true
-        }
-
-        // Privacy & Security
-        val privacySection = menu.addSubMenu("Privacy & Security")
-        fun toggle(title: String, on: Boolean, set: (Boolean) -> Unit, says: (Boolean) -> String) =
-            privacySection.add(title).apply {
-                isCheckable = true
-                isChecked = on
-                setOnMenuItemClickListener {
-                    set(!on)
-                    Toast.makeText(this@MainActivity, says(!on), Toast.LENGTH_LONG).show()
-                    true
-                }
-            }
-        toggle("Cover traffic", Privacy.coverTraffic(this@MainActivity),
-            { Privacy.setCoverTraffic(this@MainActivity, it) }) {
-            if (it) "Cover traffic on: traffic no longer shows when you send"
-            else "Cover traffic off: an observer can see when messages are sent"
-        }
-        toggle("Hide when I send", Privacy.paceMessages(this@MainActivity),
-            { Privacy.setPaceMessages(this@MainActivity, it) }) {
-            if (it) "Messages wait for the next cover-traffic beat (up to 2 s on Wi-Fi, 10 s on mobile data), so sending looks like idling"
-            else "Messages go at once and arrive faster, but an observer can see when you send"
-        }
-        toggle("Onion routing first", Privacy.onionFirst(this@MainActivity),
-            { Privacy.setOnionFirst(this@MainActivity, it) }) {
-            if (it) "Contacts are reached through onion circuits when possible"
-            else "Contacts are dialed directly: the network sees who you talk to"
-        }
-        toggle("Remove photo metadata", Privacy.stripMetadata(this@MainActivity),
-            { Privacy.setStripMetadata(this@MainActivity, it) }) {
-            if (it) "Photos are sent without location, camera or time details"
-            else "Photos are sent with their metadata, which can include where they were taken"
-        }
-        toggle("Get photos from my other devices automatically", Privacy.autoFetchFiles(this@MainActivity),
-            { Privacy.setAutoFetchFiles(this@MainActivity, it) }) {
-            if (it) "Photos, voice and video messages up to 30 days old, on Wi-Fi. Sensitive and disappearing ones only when you tap them."
-            else "Files from your other devices download only when you tap them"
-        }
-        toggle("Private notifications", Privacy.privateNotifications(this@MainActivity),
-            { Privacy.setPrivateNotifications(this@MainActivity, it) }) {
-            if (it) "Notifications say only \u201cNew message\u201d, without sender or text"
-            else "Notifications show who wrote and what they said, where other apps and watches can read them"
-        }
-        toggle("Screen security", Privacy.screenSecurity(this@MainActivity),
-            { Privacy.setScreenSecurity(this@MainActivity, it) }) {
-            if (it) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed"
-        }
-        privacySection.add("Wake up with UnifiedPush (no permanent notification)").apply {
-            isCheckable = true
-            isChecked = Push.enabled(this@MainActivity)
-            setOnMenuItemClickListener { togglePush(); true }
-        }
-        privacySection.add("App lock…").setOnMenuItemClickListener { AppLockUi.show(this@MainActivity); true }
-        if (AppLock.enabled(this@MainActivity)) {
-            privacySection.add("Lock now").setOnMenuItemClickListener { AppLock.lockNow(this@MainActivity); true }
-        }
-        privacySection.add("Erase all Threnody data…").setOnMenuItemClickListener {
-            AppLockUi.eraseAll(this@MainActivity)
-            true
-        }
-
-        // Network & Connectivity
-        val networkSection = menu.addSubMenu("Network & Connectivity")
-        if (!Push.active(this@MainActivity)) {
-            networkSection.add("Stay reachable when closed…").apply {
-                isCheckable = true
-                isChecked = Reachable.unrestricted(this@MainActivity)
-                setOnMenuItemClickListener { Reachable.request(this@MainActivity); true }
-            }
-        }
-        toggle("Reach contacts over the internet", Privacy.reachInternet(this@MainActivity),
-            { Privacy.setReachInternet(this@MainActivity, it) }) {
-            if (it) "Contacts can be reached on mobile data and other networks. " +
-                "Strangers in the public DHT see this phone's IP address, not who you talk to"
-            else "Contacts are reached only nearby, through relays, or at addresses you dial"
-        }
-        toggle("Route through volunteer relays", Privacy.useVolunteers(this@MainActivity),
-            { Privacy.setUseVolunteers(this@MainActivity, it) }) {
-            if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
-            else "Only your own contacts relay for you"
-        }
-        networkSection.add("Your handle").setOnMenuItemClickListener { node?.let { Handles.show(this@MainActivity, it) }; true }
-        networkSection.add("Reset invite links").setOnMenuItemClickListener { resetInvites(); true }
-        networkSection.add("Always-on relay").setOnMenuItemClickListener { alwaysOnRelay(); true }
-        networkSection.add("WireGuard tunnels").apply {
-            isCheckable = true
-            isChecked = Privacy.tunnels(this@MainActivity)
-            setOnMenuItemClickListener {
-                node?.let { n ->
-                    if (Privacy.tunnels(this@MainActivity)) Tunnels.disable(this@MainActivity, n)
-                    else Tunnels.enable(this@MainActivity, n)
-                }
+        PopupMenu(this, anchor).apply {
+            menu.add("Your profile").setOnMenuItemClickListener {
+                node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile") }
                 true
             }
+            menu.add("Devices").setOnMenuItemClickListener { devices(); true }
+            menu.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
+            if (AppLock.enabled(this@MainActivity)) {
+                menu.add("Lock now").setOnMenuItemClickListener { AppLock.lockNow(this@MainActivity); true }
+            }
+            menu.add("Settings").setOnMenuItemClickListener { settings(); true }
+            show()
         }
-        networkSection.add("Relay directories").setOnMenuItemClickListener { DirectoryUi.show(this@MainActivity); true }
+    }
 
-        // Messaging
-        val messagingSection = menu.addSubMenu("Messaging")
-        toggle("Send read receipts", Privacy.sendReadReceipts(this@MainActivity),
-            { Privacy.setSendReadReceipts(this@MainActivity, it) }) {
-            if (it) "When you open a chat, the sender learns you've displayed their messages"
-            else "The sender won't know when you've read their messages"
-        }
-        toggle("Send typing indicators", Privacy.sendTyping(this@MainActivity),
-            { Privacy.setSendTyping(this@MainActivity, it) }) {
-            if (it) "Contacts see “…” while you write to them"
-            else "Contacts don't see when you're typing"
-        }
-        toggle("GIF search with GIPHY", Privacy.giphy(this@MainActivity),
-            { Privacy.setGiphy(this@MainActivity, it) }) {
-            if (it) "GIF search on: GIPHY sees your searches and this phone's IP address"
-            else "GIF search off: the GIF button offers only GIFs on this phone"
-        }
-        messagingSection.add("Default disappearing timer").setOnMenuItemClickListener { defaultTimer(); true }
+    /**
+     * Every setting on one page, in sections, each switch saying what its
+     * state means. These used to be five submenus of the main menu, with
+     * the meaning shown in a toast only after the change.
+     */
+    private fun settings() {
+        val ctx = this@MainActivity
+        SettingsPage(this, "Settings").apply {
+            section("Privacy")
+            toggle("Cover traffic", { Privacy.coverTraffic(ctx) }, {
+                if (it) "Traffic doesn't show when you send. Costs data: about 110 MB a day per contact on mobile data"
+                else "An observer can see when messages are sent"
+            }) { Privacy.setCoverTraffic(ctx, it) }
+            toggle("Hide when I send", { Privacy.paceMessages(ctx) }, {
+                if (it) "Messages wait for the next cover-traffic beat (up to 2 s on Wi-Fi, 10 s on mobile data), so sending looks like idling"
+                else "Messages go at once and arrive faster, but an observer can see when you send"
+            }) { Privacy.setPaceMessages(ctx, it) }
+            toggle("Onion routing first", { Privacy.onionFirst(ctx) }, {
+                if (it) "Contacts are reached through onion circuits when possible"
+                else "Contacts are dialed directly: the network sees who you talk to"
+            }) { Privacy.setOnionFirst(ctx, it) }
+            toggle("Remove photo metadata", { Privacy.stripMetadata(ctx) }, {
+                if (it) "Photos are sent without location, camera or time details"
+                else "Photos are sent with their metadata, which can include where they were taken"
+            }) { Privacy.setStripMetadata(ctx, it) }
+            toggle("Private notifications", { Privacy.privateNotifications(ctx) }, {
+                if (it) "Notifications say only \u201cNew message\u201d, without sender or text"
+                else "Notifications show who wrote and what they said, where other apps and watches can read them"
+            }) { Privacy.setPrivateNotifications(ctx, it) }
 
-        // Advanced
-        val advancedSection = menu.addSubMenu("Advanced")
-        advancedSection.add("Diagnostics").setOnMenuItemClickListener {
-            startActivity(Intent(this@MainActivity, LogActivity::class.java)); true
-        }
+            section("Messages")
+            toggle("Send read receipts", { Privacy.sendReadReceipts(ctx) }, {
+                if (it) "When you open a chat, the sender learns you've displayed their messages"
+                else "The sender won't know when you've read their messages"
+            }) { Privacy.setSendReadReceipts(ctx, it) }
+            toggle("Send typing indicators", { Privacy.sendTyping(ctx) }, {
+                if (it) "Contacts see \u201c\u2026\u201d while you write to them"
+                else "Contacts don't see when you're typing"
+            }) { Privacy.setSendTyping(ctx, it) }
+            link("Default disappearing timer", "For new chats") { defaultTimer() }
+            toggle("GIF search with GIPHY", { Privacy.giphy(ctx) }, {
+                if (it) "GIPHY sees your searches and this phone's IP address"
+                else "The GIF button offers only GIFs on this phone"
+            }) { Privacy.setGiphy(ctx, it) }
+            toggle("Get photos from my other devices", { Privacy.autoFetchFiles(ctx) }, {
+                if (it) "Photos, voice and video messages up to 30 days old, on Wi-Fi. Sensitive and disappearing ones only when you tap them"
+                else "Files from your other devices download only when you tap them"
+            }) { Privacy.setAutoFetchFiles(ctx, it) }
 
-        popup.show()
+            section("Security")
+            link("App lock", if (AppLock.enabled(ctx)) "On" else "Off") { AppLockUi.show(ctx) }
+            toggle("Screen security", { Privacy.screenSecurity(ctx) }, {
+                if (it) "Screenshots blocked; hidden in recent apps" else "Screenshots allowed"
+            }) { Privacy.setScreenSecurity(ctx, it) }
+            link("Credentials", "Attributes others vouched for, to prove without revealing the rest") {
+                node?.let { CredentialUi.list(ctx, it) }
+            }
+
+            section("Connections")
+            toggle("Reach contacts over the internet", { Privacy.reachInternet(ctx) }, {
+                if (it) "Works on mobile data and other networks. Strangers in the public DHT see this phone's IP address, not who you talk to"
+                else "Contacts are reached only nearby, through relays, or at addresses you dial"
+            }) { Privacy.setReachInternet(ctx, it) }
+            toggle("Route through volunteer relays", { Privacy.useVolunteers(ctx) }, {
+                if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
+                else "Only your own contacts relay for you"
+            }) { Privacy.setUseVolunteers(ctx, it) }
+            toggle("I'm behind a VPN", { Privacy.meetingPoint(ctx) }, {
+                if (it) "Keeps a meeting point at a volunteer relay, so contacts reach you whatever NAT either of you is behind. " +
+                    "The relay sees this phone's address, not who you talk to"
+                else "A meeting point opens only when this network looks like it needs one"
+            }) { Privacy.setMeetingPoint(ctx, it) }
+            link("Relay directories", "Volunteer relays for circuits and meeting points") { DirectoryUi.show(ctx) }
+            link("Always-on relay", "A contact that keeps you reachable when you move") { alwaysOnRelay() }
+            toggle("WireGuard tunnels", { Privacy.tunnels(ctx) }, {
+                if (it) "Approved contacts get private network tunnels to this phone"
+                else "No tunnels"
+            }) {
+                node?.let { n -> if (it) Tunnels.enable(ctx, n) else Tunnels.disable(ctx, n) }
+            }
+            toggle("Wake up with UnifiedPush", { Push.enabled(ctx) }, {
+                if (it) "A push distributor wakes Threnody; no permanent notification"
+                else "Threnody keeps a notification to stay running"
+            }) { togglePush() }
+            if (!Push.active(ctx)) {
+                toggle("Stay reachable when closed", { Reachable.unrestricted(ctx) }, {
+                    if (it) "Battery optimisation is off for Threnody, so contacts reach you while it's closed"
+                    else "Android may stop Threnody in the background; messages arrive when you open it"
+                }) { Reachable.request(ctx) }
+            }
+
+            section("Invites")
+            link("Your handle", "A short name people can type to find you") {
+                node?.let { Handles.show(ctx, it) }
+            }
+            link("Reset invite links", "Links you shared before stop finding you once you move") { resetInvites() }
+
+            section("Devices and backup")
+            link("Link a new device") { linkDevice() }
+            link("Join another device's account") { joinAccount(null) }
+            link("Back up\u2026") { node?.let { BackupUi.backUp(ctx, it) } }
+            link("Restore from a backup\u2026") { node?.let { BackupUi.restore(ctx, it) } }
+
+            section("Advanced")
+            link("Diagnostics", "Addresses, NAT type and the connection log") {
+                startActivity(Intent(ctx, LogActivity::class.java))
+            }
+            link("Erase all Threnody data\u2026", danger = true) { AppLockUi.eraseAll(ctx) }
+        }.show()
     }
 
     private fun openChat(key: String, device: String, persona: String? = null, jump: HistoryEntry? = null, query: String? = null) {
@@ -1159,19 +1136,36 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** An anonymous identity's invite, on its own port. */
+    /**
+     * An anonymous identity's invite. It carries no address (that would be
+     * this phone's, the same as your own invites show): it names the
+     * identity's meeting point at a volunteer relay, which can take a few
+     * seconds to open the first time.
+     */
     private fun personaInvite(id: String) {
         val p = Threnody.personaNode(id) ?: return
-        val addr = Threnody.inviteAddr(this, Threnody.personaPort(this, id).toString())
-        // Anonymous identities never use the DHT: an address is all there is.
-        if (addr.isEmpty()) return failed("No network: connect to Wi-Fi to make an invite.")
-        val link = p.inviteLink(addr)
-        showCode(
-            "Anonymous invite · ${Threnody.personaLabels[id] ?: ""}",
-            "Whoever uses this reaches your anonymous identity, not you. It works while this phone is on this network.",
-            link,
-            "Anonymous identity ${p.deviceFingerprint()}",
-        )
+        Toast.makeText(this, "Getting its invite ready\u2026", Toast.LENGTH_SHORT).show()
+        Threading.background {
+            val ready = p.waitMeetingPoint(15_000uL)
+            val link = if (ready) p.inviteLink("") else null
+            runOnUiThread {
+                if (link == null) {
+                    failed(
+                        "This anonymous identity can't be reached yet: it needs a volunteer relay " +
+                            "to meet people at. Subscribe to a relay directory in Settings \u2192 " +
+                            "Relay directories, then try again.",
+                    )
+                    return@runOnUiThread
+                }
+                showCode(
+                    "Anonymous invite \u00b7 ${Threnody.personaLabels[id] ?: ""}",
+                    "Whoever uses this reaches your anonymous identity, not you, through a volunteer relay. " +
+                        "It doesn't show where this phone is.",
+                    link,
+                    "Anonymous identity ${p.deviceFingerprint()}",
+                )
+            }
+        }
     }
 
     /** The anonymous identities, each with its invite, profile, rename and burn. */
@@ -1781,7 +1775,23 @@ class MainActivity : Activity() {
         val n = node ?: return
         val handle = !target.contains("://") && Regex("^@?[A-Za-z0-9_.]+[- ]").containsMatchIn(target) &&
             target.count { it.isLetterOrDigit() } >= 9 && !target.contains(':')
-        Toast.makeText(this, if (handle) "Looking for $target… (up to two minutes)" else "Connecting…", Toast.LENGTH_SHORT).show()
+        // Finding someone can take a while (their app may be in the
+        // background): say what is going on rather than a two-second toast.
+        val status = label(connectStage(0, handle), maxLines = 4)
+        val dialog = SecureBuilder(this)
+            .setTitle(if (handle) "Looking for $target" else "Connecting")
+            .setView(padded(status))
+            .setNegativeButton("Hide") { _, _ -> }
+            .show()
+        val started = android.os.SystemClock.elapsedRealtime()
+        val ticker = object : Runnable {
+            override fun run() {
+                if (!dialog.isShowing) return
+                status.text = connectStage(android.os.SystemClock.elapsedRealtime() - started, handle)
+                status.postDelayed(this, 1000)
+            }
+        }
+        status.postDelayed(ticker, 1000)
         Threading.background {
             try {
                 if (expect) n.expectContact(target, null)
@@ -1790,11 +1800,26 @@ class MainActivity : Activity() {
                     try { n.setName(peer, name) } catch (e: Exception) { Threnody.say("! naming a contact: ${e.message}") }
                 }
                 val key = Threnody.key(n.contacts(), peer)
-                runOnUiThread { openChat(key, peer) }
+                runOnUiThread {
+                    dialog.dismiss()
+                    openChat(key, peer)
+                }
             } catch (e: Exception) {
-                runOnUiThread { failed("Couldn't connect: ${e.message}") }
+                runOnUiThread {
+                    dialog.dismiss()
+                    failed("Couldn't connect: ${e.message}")
+                }
             }
         }
+    }
+
+    /** What connecting to someone is likely doing `ms` in. */
+    private fun connectStage(ms: Long, handle: Boolean): String = when {
+        ms < 4_000 && !handle -> "Trying the addresses in the link\u2026"
+        ms < 12_000 -> "Looking them up\u2026"
+        ms < 45_000 -> "Waiting for them to answer. They need Threnody open, or opened in the last few minutes."
+        else -> "Still trying, through relays if need be. This can take up to two minutes; " +
+            "you can hide this and their chat opens when they answer."
     }
 
     private fun joinAccount(prefill: String?) {

@@ -131,7 +131,7 @@ For each phone that should use the relay (yours, your partner's, any other devic
 
 ## 5. Use it on the phones
 
-On each phone, open Settings › Network & Connectivity › **Always-on relay** and choose the relay contact. On the Linux app it's Settings › **Always-on relay**. The device then keeps a session with the relay at all times, in the background too, and redials it within seconds when the network changes. Calls and messages go through it whenever no direct path opens, and a call that starts through it moves to a direct path if the two devices can open one.
+On each phone, open Settings › Connections › **Always-on relay** and choose the relay contact. On the Linux app it's Settings › **Always-on relay**. The device then keeps a session with the relay at all times, in the background too, and redials it within seconds when the network changes. Calls and messages go through it whenever no direct path opens, and a call that starts through it moves to a direct path if the two devices can open one.
 
 The setting's title says whether the relay is connected right now. On the server, `tctl /peers` lists every device that is.
 

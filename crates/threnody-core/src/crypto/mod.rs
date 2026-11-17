@@ -26,3 +26,10 @@ pub fn random_bytes_vec(n: usize) -> Vec<u8> {
     UnwrapErr(SysRng).fill_bytes(&mut b);
     b
 }
+
+/// Whether `a` and `b` are equal, in time that depends only on their
+/// lengths: for tags and proofs an attacker may try many guesses of,
+/// choosing the other inputs (a nonce, say) itself.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}

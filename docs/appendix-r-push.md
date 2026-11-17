@@ -120,14 +120,14 @@ Compared with the always-on connection, push trades metadata for battery. The tr
 Weighing it:
 
 - **The push server can map contacts' IP addresses.** This is the main cost. A contact's IP address is not its identity, but the two are often linkable (a home connection, a fixed server). Users who care should run their own push server (ntfy is a single binary) or use one they trust, and keep push off when that's not possible. Routing wake-ups through onion circuits would hide the contacts' addresses, but Threnody circuits end at Threnody nodes, not at web servers. That is listed under *Not yet done*.
-- **Timing correlation.** Someone who sees both a sender's traffic and the push server's logs can match a message to a wake-up, within the jitter. Cover wake-ups and jitter make this a statistical attack over many messages, not a certainty for one. Constant-rate cover traffic, the default, defeats it completely, which is why push is opt-in.
+- **Timing correlation.** Someone who sees both a sender's traffic and the push server's logs can match a message to a wake-up, within the jitter. Cover wake-ups and jitter make this a statistical attack over many messages, not a certainty for one. Constant-rate cover traffic, the default, hides the sender's side of a live session, but not a send to a contact with no session: that one starts DHT lookups (Appendix N, *Seeking*) and, with push, a wake-up, both visible on the sender's network within a minute or so of the send. This is why push is opt-in.
 - **Reachability.** A sleeping phone depends on its contacts being up when it wakes. A message whose holder goes offline before the phone wakes waits until both are up again. The always-on connection has no such gap.
 
 The project rule holds: the always-on connection, with cover traffic, stays the default. Push is a setting the user turns on, explained where it is turned on.
 
 ## Android
 
-- The setting *Wake up with UnifiedPush (no permanent notification)* under Privacy & Security is off by default. Turning it on explains the trade above, then asks the UnifiedPush connector library (`org.unifiedpush.android:connector`) for the user's default distributor. With none installed, it says so and stays off.
+- The setting *Wake up with UnifiedPush* under Settings → Connections is off by default. Turning it on explains the trade above, then asks the UnifiedPush connector library (`org.unifiedpush.android:connector`) for the user's default distributor. With none installed, it says so and stays off.
 - With an endpoint, the app stops its foreground service a minute after it goes to the background (not during a call), then shuts its nodes down and ends its process. Nothing runs until the next wake-up or until the user opens the app.
 - On a wake-up, the connector's `PushService` starts the foreground service in wake mode (a brief "Checking for messages" notification). That brings the nodes up, runs `wake_sync`, and sleeps again if the app is still in the background.
 - Turning the setting off unregisters the endpoint, withdraws it from contacts, and brings back the always-on service.

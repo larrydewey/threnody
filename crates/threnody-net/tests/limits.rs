@@ -367,3 +367,27 @@ async fn linking_a_device_gets_past_a_full_strangers_limit() {
     );
     assert!(has(&laptop, &phone), "the linked device stays");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_identities_cannot_grow_the_contact_book_without_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bob, _brx) = node(&dir, "bob");
+    let addr = bob.listen("127.0.0.1:0").await.unwrap();
+    let n = threnody_net::MAX_REQUESTS + 20;
+    for _ in 0..n {
+        let me = threnody_core::Identity::generate();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let _chan = threnody_net::handshake::initiate(&mut s, &me, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(s);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let count = bob.contacts().iter().count();
+    assert!(
+        count <= threnody_net::MAX_REQUESTS,
+        "{count} contacts kept from {n} strangers"
+    );
+    bob.shutdown();
+}

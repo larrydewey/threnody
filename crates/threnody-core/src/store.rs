@@ -6,7 +6,7 @@
 //! Platform keystores (Secure Enclave, StrongBox, TPM) plug in here later.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -434,35 +434,30 @@ pub fn secure_delete(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Overwrite with random data (3 passes)
-    for _ in 0..3 {
-        let random_bytes: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+    // Overwrite in place, three random passes and one of zeros. Opening
+    // with truncate (as before 1.0.1) let the filesystem free the old
+    // blocks first, so the passes went to new ones and never touched the
+    // data. Even in place, copy-on-write filesystems and flash wear
+    // levelling may keep old blocks; what this deletes was written sealed
+    // where it mattered, and this is a second line.
+    let mut f = fs::OpenOptions::new().write(true).open(path)?;
+    for pass in 0..4 {
+        f.seek(std::io::SeekFrom::Start(0))?;
+        let mut left = size;
+        let mut chunk = vec![0u8; size.min(64 * 1024)];
+        while left > 0 {
+            let n = left.min(chunk.len());
+            if pass < 3 {
+                chunk[..n].copy_from_slice(&crate::crypto::random_bytes_vec(n));
+            } else {
+                chunk[..n].fill(0);
+            }
+            f.write_all(&chunk[..n])?;
+            left -= n;
         }
-        let mut f = opts.open(path)?;
-        f.write_all(&random_bytes)?;
         f.sync_all()?;
     }
-
-    // Final pass with zeros
-    let zeros = vec![0u8; size];
-    {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(path)?;
-        f.write_all(&zeros)?;
-        f.sync_all()?;
-    }
+    drop(f);
 
     fs::remove_file(path)?;
     Ok(())

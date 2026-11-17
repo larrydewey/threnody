@@ -194,6 +194,8 @@ impl RelayState {
         let searching = self.opening.get(&from).copied().unwrap_or(0);
         let ok = self.circuits_with(&from) + searching < MAX_CIRCUITS_PER_PEER
             && !self.hops.contains_key(&(from, circ))
+            // An id we gave `from` for an OPEN of ours still waiting.
+            && !self.pending.contains_key(&(from, circ))
             && self.first_sighting(nonce);
         if ok {
             *self.opening.entry(from).or_default() += 1;
@@ -453,12 +455,12 @@ impl Node {
             let mut stream = theirs;
             let result = async {
                 let chan = handshake::accept(&mut stream, node.identity_ref()).await?;
-                node.check_policy(chan.peer())?;
-                Ok::<_, NetError>(chan)
+                let pass = node.admit_via(chan.peer(), &from)?;
+                Ok::<_, NetError>((chan, pass))
             }
             .await;
             match result {
-                Ok(chan) => node.spawn_relayed_session(stream, chan, from, false),
+                Ok((chan, pass)) => node.spawn_relayed_session(stream, chan, from, false, pass),
                 Err(e) => {
                     node.close_circuit(from, circ);
                     node.emit_rejected_relay(from, e.to_string());
@@ -508,7 +510,7 @@ impl Node {
             }
         };
         let peer = *chan.peer();
-        self.spawn_relayed_session(stream, chan, via, true);
+        self.spawn_relayed_session(stream, chan, via, true, None);
         Ok(peer)
     }
 

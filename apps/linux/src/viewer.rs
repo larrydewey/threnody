@@ -30,32 +30,125 @@ pub struct Decoded {
     pub bytes: glib::Bytes,
 }
 
-/// Width and height of the picture in `path`, refusing what can't be
-/// read and anything over [`MAX_PIXELS`]: only its header is read.
-pub fn checked_size(path: &Path) -> Result<(i32, i32), String> {
-    let (_, w, h) = Pixbuf::file_info(path).ok_or("not a picture this computer can read")?;
+const UNREADABLE: &str = "not a picture this computer can read";
+
+fn check_pixels(w: i32, h: i32) -> Result<(i32, i32), String> {
     if w <= 0 || h <= 0 || i64::from(w) * i64::from(h) > MAX_PIXELS {
         return Err("too large a picture".into());
     }
     Ok((w, h))
 }
 
+/// Width and height of the picture in `path`, refusing what can't be
+/// read and anything over [`MAX_PIXELS`]: only its header is read (of a
+/// sealed photo, once decrypted in memory).
+pub fn checked_size(path: &Path) -> Result<(i32, i32), String> {
+    if crate::core::is_sealed(path) {
+        let data = crate::core::read_media(path).map_err(|e| e.to_string())?;
+        return checked_size_of(&data);
+    }
+    let (_, w, h) = Pixbuf::file_info(path).ok_or(UNREADABLE)?;
+    check_pixels(w, h)
+}
+
+/// As [`checked_size`], for a picture in memory: fed to a loader only
+/// until its size is known.
+pub fn checked_size_of(data: &[u8]) -> Result<(i32, i32), String> {
+    let loader = gdk::gdk_pixbuf::PixbufLoader::new();
+    let size = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = size.clone();
+    loader.connect_size_prepared(move |l, w, h| {
+        if let Ok(mut s) = s.lock() {
+            *s = Some((w, h));
+        }
+        // Nothing is decoded at full size, whatever it claims.
+        l.set_size(1, 1);
+    });
+    let known = || size.lock().ok().and_then(|s| *s);
+    for piece in data.chunks(4096) {
+        if known().is_some() || loader.write(piece).is_err() {
+            break;
+        }
+    }
+    let _ = loader.close();
+    let (w, h) = known().ok_or(UNREADABLE)?;
+    check_pixels(w, h)
+}
+
 /// Decodes `path` no larger than `max_side` on its long side, upright
-/// (embedded orientation applied); refuses more than [`MAX_PIXELS`].
+/// (embedded orientation applied); refuses more than [`MAX_PIXELS`]. A
+/// sealed photo is decrypted in memory, never to a file.
 /// Blocking: run it on a worker thread (`ui::bg`).
 pub fn load_bounded(path: &Path, max_side: i32) -> Result<Decoded, String> {
+    if crate::core::is_sealed(path) {
+        let data = crate::core::read_media(path).map_err(|e| e.to_string())?;
+        return load_bounded_from(data, max_side);
+    }
     let (w, h) = checked_size(path)?;
     let max_side = max_side.max(1);
     let pixbuf = Pixbuf::from_file_at_scale(path, max_side.min(w), max_side.min(h), true)
         .map_err(|e| e.message().to_owned())?;
+    Ok(decoded(pixbuf))
+}
+
+/// As [`load_bounded`], for a picture in memory.
+pub fn load_bounded_from(data: Vec<u8>, max_side: i32) -> Result<Decoded, String> {
+    let (w, h) = checked_size_of(&data)?;
+    let max_side = max_side.max(1);
+    let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(data));
+    let pixbuf = Pixbuf::from_stream_at_scale(
+        &stream,
+        max_side.min(w),
+        max_side.min(h),
+        true,
+        gio::Cancellable::NONE,
+    )
+    .map_err(|e| e.message().to_owned())?;
+    Ok(decoded(pixbuf))
+}
+
+/// What a GIF at `path` holds (decrypted if sealed), if it is a picture
+/// of a reasonable size. Blocking.
+pub fn gif_bytes(path: &Path) -> Result<glib::Bytes, String> {
+    let data = crate::core::read_media(path).map_err(|e| e.to_string())?;
+    checked_size_of(&data)?;
+    Ok(glib::Bytes::from_owned(data))
+}
+
+/// Shows the GIF at `path` in `pic`, animated, read off the main thread
+/// (GTK decodes it at full size: only once its size is known to be
+/// reasonable). `failed` runs if it can't be shown.
+pub fn show_gif(pic: &gtk::Picture, path: &Path, failed: impl FnOnce() + 'static) {
+    let p = path.to_owned();
+    let weak = pic.downgrade();
+    ui::bg(
+        move || gif_bytes(&p),
+        move |r| {
+            let Some(pic) = weak.upgrade() else { return };
+            let shown = r.and_then(|b| {
+                let t = gdk::Texture::from_bytes(&b).map_err(|e| e.to_string())?;
+                Ok((b, t))
+            });
+            match shown {
+                Ok((b, t)) => {
+                    pic.set_paintable(Some(&t));
+                    ui::animate(&pic, &b);
+                }
+                Err(_) => failed(),
+            }
+        },
+    );
+}
+
+fn decoded(pixbuf: Pixbuf) -> Decoded {
     let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
-    Ok(Decoded {
+    Decoded {
         width: pixbuf.width(),
         height: pixbuf.height(),
         stride: usize::try_from(pixbuf.rowstride()).unwrap_or(0),
         has_alpha: pixbuf.has_alpha(),
         bytes: pixbuf.read_pixel_bytes(),
-    })
+    }
 }
 
 impl Decoded {
@@ -575,6 +668,8 @@ pub fn show(app: &Rc<App>, persona: Option<String>, photo: Photo, send_edited: O
         }
     });
     actions.add_action(&save);
+    // A sealed photo goes to the other app as a decrypted copy, deleted
+    // on lock and at exit (`ui::open_externally`).
     let open = gio::SimpleAction::new("open", None);
     let (weak, p, t) = (Rc::downgrade(app), photo.path.clone(), toasts.clone());
     open.connect_activate(move |_, _| {
@@ -615,15 +710,7 @@ pub fn show(app: &Rc<App>, persona: Option<String>, photo: Photo, send_edited: O
         }
     };
     if gif {
-        // GTK decodes it here, at full size: only once its size is known
-        // to be reasonable.
-        if checked_size(&photo.path).is_err() {
-            failed();
-            return;
-        }
-        let file = gtk::Picture::for_filename(&photo.path);
-        pic.set_paintable(file.paintable().as_ref());
-        ui::animate(&pic, &photo.path);
+        show_gif(&pic, &photo.path, failed);
         return;
     }
     let side = screen_side(&app.window);
@@ -669,7 +756,7 @@ fn save_copy_then(
                 return;
             };
             ui::bg(
-                move || std::fs::copy(&from, &to).map(|_| ()),
+                move || crate::core::save_plain(&from, &to),
                 move |r| {
                     done(Some(match r {
                         Ok(()) => "Saved".to_owned(),
@@ -865,6 +952,25 @@ pub(crate) mod tests {
         std::fs::write(&path, fake_png(20_000, 20_000)).unwrap();
         assert!(load_bounded(&path, 200).is_err());
         assert!(checked_size(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sealed photos decode from memory as files do, bounded the same.
+    #[test]
+    fn pictures_in_memory_are_bounded_too() {
+        let dir = temp_dir("memory");
+        let path = dir.join("a.png");
+        let p = Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, 400, 300).unwrap();
+        p.fill(0x2040_60ff);
+        p.savev(&path, "png", &[]).unwrap();
+        let png = std::fs::read(&path).unwrap();
+        assert_eq!(checked_size_of(&png), Ok((400, 300)));
+        let d = load_bounded_from(png, 200).unwrap();
+        assert_eq!((d.width, d.height), (200, 150));
+        let bomb = fake_png(20_000, 20_000);
+        assert!(checked_size_of(&bomb).is_err());
+        assert!(load_bounded_from(bomb, 200).is_err());
+        assert!(checked_size_of(b"not a picture at all").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

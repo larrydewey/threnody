@@ -29,7 +29,7 @@ code   = Crockford Base32 of the first 40 bits of
 
 `id` is the owner's 32-byte identity key and `version` a counter the owner raises to get a new code. Parsing ignores case, spaces, a leading `@` and the dash inside the code, and folds the usual Crockford confusables (O→0, I/L→1). Names have no dashes, so the code is whatever follows the first one.
 
-The code binds the handle to its owner's key. Making up a key whose code matches someone else's handle takes about 2^40 Argon2id runs, thousands of CPU-years at these parameters. A finder checks the code against the key in the record before connecting, and the session's handshake then proves the key. Safety numbers (Section 5) remain the way to be sure.
+The code binds the handle to its owner's key. Making up a key whose code matches someone else's handle takes about 2^40 Argon2id runs: about 7,000 CPU-years at these parameters, which rented hardware does for something like $100,000 to $1,000,000, and the attacker may try every `version` for free. That is out of reach of most, but not of a well-funded attacker after one particular handle. A finder checks the code against the key in the record before connecting, and the session's handshake then proves the key. Safety numbers (Section 5) remain the way to be sure.
 
 ## Records in the DHT
 
@@ -42,7 +42,8 @@ record:     seed, salt, enc_key = KDF("… handle signing key" | "… salt" | "�
 knock slot: seed, salt, enc_key = KDF(…, base, epoch, "knock", slot)      slot in 0..4
 probe key  = KDF("… handle probe key", base)
 value      = nonce (24) || XChaCha20-Poly1305(enc_key, nonce, pad(payload, 448), aad)
-Record     = { 0: id bstr(32), 1: version uint, 2: Candidates bstr, ? 3: 1 }   aad "threnody handle record v1"
+Record     = { 0: id bstr(32), 1: version uint, 2: Candidates bstr, ? 3: 1, ? 4: sig bstr(64) }   aad "threnody handle record v1"
+sig        = Ed25519(owner, "threnody v1 2026-11-17 handle record signature" || dht_pub || salt || id || version_be64 || sealed_flag || len_be32(Candidates) || Candidates)
 Knock      = { 2: eph bstr(32), 3: sealed bstr }                               aad "threnody handle knock v1"
 sealed     = XChaCha20-Poly1305(k, nonce 0, { 0: id bstr(32), 1: Candidates bstr }, aad "threnody handle knock v1")
 k          = KDF("… handle knock seal", X25519(eph, owner), eph, owner)
@@ -54,9 +55,10 @@ old Knock  = { 0: id bstr(32), 1: Candidates bstr }
 **Knocks are sealed to the owner.** Everyone holding the handle has the knock slots' keys, and a knock says who is looking for the owner and where they are (their identity key and every address, LAN and public). So a finder seals its knock to the owner: `owner` is the owner's Ed25519 identity key as an X25519 key (the birational map), `eph` a fresh X25519 key. Only the owner opens it; others holding the handle see that a slot was written, not by whom. The owner's record says it opens sealed knocks with key `3`; to a record without it (an owner on an older version) the finder writes the old, readable knock, and owners still read those. Older finders ignore key `3`. X25519 is classical: an ML-KEM ciphertext doesn't fit BEP 44's 1,000 bytes beside the knock.
 
 - **Publishing.** The owner publishes its record when its addresses change, when the epoch changes, and otherwise every 30 minutes.
-- **Finding.** A finder reads the record for the current and previous epoch, checks the code, and dials the owner's addresses for five seconds. Public IPv6 addresses and mapped ports usually answer.
-- **Knocking.** If the dial fails, the finder writes a knock, with its own addresses, to a random slot and starts punching toward the owner (Appendix N, section 4) for two minutes.
-- **Answering.** The owner polls the four knock slots of the current and previous epoch at the rendezvous rates (every 20 s while the app is open, every 15 minutes in the background). It punches toward each fresh knock (under five minutes old) it hasn't acted on.
+- **Signed records.** From 1.0.1 the owner signs its record with its identity key, bound to the DHT key (`dht_pub`, which names the place and the hour) and salt the record is stored under. Everyone holding the handle or link can write a record there, and the code check only binds the `id` in it: before signatures, someone could re-seal the owner's real `id` with addresses of their own, and every finder sent its first packets, and so its address, there. A finder now takes the signed record of the two hours before an unsigned one, and treats an unsigned record (an older owner's, or a forgery) as giving no addresses: it knocks and waits for the owner to probe it.
+- **Finding.** A finder reads the record for the current and previous epoch and checks the code. It tries a hidden path first for up to 12 s (an onion circuit, or volunteer relays told only a public address from a signed record), then dials the signed record's addresses for up to five seconds. Public IPv6 addresses and mapped ports usually answer.
+- **Knocking.** While those dials run, the finder writes a knock, with its own addresses, to a random slot; if the dials fail it punches toward the owner (Appendix N, section 4) for two minutes. Knocking only after the dials failed added their five seconds to every meeting behind NAT.
+- **Answering.** The owner polls the four knock slots of the current and previous epoch at the rendezvous rates (every 20 s while the app is open, every 15 minutes in the background). For ten minutes after the owner shows an invite, sets a handle or adds a tapped contact, it polls every 3 s instead, in the background too: sharing a link usually means switching to another app, which used to drop polling to the background rate just when the finder knocked. It punches toward each fresh knock (under five minutes old) it hasn't acted on.
 - **Strangers get a share.** Anyone with the handle can knock, with any identity key and any addresses. So people met through a handle or invite get at most two of the four punch slots (Appendix N, section 4), leaving the rest for contacts, and a knock that can't be acted on yet stays new for the next poll. A stranger is probed only at public addresses, never a LAN, loopback or broadcast one, and dialed only at an address its probes came from: whoever wrote a knock or record may not be the one it names. Probe keys kept for strangers make room by dropping the oldest one not being punched, so knocks can't wipe out a meeting under way.
 - **Probes.** Both sides key their probes with the handle's probe key, in place of the discovery key two contacts share.
 
@@ -67,13 +69,14 @@ The session that results is an ordinary session with a stranger: its messages ar
 An invite link made on mobile data used to carry an address nobody could dial: the phone's address behind carrier-grade NAT, or none at all on an IPv6-only network. Invites now meet the same way handles do, with a random key instead of a handle:
 
 ```
-link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ]
+link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ] [ "&m=" meet ]
+meet  = Crockford Base32 of relay fingerprint (20) || cookie (16), "@", addr   -- a meeting point (Appendix N, section 6)
 addr  = host ":" port                -- IPv6 in brackets: [2001:db8::1]:7450
 key   = Crockford Base32 of 16 random bytes (26 symbols)
 base  = KDF("… invite", key)         -- then records, knock slots and probe key as above
 ```
 
-A finder tries, in order: an onion circuit through approved contacts or volunteer relays when one can be had (Appendices I and P), as for any dial; every address in the link; the meeting place the key names; and last, relay circuits through approved contacts (Appendix G), which work only through a contact both people already share.
+A finder tries, in order: an onion circuit through approved contacts or volunteer relays when one can be had (Appendices I and P), as for any dial, for at most 12 s, with volunteers asked only for a public address in the link; then every address in the link and, 1.5 s after the first dial, the meeting place the key names, together; and last, relay circuits through approved contacts (Appendix G), which work only through a contact both people already share.
 
 - **Addresses.** A link carries up to four: global IPv6 addresses first (no NAT to cross, often reachable directly), then the address the app suggests, then local and public IPv4 ones. The finder dials them all, 300 ms apart and each for at most 6 s, over TCP and, half a second later, QUIC, since mobile IPv6 firewalls often drop TCP silently. A dead address no longer holds up the rest.
 - **The key.** Each device makes one the first time it shows an invite and keeps it (state `invite-key`). From then on it publishes its record under the key and answers knocks there, as for a handle. When none of the addresses answers, the finder reads the record, checks that it names the fingerprint in the link (that check replaces a handle's code), dials, then knocks and punches. Relays come last, as before.
@@ -82,7 +85,7 @@ A finder tries, in order: an onion circuit through approved contacts or voluntee
 - **Limits.** The meeting place ends in a hole punch (Appendix N, section 4), which often fails behind symmetric NAT, as many VPNs are, especially when both people use one. Relays need a contact the two already share, so a brand-new contact with both sides behind VPNs may not connect.
 - **Cost.** One more record to keep, and knock slots to read at the handle rates. Last hour's slots are read only in the first five minutes of an hour, when a knock there can still be fresh; this halves the reads for handles too.
 - **By tap.** Apps can hand an invite over NFC instead of showing a QR code: the phone that taps gets the link and gives back only its fingerprint, and the one showing its invite takes that device as a contact when it connects. See [Appendix T](appendix-t-nfc.md).
-- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. The Android app offers it under Network & Connectivity → Reset invite links, the Linux app under Preferences → Invite links, and the iOS app under Add contact → Your invite. Links without `?r=` and links with one address still parse.
+- **Privacy.** Whoever has one of your invite links can find your current address for as long as the key lasts, as a handle allows. `reset_invites` (FFI) / `Node::reset_invite_key` makes a new key; older links then keep only their addresses. The Android app offers it under Settings → Invites → Reset invite links, the Linux app under Preferences → Invite links, and the iOS app under Add contact → Your invite. Links without `?r=` and links with one address still parse.
 
 ## Changing or removing a handle
 
@@ -98,9 +101,9 @@ Raising `version` gives a new code. Removing the handle, or changing it, stops p
 
 **Trade-offs, stated honestly:**
 - **A handle is as public as you make it.** Posting it publicly is posting an invite: anyone can send message requests and see your IP address. Change the code if it gets abused.
-- **Anyone with the handle can overwrite its DHT records**, since the DHT keys come from the handle. They can stop people from finding you (until the next hour's keys, or a new code), but not pretend to be you: a forged record fails the code check or the handshake.
+- **Anyone with the handle can overwrite its DHT records**, since the DHT keys come from the handle. They can stop people from finding you, and since anyone with the handle can compute every future hour's keys, for as long as they keep at it, until you take a new code. They can't pretend to be you or learn who looks you up: a forged record fails the code check, carries no valid signature (so finders neither probe nor dial its addresses), or fails the handshake.
 - **Knocks to older owners are readable.** An owner whose record doesn't ask for sealed knocks gets the old knock, which anyone with the handle can read. Someone who overwrites the owner's record (see above) can leave the flag out and so get the next finders' knocks in the old form: it shows who looks for the owner, as before this change, and the record's addresses still have to pass the code check and the handshake.
-- **Background delay.** A finder reaches an owner behind NAT only while the owner polls: within about 20 s if its app is open, otherwise when the knock is seen within the finder's two minutes of punching. Owners reachable directly (IPv6, mapped port) answer at once.
+- **Background delay.** A finder reaches an owner behind NAT only while the owner polls: within about 3 s for ten minutes after the owner showed its invite, within about 20 s if its app is open, otherwise when the knock is seen within the finder's two minutes of punching. Owners reachable directly (IPv6, mapped port) answer at once.
 
 ## Implementation
 

@@ -151,24 +151,22 @@ struct NewPersonaView: View {
     }
 }
 
-/// An anonymous identity's invite, on its own port and this network's
-/// address (it never uses the DHT).
+/// An anonymous identity's invite. It carries no address (that would be
+/// this iPhone's, the same one your own invites show): it names the
+/// identity's meeting point at a volunteer relay, which can take a few
+/// seconds to open the first time.
 @MainActor
 struct PersonaInviteView: View {
     let record: PersonaRecord
     @EnvironmentObject private var store: NodeStore
     @Environment(\.dismiss) private var dismiss
-
-    private var link: String? {
-        guard let n = store.personas[record.id], let ip = LocalAddress.ipv4(),
-              let port = store.personaPort(record.id) else { return nil }
-        return n.inviteLink(addr: "\(ip):\(port)")
-    }
+    @State private var link: String?
+    @State private var waited = false
 
     var body: some View {
         Form {
-            if store.personas[record.id] == nil {
-                ProgressView("Opening anonymous identity…")
+            if store.personas[record.id] == nil || (link == nil && !waited) {
+                ProgressView("Getting its invite ready…")
             } else if let link {
                 Section {
                     QRCodeView(text: link)
@@ -176,14 +174,20 @@ struct PersonaInviteView: View {
                         .frame(maxWidth: .infinity)
                     ShareLink("Share invite", item: link)
                 } footer: {
-                    Text("Whoever uses this reaches your anonymous identity, not you. It works while this iPhone is on this network and Threnody is open.")
+                    Text("Whoever uses this reaches your anonymous identity, not you, through a volunteer relay. It doesn't show where this iPhone is.")
                 }
             } else {
-                Text("No network: connect to Wi-Fi to make an invite.")
+                Text("This anonymous identity can't be reached yet: it meets people at a volunteer relay, and has none. Subscribe to a relay directory, then try again.")
             }
         }
         .navigationTitle("🎭 \(store.personaLabels[record.id] ?? record.label)")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        .task(id: store.personas[record.id] == nil) {
+            guard let n = store.personas[record.id] else { return }
+            let ready = await Task.detached { n.waitMeetingPoint(timeoutMs: 15_000) }.value
+            link = ready ? n.inviteLink(addr: "") : nil
+            waited = true
+        }
     }
 }

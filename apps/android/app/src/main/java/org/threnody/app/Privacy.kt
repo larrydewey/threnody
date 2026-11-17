@@ -36,6 +36,7 @@ object Privacy {
     private const val STRIP = "strip_metadata"
     private const val REACH = "reach_internet"
     private const val VOLUNTEERS = "use_volunteers"
+    private const val MEETING = "meeting_point"
     private const val READ_RECEIPTS = "send_read_receipts"
     private const val TYPING = "send_typing"
     private const val GIPHY = "giphy_search"
@@ -88,6 +89,9 @@ object Privacy {
     /** Route through volunteer relays from subscribed directories (Appendix P). */
     fun useVolunteers(ctx: Context) = prefs(ctx).getBoolean(VOLUNTEERS, true)
 
+    /** Keep a meeting point at a volunteer relay whatever the NAT looks like (behind a VPN). */
+    fun meetingPoint(ctx: Context) = prefs(ctx).getBoolean(MEETING, false)
+
     /**
      * The always-on relay: a contact (a relay node you run on a server)
      * this device keeps a session with at all times, so contacts can
@@ -130,6 +134,11 @@ object Privacy {
 
     fun setUseVolunteers(ctx: Context, on: Boolean) {
         prefs(ctx).edit().putBoolean(VOLUNTEERS, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
+
+    fun setMeetingPoint(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(MEETING, on).apply()
         Threnody.applyPrivacy(ctx)
     }
 

@@ -54,6 +54,19 @@ const ADDR_DIAL_FOR: Duration = Duration::from_secs(6);
 /// Addresses are dialed this far apart, best first (as Happy Eyeballs
 /// does), so two that reach the same device rarely both make a session.
 const ADDR_STAGGER: Duration = Duration::from_millis(300);
+/// While the user is handing out an invite or handle (just shown, copied
+/// or changed), knocks are read this often, whether or not the app is in
+/// the foreground: sharing a link usually means switching to another app,
+/// and the finder must not wait for the background rate.
+const AWAIT_POLL: Duration = Duration::from_secs(3);
+/// How long that lasts after the invite or handle was last shown.
+const AWAIT_FOR: Duration = Duration::from_secs(10 * 60);
+/// The finder's hidden path (onion or volunteer circuit) to someone met
+/// through an invite gets this long before the direct paths are tried.
+const HIDDEN_INVITE_FOR: Duration = Duration::from_secs(12);
+/// The meeting place is read this long after the link's addresses were
+/// first dialed, not after they all gave up.
+const MEET_AFTER: Duration = Duration::from_millis(1500);
 /// QUIC follows TCP to the same address after this: firewalls (most IPv6
 /// ones on mobile networks) drop TCP silently, and UDP may still pass.
 const QUIC_AFTER: Duration = Duration::from_millis(500);
@@ -79,6 +92,9 @@ pub(crate) struct HandleState {
     /// session from one is a contact we want (named so), not a message
     /// request. In memory only; at most [`MAX_EXPECTED`].
     pub(crate) expected: Mutex<HashMap<Fingerprint, Expected>>,
+    /// Until when someone is likely to knock (an invite or handle was just
+    /// shown): knocks are read every [`AWAIT_POLL`] until then.
+    awaiting: Mutex<Option<Instant>>,
 }
 
 /// A contact the user added after a tap, until its session arrives.
@@ -152,7 +168,11 @@ impl Node {
             }
             None => None,
         };
+        let on = own.is_some();
         *lock(&self.handles().own) = own;
+        if on {
+            self.await_knocks();
+        }
         self.handles().kick.notify_one();
         Ok(self.handle())
     }
@@ -183,6 +203,18 @@ impl Node {
         let k = InviteKey::generate();
         self.use_invite_key(k);
         k
+    }
+
+    /// Someone is likely to knock soon (an invite or handle was just
+    /// shown or shared): reads knocks every few seconds for a while, in
+    /// the background too, so the finder isn't kept waiting.
+    pub fn await_knocks(&self) {
+        *lock(&self.handles().awaiting) = Some(Instant::now() + AWAIT_FOR);
+        self.handles().kick.notify_one();
+    }
+
+    fn awaiting_knocks(&self) -> bool {
+        lock(&self.handles().awaiting).is_some_and(|t| Instant::now() < t)
     }
 
     fn use_invite_key(&self, k: InviteKey) {
@@ -218,6 +250,23 @@ impl Node {
     /// then `addr`, the one the app suggests, then the rest of what we know)
     /// and, with internet reachability on, our invite key.
     pub fn invite_link(&self, addr: Option<&str>) -> InviteLink {
+        // Shown to someone: they may use it any moment.
+        if self.reach_enabled() {
+            self.await_knocks();
+        }
+        // An anonymous identity's link carries no address: whoever has it
+        // (or sees it posted) would learn where the device is, the same
+        // address as its main identity's. It is reached at its meeting
+        // point only.
+        if self.shared.persona {
+            self.kick_meeting();
+            return InviteLink {
+                fingerprint: self.identity().fingerprint(),
+                addrs: Vec::new(),
+                key: None,
+                meet: self.own_meetings().first().copied(),
+            };
+        }
         let candidates = lock(&self.rdv().inner).candidates.clone();
         let of = |kind: CandidateKind| {
             candidates
@@ -239,6 +288,7 @@ impl Node {
             fingerprint: self.identity().fingerprint(),
             addrs,
             key: self.reach_enabled().then(|| self.invite_key()),
+            meet: self.own_meetings().first().copied(),
         }
     }
 
@@ -294,6 +344,9 @@ impl Node {
                 },
             );
         }
+        if self.reach_enabled() {
+            self.await_knocks();
+        }
         if let Some((key, _)) = known {
             self.accept_contact(&key);
             if let Some(n) = name {
@@ -332,14 +385,20 @@ impl Node {
             let (dht, rk) = (dht.clone(), spot.record_keys(e));
             async move {
                 let v = fetch(&dht, &rk).await?;
-                HandleRecord::open(&rk, &v).ok()
+                let mut r = HandleRecord::open(&rk, &v).ok()?;
+                // From here on a signature present is one that checked out.
+                if !r.owner_signed(&rk) {
+                    r.sig = None;
+                }
+                Some(r)
             }
         };
         let (a, b) = tokio::join!(read(now), read(now.saturating_sub(1)));
+        // The owner's own record before one anyone with the handle wrote.
         [a, b]
             .into_iter()
             .flatten()
-            .max_by_key(|r| r.candidates.issued_ms)
+            .max_by_key(|r| (r.sig.is_some(), r.candidates.issued_ms))
     }
 
     /// Reads the record behind `handle` and checks it belongs to the
@@ -391,6 +450,24 @@ impl Node {
         if rec.id == self.identity() {
             return Err(NetError::NotAllowed("that's your own handle".into()));
         }
+        // Hidden first, as for invites: through an onion or volunteer
+        // circuit the owner sees a relay's address, not ours. Volunteers
+        // dial only a public address, and only one the owner signed.
+        let public = rec
+            .candidates
+            .list
+            .iter()
+            .filter(|_| rec.sig.is_some())
+            .find(|c| crate::reach::is_public(&c.addr.ip()))
+            .map(|c| c.addr.to_string());
+        if let Ok(Some(p)) = tokio::time::timeout(
+            HIDDEN_INVITE_FOR,
+            self.reach_hidden(public.as_deref(), rec.id.fingerprint(), true),
+        )
+        .await
+        {
+            return Ok(p);
+        }
         self.meet(&Spot::Handle(handle), rec).await
     }
 
@@ -407,34 +484,66 @@ impl Node {
         if let Some(s) = self.sessions().iter().find(|s| s.peer.fingerprint() == fp) {
             return Ok(s.peer);
         }
-        let first = link.addrs.first().map(String::as_str);
-        if let Some(p) = self.reach_hidden(first, fp, true).await {
+        // A meeting point first: a circuit to it hides our address from
+        // the inviter, and it gets through whatever NAT either side is
+        // behind. An anonymous identity's link has nothing else.
+        if let Some(m) = &link.meet {
+            match self.connect_meeting(fp, m).await {
+                Ok(p) => return Ok(p),
+                Err(e) if link.addrs.is_empty() && link.key.is_none() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        // A volunteer's exit dials the address for us: only a public one
+        // can answer it (a LAN or carrier-NAT address just times out).
+        let public = link.addrs.iter().map(String::as_str).find(|a| {
+            a.parse::<std::net::SocketAddr>()
+                .is_ok_and(|sa| crate::reach::is_public(&sa.ip()))
+        });
+        if let Ok(Some(p)) =
+            tokio::time::timeout(HIDDEN_INVITE_FOR, self.reach_hidden(public, fp, true)).await
+        {
             return Ok(p);
         }
         // From here on, whoever made the link sees our address (or a
-        // relay sees both of us).
+        // relay sees both of us). The link's addresses and its meeting
+        // place are tried together: the meeting place starts a moment
+        // later, so a link whose address answers rarely knocks, but a dead
+        // address no longer holds up the knock that brings its maker.
         let mut mismatch = None;
-        let mut last = match self.dial_any(&link.addrs, fp).await {
-            Ok(p) => {
-                self.fell_back(p, FallbackPath::Direct);
-                return Ok(p);
+        let mut last = None;
+        let key = link.key.filter(|_| self.reach_enabled());
+        let direct = self.dial_any(&link.addrs, fp);
+        let meeting = async {
+            match key {
+                Some(key) => {
+                    tokio::time::sleep(MEET_AFTER).await;
+                    self.find_invite(key, fp).await
+                }
+                None => std::future::pending().await,
             }
-            Err(e @ NetError::IdentityMismatch { .. }) => {
-                // A private address can be someone else's on another
-                // network; worth saying only if nothing else works.
-                mismatch = Some(e);
-                None
-            }
-            Err(e) => Some(e),
         };
-        if let Some(key) = link.key
-            && self.reach_enabled()
-        {
-            match self.find_invite(key, fp).await {
+        tokio::pin!(direct, meeting);
+        let (mut direct_done, mut meeting_done) = (false, key.is_none());
+        while !(direct_done && meeting_done) {
+            let r = tokio::select! {
+                r = &mut direct, if !direct_done => {
+                    direct_done = true;
+                    r
+                }
+                r = &mut meeting, if !meeting_done => {
+                    meeting_done = true;
+                    r
+                }
+            };
+            match r {
                 Ok(p) => {
                     self.fell_back(p, FallbackPath::Direct);
                     return Ok(p);
                 }
+                // A private address can be someone else's on another
+                // network; worth saying only if nothing else works.
+                Err(e @ NetError::IdentityMismatch { .. }) => mismatch = Some(e),
                 Err(e) => last = Some(e),
             }
         }
@@ -534,30 +643,86 @@ impl Node {
         self.emit(Event::ReachNote {
             note: format!("{spot} is {}", peer.fingerprint()),
         });
-        // Addresses that take a dial (a public IPv6 address, a mapped port).
-        if let Some(quic) = self.quic() {
-            let mut targets: Vec<_> = rec.candidates.list.clone();
-            targets.sort_by_key(|c| c.kind.rank());
-            let targets: Vec<_> = targets
-                .iter()
-                .map(|c| c.addr)
-                .filter(|a| quic.can_reach(a.ip()))
-                .collect();
-            if !targets.is_empty()
-                && let Ok(Ok(conn)) = tokio::time::timeout(DIRECT_FOR, self.race(&targets)).await
-                && self
+        // Addresses that take a dial (a public IPv6 address, a mapped port),
+        // and the knock, together: the knock takes a DHT write of a few
+        // seconds, and waiting for the dials first added theirs to it.
+        // A record the owner didn't sign may be anyone's who holds the
+        // handle or link, naming the owner with addresses of their own: its
+        // addresses aren't dialed at once (that would show them ours), only
+        // public ones, and those only through the punch, which dials an
+        // address once its probes answer from it.
+        let signed = rec.sig.is_some();
+        let targets: Vec<_> = self
+            .quic()
+            .filter(|_| signed)
+            .map(|quic| {
+                let mut list: Vec<_> = rec.candidates.list.clone();
+                list.sort_by_key(|c| c.kind.rank());
+                list.iter()
+                    .map(|c| c.addr)
+                    .filter(|a| quic.can_reach(a.ip()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let direct = async {
+            if targets.is_empty() {
+                return false;
+            }
+            match tokio::time::timeout(DIRECT_FOR, self.race(&targets)).await {
+                Ok(Ok(conn)) => self
                     .quic_session(conn, Some(peer.fingerprint()), false)
                     .await
-                    .is_ok()
-            {
+                    .is_ok(),
+                _ => false,
+            }
+        };
+        self.add_probe_key(peer, spot.probe_key());
+        {
+            let knock = self.knock(spot, &rec);
+            tokio::pin!(direct, knock);
+            let (mut direct_done, mut knocked) = (false, None);
+            while knocked.is_none() {
+                tokio::select! {
+                    ok = &mut direct, if !direct_done => {
+                        if ok {
+                            return Ok(peer);
+                        }
+                        direct_done = true;
+                    }
+                    r = &mut knock => knocked = Some(r),
+                }
+            }
+            if let Some(Err(e)) = knocked {
+                // A dial still under way may yet answer.
+                if direct_done || !direct.await {
+                    return Err(e);
+                }
                 return Ok(peer);
             }
         }
-        // Knock, and punch while they answer.
-        self.add_probe_key(peer, spot.probe_key());
-        self.knock(spot, &rec).await?;
         let mut symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
-        let mut list = rec.candidates.list;
+        // Its meeting points, alongside the punch: through any NAT. Only a
+        // signed record's, or anyone could send us to a relay they run.
+        if signed && !rec.candidates.meetings.is_empty() {
+            let (node, points) = (self.clone(), rec.candidates.meetings.clone());
+            tokio::spawn(async move {
+                for m in &points {
+                    if node.connected(&peer)
+                        || node.connect_meeting(peer.fingerprint(), m).await.is_ok()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        // Probes to an unsigned record's addresses would show ours to
+        // whoever wrote it: we knock, and an owner that sees the knock
+        // probes us, which starts our side of the punch at its address.
+        let mut list = if signed {
+            rec.candidates.list
+        } else {
+            Vec::new()
+        };
         let mut punching = self.punch(peer, &list, symmetric, Urge::Start);
         let deadline = Instant::now() + FIND_FOR;
         let mut issued = rec.candidates.issued_ms;
@@ -580,6 +745,7 @@ impl Node {
                 if let Some(dht) = self.dht()
                     && let Some(r) = self.read_record(&dht, spot).await
                     && r.id == peer
+                    && (r.sig.is_some() || !signed)
                     && r.candidates.issued_ms > issued
                 {
                     issued = r.candidates.issued_ms;
@@ -662,6 +828,7 @@ impl Node {
             issued_ms: now_ms(),
             flags: if inner.symmetric { FLAG_SYMMETRIC } else { 0 },
             seeking_until_ms: None,
+            meetings: self.own_meetings(),
         }
     }
 
@@ -681,7 +848,9 @@ impl Node {
                 );
                 self.answer_knocks(&dht).await;
             }
-            let wait = if self.rdv().foreground.load(Ordering::Relaxed) {
+            let wait = if self.awaiting_knocks() {
+                AWAIT_POLL.min(cfg.poll_foreground)
+            } else if self.rdv().foreground.load(Ordering::Relaxed) {
                 cfg.poll_foreground
             } else {
                 cfg.poll_background
@@ -713,10 +882,15 @@ impl Node {
                 version: o.version,
                 candidates,
                 sealed_knocks: true,
+                sig: None,
             };
             (o.spot.clone(), record, digest)
         };
         let rk = spot.record_keys(ep);
+        let mut record = record;
+        if record.sign(self.identity_ref(), &rk).is_err() {
+            return;
+        }
         let Ok(value) = record.seal(&rk) else { return };
         let note = match put(dht, &rk, &value, record.candidates.issued_ms).await {
             Ok(()) => {

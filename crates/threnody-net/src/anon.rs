@@ -257,6 +257,7 @@ impl Node {
             }
             node.drop_onion_circuits_of(&peer);
             node.dir_link_closed(&peer);
+            node.meeting_link_closed(&peer);
         });
     }
 }
@@ -354,7 +355,8 @@ where
                     }
                 }
                 _ = idle_check.tick() => {
-                    let busy = node.onion_busy(&peer) || node.dir_busy(&peer);
+                    let busy =
+                        node.onion_busy(&peer) || node.dir_busy(&peer) || node.meeting_busy(&peer);
                     if busy {
                         last_use = tokio::time::Instant::now();
                     } else if outbound && last_use.elapsed() > IDLE {

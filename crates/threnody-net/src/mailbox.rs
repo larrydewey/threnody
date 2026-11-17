@@ -63,13 +63,27 @@ enum MailboxMsg {
         status: DepositStatus,
         reference: Option<u64>,
     },
+    /// Our deposit key, for a mutually approved contact: it tags anonymous
+    /// deposits that reach us over an anonymous link (see [`DEPOSIT_KEY_STATE`]).
+    Key {
+        key: [u8; 32],
+    },
 }
+
+/// Where a mailbox keeps its deposit key. Every mutually approved contact
+/// gets the same one, so a deposit tagged with it says that a contact
+/// built the circuit, not which. A deposit over an anonymous link, where
+/// a new identity costs nothing, must carry the tag, or it is declined
+/// whoever it is for: otherwise anyone could ask whether someone is the
+/// mailbox's contact (declined or held) and fill their places. The key is
+/// replaced whenever a contact stops being mutually approved.
+pub(crate) const DEPOSIT_KEY_STATE: &str = "deposit-key";
 
 impl MailboxMsg {
     fn encode(&self) -> threnody_core::Result<Vec<u8>> {
         let size = match self {
             Self::Deposit { sealed, .. } | Self::Deliver { sealed } => sealed.len(),
-            Self::Receipt { .. } => 0,
+            Self::Receipt { .. } | Self::Key { .. } => 0,
         } + 64;
         cbor::to_vec(size, |e| {
             match self {
@@ -90,6 +104,10 @@ impl MailboxMsg {
                 Self::Deliver { sealed } => {
                     e.map_len(2)?.u8(0)?.u8(2)?;
                     e.u8(2)?.bytes(sealed)?;
+                }
+                Self::Key { key } => {
+                    e.map_len(2)?.u8(0)?.u8(4)?;
+                    e.u8(2)?.bytes(key)?;
                 }
                 Self::Receipt {
                     to,
@@ -134,6 +152,11 @@ impl MailboxMsg {
             },
             2 => Self::Deliver {
                 sealed: required(sealed, "sealed message")?,
+            },
+            4 => Self::Key {
+                key: required(sealed, "deposit key")?
+                    .try_into()
+                    .map_err(|_| threnody_core::Error::Malformed("deposit key"))?,
             },
             3 => Self::Receipt {
                 to: required(to, "recipient")?,
@@ -866,7 +889,34 @@ impl Node {
             .filter_map(|(_, b)| b.encode().ok())
             .collect();
         out.extend(siblings.into_iter().map(AppMessage::Prekeys));
+        out.extend(self.deposit_key_message());
         out
+    }
+
+    fn deposit_key_message(&self) -> Option<AppMessage> {
+        let key = *lock(&self.shared.deposit_key);
+        MailboxMsg::Key { key }
+            .encode()
+            .ok()
+            .map(AppMessage::Mailbox)
+    }
+
+    /// Replaces our deposit key (a contact stopped being mutually
+    /// approved, and knew the old one) and hands the new one to the
+    /// mutually approved contacts connected now; the rest get it with
+    /// their next session.
+    pub(crate) fn rotate_deposit_key(&self) {
+        let key: [u8; 32] = threnody_core::crypto::random_bytes();
+        *lock(&self.shared.deposit_key) = key;
+        self.shared.save_state(DEPOSIT_KEY_STATE, Ok(key));
+        let Some(msg) = self.deposit_key_message() else {
+            return;
+        };
+        for s in self.sessions() {
+            if s.peer != self.identity() && self.shared.mutual(&s.peer) {
+                let _ = self.send(&s.peer, msg.clone());
+            }
+        }
     }
 
     /// Our shared bundle, for one of our own devices to pass on.
@@ -966,6 +1016,11 @@ impl Node {
                 );
             }
             MailboxMsg::Deliver { sealed } => self.open_sealed(from, &sealed),
+            MailboxMsg::Key { key } => {
+                if self.shared.mutual(&from) {
+                    lock(&self.shared.deposit_keys).insert(from, key);
+                }
+            }
             MailboxMsg::Receipt {
                 to,
                 status,
@@ -1109,6 +1164,16 @@ impl Node {
                 } => return self.on_pin(&from, conversation, *id, *pin),
                 AppMessage::List(bytes) => return self.on_list_message(from, bytes),
                 AppMessage::Receipt(payload) => return self.on_receipt(&from, payload),
+                // A chain sealed after a device was removed (see
+                // `seal_chain_to_absent`); nothing else of the account's.
+                AppMessage::Account(payload) => {
+                    if let Ok(crate::account::AccountMsg::Chain(b)) =
+                        crate::account::AccountMsg::decode(payload)
+                    {
+                        self.on_sealed_chain(from, &b);
+                    }
+                    return;
+                }
                 _ => {}
             }
             // A text already here (from its sender too) doesn't show

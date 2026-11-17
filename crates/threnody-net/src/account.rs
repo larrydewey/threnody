@@ -21,6 +21,7 @@
 //! Ops 11-14 go only to devices whose `Hello` has `FEATURE_DEVICE_SYNC`
 //! (see `filesync` and `sync`).
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
@@ -40,7 +41,7 @@ pub const LINK_CODE_TTL: Duration = Duration::from_secs(600);
 const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
-enum AccountMsg {
+pub(crate) enum AccountMsg {
     Chain(Vec<u8>),
     LinkRequest {
         proof: [u8; 32],
@@ -211,7 +212,7 @@ impl AccountMsg {
         })
     }
 
-    fn decode(b: &[u8]) -> threnody_core::Result<Self> {
+    pub(crate) fn decode(b: &[u8]) -> threnody_core::Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut op, mut one, mut two, mut name) = (None, None, None, None);
         read_map(&mut dec, |k, d| {
@@ -388,6 +389,42 @@ impl Node {
         }
     }
 
+    /// After `removed` left the account: our other devices and mutually
+    /// approved contacts with no session now get the chain sealed through
+    /// their mailboxes. Otherwise each kept treating the removed device as
+    /// ours (siblings sending it history and files, contacts sealing
+    /// messages to it) until it next had a session with one of our devices
+    /// that knew, which for a stolen phone could be the stolen phone.
+    fn seal_chain_to_absent(&self, removed: &PublicIdentity) {
+        let Ok(b) = self.account().encode() else {
+            return;
+        };
+        let Ok(m) = AccountMsg::Chain(b).encode() else {
+            return;
+        };
+        let msg = AppMessage::Account(m);
+        let live: HashSet<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        let me = self.identity();
+        let siblings = self
+            .account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, _)| *d)
+            .collect::<Vec<_>>();
+        let contacts: Vec<PublicIdentity> = self
+            .contacts()
+            .iter()
+            .filter(|c| c.mutually_approved() && !c.blocked)
+            .map(|c| c.key)
+            .collect();
+        for d in siblings.into_iter().chain(contacts) {
+            if d != me && d != *removed && !live.contains(&d) {
+                let _ = self.send_offline(&d, &msg);
+            }
+        }
+    }
+
     fn broadcast_chain(&self) {
         let peers: Vec<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
         self.send_chain(&peers);
@@ -420,6 +457,16 @@ impl Node {
     /// Handles an account message from `from`. False for a chain that
     /// waits until `from` is accepted (see [`Node::chain_wanted`]): the
     /// session offers it again then.
+    /// A chain `from` sealed to us through a mailbox, taken as one over a
+    /// session would be.
+    pub(crate) fn on_sealed_chain(&self, from: PublicIdentity, b: &[u8]) {
+        if self.chain_wanted(&from, b)
+            && let Ok(chain) = AccountChain::decode(b)
+        {
+            self.on_chain(from, chain);
+        }
+    }
+
     pub(crate) fn on_account(&self, from: PublicIdentity, payload: &[u8]) -> bool {
         let Ok(msg) = AccountMsg::decode(payload) else {
             return true;
@@ -814,10 +861,9 @@ impl Node {
         let matched = {
             let mut st = lock(&self.shared.linking);
             st.codes.retain(|(_, t)| t.elapsed() < LINK_CODE_TTL);
-            let pos = st
-                .codes
-                .iter()
-                .position(|(c, _)| link_proof(&c.secret, &session_id, &from) == proof);
+            let pos = st.codes.iter().position(|(c, _)| {
+                threnody_core::crypto::ct_eq(&link_proof(&c.secret, &session_id, &from), &proof)
+            });
             pos.map(|p| st.codes.remove(p))
         };
         if matched.is_none() || self.is_revoked(&from) || self.shared.persona {
@@ -982,6 +1028,7 @@ impl Node {
         }
         self.persist_account();
         self.broadcast_chain();
+        self.seal_chain_to_absent(device);
         if *device == self.identity() {
             self.emit(Event::ThisDeviceRemoved);
             self.fail_all_scheduled(crate::schedule::Failure::Removed);

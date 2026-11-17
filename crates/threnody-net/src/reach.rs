@@ -12,7 +12,7 @@
 //! Nothing here runs while the feature is off, and personas never use it:
 //! a direct path shows each side's address to the other.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,6 +54,16 @@ const WANT_FOR: Duration = Duration::from_secs(20 * 60);
 /// polls every [`ReachConfig::poll_seeking`], so this covers a poll, a
 /// read and a write with room to spare.
 const ANSWER_FOR: Duration = Duration::from_secs(60);
+/// A probe carries no source we can check: one captured on the way and
+/// sent again from a forged address made us punch toward that address
+/// for a minute, about 500 times what it cost. So a probe starts a punch
+/// toward a peer at most this often (unless we seek it), and adds at most
+/// [`MAX_PROBED_TARGETS`] new addresses to one under way.
+const PROBED_EVERY: Duration = Duration::from_secs(120);
+const MAX_PROBED_TARGETS: usize = 2;
+/// With "hide when I send" on, how long at most a seek waits before it
+/// republishes our record (see [`Node::seek`]).
+const SEEK_JITTER: Duration = Duration::from_secs(60);
 const PROBE_EVERY: Duration = Duration::from_secs(1);
 /// After [`SEEK_FOR`], a contact we still want is probed this often: it
 /// keeps our NAT open toward it, so its probes get through whenever it
@@ -221,11 +231,18 @@ pub(crate) struct Inner {
     seeking: HashMap<PublicIdentity, u64>,
     /// The newest record acted on, per contact.
     seen: HashMap<PublicIdentity, u64>,
+    /// Meeting points contacts' records name (see `meeting`), and the
+    /// contacts we are trying to meet there now.
+    meet_at: HashMap<PublicIdentity, Vec<threnody_core::rendezvous::MeetingPoint>>,
+    meeting_now: HashSet<PublicIdentity>,
     punches: HashMap<PublicIdentity, Arc<Punch>>,
     /// Failures so far and when punching may start again.
     backoff: HashMap<PublicIdentity, (usize, Instant)>,
     /// When we last started punching each contact (ms).
     last_punch: HashMap<PublicIdentity, u64>,
+    /// When a recognised probe last started a punch, per peer (see
+    /// [`PROBED_EVERY`]).
+    probed: HashMap<PublicIdentity, Instant>,
     /// Publishing rounds in a row where every write failed.
     put_failures: u32,
     /// DHT nodes to ping for our outside address, resolved and kept, so a
@@ -244,7 +261,7 @@ pub(crate) struct ReachState {
     dht: Mutex<Option<AsyncDht>>,
     pub(crate) inner: Mutex<Inner>,
     pub(crate) regather: Notify,
-    republish: Notify,
+    pub(crate) republish: Notify,
     poll: Notify,
     cfg: Mutex<Option<Arc<ReachConfig>>>,
     /// The always-on contact we keep a session with ([`Node::set_anchor`]).
@@ -386,6 +403,36 @@ impl Node {
         }
     }
 
+    /// Tries to reach contact `peer` at the meeting points its record
+    /// names, unless that is under way already.
+    pub(crate) fn meet_contact(&self, peer: PublicIdentity) {
+        let points = {
+            let mut inner = lock(&self.rdv().inner);
+            if self.connected(&peer) || !inner.meeting_now.insert(peer) {
+                return;
+            }
+            inner.meet_at.get(&peer).cloned().unwrap_or_default()
+        };
+        let node = self.clone();
+        tokio::spawn(async move {
+            for m in &points {
+                if node.connected(&peer)
+                    || node.connect_meeting(peer.fingerprint(), m).await.is_ok()
+                {
+                    break;
+                }
+            }
+            lock(&node.rdv().inner).meeting_now.remove(&peer);
+        });
+    }
+
+    /// Publishes every record again at once (what they carry changed).
+    pub(crate) fn republish_all(&self) {
+        lock(&self.rdv().inner).published.clear();
+        self.rdv().republish.notify_one();
+        self.rdv().handles.kick.notify_one();
+    }
+
     /// Tells rendezvous whether the app is in the foreground (contacts'
     /// records are polled more often then).
     pub fn set_foreground(&self, on: bool) {
@@ -407,6 +454,26 @@ impl Node {
             let mut inner = lock(&self.rdv().inner);
             inner.seeking.insert(*peer, until);
             inner.backoff.remove(peer);
+        }
+        // Republishing at once puts a DHT write on the wire the moment the
+        // user sends (or opens a chat): with "hide when I send" on, it
+        // waits a random while instead, so the write no longer dates the
+        // send to the second. The seeking itself starts now; the regular
+        // rounds pick it up too.
+        if self.pace_messages()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let node = self.clone();
+            let wait = Duration::from_millis(
+                u64::from_le_bytes(threnody_core::crypto::random_bytes())
+                    % SEEK_JITTER.as_millis() as u64,
+            );
+            rt.spawn(async move {
+                tokio::time::sleep(wait).await;
+                node.rdv().republish.notify_one();
+                node.rdv().poll.notify_one();
+            });
+            return;
         }
         self.rdv().republish.notify_one();
         self.rdv().poll.notify_one();
@@ -823,7 +890,24 @@ impl Node {
         // Global IPv6 addresses peers see us at: the one the OS sends from
         // can differ from the route's preferred one (a temporary address),
         // and with no NAT in the way each is worth offering.
-        for a in seen.iter().filter(|a| is_global_v6(&a.ip())).take(2) {
+        // Only one an approved contact reports, two DHT nodes agree on, or
+        // in the /64 of an address of our own: a single DHT node could
+        // otherwise add any address, as for IPv4 (section 2).
+        let ours: Vec<IpAddr> = list.iter().map(|c| c.addr.ip()).collect();
+        let same_64 = |a: &IpAddr, b: &IpAddr| match (a, b) {
+            (IpAddr::V6(a), IpAddr::V6(b)) => a.segments()[..4] == b.segments()[..4],
+            _ => false,
+        };
+        let trusted = |a: &SocketAddr| {
+            observed.iter().any(|o| o.ip() == a.ip())
+                || reported.iter().filter(|r| r.ip() == a.ip()).count() >= 2
+                || ours.iter().any(|o| same_64(o, &a.ip()))
+        };
+        for a in seen
+            .iter()
+            .filter(|a| is_global_v6(&a.ip()) && trusted(a))
+            .take(2)
+        {
             list.push(Candidate {
                 kind: CandidateKind::Ipv6,
                 addr: SocketAddr::new(a.ip(), port),
@@ -908,6 +992,7 @@ impl Node {
                     issued_ms: now,
                     flags,
                     seeking_until_ms: seeking,
+                    meetings: self.own_meetings(),
                 };
                 inner.published.insert(
                     peer,
@@ -1050,6 +1135,18 @@ impl Node {
                 continue;
             }
             let seeking = rec.seeking_until_ms.is_some_and(|t| t > now);
+            if !rec.meetings.is_empty() {
+                let both_symmetric = {
+                    let mut inner = lock(&self.rdv().inner);
+                    inner.meet_at.insert(peer, rec.meetings.clone());
+                    inner.symmetric && rec.flags & FLAG_SYMMETRIC != 0
+                };
+                // No punch gets through two symmetric NATs: straight to
+                // the meeting point (the punch still runs, in case).
+                if both_symmetric {
+                    self.meet_contact(peer);
+                }
+            }
             let newer = lock(&self.rdv().inner)
                 .seen
                 .get(&peer)
@@ -1246,6 +1343,11 @@ impl Node {
                 inner.seeking.remove(&peer);
             } else {
                 node.emit(Event::PunchFailed { peer });
+                // Where no punch gets through, a meeting point may.
+                if inner.meet_at.contains_key(&peer) {
+                    let node = node.clone();
+                    tokio::spawn(async move { node.meet_contact(peer) });
+                }
                 let fails = inner.backoff.get(&peer).map_or(0, |(n, _)| *n);
                 let wait = BACKOFF[fails.min(BACKOFF.len() - 1)];
                 inner
@@ -1419,7 +1521,11 @@ impl Node {
             Some(p) => {
                 // Where the probe came from is a path that works (with a
                 // symmetric NAT, the only one): try it first.
-                let new = {
+                let room = {
+                    let h = lock(&p.heard_from);
+                    h.contains(&src) || h.len() < MAX_PROBED_TARGETS
+                };
+                let new = room && {
                     let mut t = lock(&p.targets);
                     let new = !t.contains(&src);
                     if new {
@@ -1428,7 +1534,7 @@ impl Node {
                     }
                     new
                 };
-                {
+                if room {
                     let mut h = lock(&p.heard_from);
                     if !h.contains(&src) {
                         h.insert(0, src);
@@ -1443,6 +1549,19 @@ impl Node {
                 p.heard.notify_one();
             }
             None => {
+                {
+                    let mut inner = lock(&self.rdv().inner);
+                    let seeking = inner.seeking.get(&peer).is_some_and(|t| *t > now_ms());
+                    let recent = inner
+                        .probed
+                        .get(&peer)
+                        .is_some_and(|t| t.elapsed() < PROBED_EVERY);
+                    if recent && !seeking {
+                        return;
+                    }
+                    inner.probed.retain(|_, t| t.elapsed() < PROBED_EVERY);
+                    inner.probed.insert(peer, Instant::now());
+                }
                 self.punch(
                     peer,
                     &[Candidate {

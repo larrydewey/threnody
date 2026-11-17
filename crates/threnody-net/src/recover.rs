@@ -693,6 +693,7 @@ impl Node {
                     issued_ms: now,
                     flags: 0,
                     seeking_until_ms: Some(now + RECOVER_FOR.as_millis() as u64),
+                    meetings: self.own_meetings(),
                 };
                 let (dht, peer) = (dht.clone(), *peer);
                 puts.spawn(async move {
@@ -1137,8 +1138,8 @@ mod tests {
                 (y, ch.unwrap())
             },
         );
-        a.spawn_relayed_session(x, ax, relay, true);
-        c.spawn_relayed_session(y, cy, relay, false);
+        a.spawn_relayed_session(x, ax, relay, true, None);
+        c.spawn_relayed_session(y, cy, relay, false, None);
         a.set_approval(&c.identity(), true).unwrap();
         c.set_approval(&a.identity(), true).unwrap();
         for rx in [&mut arx, &mut crx] {

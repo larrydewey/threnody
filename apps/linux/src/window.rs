@@ -39,6 +39,10 @@ enum Pick {
 }
 
 pub struct App {
+    /// Notification ids and targets: a random token per chat for this run,
+    /// so the notification daemon (and anything watching D-Bus) sees no
+    /// contact key or anonymous identity, even with private notifications.
+    note_tokens: RefCell<HashMap<String, String>>,
     pub app: adw::Application,
     pub window: adw::ApplicationWindow,
     pub core: Arc<Core>,
@@ -265,6 +269,7 @@ impl App {
 
         let tab = Tab::from_key(core.settings().text(settings::LIST_TAB));
         let this = Rc::new(Self {
+            note_tokens: RefCell::new(HashMap::new()),
             app: app.clone(),
             window: window.clone(),
             core,
@@ -1226,7 +1231,8 @@ impl App {
         if self.unread.borrow_mut().remove(&conv.chat).is_some() {
             self.refresh_soon();
         }
-        self.app.withdraw_notification(&notification_id(&conv.chat));
+        self.app
+            .withdraw_notification(&self.notification_id(&conv.chat));
         if let Some(i) = self.convs.borrow().iter().position(|c| c.chat == conv.chat) {
             self.rebuilding.set(true);
             self.list.select_row(
@@ -1822,13 +1828,14 @@ impl App {
             n.set_body(Some(&body));
             n
         };
+        let token = self.note_token(&chat);
         n.set_default_action_and_target_value(
             "app.open-chat",
-            Some(&chat_variant(&chat).to_variant()),
+            Some(&format!("t:{token}").to_variant()),
         );
         // Its own id: it doesn't replace the chat's message notification.
         self.app
-            .send_notification(Some(&format!("scheduled-{}", notification_id(&chat))), &n);
+            .send_notification(Some(&format!("scheduled-chat-{token}")), &n);
     }
 
     /// How many messages are scheduled, across every identity, that won't
@@ -2045,11 +2052,26 @@ impl App {
             n.set_body(Some(body));
             n
         };
+        let token = self.note_token(chat);
         n.set_default_action_and_target_value(
             "app.open-chat",
-            Some(&chat_variant(chat).to_variant()),
+            Some(&format!("t:{token}").to_variant()),
         );
-        self.app.send_notification(Some(&notification_id(chat)), &n);
+        self.app
+            .send_notification(Some(&format!("chat-{token}")), &n);
+    }
+
+    /// This run's notification token for `chat`.
+    fn note_token(&self, chat: &ChatRef) -> String {
+        self.note_tokens
+            .borrow_mut()
+            .entry(chat_variant(chat))
+            .or_insert_with(|| glib::uuid_string_random().to_string())
+            .clone()
+    }
+
+    fn notification_id(&self, c: &ChatRef) -> String {
+        format!("chat-{}", self.note_token(c))
     }
 
     /// Opens a chat from a notification's target.
@@ -2060,7 +2082,16 @@ impl App {
             self.window.present();
             return;
         }
-        let Some(chat) = parse_chat(v) else { return };
+        let resolved = v.strip_prefix("t:").and_then(|t| {
+            self.note_tokens
+                .borrow()
+                .iter()
+                .find(|(_, tok)| *tok == t)
+                .map(|(variant, _)| variant.clone())
+        });
+        let Some(chat) = parse_chat(resolved.as_deref().unwrap_or(v)) else {
+            return;
+        };
         self.window.present();
         if let Some(c) = self.conversation(&chat) {
             self.open_chat(c);
@@ -2078,7 +2109,8 @@ impl App {
                 let on = w.is_active();
                 this.update_watching();
                 if on && let Some(c) = this.chat.borrow().as_ref() {
-                    this.app.withdraw_notification(&notification_id(&c.chat()));
+                    this.app
+                        .withdraw_notification(&this.notification_id(&c.chat()));
                     c.shown();
                 }
                 if on {
@@ -3259,6 +3291,22 @@ impl App {
             "Route through volunteer relays",
             "Each hop is paid with an anonymous token; no relay learns who you are",
         );
+        let meeting = adw::SwitchRow::builder()
+            .title("I'm behind a VPN")
+            .subtitle(
+                "Keep a meeting point at a volunteer relay, so contacts reach you whatever NAT \
+                 either of you is behind. The relay sees this computer's address, not who you \
+                 talk to. Without it, one opens only when the network looks like it needs one.",
+            )
+            .active(self.core.settings().opted_in(settings::MEETING))
+            .build();
+        let core = self.core.clone();
+        meeting.connect_active_notify(move |r| {
+            core.settings().set_flag(settings::MEETING, r.is_active());
+            let core = core.clone();
+            ui::bg_quiet(move || core.apply_privacy());
+        });
+        relays.add(&meeting);
         let dirs = adw::ActionRow::builder()
             .title("Relay directories")
             .subtitle(format!(
@@ -4688,13 +4736,9 @@ impl App {
         self.convs
             .borrow()
             .iter()
-            .map(|c| notification_id(&c.chat))
+            .map(|c| self.notification_id(&c.chat))
             .collect()
     }
-}
-
-fn notification_id(c: &ChatRef) -> String {
-    format!("chat-{}", chat_variant(c).replace('|', "-"))
 }
 
 /// Something a menu item does to the window.

@@ -366,3 +366,76 @@ async fn credentials_are_issued_and_selectively_presented() {
     assert_eq!(verified.issuer, issuer.node.identity());
     assert_eq!(verified.schema, "example/member/1");
 }
+
+/// Someone nobody can dial (behind a VPN, say) keeps a meeting point at a
+/// volunteer relay, and is reached there through a circuit.
+#[tokio::test]
+async fn a_device_nobody_can_dial_is_met_at_a_volunteer_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, v1, v2, a) = network(&dir).await;
+    // No listener at all: only its own outgoing link reaches it.
+    let home = Home::new(dir.path().join("hidden"));
+    let identity = home.create_identity(None).unwrap();
+    let (b, mut brx) = Node::new(NodeConfig {
+        home,
+        identity,
+        policy: AcceptPolicy::Anyone,
+        constant_rate: None,
+        tunnel_port: None,
+    })
+    .unwrap();
+    let link = d.node.serve_directory(&d.addr, false).unwrap();
+    b.subscribe_directory(&link).await.unwrap();
+    b.set_meeting_point(true);
+    timeout(Duration::from_secs(20), async {
+        while b.own_meetings().is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no meeting point");
+    let m = b.own_meetings()[0];
+
+    let peer = a
+        .node
+        .connect_meeting(b.identity().fingerprint(), &m)
+        .await
+        .unwrap();
+    assert_eq!(peer, b.identity());
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    a.node.send(&peer, text("found you")).unwrap();
+    let got = next(&mut brx, |e| {
+        matches!(e, Event::Message { msg: AppMessage::Text { body, .. }, .. } if body == "found you")
+            || matches!(e, Event::MessageRequest { .. })
+    })
+    .await;
+    drop(got);
+
+    // Someone with no directory and no tokens gets there too, straight to
+    // the meeting relay.
+    let c = spawn(&dir, "nobody").await;
+    let peer = c
+        .node
+        .connect_meeting(b.identity().fingerprint(), &m)
+        .await
+        .unwrap();
+    assert_eq!(peer, b.identity());
+
+    // Its invite link names the meeting point, and that's enough.
+    let invite = b.invite_link(None);
+    assert_eq!(invite.meet, Some(m));
+    let parsed: threnody_core::invite::InviteLink = invite.to_string().parse().unwrap();
+    let e = spawn(&dir, "invited").await;
+    assert_eq!(e.node.reach_invite(&parsed).await.unwrap(), b.identity());
+
+    // A wrong cookie leads nowhere.
+    let mut wrong = m;
+    wrong.cookie[0] ^= 1;
+    assert!(
+        a.node
+            .connect_meeting(b.identity().fingerprint(), &wrong)
+            .await
+            .is_err()
+    );
+    let _ = (v1, v2);
+}

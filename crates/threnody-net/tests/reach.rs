@@ -862,6 +862,7 @@ async fn invites_find_their_maker_when_its_address_is_dead() {
         fingerprint: carol.identity().fingerprint(),
         addrs: vec![],
         key: Some(key),
+        meet: None,
     };
     let (dave, _drx) = node(&dir, "dave");
     dave.listen_quic("127.0.0.1:0").await.unwrap();

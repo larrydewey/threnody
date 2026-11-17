@@ -24,6 +24,7 @@ pub mod history;
 pub mod identity;
 pub mod lists;
 pub mod mailbox;
+mod meeting;
 pub mod node;
 pub mod onion;
 pub(crate) mod portmap;
@@ -49,7 +50,7 @@ pub use error::{NetError, Result};
 pub use filesync::{FetchProgress, FetchState, FileStore};
 pub use groupcall::GroupCallInfo;
 pub use handle::{EXPECT_FOR, INVITE_KEY_STATE};
-pub use node::{AcceptPolicy, Event, FallbackPath, Node, NodeConfig, SessionInfo};
+pub use node::{AcceptPolicy, Event, FallbackPath, MAX_REQUESTS, Node, NodeConfig, SessionInfo};
 pub use push::WakeReport;
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};
 #[cfg(feature = "boringtun")]

@@ -349,6 +349,48 @@ impl Body {
 /// lock files are rarely touched, and never by two homes at once.
 static FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// When this process may next check a PIN for each data directory, on the
+/// monotonic clock. The saved back-off is on the wall clock, which someone
+/// at an unlocked device can set forward past it before every guess; this
+/// one they can't, short of restarting the app as well.
+static MONO_WAIT: std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests pass made-up times; only the test of this guard has it on.
+    static MONO_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn mono_on() -> bool {
+    #[cfg(test)]
+    return MONO_ON.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
+}
+
+fn mono_wait(dir: &std::path::Path) -> Option<std::time::Duration> {
+    if !mono_on() {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let mut w = MONO_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.retain(|(_, t)| *t > now);
+    w.iter().find(|(d, _)| d == dir).map(|(_, t)| *t - now)
+}
+
+fn set_mono_wait(dir: &std::path::Path, wait: Option<std::time::Duration>) {
+    let mut w = MONO_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.retain(|(d, _)| d != dir);
+    if let Some(wait) = wait {
+        w.push((dir.to_path_buf(), std::time::Instant::now() + wait));
+    }
+}
+
 fn file_lock() -> std::sync::MutexGuard<'static, ()> {
     FILE_LOCK
         .lock()
@@ -617,6 +659,11 @@ impl Home {
                 retry_at_ms: body.retry_at_ms,
             });
         }
+        if let Some(left) = mono_wait(self.dir()) {
+            return Ok(Verdict::Wait {
+                retry_at_ms: now_ms + u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
         // Both, always: which one matched mustn't show in the time taken.
         let pin = slot.matches(entered)?;
         let duress = body.duress.matches(entered)?;
@@ -624,6 +671,7 @@ impl Home {
             body.failures = 0;
             body.retry_at_ms = 0;
             body.last_fail_ms = 0;
+            set_mono_wait(self.dir(), None);
             self.save_lock(pepper, &body)?;
             return Ok(Verdict::Unlock);
         }
@@ -637,6 +685,10 @@ impl Home {
         }
         let delay = delay_ms(body.failures);
         body.retry_at_ms = if delay > 0 { now_ms + delay } else { 0 };
+        set_mono_wait(
+            self.dir(),
+            (delay > 0).then(|| std::time::Duration::from_millis(delay)),
+        );
         self.save_lock(pepper, &body)?;
         Ok(Verdict::Wrong {
             retry_at_ms: body.retry_at_ms,
@@ -1287,5 +1339,26 @@ mod tests {
         c.unlocked(100_000);
         assert!(!c.tick(150_000));
         assert!(c.tick(160_000));
+    }
+
+    #[test]
+    fn setting_the_clock_forward_does_not_skip_the_wait() {
+        MONO_ON.with(|c| c.set(true));
+        let (_t, h) = home();
+        pin_lock(&h);
+        // Enough wrong entries for a wait.
+        let mut last = Verdict::Unlock;
+        for _ in 0..5 {
+            last = check(&h, "0000", T);
+        }
+        assert!(matches!(last, Verdict::Wrong { retry_at_ms } if retry_at_ms > T));
+        // A day later on the wall clock, but not on the monotonic one.
+        assert!(matches!(
+            check(&h, PIN, T + 86_400_000),
+            Verdict::Wait { .. }
+        ));
+        set_mono_wait(h.dir(), None);
+        assert_eq!(check(&h, PIN, T + 86_400_000), Verdict::Unlock);
+        MONO_ON.with(|c| c.set(false));
     }
 }
