@@ -1921,10 +1921,12 @@ mod tests {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let old = crate::store::Home::new(a.path());
         let id = old.create_identity(None).unwrap();
-        old.save_contacts(&id, &crate::store::Contacts::default()).unwrap();
+        old.save_contacts(&id, &crate::store::Contacts::default())
+            .unwrap();
         let c = ConversationId::Peer([3; 32]);
         let now = crate::now_ms();
-        old.append_history(&id, c, entry(now, "kept", None), now).unwrap();
+        old.append_history(&id, c, entry(now, "kept", None), now)
+            .unwrap();
         // One still running, one past its time but not yet pruned.
         old.append_history(&id, c, entry(now + 1, "secret", Some(now + 3_600_000)), now)
             .unwrap();
@@ -1944,7 +1946,8 @@ mod tests {
             )
             .unwrap();
         let new = crate::store::Home::new(b.path());
-        new.restore_backup(&backup, "correct horse battery", None).unwrap();
+        new.restore_backup(&backup, "correct horse battery", None)
+            .unwrap();
         let restored = new.load_history(&id, c, 0).unwrap();
         let texts: Vec<&str> = restored.entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, ["kept"]);

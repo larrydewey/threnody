@@ -680,7 +680,11 @@ impl Node {
         // Probes to an unsigned record's addresses would show ours to
         // whoever wrote it: we knock, and an owner that sees the knock
         // probes us, which starts our side of the punch at its address.
-        let mut list = if signed { rec.candidates.list } else { Vec::new() };
+        let mut list = if signed {
+            rec.candidates.list
+        } else {
+            Vec::new()
+        };
         let mut punching = self.punch(peer, &list, symmetric, Urge::Start);
         let deadline = Instant::now() + FIND_FOR;
         let mut issued = rec.candidates.issued_ms;

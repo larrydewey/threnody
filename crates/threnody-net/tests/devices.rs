@@ -2117,7 +2117,12 @@ async fn an_absent_contact_learns_of_a_removed_device_through_a_mailbox() {
     link(&mut laptop, &mut m).await;
     link(&mut bob, &mut m).await;
     wait_for(|| laptop.node.can_send_offline(&bid)).await;
-    wait_for(|| bob.node.account_of(&lid).is_some_and(|a| a.state().has(&pid))).await;
+    wait_for(|| {
+        bob.node
+            .account_of(&lid)
+            .is_some_and(|a| a.state().has(&pid))
+    })
+    .await;
     // Bob goes away from the laptop (and the phone, which he never met).
     bob.node.disconnect(&lid);
     wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;

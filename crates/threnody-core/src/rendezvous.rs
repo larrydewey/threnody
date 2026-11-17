@@ -366,8 +366,8 @@ pub fn recognise_probe<'a>(
     let (nonce, tag) = data.split_at(16);
     candidates.into_iter().find_map(|(peer, d)| {
         let want = probe_tag(d, peer, nonce);
-        // Not secret-dependent timing worth guarding: the tag is public once sent.
-        (want == tag).then_some(*peer)
+        // The sender of a probe picks its nonce: compared in constant time.
+        crate::crypto::ct_eq(&want, tag).then_some(*peer)
     })
 }
 
@@ -386,7 +386,7 @@ pub fn recognise_timed_probe<'a>(
     candidates.into_iter().find_map(|(peer, d)| {
         [epoch.saturating_sub(1), epoch, epoch + 1]
             .into_iter()
-            .any(|e| timed_probe_tag(d, peer, e, nonce) == tag)
+            .any(|e| crate::crypto::ct_eq(&timed_probe_tag(d, peer, e, nonce), tag))
             .then_some(*peer)
     })
 }

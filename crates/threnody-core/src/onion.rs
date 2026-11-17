@@ -208,8 +208,15 @@ impl OnionPath {
     }
 
     /// [`HopKeys::deposit_tag`] for hop `target`.
-    pub fn deposit_tag(&self, target: usize, deposit_key: &[u8; 32], to: &[u8]) -> Option<[u8; 16]> {
-        self.hops.get(target).map(|h| h.deposit_tag(deposit_key, to))
+    pub fn deposit_tag(
+        &self,
+        target: usize,
+        deposit_key: &[u8; 32],
+        to: &[u8],
+    ) -> Option<[u8; 16]> {
+        self.hops
+            .get(target)
+            .map(|h| h.deposit_tag(deposit_key, to))
     }
 
     /// Builds a forward cell addressed to hop `target` (0 = nearest).
