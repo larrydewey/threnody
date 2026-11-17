@@ -43,6 +43,10 @@ const MAX_QUEUED: usize = 4096;
 /// links carry many people's circuits, so the circuit filling one is what
 /// ends, not the link.
 const MAX_QUEUED_PER_CIRCUIT: usize = 1024;
+/// Messages handed to a link's task that it hasn't taken yet. The task
+/// takes them at once into its backlog, which sheds the circuit sending
+/// the most; these pile up only while its writes stall.
+const MAX_HANDED: usize = 4 * MAX_QUEUED;
 
 /// Messages waiting for cover ticks on an anonymous link, counted by onion
 /// circuit.
@@ -102,7 +106,7 @@ impl Backlog {
 struct Handle {
     id: u64,
     /// Counted in messages: a link whose task stopped taking them (its
-    /// writes stalled) refuses more past [`MAX_QUEUED`].
+    /// writes stalled) refuses more past [`MAX_HANDED`].
     tx: budget::Sender<AppMessage>,
     addr: SocketAddr,
     outbound: bool,
@@ -199,7 +203,7 @@ impl Node {
         peer: PublicIdentity,
         addr: SocketAddr,
     ) -> budget::Receiver<AppMessage> {
-        let (tx, rx) = budget::channel(MAX_QUEUED);
+        let (tx, rx) = budget::channel(MAX_HANDED);
         let mut st = lock(&self.shared.anon);
         st.next_id += 1;
         let id = st.next_id;
@@ -232,7 +236,7 @@ impl Node {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let peer = *chan.peer();
-        let (tx, rx) = budget::channel(MAX_QUEUED);
+        let (tx, rx) = budget::channel(MAX_HANDED);
         let id = {
             let mut st = lock(&self.shared.anon);
             st.next_id += 1;
