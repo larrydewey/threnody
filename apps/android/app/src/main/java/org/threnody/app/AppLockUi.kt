@@ -24,7 +24,7 @@ import uniffi.threnody_ffi.setDuressPin
 import uniffi.threnody_ffi.setLockPolicy
 
 /**
- * App lock's settings (Privacy & Security → App lock…), the duress PIN,
+ * App lock's settings (Settings → App lock), the duress PIN,
  * "Erase all Threnody data", and the one-time notice that app lock is on.
  */
 object AppLockUi {
@@ -363,7 +363,7 @@ object AppLockUi {
                 SecureBuilder(a)
                     .setTitle("App lock")
                     .setMessage("Threnody now locks with your phone's screen lock. " +
-                        "Change this in Privacy & Security → App lock.")
+                        "Change this in Settings → App lock.")
                     .setPositiveButton("OK", null)
                     .setNegativeButton("Turn off") { _, _ -> turnOff(a, s) }
                     .setCancelable(false)
