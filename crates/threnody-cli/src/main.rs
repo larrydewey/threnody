@@ -167,8 +167,8 @@ enum Cmd {
         /// Dial contacts directly instead of through onion circuits first.
         #[arg(long)]
         no_onion: bool,
-        /// Send images with their metadata (location, camera, times)
-        /// instead of stripping it.
+        /// Send photos and videos with their metadata (location, camera,
+        /// times) and their original file names instead of stripping it.
         #[arg(long)]
         keep_metadata: bool,
         /// How long messages last in chats that haven't set their own timer
