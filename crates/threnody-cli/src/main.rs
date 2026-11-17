@@ -843,6 +843,7 @@ fn main() -> Result<()> {
                     .map(str::to_owned)
                     .collect(),
                 key: Some(key),
+                meet: None,
             }
             .to_string();
             println!("{link}");

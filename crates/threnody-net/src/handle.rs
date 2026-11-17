@@ -254,6 +254,19 @@ impl Node {
         if self.reach_enabled() {
             self.await_knocks();
         }
+        // An anonymous identity's link carries no address: whoever has it
+        // (or sees it posted) would learn where the device is, the same
+        // address as its main identity's. It is reached at its meeting
+        // point only.
+        if self.shared.persona {
+            self.kick_meeting();
+            return InviteLink {
+                fingerprint: self.identity().fingerprint(),
+                addrs: Vec::new(),
+                key: None,
+                meet: self.own_meetings().first().copied(),
+            };
+        }
         let candidates = lock(&self.rdv().inner).candidates.clone();
         let of = |kind: CandidateKind| {
             candidates
@@ -275,6 +288,7 @@ impl Node {
             fingerprint: self.identity().fingerprint(),
             addrs,
             key: self.reach_enabled().then(|| self.invite_key()),
+            meet: self.own_meetings().first().copied(),
         }
     }
 
@@ -469,6 +483,16 @@ impl Node {
         }
         if let Some(s) = self.sessions().iter().find(|s| s.peer.fingerprint() == fp) {
             return Ok(s.peer);
+        }
+        // A meeting point first: a circuit to it hides our address from
+        // the inviter, and it gets through whatever NAT either side is
+        // behind. An anonymous identity's link has nothing else.
+        if let Some(m) = &link.meet {
+            match self.connect_meeting(fp, m).await {
+                Ok(p) => return Ok(p),
+                Err(e) if link.addrs.is_empty() && link.key.is_none() => return Err(e),
+                Err(_) => {}
+            }
         }
         // A volunteer's exit dials the address for us: only a public one
         // can answer it (a LAN or carrier-NAT address just times out).
@@ -677,6 +701,20 @@ impl Node {
             }
         }
         let mut symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
+        // Its meeting points, alongside the punch: through any NAT. Only a
+        // signed record's, or anyone could send us to a relay they run.
+        if signed && !rec.candidates.meetings.is_empty() {
+            let (node, points) = (self.clone(), rec.candidates.meetings.clone());
+            tokio::spawn(async move {
+                for m in &points {
+                    if node.connected(&peer)
+                        || node.connect_meeting(peer.fingerprint(), m).await.is_ok()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
         // Probes to an unsigned record's addresses would show ours to
         // whoever wrote it: we knock, and an owner that sees the knock
         // probes us, which starts our side of the punch at its address.
@@ -790,6 +828,7 @@ impl Node {
             issued_ms: now_ms(),
             flags: if inner.symmetric { FLAG_SYMMETRIC } else { 0 },
             seeking_until_ms: None,
+            meetings: self.own_meetings(),
         }
     }
 

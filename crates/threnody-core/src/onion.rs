@@ -313,24 +313,30 @@ pub struct ExtendReq {
     pub e_pub: Vec<u8>,
     pub addr: Option<String>,
     pub token: Option<Vec<u8>>,
+    /// A meeting point's cookie (Appendix N, *Meeting points*): the relay
+    /// extends over the link whoever registered the cookie keeps with it.
+    pub meet: Option<[u8; 16]>,
 }
 
 const EXTEND_ADDR: u8 = 1;
 const EXTEND_TOKEN: u8 = 2;
+const EXTEND_MEET: u8 = 4;
 
 impl ExtendReq {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = self.to.0.to_vec();
         out.extend_from_slice(&self.e_pub);
-        if self.addr.is_none() && self.token.is_none() {
+        if self.addr.is_none() && self.token.is_none() && self.meet.is_none() {
             return Ok(out);
         }
         let flags = u8::from(self.addr.is_some()) * EXTEND_ADDR
-            + u8::from(self.token.is_some()) * EXTEND_TOKEN;
+            + u8::from(self.token.is_some()) * EXTEND_TOKEN
+            + u8::from(self.meet.is_some()) * EXTEND_MEET;
         out.push(flags);
         for field in [
             self.addr.as_ref().map(String::as_bytes),
             self.token.as_deref(),
+            self.meet.as_ref().map(<[u8; 16]>::as_slice),
         ]
         .into_iter()
         .flatten()
@@ -362,11 +368,12 @@ impl ExtendReq {
             e_pub,
             addr: None,
             token: None,
+            meet: None,
         };
         let Some((&flags, tail)) = rest.split_first() else {
             return Ok(req);
         };
-        if flags & !(EXTEND_ADDR | EXTEND_TOKEN) != 0 {
+        if flags & !(EXTEND_ADDR | EXTEND_TOKEN | EXTEND_MEET) != 0 {
             return Err(Error::Malformed("extend flags"));
         }
         rest = tail;
@@ -394,6 +401,12 @@ impl ExtendReq {
         }
         if flags & EXTEND_TOKEN != 0 {
             req.token = Some(field(&mut rest)?);
+        }
+        if flags & EXTEND_MEET != 0 {
+            req.meet = Some(
+                <[u8; 16]>::try_from(field(&mut rest)?.as_slice())
+                    .map_err(|_| Error::Malformed("extend meeting cookie"))?,
+            );
         }
         if !rest.is_empty() {
             return Err(Error::Malformed("extend trailing bytes"));
@@ -428,6 +441,7 @@ mod tests {
             e_pub: e_pub.clone(),
             addr: None,
             token: None,
+            meet: None,
         };
         // The plain form is exactly Appendix I's.
         assert_eq!(plain.encode().unwrap().len(), 20 + e_pub.len());

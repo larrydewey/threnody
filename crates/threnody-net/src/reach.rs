@@ -12,7 +12,7 @@
 //! Nothing here runs while the feature is off, and personas never use it:
 //! a direct path shows each side's address to the other.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -231,6 +231,10 @@ pub(crate) struct Inner {
     seeking: HashMap<PublicIdentity, u64>,
     /// The newest record acted on, per contact.
     seen: HashMap<PublicIdentity, u64>,
+    /// Meeting points contacts' records name (see `meeting`), and the
+    /// contacts we are trying to meet there now.
+    meet_at: HashMap<PublicIdentity, Vec<threnody_core::rendezvous::MeetingPoint>>,
+    meeting_now: HashSet<PublicIdentity>,
     punches: HashMap<PublicIdentity, Arc<Punch>>,
     /// Failures so far and when punching may start again.
     backoff: HashMap<PublicIdentity, (usize, Instant)>,
@@ -257,7 +261,7 @@ pub(crate) struct ReachState {
     dht: Mutex<Option<AsyncDht>>,
     pub(crate) inner: Mutex<Inner>,
     pub(crate) regather: Notify,
-    republish: Notify,
+    pub(crate) republish: Notify,
     poll: Notify,
     cfg: Mutex<Option<Arc<ReachConfig>>>,
     /// The always-on contact we keep a session with ([`Node::set_anchor`]).
@@ -397,6 +401,36 @@ impl Node {
             self.rdv().poll.notify_one();
             self.rdv().handles.kick.notify_one();
         }
+    }
+
+    /// Tries to reach contact `peer` at the meeting points its record
+    /// names, unless that is under way already.
+    pub(crate) fn meet_contact(&self, peer: PublicIdentity) {
+        let points = {
+            let mut inner = lock(&self.rdv().inner);
+            if self.connected(&peer) || !inner.meeting_now.insert(peer) {
+                return;
+            }
+            inner.meet_at.get(&peer).cloned().unwrap_or_default()
+        };
+        let node = self.clone();
+        tokio::spawn(async move {
+            for m in &points {
+                if node.connected(&peer)
+                    || node.connect_meeting(peer.fingerprint(), m).await.is_ok()
+                {
+                    break;
+                }
+            }
+            lock(&node.rdv().inner).meeting_now.remove(&peer);
+        });
+    }
+
+    /// Publishes every record again at once (what they carry changed).
+    pub(crate) fn republish_all(&self) {
+        lock(&self.rdv().inner).published.clear();
+        self.rdv().republish.notify_one();
+        self.rdv().handles.kick.notify_one();
     }
 
     /// Tells rendezvous whether the app is in the foreground (contacts'
@@ -958,6 +992,7 @@ impl Node {
                     issued_ms: now,
                     flags,
                     seeking_until_ms: seeking,
+                    meetings: self.own_meetings(),
                 };
                 inner.published.insert(
                     peer,
@@ -1100,6 +1135,18 @@ impl Node {
                 continue;
             }
             let seeking = rec.seeking_until_ms.is_some_and(|t| t > now);
+            if !rec.meetings.is_empty() {
+                let both_symmetric = {
+                    let mut inner = lock(&self.rdv().inner);
+                    inner.meet_at.insert(peer, rec.meetings.clone());
+                    inner.symmetric && rec.flags & FLAG_SYMMETRIC != 0
+                };
+                // No punch gets through two symmetric NATs: straight to
+                // the meeting point (the punch still runs, in case).
+                if both_symmetric {
+                    self.meet_contact(peer);
+                }
+            }
             let newer = lock(&self.rdv().inner)
                 .seen
                 .get(&peer)
@@ -1296,6 +1343,11 @@ impl Node {
                 inner.seeking.remove(&peer);
             } else {
                 node.emit(Event::PunchFailed { peer });
+                // Where no punch gets through, a meeting point may.
+                if inner.meet_at.contains_key(&peer) {
+                    let node = node.clone();
+                    tokio::spawn(async move { node.meet_contact(peer) });
+                }
                 let fails = inner.backoff.get(&peer).map_or(0, |(n, _)| *n);
                 let wait = BACKOFF[fails.min(BACKOFF.len() - 1)];
                 inner
