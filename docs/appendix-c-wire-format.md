@@ -370,6 +370,7 @@ A backup leaves out:
 - **One-time prekeys,** ours (`prekeys`) and those we hold for contacts (`bundles`). A restored copy would let a sealed message that was already opened be opened again, or seal a second message to a prekey a contact already used. Fresh ones are made and handed out as sessions come up. Messages sealed to the lost device's prekeys can't be opened.
 - **Relay tokens** (`relay-wallet`, Appendix P), each of which can be spent once.
 - **Anonymous identities** (Appendix M). A backup would link them to the main identity.
+- **Disappearing messages**, expired or not, and what quotes of them keep. A backup can be read long after their time, with no timer to remove them. Before 1.0.1 they went in.
 - **Scheduled messages** (`scheduled`). A backup restored later must not send old messages, or send them a second time while the old device still runs. Restoring drops any that are pending on the device restored onto.
 - **Saved tunnel peers** (`tunnels`, Appendix D, *Persistence*). Their PSKs come from sessions with this device, so they never leave it.
 - **Received files' contents.** History keeps only where the app saved them.
