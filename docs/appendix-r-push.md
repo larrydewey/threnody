@@ -127,7 +127,7 @@ The project rule holds: the always-on connection, with cover traffic, stays the 
 
 ## Android
 
-- The setting *Wake up with UnifiedPush (no permanent notification)* under Privacy & Security is off by default. Turning it on explains the trade above, then asks the UnifiedPush connector library (`org.unifiedpush.android:connector`) for the user's default distributor. With none installed, it says so and stays off.
+- The setting *Wake up with UnifiedPush* under Settings → Connections is off by default. Turning it on explains the trade above, then asks the UnifiedPush connector library (`org.unifiedpush.android:connector`) for the user's default distributor. With none installed, it says so and stays off.
 - With an endpoint, the app stops its foreground service a minute after it goes to the background (not during a call), then shuts its nodes down and ends its process. Nothing runs until the next wake-up or until the user opens the app.
 - On a wake-up, the connector's `PushService` starts the foreground service in wake mode (a brief "Checking for messages" notification). That brings the nodes up, runs `wake_sync`, and sleeps again if the app is still in the background.
 - Turning the setting off unregisters the endpoint, withdraws it from contacts, and brings back the always-on service.

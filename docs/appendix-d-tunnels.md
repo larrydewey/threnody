@@ -48,7 +48,7 @@ Offers travel inside the authenticated ratchet, so only the genuine peer can set
 
 ### Userspace WireGuard (Android)
 
-Android gives apps no kernel WireGuard, so the node carries tunnels itself with `boringtun` (`threnody-net::wg_userspace`). The app's *WireGuard tunnels* setting (Network & Connectivity, off by default) asks for Android's VPN permission. It then opens a VPN interface with:
+Android gives apps no kernel WireGuard, so the node carries tunnels itself with `boringtun` (`threnody-net::wg_userspace`). The app's *WireGuard tunnels* setting (Settings → Connections, off by default) asks for Android's VPN permission. It then opens a VPN interface with:
 
 - the device's overlay address (`/128`);
 - a route for the overlay `/48` only, so no other traffic, IPv4 included, goes through it;
