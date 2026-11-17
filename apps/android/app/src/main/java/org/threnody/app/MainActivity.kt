@@ -1033,7 +1033,12 @@ class MainActivity : Activity() {
                 if (it) "When contacts can't relay for you, circuits go through volunteers from your directories"
                 else "Only your own contacts relay for you"
             }) { Privacy.setUseVolunteers(ctx, it) }
-            link("Relay directories") { DirectoryUi.show(ctx) }
+            toggle("I'm behind a VPN", { Privacy.meetingPoint(ctx) }, {
+                if (it) "Keeps a meeting point at a volunteer relay, so contacts reach you whatever NAT either of you is behind. " +
+                    "The relay sees this phone's address, not who you talk to"
+                else "A meeting point opens only when this network looks like it needs one"
+            }) { Privacy.setMeetingPoint(ctx, it) }
+            link("Relay directories", "Volunteer relays for circuits and meeting points") { DirectoryUi.show(ctx) }
             link("Always-on relay", "A contact that keeps you reachable when you move") { alwaysOnRelay() }
             toggle("WireGuard tunnels", { Privacy.tunnels(ctx) }, {
                 if (it) "Approved contacts get private network tunnels to this phone"

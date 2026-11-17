@@ -241,6 +241,7 @@ object Threnody {
         node.setSendReadReceipts(Privacy.sendReadReceipts(ctx))
         node.setReachInternet(Privacy.reachInternet(ctx))
         node.setUseVolunteers(Privacy.useVolunteers(ctx))
+        node.setMeetingPoint(Privacy.meetingPoint(ctx))
     }
 
     /** What a notification or the chat list says for a file. */
