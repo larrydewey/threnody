@@ -821,6 +821,7 @@ impl Core {
         // Never on metered networks; `set_metered` applies this again.
         node.set_auto_fetch_files(fetch && !persona && !self.metered.load(Ordering::Relaxed));
         node.set_use_volunteers(volunteers);
+        node.set_meeting_point(self.settings().opted_in(settings::MEETING));
         node.set_cover_traffic(self.cover_ms());
         node.set_pace_messages(self.settings().flag(settings::PACE));
         node.set_onion_first(onion);
@@ -1073,6 +1074,8 @@ impl Core {
                     if let Some(h) = homes.get(&id) {
                         keyring::delete(h);
                     }
+                    // And so would its port in our settings.
+                    self.settings().set_number(&format!("port_{id}"), None);
                     self.say(format!(
                         "* burned expired anonymous identity {}",
                         short(&id)
@@ -1184,10 +1187,14 @@ impl Core {
             .create_persona(label.into(), expires_ms, Some(pw.0.clone()))
             .map_err(|e| e.to_string())?;
         if let Err(e) = keyring::store(&PathBuf::from(&rec.home), &pw) {
-            // Nowhere to keep its key.
-            threnody_ffi::change_passphrase(rec.home.clone(), Some(pw.0.clone()), None)
-                .map_err(|e| e.to_string())?;
-            self.say(format!("! no keyring ({e}); its key is stored unprotected"));
+            // Nowhere to keep its key, and an anonymous identity whose key
+            // sits unprotected on disk is one anyone with the disk can be.
+            // It goes again rather than live that way.
+            let _ = self.main.burn_persona(rec.id.clone());
+            return Err(format!(
+                "No system keyring ({e}) to protect an anonymous identity's key with. \
+                 Start a keyring (GNOME Keyring, KWallet) and try again."
+            ));
         }
         self.open_persona(&rec)?;
         let _ = self.ui.send_blocking(UiEvent::PersonasChanged);
