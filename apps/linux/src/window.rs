@@ -2687,7 +2687,35 @@ impl App {
         if link.starts_with("threnody-link://") {
             return self.join_account(&link);
         }
-        self.toast("Connecting…");
+        // Finding someone can take a while (their app may be in the
+        // background): say what is going on rather than a short toast.
+        let handle = looks_like_handle(&link);
+        let dialog = ui::alert(
+            &if handle {
+                format!("Looking for {link}")
+            } else {
+                "Connecting".to_owned()
+            },
+            connect_stage(0, handle),
+            &[("hide", "Hide")],
+        );
+        dialog.present(Some(&self.window));
+        let started = std::time::Instant::now();
+        let shown = Rc::new(Cell::new(true));
+        dialog.connect_closed({
+            let shown = shown.clone();
+            move |_| shown.set(false)
+        });
+        glib::timeout_add_seconds_local(1, {
+            let (dialog, shown) = (dialog.clone(), shown.clone());
+            move || {
+                if !shown.get() {
+                    return glib::ControlFlow::Break;
+                }
+                dialog.set_body(connect_stage(started.elapsed().as_millis(), handle));
+                glib::ControlFlow::Continue
+            }
+        });
         let core = self.core.clone();
         let weak = Rc::downgrade(self);
         bg(
@@ -2706,6 +2734,9 @@ impl App {
                 Ok(peer)
             },
             move |r: Result<String, String>| {
+                if shown.get() {
+                    dialog.force_close();
+                }
                 let Some(this) = weak.upgrade() else { return };
                 match r {
                     Ok(peer) => {
@@ -4855,5 +4886,54 @@ mod tests {
             Some("Carol was added by Bob")
         );
         assert_eq!(role_notice(1), "You are now an admin");
+    }
+}
+
+/// Whether `target` reads as a handle (`name-code`) rather than a link or
+/// an address, as the Android app tells them apart.
+fn looks_like_handle(target: &str) -> bool {
+    let t = target.trim();
+    let t = t.strip_prefix('@').unwrap_or(t);
+    let name_then_dash = t.find(['-', ' ']).is_some_and(|i| {
+        i > 0
+            && t[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    });
+    !t.contains("://")
+        && !t.contains(':')
+        && name_then_dash
+        && t.chars().filter(|c| c.is_alphanumeric()).count() >= 9
+}
+
+/// What connecting to someone is likely doing `ms` in.
+fn connect_stage(ms: u128, handle: bool) -> &'static str {
+    match ms {
+        ms if ms < 4_000 && !handle => "Trying the addresses in the link…",
+        ms if ms < 12_000 => "Looking them up…",
+        ms if ms < 45_000 => {
+            "Waiting for them to answer. They need Threnody open, or opened in the last few minutes."
+        }
+        _ => {
+            "Still trying, through relays if need be. This can take up to two minutes; \
+             you can hide this and their chat opens when they answer."
+        }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[test]
+    fn handles_and_links_are_told_apart() {
+        assert!(looks_like_handle("@alice-7K3QM-2PX9A"));
+        assert!(looks_like_handle("alice 7k3qm2px9a"));
+        assert!(!looks_like_handle("threnody://ABCDEFGHJK@1.2.3.4:7450"));
+        assert!(!looks_like_handle("1.2.3.4:7450"));
+        assert!(!looks_like_handle("alice"));
+        assert_eq!(connect_stage(0, false), "Trying the addresses in the link…");
+        assert_eq!(connect_stage(0, true), "Looking them up…");
+        assert!(connect_stage(60_000, true).starts_with("Still trying"));
     }
 }
