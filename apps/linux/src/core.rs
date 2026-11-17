@@ -885,6 +885,21 @@ impl Core {
 
     /// The invite link for the main identity or a persona.
     pub fn invite(&self, persona: Option<&str>) -> Result<String, String> {
+        // An anonymous identity's invite carries no address, only its
+        // meeting point at a volunteer relay (Appendix N, section 6).
+        if let Some(id) = persona {
+            let node = self.node(Some(id))?;
+            // Asks for one if it has none yet, without waiting.
+            if !node.wait_meeting_point(0) {
+                return Err(
+                    "This anonymous identity can't be reached yet: it meets people at a \
+                     volunteer relay, and has none so far. Subscribe to a relay directory in \
+                     Preferences, or try again in a few seconds."
+                        .into(),
+                );
+            }
+            return Ok(node.invite_link(String::new()));
+        }
         let ip = Self::lan_ip();
         let (node, port) = match persona {
             None => (self.main.clone(), self.port),

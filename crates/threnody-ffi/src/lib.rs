@@ -1752,6 +1752,30 @@ impl ThrenodyNode {
         self.node.invite_link(addr).to_string()
     }
 
+    /// Waits up to `timeout_ms` for this node's meeting point at a
+    /// volunteer relay (Appendix N, section 6); true once it has one. An
+    /// anonymous identity's invite is usable only then, since it carries
+    /// no address. Blocks: call off the main thread.
+    pub fn wait_meeting_point(&self, timeout_ms: u64) -> bool {
+        let _guard = self.rt.enter();
+        self.node.kick_meeting();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while self.node.own_meetings().is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        true
+    }
+
+    /// Keeps a meeting point whatever this device's NAT looks like (for
+    /// someone who knows they're behind a VPN), or stops.
+    pub fn set_meeting_point(&self, on: bool) {
+        let _guard = self.rt.enter();
+        self.node.set_meeting_point(on);
+    }
+
     /// Makes invite links made so far stop finding this device once it
     /// moves (they keep only the addresses they carry).
     pub fn reset_invites(&self) {
