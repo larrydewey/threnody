@@ -23,6 +23,9 @@ async fn spawn(dir: &tempfile::TempDir, name: &str) -> N {
         tunnel_port: None,
     })
     .unwrap();
+    // These tests tell files apart by name, which metadata removal would
+    // make "photo.png" for every picture (delivery tests cover that).
+    node.set_strip_metadata(false);
     let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
     N { node, rx, addr }
 }

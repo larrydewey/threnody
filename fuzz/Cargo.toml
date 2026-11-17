@@ -50,6 +50,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "media"
+path = "fuzz_targets/media.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "nfc_card"
 path = "fuzz_targets/nfc_card.rs"
 test = false

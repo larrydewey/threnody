@@ -1124,7 +1124,8 @@ impl Node {
         (!p.title.is_empty() || !p.description.is_empty() || !p.image.is_empty()).then_some(p)
     }
 
-    /// Makes file contents ready to send: images lose their metadata
+    /// Makes file contents ready to send: images and videos (JPEG, PNG,
+    /// WebP, GIF, MP4/MOV and the like) lose their metadata
     /// unless that is switched off, and the size limit is checked. A photo
     /// whose metadata can't be removed (HEIC, AVIF, TIFF) is refused rather
     /// than sent with it; apps convert those to JPEG first.
@@ -1152,6 +1153,18 @@ impl Node {
         Ok(data)
     }
 
+    /// The name a file called `name` with contents `data` (as prepared)
+    /// goes under: a photo's, video's or sound's loses what the device
+    /// called it (`photo.jpg` for `PXL_20261117_143022123.jpg`) unless
+    /// metadata removal is off, as that name says when and on what it was
+    /// taken. Other files keep the names people gave them.
+    pub fn prepare_name(&self, name: String, data: &[u8]) -> String {
+        if !self.strip_metadata() {
+            return name;
+        }
+        threnody_core::media::neutral_name(&name, data).unwrap_or(name)
+    }
+
     /// Sends a file to `peer` (who must be reachable live: files aren't
     /// sealed for mailboxes) and records it in history, with
     /// `file.location`, where it lives on this device.
@@ -1167,6 +1180,7 @@ impl Node {
             forwarded,
         } = file;
         let data = self.prepare_file(data)?;
+        let name = self.prepare_name(name, &data);
         self.accept_contact(peer);
         let local_id = local_id();
         let size = data.len() as u64;

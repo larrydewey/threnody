@@ -74,16 +74,16 @@ pub fn is_image_name(name: String) -> bool {
 }
 
 /// Whether a picked image must be re-encoded (as JPEG) before sending so
-/// that it carries no metadata. The bytes decide first: JPEG, PNG and
-/// WebP (which the node strips) and GIF don't; HEIF/AVIF, TIFF (camera
-/// raw files included) and BMP do, whatever the file is called; any
+/// that it carries no metadata. The bytes decide first: JPEG, PNG, WebP
+/// and GIF (which the node strips) don't; HEIF/AVIF, TIFF and Canon CR3
+/// (camera raw files) and BMP do, whatever the file is called; any
 /// other ISO-BMFF file (a video or sound) is no image and doesn't. Bytes
 /// that say nothing leave it to the name. `head`: at least the first 32
 /// bytes.
 #[uniffi::export]
 pub fn image_needs_conversion(name: String, head: Vec<u8>) -> bool {
-    use threnody_core::media::{kind, needs_converting};
-    if kind(&head).is_some() || head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+    use threnody_core::media::{Kind, kind, needs_converting};
+    if matches!(kind(&head), Some(k) if k != Kind::Bmff) {
         return false;
     }
     // Every photo the node would refuse to send unconverted, at least.
@@ -92,9 +92,9 @@ pub fn image_needs_conversion(name: String, head: Vec<u8>) -> bool {
     }
     if head.len() >= 12 && &head[4..8] == b"ftyp" {
         /// Image brands of ISO-BMFF; anything else in it is video or sound.
-        const IMAGE: [&[u8; 4]; 12] = [
+        const IMAGE: [&[u8; 4]; 13] = [
             b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1",
-            b"msf1", b"avif", b"avis",
+            b"msf1", b"avif", b"avis", b"crx ",
         ];
         return IMAGE.iter().any(|b| &head[8..12] == *b);
     }
