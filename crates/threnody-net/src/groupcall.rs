@@ -64,13 +64,21 @@ struct Leg {
 struct GroupCall {
     info: GroupCallInfo,
     base: Zeroizing<[u8; 32]>,
+    /// Our salt for this time in the call: fresh for each `GroupCall`,
+    /// so a restart (or leaving and coming back) gives every leg new keys.
+    salt: [u8; 16],
+    /// Each participant's salt, as its `Start` or `Join` gave it (none
+    /// from a 1.0 peer).
+    salts: HashMap<PublicIdentity, Option<[u8; 16]>>,
     legs: HashMap<PublicIdentity, Leg>,
-    /// Keys of legs to participants who left, kept for the rest of the
-    /// call: a leg's keys come only from the call and the two devices, so
-    /// a leg built again for one who rejoins must carry on from where its
-    /// sequence numbers and replay window stood. Starting afresh reused
-    /// every nonce and let old packets in again.
-    retired: HashMap<PublicIdentity, MediaKeys>,
+    /// Keys of legs to participants who dropped out, with the salt they
+    /// were made with, kept for the rest of the call. One that comes back
+    /// with the same salt (its leg went silent, but it never left) carries
+    /// on from where the sequence numbers and replay window stood, which
+    /// matters most for 1.0 peers, whose legs have no salt at all: new
+    /// keys from the same inputs would reuse every nonce and let old
+    /// packets in again.
+    retired: HashMap<PublicIdentity, (Option<[u8; 16]>, MediaKeys)>,
     /// Who each participant says it has sessions with.
     links: HashMap<PublicIdentity, Vec<PublicIdentity>>,
     /// Our own links as we last told the others.
@@ -213,6 +221,8 @@ impl Node {
                 started_ms: now_ms(),
             },
             base: Zeroizing::new(base),
+            salt: threnody_core::crypto::random_bytes(),
+            salts: HashMap::new(),
             legs: HashMap::new(),
             retired: HashMap::new(),
             links: HashMap::new(),
@@ -224,14 +234,16 @@ impl Node {
         Ok(())
     }
 
-    /// `from` started group call `call` in `group`, keyed by `base`: it
-    /// rings here unless we're in a call. Returns whether it rings.
+    /// `from` started group call `call` in `group`, keyed by `base`, with
+    /// its `salt` (none from a 1.0 peer): it rings here unless we're in a
+    /// call. Returns whether it rings.
     pub fn group_call_rang(
         &self,
         group: [u8; 16],
         call: u64,
         from: PublicIdentity,
         base: [u8; 32],
+        salt: Option<[u8; 16]>,
         video: bool,
     ) -> bool {
         // A build without call media doesn't ring, as for a call with one
@@ -256,6 +268,8 @@ impl Node {
                 started_ms: now_ms(),
             },
             base: Zeroizing::new(base),
+            salt: threnody_core::crypto::random_bytes(),
+            salts: HashMap::from([(from, salt)]),
             legs: HashMap::new(),
             retired: HashMap::new(),
             links: HashMap::new(),
@@ -301,16 +315,29 @@ impl Node {
         Ok(())
     }
 
+    /// Our salt for group call `call` (fresh each time we take part), for
+    /// the group layer to send with `Start` and `Join`.
+    pub fn group_call_salt(&self, call: u64) -> Option<[u8; 16]> {
+        lock(&self.shared.group_calls)
+            .current
+            .as_ref()
+            .filter(|c| c.info.call == call)
+            .map(|c| c.salt)
+    }
+
     /// `device` is in call `call` (it joined, or answered our join), with
-    /// sessions to `links`. Returns whether it's new to us: then, if
-    /// we're in the call, the group layer answers it with our own `Join`,
-    /// so it learns of us even if our join reached it before the call did.
+    /// sessions to `links` and its `salt` (none from a 1.0 peer). Returns
+    /// whether it's new to us: then, if we're in the call, the group layer
+    /// answers it with our own `Join`, so it learns of us even if our join
+    /// reached it before the call did. A participant that joins again with
+    /// another salt (it restarted) counts as new, with a new leg.
     pub fn group_call_joined(
         &self,
         call: u64,
         device: PublicIdentity,
         video: bool,
         links: Vec<PublicIdentity>,
+        salt: Option<[u8; 16]>,
     ) -> bool {
         let me = self.identity();
         if device == me {
@@ -320,11 +347,29 @@ impl Node {
         let Some(c) = gc.current.as_mut().filter(|c| c.info.call == call) else {
             return false;
         };
-        c.links.insert(device, links);
+        c.links.insert(device, links.clone());
+        let known = c.salts.get(&device).copied();
         if let Some(p) = c.info.participants.iter_mut().find(|(p, _)| *p == device) {
             p.1 = video;
-            return false;
+            if known == Some(salt) {
+                return false;
+            }
+            // Back with another salt: whatever it had of the call is gone,
+            // and its old leg with it.
+            c.info.participants.retain(|(p, _)| *p != device);
+            c.legs.remove(&device);
+            c.salts.insert(device, salt);
+            let group = c.info.group;
+            drop(gc);
+            self.emit(Event::GroupCallMember {
+                group,
+                call,
+                device,
+                joined: false,
+            });
+            return self.group_call_joined(call, device, video, links, salt);
         }
+        c.salts.insert(device, salt);
         if c.info.participants.len() + usize::from(c.info.joined) >= MAX_GROUP_CALL {
             return false;
         }
@@ -361,7 +406,8 @@ impl Node {
         }
         c.info.participants.retain(|(p, _)| *p != device);
         if let Some(leg) = c.legs.remove(&device) {
-            c.retired.insert(device, leg.keys);
+            let salt = c.salts.get(&device).copied().flatten();
+            c.retired.insert(device, (salt, leg.keys));
         }
         c.links.remove(&device);
         let group = c.info.group;
@@ -652,9 +698,18 @@ impl Node {
 }
 
 fn add_leg(c: &mut GroupCall, me: &PublicIdentity, peer: PublicIdentity) {
-    let keys = c.retired.remove(&peer).unwrap_or_else(|| {
-        MediaKeys::for_leg(&c.base, c.info.call, me.as_bytes(), peer.as_bytes())
-    });
+    let theirs = c.salts.get(&peer).copied().flatten();
+    let retired = c.retired.remove(&peer).filter(|(s, _)| *s == theirs);
+    let keys = match retired {
+        Some((_, keys)) => keys,
+        None => MediaKeys::for_leg(
+            &c.base,
+            c.info.call,
+            me.as_bytes(),
+            peer.as_bytes(),
+            theirs.as_ref().map(|t| (&c.salt, t)),
+        ),
+    };
     let (tx, rx) = mpsc::channel(MEDIA_QUEUE);
     c.legs.insert(
         peer,

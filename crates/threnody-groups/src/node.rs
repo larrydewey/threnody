@@ -1187,6 +1187,7 @@ impl GroupNode {
                 call,
                 video,
                 secret,
+                salt: node.group_call_salt(call),
             },
             None,
         )?;
@@ -1206,7 +1207,12 @@ impl GroupNode {
         self.send_call(
             node,
             &group,
-            &GroupCallMsg::Join { call, video, links },
+            &GroupCallMsg::Join {
+                call,
+                video,
+                links,
+                salt: node.group_call_salt(call),
+            },
             None,
         )
     }
@@ -1357,12 +1363,19 @@ impl GroupNode {
                 .collect()
         };
         match msg {
-            GroupCallMsg::Start { video, secret, .. } if !ours => {
-                node.group_call_rang(group, call, from, secret, video);
+            GroupCallMsg::Start {
+                video,
+                secret,
+                salt,
+                ..
+            } if !ours => {
+                node.group_call_rang(group, call, from, secret, salt, video);
             }
             GroupCallMsg::Start { .. } => {}
-            GroupCallMsg::Join { video, links, .. } => {
-                let new = node.group_call_joined(call, from, video, devices(links));
+            GroupCallMsg::Join {
+                video, links, salt, ..
+            } => {
+                let new = node.group_call_joined(call, from, video, devices(links), salt);
                 // A newcomer may have missed that we're in: say so, to it.
                 if let Some(c) = node
                     .group_call()
@@ -1372,6 +1385,7 @@ impl GroupNode {
                         call,
                         video: c.video,
                         links: self::links(node, call, false),
+                        salt: node.group_call_salt(call),
                     };
                     let _ = self.send_call(node, &group, &join, Some(&from));
                 }

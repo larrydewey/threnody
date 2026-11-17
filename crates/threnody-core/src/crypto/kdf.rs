@@ -47,6 +47,7 @@ pub mod label {
     pub const CALL_DIRECTION: &str = "threnody v1 2026-10-08 call media direction key";
     pub const GROUP_CALL_LEG: &str = "threnody v1 2026-11-05 group call leg";
     pub const GROUP_CALL_LEG_ID: &str = "threnody v1 2026-11-05 group call leg id";
+    pub const GROUP_CALL_LEG_SALTED: &str = "threnody v1 2026-11-17 group call leg salted";
     pub const HISTORY_NAME_KEY: &str = "threnody v1 2026-11-05 history file name key";
     pub const HISTORY_FILE_NAME: &str = "threnody v1 2026-11-05 history file name";
     pub const TAP_TRANSCRIPT: &str = "threnody v1 2026-11-05 nfc tap transcript";

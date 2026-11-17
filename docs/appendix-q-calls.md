@@ -97,14 +97,16 @@ Group call messages travel as group content kind 9 (Appendix F), inside the grou
 
 ```
 GroupCallMsg = { 0: op, 1: call uint, ? 2: device bstr(32), ? 3: flags uint,
-                 ? 4: data bstr, ? 5: secret bstr(32), ? 6: links [* bstr(32)] }
-op: 1 start (flags, secret), 2 join (flags, links), 3 leave,
+                 ? 4: data bstr, ? 5: secret bstr(32), ? 6: links [* bstr(32)],
+                 ? 7: salt bstr(16) }
+op: 1 start (flags, secret, salt), 2 join (flags, links, salt), 3 leave,
     4 leg (device = to, data ≤ 64 KiB), 6 update (flags, links)
 flags: 1 = video
 ```
 
 - **Start.** The starter picks a random non-zero call id and a fresh 32-byte call secret. It rings every other member's devices, except the starter's own other devices. The call secret goes only inside the group's encryption and isn't tied to the group's epoch, so members at different epochs still agree on it.
 - **Join and leave.** These keep everyone's roster. A member who sees a join from someone new, while in the call itself, answers with its own `join` to that member alone. A joiner therefore learns everyone already in the call, even when someone's join reached it before the call's start did. A call rings for 60 s, then stops ringing (the call goes on). With no session to a member, call messages go through another member that has one (Appendix F forwarding), but they are never held or sealed for later, since a call can't wait.
+- **Salt.** `start` and `join` carry the sender's **salt**: 16 random bytes, fresh each time a device takes part in a call (when it starts the call, or is rung by it). Its legs' keys depend on it, so a device that restarts and rejoins the same call gets new leg keys rather than starting its sequence numbers, and so its nonces, over again under old ones. A `join` from a participant with a different salt from the one it had means it lost the call: its old leg is dropped, and it counts as new. Version 1.0 sends no salt; a leg to such a device is keyed without salts, as before.
 - **Links.** `join` and `update` carry the sender's **links**: the participants it has a live session with. A participant sends an `update` whenever its links change. Links say who can carry a leg for whom.
 - **Leg signalling.** Session descriptions and ICE candidates for the leg between A and B go over A and B's own ratchet when they have a session (`CallMsg::Signal` under the leg's id). Otherwise they go in a group message addressed to B alone (op 4). Either way they never pass through a relay as anything it could change, so no relay can stand in the middle of a leg's DTLS.
 - **The hub.** The participant linked to the most others (ties: the smaller key) is shown as the call's hub. It carries the most legs, but nothing depends on agreeing who it is.
@@ -116,8 +118,12 @@ flags: 1 = video
 ```
 leg id   = first 8 bytes of KDF("group call leg id", call id, min(key_A, key_B), max(key_A, key_B)), never 0
 leg keys = MediaKeys(leg id, s, s, caller = A < B),
-           s = KDF("group call leg", call secret, call id, min(key_A, key_B), max(key_A, key_B))
+           s = KDF("group call leg salted", call secret, call id, min(key_A, key_B), max(key_A, key_B),
+                   salt of min, salt of max)
+           (1.0 peers, without salts: s = KDF("group call leg", call secret, call id, min, max))
 ```
+
+A leg whose peer drops out (it left, or its media went silent for 30 s) keeps its keys, sequence numbers and replay window for the rest of the call. When that peer comes back with the same salt, its leg carries on from where they stood.
 
 The device with the smaller key makes the WebRTC offer, and counts as the leg's caller for its direction keys. Packets use the format above, with the leg id where a call id goes.
 

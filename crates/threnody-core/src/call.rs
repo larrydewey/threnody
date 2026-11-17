@@ -297,14 +297,19 @@ pub fn valid_reaction(emoji: &str) -> bool {
 ///
 /// ```text
 /// GroupCallMsg = { 0: op, 1: call uint, ? 2: device bstr(32), ? 3: flags uint,
-///                  ? 4: data bstr, ? 5: secret bstr(32), ? 6: links [* bstr(32)] }
-/// op: 1 start (flags, secret), 2 join (flags, links), 3 leave,
+///                  ? 4: data bstr, ? 5: secret bstr(32), ? 6: links [* bstr(32)],
+///                  ? 7: salt bstr(16) }
+/// op: 1 start (flags, secret, salt), 2 join (flags, links, salt), 3 leave,
 ///     4 leg (device = to, data), 6 update (flags, links)
 /// flags: 1 = video
 /// ```
 ///
 /// `links` are the participants the sender has a session with: any of
-/// them can pass on a leg the sender can't carry itself.
+/// them can pass on a leg the sender can't carry itself. `salt` is fresh
+/// each time the sender takes part in the call (start or join), and goes
+/// into its legs' keys ([`MediaKeys::for_leg`]), so a device that rejoins
+/// after a restart never seals under keys it used before. 1.0 peers send
+/// none.
 #[derive(Clone, PartialEq, Eq)]
 pub enum GroupCallMsg {
     /// The sender started call `call`. `secret` keys its legs
@@ -315,6 +320,7 @@ pub enum GroupCallMsg {
         call: u64,
         video: bool,
         secret: [u8; 32],
+        salt: Option<[u8; 16]>,
     },
     /// The sender is in the call (it joined, or answers someone who just
     /// joined), with sessions to `links`.
@@ -322,6 +328,7 @@ pub enum GroupCallMsg {
         call: u64,
         video: bool,
         links: Vec<[u8; 32]>,
+        salt: Option<[u8; 16]>,
     },
     Leave {
         call: u64,
@@ -347,7 +354,9 @@ impl std::fmt::Debug for GroupCallMsg {
         // Never log the secret, nor the leg's session descriptions.
         match self {
             Self::Start { call, video, .. } => write!(f, "Start({call:x}, video={video})"),
-            Self::Join { call, video, links } => {
+            Self::Join {
+                call, video, links, ..
+            } => {
                 write!(f, "Join({call:x}, video={video}, {} links)", links.len())
             }
             Self::Leave { call } => write!(f, "Leave({call:x})"),
@@ -390,15 +399,29 @@ impl GroupCallMsg {
                     call,
                     video,
                     secret,
+                    salt,
                 } => {
-                    e.map_len(4)?.u8(0)?.u8(1)?.u8(1)?.u64(*call)?;
+                    e.map_len(4 + usize::from(salt.is_some()))?;
+                    e.u8(0)?.u8(1)?.u8(1)?.u64(*call)?;
                     e.u8(3)?.u64(flags(*video))?;
                     e.u8(5)?.bytes(secret)?;
+                    if let Some(s) = salt {
+                        e.u8(7)?.bytes(s)?;
+                    }
                 }
-                Self::Join { call, video, links } => {
-                    e.map_len(4)?.u8(0)?.u8(2)?.u8(1)?.u64(*call)?;
+                Self::Join {
+                    call,
+                    video,
+                    links,
+                    salt,
+                } => {
+                    e.map_len(4 + usize::from(salt.is_some()))?;
+                    e.u8(0)?.u8(2)?.u8(1)?.u64(*call)?;
                     e.u8(3)?.u64(flags(*video))?;
                     put_links(e, links)?;
+                    if let Some(s) = salt {
+                        e.u8(7)?.bytes(s)?;
+                    }
                 }
                 Self::Leave { call } => {
                     e.map_len(2)?.u8(0)?.u8(3)?.u8(1)?.u64(*call)?;
@@ -420,7 +443,7 @@ impl GroupCallMsg {
     pub fn decode(b: &[u8]) -> Result<Self> {
         let mut dec = Decoder::new(b);
         let (mut op, mut call, mut device, mut flags, mut data) = (None, None, None, 0, None);
-        let (mut secret, mut links) = (None, Vec::new());
+        let (mut secret, mut links, mut salt) = (None, Vec::new(), None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => op = Some(d.u8()?),
@@ -429,6 +452,7 @@ impl GroupCallMsg {
                 3 => flags = d.u64()?,
                 4 => data = Some(d.bytes()?.to_vec()),
                 5 => secret = Some(fixed_bytes::<32>(d)?),
+                7 => salt = Some(fixed_bytes::<16>(d)?),
                 6 => {
                     for _ in 0..d.array_len()? {
                         let l = fixed_bytes::<32>(d)?;
@@ -453,8 +477,14 @@ impl GroupCallMsg {
                 call,
                 video,
                 secret: required(secret, "group call secret")?,
+                salt,
             },
-            2 => Self::Join { call, video, links },
+            2 => Self::Join {
+                call,
+                video,
+                links,
+                salt,
+            },
             3 => Self::Leave { call },
             4 => {
                 let data = required(data, "group call leg")?;
@@ -546,14 +576,37 @@ impl MediaKeys {
     }
 
     /// Keys for the leg between us (`me`) and `peer` in group call
-    /// `call`, from the group's exporter secret for the call (`base`).
-    /// The side with the smaller key counts as the caller.
-    pub fn for_leg(base: &[u8; 32], call: u64, me: &[u8; 32], peer: &[u8; 32]) -> Self {
+    /// `call`, from the call's secret (`base`) and, when both sides sent
+    /// one, each side's salt for this time in the call (`salts`: ours,
+    /// then the peer's). The side with the smaller key counts as the
+    /// caller.
+    ///
+    /// Without both salts (a 1.0 peer) the keys come from the call and
+    /// the two devices alone, so a device that rejoins after a restart
+    /// would start its sequence numbers, and so its nonces, over again
+    /// under the same key.
+    pub fn for_leg(
+        base: &[u8; 32],
+        call: u64,
+        me: &[u8; 32],
+        peer: &[u8; 32],
+        salts: Option<(&[u8; 16], &[u8; 16])>,
+    ) -> Self {
         let (lo, hi) = if me <= peer { (me, peer) } else { (peer, me) };
-        let secret: Zeroizing<[u8; 32]> = Zeroizing::new(kdf::derive(
-            label::GROUP_CALL_LEG,
-            &[base, &call.to_be_bytes(), lo, hi],
-        ));
+        let secret: Zeroizing<[u8; 32]> = Zeroizing::new(match salts {
+            Some((mine, theirs)) => {
+                let (s_lo, s_hi) = if me <= peer {
+                    (mine, theirs)
+                } else {
+                    (theirs, mine)
+                };
+                kdf::derive(
+                    label::GROUP_CALL_LEG_SALTED,
+                    &[base, &call.to_be_bytes(), lo, hi, s_lo, s_hi],
+                )
+            }
+            None => kdf::derive(label::GROUP_CALL_LEG, &[base, &call.to_be_bytes(), lo, hi]),
+        });
         Self::new(leg_id(call, me, peer), &secret, &secret, me < peer)
     }
 
@@ -767,16 +820,25 @@ mod tests {
                 call: 5,
                 video: true,
                 secret: [4; 32],
+                salt: Some([8; 16]),
+            },
+            GroupCallMsg::Start {
+                call: 5,
+                video: false,
+                secret: [4; 32],
+                salt: None,
             },
             GroupCallMsg::Join {
                 call: 5,
                 video: false,
                 links: vec![[1; 32], [6; 32]],
+                salt: Some([5; 16]),
             },
             GroupCallMsg::Join {
                 call: 5,
                 video: true,
                 links: vec![],
+                salt: None,
             },
             GroupCallMsg::Leave { call: 5 },
             GroupCallMsg::Leg {
@@ -810,17 +872,29 @@ mod tests {
         assert_eq!(leg_id(7, &a, &b), leg_id(7, &b, &a));
         assert_ne!(leg_id(7, &a, &b), leg_id(7, &a, &c));
         assert_ne!(leg_id(7, &a, &b), leg_id(8, &a, &b));
-        let mut ab = MediaKeys::for_leg(&base, 7, &a, &b);
-        let mut ba = MediaKeys::for_leg(&base, 7, &b, &a);
+        let mut ab = MediaKeys::for_leg(&base, 7, &a, &b, None);
+        let mut ba = MediaKeys::for_leg(&base, 7, &b, &a, None);
         assert_eq!(ab.call(), leg_id(7, &a, &b));
         let p = ab.seal(0, b"hi").unwrap();
         assert_eq!(ba.open(&p).unwrap(), (0, b"hi".to_vec()));
         assert_eq!(ab.open(&ba.seal(0, b"yo").unwrap()).unwrap().1, b"yo");
         // Another leg, or another call's base, can't open it.
-        let mut ac = MediaKeys::for_leg(&base, 7, &c, &a);
+        let mut ac = MediaKeys::for_leg(&base, 7, &c, &a, None);
         assert!(ac.open(&ab.seal(0, b"x").unwrap()).is_err());
-        let mut other = MediaKeys::for_leg(&[8; 32], 7, &b, &a);
+        let mut other = MediaKeys::for_leg(&[8; 32], 7, &b, &a, None);
         assert!(other.open(&ab.seal(0, b"x").unwrap()).is_err());
+        // Salted: both sides agree whichever asks, and a new salt (a
+        // rejoin after a restart) gives keys the old ones can't open.
+        let (sa, sb, sb2) = ([1; 16], [2; 16], [3; 16]);
+        let mut ab = MediaKeys::for_leg(&base, 7, &a, &b, Some((&sa, &sb)));
+        let mut ba = MediaKeys::for_leg(&base, 7, &b, &a, Some((&sb, &sa)));
+        assert_eq!(ba.open(&ab.seal(0, b"s").unwrap()).unwrap().1, b"s");
+        assert_eq!(ab.open(&ba.seal(0, b"t").unwrap()).unwrap().1, b"t");
+        let mut fresh = MediaKeys::for_leg(&base, 7, &b, &a, Some((&sb2, &sa)));
+        let mut ab_old = MediaKeys::for_leg(&base, 7, &a, &b, Some((&sa, &sb)));
+        assert!(ab_old.open(&fresh.seal(0, b"u").unwrap()).is_err());
+        let mut legacy = MediaKeys::for_leg(&base, 7, &b, &a, None);
+        assert!(ab_old.open(&legacy.seal(0, b"v").unwrap()).is_err());
         // The hub's wrapper.
         let w = wrap_relayed(&c, &p);
         assert_eq!(unwrap_relayed(&w), Some((c, &p[..])));
