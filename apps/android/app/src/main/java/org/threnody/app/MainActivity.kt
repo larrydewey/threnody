@@ -1775,7 +1775,23 @@ class MainActivity : Activity() {
         val n = node ?: return
         val handle = !target.contains("://") && Regex("^@?[A-Za-z0-9_.]+[- ]").containsMatchIn(target) &&
             target.count { it.isLetterOrDigit() } >= 9 && !target.contains(':')
-        Toast.makeText(this, if (handle) "Looking for $target… (up to two minutes)" else "Connecting…", Toast.LENGTH_SHORT).show()
+        // Finding someone can take a while (their app may be in the
+        // background): say what is going on rather than a two-second toast.
+        val status = label(connectStage(0, handle), maxLines = 4)
+        val dialog = SecureBuilder(this)
+            .setTitle(if (handle) "Looking for $target" else "Connecting")
+            .setView(padded(status))
+            .setNegativeButton("Hide") { _, _ -> }
+            .show()
+        val started = android.os.SystemClock.elapsedRealtime()
+        val ticker = object : Runnable {
+            override fun run() {
+                if (!dialog.isShowing) return
+                status.text = connectStage(android.os.SystemClock.elapsedRealtime() - started, handle)
+                status.postDelayed(this, 1000)
+            }
+        }
+        status.postDelayed(ticker, 1000)
         Threading.background {
             try {
                 if (expect) n.expectContact(target, null)
@@ -1784,11 +1800,26 @@ class MainActivity : Activity() {
                     try { n.setName(peer, name) } catch (e: Exception) { Threnody.say("! naming a contact: ${e.message}") }
                 }
                 val key = Threnody.key(n.contacts(), peer)
-                runOnUiThread { openChat(key, peer) }
+                runOnUiThread {
+                    dialog.dismiss()
+                    openChat(key, peer)
+                }
             } catch (e: Exception) {
-                runOnUiThread { failed("Couldn't connect: ${e.message}") }
+                runOnUiThread {
+                    dialog.dismiss()
+                    failed("Couldn't connect: ${e.message}")
+                }
             }
         }
+    }
+
+    /** What connecting to someone is likely doing `ms` in. */
+    private fun connectStage(ms: Long, handle: Boolean): String = when {
+        ms < 4_000 && !handle -> "Trying the addresses in the link\u2026"
+        ms < 12_000 -> "Looking them up\u2026"
+        ms < 45_000 -> "Waiting for them to answer. They need Threnody open, or opened in the last few minutes."
+        else -> "Still trying, through relays if need be. This can take up to two minutes; " +
+            "you can hide this and their chat opens when they answer."
     }
 
     private fun joinAccount(prefill: String?) {
