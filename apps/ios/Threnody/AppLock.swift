@@ -14,7 +14,10 @@ import UIKit
 final class AppLock: ObservableObject {
     static let shared = AppLock()
 
-    @Published private(set) var locked: Bool
+    @Published private(set) var locked: Bool {
+        // Decrypted copies of sealed files (QuickLook, Share) go when it locks.
+        didSet { if locked && !oldValue { Media.wipePlain() } }
+    }
     /// The settings once read (nil until then, or when unreadable).
     @Published private(set) var settings: LockSettings?
     /// The lock file is there but can't be read: stay locked, offer erasing.
