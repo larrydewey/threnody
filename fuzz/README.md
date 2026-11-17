@@ -10,6 +10,7 @@ cargo +nightly fuzz run app_message
 cargo +nightly fuzz run credential     # credential messages, presentations, relay tokens
 cargo +nightly fuzz run directory      # directory messages, documents, descriptors, EXTEND cells
 cargo +nightly fuzz run nfc_card       # NFC tap APDUs, card and reader sides (Appendix T)
+cargo +nightly fuzz run media          # metadata removal from photos and videos (JPEG, PNG, WebP, GIF, MP4/MOV)
 ```
 
 On stable Rust, `crates/threnody-core/src/robustness.rs` runs a seeded mutation test over the same parsers as part of `cargo test`.
