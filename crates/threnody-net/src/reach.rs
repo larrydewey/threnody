@@ -54,6 +54,13 @@ const WANT_FOR: Duration = Duration::from_secs(20 * 60);
 /// polls every [`ReachConfig::poll_seeking`], so this covers a poll, a
 /// read and a write with room to spare.
 const ANSWER_FOR: Duration = Duration::from_secs(60);
+/// A probe carries no source we can check: one captured on the way and
+/// sent again from a forged address made us punch toward that address
+/// for a minute, about 500 times what it cost. So a probe starts a punch
+/// toward a peer at most this often (unless we seek it), and adds at most
+/// [`MAX_PROBED_TARGETS`] new addresses to one under way.
+const PROBED_EVERY: Duration = Duration::from_secs(120);
+const MAX_PROBED_TARGETS: usize = 2;
 /// With "hide when I send" on, how long at most a seek waits before it
 /// republishes our record (see [`Node::seek`]).
 const SEEK_JITTER: Duration = Duration::from_secs(60);
@@ -229,6 +236,9 @@ pub(crate) struct Inner {
     backoff: HashMap<PublicIdentity, (usize, Instant)>,
     /// When we last started punching each contact (ms).
     last_punch: HashMap<PublicIdentity, u64>,
+    /// When a recognised probe last started a punch, per peer (see
+    /// [`PROBED_EVERY`]).
+    probed: HashMap<PublicIdentity, Instant>,
     /// Publishing rounds in a row where every write failed.
     put_failures: u32,
     /// DHT nodes to ping for our outside address, resolved and kept, so a
@@ -846,7 +856,24 @@ impl Node {
         // Global IPv6 addresses peers see us at: the one the OS sends from
         // can differ from the route's preferred one (a temporary address),
         // and with no NAT in the way each is worth offering.
-        for a in seen.iter().filter(|a| is_global_v6(&a.ip())).take(2) {
+        // Only one an approved contact reports, two DHT nodes agree on, or
+        // in the /64 of an address of our own: a single DHT node could
+        // otherwise add any address, as for IPv4 (section 2).
+        let ours: Vec<IpAddr> = list.iter().map(|c| c.addr.ip()).collect();
+        let same_64 = |a: &IpAddr, b: &IpAddr| match (a, b) {
+            (IpAddr::V6(a), IpAddr::V6(b)) => a.segments()[..4] == b.segments()[..4],
+            _ => false,
+        };
+        let trusted = |a: &SocketAddr| {
+            observed.iter().any(|o| o.ip() == a.ip())
+                || reported.iter().filter(|r| r.ip() == a.ip()).count() >= 2
+                || ours.iter().any(|o| same_64(o, &a.ip()))
+        };
+        for a in seen
+            .iter()
+            .filter(|a| is_global_v6(&a.ip()) && trusted(a))
+            .take(2)
+        {
             list.push(Candidate {
                 kind: CandidateKind::Ipv6,
                 addr: SocketAddr::new(a.ip(), port),
@@ -1442,7 +1469,11 @@ impl Node {
             Some(p) => {
                 // Where the probe came from is a path that works (with a
                 // symmetric NAT, the only one): try it first.
-                let new = {
+                let room = {
+                    let h = lock(&p.heard_from);
+                    h.contains(&src) || h.len() < MAX_PROBED_TARGETS
+                };
+                let new = room && {
                     let mut t = lock(&p.targets);
                     let new = !t.contains(&src);
                     if new {
@@ -1451,7 +1482,7 @@ impl Node {
                     }
                     new
                 };
-                {
+                if room {
                     let mut h = lock(&p.heard_from);
                     if !h.contains(&src) {
                         h.insert(0, src);
@@ -1466,6 +1497,19 @@ impl Node {
                 p.heard.notify_one();
             }
             None => {
+                {
+                    let mut inner = lock(&self.rdv().inner);
+                    let seeking = inner.seeking.get(&peer).is_some_and(|t| *t > now_ms());
+                    let recent = inner
+                        .probed
+                        .get(&peer)
+                        .is_some_and(|t| t.elapsed() < PROBED_EVERY);
+                    if recent && !seeking {
+                        return;
+                    }
+                    inner.probed.retain(|_, t| t.elapsed() < PROBED_EVERY);
+                    inner.probed.insert(peer, Instant::now());
+                }
                 self.punch(
                     peer,
                     &[Candidate {
