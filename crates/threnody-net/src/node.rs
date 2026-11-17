@@ -548,9 +548,18 @@ impl Route {
 /// How long a replaced session lingers (see `spawn_session`).
 const REPLACED_GRACE: Duration = Duration::from_secs(2);
 
+/// Messages a session may have waiting to go out, queued and pending
+/// together. Past it, a contact's session ends (what it was owed is kept
+/// and resent with the next one), so a contact that stops reading, or
+/// asks for answers faster than the link's ticks carry them, can't grow
+/// our memory without end. Our own devices (history sync) are exempt.
+pub const MAX_BACKLOG: usize = 4096;
+
 struct SessionHandle {
     id: u64,
     tx: mpsc::UnboundedSender<AppMessage>,
+    /// Messages in `tx` the session hasn't taken yet.
+    queued: Arc<AtomicUsize>,
     info: SessionInfo,
     /// The QUIC connection under a QUIC session, for call media datagrams.
     datagrams: Option<quinn::Connection>,
@@ -1738,6 +1747,13 @@ impl Node {
         } else {
             msg
         };
+        // A session that stopped taking what we queue (its peer doesn't
+        // read): refused, not kept. A tracked message stays for the next
+        // session.
+        if h.queued.load(Ordering::Relaxed) >= MAX_BACKLOG && !self.is_own_device(peer) {
+            return Err(NetError::Closed);
+        }
+        h.queued.fetch_add(1, Ordering::Relaxed);
         h.tx.send(msg).map_err(|_| NetError::Closed)
     }
 
@@ -2067,7 +2083,9 @@ impl Node {
             remote,
         };
         // Whatever the last session didn't get acknowledged goes first.
+        let queued = Arc::new(AtomicUsize::new(0));
         for m in lock(&self.shared.delivery).resend(&peer) {
+            queued.fetch_add(1, Ordering::Relaxed);
             let _ = tx.send(m);
         }
         // A newer session to the same peer replaces the old one; dropping
@@ -2088,6 +2106,7 @@ impl Node {
             SessionHandle {
                 id,
                 tx,
+                queued: queued.clone(),
                 info,
                 datagrams,
                 heard_ms: heard_ms.clone(),
@@ -2128,7 +2147,8 @@ impl Node {
         let started = tokio::time::Instant::now();
         tokio::spawn(async move {
             let result = run_session(
-                &node, stream, chan, addr, via, over, conn, rx, outbound, stranger, heard_ms,
+                &node, stream, chan, addr, via, over, conn, rx, queued, outbound, stranger,
+                heard_ms,
             )
             .await;
             // Closed on purpose (either side) is not a loss to repair.
@@ -2191,6 +2211,7 @@ async fn run_session<S>(
     over: Over,
     conn: Option<quinn::Connection>,
     mut outbox: mpsc::UnboundedReceiver<AppMessage>,
+    queued: Arc<AtomicUsize>,
     outbound: bool,
     mut stranger_pass: Option<StrangerPass>,
     heard_ms: Arc<AtomicU64>,
@@ -2311,6 +2332,11 @@ where
     }
     let result: Result<()> = async {
         loop {
+            if pending.len() + queued.load(Ordering::Relaxed) > MAX_BACKLOG
+                && !node.is_own_device(&peer)
+            {
+                return Err(NetError::Refused("too much waiting to go to the peer".into()));
+            }
             // Accepted (or approved) meanwhile: a stranger no more.
             if stranger && !node.is_stranger(&peer) {
                 stranger = false;
@@ -2737,6 +2763,9 @@ where
                     }
                 }
                 out = outbox.recv() => {
+                    if out.is_some() {
+                        queued.fetch_sub(1, Ordering::Relaxed);
+                    }
                     // Our own revocation on its way out: what this session
                     // set up under mutual approval (tunnel offer, discovery
                     // key, prekeys, push) is set up afresh if it returns,

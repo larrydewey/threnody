@@ -391,3 +391,36 @@ async fn fresh_identities_cannot_grow_the_contact_book_without_bound() {
     );
     bob.shutdown();
 }
+
+/// A session with more waiting to go out than `MAX_BACKLOG` (a contact
+/// asking for answers faster than cover ticks carry them, or not reading
+/// at all) ends rather than hold it all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_too_far_behind_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx) = node(&dir, "alice");
+    let (bob, _brx) = node(&dir, "bob");
+    // A tick every 10 s: almost nothing leaves.
+    alice.set_constant_rate(Some(Duration::from_secs(10)));
+    let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
+    let bi = alice
+        .connect(&addr, Some(bob.identity().fingerprint()))
+        .await
+        .unwrap();
+    assert!(until(5, || has(&alice, &bob)).await);
+    let mut refused = false;
+    for _ in 0..threnody_net::node::MAX_BACKLOG + 64 {
+        if alice
+            .send(&bi, AppMessage::Typing { active: true })
+            .is_err()
+        {
+            refused = true;
+            break;
+        }
+    }
+    assert!(
+        refused || until(5, || !has(&alice, &bob)).await,
+        "the backlog is refused or the session ends"
+    );
+    assert!(until(5, || !has(&alice, &bob)).await, "the session ended");
+}
