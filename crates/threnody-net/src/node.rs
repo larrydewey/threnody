@@ -879,8 +879,12 @@ impl Node {
                 chain
             }
         };
-        let deposit_key = match cfg.home.load_state(&cfg.identity, crate::mailbox::DEPOSIT_KEY_STATE)? {
-            Some(b) if b.len() == 32 => <[u8; 32]>::try_from(b.as_slice()).unwrap_or_else(|_| threnody_core::crypto::random_bytes()),
+        let deposit_key = match cfg
+            .home
+            .load_state(&cfg.identity, crate::mailbox::DEPOSIT_KEY_STATE)?
+        {
+            Some(b) if b.len() == 32 => <[u8; 32]>::try_from(b.as_slice())
+                .unwrap_or_else(|_| threnody_core::crypto::random_bytes()),
             _ => {
                 let k: [u8; 32] = threnody_core::crypto::random_bytes();
                 cfg.home

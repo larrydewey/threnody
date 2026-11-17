@@ -405,7 +405,13 @@ impl Node {
         let msg = AppMessage::Account(m);
         let live: HashSet<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
         let me = self.identity();
-        let siblings = self.account().state().devices.iter().map(|(d, _)| *d).collect::<Vec<_>>();
+        let siblings = self
+            .account()
+            .state()
+            .devices
+            .iter()
+            .map(|(d, _)| *d)
+            .collect::<Vec<_>>();
         let contacts: Vec<PublicIdentity> = self
             .contacts()
             .iter()
@@ -855,10 +861,9 @@ impl Node {
         let matched = {
             let mut st = lock(&self.shared.linking);
             st.codes.retain(|(_, t)| t.elapsed() < LINK_CODE_TTL);
-            let pos = st
-                .codes
-                .iter()
-                .position(|(c, _)| link_proof(&c.secret, &session_id, &from) == proof);
+            let pos = st.codes.iter().position(|(c, _)| {
+                threnody_core::crypto::ct_eq(&link_proof(&c.secret, &session_id, &from), &proof)
+            });
             pos.map(|p| st.codes.remove(p))
         };
         if matched.is_none() || self.is_revoked(&from) || self.shared.persona {

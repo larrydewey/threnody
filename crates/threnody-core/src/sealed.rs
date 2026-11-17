@@ -46,12 +46,16 @@ impl KdfParams {
         lanes: 1,
     };
 
-    /// Upper bounds accepted when opening, so a tampered file cannot make
-    /// us allocate unbounded memory or spin for hours.
+    /// Upper bounds accepted when opening, so a tampered file (a backup
+    /// someone handed over, say) cannot make us allocate much memory or
+    /// spin for long: four times [`Self::DEFAULT`]'s memory and a little
+    /// over twice its passes, which a phone still survives. Nothing this
+    /// code writes comes near them. (Before 1.0.1 the cap was 1 GiB and
+    /// 32 passes, enough to kill a phone app on restore.)
     const MAX: Self = Self {
-        m_kib: 1024 * 1024,
-        t: 32,
-        lanes: 16,
+        m_kib: 256 * 1024,
+        t: 8,
+        lanes: 8,
     };
 
     pub(crate) fn derive(&self, passphrase: &[u8], salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {

@@ -772,10 +772,7 @@ impl Node {
                     .get(&up)
                     .map(|h| h.keys.deposit_tag(&key, to));
                 want.is_some_and(|w| {
-                    w.iter()
-                        .zip(&data[DEPOSIT_HEAD..head_len])
-                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                        == 0
+                    threnody_core::crypto::ct_eq(&w, &data[DEPOSIT_HEAD..head_len])
                 })
             }
         });
@@ -1192,7 +1189,9 @@ impl Node {
                 .iter()
                 .find(|(p, _)| Some(p.fingerprint()) == mailbox)
                 .map(|(_, k)| *k);
-            Some(key.ok_or_else(|| NetError::NoRoute("no deposit key for this mailbox yet".into()))?)
+            Some(
+                key.ok_or_else(|| NetError::NoRoute("no deposit key for this mailbox yet".into()))?,
+            )
         } else {
             None
         };
@@ -1499,7 +1498,9 @@ mod tests {
     async fn volunteers_extend_only_to_addresses_of_their_kind() {
         let dir = tempfile::tempdir().unwrap();
         let public = test_node(&dir, "public");
-        public.set_volunteer(Some(vec!["203.0.113.5:7450".into()])).unwrap();
+        public
+            .set_volunteer(Some(vec!["203.0.113.5:7450".into()]))
+            .unwrap();
         for bad in [
             "127.0.0.1:7450",
             "10.1.2.3:7450",
@@ -1515,7 +1516,9 @@ mod tests {
         assert!(public.extend_target("198.51.100.7:7450").await.is_some());
         // A relay on loopback (tests) reaches loopback, still no metadata service.
         let local = test_node(&dir, "local");
-        local.set_volunteer(Some(vec!["127.0.0.1:7450".into()])).unwrap();
+        local
+            .set_volunteer(Some(vec!["127.0.0.1:7450".into()]))
+            .unwrap();
         assert!(local.extend_target("127.0.0.1:9").await.is_some());
         assert!(local.extend_target("169.254.169.254:80").await.is_none());
         assert!(local.extend_target("10.1.2.3:7450").await.is_none());

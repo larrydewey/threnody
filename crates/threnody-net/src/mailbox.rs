@@ -65,7 +65,9 @@ enum MailboxMsg {
     },
     /// Our deposit key, for a mutually approved contact: it tags anonymous
     /// deposits that reach us over an anonymous link (see [`DEPOSIT_KEY_STATE`]).
-    Key { key: [u8; 32] },
+    Key {
+        key: [u8; 32],
+    },
 }
 
 /// Where a mailbox keeps its deposit key. Every mutually approved contact
@@ -893,7 +895,10 @@ impl Node {
 
     fn deposit_key_message(&self) -> Option<AppMessage> {
         let key = *lock(&self.shared.deposit_key);
-        MailboxMsg::Key { key }.encode().ok().map(AppMessage::Mailbox)
+        MailboxMsg::Key { key }
+            .encode()
+            .ok()
+            .map(AppMessage::Mailbox)
     }
 
     /// Replaces our deposit key (a contact stopped being mutually

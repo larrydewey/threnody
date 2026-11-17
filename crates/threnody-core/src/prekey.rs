@@ -355,6 +355,19 @@ impl PrekeyStore {
         let sender =
             known(&sender).ok_or(Error::Malformed("sealed message from unknown sender"))?;
         sender.verify(&sender_sig_input(&h, &sender, me, &body), &sig)?;
+        // A one-time prekey is reserved for one contact: another who got
+        // hold of that contact's bundle mustn't use them up, leaving it
+        // the signed prekey alone.
+        if let Some(id) = s.opk_id
+            && self
+                .opks
+                .get(&id)
+                .is_some_and(|o| o.peer != *sender.as_bytes())
+        {
+            return Err(Error::Malformed(
+                "one-time prekey reserved for another contact",
+            ));
+        }
         // Accept: consume the one-time prekey and remember the transcript.
         if let Some(id) = s.opk_id {
             self.opks.remove(&id);
@@ -843,6 +856,28 @@ mod tests {
         bad[last] ^= 1;
         assert!(store.open(&bob.public(), &bad, NOW, known(&alice)).is_err());
         store.open(&bob.public(), &s2, NOW, known(&alice)).unwrap();
+    }
+
+    #[test]
+    fn one_time_prekeys_serve_only_the_contact_they_were_made_for() {
+        // Bob made a bundle for Alice; Mallory, another contact, got it.
+        let (alice, bob, mut store, mut book) = setup();
+        let mallory = Identity::generate();
+        let sealed = book.seal(&mallory, &bob.public(), b"burn", NOW).unwrap();
+        assert!(
+            store
+                .open(&bob.public(), &sealed, NOW, known(&mallory))
+                .is_err()
+        );
+        // Alice's keys are still there for her.
+        assert_eq!(
+            store
+                .opks
+                .values()
+                .filter(|o| o.peer == *alice.public().as_bytes())
+                .count(),
+            OPKS_PER_BUNDLE
+        );
     }
 
     #[test]
