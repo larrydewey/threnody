@@ -54,6 +54,9 @@ const WANT_FOR: Duration = Duration::from_secs(20 * 60);
 /// polls every [`ReachConfig::poll_seeking`], so this covers a poll, a
 /// read and a write with room to spare.
 const ANSWER_FOR: Duration = Duration::from_secs(60);
+/// With "hide when I send" on, how long at most a seek waits before it
+/// republishes our record (see [`Node::seek`]).
+const SEEK_JITTER: Duration = Duration::from_secs(60);
 const PROBE_EVERY: Duration = Duration::from_secs(1);
 /// After [`SEEK_FOR`], a contact we still want is probed this often: it
 /// keeps our NAT open toward it, so its probes get through whenever it
@@ -407,6 +410,26 @@ impl Node {
             let mut inner = lock(&self.rdv().inner);
             inner.seeking.insert(*peer, until);
             inner.backoff.remove(peer);
+        }
+        // Republishing at once puts a DHT write on the wire the moment the
+        // user sends (or opens a chat): with "hide when I send" on, it
+        // waits a random while instead, so the write no longer dates the
+        // send to the second. The seeking itself starts now; the regular
+        // rounds pick it up too.
+        if self.pace_messages()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let node = self.clone();
+            let wait = Duration::from_millis(
+                u64::from_le_bytes(threnody_core::crypto::random_bytes())
+                    % SEEK_JITTER.as_millis() as u64,
+            );
+            rt.spawn(async move {
+                tokio::time::sleep(wait).await;
+                node.rdv().republish.notify_one();
+                node.rdv().poll.notify_one();
+            });
+            return;
         }
         self.rdv().republish.notify_one();
         self.rdv().poll.notify_one();

@@ -50,6 +50,7 @@ A short comparison by threat, as fairly as we can put it. The other apps change 
 ## The trade-offs
 
 - **It costs data.** Hiding when you send means sending all the time. Each connected contact costs about 560 MB a day on Wi-Fi and about 110 MB a day on mobile data, both ways. You can turn cover traffic off.
+- **Messages to someone who isn't connected still show.** Cover traffic hides when you send over a live connection. A message to a contact with no connection makes your phone look them up in the DHT (and wake them through push, if they use it), and that traffic shows that something happened, to within about a minute.
 - **Size still shows for long messages and files.** With cover traffic on, messages of up to about 4 KB of text are all padded to one size, the size of the filler. Longer ones, and every photo, voice message and file, are padded up to the next size step (8 KiB, 16 KiB, 32 KiB, 64 KiB, then steps of 64 KiB), so an observer can tell that something larger was sent and roughly how large. Without cover traffic the steps start at 256 bytes.
 - **Your contacts need Threnody too**, and a relay is only as available as the contact or volunteer running it.
 - **Finding a contact across the internet** uses the public BitTorrent DHT as a meeting point, for contacts and for invite links and handles alike. What's stored there is encrypted so only people who hold the key can read it, under keys that change, but DHT nodes see your IP address.
