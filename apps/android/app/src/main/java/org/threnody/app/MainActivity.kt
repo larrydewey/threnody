@@ -1131,19 +1131,36 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** An anonymous identity's invite, on its own port. */
+    /**
+     * An anonymous identity's invite. It carries no address (that would be
+     * this phone's, the same as your own invites show): it names the
+     * identity's meeting point at a volunteer relay, which can take a few
+     * seconds to open the first time.
+     */
     private fun personaInvite(id: String) {
         val p = Threnody.personaNode(id) ?: return
-        val addr = Threnody.inviteAddr(this, Threnody.personaPort(this, id).toString())
-        // Anonymous identities never use the DHT: an address is all there is.
-        if (addr.isEmpty()) return failed("No network: connect to Wi-Fi to make an invite.")
-        val link = p.inviteLink(addr)
-        showCode(
-            "Anonymous invite · ${Threnody.personaLabels[id] ?: ""}",
-            "Whoever uses this reaches your anonymous identity, not you. It works while this phone is on this network.",
-            link,
-            "Anonymous identity ${p.deviceFingerprint()}",
-        )
+        Toast.makeText(this, "Getting its invite ready\u2026", Toast.LENGTH_SHORT).show()
+        Threading.background {
+            val ready = p.waitMeetingPoint(15_000uL)
+            val link = if (ready) p.inviteLink("") else null
+            runOnUiThread {
+                if (link == null) {
+                    failed(
+                        "This anonymous identity can't be reached yet: it needs a volunteer relay " +
+                            "to meet people at. Subscribe to a relay directory in Settings \u2192 " +
+                            "Relay directories, then try again.",
+                    )
+                    return@runOnUiThread
+                }
+                showCode(
+                    "Anonymous invite \u00b7 ${Threnody.personaLabels[id] ?: ""}",
+                    "Whoever uses this reaches your anonymous identity, not you, through a volunteer relay. " +
+                        "It doesn't show where this phone is.",
+                    link,
+                    "Anonymous identity ${p.deviceFingerprint()}",
+                )
+            }
+        }
     }
 
     /** The anonymous identities, each with its invite, profile, rename and burn. */

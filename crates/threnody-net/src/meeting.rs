@@ -156,7 +156,7 @@ impl Node {
 
     /// Looks again at whether we want a meeting point (our NAT or our
     /// relays changed).
-    pub(crate) fn kick_meeting(&self) {
+    pub fn kick_meeting(&self) {
         self.meet_state().kick.notify_one();
     }
 
