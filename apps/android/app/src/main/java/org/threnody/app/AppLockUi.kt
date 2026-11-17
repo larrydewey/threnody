@@ -60,6 +60,8 @@ object AppLockUi {
                 val pepper = KeyVault.secret(a)
                 change(pepper)
                 val s = appLock(home(a), pepper)
+                // Only an app PIN with biometrics on uses the bound key.
+                if (!s.enabled || s.kind == null || !s.biometric) BiometricKey.forget(a)
                 AppLock.changed(s)
                 a.runOnUiThread {
                     done?.let { Toast.makeText(a, it, Toast.LENGTH_LONG).show() }
@@ -189,9 +191,21 @@ object AppLockUi {
         items += "Lock when idle: ${idle(s)}" to { chooseIdle(a, s) }
         if (!device) {
             items += "Also unlock with biometrics: ${if (s.biometric) "on" else "off"}" to {
-                change(a, null, { p ->
-                    setLockPolicy(home(a), p, !s.biometric, s.awaySecs, s.idleSecs, s.eraseAfterFailures)
-                }) { showOn(a, it) }
+                val set = {
+                    change(a, null, { p ->
+                        setLockPolicy(home(a), p, !s.biometric, s.awaySecs, s.idleSecs, s.eraseAfterFailures)
+                    }) { showOn(a, it) }
+                }
+                if (s.biometric) {
+                    set()
+                } else {
+                    // Binds unlocking to the biometrics enrolled now: one
+                    // added later (by anyone with the phone's PIN) turns
+                    // biometric unlock off instead of opening the app.
+                    BiometricKey.enroll(a) { ok, error ->
+                        if (ok) set() else if (error != null) toast(a, error)
+                    }
+                }
             }
             items += "Change ${noun(kind)}…" to { changeSecret(a, kind!!) }
             items += "Duress PIN: ${if (s.duress) "set" else "not set"}…" to { duress(a, s) }

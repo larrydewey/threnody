@@ -663,7 +663,7 @@ object Calls {
         // (voice only stays one tap away).
         val video = c.group == null && c.peerVideo
         val answerVideo = answering(5, true)
-        val hide = AppLock.enabled(ctx)
+        val hide = hideCaller(ctx)
         val n = Notification.Builder(ctx, CHANNEL_RING)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(when {
@@ -726,7 +726,7 @@ object Calls {
             ctx, 4, Intent(ctx, Decline::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val hide = AppLock.enabled(ctx)
+        val hide = hideCaller(ctx)
         return Notification.Builder(ctx, CHANNEL_ONGOING)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(when {
@@ -767,7 +767,7 @@ object Calls {
         val n = Notification.Builder(ctx, CHANNEL_MISSED)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(when {
-                AppLock.enabled(ctx) -> if (c.group != null) "Missed group call" else "Missed call"
+                hideCaller(ctx) -> if (c.group != null) "Missed group call" else "Missed call"
                 c.group != null -> "Missed group call in ${c.title}"
                 else -> "Missed call from ${c.title}"
             })
@@ -783,8 +783,15 @@ object Calls {
         Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(ctx, icon), label, intent).build()
 
     /**
-     * Who a call notification names: with app lock on, no one (the
-     * notification shows past the lock, so it says only that there's a call).
+     * Whether call notifications keep quiet about who calls: with app lock
+     * on (they show past the lock) or private notifications on, as message
+     * notifications do.
+     */
+    private fun hideCaller(ctx: Context) = AppLock.enabled(ctx) || Privacy.privateNotifications(ctx)
+
+    /**
+     * Who a call notification names: when [hide], no one, a generic person
+     * with no contact key or picture, so it says only that there's a call.
      */
     private fun person(c: Call, hide: Boolean) =
         Person.Builder().setName(if (hide) "Threnody" else c.title).build()

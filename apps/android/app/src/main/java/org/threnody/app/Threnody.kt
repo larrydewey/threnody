@@ -595,6 +595,7 @@ object Threnody {
             }
         }
         KeyVault.forget(app)
+        BiometricKey.forget(app)
         for (dir in listOfNotNull(app.filesDir, app.cacheDir, app.noBackupFilesDir, app.codeCacheDir)) {
             dir.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
         }
@@ -739,6 +740,10 @@ object Threnody {
         }
 
     private fun pump(ctx: Context, node: ThrenodyNode, persona: String?) = Thread {
+        // The main node and the anonymous identities share one log: each
+        // line says which kind of node it came from, never which identity.
+        val tag = if (persona == null) "[main] " else "[anon] "
+        fun say(line: String) = Threnody.say(tag + line)
         while (true) {
             val e = node.nextEvent(1000u) ?: continue
             when (e) {
@@ -877,7 +882,7 @@ object Threnody {
                         "If you didn't link it, remove it in Devices.")
                 }
                 is NodeEvent.AccountChanged -> {
-                    say("· $e")
+                    say("· ${e::class.simpleName}")
                     if (e.added.isNotEmpty() && e.account == node.accountFingerprint()) {
                         // Another of our devices linked one: say so here too.
                         ThrenodyService.notifyAccount(ctx, "A new device joined your account. " +
@@ -931,7 +936,8 @@ object Threnody {
                     notices[persona to e.peer] = e.notice
                     say("* ${short(e.peer)}: ${e.notice}")
                 }
-                else -> say("· $e")
+                // The event's kind only: its fields can hold group names and the like.
+                else -> say("· ${e::class.simpleName}")
             }
             for (l in listeners) l(e)
         }

@@ -19,7 +19,9 @@ import android.widget.TextView
 import uniffi.threnody_ffi.LockKind
 import uniffi.threnody_ffi.LockOutcome
 import uniffi.threnody_ffi.LockSettings
+import uniffi.threnody_ffi.appLock
 import uniffi.threnody_ffi.biometricUnlocked
+import uniffi.threnody_ffi.setLockPolicy
 import uniffi.threnody_ffi.unlockApp
 
 /**
@@ -188,23 +190,23 @@ class LockActivity : Activity() {
 
     /**
      * Biometrics. Without an app PIN (device lock) the phone's own PIN may
-     * stand in for them. With an app PIN only strong biometrics count: the
-     * phone's PIN must not get around the app PIN or the duress PIN.
+     * stand in for them. With an app PIN only strong biometrics count, and
+     * only through [BiometricKey]: neither the phone's PIN nor a fingerprint
+     * enrolled since biometrics were turned on gets around the app PIN or
+     * the duress PIN.
      */
     private fun biometric() {
         val device = AppLock.settings?.kind == null
+        if (!device) return boundBiometric()
         val b = BiometricPrompt.Builder(this).setTitle("Unlock Threnody")
         if (Build.VERSION.SDK_INT >= 30) {
             b.setAllowedAuthenticators(
-                if (device) BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-                else BiometricManager.Authenticators.BIOMETRIC_STRONG,
+                BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL,
             )
-        } else if (device) {
+        } else {
             @Suppress("DEPRECATION")
             b.setDeviceCredentialAllowed(true)
         }
-        // A biometric-only prompt must have a way out, or build() throws.
-        if (!device) b.setNegativeButton("Use PIN", mainExecutor) { _, _ -> field.requestFocus() }
         val prompt = try {
             b.build()
         } catch (e: Exception) {
@@ -221,7 +223,7 @@ class LockActivity : Activity() {
                 // took the phone's PIN. Anything else (the sensor busy,
                 // locked out, cancelled) keeps the lock.
                 val secure = getSystemService(KeyguardManager::class.java)?.isDeviceSecure ?: true
-                if (device && !secure) {
+                if (!secure) {
                     android.widget.Toast.makeText(
                         this@LockActivity,
                         "Your phone has no screen lock any more; set an app PIN to keep Threnody locked",
@@ -229,11 +231,58 @@ class LockActivity : Activity() {
                     ).show()
                     passed()
                 } else {
-                    status.text = if (device) "Try again" else ""
+                    status.text = "Try again"
                     bio.visibility = View.VISIBLE
                 }
             }
         })
+    }
+
+    /** App PIN mode: the prompt must unlock the [BiometricKey] cipher. */
+    private fun boundBiometric() {
+        try {
+            BiometricKey.unlock(
+                this,
+                ok = { passed() },
+                failed = { msg ->
+                    status.text = msg
+                    field.requestFocus()
+                },
+                onError = { _, _ ->
+                    // Cancelled, locked out, sensor busy: the PIN still works.
+                    status.text = ""
+                    bio.visibility = View.VISIBLE
+                },
+                usePin = { field.requestFocus() },
+            )
+        } catch (_: BiometricKey.Gone) {
+            biometricsGone()
+        } catch (e: Exception) {
+            status.text = "Biometrics aren't available"
+        }
+    }
+
+    /**
+     * The key is gone: the enrolled biometrics changed (or the screen lock
+     * was removed, or biometrics were on before they were bound). Turns
+     * biometrics off so only the PIN opens the app.
+     */
+    private fun biometricsGone() {
+        BiometricKey.forget(this)
+        bio.visibility = View.GONE
+        status.text = "Biometric unlock needs setting up again (fingerprints changed, or Threnody was updated). Enter your PIN, then turn biometrics on in Settings → App lock."
+        field.requestFocus()
+        val s = AppLock.settings ?: return
+        val home = Threnody.home(this)
+        Threading.background {
+            try {
+                val pepper = KeyVault.secret(this)
+                setLockPolicy(home, pepper, false, s.awaySecs, s.idleSecs, s.eraseAfterFailures)
+                AppLock.changed(appLock(home, pepper))
+            } catch (e: Exception) {
+                Threnody.say("! turning biometrics off: ${e.message}")
+            }
+        }
     }
 
     private fun passed() {
