@@ -28,8 +28,10 @@ pub use applock::{
 mod calls;
 mod folders;
 mod lists;
+mod media;
 pub use folders::{ChatUnread, FolderInfo, QuietSlotInfo};
 pub use lists::{ListInfo, ListItemInfo};
+pub use media::{is_sealed_media, media_size, secure_delete_file};
 mod groupcalls;
 mod groups;
 mod persona;

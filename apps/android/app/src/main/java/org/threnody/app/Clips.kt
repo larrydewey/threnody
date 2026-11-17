@@ -16,9 +16,11 @@ import java.io.File
  * Voice and video messages: where recordings go, recording sound, and
  * playing one message at a time.
  *
- * Recordings are written straight into the identity's private media
- * folder, beside received photos, and sent from there; a cancelled one is
- * deleted. Voice is AAC in MPEG-4 (.m4a), video H.264 and AAC (.mp4),
+ * Recordings are written into the cache (never backed up), then sealed
+ * into the identity's private media folder, beside received photos, when
+ * sent ([Media.savePrivate]); the recording is deleted either way, and a
+ * cancelled one at once. Kept clips play decrypted in memory
+ * ([Media.dataSource]). Voice is AAC in MPEG-4 (.m4a), video H.264 and AAC (.mp4),
  * which the Linux app plays too. Its own recordings (Opus in Ogg, VP8 in
  * WebM) play here as well.
  */
@@ -30,9 +32,9 @@ object Clips {
     /** Shorter presses are taken as a tap, not a recording. */
     const val MIN_MS = 700L
 
-    /** A new file to record into. */
+    /** A new file to record into, plain only until it is sent. */
     fun file(ctx: Context, persona: String?, video: Boolean): File {
-        val dir = Media.dir(ctx, persona).apply { mkdirs() }
+        val dir = File(ctx.cacheDir, "clips-" + (persona ?: "main")).apply { mkdirs() }
         val now = System.currentTimeMillis()
         return File(dir, if (video) "$now-video.mp4" else "$now-voice.m4a")
     }
@@ -57,7 +59,8 @@ object Clips {
         Threading.io {
             val b = try {
                 MediaMetadataRetriever().use { r ->
-                    r.setDataSource(app, Uri.parse(location))
+                    val sealed = Media.dataSource(location)
+                    if (sealed != null) r.setDataSource(sealed) else r.setDataSource(app, Uri.parse(location))
                     r.getScaledFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, side, side)
                 }
             } catch (_: Exception) {
@@ -162,7 +165,8 @@ class ClipPlayer(private val ctx: Context) {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                setDataSource(ctx, Uri.parse(location))
+                val sealed = Media.dataSource(location)
+                if (sealed != null) setDataSource(sealed) else setDataSource(ctx, Uri.parse(location))
                 setOnCompletionListener {
                     seekTo(0)
                     report()

@@ -16,6 +16,10 @@ import java.io.File
  * anonymous identity receives) to the app the user opens them with, one
  * read-only grant at a time. Not exported: other apps reach a file only
  * through a URI granted for it.
+ *
+ * Kept files are sealed: the other app reads a decrypted copy in the
+ * cache, unlinked as soon as it is opened, so it is gone once that app
+ * closes it.
  */
 class FilesProvider : ContentProvider() {
     override fun onCreate() = true
@@ -31,7 +35,20 @@ class FilesProvider : ContentProvider() {
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
         if (mode != "r") throw SecurityException("read only")
         val f = file(uri) ?: throw java.io.FileNotFoundException(uri.toString())
-        return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        val ctx = context ?: throw java.io.FileNotFoundException(uri.toString())
+        val copy: File? = try {
+            Media.plainCopy(ctx, Uri.fromFile(f).toString())
+        } catch (e: Exception) {
+            throw java.io.FileNotFoundException("can't open ${f.name}: ${e.message}")
+        }
+        // Kept before sealing: as it is.
+        val plain = copy ?: return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        return try {
+            ParcelFileDescriptor.open(plain, ParcelFileDescriptor.MODE_READ_ONLY)
+        } finally {
+            // Readable through the descriptor until it is closed, by no name.
+            plain.delete()
+        }
     }
 
     override fun getType(uri: Uri): String =
@@ -43,7 +60,8 @@ class FilesProvider : ContentProvider() {
         // Files are kept as "<time>-<random>-<name>": show the name.
         val name = f.name.split('-', limit = 3).getOrElse(2) { f.name }
         return MatrixCursor(arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)).apply {
-            addRow(arrayOf<Any>(name, f.length()))
+            val size = try { uniffi.threnody_ffi.mediaSize(f.path).toLong() } catch (_: Exception) { f.length() }
+            addRow(arrayOf<Any>(name, size))
         }
     }
 

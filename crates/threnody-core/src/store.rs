@@ -434,33 +434,29 @@ pub fn secure_delete(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Overwrite with random data (3 passes)
-    for _ in 0..3 {
-        let random_bytes: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
+    // Three passes of random data, then zeros, a block at a time so a
+    // long video needn't fit in memory.
+    for pass in 0..4 {
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).truncate(true);
+        opts.write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
         let mut f = opts.open(path)?;
-        f.write_all(&random_bytes)?;
-        f.sync_all()?;
-    }
-
-    // Final pass with zeros
-    let zeros = vec![0u8; size];
-    {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        let mut block = vec![0u8; size.min(64 * 1024)];
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(block.len());
+            if pass < 3 {
+                block[..n]
+                    .iter_mut()
+                    .for_each(|b| *b = rand::random::<u8>());
+            }
+            f.write_all(&block[..n])?;
+            left -= n;
         }
-        let mut f = opts.open(path)?;
-        f.write_all(&zeros)?;
         f.sync_all()?;
     }
 
