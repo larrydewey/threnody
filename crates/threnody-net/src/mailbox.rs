@@ -1159,6 +1159,16 @@ impl Node {
                 } => return self.on_pin(&from, conversation, *id, *pin),
                 AppMessage::List(bytes) => return self.on_list_message(from, bytes),
                 AppMessage::Receipt(payload) => return self.on_receipt(&from, payload),
+                // A chain sealed after a device was removed (see
+                // `seal_chain_to_absent`); nothing else of the account's.
+                AppMessage::Account(payload) => {
+                    if let Ok(crate::account::AccountMsg::Chain(b)) =
+                        crate::account::AccountMsg::decode(payload)
+                    {
+                        self.on_sealed_chain(from, &b);
+                    }
+                    return;
+                }
                 _ => {}
             }
             // A text already here (from its sender too) doesn't show

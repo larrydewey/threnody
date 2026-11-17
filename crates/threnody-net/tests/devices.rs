@@ -2095,3 +2095,38 @@ async fn a_contacts_deletion_of_a_file_reaches_our_other_devices_through_us() {
     wait_for(|| file_named(&laptop.node, &bid, "take-back.pdf").is_none()).await;
     wait_for(|| file_named(&phone.node, &bid, "take-back.pdf").is_none()).await;
 }
+
+/// A contact away when a device is removed hears of it through a mailbox,
+/// not only at its next session with one of our devices (which could be
+/// the removed one).
+#[tokio::test]
+async fn an_absent_contact_learns_of_a_removed_device_through_a_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut laptop = spawn(&dir, "laptop").await;
+    let mut phone = spawn(&dir, "phone").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut m = spawn(&dir, "m").await;
+    let code = laptop.node.create_link_code(laptop.addr.clone());
+    phone.node.link_with(&code).await.unwrap();
+    let (lid, pid, bid) = (
+        laptop.node.identity(),
+        phone.node.identity(),
+        bob.node.identity(),
+    );
+    link(&mut laptop, &mut bob).await;
+    link(&mut laptop, &mut m).await;
+    link(&mut bob, &mut m).await;
+    wait_for(|| laptop.node.can_send_offline(&bid)).await;
+    wait_for(|| bob.node.account_of(&lid).is_some_and(|a| a.state().has(&pid))).await;
+    // Bob goes away from the laptop (and the phone, which he never met).
+    bob.node.disconnect(&lid);
+    wait_for(|| laptop.node.sessions().iter().all(|s| s.peer != bid)).await;
+
+    laptop.node.remove_device(&pid).unwrap();
+    wait_for(|| bob.node.is_revoked(&pid)).await;
+    assert!(
+        bob.node.sessions().iter().all(|s| s.peer != lid),
+        "learned it through the mailbox, not a session"
+    );
+    let _ = (&mut phone.rx, &mut m.rx, &mut laptop.rx, &mut bob.rx);
+}
