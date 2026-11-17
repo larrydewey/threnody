@@ -10,6 +10,7 @@
 //! named inside an EXTEND cell readable by the last relay alone.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use const_cbor::Decoder;
@@ -250,6 +251,8 @@ struct RelayHop {
     /// When the CREATE came: tells this hop from a later one on the same
     /// link circuit.
     born: Instant,
+    /// EXTENDs to an address this hop has asked us to dial.
+    dials: u8,
 }
 
 impl RelayHop {
@@ -263,6 +266,7 @@ impl RelayHop {
             deposit: None,
             net,
             born: Instant::now(),
+            dials: 0,
         }
     }
 
@@ -296,7 +300,15 @@ pub(crate) struct OnionState {
     anon: HashSet<Link>,
     /// Per carrier: start of the current minute and tokens checked in it.
     token_rate: HashMap<Carrier, (Instant, u32)>,
+    /// Hops whose EXTEND we are dialing an address for.
+    dialing: HashSet<Link>,
 }
+
+/// Addresses a volunteer relay dials for EXTENDs at once, in all.
+const MAX_EXTEND_DIALS: usize = 32;
+/// Addresses one hop may have us dial: a paid circuit names one, and a
+/// retry or two covers a destination that moved.
+const MAX_EXTEND_DIALS_PER_HOP: u8 = 3;
 
 /// Relay tokens checked per neighbour per minute: each costs pairings.
 pub const MAX_TOKEN_CHECKS_PER_MINUTE: u32 = 120;
@@ -644,7 +656,7 @@ impl Node {
         let (allowed, from_contact) = {
             let st = lock(&self.shared.onion);
             // One extension at a time: a second would orphan the first.
-            let extending = st.extending.values().any(|u| *u == up);
+            let extending = st.extending.values().any(|u| *u == up) || st.dialing.contains(&up);
             st.hops.get(&up).map_or((false, false), |h| {
                 (h.full && h.next.is_none() && !extending, h.contact)
             })
@@ -678,9 +690,32 @@ impl Node {
         let Some(addr) = req.addr.clone().filter(|_| self.volunteering()) else {
             return fail(self);
         };
+        // A dial in flight counts as the hop's one extension, and dials are
+        // bounded in all and per hop: a paid client otherwise had us open
+        // any number of connections at once, to anything.
+        {
+            let mut st = lock(&self.shared.onion);
+            if st.dialing.len() >= MAX_EXTEND_DIALS {
+                drop(st);
+                return fail(self);
+            }
+            let Some(hop) = st.hops.get_mut(&up) else {
+                return;
+            };
+            if hop.dials >= MAX_EXTEND_DIALS_PER_HOP {
+                drop(st);
+                return fail(self);
+            }
+            hop.dials += 1;
+            st.dialing.insert(up);
+        }
         let node = self.clone();
         tokio::spawn(async move {
-            let dialed = node.anon_dial(&addr, Some(req.to), false).await;
+            let dialed = match node.extend_target(&addr).await {
+                Some(sa) => node.anon_dial(&sa.to_string(), Some(req.to), false).await,
+                None => Err(NetError::NotAllowed("not an address relays dial".into())),
+            };
+            lock(&node.shared.onion).dialing.remove(&up);
             let Ok(next) = dialed else {
                 return fail(&node);
             };
@@ -706,6 +741,11 @@ impl Node {
                 fail(&node);
             }
         });
+    }
+
+    /// Where an EXTEND naming `addr` may take us: see [`dial_target`].
+    async fn extend_target(&self, addr: &str) -> Option<SocketAddr> {
+        dial_target(addr, &self.volunteer_addrs()).await
     }
 
     /// We are the circuit's last hop and a mailbox: someone, hidden from us,
@@ -1351,6 +1391,48 @@ impl Node {
     }
 }
 
+/// Where a relay or directory may dial `addr` on someone else's behalf:
+/// a public address (a name is looked up first, and every address it has
+/// must be public), so a paying stranger can't use it to reach its LAN,
+/// loopback or a cloud metadata service, or time connections to scan them.
+/// One that itself serves at a private or loopback address (`own`: a
+/// community network, tests) also dials addresses of that kind.
+pub(crate) async fn dial_target(addr: &str, own: &[IpAddr]) -> Option<SocketAddr> {
+    let found: Vec<SocketAddr> =
+        tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(addr))
+            .await
+            .ok()?
+            .ok()?
+            .collect();
+    let allowed = |ip: IpAddr| {
+        let ip = ip.to_canonical();
+        crate::reach::is_public(&ip)
+            || own.iter().any(|o| {
+                let o = o.to_canonical();
+                (o.is_loopback() && ip.is_loopback())
+                    || (!o.is_loopback()
+                        && !crate::reach::is_public(&o)
+                        && !ip.is_loopback()
+                        && !ip.is_unspecified()
+                        && !ip.is_multicast()
+                        && !is_link_local(&ip)
+                        && !crate::reach::is_public(&ip))
+            })
+    };
+    if found.is_empty() || !found.iter().all(|a| allowed(a.ip())) {
+        return None;
+    }
+    found.first().copied()
+}
+
+/// Link-local (169.254/16, fe80::/10): cloud metadata services live there.
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,6 +1451,32 @@ mod tests {
         })
         .unwrap()
         .0
+    }
+
+    #[tokio::test]
+    async fn volunteers_extend_only_to_addresses_of_their_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let public = test_node(&dir, "public");
+        public.set_volunteer(Some(vec!["203.0.113.5:7450".into()])).unwrap();
+        for bad in [
+            "127.0.0.1:7450",
+            "10.1.2.3:7450",
+            "192.168.1.1:22",
+            "169.254.169.254:80",
+            "[::1]:7450",
+            "[fe80::1]:7450",
+            "100.64.0.1:7450",
+            "localhost:7450",
+        ] {
+            assert!(public.extend_target(bad).await.is_none(), "{bad}");
+        }
+        assert!(public.extend_target("198.51.100.7:7450").await.is_some());
+        // A relay on loopback (tests) reaches loopback, still no metadata service.
+        let local = test_node(&dir, "local");
+        local.set_volunteer(Some(vec!["127.0.0.1:7450".into()])).unwrap();
+        assert!(local.extend_target("127.0.0.1:9").await.is_some());
+        assert!(local.extend_target("169.254.169.254:80").await.is_none());
+        assert!(local.extend_target("10.1.2.3:7450").await.is_none());
     }
 
     async fn listening(dir: &tempfile::TempDir, name: &str) -> (Node, Events, String) {
