@@ -1417,7 +1417,7 @@ mod tests {
             d.on_directory(stranger, &ask(id));
         }
         let mut answers = 0;
-        while out.try_recv().is_ok() {
+        while out.try_recv().is_some() {
             answers += 1;
         }
         assert_eq!(answers, MAX_DIRECTORY_REQUESTS_PER_MINUTE as usize);
@@ -1425,7 +1425,7 @@ mod tests {
         let other = threnody_core::Identity::generate().public();
         let mut out = d.fake_anon_link(other, "198.51.100.1:1".parse().unwrap());
         d.on_directory(other, &ask(1000));
-        assert!(out.try_recv().is_ok());
+        assert!(out.try_recv().is_some());
     }
 
     #[tokio::test]

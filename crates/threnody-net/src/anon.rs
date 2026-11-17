@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::budget;
 use crate::error::{NetError, Result};
 use crate::frame::write_frame;
 use crate::gate::{Gate, Pass, Source};
@@ -100,7 +101,9 @@ impl Backlog {
 
 struct Handle {
     id: u64,
-    tx: mpsc::UnboundedSender<AppMessage>,
+    /// Counted in messages: a link whose task stopped taking them (its
+    /// writes stalled) refuses more past [`MAX_QUEUED`].
+    tx: budget::Sender<AppMessage>,
     addr: SocketAddr,
     outbound: bool,
 }
@@ -180,7 +183,7 @@ impl Node {
         lock(&self.shared.anon)
             .links
             .get(to)
-            .is_some_and(|h| h.tx.send(msg).is_ok())
+            .is_some_and(|h| h.tx.send(1, msg))
     }
 
     /// Where the far end of an anonymous link is (for per-address limits).
@@ -195,8 +198,8 @@ impl Node {
         &self,
         peer: PublicIdentity,
         addr: SocketAddr,
-    ) -> mpsc::UnboundedReceiver<AppMessage> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> budget::Receiver<AppMessage> {
+        let (tx, rx) = budget::channel(MAX_QUEUED);
         let mut st = lock(&self.shared.anon);
         st.next_id += 1;
         let id = st.next_id;
@@ -229,7 +232,7 @@ impl Node {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let peer = *chan.peer();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = budget::channel(MAX_QUEUED);
         let id = {
             let mut st = lock(&self.shared.anon);
             st.next_id += 1;
@@ -267,7 +270,7 @@ async fn run_anon<S>(
     stream: S,
     mut chan: SecureChannel,
     outbound: bool,
-    mut outbox: mpsc::UnboundedReceiver<AppMessage>,
+    mut outbox: budget::Receiver<AppMessage>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,

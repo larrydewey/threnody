@@ -7,6 +7,7 @@
 
 pub mod account;
 mod anon;
+mod budget;
 pub mod call;
 pub mod cred;
 pub mod delivery;

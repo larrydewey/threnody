@@ -25,8 +25,9 @@ use const_cbor::Decoder;
 use threnody_core::cbor::{self, finish, fixed_bytes, read_map, required};
 use threnody_core::crypto::random_bytes;
 use threnody_core::{AppMessage, Fingerprint, PublicIdentity};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
+use crate::budget;
 use crate::error::{NetError, Result};
 use crate::frame::{read_frame, write_frame};
 use crate::handshake;
@@ -36,6 +37,10 @@ use crate::node::{Event, FallbackPath, Node, lock};
 pub const MAX_TTL: u8 = 3;
 /// Most circuits one neighbour may hold through us.
 pub const MAX_CIRCUITS_PER_PEER: usize = 64;
+/// Bytes of frames that may wait at a circuit's end for the session here
+/// to read them (a frame may be as large as a file's). A peer sending
+/// faster than that has the circuit closed.
+pub const RELAY_BUDGET: usize = 64 * 1024 * 1024;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const NONCE_MEMORY: Duration = Duration::from_secs(600);
 const NONCE_PRUNE_EVERY: Duration = Duration::from_secs(60);
@@ -150,7 +155,7 @@ enum Hop {
     /// Relay: to this peer, on this circuit.
     Forward(PublicIdentity, u64),
     /// We are an endpoint: to the local session's pump.
-    Endpoint(mpsc::UnboundedSender<Vec<u8>>),
+    Endpoint(budget::Sender<Vec<u8>>),
 }
 
 #[derive(Default)]
@@ -300,13 +305,21 @@ impl Node {
                 }
             }
             RelayMsg::Data { circ, frame } => {
-                let target = match lock(&self.shared.relay).hops.get(&(from, circ)) {
-                    Some(Hop::Forward(to, c2)) => Some((*to, *c2)),
-                    Some(Hop::Endpoint(tx)) => {
-                        let _ = tx.send(frame);
+                let hop = match lock(&self.shared.relay).hops.get(&(from, circ)) {
+                    Some(Hop::Forward(to, c2)) => Ok(Some((*to, *c2))),
+                    Some(Hop::Endpoint(tx)) => Err(tx.clone()),
+                    None => Ok(None),
+                };
+                let target = match hop {
+                    Ok(t) => t,
+                    Err(tx) => {
+                        // A peer sending faster than the session here reads
+                        // has the circuit closed, not queued without end.
+                        if !tx.send(frame.len(), frame) {
+                            self.close_circuit(from, circ);
+                        }
                         return;
                     }
-                    None => None,
                 };
                 match target {
                     Some((to, c2)) => {
@@ -471,7 +484,7 @@ impl Node {
 
     /// Wires one end of an in-memory stream to circuit hop `(peer, circ)`.
     fn bind_endpoint(&self, peer: PublicIdentity, circ: u64, stream: tokio::io::DuplexStream) {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = budget::channel::<Vec<u8>>(RELAY_BUDGET);
         lock(&self.shared.relay)
             .hops
             .insert((peer, circ), Hop::Endpoint(tx));
@@ -809,7 +822,7 @@ impl Node {
 /// when a frame came the other way would lose bytes and garble the stream.
 async fn pump_frames<S>(
     stream: S,
-    mut inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut inbound: budget::Receiver<Vec<u8>>,
     mut send: impl FnMut(Vec<u8>) -> bool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
@@ -839,6 +852,7 @@ async fn pump_frames<S>(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     #[test]
     fn opens_still_searching_count_against_the_cap() {
@@ -862,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn a_frame_read_in_pieces_survives_frames_the_other_way() {
         let (ours, theirs) = tokio::io::duplex(256);
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = budget::channel(1 << 20);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let pump = tokio::spawn(pump_frames(ours, in_rx, move |f| out_tx.send(f).is_ok()));
         let (mut rd, mut wr) = tokio::io::split(theirs);
@@ -874,7 +888,7 @@ mod tests {
             .unwrap();
         wr.write_all(&frame[..2000]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        in_tx.send(vec![9; 10]).unwrap();
+        assert!(in_tx.send(10, vec![9; 10]));
         let mut back = [0u8; 14];
         rd.read_exact(&mut back).await.unwrap();
         assert_eq!(&back[4..], &[9; 10]);

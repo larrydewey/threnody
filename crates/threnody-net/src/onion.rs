@@ -21,8 +21,9 @@ use threnody_core::onion::{
 };
 use threnody_core::{AppMessage, Fingerprint, PublicIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
+use crate::budget;
 use crate::error::{NetError, Result};
 use crate::handshake;
 use crate::mailbox::DepositStatus;
@@ -30,6 +31,10 @@ use crate::node::{Node, lock};
 
 /// Most circuits one neighbour may hold through us.
 pub const MAX_CIRCUITS_PER_PEER: usize = 64;
+/// Bytes of a circuit's cells that may wait for the local side to take
+/// them, at its end or ours. A far end sending faster than that (whether
+/// it means to or not) has the circuit torn down.
+pub const CIRCUIT_BUDGET: usize = 4 * 1024 * 1024;
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Steps over anonymous links wait for cover-traffic ticks at each hop.
 const VOLUNTEER_STEP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -286,7 +291,7 @@ struct RelayHop {
     /// people who relay for their contacts alone.
     contact: bool,
     next: Option<Link>,
-    endpoint: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    endpoint: Option<budget::Sender<Vec<u8>>>,
     /// An anonymous mailbox deposit being received.
     deposit: Option<PendingDeposit>,
     /// Where an anonymous link's far end is (for per-network limits).
@@ -334,7 +339,7 @@ pub(crate) struct OnionState {
     /// Downstream creates we sent for an EXTEND, awaiting CREATED.
     extending: HashMap<Link, Link>,
     /// Our own circuits: first-hop link circuit -> backward cells.
-    origins: HashMap<Link, mpsc::UnboundedSender<Cell>>,
+    origins: HashMap<Link, budget::Sender<Cell>>,
     /// Our first-hop CREATEs awaiting CREATED.
     creating: HashMap<Link, oneshot::Sender<CreatedFields>>,
     /// Per carrier: start of the current minute and deposits in it.
@@ -652,9 +657,16 @@ impl Node {
             }
             return;
         }
-        // For one of our own circuits.
-        if let Some(tx) = st.origins.get(&link) {
-            let _ = tx.send(cell);
+        // For one of our own circuits. One whose far end sends faster than
+        // we take its cells is torn down rather than kept growing.
+        let full = st
+            .origins
+            .get(&link)
+            .is_some_and(|tx| !tx.send(cell.len(), cell));
+        if full {
+            drop(st);
+            self.onion_send(&link.0, &OnionMsg::Destroy { circ: link.1 });
+            self.onion_destroy(link, false);
         }
     }
 
@@ -702,7 +714,12 @@ impl Node {
                     self.onion_deposit_check(up);
                 } else if let Some(tx) = hop.endpoint.clone() {
                     drop(st);
-                    let _ = tx.send(p.data);
+                    // Sent faster than the session here reads it: the
+                    // circuit ends rather than queue without end.
+                    if !tx.send(p.data.len(), p.data) {
+                        self.onion_reply(up, &Payload::new(Cmd::End, vec![]));
+                        self.onion_destroy(up, true);
+                    }
                 }
             }
             Cmd::End => self.onion_destroy(up, true),
@@ -916,7 +933,7 @@ impl Node {
     /// We are the circuit's destination: attach a session to the stream.
     fn onion_endpoint(&self, up: Link) {
         let (ours, theirs) = tokio::io::duplex(1 << 20);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = budget::channel::<Vec<u8>>(CIRCUIT_BUDGET);
         {
             let mut st = lock(&self.shared.onion);
             let Some(hop) = st.hops.get_mut(&up) else {
@@ -1140,7 +1157,7 @@ impl Node {
     async fn build_circuit(
         &self,
         route: &OnionRoute,
-    ) -> Result<(u64, OnionPath, mpsc::UnboundedReceiver<Cell>)> {
+    ) -> Result<(u64, OnionPath, budget::Receiver<Cell>)> {
         let first = route.first;
         if let Some(addr) = &route.first_addr {
             // A fresh identity: the entry relay learns our address, not who we are.
@@ -1167,7 +1184,7 @@ impl Node {
         };
         let circ = u64::from_le_bytes(random_bytes());
         let link = (first, circ);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Cell>();
+        let (tx, mut rx) = budget::channel::<Cell>(CIRCUIT_BUDGET);
         let result = async {
             let head = route.hops.first().ok_or(NetError::Closed)?;
             // First hop: CREATE over the link.
@@ -1598,6 +1615,7 @@ mod tests {
     use super::*;
     use crate::{AcceptPolicy, NodeConfig};
     use threnody_core::store::Home;
+    use tokio::sync::mpsc;
 
     fn test_node(dir: &tempfile::TempDir, name: &str) -> Node {
         let home = Home::new(dir.path().join(name));
