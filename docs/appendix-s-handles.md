@@ -69,7 +69,8 @@ The session that results is an ordinary session with a stranger: its messages ar
 An invite link made on mobile data used to carry an address nobody could dial: the phone's address behind carrier-grade NAT, or none at all on an IPv6-only network. Invites now meet the same way handles do, with a random key instead of a handle:
 
 ```
-link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ]
+link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ] [ "&m=" meet ]
+meet  = Crockford Base32 of relay fingerprint (20) || cookie (16), "@", addr   -- a meeting point (Appendix N, section 6)
 addr  = host ":" port                -- IPv6 in brackets: [2001:db8::1]:7450
 key   = Crockford Base32 of 16 random bytes (26 symbols)
 base  = KDF("… invite", key)         -- then records, knock slots and probe key as above

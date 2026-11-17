@@ -2,7 +2,8 @@
 //! by across the internet when none of those addresses answer.
 //!
 //! ```text
-//! link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ]
+//! link  = "threnody://" fingerprint [ "@" addr *( "," addr ) ] [ "?r=" key ] [ "&m=" meet ]
+//! meet  = Crockford Base32 of relay fingerprint (20) || cookie (16), "@", addr
 //! addr  = host ":" port            -- IPv6 in brackets: [2001:db8::1]:7450
 //! key   = Crockford Base32 of 16 random bytes (26 symbols)
 //! base  = KDF("… invite", key)     -- a meeting place, as a handle's is (Appendix S)
@@ -120,6 +121,58 @@ pub struct InviteLink {
     /// `host:port`, IPv6 hosts in brackets; best first.
     pub addrs: Vec<String>,
     pub key: Option<InviteKey>,
+    /// A meeting point (Appendix N) the inviter listens at: how an
+    /// anonymous identity, whose links carry no address, is reached.
+    pub meet: Option<crate::rendezvous::MeetingPoint>,
+}
+
+/// Crockford Base32 of `bytes`, zero bits padding the last symbol.
+fn to_b32(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for &b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(CROCKFORD[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(CROCKFORD[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+/// `n` bytes from Crockford Base32 made by [`to_b32`].
+fn from_b32(s: &str, n: usize) -> Option<Vec<u8>> {
+    let syms: Vec<u8> = s.bytes().map(crockford_value).collect::<Option<_>>()?;
+    if syms.len() != (n * 8).div_ceil(5) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    let (mut acc, mut bits) = (0u32, 0);
+    for v in syms {
+        acc = (acc << 5) | u32::from(v);
+        bits += 5;
+        if bits >= 8 && out.len() < n {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    (out.len() == n).then_some(out)
+}
+
+fn parse_meet(v: &str) -> Result<crate::rendezvous::MeetingPoint> {
+    let bad = || Error::Malformed("invite link meeting point");
+    let (code, addr) = v.split_once('@').ok_or_else(bad)?;
+    let b = from_b32(code, 36).ok_or_else(bad)?;
+    let addr: std::net::SocketAddr = addr.parse().map_err(|_| bad())?;
+    Ok(crate::rendezvous::MeetingPoint {
+        relay: Fingerprint(b[..20].try_into().map_err(|_| bad())?),
+        addr,
+        cookie: b[20..].try_into().map_err(|_| bad())?,
+    })
 }
 
 impl fmt::Display for InviteLink {
@@ -128,8 +181,15 @@ impl fmt::Display for InviteLink {
         if !self.addrs.is_empty() {
             write!(f, "@{}", self.addrs.join(","))?;
         }
+        let mut sep = '?';
         if let Some(k) = &self.key {
             write!(f, "?r={k}")?;
+            sep = '&';
+        }
+        if let Some(m) = &self.meet {
+            let mut b = m.relay.0.to_vec();
+            b.extend_from_slice(&m.cookie);
+            write!(f, "{sep}m={}@{}", to_b32(&b), m.addr)?;
         }
         Ok(())
     }
@@ -144,10 +204,12 @@ impl FromStr for InviteLink {
         let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
         let rest = rest.trim_end_matches('/');
         let (fp, addrs) = rest.split_once('@').unwrap_or((rest, ""));
-        let mut key = None;
+        let (mut key, mut meet) = (None, None);
         for pair in query.split('&') {
             if let Some(k) = pair.strip_prefix("r=") {
                 key = Some(k.parse()?);
+            } else if let Some(m) = pair.strip_prefix("m=") {
+                meet = Some(parse_meet(m)?);
             }
         }
         let addrs: Vec<String> = addrs
@@ -157,7 +219,7 @@ impl FromStr for InviteLink {
             .take(MAX_ADDRS)
             .map(str::to_owned)
             .collect();
-        if addrs.is_empty() && key.is_none() {
+        if addrs.is_empty() && key.is_none() && meet.is_none() {
             return Err(Error::Malformed("invite link has no address"));
         }
         if addrs.iter().any(|a| !is_host_port(a)) {
@@ -167,6 +229,7 @@ impl FromStr for InviteLink {
             fingerprint: fp.parse()?,
             addrs,
             key,
+            meet,
         })
     }
 }
@@ -209,6 +272,7 @@ mod tests {
             fingerprint: fp,
             addrs: vec!["[2001:db8::7]:7450".into(), "198.51.100.4:7450".into()],
             key: Some(InviteKey::generate()),
+            meet: None,
         };
         let s = link.to_string();
         assert_eq!(s.parse::<InviteLink>().unwrap(), link);

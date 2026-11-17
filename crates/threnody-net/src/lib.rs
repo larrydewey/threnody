@@ -24,6 +24,7 @@ pub mod history;
 pub mod identity;
 pub mod lists;
 pub mod mailbox;
+mod meeting;
 pub mod node;
 pub mod onion;
 pub(crate) mod portmap;

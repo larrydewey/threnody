@@ -693,6 +693,7 @@ impl Node {
                     issued_ms: now,
                     flags: 0,
                     seeking_until_ms: Some(now + RECOVER_FOR.as_millis() as u64),
+                    meetings: self.own_meetings(),
                 };
                 let (dht, peer) = (dht.clone(), *peer);
                 puts.spawn(async move {

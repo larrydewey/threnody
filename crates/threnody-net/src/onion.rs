@@ -54,7 +54,7 @@ const DEPOSIT_HEAD: usize = 36;
 const DEPOSIT_TAG: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
-enum OnionMsg {
+pub(crate) enum OnionMsg {
     Create {
         circ: u64,
         e_pub: Vec<u8>,
@@ -74,6 +74,17 @@ enum OnionMsg {
     Destroy {
         circ: u64,
     },
+    /// Over an anonymous link to a volunteer relay: splice circuits that
+    /// EXTEND with `cookie` onto this link (Appendix N, *Meeting points*).
+    /// The first time, paid with `token` (bound to the cookie).
+    Listen {
+        cookie: [u8; 16],
+        token: Option<Vec<u8>>,
+    },
+    /// The relay's answer: it listens for `cookie` on this link.
+    Listening {
+        cookie: [u8; 16],
+    },
 }
 
 impl OnionMsg {
@@ -83,6 +94,7 @@ impl OnionMsg {
             | Self::Created { circ, .. }
             | Self::Cell { circ, .. }
             | Self::Destroy { circ } => *circ,
+            Self::Listen { .. } | Self::Listening { .. } => 0,
         }
     }
 
@@ -113,6 +125,21 @@ impl OnionMsg {
                 Self::Destroy { circ } => {
                     e.map_len(2)?.u8(0)?.u8(4)?.u8(1)?.u64(*circ)?;
                 }
+                Self::Listen { cookie, token } => {
+                    e.map_len(3 + usize::from(token.is_some()))?
+                        .u8(0)?
+                        .u8(5)?
+                        .u8(1)?
+                        .u64(0)?;
+                    e.u8(8)?.bytes(cookie)?;
+                    if let Some(t) = token {
+                        e.u8(7)?.bytes(t)?;
+                    }
+                }
+                Self::Listening { cookie } => {
+                    e.map_len(3)?.u8(0)?.u8(6)?.u8(1)?.u64(0)?;
+                    e.u8(8)?.bytes(cookie)?;
+                }
             }
             Ok(())
         })
@@ -122,6 +149,7 @@ impl OnionMsg {
         let mut dec = Decoder::new(b);
         let (mut op, mut circ, mut e_pub, mut id, mut ct, mut sig, mut cell, mut token) =
             (None, None, None, None, None, None, None, None);
+        let mut cookie = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => op = Some(d.u8()?),
@@ -138,6 +166,7 @@ impl OnionMsg {
                     }
                     token = Some(t.to_vec());
                 }
+                8 => cookie = Some(fixed_bytes::<16>(d)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -161,6 +190,13 @@ impl OnionMsg {
                 cell: required(cell, "cell")?,
             },
             4 => Self::Destroy { circ },
+            5 => Self::Listen {
+                cookie: required(cookie, "meeting cookie")?,
+                token,
+            },
+            6 => Self::Listening {
+                cookie: required(cookie, "meeting cookie")?,
+            },
             other => return Err(threnody_core::Error::UnexpectedType(u64::from(other))),
         })
     }
@@ -199,6 +235,9 @@ pub(crate) struct Hop {
     pub addr: Option<String>,
     /// A volunteer relay, paid with a token.
     pub volunteer: Option<PublicIdentity>,
+    /// Reached at a meeting point: the previous hop (the relay) extends
+    /// over the link registered under this cookie.
+    pub meet: Option<[u8; 16]>,
 }
 
 /// A circuit to build: its first hop and how we reach it, then every hop.
@@ -223,6 +262,7 @@ impl OnionRoute {
                     fp: *fp,
                     addr: None,
                     volunteer: None,
+                    meet: None,
                 })
                 .collect(),
         }
@@ -416,6 +456,11 @@ impl Node {
     }
 
     /// Sends over the anonymous link to `to` when `anon`, else its session.
+    pub(crate) fn send_anon_msg(&self, to: &PublicIdentity, m: &OnionMsg) -> bool {
+        self.onion_send_via(to, m, true)
+    }
+
+    /// Sends over the anonymous link to `to` when `anon`, else its session.
     fn onion_send_via(&self, to: &PublicIdentity, m: &OnionMsg, anon: bool) -> bool {
         let Ok(b) = m.encode() else { return false };
         if anon {
@@ -444,6 +489,11 @@ impl Node {
                 }
             }
             OnionMsg::Destroy { circ } => self.onion_destroy((from, circ), true),
+            OnionMsg::Listen { cookie, token } if anon => {
+                self.meeting_listen(from, cookie, token.as_deref());
+            }
+            OnionMsg::Listening { cookie } if anon => self.meeting_listening(from, cookie),
+            OnionMsg::Listen { .. } | OnionMsg::Listening { .. } => {}
         }
     }
 
@@ -673,11 +723,19 @@ impl Node {
             // One extension at a time: a second would orphan the first.
             let extending = st.extending.values().any(|u| *u == up) || st.dialing.contains(&up);
             st.hops.get(&up).map_or((false, false), |h| {
-                (h.full && h.next.is_none() && !extending, h.contact)
+                // A meeting point extends any hop, paid or not: only onto
+                // a link someone registered to be met at, never further.
+                (
+                    (h.full || req.meet.is_some()) && h.next.is_none() && !extending,
+                    h.contact,
+                )
             })
         };
         if !allowed {
             return fail(self);
+        }
+        if let Some(cookie) = req.meet {
+            return self.extend_to_meeting(up, cookie, req.e_pub, req.token);
         }
         let contact = from_contact
             .then(|| {
@@ -1143,6 +1201,7 @@ impl Node {
                     e_pub,
                     addr: hop.addr.clone(),
                     token,
+                    meet: hop.meet,
                 }
                 .encode()?;
                 let cell = onion.wrap(onion.len() - 1, &Payload::new(Cmd::Extend, data))?;
@@ -1295,6 +1354,51 @@ impl Node {
         )))
     }
 
+    pub(crate) async fn meet_route(&self, route: &OnionRoute) -> Result<PublicIdentity> {
+        self.try_onion_path(route).await
+    }
+
+    /// A meeting point's EXTEND (see `meeting`): onto the anonymous link
+    /// registered for `cookie`, as a volunteer's EXTEND goes onto a link it
+    /// dials, but to nothing it has to dial.
+    fn extend_to_meeting(
+        &self,
+        up: Link,
+        cookie: [u8; 16],
+        e_pub: Vec<u8>,
+        token: Option<Vec<u8>>,
+    ) {
+        let fail = |n: &Self| n.onion_reply(up, &Payload::new(Cmd::ExtendFailed, vec![]));
+        let Some(next) = self.meeting_link(&cookie).filter(|_| self.volunteering()) else {
+            return fail(self);
+        };
+        let c = u64::from_le_bytes(random_bytes());
+        {
+            let mut st = lock(&self.shared.onion);
+            if !st.hops.contains_key(&up) || st.link_in_use(&(next, c)) {
+                drop(st);
+                return fail(self);
+            }
+            st.anon.insert((next, c));
+            st.extending.insert((next, c), up);
+        }
+        if !self.onion_send(
+            &next,
+            &OnionMsg::Create {
+                circ: c,
+                e_pub,
+                token,
+            },
+        ) {
+            {
+                let mut st = lock(&self.shared.onion);
+                st.extending.remove(&(next, c));
+                st.anon.remove(&(next, c));
+            }
+            fail(self);
+        }
+    }
+
     async fn try_onion_path(&self, route: &OnionRoute) -> Result<PublicIdentity> {
         let first = route.first;
         let (circ, mut onion, mut rx) = self.build_circuit(route).await?;
@@ -1412,16 +1516,19 @@ impl Node {
                         fp: r1.identity.fingerprint(),
                         addr: None,
                         volunteer: Some(r1.identity),
+                        meet: None,
                     },
                     Hop {
                         fp: r2.identity.fingerprint(),
                         addr: Some(r2.addrs[0].clone()),
                         volunteer: Some(r2.identity),
+                        meet: None,
                     },
                     Hop {
                         fp: dest,
                         addr: Some(addr.to_owned()),
                         volunteer: None,
+                        meet: None,
                     },
                 ],
             })
@@ -1588,6 +1695,7 @@ mod tests {
             e_pub: CreateState::new(to).1,
             addr: None,
             token: None,
+            meet: None,
         }
         .encode()
         .unwrap()

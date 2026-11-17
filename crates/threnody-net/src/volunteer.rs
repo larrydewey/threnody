@@ -392,6 +392,7 @@ impl Node {
         self.save_subs();
         let _ = self.fetch_tokens(&link.issuer).await;
         self.start_directory_upkeep();
+        self.kick_meeting();
         // A volunteer registers with a new directory at once.
         if self.volunteering() {
             let node = self.clone();
@@ -590,6 +591,8 @@ impl Node {
             self.vol().upkeep.store(false, Ordering::Relaxed);
             return;
         };
+        let node = self.clone();
+        handle.spawn(async move { node.meeting_loop().await });
         let node = self.clone();
         handle.spawn(async move {
             let closed = node.closed();

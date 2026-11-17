@@ -585,6 +585,7 @@ mod tests {
             fingerprint: fp,
             addrs: addrs.iter().map(|a| (*a).to_owned()).collect(),
             key: Some(InviteKey::from_bytes(&[0x42; 16]).unwrap()),
+            meet: None,
         }
     }
 

@@ -617,6 +617,8 @@ pub(crate) struct Shared {
     /// The deposit keys our mutually approved contacts gave us. In memory:
     /// each session hands it over again.
     pub(crate) deposit_keys: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
+    /// Meeting points: ours, and those we listen for as a relay.
+    pub(crate) meeting: crate::meeting::MeetingState,
     pub(crate) ble: Mutex<crate::discovery::BleState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
@@ -1017,6 +1019,7 @@ impl Node {
             siblings: Mutex::new(siblings),
             deposit_key: Mutex::new(deposit_key),
             deposit_keys: Mutex::default(),
+            meeting: crate::meeting::MeetingState::default(),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),

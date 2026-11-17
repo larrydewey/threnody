@@ -474,6 +474,7 @@ mod tests {
             issued_ms: 42,
             flags: 0,
             seeking_until_ms: None,
+            meetings: Vec::new(),
         }
     }
 
@@ -535,6 +536,7 @@ mod tests {
                 issued_ms: u64::MAX,
                 flags: u64::MAX,
                 seeking_until_ms: Some(u64::MAX),
+                meetings: Vec::new(),
             },
         };
         let rk = h.knock_keys(7, 2);
@@ -609,6 +611,7 @@ mod tests {
                 issued_ms: u64::MAX,
                 flags: u64::MAX,
                 seeking_until_ms: Some(u64::MAX),
+                meetings: Vec::new(),
             },
             sealed_knocks: true,
             sig: None,

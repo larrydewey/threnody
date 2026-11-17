@@ -123,7 +123,18 @@ Once either side sees the other's fresh candidates:
 
 **Symmetric NAT.** With `flags & 1` set on exactly one side, the other side (which has a stable port) dials, and the symmetric side's probes open its own mapping toward that port. That usually works. When both sides are symmetric, the relay fallback applies.
 
-**Where this fails in practice.** Hole punching often fails behind symmetric NAT, which many VPNs use, especially when both people are on one. Relaying then needs a contact the two already share, so a brand-new contact (met through an invite or a handle) with both sides behind VPNs may not connect at all until one of them turns the VPN off, or both are on the same network.
+**Where this fails in practice.** Hole punching often fails behind symmetric NAT, which many VPNs use, especially when both people are on one. Meeting points (below) cover that case.
+
+## 6. Meeting points
+
+A device that a punch may not reach keeps a *meeting point*: an outgoing link to a volunteer relay (Appendix P) where circuits naming a secret cookie are spliced onto the link. It keeps one when its own NAT looks symmetric, when it is an anonymous identity (whose invites carry no address, Appendix M), or when the user asks for one (`Node::set_meeting_point`, for someone who knows they're behind a VPN), and only with volunteer relays in its directories.
+
+- **Listening.** The device opens an anonymous link to a relay from its directories under a throwaway identity (as a client's first hop does), and sends `Listen { cookie }` (onion op 5, `{ 0: 5, 1: 0, 8: cookie bstr(16), ? 7: token }`), paying with a relay token bound to the cookie. The relay answers `Listening { cookie }` (op 6). It keeps at most 4,096 cookies, 64 from one network (a /24 or /56), one per link, and forgets a cookie when its link ends. The device sends `Listen` again every minute (free for a cookie the relay already holds), which keeps the link, its NAT mapping and the relay's idle timer alive, and opens a new meeting point elsewhere when the link drops.
+- **Publishing.** `Candidates` gets key `4`: up to two `[relay_fp bstr(20), addr bstr(4 or 16), port uint, cookie bstr(16)]`; with one present a record carries at most eight addresses, so it still fits. Older readers ignore the key. The meeting point goes into pairwise records, recovery slots, handle and invite records, and invite links (`&m=`, Appendix S).
+- **Meeting.** A finder builds a circuit whose last relay is the meeting relay and EXTENDs with flag `4` and the cookie (Appendix P). The relay passes the CREATE down the registered link, and the device answers as any last hop does, so the finder checks its identity in `CREATED` as for every hop; then it BEGINs a session. A relay extends a hop to a meeting point whether or not the hop paid: it carries the circuit only to someone who asked to be met there. When the finder holds tokens, the circuit's first relay is another volunteer, so the meeting relay doesn't see the finder's address; with none it goes straight to the meeting relay, which then sees it.
+- **When.** A contact whose record names a meeting point is met there when a punch fails, or at once when both sides' NATs look symmetric (the punch still runs). A handle or invite record's meeting point is tried alongside the knock, from a signed record only. An invite link's is tried first.
+- **Who learns what.** The meeting relay sees the device's address and that something reached it, not who either side is (the link's identity is thrown away; the session inside the circuit is end to end). With a first relay, no relay sees both addresses. The cookie is all it takes to reach the device there, so it travels only in records and links meant for whoever may reach it, and anyone it reaches still meets the device's own accept policy and stranger limits (Appendix A).
+
 
 ## 5. Fast recovery
 
