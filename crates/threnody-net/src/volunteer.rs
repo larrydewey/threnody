@@ -129,6 +129,9 @@ struct DirServer {
     registered: HashMap<(u32, [u8; 16]), u32>,
     doc: Option<DirectoryDoc>,
     dirty: bool,
+    /// Where we serve the directory (see [`crate::onion::dial_target`]):
+    /// set each time it is served, empty after a restart until then.
+    own: Vec<std::net::IpAddr>,
 }
 
 pub(crate) struct VolunteerState {
@@ -255,6 +258,7 @@ impl Node {
                 registered: HashMap::new(),
                 doc: None,
                 dirty: true,
+                own: Vec::new(),
             });
         }
     }
@@ -677,6 +681,16 @@ impl Node {
         lock(&self.vol().relay).is_some()
     }
 
+    /// The literal IP addresses we volunteer at (none when we don't).
+    pub(crate) fn volunteer_addrs(&self) -> Vec<std::net::IpAddr> {
+        lock(&self.vol().relay)
+            .iter()
+            .flatten()
+            .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+            .map(|a| a.ip())
+            .collect()
+    }
+
     /// Volunteers as a relay reachable at `addrs` (public `host:port`s), or
     /// stops (`None`). Registers with every subscribed directory now and
     /// every few hours. Tokens are accepted from those directories.
@@ -846,10 +860,17 @@ impl Node {
             issuer: issuer.key().id(),
             addr: addr.to_owned(),
         };
+        let own: Vec<std::net::IpAddr> = addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| vec![a.ip()])
+            .unwrap_or_default();
         {
             let mut server = lock(&self.vol().server);
             match server.as_mut() {
-                Some(s) => s.review = review,
+                Some(s) => {
+                    s.review = review;
+                    s.own = own;
+                }
                 None => {
                     *server = Some(DirServer {
                         issuer,
@@ -859,6 +880,7 @@ impl Node {
                         registered: HashMap::new(),
                         doc: None,
                         dirty: true,
+                        own,
                     })
                 }
             }
@@ -1031,9 +1053,18 @@ impl Node {
     /// identity.
     async fn probe_and_list(&self, peer: PublicIdentity, id: u64, d: RelayDescriptor) {
         let mut reachable = false;
+        let own = lock(&self.vol().server)
+            .as_ref()
+            .map(|s| s.own.clone())
+            .unwrap_or_default();
         for addr in &d.addrs {
+            // Only where a relay can be listed: never our LAN or loopback
+            // on a stranger's say-so.
+            let Some(sa) = crate::onion::dial_target(addr, &own).await else {
+                continue;
+            };
             if self
-                .anon_dial(addr, Some(d.identity.fingerprint()), true)
+                .anon_dial(&sa.to_string(), Some(d.identity.fingerprint()), true)
                 .await
                 .is_ok()
             {
