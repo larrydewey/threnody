@@ -334,7 +334,8 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     let entry = last(&alice);
     assert!(entry.delivered && entry.file.is_some_and(|f| f.size == 3));
 
-    // A photo loses its location on the way, keeps its caption and flag.
+    // A photo loses its location and the name the phone gave it on the
+    // way, keeps its caption and flag.
     let mut photo = vec![0xFF, 0xD8];
     photo.extend([0xFF, 0xE1, 0, 17]);
     photo.extend(b"Exif\0\0GPS 51.5N");
@@ -361,6 +362,7 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     let Event::Message {
         msg:
             AppMessage::File {
+                name,
                 data,
                 sensitive,
                 caption,
@@ -382,6 +384,7 @@ async fn history_marks_messages_delivered_when_acknowledged() {
         unreachable!()
     };
     assert!(!data.windows(3).any(|w| w == b"GPS"), "metadata sent");
+    assert_eq!(name, "photo.jpg");
     assert!(data.ends_with(&[0x12, 0x34, 0xFF, 0xD9]));
     assert!(sensitive && caption == "the view" && album == 5);
     assert_eq!(last(&alice).text, "the view");
@@ -399,7 +402,7 @@ async fn history_marks_messages_delivered_when_acknowledged() {
     alice.set_strip_metadata(false);
     send_photo(photo.clone());
     let Event::Message {
-        msg: AppMessage::File { data, .. },
+        msg: AppMessage::File { name, data, .. },
         ..
     } = next(&mut brx, |e| {
         matches!(
@@ -415,6 +418,7 @@ async fn history_marks_messages_delivered_when_acknowledged() {
         unreachable!()
     };
     assert_eq!(data, photo);
+    assert_eq!(name, "IMG.jpg");
     while arx.try_recv().is_ok() {}
     tokio::time::sleep(Duration::from_millis(200)).await;
     while arx.try_recv().is_ok() {}

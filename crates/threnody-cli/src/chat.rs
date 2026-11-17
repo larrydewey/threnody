@@ -2570,9 +2570,9 @@ impl Ui {
             self.node.onion_hops()
         );
         say!(
-            "  images       {}",
+            "  media        {}",
             if self.node.strip_metadata() {
-                "metadata stripped before sending"
+                "photos and videos sent without metadata or original names"
             } else {
                 "sent with their metadata (--keep-metadata)"
             }
