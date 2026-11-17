@@ -333,6 +333,18 @@ impl Carrier {
 }
 
 impl OnionState {
+    /// Whether link circuit `link` already names a circuit here, ours or a
+    /// neighbour's. Both sides of a link pick ids for it, from one space:
+    /// a neighbour that CREATEs with an id we gave it for a circuit of ours
+    /// would otherwise get its cells mixed into that circuit.
+    fn link_in_use(&self, link: &Link) -> bool {
+        self.hops.contains_key(link)
+            || self.down.contains_key(link)
+            || self.extending.contains_key(link)
+            || self.origins.contains_key(link)
+            || self.creating.contains_key(link)
+    }
+
     /// Whether another stranger's hop fits, from network `net`.
     fn stranger_room(&self, net: Option<[u8; 16]>) -> bool {
         let strangers = self.hops.iter().filter(|(l, _)| self.anon.contains(l));
@@ -450,7 +462,7 @@ impl Node {
             .map(|a| crate::volunteer::network(a.ip()));
         let admitted = {
             let st = lock(&self.shared.onion);
-            !st.hops.contains_key(&(from, circ))
+            !st.link_in_use(&(from, circ))
                 && st.hops.keys().filter(|(p, _)| *p == from).count() < MAX_CIRCUITS_PER_PEER
                 && (contact || st.stranger_room(net))
         };
