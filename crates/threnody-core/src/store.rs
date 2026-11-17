@@ -444,7 +444,7 @@ pub fn secure_delete(path: &Path) -> Result<()> {
     for pass in 0..4 {
         f.seek(std::io::SeekFrom::Start(0))?;
         let mut left = size;
-        let mut chunk = vec![0u8; size.min(1 << 20)];
+        let mut chunk = vec![0u8; size.min(64 * 1024)];
         while left > 0 {
             let n = left.min(chunk.len());
             if pass < 3 {

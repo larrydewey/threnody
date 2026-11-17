@@ -228,6 +228,10 @@ struct ChatView: View {
             if case let .success(urls) = result { loadFiles(urls) }
         }
         .quickLookPreview($previewURL)
+        // A decrypted copy of a sealed file goes when QuickLook closes.
+        .onChange(of: previewURL) { old, _ in
+            if let old { Media.dropPlain(old) }
+        }
     }
 
     private func withDialogs(_ content: some View) -> some View {

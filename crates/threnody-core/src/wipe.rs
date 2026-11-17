@@ -38,7 +38,8 @@ const DIRS: &[&str] = &[
     "personas",
     // Received photos and clips (the Linux app).
     "media",
-    // Edited photos not yet sent (the Linux app's editor).
+    // Edited photos not yet sent (the Linux app's editor, before it kept
+    // them in the runtime directory).
     "edited",
     // Received files (the CLI, and the Linux app without XDG Downloads).
     "downloads",

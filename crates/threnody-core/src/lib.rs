@@ -24,6 +24,7 @@ pub mod identity;
 pub mod invite;
 pub mod lists;
 pub mod media;
+pub mod media_seal;
 pub mod message;
 pub mod onion;
 pub mod persona;

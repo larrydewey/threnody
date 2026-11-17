@@ -1,6 +1,7 @@
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import os
 
 /// A failure to show the user as it is.
 struct AppError: LocalizedError {
@@ -17,7 +18,22 @@ struct AppError: LocalizedError {
 /// relative to Application Support (the container moves between app
 /// updates): `media/<name>` for the main identity, `media-p-<id>/<name>`
 /// for an anonymous identity.
+///
+/// Every kept file is sealed under the main identity (`sealMedia`), so a
+/// copy of the app's files is useless without the identity's key, as the
+/// identity itself is. Pictures decode from bytes decrypted in memory;
+/// QuickLook and Share get a decrypted copy in the temporary directory
+/// (`plainCopy`), deleted when QuickLook closes, on lock and at start.
+/// Files kept before sealing are read as they are until `sealAll` seals
+/// them at start.
 enum Media {
+    /// The main node, whose identity seals kept files: set when it starts.
+    private static let sealerLock = OSAllocatedUnfairLock<ThrenodyNode?>(uncheckedState: nil)
+    static var sealer: ThrenodyNode? {
+        get { sealerLock.withLockUnchecked { $0 } }
+        set { sealerLock.withLockUnchecked { $0 = newValue } }
+    }
+
     /// How long a file nothing refers to is kept: its message may not be
     /// recorded yet.
     static let grace: TimeInterval = 10 * 60
@@ -33,18 +49,84 @@ enum Media {
         Paths.support.appendingPathComponent(dirName(persona), isDirectory: true)
     }
 
-    /// Keeps `data` privately; returns its location, or nil if it couldn't.
+    /// Keeps `data` privately, sealed; returns its location, or nil if it couldn't.
     static func save(name: String, data: Data, persona: String?) -> String? {
+        guard let sealer else { return nil }
         let folder = dir(persona)
         let location = "\(dirName(persona))/\(UUID().uuidString)-\(safeFileName(name: name))"
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             try Paths.excludeFromBackup(folder)
-            // Written while locked (a background receipt), read only unlocked.
-            try data.write(to: Paths.support.appendingPathComponent(location), options: .completeFileProtectionUnlessOpen)
+            let path = Paths.support.appendingPathComponent(location).path
+            try sealer.sealMedia(data: data, dst: path)
+            // Written while locked (a background receipt), read only
+            // unlocked; sealed whether or not the class can be set now.
+            try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUnlessOpen], ofItemAtPath: path)
             return location
         } catch {
             return nil
+        }
+    }
+
+    /// What the kept file at `url` holds: decrypted in memory if sealed,
+    /// as it is if kept before sealing. Call it off the main thread.
+    static func read(_ url: URL) -> Data? {
+        guard isSealedMedia(path: url.path) else { return try? Data(contentsOf: url) }
+        return try? sealer?.openMedia(path: url.path)
+    }
+
+    /// Where decrypted copies wait for QuickLook or Share: the temporary
+    /// directory, never backed up.
+    static var plainDir: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("plain", isDirectory: true)
+    }
+
+    /// A decrypted copy of the kept file at `url`, under the name it was
+    /// sent with, for QuickLook or Share; `url` itself if it isn't sealed.
+    /// Delete it with `dropPlain`. Call it off the main thread.
+    static func plainCopy(_ url: URL) throws -> URL {
+        guard isSealedMedia(path: url.path) else { return url }
+        guard let sealer else { throw AppError("Threnody isn't running") }
+        let dir = plainDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Kept as "<UUID>-<name>".
+        let kept = url.lastPathComponent
+        let name = kept.count > 37 ? String(kept.dropFirst(37)) : kept
+        let out = dir.appendingPathComponent(name.isEmpty ? "file" : name)
+        do {
+            try sealer.openMediaFile(src: url.path, dst: out.path)
+        } catch {
+            try? FileManager.default.removeItem(at: dir)
+            throw error
+        }
+        return out
+    }
+
+    /// Deletes a decrypted copy `plainCopy` made (QuickLook closed); never
+    /// a kept file.
+    static func dropPlain(_ url: URL) {
+        let dir = url.deletingLastPathComponent()
+        guard dir.deletingLastPathComponent().standardizedFileURL.path == plainDir.standardizedFileURL.path else { return }
+        _ = try? secureDeleteFile(path: url.path)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// Deletes every decrypted copy (at start and on lock).
+    static func wipePlain() {
+        let fm = FileManager.default
+        if let copies = fm.enumerator(at: plainDir, includingPropertiesForKeys: nil) {
+            for case let f as URL in copies { _ = try? secureDeleteFile(path: f.path) }
+        }
+        try? fm.removeItem(at: plainDir)
+    }
+
+    /// Seals, in place, files every identity's folder kept before media was
+    /// sealed (the plaintext is overwritten). Run before the first sweep.
+    static func sealAll() {
+        let fm = FileManager.default
+        guard let sealer, let items = try? fm.contentsOfDirectory(at: Paths.support, includingPropertiesForKeys: nil) else { return }
+        for item in items where item.lastPathComponent == "media" || item.lastPathComponent.hasPrefix("media-p-") {
+            _ = try? sealer.sealMediaDir(dir: item.path)
         }
     }
 
@@ -150,11 +232,14 @@ enum Media {
 
     /// The image at `url` turned upright and at most `maxSide` pixels on
     /// its longer side, or nil if it isn't one, can't be read, or is too
-    /// large to decode. Call it off the main thread.
+    /// large to decode. A sealed one is decrypted in memory, never to a
+    /// file; thumbnails are only cached in memory. Call it off the main
+    /// thread.
     static func thumbnail(_ url: URL, maxSide: Int) -> CGImage? {
         let key = "\(url.path)@\(maxSide)" as NSString
         if let hit = thumbs.object(forKey: key) { return hit }
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+        guard let data = read(url),
+              let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               let cg = downsample(source, maxSide: maxSide)
         else { return nil }
         thumbs.setObject(cg, forKey: key, cost: cg.bytesPerRow * cg.height)

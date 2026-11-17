@@ -188,9 +188,8 @@ class ImageActivity : Activity() {
     private fun save(location: String, name: String, then: java.io.File? = null) {
         Threading.background {
             val ok = try {
-                val uri = android.net.Uri.parse(location)
-                val bytes = (if (uri.scheme == "file") java.io.File(uri.path ?: "").readBytes()
-                    else contentResolver.openInputStream(uri)?.use { it.readBytes() })
+                // Decrypted in memory if it was kept sealed.
+                val bytes = Media.read(this, location, Long.MAX_VALUE)
                     ?: throw IllegalStateException("unreadable")
                 val values = ContentValues().apply {
                     put(MediaStore.Downloads.DISPLAY_NAME, name.substringAfterLast('/').ifBlank { "photo" })
