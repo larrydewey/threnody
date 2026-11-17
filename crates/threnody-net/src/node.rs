@@ -1497,11 +1497,12 @@ impl Node {
         chan: SecureChannel,
         via: PublicIdentity,
         outbound: bool,
+        stranger: Option<StrangerPass>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let addr = self.relay_addr(&via);
-        self.spawn_session(stream, chan, addr, outbound, Route::Relay(via));
+        self.start_session(stream, chan, addr, outbound, Route::Relay(via), stranger);
     }
 
     pub(crate) fn spawn_onion_session<S>(
@@ -1510,11 +1511,49 @@ impl Node {
         chan: SecureChannel,
         via: PublicIdentity,
         outbound: bool,
+        stranger: Option<StrangerPass>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let addr = self.relay_addr(&via);
-        self.spawn_session(stream, chan, addr, outbound, Route::Onion(via));
+        self.start_session(stream, chan, addr, outbound, Route::Onion(via), stranger);
+    }
+
+    /// Keeps message requests to [`MAX_REQUESTS`], deleting those least
+    /// recently heard from (never `keep`, the one just arrived). Requests
+    /// with a session up go last.
+    fn evict_requests(&self, keep: &PublicIdentity) {
+        let live: HashSet<PublicIdentity> = self.sessions().into_iter().map(|s| s.peer).collect();
+        let mut requests: Vec<(bool, u64, PublicIdentity)> = lock(&self.shared.contacts)
+            .iter()
+            .filter(|c| !c.accepted && !c.blocked && !c.local_approved && c.key != *keep)
+            .map(|c| (live.contains(&c.key), c.last_seen_ms, c.key))
+            .collect();
+        // A device of an account we accepted counts as accepted.
+        requests.retain(|(_, _, k)| !self.is_accepted(k));
+        // One place for the newcomer.
+        let over = (requests.len() + 1).saturating_sub(MAX_REQUESTS);
+        if over == 0 {
+            return;
+        }
+        requests.sort_unstable_by_key(|(live, seen, _)| (*live, *seen));
+        for (_, _, key) in requests.into_iter().take(over) {
+            self.delete_request(&key);
+        }
+    }
+
+    /// [`Node::admit`] for a session arriving through a circuit whose last
+    /// hop before us is `via`: a stranger there takes one of the same
+    /// places a direct one would, counted against the network it came
+    /// from (an anonymous link's address, else the neighbour's). Without
+    /// this, circuits let any number of fresh identities hold sessions.
+    pub(crate) fn admit_via(
+        &self,
+        peer: &PublicIdentity,
+        via: &PublicIdentity,
+    ) -> Result<Option<StrangerPass>> {
+        let addr = self.anon_addr(via).unwrap_or_else(|| self.relay_addr(via));
+        self.admit(peer, Source::ip(addr.ip()))
     }
 
     pub(crate) fn check_policy(&self, peer: &PublicIdentity) -> Result<()> {
@@ -1556,9 +1595,9 @@ impl Node {
 
     /// [`Node::check_policy`] for a session arriving over its own
     /// connection from `source`; a stranger also needs a place among
-    /// [`MAX_STRANGERS`], which the returned pass holds. Relay and onion
-    /// circuits don't come through here: they ride on a contact's
-    /// session, hold no socket of ours, and are capped per neighbour.
+    /// [`MAX_STRANGERS`], which the returned pass holds. Sessions through
+    /// relay and onion circuits take their place through
+    /// [`Node::admit_via`].
     ///
     /// A new device of ours, linking with a code we issued, is a stranger
     /// until it shows the code inside its session: while a code is out,
@@ -1984,6 +2023,9 @@ impl Node {
             self.shared.save_contacts(&contacts);
             is_new
         };
+        if new_contact {
+            self.evict_requests(&peer);
+        }
         let since_ms = now_ms();
         let heard_ms = Arc::new(AtomicU64::new(since_ms));
         let info = SessionInfo {
@@ -3007,6 +3049,14 @@ const LAST_WORDS: Duration = Duration::from_secs(1);
 /// How long a young session that ended waits for a twin (see
 /// `spawn_session`) before it counts as a disconnection.
 const TWIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Message requests (contacts nobody accepted, approved or blocked) kept
+/// at once. Every fresh identity that completes a handshake becomes one,
+/// so without a bound a stranger could grow the contact book, and the
+/// work every probe and beacon does with it, for as long as it liked.
+/// Past it the request least recently heard from goes, with its
+/// conversation, as if the user had deleted it.
+pub const MAX_REQUESTS: usize = 256;
 
 /// Sessions with one peer starting this close together are duplicates.
 const DUPLICATE_WINDOW_MS: u64 = 5_000;

@@ -821,12 +821,12 @@ impl Node {
             let mut stream = theirs;
             let result = async {
                 let chan = handshake::accept(&mut stream, node.identity_ref()).await?;
-                node.check_policy(chan.peer())?;
-                Ok::<_, NetError>(chan)
+                let pass = node.admit_via(chan.peer(), &up.0)?;
+                Ok::<_, NetError>((chan, pass))
             }
             .await;
             match result {
-                Ok(chan) => node.spawn_onion_session(stream, chan, up.0, false),
+                Ok((chan, pass)) => node.spawn_onion_session(stream, chan, up.0, false, pass),
                 Err(e) => {
                     node.onion_destroy(up, true);
                     node.emit_rejected_relay(up.0, e.to_string());
@@ -1260,7 +1260,7 @@ impl Node {
         let dest = route.hops.last().ok_or(NetError::Closed)?.fp;
         let chan = handshake::initiate(&mut stream, self.identity_ref(), Some(dest)).await?;
         let peer = *chan.peer();
-        self.spawn_onion_session(stream, chan, first, true);
+        self.spawn_onion_session(stream, chan, first, true, None);
         Ok(peer)
     }
 }
