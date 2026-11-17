@@ -611,6 +611,12 @@ pub(crate) struct Shared {
     pub(crate) linking: Mutex<LinkState>,
     /// Shared prekey bundles of our own other devices, to forward.
     pub(crate) siblings: Mutex<HashMap<[u8; 32], PrekeyBundle>>,
+    /// Our mailbox's deposit key, the same for every mutually approved
+    /// contact, and replaced when one stops being one (see `mailbox`).
+    pub(crate) deposit_key: Mutex<[u8; 32]>,
+    /// The deposit keys our mutually approved contacts gave us. In memory:
+    /// each session hands it over again.
+    pub(crate) deposit_keys: Mutex<HashMap<PublicIdentity, [u8; 32]>>,
     pub(crate) ble: Mutex<crate::discovery::BleState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     next_id: AtomicU64,
@@ -873,6 +879,15 @@ impl Node {
                 chain
             }
         };
+        let deposit_key = match cfg.home.load_state(&cfg.identity, crate::mailbox::DEPOSIT_KEY_STATE)? {
+            Some(b) if b.len() == 32 => <[u8; 32]>::try_from(b.as_slice()).unwrap_or_else(|_| threnody_core::crypto::random_bytes()),
+            _ => {
+                let k: [u8; 32] = threnody_core::crypto::random_bytes();
+                cfg.home
+                    .save_state(&cfg.identity, crate::mailbox::DEPOSIT_KEY_STATE, &k)?;
+                k
+            }
+        };
         let siblings = match cfg.home.load_state(&cfg.identity, "siblings")? {
             Some(b) => crate::mailbox::decode_bundle_list(&b)?,
             None => HashMap::new(),
@@ -996,6 +1011,8 @@ impl Node {
             accounts: Mutex::new(accounts),
             linking: Mutex::new(LinkState::default()),
             siblings: Mutex::new(siblings),
+            deposit_key: Mutex::new(deposit_key),
+            deposit_keys: Mutex::default(),
             shutdown: tokio::sync::watch::Sender::new(false),
             next_id: AtomicU64::new(1),
             delivery: Mutex::new(delivery),
@@ -1881,6 +1898,9 @@ impl Node {
     /// session may end right after; its last act is to send that.
     pub(crate) fn withdraw_approval(&self, peer: &PublicIdentity) {
         self.shared.tunnel_down(peer);
+        // It knew our deposit key: a new one for those still approved.
+        self.rotate_deposit_key();
+        lock(&self.shared.deposit_keys).remove(peer);
         // No longer mutual: its wake-up endpoint goes (Appendix R).
         self.forget_push(peer);
         let _ = self.send(peer, AppMessage::Approval { approved: false });

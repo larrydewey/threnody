@@ -49,6 +49,9 @@ const DEPOSIT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_DEPOSITS_PER_MINUTE: u32 = 30;
 /// `to (32) || total_len (u32 BE)` before the sealed bytes.
 const DEPOSIT_HEAD: usize = 36;
+/// A deposit over an anonymous link adds a 16-byte deposit tag (see
+/// [`crate::mailbox::DEPOSIT_KEY_STATE`]) after the head.
+const DEPOSIT_TAG: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
 enum OnionMsg {
@@ -751,10 +754,30 @@ impl Node {
     /// We are the circuit's last hop and a mailbox: someone, hidden from us,
     /// leaves a sealed message for one of our contacts.
     fn onion_deposit_start(&self, up: Link, data: &[u8]) {
-        let head = data.get(..DEPOSIT_HEAD).and_then(|h| {
+        let anon = lock(&self.shared.onion).anon.contains(&up);
+        let head_len = DEPOSIT_HEAD + if anon { DEPOSIT_TAG } else { 0 };
+        let head = data.get(..head_len).and_then(|h| {
             let to: [u8; 32] = h[..32].try_into().ok()?;
-            let total = u32::from_be_bytes(h[32..].try_into().ok()?) as usize;
+            let total = u32::from_be_bytes(h[32..36].try_into().ok()?) as usize;
             (total <= crate::mailbox::MAX_HELD_BYTES).then_some((to, total))
+        });
+        // Over an anonymous link, only a contact's circuit (it holds our
+        // deposit key) gets an answer that depends on who it is for. The
+        // check comes first, so a stranger learns nothing from the answer.
+        let head = head.filter(|(to, _)| {
+            !anon || {
+                let key = *lock(&self.shared.deposit_key);
+                let want = lock(&self.shared.onion)
+                    .hops
+                    .get(&up)
+                    .map(|h| h.keys.deposit_tag(&key, to));
+                want.is_some_and(|w| {
+                    w.iter()
+                        .zip(&data[DEPOSIT_HEAD..head_len])
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0
+                })
+            }
         });
         // Only for our own mutually approved contacts: anything else would
         // be declined once complete, so it is declined before it is kept.
@@ -766,7 +789,7 @@ impl Node {
             let free = hop
                 .is_some_and(|h| h.next.is_none() && h.endpoint.is_none() && h.deposit.is_none());
             let net = hop.and_then(|h| h.net);
-            let first = data.len().saturating_sub(DEPOSIT_HEAD);
+            let first = data.len().saturating_sub(head_len);
             match head {
                 Some((to, total))
                     if free
@@ -777,7 +800,7 @@ impl Node {
                         h.deposit = Some(PendingDeposit {
                             to,
                             total,
-                            sealed: data[DEPOSIT_HEAD..].to_vec(),
+                            sealed: data[head_len..].to_vec(),
                         });
                     }
                     true
@@ -1160,6 +1183,19 @@ impl Node {
         sealed: &[u8],
     ) -> Result<DepositStatus> {
         let first = route.first;
+        // A mailbox reached by its address (through a volunteer, over an
+        // anonymous link) takes the deposit only with its tag.
+        let tagged = route.hops.last().is_some_and(|h| h.addr.is_some());
+        let key = if tagged {
+            let mailbox = route.hops.last().map(|h| h.fp);
+            let key = lock(&self.shared.deposit_keys)
+                .iter()
+                .find(|(p, _)| Some(p.fingerprint()) == mailbox)
+                .map(|(_, k)| *k);
+            Some(key.ok_or_else(|| NetError::NoRoute("no deposit key for this mailbox yet".into()))?)
+        } else {
+            None
+        };
         let (circ, mut onion, mut rx) = self.build_circuit(route).await?;
         let result = async {
             let last = onion.len() - 1;
@@ -1169,7 +1205,13 @@ impl Node {
                     .map_err(|_| NetError::Closed)?
                     .to_be_bytes(),
             );
-            let split = sealed.len().min(MAX_DATA - DEPOSIT_HEAD);
+            if let Some(k) = &key {
+                let tag = onion
+                    .deposit_tag(last, k, to.as_bytes())
+                    .ok_or(NetError::Closed)?;
+                head.extend_from_slice(&tag);
+            }
+            let split = sealed.len().min(MAX_DATA - head.len());
             head.extend_from_slice(&sealed[..split]);
             let cells = std::iter::once(Payload::new(Cmd::Deposit, head)).chain(
                 sealed[split..]
@@ -1691,9 +1733,16 @@ mod tests {
             .get_mut(&contact)
             .unwrap()
             .remote_approved = true;
-        let deposit = |to: &PublicIdentity, total: usize| {
+        // A deposit's first cell; over an anonymous link, tagged with our
+        // deposit key as a contact's circuit would be.
+        let deposit = |up: Link, to: &PublicIdentity, total: usize| {
             let mut d = to.as_bytes().to_vec();
             d.extend_from_slice(&u32::try_from(total).unwrap().to_be_bytes());
+            let st = lock(&node.shared.onion);
+            if st.anon.contains(&up) {
+                let key = *lock(&node.shared.deposit_key);
+                d.extend_from_slice(&st.hops[&up].keys.deposit_tag(&key, to.as_bytes()));
+            }
             d.extend_from_slice(&[0; 100]);
             d
         };
@@ -1708,8 +1757,16 @@ mod tests {
         let stranger = threnody_core::Identity::generate().public();
         let up = fake_hop(&node, stranger, 1, false, false);
         let nobody = threnody_core::Identity::generate().public();
-        node.onion_deposit_start(up, &deposit(&nobody, 4096));
+        node.onion_deposit_start(up, &deposit(up, &nobody, 4096));
         assert_eq!(pending(&node), 0);
+        // Without the tag (or with a wrong one), a stranger's deposit is
+        // declined even for our contact: the answer doesn't say who is one.
+        let probe = fake_hop(&node, stranger, 5, false, false);
+        let mut untagged = contact.as_bytes().to_vec();
+        untagged.extend_from_slice(&4096u32.to_be_bytes());
+        untagged.extend_from_slice(&[0; 116]);
+        node.onion_deposit_start(probe, &untagged);
+        assert_eq!(pending(&node), 0, "untagged over an anonymous link");
         // What counts is what has arrived, not what a head claims: one
         // network may start several deposits.
         let max = crate::mailbox::MAX_HELD_BYTES;
@@ -1723,9 +1780,9 @@ mod tests {
             node.onion_recognized(up, Payload::new(Cmd::Data, vec![0; len]));
         };
         let a = hop_from(1, 2);
-        node.onion_deposit_start(a, &deposit(&contact, max));
+        node.onion_deposit_start(a, &deposit(a, &contact, max));
         let b = hop_from(1, 3);
-        node.onion_deposit_start(b, &deposit(&contact, max));
+        node.onion_deposit_start(b, &deposit(b, &contact, max));
         assert_eq!(pending(&node), 2);
         // But together they may hold only so much from that network.
         data(a, max / 2);
@@ -1737,12 +1794,12 @@ mod tests {
         let nets = MAX_PENDING_DEPOSIT_BYTES / max;
         for n in 2..=nets as u8 {
             let up = hop_from(n, 10 + u64::from(n));
-            node.onion_deposit_start(up, &deposit(&contact, max));
+            node.onion_deposit_start(up, &deposit(up, &contact, max));
             data(up, max - 200);
         }
         assert_eq!(pending(&node), nets);
         let late = hop_from(100, 200);
-        node.onion_deposit_start(late, &deposit(&contact, max));
+        node.onion_deposit_start(late, &deposit(late, &contact, max));
         assert_eq!(pending(&node), nets + 1);
         // Its network has room, but all of them together do not.
         data(late, max - 200);
@@ -1755,7 +1812,7 @@ mod tests {
             true,
             false,
         );
-        node.onion_deposit_start(up, &deposit(&contact, max));
+        node.onion_deposit_start(up, &deposit(up, &contact, max));
         data(up, max - 200);
         assert_eq!(pending(&node), nets + 1);
     }
