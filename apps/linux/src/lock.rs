@@ -244,6 +244,8 @@ impl Lock {
     pub fn show_lock(&self) {
         let Some(app) = self.app() else { return };
         self.stack.set_visible_child_name("lock");
+        // Decrypted copies of sealed media given to players and other apps.
+        crate::core::wipe_plain_copies();
         for _ in 0..16 {
             let Some(d) = app.window.visible_dialog() else {
                 break;

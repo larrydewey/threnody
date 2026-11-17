@@ -133,6 +133,9 @@ object AppLock {
     }
 
     private fun showLock(from: Activity) {
+        // Decrypted copies of sealed media (a video playing) go when it locks.
+        val app = from.applicationContext
+        Threading.background { Media.wipePlain(app) }
         if (isExempt(from)) return
         hide(from)
         from.startActivity(

@@ -800,11 +800,11 @@ impl ChatView {
                             data.push(match &e.file {
                                 Some(f) => {
                                     let path = f.location.clone().unwrap_or_default();
-                                    Some(std::fs::read(&path).map_err(|x| {
-                                        threnody_ffi::ThrenodyError::Failed {
+                                    Some(core::read_media(std::path::Path::new(&path)).map_err(
+                                        |x| threnody_ffi::ThrenodyError::Failed {
                                             reason: format!("that file isn't on this device: {x}"),
-                                        }
-                                    })?)
+                                        },
+                                    )?)
                                 }
                                 None => None,
                             });
@@ -1927,6 +1927,10 @@ impl ChatView {
                 }
             });
             row.add_controller(open);
+            // A sealed file's folder shows only ciphertext.
+            if core::is_sealed(&p) {
+                return row.upcast();
+            }
             let folder = gtk::Button::from_icon_name("folder-open-symbolic");
             folder.set_tooltip_text(Some("Show in folder"));
             folder.add_css_class("flat");
@@ -2008,11 +2012,8 @@ impl ChatView {
         }
         let pic = gtk::Picture::new();
         if viewer::is_gif(&f.name) {
-            // GTK decodes GIFs itself, here: only reasonable ones.
-            if viewer::checked_size(&p).is_ok() {
-                pic.set_filename(Some(&p));
-                ui::animate(&pic, &p);
-            }
+            // GTK decodes GIFs itself: only reasonable ones.
+            viewer::show_gif(&pic, &p, || {});
         } else {
             viewer::thumbnail(
                 &pic,
@@ -2167,11 +2168,20 @@ impl ChatView {
 
     /// A voice or video message that plays in the chat.
     fn clip_view(&self, c: Clip, path: &std::path::Path) -> gtk::Widget {
+        // A decrypted copy deleted on lock is made again.
+        let wiped = self
+            .players
+            .borrow()
+            .get(path)
+            .is_some_and(|m| m.file().and_then(|f| f.path()).is_some_and(|p| !p.exists()));
+        if wiped {
+            self.players.borrow_mut().remove(path);
+        }
         let media = self
             .players
             .borrow_mut()
             .entry(path.to_owned())
-            .or_insert_with(|| gtk::MediaFile::for_filename(path))
+            .or_insert_with(|| player_for(path))
             .clone();
         if c.video {
             let v = gtk::Video::new();
@@ -2300,15 +2310,22 @@ impl ChatView {
     /// Finishes a recording and sends it.
     fn send_clip(self: &Rc<Self>, rec: clip::Recorder, video: bool) {
         let Some(node) = self.node() else { return };
+        let Some(core) = self.app.upgrade().map(|a| a.core.clone()) else {
+            return;
+        };
+        let persona = self.persona();
         let dest = self.dest();
         self.toast("Sending…");
         let weak = self.weak_self.clone();
         bg(
             move || -> Result<(), String> {
                 let done = rec.finish()?;
-                let data = std::fs::read(&done.path).map_err(|e| e.to_string())?;
+                let data = std::fs::read(&done.path).map_err(|e| e.to_string());
+                // Plain only while it was recorded: what is kept is sealed
+                // into media/ below.
+                let _ = threnody_ffi::secure_delete_file(done.path.display().to_string());
+                let data = data?;
                 if data.len() as u64 > node.max_file_size() {
-                    let _ = std::fs::remove_file(&done.path);
                     return Err(format!(
                         "it's larger than {}",
                         ui::human_size(node.max_file_size())
@@ -2327,8 +2344,11 @@ impl ChatView {
                     }),
                     ..FileOptions::default()
                 };
-                let location = Some(done.path.display().to_string());
-                send_file_to(&node, &dest, name, data, location, options).map_err(|e| e.to_string())
+                let location = core
+                    .keep_private(persona.as_deref(), &name, &data)
+                    .ok_or("couldn't keep it")?;
+                send_file_to(&node, &dest, name, data, Some(location), options)
+                    .map_err(|e| e.to_string())
             },
             move |r| {
                 let Some(t) = weak.upgrade() else { return };
@@ -3738,11 +3758,11 @@ impl ChatView {
                 overlay.add_overlay(&edit);
                 overlay.upcast()
             } else if viewer::is_gif(&name) && viewer::checked_size(p).is_ok() {
-                let pic = gtk::Picture::for_filename(p);
+                let pic = gtk::Picture::new();
                 pic.set_can_shrink(true);
                 pic.set_content_fit(gtk::ContentFit::Cover);
                 pic.add_css_class("photo");
-                ui::animate(&pic, p);
+                viewer::show_gif(&pic, p, || {});
                 pic.upcast()
             } else {
                 let file = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -3840,7 +3860,7 @@ impl ChatView {
                         .to_string_lossy()
                         .into_owned();
                     let mut converted = false;
-                    let data = match std::fs::read(p) {
+                    let data = match core::read_media(p) {
                         Ok(d) if !strip => d,
                         Ok(d) => match prepare(p, name.clone(), d) {
                             Ok((n, d, c)) => {
@@ -3912,7 +3932,7 @@ impl ChatView {
                         }
                         Ok(()) if draft => match &adopt_to {
                             Some(d) => {
-                                if let Err(e) = core::adopt_edit(p, d) {
+                                if let Err(e) = core::adopt_edit(&core.main, p, d) {
                                     core.say(format!("! keeping an edited photo: {e}"));
                                 }
                             }
@@ -5190,6 +5210,26 @@ fn prepare(
         .map_err(|_| unreadable())?;
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
     Ok((format!("{stem}.jpg"), jpeg, true))
+}
+
+/// A player for the voice or video message at `path`. A sealed one plays
+/// from a decrypted copy in the scratch directory (`core::plain_path`),
+/// made off the main thread: GTK's GStreamer backend plays files.
+fn player_for(path: &std::path::Path) -> gtk::MediaFile {
+    if !core::is_sealed(path) {
+        return gtk::MediaFile::for_filename(path);
+    }
+    let media = gtk::MediaFile::new();
+    let (weak, p) = (media.downgrade(), path.to_owned());
+    bg(
+        move || core::plain_path(&p),
+        move |r| {
+            if let (Some(m), Ok(plain)) = (weak.upgrade(), r) {
+                m.set_filename(Some(&plain));
+            }
+        },
+    );
+    media
 }
 
 /// What a file whose contents another of our devices may have says.

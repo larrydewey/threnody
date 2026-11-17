@@ -161,13 +161,29 @@ final class ChatTargetTests: TempDirTestCase {
 }
 
 final class MediaTests: TempDirTestCase {
+    override func tearDownWithError() throws {
+        Media.sealer = nil
+        try super.tearDownWithError()
+    }
+
     func testSavedFilesAreExcludedFromBackupAndNamedSafely() throws {
+        // Nothing is kept unsealed.
+        XCTAssertNil(Media.save(name: "x.jpg", data: Data("jpg".utf8), persona: nil))
+        Media.sealer = try openNode()
         let location = try XCTUnwrap(Media.save(name: "../x.jpg", data: Data("jpg".utf8), persona: nil))
         XCTAssertTrue(location.hasPrefix("media/"))
         XCTAssertTrue(location.hasSuffix("-x.jpg"))
         XCTAssertFalse(location.dropFirst("media/".count).contains("/"))
         let url = try XCTUnwrap(Media.resolve(location))
-        XCTAssertEqual(try Data(contentsOf: url), Data("jpg".utf8))
+        // Sealed on disk, opened in memory, and as a copy under its own name.
+        XCTAssertTrue(try Data(contentsOf: url).starts(with: Data("thr-media1".utf8)))
+        XCTAssertEqual(Media.read(url), Data("jpg".utf8))
+        let plain = try Media.plainCopy(url)
+        XCTAssertEqual(plain.lastPathComponent, "x.jpg")
+        XCTAssertEqual(try Data(contentsOf: plain), Data("jpg".utf8))
+        Media.dropPlain(plain)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: plain.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertTrue(try excludedFromBackup(Media.dir(nil)))
         let persona = try XCTUnwrap(Media.save(name: "y.png", data: Data("png".utf8), persona: "ab12"))
         XCTAssertTrue(persona.hasPrefix("media-p-ab12/"))

@@ -266,13 +266,26 @@ pub fn open_externally(
     path: &std::path::Path,
     on_fail: impl FnOnce() + 'static,
 ) {
-    gtk::FileLauncher::new(Some(&gtk::gio::File::for_path(path))).launch(
-        Some(window),
-        gtk::gio::Cancellable::NONE,
+    // A sealed file goes as a decrypted copy in the scratch directory
+    // (`core::plain_path`), deleted on lock and at exit.
+    let window: gtk::Window = window.clone().upcast();
+    let path = path.to_owned();
+    bg(
+        move || crate::core::plain_path(&path),
         move |r| {
-            if r.is_err() {
+            let Ok(plain) = r else {
                 on_fail();
-            }
+                return;
+            };
+            gtk::FileLauncher::new(Some(&gtk::gio::File::for_path(plain))).launch(
+                Some(&window),
+                gtk::gio::Cancellable::NONE,
+                move |r| {
+                    if r.is_err() {
+                        on_fail();
+                    }
+                },
+            );
         },
     );
 }
@@ -302,16 +315,14 @@ pub fn confirm_link(window: &adw::ApplicationWindow, url: &str) {
     d.present(Some(window));
 }
 
-/// Plays an animated GIF in `pic` (GTK draws only its first frame) while
-/// the picture exists; it only advances while it's on screen.
-pub fn animate(pic: &gtk::Picture, path: &std::path::Path) {
-    let is_gif = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
-    if !is_gif {
-        return;
-    }
-    let Ok(anim) = gdk::gdk_pixbuf::PixbufAnimation::from_file(path) else {
+/// Plays an animated GIF (`data`, in memory) in `pic` (GTK draws only
+/// its first frame) while the picture exists; it only advances while it's
+/// on screen.
+pub fn animate(pic: &gtk::Picture, data: &glib::Bytes) {
+    let stream = gtk::gio::MemoryInputStream::from_bytes(data);
+    let Ok(anim) =
+        gdk::gdk_pixbuf::PixbufAnimation::from_stream(&stream, gtk::gio::Cancellable::NONE)
+    else {
         return;
     };
     if anim.is_static_image() {

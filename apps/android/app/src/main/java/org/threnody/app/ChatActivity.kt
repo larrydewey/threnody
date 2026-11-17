@@ -494,11 +494,14 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** Sends a recorded voice or video message from where it was recorded. */
+    /**
+     * Sends a recorded voice or video message, kept sealed with the chat's
+     * files; the plain recording is deleted either way.
+     */
     private fun sendClip(file: java.io.File, measured: Long, video: Boolean) {
         Threnody.touch()
         Threading.background {
-            val location = Uri.fromFile(file).toString()
+            var location: String? = null
             // The file's own length when it says, else as timed.
             val ms = try {
                 android.media.MediaMetadataRetriever().use {
@@ -514,12 +517,16 @@ class ChatActivity : Activity() {
                     "it's larger than " + Formatter.formatShortFileSize(this, node.maxFileSize().toLong())
                 } else {
                     val options = FileOptions(false, "", 0uL, Clip(video, ms.coerceIn(0, Int.MAX_VALUE.toLong()).toUInt()))
-                    val g = group
-                    sendFileTo(file.name, data, location, options)
+                    val kept = Media.savePrivate(this, file.name, data, persona)
+                        ?: throw IllegalStateException("couldn't keep it")
+                    location = kept
+                    sendFileTo(file.name, data, kept, options)
                     null
                 }
             } catch (e: Exception) {
                 e.message ?: "error"
+            } finally {
+                Media.dropPlain(file)
             }
             if (error != null) {
                 Media.forget(this, location)
@@ -662,17 +669,43 @@ class ChatActivity : Activity() {
             setOnClickListener { dialog.dismiss() }
         }
         video.setMediaController(android.widget.MediaController(this).apply { setAnchorView(box) })
-        video.setVideoURI(Uri.parse(location))
         video.setOnPreparedListener { video.start() }
         video.setOnErrorListener { _, _, _ ->
             Toast.makeText(this, "Couldn't play this video", Toast.LENGTH_SHORT).show()
             dialog.dismiss()
             true
         }
+        // VideoView plays files: a sealed one from a decrypted copy in the
+        // cache, deleted when the player closes.
+        var plain: java.io.File? = null
+        var closed = false
         dialog.setContentView(box)
-        dialog.setOnDismissListener { video.stopPlayback() }
+        dialog.setOnDismissListener {
+            video.stopPlayback()
+            closed = true
+            plain?.let { f -> Threading.background { Media.dropPlain(f) } }
+        }
         Privacy.secure(dialog)
         dialog.show()
+        Threading.background {
+            val copy = try {
+                Media.plainCopy(this, location)
+            } catch (_: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, "Couldn't play this video", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                }
+                return@background
+            }
+            runOnUiThread {
+                if (closed) {
+                    copy?.let { f -> Threading.background { Media.dropPlain(f) } }
+                } else {
+                    plain = copy
+                    if (copy != null) video.setVideoPath(copy.path) else video.setVideoURI(Uri.parse(location))
+                }
+            }
+        }
     }
 
     /** Whether the contact was last told we are typing, and when. */

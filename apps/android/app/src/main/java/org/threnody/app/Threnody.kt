@@ -182,9 +182,19 @@ object Threnody {
         say("* burned anonymous identity ${id.take(6)}")
     }
 
-    /** Removes kept photos whose messages were deleted or disappeared. */
-    private fun sweepMedia(ctx: Context, node: ThrenodyNode) {
-        Threading.schedulePeriodic(1, 5, TimeUnit.MINUTES) {
+    /**
+     * Deletes decrypted copies a previous run left and seals files kept
+     * before media was sealed; then removes kept photos whose messages
+     * were deleted or disappeared: at start, then every five minutes.
+     */
+    private fun sweepMedia(ctx: Context, node: ThrenodyNode) = Threading.background {
+        Media.wipePlain(ctx)
+        Media.sealAll(ctx)
+        sweepPeriodically(ctx, node)
+    }
+
+    private fun sweepPeriodically(ctx: Context, node: ThrenodyNode) {
+        Threading.schedulePeriodic(0, 5, TimeUnit.MINUTES) {
             Media.sweep(ctx, node)
             for ((id, n) in personaNodes) Media.sweep(ctx, n, id)
             // Expired personas burn while the app runs, too.

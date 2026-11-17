@@ -207,6 +207,8 @@ struct FileContent: View {
     @State private var unshowable = false
     /// A file that turned out to be an image too large for QuickLook.
     @State private var refused = false
+    /// A decrypted copy to share, for a file QuickLook won't show.
+    @State private var shareURL: URL?
 
     var body: some View {
         if let file = entry.file {
@@ -229,7 +231,7 @@ struct FileContent: View {
                     }
                     .buttonStyle(.plain)
                 } else if photo, let image, let url {
-                    Button { onOpen(url) } label: {
+                    Button { openPlain(url, check: false) } label: {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFit()
@@ -239,18 +241,22 @@ struct FileContent: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel(label)
                     if !compact && !caption.isEmpty && !file.sensitive { Text(caption) }
-                } else if photo && unshowable, let url {
+                } else if photo && unshowable {
                     // Never handed to QuickLook, which would decode it whole.
                     Label("\(label) · Too large to preview", systemImage: "photo")
-                    ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+                    if let shareURL {
+                        ShareLink(item: shareURL) { Label("Share", systemImage: "square.and.arrow.up") }
+                    }
                 } else if photo {
                     RoundedRectangle(cornerRadius: 10)
                         .fill(Color.secondary.opacity(0.2))
                         .frame(width: compact ? 120 : 220, height: compact ? 120 : 160)
                         .overlay(ProgressView())
-                } else if refused, let url {
+                } else if refused {
                     Label("\(label) · Too large to preview", systemImage: "paperclip")
-                    ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+                    if let shareURL {
+                        ShareLink(item: shareURL) { Label("Share", systemImage: "square.and.arrow.up") }
+                    }
                 } else if let url {
                     Button { open(url, clip: file.clip != nil) } label: {
                         Label(label, systemImage: file.clip == nil ? "paperclip" : (file.clip?.video == true ? "video" : "waveform"))
@@ -266,6 +272,7 @@ struct FileContent: View {
                     image = UIImage(cgImage: cg)
                 } else {
                     unshowable = true
+                    shareURL = try? await offMain { try Media.plainCopy(url) }
                 }
             }
         }
@@ -274,13 +281,27 @@ struct FileContent: View {
     /// Opens a file in QuickLook, unless its bytes are an image too large
     /// to decode, whatever its name says.
     private func open(_ url: URL, clip: Bool) {
-        if clip {
-            onOpen(url)
-            return
-        }
+        openPlain(url, check: !clip)
+    }
+
+    /// QuickLook and Share read files: a sealed one goes as a decrypted
+    /// copy (`Media.plainCopy`), deleted when QuickLook closes, on lock and
+    /// at start. With `check`, one whose bytes are an image too large to
+    /// decode is refused (and offered for sharing) instead.
+    private func openPlain(_ url: URL, check: Bool) {
         Task {
-            let safe = (try? await offMain { Media.previewable(url) }) ?? false
-            if safe { onOpen(url) } else { refused = true }
+            guard let plain = try? await offMain({ try Media.plainCopy(url) }) else {
+                refused = true
+                return
+            }
+            var safe = true
+            if check { safe = (try? await offMain { Media.previewable(plain) }) ?? false }
+            if safe {
+                onOpen(plain)
+            } else {
+                shareURL = plain
+                refused = true
+            }
         }
     }
 }
