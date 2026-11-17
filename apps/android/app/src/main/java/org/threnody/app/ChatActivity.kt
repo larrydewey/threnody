@@ -1849,8 +1849,17 @@ class ChatActivity : Activity() {
                 return
             }
             if (option == "Copy text") {
-                getSystemService(android.content.ClipboardManager::class.java)
-                    ?.setPrimaryClip(android.content.ClipData.newPlainText("message", e.text))
+                val clip = android.content.ClipData.newPlainText("message", e.text)
+                // Disappearing messages (and every copy with screen security
+                // on) are marked sensitive: Android 13+ then doesn't show
+                // the text in its clipboard preview, and keyboards with a
+                // clipboard history are asked not to keep it.
+                if (android.os.Build.VERSION.SDK_INT >= 33 && (e.disappearing || Privacy.screenSecurity(this))) {
+                    clip.description.extras = android.os.PersistableBundle().apply {
+                        putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+                    }
+                }
+                getSystemService(android.content.ClipboardManager::class.java)?.setPrimaryClip(clip)
                 return
             }
             if (option == "Select text") return selectText(e.text)
