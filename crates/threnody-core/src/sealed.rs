@@ -50,7 +50,7 @@ impl KdfParams {
     /// someone handed over, say) cannot make us allocate much memory or
     /// spin for long: four times [`Self::DEFAULT`]'s memory and a little
     /// over twice its passes, which a phone still survives. Nothing this
-    /// code writes comes near them. (Before 1.0.1 the cap was 1 GiB and
+    /// code writes comes near them. (Before 1.1.0 the cap was 1 GiB and
     /// 32 passes, enough to kill a phone app on restore.)
     const MAX: Self = Self {
         m_kib: 256 * 1024,
