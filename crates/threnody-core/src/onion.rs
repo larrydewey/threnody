@@ -97,6 +97,14 @@ impl HopKeys {
         }
     }
 
+    /// Proves, to the mailbox at this hop, that whoever built the circuit
+    /// holds the mailbox's deposit key (which it gives all its mutually
+    /// approved contacts, the same for each): bound to this hop's keys,
+    /// so it can't be replayed on another circuit, and to the recipient.
+    pub fn deposit_tag(&self, deposit_key: &[u8; 32], to: &[u8]) -> [u8; 16] {
+        kdf::derive(label::ONION_DEPOSIT_TAG, &[deposit_key, &*self.df, to])
+    }
+
     // ---- relay side ----
 
     /// Removes this hop's forward layer. Returns the payload when the cell
@@ -197,6 +205,11 @@ impl OnionPath {
 
     pub fn is_empty(&self) -> bool {
         self.hops.is_empty()
+    }
+
+    /// [`HopKeys::deposit_tag`] for hop `target`.
+    pub fn deposit_tag(&self, target: usize, deposit_key: &[u8; 32], to: &[u8]) -> Option<[u8; 16]> {
+        self.hops.get(target).map(|h| h.deposit_tag(deposit_key, to))
     }
 
     /// Builds a forward cell addressed to hop `target` (0 = nearest).
