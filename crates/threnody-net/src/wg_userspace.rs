@@ -199,6 +199,12 @@ impl Device {
     fn for_datagram(&mut self, datagram: &[u8]) -> Option<(PublicIdentity, &mut Peer)> {
         let found = match Tunn::parse_incoming_packet(datagram).ok()? {
             Packet::HandshakeInit(h) => {
+                // The cheap check WireGuard makes first: anyone can send
+                // an initiation, and opening one costs an X25519. Only
+                // peers we gave our tunnel key can make a valid mac1.
+                if !mac1_ok(&self.public, datagram) {
+                    return None;
+                }
                 let half = parse_handshake_anon(&self.secret, &self.public, &h).ok()?;
                 return self
                     .peers
@@ -215,6 +221,28 @@ impl Device {
             .find(|(_, p)| p.index == found)
             .map(|(id, p)| (*id, p))
     }
+}
+
+/// Whether a handshake initiation's `mac1` is valid for our static key:
+/// `MAC(HASH("mac1----" || our public key), msg[..116])`, keyed BLAKE2s
+/// with a 16-byte tag (the WireGuard paper, section 5.4.4).
+fn mac1_ok(ours: &PublicKey, msg: &[u8]) -> bool {
+    use blake2::digest::{Digest, KeyInit, Mac as _};
+    const INIT_LEN: usize = 148;
+    if msg.len() != INIT_LEN {
+        return false;
+    }
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"mac1----");
+    h.update(ours.as_bytes());
+    let key = h.finalize();
+    let Ok(mut mac) =
+        <blake2::Blake2sMac<blake2::digest::consts::U16> as KeyInit>::new_from_slice(&key)
+    else {
+        return false;
+    };
+    mac.update(&msg[..116]);
+    threnody_core::crypto::ct_eq(&mac.finalize().into_bytes(), &msg[116..132])
 }
 
 /// The destination of an IPv6 packet.
@@ -456,6 +484,24 @@ mod tests {
             direct_at: None,
         };
         (peer, theirs)
+    }
+
+    #[test]
+    fn only_initiations_made_for_our_key_pass_the_mac1_check() {
+        let mut buf = [0u8; 256];
+        let (_, mut theirs) = peer_and_tunn();
+        let TunnResult::WriteToNetwork(init) = theirs.format_handshake_initiation(&mut buf, false)
+        else {
+            panic!("no initiation");
+        };
+        let init = init.to_vec();
+        let a = PublicKey::from(&secret(1));
+        assert!(mac1_ok(&a, &init));
+        assert!(!mac1_ok(&PublicKey::from(&secret(3)), &init), "another key");
+        let mut bad = init.clone();
+        bad[20] ^= 1;
+        assert!(!mac1_ok(&a, &bad), "tampered");
+        assert!(!mac1_ok(&a, &init[..100]), "short");
     }
 
     #[test]
