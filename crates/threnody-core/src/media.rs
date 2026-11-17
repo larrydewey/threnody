@@ -852,6 +852,92 @@ mod tests {
         }
     }
 
+    /// A track: handler `handler`, its samples' sizes, and the chunk
+    /// offsets (one sample per chunk), in `co64` when `wide`.
+    fn track(handler: &[u8; 4], sizes: &[u32], offsets: &[u64], wide: bool) -> Vec<u8> {
+        let mut hdlr = vec![0; 8];
+        hdlr.extend(handler);
+        hdlr.extend([0; 12]);
+        let mut stsz = vec![0; 8];
+        stsz[8 - 4..].copy_from_slice(&0u32.to_be_bytes());
+        stsz.extend((sizes.len() as u32).to_be_bytes());
+        for z in sizes {
+            stsz.extend(z.to_be_bytes());
+        }
+        let mut stsc = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsc.extend([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        let mut co = vec![0, 0, 0, 0];
+        co.extend((offsets.len() as u32).to_be_bytes());
+        for o in offsets {
+            if wide {
+                co.extend(o.to_be_bytes());
+            } else {
+                co.extend((*o as u32).to_be_bytes());
+            }
+        }
+        let mut stbl = bx(b"stsz", &stsz);
+        stbl.extend(bx(b"stsc", &stsc));
+        stbl.extend(bx(if wide { b"co64" } else { b"stco" }, &co));
+        let mut mdia = bx(b"hdlr", &hdlr);
+        mdia.extend(bx(b"minf", &bx(b"stbl", &stbl)));
+        bx(b"trak", &bx(b"mdia", &mdia))
+    }
+
+    #[test]
+    fn video_loses_timed_location_tracks() {
+        const PICTURE: &[u8] = b"PICTURE!";
+        const FIXES: [&[u8]; 2] = [b"GPS +51.5074", b"GPS -000.1278"];
+        let ftyp = bx(b"ftyp", b"isom\0\0\0\0isom");
+        let build = |offsets: [u64; 3], handler: &[u8; 4]| {
+            let mut body = track(b"vide", &[PICTURE.len() as u32], &offsets[..1], false);
+            body.extend(track(
+                handler,
+                &FIXES.map(|f| f.len() as u32),
+                &offsets[1..],
+                true,
+            ));
+            bx(b"moov", &body)
+        };
+        let mut samples = PICTURE.to_vec();
+        for f in FIXES {
+            samples.extend(f);
+        }
+        let mdat = bx(b"mdat", &samples);
+        for handler in [b"meta", b"text", b"camm"] {
+            let start = (ftyp.len() + build([0; 3], handler).len() + 8) as u64;
+            let offsets = [
+                start,
+                start + PICTURE.len() as u64,
+                start + (PICTURE.len() + FIXES[0].len()) as u64,
+            ];
+            let mut m = ftyp.clone();
+            m.extend(build(offsets, handler));
+            m.extend(&mdat);
+            let Stripped::Image(out) = strip(m.clone()).unwrap() else {
+                panic!()
+            };
+            assert_eq!(out.len(), m.len());
+            assert!(contains(&out, PICTURE), "the picture stays");
+            assert!(
+                !contains(&out, b"GPS"),
+                "{:?}",
+                String::from_utf8_lossy(handler)
+            );
+            let at = offsets[1] as usize;
+            assert_eq!(&out[at..at + FIXES[0].len() + FIXES[1].len()], &[0; 25][..]);
+            assert_eq!(strip(out.clone()).unwrap(), Stripped::Image(out));
+            // A sample said to lie past the end: refused, not sent.
+            let mut bad = ftyp.clone();
+            bad.extend(build([offsets[0], offsets[1], m.len() as u64], handler));
+            bad.extend(&mdat);
+            assert!(strip(bad).is_err());
+            // Fragmented, with such a track: refused.
+            let mut frag = m.clone();
+            frag.extend(bx(b"moof", &[]));
+            assert!(strip(frag).is_err());
+        }
+    }
+
     #[test]
     fn damaged_videos_fail() {
         let m = movie(true, Size::Plain);
