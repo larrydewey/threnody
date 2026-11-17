@@ -371,14 +371,20 @@ impl Node {
             let (dht, rk) = (dht.clone(), spot.record_keys(e));
             async move {
                 let v = fetch(&dht, &rk).await?;
-                HandleRecord::open(&rk, &v).ok()
+                let mut r = HandleRecord::open(&rk, &v).ok()?;
+                // From here on a signature present is one that checked out.
+                if !r.owner_signed(&rk) {
+                    r.sig = None;
+                }
+                Some(r)
             }
         };
         let (a, b) = tokio::join!(read(now), read(now.saturating_sub(1)));
+        // The owner's own record before one anyone with the handle wrote.
         [a, b]
             .into_iter()
             .flatten()
-            .max_by_key(|r| r.candidates.issued_ms)
+            .max_by_key(|r| (r.sig.is_some(), r.candidates.issued_ms))
     }
 
     /// Reads the record behind `handle` and checks it belongs to the
@@ -429,6 +435,24 @@ impl Node {
         let rec = self.resolve_handle(&handle).await?;
         if rec.id == self.identity() {
             return Err(NetError::NotAllowed("that's your own handle".into()));
+        }
+        // Hidden first, as for invites: through an onion or volunteer
+        // circuit the owner sees a relay's address, not ours. Volunteers
+        // dial only a public address, and only one the owner signed.
+        let public = rec
+            .candidates
+            .list
+            .iter()
+            .filter(|_| rec.sig.is_some())
+            .find(|c| crate::reach::is_public(&c.addr.ip()))
+            .map(|c| c.addr.to_string());
+        if let Ok(Some(p)) = tokio::time::timeout(
+            HIDDEN_INVITE_FOR,
+            self.reach_hidden(public.as_deref(), rec.id.fingerprint(), true),
+        )
+        .await
+        {
+            return Ok(p);
         }
         self.meet(&Spot::Handle(handle), rec).await
     }
@@ -598,8 +622,15 @@ impl Node {
         // Addresses that take a dial (a public IPv6 address, a mapped port),
         // and the knock, together: the knock takes a DHT write of a few
         // seconds, and waiting for the dials first added theirs to it.
+        // A record the owner didn't sign may be anyone's who holds the
+        // handle or link, naming the owner with addresses of their own: its
+        // addresses aren't dialed at once (that would show them ours), only
+        // public ones, and those only through the punch, which dials an
+        // address once its probes answer from it.
+        let signed = rec.sig.is_some();
         let targets: Vec<_> = self
             .quic()
+            .filter(|_| signed)
             .map(|quic| {
                 let mut list: Vec<_> = rec.candidates.list.clone();
                 list.sort_by_key(|c| c.kind.rank());
@@ -646,7 +677,10 @@ impl Node {
             }
         }
         let mut symmetric = rec.candidates.flags & FLAG_SYMMETRIC != 0;
-        let mut list = rec.candidates.list;
+        // Probes to an unsigned record's addresses would show ours to
+        // whoever wrote it: we knock, and an owner that sees the knock
+        // probes us, which starts our side of the punch at its address.
+        let mut list = if signed { rec.candidates.list } else { Vec::new() };
         let mut punching = self.punch(peer, &list, symmetric, Urge::Start);
         let deadline = Instant::now() + FIND_FOR;
         let mut issued = rec.candidates.issued_ms;
@@ -669,6 +703,7 @@ impl Node {
                 if let Some(dht) = self.dht()
                     && let Some(r) = self.read_record(&dht, spot).await
                     && r.id == peer
+                    && (r.sig.is_some() || !signed)
                     && r.candidates.issued_ms > issued
                 {
                     issued = r.candidates.issued_ms;
@@ -804,10 +839,15 @@ impl Node {
                 version: o.version,
                 candidates,
                 sealed_knocks: true,
+                sig: None,
             };
             (o.spot.clone(), record, digest)
         };
         let rk = spot.record_keys(ep);
+        let mut record = record;
+        if record.sign(self.identity_ref(), &rk).is_err() {
+            return;
+        }
         let Ok(value) = record.seal(&rk) else { return };
         let note = match put(dht, &rk, &value, record.candidates.issued_ms).await {
             Ok(()) => {

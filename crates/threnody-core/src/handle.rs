@@ -58,6 +58,8 @@ const SALT: &str = "threnody v1 2026-10-18 handle salt";
 const ENCRYPTION: &str = "threnody v1 2026-10-18 handle encryption";
 const PROBE_KEY: &str = "threnody v1 2026-10-18 handle probe key";
 const KNOCK_SEAL: &str = "threnody v1 2026-11-05 handle knock seal";
+/// What an owner signs its record under (see [`HandleRecord::sign`]).
+const RECORD_SIG: &[u8] = b"threnody v1 2026-11-17 handle record signature";
 const RECORD_AAD: &[u8] = b"threnody handle record v1";
 const KNOCK_AAD: &[u8] = b"threnody handle knock v1";
 
@@ -221,6 +223,12 @@ pub struct HandleRecord {
     /// The owner opens knocks sealed to its key ([`Knock::seal_to`]);
     /// older owners don't say so, and get readable ones.
     pub sealed_knocks: bool,
+    /// The owner's signature over the record, bound to where it is kept
+    /// ([`HandleRecord::sign`]). Anyone with the handle or invite can
+    /// write a record there, naming the owner with addresses of their
+    /// choosing; a signed one can only come from the owner. Older owners
+    /// don't sign.
+    pub sig: Option<[u8; 64]>,
 }
 
 /// A finder asking the owner to punch toward it.
@@ -234,12 +242,15 @@ impl HandleRecord {
     pub fn seal(&self, keys: &RecordKeys) -> Result<Vec<u8>> {
         let cand = self.candidates.encode()?;
         let pt = cbor::to_vec(PADDED_LEN, |e| {
-            e.map_len(3 + usize::from(self.sealed_knocks))?;
+            e.map_len(3 + usize::from(self.sealed_knocks) + usize::from(self.sig.is_some()))?;
             e.u8(0)?.bytes(self.id.as_bytes())?;
             e.u8(1)?.uint(self.version)?;
             e.u8(2)?.bytes(&cand)?;
             if self.sealed_knocks {
                 e.u8(3)?.uint(1)?;
+            }
+            if let Some(sig) = &self.sig {
+                e.u8(4)?.bytes(sig)?;
             }
             Ok(())
         })?;
@@ -249,13 +260,14 @@ impl HandleRecord {
     pub fn open(keys: &RecordKeys, value: &[u8]) -> Result<Self> {
         let pt = open(keys, value, RECORD_AAD)?;
         let mut dec = Decoder::new(&pt);
-        let (mut id, mut version, mut cand, mut sealed) = (None, None, None, false);
+        let (mut id, mut version, mut cand, mut sealed, mut sig) = (None, None, None, false, None);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => id = Some(fixed_bytes::<32>(d)?),
                 1 => version = Some(d.u64()?),
                 2 => cand = Some(d.bytes()?.to_vec()),
                 3 => sealed = d.u64()? == 1,
+                4 => sig = Some(fixed_bytes::<64>(d)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -266,7 +278,46 @@ impl HandleRecord {
             version: required(version, "handle version")?,
             candidates: Candidates::decode(&required(cand, "handle candidates")?)?,
             sealed_knocks: sealed,
+            sig,
         })
+    }
+
+    /// Signs the record as its owner `id`, bound to the meeting place and
+    /// hour `keys` are for: it can't be moved to another handle, invite or
+    /// hour.
+    pub fn sign(&mut self, owner: &Identity, keys: &RecordKeys) -> Result<()> {
+        if owner.public() != self.id {
+            return Err(Error::Malformed("a record is signed by its owner"));
+        }
+        self.sig = Some(owner.sign(&self.signed_bytes(keys)?));
+        Ok(())
+    }
+
+    /// Whether the record carries a valid signature by the identity it
+    /// names, for the place and hour `keys` are for.
+    pub fn owner_signed(&self, keys: &RecordKeys) -> bool {
+        let Some(sig) = &self.sig else { return false };
+        self.signed_bytes(keys)
+            .is_ok_and(|m| self.id.verify(&m, sig).is_ok())
+    }
+
+    fn signed_bytes(&self, keys: &RecordKeys) -> Result<Vec<u8>> {
+        // The DHT key the record is stored under names the place and hour,
+        // and is public: anyone who can read the record knows it.
+        let place = ed25519_dalek::SigningKey::from_bytes(&keys.signing_seed)
+            .verifying_key()
+            .to_bytes();
+        let cand = self.candidates.encode()?;
+        let mut m = Vec::with_capacity(RECORD_SIG.len() + 32 + 16 + 32 + cand.len() + 2);
+        m.extend_from_slice(RECORD_SIG);
+        m.extend_from_slice(&place);
+        m.extend_from_slice(&keys.salt);
+        m.extend_from_slice(self.id.as_bytes());
+        m.extend_from_slice(&self.version.to_be_bytes());
+        m.push(u8::from(self.sealed_knocks));
+        m.extend_from_slice(&u32::try_from(cand.len()).unwrap_or(u32::MAX).to_be_bytes());
+        m.extend_from_slice(&cand);
+        Ok(m)
     }
 }
 
@@ -503,6 +554,7 @@ mod tests {
             version: 0,
             candidates: candidates(),
             sealed_knocks: false,
+            sig: None,
         };
         let back = HandleRecord::open(&h.record_keys(7), &r.seal(&h.record_keys(7)).unwrap());
         assert_eq!(back.unwrap(), r);
@@ -518,6 +570,7 @@ mod tests {
             version: 3,
             candidates: candidates(),
             sealed_knocks: true,
+            sig: None,
         };
         let v = r.seal(&h.record_keys(7)).unwrap();
         assert_eq!(v.len(), RECORD_LEN);
@@ -537,5 +590,45 @@ mod tests {
         // A knock never opens as a record, or the other way round.
         assert!(HandleRecord::open(&h.knock_keys(7, 2), &v).is_err());
         assert_ne!(h.record_keys(7).salt, h.knock_keys(7, 0).salt);
+    }
+
+    #[test]
+    fn only_the_owner_signs_its_record_and_the_signature_stays_put() {
+        let owner = Identity::generate();
+        let h = Handle::new(&owner.public(), "larry", 0).unwrap();
+        let ipv6 = Candidate {
+            kind: CandidateKind::Ipv6,
+            addr: "[2001:db8:1:2:3:4:5:6]:65535".parse().unwrap(),
+        };
+        let mut r = HandleRecord {
+            id: owner.public(),
+            version: u64::MAX,
+            // The most a record carries, signed, still fits.
+            candidates: Candidates {
+                list: vec![ipv6; crate::rendezvous::MAX_CANDIDATES],
+                issued_ms: u64::MAX,
+                flags: u64::MAX,
+                seeking_until_ms: Some(u64::MAX),
+            },
+            sealed_knocks: true,
+            sig: None,
+        };
+        let rk = h.record_keys(7);
+        assert!(!r.owner_signed(&rk), "unsigned");
+        r.sign(&owner, &rk).unwrap();
+        let v = r.seal(&rk).unwrap();
+        assert_eq!(v.len(), RECORD_LEN);
+        let back = HandleRecord::open(&rk, &v).unwrap();
+        assert!(back.owner_signed(&rk));
+        // Not in another hour or place, and not with other addresses.
+        assert!(!back.owner_signed(&h.record_keys(8)));
+        let other = Handle::new(&owner.public(), "larrz", 0).unwrap();
+        assert!(!back.owner_signed(&other.record_keys(7)));
+        let mut moved = back.clone();
+        moved.candidates.list.truncate(1);
+        assert!(!moved.owner_signed(&rk));
+        // Nobody else can sign as the owner.
+        let mut forged = back;
+        assert!(forged.sign(&Identity::generate(), &rk).is_err());
     }
 }
