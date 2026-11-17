@@ -453,12 +453,12 @@ impl Node {
             let mut stream = theirs;
             let result = async {
                 let chan = handshake::accept(&mut stream, node.identity_ref()).await?;
-                node.check_policy(chan.peer())?;
-                Ok::<_, NetError>(chan)
+                let pass = node.admit_via(chan.peer(), &from)?;
+                Ok::<_, NetError>((chan, pass))
             }
             .await;
             match result {
-                Ok(chan) => node.spawn_relayed_session(stream, chan, from, false),
+                Ok((chan, pass)) => node.spawn_relayed_session(stream, chan, from, false, pass),
                 Err(e) => {
                     node.close_circuit(from, circ);
                     node.emit_rejected_relay(from, e.to_string());
@@ -508,7 +508,7 @@ impl Node {
             }
         };
         let peer = *chan.peer();
-        self.spawn_relayed_session(stream, chan, via, true);
+        self.spawn_relayed_session(stream, chan, via, true, None);
         Ok(peer)
     }
 
