@@ -1,0 +1,6 @@
+- Calls: the screen turns off at your ear, video keeps it on, ringback tone, pick speaker or headset, connection warnings, picture-in-picture.
+- Reach contacts behind VPNs through volunteer relay meeting points.
+- New contacts connect much sooner.
+- Shorter menus and one Settings page.
+- Media encrypted on the phone; video metadata removed.
+- Many security fixes from an internal review.
