@@ -132,9 +132,7 @@ class CallActivity : Activity() {
         camera = round(R.drawable.ic_videocam, "Camera", idle, text) {
             Calls.current?.let { Calls.setVideo(this, !it.video) }
         }
-        speaker = round(R.drawable.ic_speaker, "Speaker", idle, text) {
-            Calls.current?.let { Calls.setSpeaker(this, !it.speaker) }
-        }
+        speaker = round(R.drawable.ic_speaker, "Sound", idle, text) { pickOutput() }
         // Over our own picture: front or back camera, when there are both.
         flip = ImageButton(this).apply {
             setImageResource(R.drawable.ic_cameraswitch)
@@ -471,8 +469,11 @@ class CallActivity : Activity() {
             "connecting" -> "Connecting…"
             "interrupted" -> "Reconnecting…"
             else -> duration(SystemClock.elapsedRealtime() - c.since) +
-                if (group) " · ${c.members.size + 1} people" else ""
+                (if (group) " · ${c.members.size + 1} people" else "") +
+                (c.quality?.let { " · $it" } ?: "")
         }
+        // Trouble shows in warning colours, so it's seen at a glance.
+        status.setTextColor(getColor(if (c.quality != null && c.state == "connected") R.color.warning else R.color.muted))
         val ringing = c.state == "incoming"
         ringingRow.visibility = if (ringing) View.VISIBLE else View.GONE
         // Joining a group call, either way is fine.
@@ -492,8 +493,37 @@ class CallActivity : Activity() {
         mute.contentDescription = if (c.muted) "Unmute" else "Mute"
         camera.alpha = if (c.video) 1f else 0.6f
         camera.contentDescription = if (c.video) "Turn camera off" else "Turn camera on"
-        speaker.alpha = if (c.speaker) 1f else 0.6f
+        val heard = Calls.outputNow(this)
+        speaker.alpha = if (heard != null && heard != "earpiece") 1f else 0.6f
+        speaker.contentDescription = "Sound: " +
+            (Calls.outputs(this).firstOrNull { it.key == heard }?.label ?: if (c.speaker) "Speaker" else "Phone")
         cameraIfWanted()
+    }
+
+    /**
+     * Where to hear the call: with only the phone and its speaker, the
+     * button switches between them, as before; with a headset or car too,
+     * it lists them all, the current one ticked.
+     */
+    private fun pickOutput() {
+        val c = Calls.current ?: return
+        val outs = Calls.outputs(this)
+        if (outs.size <= 2) {
+            Calls.setSpeaker(this, !c.speaker)
+            return
+        }
+        val now = Calls.outputNow(this)
+        android.widget.PopupMenu(this, speaker).apply {
+            outs.forEachIndexed { i, o ->
+                menu.add(0, i, i, o.label).isChecked = o.key == now
+            }
+            menu.setGroupCheckable(0, true, true)
+            setOnMenuItemClickListener { item ->
+                outs.getOrNull(item.itemId)?.let { Calls.setOutput(this@CallActivity, it.key) }
+                true
+            }
+            show()
+        }
     }
 
     /**
