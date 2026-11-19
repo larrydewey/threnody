@@ -57,7 +57,14 @@ object Calls {
         val group: String? = null,
         /** A group call's other participants (device fingerprints), and whether each sends video. */
         val members: Map<String, Boolean> = emptyMap(),
+        /** Where the user chose to hear the call ([Output.key]); null lets the app pick. */
+        val output: String? = null,
+        /** What's wrong with the connection, to show on the call screen; null when it's fine. */
+        val quality: String? = null,
     )
+
+    /** Somewhere a call can be heard: the phone held to an ear, the speaker, a headset. */
+    data class Output(val key: String, val label: String)
 
     @Volatile var current: Call? = null
         private set
@@ -75,7 +82,41 @@ object Calls {
 
     private fun changed() {
         earSensor()
+        ringback()
         listeners.forEach { it() }
+    }
+
+    /** The ringback tone, while it plays. */
+    private var ringTone: android.media.ToneGenerator? = null
+
+    /**
+     * Plays the ringback tone while our call rings at the other end (for a
+     * group call, until someone joins), as a phone does: without it, a
+     * call that's ringing sounded the same as one that wasn't going
+     * anywhere. In the call's own audio, so it comes from wherever the
+     * call will.
+     */
+    @Synchronized
+    private fun ringback() {
+        val c = current
+        val want = c != null && c.outgoing &&
+            (c.state == "ringing" || (c.group != null && c.state == "calling"))
+        if (want && ringTone == null) {
+            ringTone = try {
+                android.media.ToneGenerator(AudioManager.STREAM_VOICE_CALL, 70).also {
+                    it.startTone(android.media.ToneGenerator.TONE_SUP_RINGTONE)
+                }
+            } catch (e: Exception) {
+                Threnody.say("! ringback: ${e.javaClass.simpleName}")
+                null
+            }
+        } else if (!want && ringTone != null) {
+            ringTone?.let {
+                try { it.stopTone() } catch (_: Exception) {}
+                it.release()
+            }
+            ringTone = null
+        }
     }
 
     /** A short tone in the call's audio (see the callers). */
@@ -104,9 +145,9 @@ object Calls {
      */
     private fun atEar(ctx: Context): Boolean {
         val c = current ?: return false
-        if (c.state == "incoming" || c.speaker || c.video || c.peerVideo) return false
+        if (c.state == "incoming" || c.video || c.peerVideo) return false
         if (c.members.values.any { it }) return false
-        return headset(ctx) == null
+        return outputNow(ctx) == "earpiece"
     }
 
     /**
@@ -420,7 +461,7 @@ object Calls {
 
     fun setSpeaker(ctx: Context, on: Boolean) {
         val c = current ?: return
-        current = c.copy(speaker = on)
+        current = c.copy(speaker = on, output = if (on) "speaker" else null)
         route(ctx)
         changed()
     }
@@ -525,6 +566,9 @@ object Calls {
         changed()
     }
 
+    /** How often the call's connection is checked (and every other time logged). */
+    private const val QUALITY_EVERY_MS = 2500L
+
     /** The call whose media is being logged. */
     @Volatile private var logging: ULong = 0u
 
@@ -533,12 +577,36 @@ object Calls {
         if (logging == c.id) return
         logging = c.id
         Thread {
+            var prev: uniffi.threnody_ffi.CallStats? = null
+            var silent = 0
+            var round = 0
             while (current?.id == c.id) {
-                Thread.sleep(5000)
+                Thread.sleep(QUALITY_EVERY_MS)
                 val s = try { c.node.callStats() } catch (_: Exception) { null } ?: break
-                Threnody.say("* call media: sent ${s.sentDatagrams} datagrams, ${s.sentStream} in stream, " +
-                    "${s.sendFailed} failed; got ${s.received}, ${s.rejected} rejected, ${s.dropped} dropped")
-                try { c.node.callMediaReport() } catch (_: Exception) { null }?.let { Threnody.say("* call quality: $it") }
+                if (++round % 2 == 0) {
+                    Threnody.say("* call media: sent ${s.sentDatagrams} datagrams, ${s.sentStream} in stream, " +
+                        "${s.sendFailed} failed; got ${s.received}, ${s.rejected} rejected, ${s.dropped} dropped")
+                    try { c.node.callMediaReport() } catch (_: Exception) { null }?.let { Threnody.say("* call quality: $it") }
+                }
+                val p = prev
+                prev = s
+                if (p == null) continue
+                val got = (s.received - p.received).toLong()
+                val lost = (s.rejected - p.rejected + s.dropped - p.dropped).toLong()
+                val sent = (s.sentDatagrams - p.sentDatagrams + s.sentStream - p.sentStream).toLong()
+                val failed = (s.sendFailed - p.sendFailed).toLong()
+                silent = if (got == 0L) silent + 1 else 0
+                val now = current?.takeIf { it.id == c.id } ?: break
+                val quality = when {
+                    now.state != "connected" -> null
+                    silent >= 2 -> "Not hearing from them"
+                    lost * 10 > got + lost || failed * 10 > sent + failed -> "Weak connection"
+                    else -> null
+                }
+                if (quality != now.quality) {
+                    update(c.id) { it.copy(quality = quality) }
+                    changed()
+                }
             }
         }.apply { isDaemon = true; name = "call-stats" }.start()
     }
@@ -625,19 +693,29 @@ object Calls {
      * connects or drops, so audio follows it without a gap to silence.
      */
     private fun route(ctx: Context) {
+        try {
+            routeNow(ctx)
+        } finally {
+            // A headset coming or going changes whether the phone is at an ear.
+            earSensor()
+        }
+    }
+
+    private fun routeNow(ctx: Context) {
         val c = current ?: return
-        // A headset coming or going changes whether the phone is at an ear.
-        earSensor()
         if (Telecom.active()) {
-            Telecom.speaker(c.speaker || (c.video && headset(ctx) == null))
+            val chosen = c.output
+            if (chosen != null) Telecom.setOutput(chosen)
+            else Telecom.speaker(c.speaker || (c.video && headset(ctx) == null))
             return
         }
         val am = ctx.getSystemService(AudioManager::class.java) ?: return
+        if (c.output != null && routeChosen(am, c.output)) return
         val headset = if (c.speaker) null else headset(ctx)
         val speaker = c.speaker || (headset == null && c.video)
         val to = when {
             speaker -> "speaker"
-            headset != null -> headset.productName?.toString()?.takeIf { it.isNotBlank() } ?: "headset"
+            headset != null -> "dev:${headset.id}"
             else -> "earpiece"
         }
         try {
@@ -653,10 +731,82 @@ object Calls {
         } catch (e: Exception) {
             Threnody.say("! call audio: ${e.javaClass.simpleName}")
         }
+        noteRoute(to)
+    }
+
+    private fun noteRoute(to: String) {
         if (to != routedTo) {
             routedTo = to
-            Threnody.say("* call audio: $to")
+            Threnody.say("* call audio: ${if (to.startsWith("dev:")) "headset" else to}")
         }
+    }
+
+    /**
+     * Sends the audio where the user chose ([Output.key]); false when that
+     * isn't there any more (a headset switched off), so the app picks.
+     */
+    private fun routeChosen(am: AudioManager, key: String): Boolean {
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                val devs = am.availableCommunicationDevices
+                val pick = when {
+                    key == "speaker" -> devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    key == "earpiece" -> devs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+                    else -> devs.firstOrNull { "dev:${it.id}" == key }
+                } ?: return false
+                if (am.communicationDevice?.id != pick.id) am.setCommunicationDevice(pick)
+            } else {
+                when {
+                    key == "speaker" -> legacyRoute(am, speaker = true, sco = false)
+                    key == "earpiece" -> legacyRoute(am, speaker = false, sco = false)
+                    else -> {
+                        val d = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { "dev:${it.id}" == key }
+                            ?: return false
+                        legacyRoute(am, speaker = false, sco = d.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Threnody.say("! call audio: ${e.javaClass.simpleName}")
+            return false
+        }
+        noteRoute(key)
+        return true
+    }
+
+    /** Where the call can be heard now, the phone itself first. */
+    fun outputs(ctx: Context): List<Output> {
+        if (Telecom.active()) return Telecom.outputs()
+        val am = ctx.getSystemService(AudioManager::class.java) ?: return emptyList()
+        val list = mutableListOf<Output>()
+        fun name(d: AudioDeviceInfo, fallback: String) =
+            d.productName?.toString()?.takeIf { it.isNotBlank() && it != android.os.Build.MODEL } ?: fallback
+        val devs = if (Build.VERSION.SDK_INT >= 31) am.availableCommunicationDevices
+            else am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        for (d in devs) {
+            when (d.type) {
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> list += Output("earpiece", "Phone")
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> list += Output("speaker", "Speaker")
+                AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                AudioDeviceInfo.TYPE_USB_HEADSET -> list += Output("dev:${d.id}", name(d, "Wired headset"))
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO, 26 -> list += Output("dev:${d.id}", name(d, "Bluetooth"))
+                AudioDeviceInfo.TYPE_HEARING_AID -> list += Output("dev:${d.id}", name(d, "Hearing aid"))
+            }
+        }
+        if (list.none { it.key == "earpiece" } && Build.VERSION.SDK_INT < 31) list.add(0, Output("earpiece", "Phone"))
+        return list.distinctBy { it.key }.distinctBy { it.label }
+    }
+
+    /** The [Output.key] the call is heard on now. */
+    fun outputNow(ctx: Context): String? =
+        if (Telecom.active()) Telecom.outputNow() else routedTo
+
+    /** The user picked where to hear the call. */
+    fun setOutput(ctx: Context, key: String) {
+        val c = current ?: return
+        current = c.copy(output = key, speaker = key == "speaker")
+        route(ctx)
+        changed()
     }
 
     /** Gives audio routing back to the system after a call. */
