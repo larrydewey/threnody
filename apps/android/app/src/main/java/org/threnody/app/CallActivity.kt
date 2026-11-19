@@ -64,6 +64,11 @@ class CallActivity : Activity() {
             ticker.postDelayed(this, 1000)
         }
     }
+    /** The call's text and buttons, which step aside during video. */
+    private lateinit var chrome: LinearLayout
+    /** When the screen was last touched ([SystemClock.elapsedRealtime]). */
+    private var touchedAt = 0L
+    private var inPip = false
     private var feed: CallCamera? = null
     /** Which camera `feed` is. */
     private var feedFront = true
@@ -213,7 +218,7 @@ class CallActivity : Activity() {
             addView(emojiButton, LinearLayout.LayoutParams(dp(52), dp(52)))
         }
 
-        val content = LinearLayout(this).apply {
+        val content = LinearLayout(this).also { chrome = it }.apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(Design.xl), dp(Design.xxl * 2), dp(Design.xl), dp(Design.xxl * 2))
@@ -241,8 +246,105 @@ class CallActivity : Activity() {
         }
         setContentView(frame)
         fitSystemBars(frame, content, content)
+        touchedAt = SystemClock.elapsedRealtime()
         // Answer, from the ringing notification (with video, from its video button).
         if (intent.action == ANSWER) Calls.answer(this, intent.getBooleanExtra(VIDEO, false))
+    }
+
+    /**
+     * During video the buttons fade after a few seconds, so they don't
+     * cover the picture; a tap brings them back (and does only that).
+     */
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+            touchedAt = SystemClock.elapsedRealtime()
+            if (::chrome.isInitialized && chrome.visibility != View.VISIBLE && !inPip) {
+                showChrome(true)
+                return true
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun showChrome(on: Boolean) {
+        if (on) {
+            chrome.visibility = View.VISIBLE
+            chrome.animate().alpha(1f).setDuration(Design.durationFast.toLong()).start()
+        } else if (chrome.visibility == View.VISIBLE) {
+            chrome.animate().alpha(0f).setDuration(Design.durationFast.toLong() * 2)
+                .withEndAction { if (chrome.alpha == 0f) chrome.visibility = View.INVISIBLE }
+                .start()
+        }
+        flip.alpha = if (on) 1f else 0f
+    }
+
+    /** Whether there's video on screen worth leaving the buttons off. */
+    private fun watching(c: Calls.Call?): Boolean =
+        c != null && (c.state == "connected" || c.state == "interrupted") &&
+            (c.peerVideo || c.members.values.any { it })
+
+    /** Fades the buttons out once video has run untouched for a while. */
+    private fun autoHide(c: Calls.Call?) {
+        if (!::chrome.isInitialized || inPip) return
+        val screenReader = getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+            ?.isTouchExplorationEnabled == true
+        if (!watching(c) || screenReader) {
+            if (chrome.visibility != View.VISIBLE) showChrome(true)
+            return
+        }
+        val idle = SystemClock.elapsedRealtime() - touchedAt > HIDE_AFTER_MS
+        if (idle && picks.visibility != View.VISIBLE) showChrome(false)
+    }
+
+    /**
+     * Leaving a video call (Home, or another app) keeps it in a small
+     * window over everything, as a call should; an audio call goes on in
+     * its notification as before.
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val c = Calls.current
+        if (watching(c) || c?.video == true) enterPip()
+    }
+
+    private fun pipParams(): android.app.PictureInPictureParams =
+        android.app.PictureInPictureParams.Builder()
+            .setAspectRatio(android.util.Rational(9, 16))
+            .build()
+
+    private fun enterPip() {
+        if (!packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)) return
+        try {
+            enterPictureInPictureMode(pipParams())
+        } catch (e: Exception) {
+            Threnody.say("! picture in picture: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Rotation and the small window no longer start the screen over (that
+     * restarted the camera mid-call): the group grid lays itself out again
+     * for the new shape.
+     */
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        tileViews.clear()
+        show()
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: android.content.res.Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        inPip = isInPictureInPictureMode
+        // A small window shows their picture, nothing to press.
+        chrome.visibility = if (inPip) View.GONE else View.VISIBLE
+        chrome.alpha = 1f
+        local.alpha = if (inPip) 0f else 1f
+        flip.alpha = if (inPip) 0f else 1f
+        floats.visibility = if (inPip) View.GONE else View.VISIBLE
+        touchedAt = SystemClock.elapsedRealtime()
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -335,6 +437,8 @@ class CallActivity : Activity() {
 
     private fun show() {
         val c = Calls.current
+        keepAwake(c)
+        autoHide(c)
         if (c == null) {
             // Over: say how, briefly, then go.
             status.text = Calls.ended ?: "Call ended"
@@ -390,6 +494,20 @@ class CallActivity : Activity() {
         camera.contentDescription = if (c.video) "Turn camera off" else "Turn camera on"
         speaker.alpha = if (c.speaker) 1f else 0.6f
         cameraIfWanted()
+    }
+
+    /**
+     * Keeps the screen from timing out while there's video to watch (ours
+     * or theirs, or a group member's): video doesn't count as using the
+     * phone, so the screen dimmed and went off mid-call. An audio-only
+     * call lets it time out as usual; at an ear, the proximity sensor
+     * turns it off instead (see `Calls`).
+     */
+    private fun keepAwake(c: Calls.Call?) {
+        val video = c != null && c.state != "incoming" &&
+            (c.video || c.peerVideo || c.members.values.any { it })
+        val flag = android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        if (video) window.addFlags(flag) else window.clearFlags(flag)
     }
 
     /**
@@ -520,6 +638,8 @@ class CallActivity : Activity() {
         const val VIDEO = "org.threnody.app.VIDEO"
         private const val FLOAT_MS = 2800L
         private const val MAX_FLOATING = 24
+        /** Video untouched this long, and the buttons fade. */
+        private const val HIDE_AFTER_MS = 5_000L
         private val QUICK = listOf("❤️", "😂", "👍", "😮", "😢", "🎉", "🔥", "😘")
     }
 

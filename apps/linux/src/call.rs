@@ -71,6 +71,10 @@ pub struct CallBar {
     react: gtk::MenuButton,
     /// Where emoji float up, over the whole bar (takes no clicks).
     floats: gtk::Fixed,
+    /// The session's inhibitors while a call runs: the screen blanking
+    /// while video shows, and suspending for any call (0 = none).
+    inhibit_idle: Cell<u32>,
+    inhibit_suspend: Cell<u32>,
 }
 
 /// The emoji the reaction button offers first; the rest are a click away.
@@ -205,6 +209,8 @@ impl CallBar {
             shown: RefCell::new(None),
             camera: RefCell::new(None),
             peer_video: Cell::new(false),
+            inhibit_idle: Cell::new(0),
+            inhibit_suspend: Cell::new(0),
             ticking: Cell::new(false),
             syncing: Cell::new(false),
             react,
@@ -381,6 +387,8 @@ impl CallBar {
             group: None,
             joined: false,
         });
+        // From ringing on, the computer mustn't suspend under the call.
+        self.keep_awake(false);
     }
 
     /// Whether the call on screen is a group call.
@@ -728,8 +736,45 @@ impl CallBar {
         self.local.set_visible(ours);
         self.remote.set_visible(!group);
         self.grid.set_visible(group && others);
-        self.video
-            .set_visible(ours || self.peer_video.get() || (group && others && self.joined_now()));
+        let video = ours || self.peer_video.get() || (group && others && self.joined_now());
+        self.video.set_visible(video);
+        self.keep_awake(video);
+    }
+
+    /// Asks the desktop not to blank the screen while there's video (it
+    /// doesn't count as using the computer, so the screen went off mid
+    /// call), and not to suspend while any call runs.
+    fn keep_awake(&self, video: bool) {
+        let Some(window) = self.widget.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let Some(app) = window.application() else {
+            return;
+        };
+        let set =
+            |cell: &Cell<u32>, want: bool, flags: gtk::ApplicationInhibitFlags, why: &str| match (
+                want,
+                cell.get(),
+            ) {
+                (true, 0) => cell.set(app.inhibit(Some(&window), flags, Some(why))),
+                (false, cookie) if cookie != 0 => {
+                    app.uninhibit(cookie);
+                    cell.set(0);
+                }
+                _ => {}
+            };
+        set(
+            &self.inhibit_idle,
+            video,
+            gtk::ApplicationInhibitFlags::IDLE,
+            "Video call",
+        );
+        set(
+            &self.inhibit_suspend,
+            self.busy(),
+            gtk::ApplicationInhibitFlags::SUSPEND,
+            "Call in progress",
+        );
     }
 
     fn joined_now(&self) -> bool {

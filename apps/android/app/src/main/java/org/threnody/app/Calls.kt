@@ -73,7 +73,75 @@ object Calls {
         return { listeners.remove(l) }
     }
 
-    private fun changed() = listeners.forEach { it() }
+    private fun changed() {
+        earSensor()
+        listeners.forEach { it() }
+    }
+
+    /** A short tone in the call's audio (see the callers). */
+    private fun cue(tone: Int) {
+        try {
+            val g = android.media.ToneGenerator(AudioManager.STREAM_VOICE_CALL, 60)
+            g.startTone(tone, 150)
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ g.release() }, 400)
+        } catch (e: Exception) {
+            // Some devices refuse a tone generator now and then: no cue.
+            Threnody.say("! call tone: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /** The app's context while a call runs, for [earSensor]. */
+    @Volatile private var appContext: Context? = null
+
+    /** Turns the screen off while the phone is held to an ear (see [earSensor]). */
+    private var proximity: android.os.PowerManager.WakeLock? = null
+
+    /**
+     * Whether the call's sound comes from the earpiece, so the phone is
+     * likely held to an ear: answered and audio only, both ways, with no
+     * speaker and no headset. Not while ringing (the screen is how you
+     * answer), nor with video either way (the screen is the call).
+     */
+    private fun atEar(ctx: Context): Boolean {
+        val c = current ?: return false
+        if (c.state == "incoming" || c.speaker || c.video || c.peerVideo) return false
+        if (c.members.values.any { it }) return false
+        return headset(ctx) == null
+    }
+
+    /**
+     * Holds the proximity wake lock while the phone is likely at an ear:
+     * the system turns the screen off, and ignores touches, while
+     * something is close to the sensor, so a cheek can't press Mute or
+     * Hang up. Self-managed calls (ours) don't get this from the system
+     * phone app. Run on every change of the call and of where its audio
+     * goes, wherever the user is in the app.
+     */
+    @Synchronized
+    private fun earSensor() {
+        val ctx = appContext ?: return
+        val want = atEar(ctx)
+        val held = proximity?.isHeld == true
+        if (want && !held) {
+            val pm = ctx.getSystemService(android.os.PowerManager::class.java) ?: return
+            if (!pm.isWakeLockLevelSupported(android.os.PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)) return
+            proximity = (proximity ?: pm.newWakeLock(
+                android.os.PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "threnody:call-proximity",
+            ).apply { setReferenceCounted(false) }).also {
+                try { it.acquire(4 * 60 * 60 * 1000L) } catch (e: Exception) {
+                    Threnody.say("! proximity: ${e.javaClass.simpleName}")
+                }
+            }
+        } else if (!want && held) {
+            // Wait for the phone to leave the ear before the screen comes
+            // back, or it lights up against the cheek.
+            try {
+                proximity?.release(android.os.PowerManager.RELEASE_FLAG_WAIT_FOR_NO_PROXIMITY)
+            } catch (e: Exception) {
+                Threnody.say("! proximity: ${e.javaClass.simpleName}")
+            }
+        }
+    }
 
     private val reactionListeners = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
 
@@ -408,7 +476,12 @@ object Calls {
             is NodeEvent.CallReaction -> if (current?.id == e.call) reactionListeners.forEach { it(e.emoji) }
             is NodeEvent.CallMedia -> update(e.call) {
                 when (e.state) {
-                    "connected" -> it.copy(state = "connected", since = if (it.since == 0L) SystemClock.elapsedRealtime() else it.since)
+                    "connected" -> {
+                        // The first time: a short tone, so someone with the
+                        // phone at their ear (screen off) hears that it's up.
+                        if (it.since == 0L) cue(android.media.ToneGenerator.TONE_PROP_ACK)
+                        it.copy(state = "connected", since = if (it.since == 0L) SystemClock.elapsedRealtime() else it.since)
+                    }
                     "interrupted" -> it.copy(state = "interrupted")
                     else -> it
                 }
@@ -427,6 +500,8 @@ object Calls {
                     e.byUs -> android.telecom.DisconnectCause.LOCAL
                     else -> android.telecom.DisconnectCause.REMOTE
                 })
+                // They hung up, or it dropped, mid-call: a tone says so.
+                if (c.since != 0L && !e.byUs) cue(android.media.ToneGenerator.TONE_PROP_PROMPT)
                 ongoing(ctx)
                 inCall(ctx, false)
                 ended = when {
@@ -477,6 +552,12 @@ object Calls {
 
     /** Voice-call audio mode while a call runs (echo cancellation, earpiece), and the microphone kept. */
     private fun inCall(ctx: Context, on: Boolean) {
+        appContext = if (on) ctx.applicationContext else null
+        if (!on) {
+            try {
+                proximity?.takeIf { it.isHeld }?.release()
+            } catch (_: Exception) {}
+        }
         try {
             if (on && wifiLock == null) {
                 val wm = ctx.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
@@ -545,6 +626,8 @@ object Calls {
      */
     private fun route(ctx: Context) {
         val c = current ?: return
+        // A headset coming or going changes whether the phone is at an ear.
+        earSensor()
         if (Telecom.active()) {
             Telecom.speaker(c.speaker || (c.video && headset(ctx) == null))
             return

@@ -78,7 +78,9 @@
             android:windowSoftInputMode="adjustResize" />
         <activity android:name=".CallActivity" android:exported="false"
             android:launchMode="singleTask" android:excludeFromRecents="true"
-            android:taskAffinity="org.threnody.app.call" />
+            android:taskAffinity="org.threnody.app.call"
+            android:supportsPictureInPicture="true"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation" />
         <activity android:name=".ChatActivity" android:exported="false"
             android:parentActivityName=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
