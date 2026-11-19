@@ -179,6 +179,9 @@ class ChatActivity : Activity() {
     /** A history entry, or a message still being sent. */
     private data class Item(val entry: HistoryEntry, val sending: Boolean = false)
 
+    /** The way back to a call running elsewhere. */
+    private val callBanner by lazy { CallBanner(this) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Privacy.apply(this)
@@ -248,6 +251,7 @@ class ChatActivity : Activity() {
             visibility = View.GONE
         }
         root.addView(bar, matchWrap)
+        root.addView(callBanner.view, matchWrap)
         root.addView(banner, matchWrap)
         pinBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -740,6 +744,7 @@ class ChatActivity : Activity() {
     override fun onStart() {
         super.onStart()
         started = true
+        callBanner.start()
         Threnody.visible++
         Threnody.visibleChat = setOf(key, device) + (convo?.devices ?: emptyList())
         ThrenodyService.clearNotification(this, ThrenodyService.notificationKey(key, persona))
@@ -782,6 +787,7 @@ class ChatActivity : Activity() {
 
     override fun onStop() {
         started = false
+        callBanner.stop()
         saveDraft()
         // Leaving the chat stops a voice message, and drops one recording.
         clipPlayer?.stop()

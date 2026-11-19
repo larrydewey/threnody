@@ -1,0 +1,5 @@
+- The screen turns off when the phone is at your ear in a call, so your cheek can't press anything.
+- Video calls keep the screen on, fade the buttons, and continue in a small window when you leave.
+- Hear a ringback tone while your call rings.
+- Choose speaker, headset, hearing aid or car for a call.
+- Warnings when a call's connection is weak, and a bar to return to a call.

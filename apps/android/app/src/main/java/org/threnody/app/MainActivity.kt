@@ -57,6 +57,9 @@ class MainActivity : Activity() {
     /** Bumped per search, so a slow one's results don't replace a newer one's. */
     private var searches = 0
 
+    /** The way back to a call running elsewhere. */
+    private val callBanner by lazy { CallBanner(this) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Privacy.apply(this)
@@ -113,6 +116,7 @@ class MainActivity : Activity() {
         drawTabs()
 
         root.addView(bar, matchWrap)
+        root.addView(callBanner.view, matchWrap)
         root.addView(android.widget.HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             addView(tabBar)
@@ -151,6 +155,7 @@ class MainActivity : Activity() {
         ThrenodyService.clearLocked(this)
         unsubscribe = Threnody.subscribe { refreshSoon() }
         refreshSoon()
+        callBanner.start()
         // "My invite" still showing: serve it to a tapping phone again.
         nfcInvite?.let { (dialog, link) -> if (dialog.isShowing) armNfc(dialog, link) }
     }
@@ -158,6 +163,7 @@ class MainActivity : Activity() {
     override fun onStop() {
         Threnody.visible--
         unsubscribe?.invoke()
+        callBanner.stop()
         // A stopped activity never answers taps.
         NfcShare.disarm(this)
         super.onStop()

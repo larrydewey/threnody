@@ -20,6 +20,7 @@ mod lists;
 mod lock;
 #[cfg(feature = "nfc")]
 mod nfc;
+mod ringback;
 mod scan;
 mod schedule;
 mod settings;

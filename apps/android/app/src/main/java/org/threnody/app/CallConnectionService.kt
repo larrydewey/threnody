@@ -86,6 +86,7 @@ class CallConnection(val ctx: Context, incoming: Boolean) : Connection() {
     @Deprecated("Replaced by CallEndpoint on API 34; still delivered there")
     override fun onCallAudioStateChanged(state: CallAudioState?) {
         state ?: return
+        Telecom.audio = state
         Calls.systemRoute(state.route == CallAudioState.ROUTE_SPEAKER, state.isMuted)
     }
 
@@ -199,6 +200,7 @@ object Telecom {
     fun ended(cause: Int) {
         connection?.end(cause)
         connection = null
+        audio = null
     }
 
     /** Speaker or not, through Telecom (it knows about cars and headsets). */
@@ -207,6 +209,57 @@ object Telecom {
         val c = connection ?: return false
         c.setAudioRoute(if (on) CallAudioState.ROUTE_SPEAKER else CallAudioState.ROUTE_WIRED_OR_EARPIECE)
         return true
+    }
+
+    /** Telecom's latest word on where the call's audio goes, and could go. */
+    @Volatile var audio: CallAudioState? = null
+
+    private fun btName(d: android.bluetooth.BluetoothDevice): String =
+        try { d.name?.takeIf { it.isNotBlank() } } catch (_: SecurityException) { null } ?: "Bluetooth"
+
+    /** Where Telecom can send the call's audio now, the phone itself first. */
+    @Suppress("DEPRECATION")
+    fun outputs(): List<Calls.Output> {
+        val s = audio ?: return emptyList()
+        val mask = s.supportedRouteMask
+        val list = mutableListOf<Calls.Output>()
+        if (mask and CallAudioState.ROUTE_EARPIECE != 0) list += Calls.Output("earpiece", "Phone")
+        if (mask and CallAudioState.ROUTE_WIRED_HEADSET != 0) list += Calls.Output("wired", "Wired headset")
+        if (mask and CallAudioState.ROUTE_SPEAKER != 0) list += Calls.Output("speaker", "Speaker")
+        if (mask and CallAudioState.ROUTE_BLUETOOTH != 0) {
+            val devices = s.supportedBluetoothDevices
+            if (devices.isEmpty()) list += Calls.Output("bt:", "Bluetooth")
+            for (d in devices) list += Calls.Output("bt:${d.address}", btName(d))
+        }
+        return list
+    }
+
+    /** The [Calls.Output.key] Telecom sends the audio to now. */
+    @Suppress("DEPRECATION")
+    fun outputNow(): String? {
+        val s = audio ?: return null
+        return when (s.route) {
+            CallAudioState.ROUTE_EARPIECE -> "earpiece"
+            CallAudioState.ROUTE_WIRED_HEADSET -> "wired"
+            CallAudioState.ROUTE_SPEAKER -> "speaker"
+            CallAudioState.ROUTE_BLUETOOTH -> "bt:${s.activeBluetoothDevice?.address ?: ""}"
+            else -> null
+        }
+    }
+
+    /** Sends the audio to [Calls.Output] `key`, through Telecom. */
+    @Suppress("DEPRECATION")
+    fun setOutput(key: String) {
+        val c = connection ?: return
+        if (key == outputNow()) return
+        when {
+            key == "speaker" -> c.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+            key == "earpiece" || key == "wired" -> c.setAudioRoute(CallAudioState.ROUTE_WIRED_OR_EARPIECE)
+            key.startsWith("bt:") -> {
+                val d = audio?.supportedBluetoothDevices?.firstOrNull { "bt:${it.address}" == key }
+                if (d != null) c.requestBluetoothAudio(d) else c.setAudioRoute(CallAudioState.ROUTE_BLUETOOTH)
+            }
+        }
     }
 
     /** Video on or off, for the car's or watch's picture of the call. */
