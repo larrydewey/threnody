@@ -160,6 +160,7 @@ The normative details that the spec deferred are written up in [`docs/`](docs/):
 - [Appendix R: waking a sleeping device with UnifiedPush](docs/appendix-r-push.md) (opt-in)
 - [Appendix S: handles](docs/appendix-s-handles.md)
 - [Appendix T: adding contacts by NFC tap](docs/appendix-t-nfc.md)
+- [Appendix U: large files](docs/appendix-u-large-files.md) (draft plan)
 - [Test vectors](docs/test-vectors/v1.txt), regenerated and checked by `cargo test`
 - [Tamarin proofs of the handshake, ratchet, sealed messages, onion hops and device linking](proofs/README.md)
 
