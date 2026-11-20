@@ -34,12 +34,13 @@ RatchetHeader = { 0 => bstr .size 1216, 1 => bstr .size 1120, 2 => uint, 3 => ui
 ; --- Application layer (inside the ratchet, after unpadding) ---
 AppMessage = Hello / Text / File / Approval / Cover / TunnelOffer / Group / Relay / Prekeys / Mailbox / Onion / Account
            / Direct / Tracked / Ack / Delete / Edit / Identity / React / Observed / Paths / Credential / Directory
-           / Typing / Read / Call / Media / Pin / List / Tunnel / Push / Receipt
+           / Typing / Read / Call / Media / Pin / List / Tunnel / Push / Receipt / Offer / Transfer
 Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 acks, 2 delete, 4 edit, 8 identity, 16 react,
                                                            ; 32 observed, 64 paths, 128 credentials, 256 typing,
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
                                                            ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off,
-                                                           ; 131072 receipts, 262144 device sync); absent = 0
+                                                           ; 131072 receipts, 262144 device sync,
+                                                           ; 524288 large files, reserved: not yet sent); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded, 16 timer off)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr,    ; quoted message id, its sender's device, its text (≤ 200 chars)
@@ -78,6 +79,8 @@ List       = { 0 => 28, 2 => bstr }                        ; a shared list's sta
 Tunnel     = { 0 => 29, 2 => bstr }                        ; one WireGuard packet, Appendix D
 Push       = { 0 => 30, 2 => bstr .cbor PushReg }         ; wake-up endpoint or its withdrawal, mutual contacts only, Appendix R
 Receipt    = { 0 => 31, 2 => bstr .cbor ReceiptMsg }      ; delivery and read receipts, live or sealed, Appendix H
+Offer      = { 0 => 32, 2 => bstr .cbor FileOffer }       ; a file offered rather than sent inline, Appendix U
+Transfer   = { 0 => 33, 2 => bstr .cbor TransferMsg }     ; pulling an offered file in pieces, Appendix U
 
 GroupWire = { 0 => 1..10, 1 => bstr .size 16, ? 2 => bstr, ? 3 => tstr, ? 4 => bstr .size 32, ? 5 => uint,
               ? 6 => bstr .size 32, ? 7 => [* bstr], ? 8 => [uint, uint, bstr .size 8, bstr .size 8],
