@@ -1164,6 +1164,26 @@ impl Node {
                 } => return self.on_pin(&from, conversation, *id, *pin),
                 AppMessage::List(bytes) => return self.on_list_message(from, bytes),
                 AppMessage::Receipt(payload) => return self.on_receipt(&from, payload),
+                // An offered file: recorded by the node itself, its pieces
+                // fetched from the sender once we meet (see `transfer`).
+                AppMessage::Offer(bytes) => {
+                    if !self.on_file_offer(&from, bytes) {
+                        return;
+                    }
+                    let contact = self.is_accepted(&from);
+                    if contact
+                        && let Ok(o) = threnody_core::transfer::Offer::decode(bytes)
+                        && o.id != 0
+                    {
+                        self.queue_receipt(&from, &[o.id], &[]);
+                    }
+                    if contact {
+                        self.emit(Event::OfflineMessage { from, via, msg });
+                    } else {
+                        self.emit(Event::MessageRequest { peer: from, msg });
+                    }
+                    return;
+                }
                 // A chain sealed after a device was removed (see
                 // `seal_chain_to_absent`); nothing else of the account's.
                 AppMessage::Account(payload) => {
