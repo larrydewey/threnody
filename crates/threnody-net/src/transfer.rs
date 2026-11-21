@@ -233,6 +233,27 @@ fn hashes_state(root: &[u8; 32]) -> String {
     format!("{HASHES_PREFIX}{}", hex(&root[..16]))
 }
 
+fn thumbnail_state(root: &[u8; 32]) -> String {
+    format!(
+        "{}{}",
+        threnody_core::transfer::THUMBNAIL_STATE_PREFIX,
+        hex(&root[..16])
+    )
+}
+
+/// `t` if it is a JPEG within [`tx::MAX_THUMBNAIL`], without its metadata;
+/// otherwise empty. Thumbnails are made by apps on one side and shown on
+/// the other: neither is trusted to have left nothing in them.
+fn clean_thumbnail(t: Vec<u8>) -> Vec<u8> {
+    if t.len() > tx::MAX_THUMBNAIL || !t.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Vec::new();
+    }
+    match media::strip(t) {
+        Ok(media::Stripped::Image(i)) if i.len() <= tx::MAX_THUMBNAIL => i,
+        _ => Vec::new(),
+    }
+}
+
 fn encode_hashes(h: &[[u8; 32]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + h.len() * 32);
     out.push(VERSION);
@@ -610,6 +631,10 @@ impl Read for EditedReader<'_> {
 pub struct SendOptions {
     pub sensitive: bool,
     pub caption: String,
+    /// A small JPEG of the file (a photo or a video's frame) shown before
+    /// it is downloaded; kept only within [`tx::MAX_THUMBNAIL`], and sent
+    /// without metadata. Empty: none.
+    pub thumbnail: Vec<u8>,
     pub album: u64,
     pub clip: Option<Clip>,
     pub forwarded: bool,
@@ -742,7 +767,7 @@ impl Node {
             clip: opts.clip,
             caption: opts.caption.clone(),
             album: opts.album,
-            thumbnail: Vec::new(),
+            thumbnail: clean_thumbnail(opts.thumbnail),
         };
         let bytes = offer.encode()?;
         self.shared
@@ -850,6 +875,9 @@ impl Node {
             offer.id,
         );
         let auto = wants_auto(&offer, contact, self.on_mobile());
+        let mut offer = offer;
+        // Kept on its own, not with the offers (rewritten as downloads go).
+        let thumbnail = clean_thumbnail(std::mem::take(&mut offer.thumbnail));
         {
             let mut t = lock(&self.shared.transfers);
             if t.incoming.len() >= MAX_INCOMING {
@@ -857,9 +885,14 @@ impl Node {
                 if let Some(i) = t.incoming.iter().position(|i| i.run.is_none()) {
                     let gone = t.incoming.remove(i);
                     self.drop_partial(&t, &gone);
+                    self.forget_thumbnail(&gone.offer.root);
                 } else {
                     return true;
                 }
+            }
+            if !thumbnail.is_empty() {
+                self.shared
+                    .save_state(&thumbnail_state(&offer.root), Ok(thumbnail));
             }
             t.incoming.push(Incoming {
                 conv,
@@ -946,6 +979,27 @@ impl Node {
 
     fn drop_partial(&self, t: &Transfers, inc: &Incoming) {
         self.remove_partial(t, &inc.offer.root);
+    }
+
+    fn forget_thumbnail(&self, root: &[u8; 32]) {
+        let _ = self.shared.home.remove_state(&thumbnail_state(root));
+    }
+
+    /// The thumbnail offered with message `id` in `conv`, while the file
+    /// isn't here yet; None if it came without one.
+    pub fn offer_thumbnail(&self, conv: ConversationId, id: u64) -> Option<Vec<u8>> {
+        self.rekey_transfers();
+        let root = {
+            let t = lock(&self.shared.transfers);
+            t.incoming[t.find_in(conv, id)?].offer.root
+        };
+        self.shared
+            .home
+            .load_state(self.identity_ref(), &thumbnail_state(&root))
+            .ok()
+            .flatten()
+            .map(|t| t.to_vec())
+            .filter(|t| !t.is_empty())
     }
 
     /// A peer's conversation moves from its device to its account once
@@ -1533,6 +1587,7 @@ impl Node {
         drop(t);
         match kept {
             Some(loc) => {
+                self.forget_thumbnail(&offer.root);
                 let _ = self.shared.home.set_file_location(
                     self.identity_ref(),
                     inc.conv,
@@ -1671,6 +1726,9 @@ impl Node {
         }
         for r in gone_in.iter().chain(&gone_out) {
             self.remove_partial(&t, r);
+        }
+        for r in &gone_in {
+            self.forget_thumbnail(r);
         }
         t.incoming.retain(|i| !gone_in.contains(&i.offer.root));
         t.outgoing.retain(|o| !gone_out.contains(&o.root));
@@ -1931,6 +1989,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn only_small_jpegs_go_as_thumbnails() {
+        // Not a JPEG (a PNG, random bytes) or too large: none.
+        assert!(clean_thumbnail(b"\x89PNG\r\n\x1a\nrest".to_vec()).is_empty());
+        assert!(clean_thumbnail(vec![7; 100]).is_empty());
+        let mut big = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        big.resize(tx::MAX_THUMBNAIL + 1, 0);
+        assert!(clean_thumbnail(big).is_empty());
+        assert!(clean_thumbnail(Vec::new()).is_empty());
     }
 
     #[test]

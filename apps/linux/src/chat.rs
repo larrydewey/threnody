@@ -832,6 +832,7 @@ impl ChatView {
                                         album,
                                         clip: f.clip,
                                         forwarded: true,
+                                        thumbnail: None,
                                     };
                                     send_file_to(
                                         n,
@@ -2185,7 +2186,38 @@ impl ChatView {
         self.offered
             .borrow_mut()
             .push((e.id, state, button, f.size));
-        row.upcast()
+        if f.sensitive {
+            return row.upcast();
+        }
+        // The picture it came with, if any, above: never for a sensitive
+        // file, which stays covered until downloaded and opened.
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let pic = gtk::Picture::new();
+        pic.set_can_shrink(true);
+        pic.set_content_fit(gtk::ContentFit::Contain);
+        pic.set_size_request(-1, 180);
+        pic.set_halign(gtk::Align::Start);
+        pic.add_css_class("photo");
+        pic.set_alternative_text(Some(&format!("Preview of {}", f.name)));
+        pic.set_visible(false);
+        outer.append(&pic);
+        outer.append(&row);
+        if let (Some(node), Dest::Contact(d)) = (self.node(), self.dest()) {
+            let id = e.id;
+            let weak = pic.downgrade();
+            bg(
+                move || node.offer_thumbnail(d, id),
+                move |jpeg| {
+                    let texture =
+                        jpeg.and_then(|j| gdk::Texture::from_bytes(&glib::Bytes::from(&j)).ok());
+                    if let (Some(t), Some(pic)) = (texture, weak.upgrade()) {
+                        pic.set_paintable(Some(&t));
+                        pic.set_visible(true);
+                    }
+                },
+            );
+        }
+        outer.upcast()
     }
 
     /// Downloads the file offered as message `id`, or stops its download
@@ -4007,6 +4039,13 @@ impl ChatView {
                             album,
                             clip: None,
                             forwarded: false,
+                            // Shown in their chat before they download it;
+                            // never for a sensitive file, kept covered there.
+                            thumbnail: if sensitive {
+                                None
+                            } else {
+                                crate::thumb::offer_thumbnail(p, &name)
+                            },
                         };
                         if let Err(e) = node.send_file_at(
                             d.clone(),
@@ -4055,6 +4094,7 @@ impl ChatView {
                         album,
                         clip: None,
                         forwarded: false,
+                        thumbnail: None,
                     };
                     // A converted photo can never be made again from the
                     // original: keep what was sent, privately, so our

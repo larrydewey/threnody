@@ -1681,7 +1681,10 @@ async fn an_offer_waits_in_a_mailbox_and_the_file_comes_once_we_meet() {
             &bid,
             "big.bin".into(),
             src.display().to_string(),
-            Default::default(),
+            threnody_net::SendOptions {
+                thumbnail: thumbnail_with_gps(),
+                ..Default::default()
+            },
         )
         .unwrap();
     wait_for(|| r.node.held_messages() == 1).await;
@@ -1713,6 +1716,11 @@ async fn an_offer_waits_in_a_mailbox_and_the_file_comes_once_we_meet() {
     let offer = threnody_core::transfer::Offer::decode(&bytes).unwrap();
     assert_eq!((offer.id, offer.size), (local_id, data.len() as u64));
     let conv = b2.conversation_for(&aid);
+    // Its thumbnail came with it, without the location A's app left in.
+    let thumb = b2.offer_thumbnail(conv, offer.id).unwrap();
+    assert!(thumb.starts_with(&[0xFF, 0xD8, 0xFF]));
+    assert!(!contains(&thumb, b"GPS"), "metadata left in the thumbnail");
+    assert!(contains(&thumb, b"pixels"));
     assert_eq!(
         b2.download(conv, offer.id).unwrap(),
         threnody_net::TransferState::Waiting
@@ -1735,4 +1743,29 @@ async fn an_offer_waits_in_a_mailbox_and_the_file_comes_once_we_meet() {
     .await;
     let kept = files.join("kept-big.bin");
     assert_eq!(std::fs::read(kept).unwrap(), data);
+    // Here now: its thumbnail is gone with the offer.
+    assert_eq!(b2.offer_thumbnail(conv, offer.id), None);
+}
+
+fn contains(h: &[u8], n: &[u8]) -> bool {
+    h.windows(n.len()).any(|w| w == n)
+}
+
+/// A tiny JPEG whose EXIF says where it was taken.
+fn thumbnail_with_gps() -> Vec<u8> {
+    let seg = |marker: u8, body: &[u8]| {
+        let mut s = vec![0xFF, marker];
+        s.extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_be_bytes());
+        s.extend_from_slice(body);
+        s
+    };
+    let mut j = vec![0xFF, 0xD8];
+    j.extend(seg(0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0"));
+    j.extend(seg(0xE1, b"Exif\0\0MM\0\x2a\0\0\0\x08\0\0GPS 51.5N 0.12W"));
+    j.extend(seg(0xDB, &[0; 65]));
+    j.extend(seg(0xC0, &[8, 0, 1, 0, 1, 1, 1, 0x11, 0]));
+    j.extend(seg(0xDA, &[1, 1, 0, 0, 0x3F, 0]));
+    j.extend(b"pixels");
+    j.extend([0xFF, 0xD9]);
+    j
 }

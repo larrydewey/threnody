@@ -168,6 +168,13 @@ impl From<LinkPreviewInfo> for threnody_core::LinkPreview {
     }
 }
 
+/// The largest thumbnail an offered file carries: apps make a JPEG within
+/// this of a photo or video too large for one message.
+#[uniffi::export]
+pub fn max_offer_thumbnail() -> u32 {
+    threnody_core::transfer::MAX_THUMBNAIL as u32
+}
+
 /// The largest preview image a message carries: apps shrink the fetched
 /// one to a JPEG within this.
 #[uniffi::export]
@@ -468,6 +475,10 @@ pub struct FileOptions {
     /// Forwarded from another chat.
     #[uniffi(default = false)]
     pub forwarded: bool,
+    /// A small JPEG of it (at most 24 KiB) shown before a large file is
+    /// downloaded (`send_file_at`); ignored for a file sent inline.
+    #[uniffi(default = None)]
+    pub thumbnail: Option<Vec<u8>>,
 }
 
 /// A fresh album id for photos or files sent together.
@@ -3634,6 +3645,7 @@ mod tests {
             album: 0,
             clip: None,
             forwarded: false,
+            thumbnail: None,
         }
     }
 
@@ -4028,6 +4040,7 @@ mod tests {
                     album: 0,
                     clip: None,
                     forwarded: false,
+                    thumbnail: None,
                 },
             )
             .unwrap();
@@ -4078,6 +4091,7 @@ mod tests {
                 album: 0,
                 clip: None,
                 forwarded: false,
+                thumbnail: None,
             },
         )
         .unwrap();
@@ -4744,6 +4758,7 @@ mod tests {
                         duration_ms: 2_500,
                     }),
                     forwarded: false,
+                    thumbnail: None,
                 },
             )
             .unwrap();
@@ -4782,6 +4797,7 @@ mod tests {
                 album,
                 clip,
                 forwarded: false,
+                thumbnail: None,
             };
             member
                 .record_received_group_file(group, from, name, 3000, Some("/x".into()), id, options)
