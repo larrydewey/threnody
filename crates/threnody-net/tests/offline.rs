@@ -1613,3 +1613,126 @@ async fn an_older_sender_gets_reads_as_read_and_no_receipts() {
     assert_eq!(b2.pending_receipts(), 0);
     let _ = &mut b2rx;
 }
+
+/// Keeps large files as plain files in a directory.
+struct DirLarge(std::path::PathBuf);
+
+impl threnody_net::LargeFileStore for DirLarge {
+    fn size(&self, location: &str) -> Option<u64> {
+        std::fs::metadata(location).ok().map(|m| m.len())
+    }
+
+    fn read_at(&self, location: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(location).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut out = Vec::new();
+        f.take(len as u64).read_to_end(&mut out).ok()?;
+        Some(out)
+    }
+
+    fn keep_stream(&self, name: &str, _clip: bool, src: &mut dyn std::io::Read) -> Option<String> {
+        let p = self.0.join(format!("kept-{name}"));
+        let mut f = std::fs::File::create(&p).ok()?;
+        std::io::copy(src, &mut f).ok()?;
+        Some(p.display().to_string())
+    }
+
+    fn free_space(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// A node that takes offered files, kept in `<name>-files`.
+async fn spawn_large(dir: &tempfile::TempDir, name: &str) -> N {
+    let (node, rx) = open(dir, name, true);
+    let files = dir.path().join(format!("{name}-files"));
+    std::fs::create_dir_all(&files).unwrap();
+    node.set_large_file_store(Arc::new(DirLarge(files)));
+    node.set_large_threshold(64 * 1024);
+    let addr = node.listen("127.0.0.1:0").await.unwrap().to_string();
+    N { node, rx, addr }
+}
+
+#[tokio::test]
+async fn an_offer_waits_in_a_mailbox_and_the_file_comes_once_we_meet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut r) = (
+        spawn_large(&dir, "a").await,
+        spawn_large(&dir, "b").await,
+        spawn(&dir, "r").await,
+    );
+    link(&mut a, &mut b).await;
+    link(&mut a, &mut r).await;
+    link(&mut b, &mut r).await;
+    let (aid, bid) = (a.node.identity(), b.node.identity());
+    wait_for(|| a.node.can_send_offline(&bid)).await;
+
+    // B goes away; A offers it a file nobody can strip (random bytes).
+    b.node.shutdown();
+    wait_for(|| gone(&a.node, &bid) && gone(&r.node, &bid)).await;
+    let data: Vec<u8> = (0..700_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) as u8)
+        .collect();
+    let src = dir.path().join("big.bin");
+    std::fs::write(&src, &data).unwrap();
+    a.node
+        .send_file_at(
+            &bid,
+            "big.bin".into(),
+            src.display().to_string(),
+            Default::default(),
+        )
+        .unwrap();
+    wait_for(|| r.node.held_messages() == 1).await;
+    let local_id = a
+        .node
+        .history(a.node.conversation_for(&bid))
+        .unwrap()
+        .entries()
+        .last()
+        .unwrap()
+        .local_id;
+
+    // B comes back to R only: the offer is there, the file isn't yet.
+    let (b2, mut b2rx) = open(&dir, "b", false);
+    let files = dir.path().join("b-files");
+    b2.set_large_file_store(Arc::new(DirLarge(files.clone())));
+    b2.set_receipt_delay(0, 0);
+    b2.set_prefer_onion(false);
+    b2.connect(&r.addr, None).await.unwrap();
+    let Event::OfflineMessage {
+        from,
+        msg: AppMessage::Offer(bytes),
+        ..
+    } = next(&mut b2rx, |e| matches!(e, Event::OfflineMessage { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(from, aid);
+    let offer = threnody_core::transfer::Offer::decode(&bytes).unwrap();
+    assert_eq!((offer.id, offer.size), (local_id, data.len() as u64));
+    let conv = b2.conversation_for(&aid);
+    assert_eq!(
+        b2.download(conv, offer.id).unwrap(),
+        threnody_net::TransferState::Waiting
+    );
+    // Its receipt reaches A through R (A is there): delivered before
+    // a single piece has moved.
+    wait_for(|| entry(&a.node, &bid, local_id).delivered).await;
+
+    // Once they meet, the pieces come from A, and A hears it arrived.
+    b2.connect(&a.addr, None).await.unwrap();
+    next(&mut b2rx, |e| {
+        matches!(
+            e,
+            Event::Transfer {
+                state: threnody_net::TransferState::Done,
+                ..
+            }
+        )
+    })
+    .await;
+    let kept = files.join("kept-big.bin");
+    assert_eq!(std::fs::read(kept).unwrap(), data);
+}

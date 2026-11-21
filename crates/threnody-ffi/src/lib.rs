@@ -1408,9 +1408,16 @@ fn convert(e: Event) -> NodeEvent {
                 _ => None,
             },
         },
+        // An offer opened from a mailbox (Appendix U) shows as one that
+        // came over a session: its pieces come from the sender either way.
         Event::Message {
             peer,
             msg: AppMessage::Offer(b),
+        }
+        | Event::OfflineMessage {
+            from: peer,
+            msg: AppMessage::Offer(b),
+            ..
         } => match threnody_core::transfer::Offer::decode(&b) {
             Ok(o) => NodeEvent::FileOffered {
                 peer: fp(&peer),
@@ -3378,6 +3385,35 @@ mod tests {
             None
         );
         assert_eq!(decode_qr(0, 0, 0, vec![]), None);
+    }
+
+    /// An offer opened from a mailbox shows as any other offer.
+    #[test]
+    fn an_offer_from_a_mailbox_is_offered() {
+        let from = threnody_core::Identity::generate().public();
+        let offer = threnody_core::transfer::Offer {
+            sent_ms: 1,
+            id: 9,
+            name: "film.mp4".into(),
+            size: 40_000_000,
+            root: [1; 32],
+            key: [2; 32],
+            sensitive: false,
+            forwarded: false,
+            clip: None,
+            caption: String::new(),
+            album: 0,
+            thumbnail: Vec::new(),
+        };
+        let e = Event::OfflineMessage {
+            from,
+            via: from,
+            msg: AppMessage::Offer(offer.encode().unwrap()),
+        };
+        let NodeEvent::FileOffered { name, size, id, .. } = convert(e) else {
+            panic!("expected FileOffered");
+        };
+        assert_eq!((name.as_str(), size, id), ("film.mp4", 40_000_000, 9));
     }
 
     /// A message the app has no event for is logged by kind only: a sealed

@@ -666,7 +666,9 @@ impl Node {
             .size(&location)
             .ok_or_else(|| NetError::NotFound("file not found".into()))?;
         let threshold = self.shared.large_threshold.load(Ordering::Relaxed);
-        let large = self.supports(peer, FEATURE_LARGE_FILES);
+        // A peer away since we started is judged by its last session: the
+        // offer may go to its mailboxes.
+        let large = self.known_to_support(peer, FEATURE_LARGE_FILES);
         let head = store.read_at(&location, 0, 64).unwrap_or_default();
         let strip = self.strip_metadata() && media::kind(&head).is_some();
         if size > threshold && !large {
@@ -776,8 +778,14 @@ impl Node {
             if !matches!(e, NetError::Closed) {
                 return Err(e);
             }
+            // Away: sealed for its mailboxes, as a text is, so it learns
+            // of the file before we next meet; it waits here should every
+            // mailbox decline it. The pieces still come from us.
             self.seek(peer);
-            self.hold(peer, msg, tag);
+            if !(self.can_send_offline(peer) && self.send_offline_or_hold(peer, &msg, tag).is_ok())
+            {
+                self.hold(peer, msg, tag);
+            }
         }
         self.append_file(
             peer,
@@ -865,6 +873,8 @@ impl Node {
             self.save_incoming(&t);
         }
         if auto {
+            // It may have come through a mailbox: look for its sender.
+            self.seek(peer);
             self.pump_transfers();
         }
         true
@@ -882,6 +892,7 @@ impl Node {
     /// it ran out of space or failed).
     pub fn download(&self, conv: ConversationId, id: u64) -> Result<TransferState> {
         self.rekey_transfers();
+        let from;
         {
             let mut t = lock(&self.shared.transfers);
             let i = t
@@ -893,8 +904,11 @@ impl Node {
                 inc.status = Status::Wanted;
                 inc.run = None;
             }
+            from = inc.from;
             self.save_incoming(&t);
         }
+        // The pieces come from its sender: reach it if we haven't.
+        self.seek(&from);
         self.pump_transfers();
         self.transfer_state(conv, id)
             .ok_or_else(|| NetError::NotFound("no such file".into()))
