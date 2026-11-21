@@ -81,7 +81,10 @@ struct SendSheet: View {
     /// Small previews of the picked photos, decoded off the main thread
     /// and refused when too large, as received ones are.
     private func loadThumbs() async {
-        for f in files where isImageName(name: f.name) {
+        for f in files where f.thumbnail != nil && f.data.isEmpty {
+            if let t = f.thumbnail, let image = UIImage(data: t) { thumbs[f.id] = image }
+        }
+        for f in files where isImageName(name: f.name) && !f.data.isEmpty {
             let data = f.data
             let cg = try? await offMain { Media.thumbnail(data: data, maxSide: 144) }
             if let cg = cg ?? nil { thumbs[f.id] = UIImage(cgImage: cg) }

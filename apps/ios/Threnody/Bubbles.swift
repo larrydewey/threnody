@@ -1,5 +1,44 @@
+import Observation
 import SwiftUI
 import UIKit
+
+/// Files a contact offered in the open chat, too large for one message
+/// (Appendix U): where each download is, by message id, the thumbnails
+/// they came with, and what a tap on one does.
+@MainActor @Observable final class Offers {
+    var states: [UInt64: TransferState] = [:]
+    var thumbs: [UInt64: UIImage] = [:]
+    /// Offers known to have come without a thumbnail (not asked again).
+    var thumbless: Set<UInt64> = []
+    @ObservationIgnored var tap: (HistoryEntry) -> Void = { _ in }
+}
+
+private struct OffersKey: EnvironmentKey {
+    static let defaultValue: Offers? = nil
+}
+
+extension EnvironmentValues {
+    var offers: Offers? {
+        get { self[OffersKey.self] }
+        set { self[OffersKey.self] = newValue }
+    }
+}
+
+/// How an offered file's download stands, after its size.
+func offerText(_ s: TransferState, size: UInt64) -> String {
+    let total = ByteCountFormatter.string(fromByteCount: Int64(min(size, UInt64(Int64.max))), countStyle: .file)
+    switch s {
+    case .idle: return "Tap to download · \(total)"
+    case .waiting: return "Waiting for the sender… · tap to cancel"
+    case let .fetching(received, all):
+        let pct = all == 0 ? 100 : received * 100 / all
+        return "Downloading… \(pct)% of \(total) · tap to cancel"
+    case .noSpace: return "Not enough space for \(total) · tap to try again"
+    case .unavailable: return "No longer available from the sender · tap to try again"
+    case .failed: return "Didn't arrive intact · tap to try again"
+    case .done: return "Downloaded"
+    }
+}
 
 /// A message in a chat: who sent it (in groups), what it replies to, its
 /// text (mentions by name, search matches marked), photos and files,
@@ -209,6 +248,7 @@ struct FileContent: View {
     @State private var refused = false
     /// A decrypted copy to share, for a file QuickLook won't show.
     @State private var shareURL: URL?
+    @Environment(\.offers) private var offers
 
     var body: some View {
         if let file = entry.file {
@@ -216,7 +256,24 @@ struct FileContent: View {
             let photo = file.clip == nil && isImageName(name: file.name)
             let label = fileLabel(name: file.name, sensitive: file.sensitive, caption: compact ? "" : caption, clip: file.clip)
             VStack(alignment: .leading, spacing: 6) {
-                if url == nil {
+                if url == nil, !entry.outgoing, let offers, let state = offers.states[entry.id] {
+                    // Offered, too large for one message: its picture (never
+                    // a sensitive file's) and how its download stands.
+                    Button { offers.tap(entry) } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if !file.sensitive, let thumb = offers.thumbs[entry.id] {
+                                Image(uiImage: thumb)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(maxWidth: compact ? 128 : 240, maxHeight: compact ? 128 : 220)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    .accessibilityHidden(true)
+                            }
+                            Label("\(label) · \(offerText(state, size: file.size))", systemImage: "arrow.down.circle")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                } else if url == nil {
                     Label("\(label) · on another device", systemImage: "paperclip")
                 } else if photo && file.sensitive && !revealed {
                     Button(action: onReveal) {
