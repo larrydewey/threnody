@@ -266,6 +266,13 @@ impl Core {
         // Receipts waiting for a contact may go as soon as it connects:
         // the user's choice applies first (the node keeps it too).
         main.set_send_read_receipts(saved.flag(settings::SEND_READ));
+        // Files too large for one message, sent and downloaded in pieces;
+        // before listening, so every session says this device takes them.
+        // Only the main identity: it seals what it downloads.
+        main.set_large_file_store(Arc::new(LinuxLarge {
+            dir: home.join("media"),
+            node: Arc::downgrade(&main),
+        }));
         let port = main
             .listen(format!("0.0.0.0:{PORT}"))
             .or_else(|_| main.listen(format!("0.0.0.0:{fallback}")))
@@ -2061,6 +2068,69 @@ impl threnody_ffi::SyncedFileStore for LinuxFiles {
     }
 }
 
+/// Where the main identity keeps files too large for one message
+/// (Appendix U): a picked file is read in pieces where it is, never
+/// whole, and a download is sealed into the private media directory as
+/// it is written.
+pub struct LinuxLarge {
+    pub dir: PathBuf,
+    /// The main node, whose identity seals them.
+    pub node: std::sync::Weak<ThrenodyNode>,
+}
+
+impl threnody_ffi::LargeFileStore for LinuxLarge {
+    fn size(&self, location: String) -> Option<u64> {
+        std::fs::metadata(&location)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        threnody_ffi::media_size(location).ok()
+    }
+
+    fn read_at(&self, location: String, offset: u64, len: u32) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = Path::new(&location);
+        if is_sealed(path) {
+            return self
+                .node
+                .upgrade()?
+                .read_media_range(location, offset, len)
+                .ok();
+        }
+        let mut f = std::fs::File::open(path).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut out = Vec::with_capacity(len as usize);
+        f.take(u64::from(len)).read_to_end(&mut out).ok()?;
+        Some(out)
+    }
+
+    fn reserve(&self, name: String, _clip: bool) -> Option<threnody_ffi::ReservedFile> {
+        if WIPING.load(Ordering::SeqCst) {
+            return None;
+        }
+        private_dir(&self.dir).ok()?;
+        let (path, _) = create_free(&self.dir, &name, 0o600).ok()?;
+        let path = path.display().to_string();
+        Some(threnody_ffi::ReservedFile {
+            path: path.clone(),
+            location: path,
+        })
+    }
+
+    fn free_space(&self) -> Option<u64> {
+        let _ = private_dir(&self.dir);
+        free_space(&self.dir)
+    }
+}
+
+/// Bytes free on the filesystem holding `dir`.
+fn free_space(dir: &Path) -> Option<u64> {
+    use gtk::gio::prelude::FileExt;
+    gtk::gio::File::for_path(dir)
+        .query_filesystem_info("filesystem::free", gtk::gio::Cancellable::NONE)
+        .ok()
+        .map(|i| i.attribute_uint64("filesystem::free"))
+}
+
 // ----- Media at rest -----
 //
 // Private media (received photos, voice and video messages, anything a
@@ -2169,6 +2239,16 @@ pub fn plain_path(path: &Path) -> std::io::Result<PathBuf> {
     let node = media_node()?;
     let dir = scratch_dir().join("open");
     private_dir(&dir)?;
+    // The scratch directory is in memory on most systems: a copy that
+    // won't fit there isn't made anywhere else (plaintext on disk).
+    let size = threnody_ffi::media_size(path.display().to_string())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if free_space(&dir).is_some_and(|free| size.saturating_add(64 << 20) > free) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "too large to open from here: save a copy instead",
+        ));
+    }
     let name = path
         .file_name()
         .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
@@ -2190,7 +2270,10 @@ pub fn save_plain(from: &Path, to: &Path) -> std::io::Result<()> {
     if !is_sealed(from) {
         return std::fs::copy(from, to).map(|_| ());
     }
-    std::fs::write(to, read_media(from)?)
+    // Decrypted as it is written: a large file never whole in memory.
+    media_node()?
+        .open_media_file(from.display().to_string(), to.display().to_string())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// `dir/name` with any path the sender put in the name stripped, and a
@@ -2400,6 +2483,124 @@ mod tests {
             .keep("x.png".into(), b"other".to_vec(), false)
             .unwrap();
         assert_ne!(again, at);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Waits up to 30 s for an event `want` matches.
+    fn wait_for(node: &ThrenodyNode, want: impl Fn(&NodeEvent) -> bool) -> NodeEvent {
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < end {
+            if let Some(e) = node.next_event(200)
+                && want(&e)
+            {
+                return e;
+            }
+        }
+        panic!("no such event");
+    }
+
+    #[test]
+    fn large_files_go_both_ways_through_the_store() {
+        use std::os::unix::fs::PermissionsExt;
+        use threnody_ffi::{LargeFileStore, TransferState};
+        let dir = temp("large");
+        let open = |n: &str| {
+            let node = ThrenodyNode::open(dir.join(n).display().to_string(), None, None).unwrap();
+            node.set_call_devices(false);
+            node.set_large_file_store(Arc::new(LinuxLarge {
+                dir: dir.join(n).join("media"),
+                node: Arc::downgrade(&node),
+            }));
+            node
+        };
+        let (alice, bob) = (open("a"), open("b"));
+        let addr = bob.listen("127.0.0.1:0".into()).unwrap();
+        let bob_fp = alice.connect(bob.invite_link(addr)).unwrap();
+        let alice_fp = alice.device_fingerprint();
+        wait_for(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(alice_fp.clone()).unwrap();
+
+        // Too large for one message: offered from where it is.
+        let data: Vec<u8> = (0..9 * 1024 * 1024 + 4321)
+            .map(|i: usize| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let src = dir.join("data.bin");
+        std::fs::write(&src, &data).unwrap();
+        let options = || FileOptions {
+            sensitive: false,
+            caption: String::new(),
+            album: 0,
+            clip: None,
+            forwarded: false,
+        };
+        alice
+            .send_file_at(
+                bob_fp.clone(),
+                "data.bin".into(),
+                src.display().to_string(),
+                options(),
+            )
+            .unwrap();
+        let NodeEvent::FileOffered { id, size, .. } =
+            wait_for(&bob, |e| matches!(e, NodeEvent::FileOffered { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(
+            bob.transfer_state(alice_fp.clone(), id),
+            Some(TransferState::Idle)
+        );
+        bob.download_file(alice_fp.clone(), id).unwrap();
+        wait_for(
+            &bob,
+            |e| matches!(e, NodeEvent::TransferChanged { id: i, state: TransferState::Done, .. } if *i == id),
+        );
+        // Sealed into the private media directory, only the user's.
+        let kept = bob.history(alice_fp.clone(), 1).unwrap()[0]
+            .file
+            .clone()
+            .unwrap()
+            .location
+            .unwrap();
+        let kept_path = PathBuf::from(&kept);
+        assert!(kept_path.starts_with(dir.join("b").join("media")));
+        assert!(is_sealed(&kept_path));
+        let mode = std::fs::metadata(&kept_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(read_with(&bob, &kept_path).unwrap(), data);
+        // Read back in ranges, decrypting only those.
+        let store = LinuxLarge {
+            dir: dir.join("b").join("media"),
+            node: Arc::downgrade(&bob),
+        };
+        assert_eq!(store.size(kept.clone()), Some(data.len() as u64));
+        assert_eq!(
+            store.read_at(kept.clone(), 5_000_000, 70_000).unwrap(),
+            &data[5_000_000..5_070_000]
+        );
+        assert!(store.free_space().is_some_and(|f| f > 0));
+
+        // Sent on from where it is kept, sealed: read through the node.
+        bob.send_file_at(alice_fp.clone(), "again.bin".into(), kept, options())
+            .unwrap();
+        let NodeEvent::FileOffered { id, .. } =
+            wait_for(&alice, |e| matches!(e, NodeEvent::FileOffered { .. }))
+        else {
+            unreachable!()
+        };
+        alice.download_file(bob_fp.clone(), id).unwrap();
+        wait_for(
+            &alice,
+            |e| matches!(e, NodeEvent::TransferChanged { id: i, state: TransferState::Done, .. } if *i == id),
+        );
+        let back = alice.history(bob_fp, 1).unwrap()[0]
+            .file
+            .clone()
+            .unwrap()
+            .location
+            .unwrap();
+        assert_eq!(read_with(&alice, Path::new(&back)).unwrap(), data);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

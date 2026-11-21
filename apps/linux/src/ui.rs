@@ -260,11 +260,11 @@ pub fn show_code(
 }
 
 /// Opens a file in the app the desktop picks for it; `on_fail` runs if
-/// none can.
+/// none can, with what to say.
 pub fn open_externally(
     window: &impl IsA<gtk::Window>,
     path: &std::path::Path,
-    on_fail: impl FnOnce() + 'static,
+    on_fail: impl FnOnce(&str) + 'static,
 ) {
     // A sealed file goes as a decrypted copy in the scratch directory
     // (`core::plain_path`), deleted on lock and at exit.
@@ -273,16 +273,23 @@ pub fn open_externally(
     bg(
         move || crate::core::plain_path(&path),
         move |r| {
-            let Ok(plain) = r else {
-                on_fail();
-                return;
+            let plain = match r {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::StorageFull => {
+                    on_fail("Too large to open from here: save a copy instead");
+                    return;
+                }
+                Err(_) => {
+                    on_fail("No application can open this file");
+                    return;
+                }
             };
             gtk::FileLauncher::new(Some(&gtk::gio::File::for_path(plain))).launch(
                 Some(&window),
                 gtk::gio::Cancellable::NONE,
                 move |r| {
                     if r.is_err() {
-                        on_fail();
+                        on_fail("No application can open this file");
                     }
                 },
             );
