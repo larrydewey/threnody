@@ -110,7 +110,9 @@ Simpler, and private to you: **your own always-on relay node** (docs/relay-node.
 
 ## Metadata
 
-For now a photo or video whose metadata is removed is read whole to strip it, so one over 64 MiB is refused while metadata removal is on (the app says to turn it off to send it). A sender serving it strips it again, keeping the stripped copy in memory for two minutes between windows. `media::strip` and `as_sent` take the whole file in memory. Large videos need streaming stripping (the BMFF walker in `media/bmff.rs` rewriting box by box into a temporary file). Images over 8 MiB are rare once converted, but conversion still decodes at most 4096 px on the longer side (memory-bound bitmaps); that stays. A file that can't be stripped streaming is refused, as now, never sent with its metadata.
+A video (MP4, MOV, M4A, 3GP) is stripped as it is read. Its metadata never changes its size: the boxes holding the place, the device and XMP become `free` boxes of the same length, and the times and timed-metadata samples become zeros. So stripping is a list of edits (`media::video_edits`): bytes to write and ranges to zero, found by reading the top-level box headers and the movie box, never the media. The movie box may be at most 64 MiB (`media::MAX_HELD`); an hour of video needs a few MiB. The edits are applied to each range as it is read, both when the sender prepares the hash list and when it serves a piece, so a video of any length goes without its metadata and nothing but the movie box is ever in memory. The in-memory `media::strip` uses the same edits, so a small video comes out byte for byte as it always has. A sample table whose entries run past its own box is refused.
+
+A photo can change size when stripped, so it is still read whole: one over 64 MiB is refused while metadata removal is on (the app says to turn it off to send it). A sender serving it strips it again, keeping the stripped copy in memory for two minutes between windows. Photos over 8 MiB are rare once converted, and conversion still decodes at most 4096 px on the longer side (memory-bound bitmaps); that stays. A photo whose metadata can't be removed (HEIC, AVIF, TIFF and camera raw files built on it) is refused at any size while removal is on, never sent with its metadata.
 
 ## Limits that change
 
@@ -144,7 +146,7 @@ Each phase is its own PR (or a few), and each leaves the app shippable.
 - Core (`threnody-core`): new `transfer.rs` with `Offer`, `Want`, `Piece`, `Hashes`, `Missing`, `Have` codecs, piece encryption and the hash list and root. `FEATURE_LARGE_FILES` and the new kinds in `message.rs`. History file record gains `root`, `K` and transfer state (encrypted state, older readers skip). Test vectors in `docs/test-vectors`, a fuzz target `fuzz/fuzz_targets/transfer.rs`, cases in `robustness.rs`.
 - Net (`threnody-net`): `transfer.rs` engine generalised from `filesync.rs` (queue, windows, stall and resume, progress persisted in `file-transfers` state, partial files sealed on disk). Offers sent as tracked messages and through mailboxes. Serving from a location with range reads.
 - FFI: path-based `send_file_path(peer, location, size, options)`. `FileStore` gains range reads, a streaming writer (create, append, finish, abort) and `free_space()`. Events for offer, progress, done, failed. `download`, `cancel` and settings.
-- Streaming metadata stripping for video.
+- Streaming metadata stripping for video (done: see *Metadata*).
 - Android: SAF streaming (no `readBytes`), `StatFs` for free space, progress in the bubble, **Download (size)**, long transfers in a foreground service or WorkManager so they survive the background.
 - Linux: the same through GIO streams, at parity with Android.
 - iOS: the same (built and tested on the Mac).

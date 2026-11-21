@@ -18,7 +18,11 @@
 
 mod bmff;
 
+use std::io::{Read, Seek};
+
 use crate::{Error, Result};
+
+pub use bmff::{Edits, MAX_HELD};
 
 /// What [`strip`] did.
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +97,16 @@ pub fn strip(data: Vec<u8>) -> Result<Stripped> {
         Some(Kind::Bmff) => Stripped::Image(bmff::strip(data)?),
         None => Stripped::Unsupported(data),
     })
+}
+
+/// For a video too large to hold, the changes [`strip`] would make,
+/// found by reading only its boxes' headers and its movie box, never its
+/// media: applied to each range of the original as it is read, they give
+/// that range of the stripped video. Only for [`Kind::Bmff`]; stripping
+/// a video never changes its size. A movie box larger than [`MAX_HELD`]
+/// is an error.
+pub fn video_edits<R: Read + Seek>(r: &mut R, len: u64) -> Result<Edits> {
+    bmff::plan(r, len)
 }
 
 /// The bytes that were sent of a file now `raw` on disk, recorded as
@@ -964,6 +978,17 @@ mod tests {
         let mut deep_movie = bx(b"ftyp", b"isom");
         deep_movie.extend(bx(b"moov", &deep));
         assert!(strip(deep_movie).is_err());
+        // A table claiming more entries than its box holds, its last
+        // ones read from whatever follows: refused.
+        let mut over = bx(b"ftyp", b"isom");
+        let mut t = track(b"meta", &[4], &[0], false);
+        let at = t.windows(4).position(|w| w == b"stco").unwrap() + 8;
+        t[at..at + 4].copy_from_slice(&3u32.to_be_bytes());
+        let mut body = t;
+        body.extend(bx(b"free", &[0; 16]));
+        over.extend(bx(b"moov", &body));
+        over.extend(bx(b"mdat", &[0; 64]));
+        assert!(strip(over).is_err());
         // A 64-bit size past the end.
         let mut huge = bx(b"ftyp", b"isom");
         huge.extend(1u32.to_be_bytes());
@@ -1098,5 +1123,95 @@ mod tests {
         for no in ["doc.pdf", "jpg", "", "a.jpg.txt", "clip.mp4"] {
             assert!(!looks_like_image(no), "{no}");
         }
+    }
+
+    /// Reads like a file, counting what it reads.
+    struct Counting<'a> {
+        d: std::io::Cursor<&'a [u8]>,
+        read: usize,
+    }
+
+    impl std::io::Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.d.read(buf)?;
+            self.read += n;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for Counting<'_> {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.d.seek(to)
+        }
+    }
+
+    #[test]
+    fn large_videos_are_stripped_as_they_are_read() {
+        // A long video's media, after the movie box.
+        let ftyp = bx(b"ftyp", b"isom\0\0\0\0isom");
+        let picture = vec![0x77; 3 << 20];
+        let fixes = b"GPS +51.5074-000.1278";
+        let mut moov_len = 0;
+        let m = loop {
+            let start = (ftyp.len() + moov_len + 8) as u64;
+            let mut body = track(b"vide", &[picture.len() as u32], &[start], false);
+            body.extend(track(
+                b"meta",
+                &[fixes.len() as u32],
+                &[start + picture.len() as u64],
+                true,
+            ));
+            body.extend(bx(b"udta", &bx(b"\xa9xyz", b"+51.5074-000.1278/")));
+            let moov = bx(b"moov", &body);
+            if moov.len() != moov_len {
+                moov_len = moov.len();
+                continue;
+            }
+            let mut media = picture.clone();
+            media.extend(fixes);
+            let mut m = ftyp.clone();
+            m.extend(moov);
+            m.extend(bx(b"mdat", &media));
+            m.extend(bx(b"meta", b"\0\0\0\0more GPS"));
+            break m;
+        };
+        let Stripped::Image(whole) = strip(m.clone()).unwrap() else {
+            panic!()
+        };
+        assert!(!contains(&whole, b"GPS") && !contains(&whole, b"51.5074"));
+        let mut r = Counting {
+            d: std::io::Cursor::new(&m[..]),
+            read: 0,
+        };
+        let edits = video_edits(&mut r, m.len() as u64).unwrap();
+        // Headers and the movie box, never the media.
+        assert!(r.read < 4096, "read {}", r.read);
+        assert!(!edits.is_empty());
+        // Any range, edited, is that range of the stripped video.
+        for (at, n) in [
+            (0, m.len()),
+            (0, 1),
+            (37, 300),
+            (ftyp.len() + 10, 1 << 20),
+            (m.len() - 40, 40),
+            (m.len() - 60, 25),
+        ] {
+            let mut part = m[at..at + n].to_vec();
+            edits.apply(at as u64, &mut part);
+            assert_eq!(part, &whole[at..at + n], "{at}+{n}");
+        }
+        for (i, piece) in m.chunks(1000).enumerate() {
+            let at = i * 1000;
+            let mut p = piece.to_vec();
+            edits.apply(at as u64, &mut p);
+            assert_eq!(p, &whole[at..at + p.len()]);
+        }
+        // Stripped again, nothing changes.
+        let mut again = std::io::Cursor::new(&whole[..]);
+        let mut twice = whole.clone();
+        video_edits(&mut again, whole.len() as u64)
+            .unwrap()
+            .apply(0, &mut twice);
+        assert_eq!(twice, whole);
     }
 }

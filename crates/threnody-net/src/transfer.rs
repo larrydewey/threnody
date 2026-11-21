@@ -21,9 +21,12 @@
 //!   decrypted a piece at a time into the app's store, the partial file
 //!   and hash list are deleted, and the sender hears `Have`.
 //!
-//! Nothing here holds a whole file in memory, except a photo or video
-//! whose metadata must be removed: that is read whole (at most
-//! [`MAX_STRIP_IN_MEMORY`]) until stripping works as a stream.
+//! Nothing here holds a whole file in memory, except a photo whose
+//! metadata must be removed: that is read whole (at most
+//! [`MAX_STRIP_IN_MEMORY`]), since stripping can change its size. A
+//! video's metadata is removed as it is read: the boxes that hold it
+//! become [`media::Edits`], found from the video's headers and movie box
+//! and applied to every piece.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -71,8 +74,9 @@ pub const WINDOW: u64 = 8;
 pub const STALL: Duration = Duration::from_secs(60);
 /// How long a sender serves a file its peer hasn't finished.
 pub const SERVE_DAYS: u64 = 30;
-/// Largest photo or video whose metadata is removed before offering it,
-/// for now (it is read whole to strip).
+/// Largest photo whose metadata is removed before offering it (it is
+/// read whole to strip). Videos have no limit but their movie box's,
+/// [`media::MAX_HELD`].
 pub const MAX_STRIP_IN_MEMORY: u64 = 64 * 1024 * 1024;
 /// Space a download must leave free.
 pub const SPACE_MARGIN: u64 = 512 * 1024 * 1024;
@@ -215,8 +219,8 @@ pub(crate) struct Transfers {
     pub(crate) incoming: Vec<Incoming>,
     /// Hash lists recently read for serving.
     hash_cache: VecDeque<([u8; 32], HashList)>,
-    /// Stripped contents recently read for serving.
-    stripped: VecDeque<([u8; 32], Arc<Vec<u8>>, Instant)>,
+    /// How files recently served are stripped.
+    stripped: VecDeque<([u8; 32], Stripping, Instant)>,
     /// Wants being read for, so a requester gets one answer at a time.
     serving: HashSet<(PublicIdentity, [u8; 32])>,
 }
@@ -422,6 +426,18 @@ struct StoreReader<'a> {
     size: u64,
 }
 
+impl Seek for StoreReader<'_> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::End(d) => self.size.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = pos.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        Ok(self.pos)
+    }
+}
+
 impl Read for StoreReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pos >= self.size || buf.is_empty() {
@@ -439,6 +455,58 @@ impl Read for StoreReader<'_> {
         self.pos += data.len() as u64;
         Ok(data.len())
     }
+}
+
+/// How the photo or video at `location`, `size` bytes starting `head`,
+/// loses its metadata: a video by edits found from its boxes, whatever
+/// its length; a photo stripped whole, up to [`MAX_STRIP_IN_MEMORY`].
+/// Anything else goes as it is; a photo whose metadata can't be removed
+/// (HEIC, AVIF, TIFF) is refused.
+fn stripping(
+    store: &dyn LargeFileStore,
+    location: &str,
+    size: u64,
+    head: &[u8],
+) -> Result<Stripping> {
+    if media::kind(head) == Some(media::Kind::Bmff) {
+        let mut r = StoreReader {
+            store,
+            location,
+            pos: 0,
+            size,
+        };
+        let edits = media::video_edits(&mut r, size).map_err(|e| match e {
+            threnody_core::Error::Io(_) => NetError::NotFound("file unreadable".into()),
+            e => NetError::NotAllowed(format!(
+                "this video's location and camera details can't be removed ({e}): \
+                 turn metadata removal off to send it"
+            )),
+        })?;
+        return Ok(Stripping::Edits(Arc::new(edits)));
+    }
+    if size > MAX_STRIP_IN_MEMORY {
+        return Err(NetError::NotAllowed(
+            "this photo is too large to remove its location and camera details: \
+             turn metadata removal off to send it"
+                .into(),
+        ));
+    }
+    let raw = read_whole(store, location, size)?;
+    match media::strip(raw)? {
+        Stripped::Image(d) => Ok(Stripping::Whole(Arc::new(d))),
+        Stripped::Unsupported(d) if !media::needs_converting(&d) => {
+            Ok(Stripping::Whole(Arc::new(d)))
+        }
+        Stripped::Unsupported(_) => Err(cant_strip()),
+    }
+}
+
+fn cant_strip() -> NetError {
+    NetError::NotAllowed(
+        "this photo's location and camera details can't be removed: \
+         send it as a JPEG, or turn metadata removal off"
+            .into(),
+    )
 }
 
 /// The whole file at `location`, `size` bytes.
@@ -513,12 +581,28 @@ fn wants_auto(offer: &Offer, contact: bool, mobile: bool) -> bool {
         && offer.size <= limit
 }
 
-/// How the file being sent is read.
-enum Source {
-    /// Through the store, as it is.
-    Raw,
-    /// Its metadata removed, in memory.
-    Stripped(Arc<Vec<u8>>),
+/// How a file sent without its metadata is read.
+#[derive(Clone)]
+enum Stripping {
+    /// A photo, stripped in memory.
+    Whole(Arc<Vec<u8>>),
+    /// A video, through the store, edited as it is read.
+    Edits(Arc<media::Edits>),
+}
+
+/// A [`StoreReader`] that strips a video as it reads.
+struct EditedReader<'a> {
+    inner: StoreReader<'a>,
+    edits: &'a media::Edits,
+}
+
+impl Read for EditedReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let at = self.inner.pos;
+        let n = self.inner.read(buf)?;
+        self.edits.apply(at, &mut buf[..n]);
+        Ok(n)
+    }
 }
 
 /// Options for [`Node::send_file_at`], as for an inline file.
@@ -610,27 +694,34 @@ impl Node {
         if size > tx::MAX_OFFERED {
             return Err(NetError::NotAllowed("file too large".into()));
         }
+        if self.strip_metadata() && media::needs_converting(&head) {
+            return Err(cant_strip());
+        }
         let key = FileKey::generate();
-        let (source, size, (hashes, root)) = if strip {
-            if size > MAX_STRIP_IN_MEMORY {
-                return Err(NetError::NotAllowed(
-                    "this photo or video is too large to remove its location and camera \
-                     details: turn metadata removal off to send it"
-                        .into(),
-                ));
+        let reader = StoreReader {
+            store: &*store,
+            location: &location,
+            pos: 0,
+            size,
+        };
+        let (stripping, size, (hashes, root)) = if strip {
+            match stripping(&*store, &location, size, &head)? {
+                Stripping::Whole(data) => {
+                    let n = data.len() as u64;
+                    let prepared = tx::prepare(&key, n, &data[..])?;
+                    (Some(Stripping::Whole(data)), n, prepared)
+                }
+                Stripping::Edits(edits) => {
+                    let edited = EditedReader {
+                        inner: reader,
+                        edits: &edits,
+                    };
+                    let prepared = tx::prepare(&key, size, edited)?;
+                    (Some(Stripping::Edits(edits)), size, prepared)
+                }
             }
-            let data = self.stripped_copy(&*store, &location, size)?;
-            let n = data.len() as u64;
-            let prepared = tx::prepare(&key, n, &data[..])?;
-            (Source::Stripped(Arc::new(data)), n, prepared)
         } else {
-            let reader = StoreReader {
-                store: &*store,
-                location: &location,
-                pos: 0,
-                size,
-            };
-            (Source::Raw, size, tx::prepare(&key, size, reader)?)
+            (None, size, tx::prepare(&key, size, reader)?)
         };
         let name = self.prepare_name(name, &head);
         self.accept_contact(peer);
@@ -656,8 +747,8 @@ impl Node {
             .save_state(&hashes_state(&root), Ok(encode_hashes(&hashes)));
         {
             let mut t = lock(&self.shared.transfers);
-            if let Source::Stripped(d) = source {
-                keep_stripped(&mut t, root, d);
+            if let Some(s) = stripping {
+                keep_stripped(&mut t, root, s);
             }
             t.outgoing.push(Outgoing {
                 root,
@@ -705,26 +796,6 @@ impl Node {
             0,
         );
         Ok(())
-    }
-
-    /// The file at `location` with its metadata removed, as it is sent.
-    /// One whose metadata can't be removed (HEIC, AVIF, TIFF) is refused.
-    fn stripped_copy(
-        &self,
-        store: &dyn LargeFileStore,
-        location: &str,
-        size: u64,
-    ) -> Result<Vec<u8>> {
-        let raw = read_whole(store, location, size)?;
-        match media::strip(raw)? {
-            Stripped::Image(d) => Ok(d),
-            Stripped::Unsupported(d) if !media::needs_converting(&d) => Ok(d),
-            Stripped::Unsupported(_) => Err(NetError::NotAllowed(
-                "this photo's location and camera details can't be removed: \
-                 send it as a JPEG, or turn metadata removal off"
-                    .into(),
-            )),
-        }
     }
 
     fn save_outgoing(&self, t: &Transfers) {
@@ -1097,7 +1168,7 @@ impl Node {
         }
         let key = FileKey::from_bytes(o.key);
         let stripped = if o.strip {
-            Some(self.stripped_for(store, o)?)
+            Some(self.stripping_for(store, o)?)
         } else {
             None
         };
@@ -1106,9 +1177,13 @@ impl Node {
             let len = tx::piece_len(o.size, i)?;
             let start = i * PIECE as u64;
             let plain = match &stripped {
-                Some(d) => d
+                Some(Stripping::Whole(d)) => d
                     .get(start as usize..start as usize + len)
                     .map(<[u8]>::to_vec),
+                Some(Stripping::Edits(e)) => store.read_at(&o.location, start, len).map(|mut p| {
+                    e.apply(start, &mut p);
+                    p
+                }),
                 None => store.read_at(&o.location, start, len),
             };
             let piece = plain
@@ -1162,25 +1237,29 @@ impl Node {
         Some(h)
     }
 
-    /// The stripped contents of `o`, from memory or read again.
-    fn stripped_for(&self, store: &dyn LargeFileStore, o: &Outgoing) -> Option<Arc<Vec<u8>>> {
+    /// How `o` is stripped, remembered or worked out again. The pieces
+    /// served are checked against the hash list, so a file changed since
+    /// is never served as the one offered.
+    fn stripping_for(&self, store: &dyn LargeFileStore, o: &Outgoing) -> Option<Stripping> {
         {
             let mut t = lock(&self.shared.transfers);
             t.stripped.retain(|(_, _, at)| at.elapsed() < SERVE_TTL);
-            if let Some((_, d, _)) = t.stripped.iter().find(|(r, ..)| *r == o.root) {
-                return Some(d.clone());
+            if let Some((_, s, _)) = t.stripped.iter().find(|(r, ..)| *r == o.root) {
+                return Some(s.clone());
             }
         }
         let size = store.size(&o.location)?;
-        if size > MAX_STRIP_IN_MEMORY {
+        let head = store.read_at(&o.location, 0, 64)?;
+        let s = stripping(store, &o.location, size, &head).ok()?;
+        let n = match &s {
+            Stripping::Whole(d) => d.len() as u64,
+            Stripping::Edits(_) => size,
+        };
+        if n != o.size {
             return None;
         }
-        let d = Arc::new(self.stripped_copy(store, &o.location, size).ok()?);
-        if d.len() as u64 != o.size {
-            return None;
-        }
-        keep_stripped(&mut lock(&self.shared.transfers), o.root, d.clone());
-        Some(d)
+        keep_stripped(&mut lock(&self.shared.transfers), o.root, s.clone());
+        Some(s)
     }
 
     /// `from` has the whole file: a 1:1 offer is done with.
@@ -1537,7 +1616,7 @@ impl Node {
     }
 }
 
-fn keep_stripped(t: &mut Transfers, root: [u8; 32], d: Arc<Vec<u8>>) {
+fn keep_stripped(t: &mut Transfers, root: [u8; 32], d: Stripping) {
     t.stripped.retain(|(r, ..)| *r != root);
     while t.stripped.len() >= SERVE_CACHE {
         t.stripped.pop_front();

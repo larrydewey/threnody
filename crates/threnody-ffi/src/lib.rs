@@ -5894,5 +5894,73 @@ mod tests {
             &bob,
             |e| matches!(e, NodeEvent::TransferChanged { id: i, state: TransferState::Unavailable, .. } if *i == id),
         );
+
+        // A video longer than memory would hold loses where it was taken
+        // as it is read, piece by piece.
+        let bx = |ty: &[u8], body: &[u8]| {
+            let mut b = u32::try_from(8 + body.len())
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            b.extend_from_slice(ty);
+            b.extend_from_slice(body);
+            b
+        };
+        let mut video = bx(b"ftyp", b"isom\0\0\0\0isom");
+        let mut mvhd = vec![0; 4];
+        mvhd.extend([0xC1; 8]);
+        mvhd.extend([0x55; 88]);
+        let mut moov = bx(b"mvhd", &mvhd);
+        moov.extend(bx(b"udta", &bx(b"\xa9xyz", b"+51.5074-000.1278/")));
+        video.extend(bx(b"moov", &moov));
+        video.extend(bx(b"mdat", &data[..2 * tx::PIECE + 77]));
+        video.extend(bx(b"meta", b"\0\0\0\0Pixel 9 at +51.5074"));
+        let threnody_core::media::Stripped::Image(stripped) =
+            threnody_core::media::strip(video.clone()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_ne!(stripped, video);
+        let clip = dir.path().join("VID_20261120_101500.mp4");
+        std::fs::write(&clip, &video).unwrap();
+        alice
+            .send_file_at(
+                bob_fp.clone(),
+                "VID_20261120_101500.mp4".into(),
+                clip.display().to_string(),
+                file_options(),
+            )
+            .unwrap();
+        let e = wait(&bob, |e| matches!(e, NodeEvent::FileOffered { .. }));
+        let NodeEvent::FileOffered { id, name, size, .. } = e else {
+            unreachable!()
+        };
+        assert_eq!((name.as_str(), size), ("video.mp4", video.len() as u64));
+        bob.download_file(alice_fp.clone(), id).unwrap();
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::TransferChanged { id: i, state: TransferState::Done, .. } if *i == id),
+        );
+        let entry = bob.history(alice_fp.clone(), 1).unwrap().pop().unwrap();
+        let got = bob
+            .open_media(entry.file.unwrap().location.unwrap())
+            .unwrap();
+        assert_eq!(got, stripped);
+
+        // A photo whose metadata can't be removed isn't offered as it is.
+        let heic = dir.path().join("IMG_1.HEIC");
+        let mut h = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic".to_vec();
+        h.extend(&data[..2 * tx::PIECE]);
+        std::fs::write(&heic, &h).unwrap();
+        assert!(
+            alice
+                .send_file_at(
+                    bob_fp.clone(),
+                    "IMG_1.HEIC".into(),
+                    heic.display().to_string(),
+                    file_options(),
+                )
+                .is_err()
+        );
     }
 }
