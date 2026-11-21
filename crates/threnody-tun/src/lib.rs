@@ -36,7 +36,12 @@ mod unix {
             if !ok {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self(AsyncFd::new(fd)?))
+            // SAFETY: `fd` is an `OwnedFd`, valid and open; the `AsyncFd`
+            // owns it from here, so it stays open and the same descriptor
+            // until the `AsyncFd` is dropped, and `as_raw_fd` always returns
+            // it.
+            let fd = unsafe { AsyncFd::register(fd) }?;
+            Ok(Self(fd))
         }
 
         /// Reads one packet into `buf`; returns its length.

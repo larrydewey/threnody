@@ -8,7 +8,7 @@ val calls = (findProperty("threnody.calls") as String?)?.toBooleanStrict() ?: tr
 
 android {
     namespace = "org.threnody.app"
-    compileSdk = 36
+    compileSdk = 37
     defaultConfig {
         applicationId = "org.threnody.app"
         minSdk = 29
@@ -85,10 +85,10 @@ dependencies {
     // UniFFI's Kotlin bindings call into libthrenody_ffi.so through JNA.
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     // Material 3 Components for dynamic color support
-    implementation("com.google.android.material:material:1.12.0")
+    implementation("com.google.android.material:material:1.14.0")
     // AndroidX Core for AppCompatDelegate
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.8.0")
+    implementation("androidx.core:core-ktx:1.19.1")
     // UnifiedPush wake-ups (Appendix R), off unless the user turns them on.
     implementation("org.unifiedpush.android:connector:3.3.5")
     // WebRTC's Java half for calls (audio devices), from LiveKit's prebuilt
