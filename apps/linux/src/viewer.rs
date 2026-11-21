@@ -675,8 +675,8 @@ pub fn show(app: &Rc<App>, persona: Option<String>, photo: Photo, send_edited: O
     open.connect_activate(move |_, _| {
         if let Some(app) = weak.upgrade() {
             let t = t.clone();
-            ui::open_externally(&app.window, &p, move || {
-                t.add_toast(adw::Toast::new("No application can open this file"));
+            ui::open_externally(&app.window, &p, move |why| {
+                t.add_toast(adw::Toast::new(why));
             });
         }
     });

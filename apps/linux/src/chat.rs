@@ -8,7 +8,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use threnody_ffi::{
     Clip, FileFetch, FileOptions, GroupBanner, GroupInfo, GroupMemberAction, GroupMemberRow,
-    HistoryEntry, MemberRole, TickMark,
+    HistoryEntry, MemberRole, TickMark, TransferState,
 };
 
 use crate::core::{self, ChatRef, Conversation, Core, Node, Target};
@@ -42,6 +42,8 @@ pub type Key = (u64, String);
 /// A file on screen coming from another of our devices: the entry (time
 /// and sender), its state label, and its size.
 type Fetching = ((u64, String), gtk::Label, u64);
+/// An offered file shown: its message id, state line, button and size.
+type Offered = (u64, gtk::Label, gtk::Button, u64);
 
 pub struct ChatView {
     app: Weak<App>,
@@ -94,6 +96,7 @@ pub struct ChatView {
     /// Files on screen coming from our other devices, by time and sender:
     /// their state labels and sizes, kept current once a second.
     fetching: RefCell<Vec<Fetching>>,
+    offered: RefCell<Vec<Offered>>,
     fetch_poll: RefCell<Option<glib::SourceId>>,
     /// Voice and video messages by file, kept across redraws so one
     /// playing goes on playing when a message arrives.
@@ -446,6 +449,7 @@ impl ChatView {
             shown: RefCell::new(Vec::new()),
             thumbs: Thumbs::default(),
             fetching: RefCell::new(Vec::new()),
+            offered: RefCell::new(Vec::new()),
             fetch_poll: RefCell::new(None),
             players: RefCell::new(HashMap::new()),
             typing_row,
@@ -1596,6 +1600,7 @@ impl ChatView {
         }
         self.bubbles.borrow_mut().clear();
         self.fetching.borrow_mut().clear();
+        self.offered.borrow_mut().clear();
         let node = self.node();
         let group = self.group().is_some();
         let mut last_day = String::new();
@@ -1842,6 +1847,12 @@ impl ChatView {
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         let key = (e.at_ms, e.device.clone());
+        if path.is_none()
+            && f.location.is_none()
+            && let Some(s) = self.offer_state(e)
+        {
+            return self.offer_view(e, f, s);
+        }
         if path.is_none() && f.location.is_none() && f.fetch != FileFetch::NotHere {
             return self.fetch_view(e, f);
         }
@@ -1983,6 +1994,12 @@ impl ChatView {
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
         let Some(p) = path else {
+            // An album's photo offered, too large for one message.
+            if f.location.is_none()
+                && let Some(s) = self.offer_state(e)
+            {
+                return self.offer_view(e, f, s);
+            }
             // An album's photo another of our devices may have.
             if f.location.is_none() && f.fetch != FileFetch::NotHere {
                 return self.fetch_view(e, f);
@@ -2106,6 +2123,117 @@ impl ChatView {
             self.poll_fetches();
         }
         row.upcast()
+    }
+
+    /// Where the download of `e`'s file is, if the contact offered it (too
+    /// large for one message) and it isn't here yet.
+    fn offer_state(&self, e: &HistoryEntry) -> Option<TransferState> {
+        let Dest::Contact(d) = self.dest() else {
+            return None;
+        };
+        if e.outgoing {
+            return None;
+        }
+        self.node()?.transfer_state(d, e.id)
+    }
+
+    /// A file the contact offered: what it is, how its download is going,
+    /// and a button to start, stop or retry it.
+    fn offer_view(
+        &self,
+        e: &HistoryEntry,
+        f: &threnody_ffi::FileInfo,
+        s: TransferState,
+    ) -> gtk::Widget {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.add_css_class("file-row");
+        let icon = gtk::Image::from_icon_name(match f.clip {
+            Some(c) if c.video => "camera-web-symbolic",
+            Some(_) => "audio-input-microphone-symbolic",
+            None if core::is_image(&f.name) => "image-x-generic-symbolic",
+            None => "folder-download-symbolic",
+        });
+        icon.set_pixel_size(32);
+        row.append(&icon);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let label = match f.clip {
+            Some(c) => core::file_label(&f.name, f.sensitive, "", Some(c)),
+            None => f.name.clone(),
+        };
+        let name = gtk::Label::builder()
+            .label(&label)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .max_width_chars(36)
+            .build();
+        name.add_css_class("heading");
+        text.append(&name);
+        let state = ui::label(&offer_text(f.size, s), &["caption", "dim-label"]);
+        text.append(&state);
+        row.append(&text);
+        let button = gtk::Button::with_label(offer_action(s));
+        button.add_css_class("pill");
+        button.set_valign(gtk::Align::Center);
+        button.set_visible(s != TransferState::Done);
+        let (weak, id) = (self.weak_self.clone(), e.id);
+        button.connect_clicked(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.offer_clicked(id);
+            }
+        });
+        row.append(&button);
+        self.offered
+            .borrow_mut()
+            .push((e.id, state, button, f.size));
+        row.upcast()
+    }
+
+    /// Downloads the file offered as message `id`, or stops its download
+    /// (deleting what came), as it now stands.
+    fn offer_clicked(self: &Rc<Self>, id: u64) {
+        let (Some(node), Dest::Contact(d)) = (self.node(), self.dest()) else {
+            return;
+        };
+        let weak = self.weak_self.clone();
+        bg(
+            move || {
+                let r = match node.transfer_state(d.clone(), id) {
+                    Some(TransferState::Waiting | TransferState::Fetching { .. }) => {
+                        node.cancel_download(d.clone(), id)
+                    }
+                    None | Some(TransferState::Done) => Ok(()),
+                    Some(_) => node.download_file(d.clone(), id).map(|_| ()),
+                };
+                (r.map_err(|e| e.to_string()), node.transfer_state(d, id))
+            },
+            move |(r, now)| {
+                let Some(t) = weak.upgrade() else { return };
+                if let Err(e) = r {
+                    t.toast(&format!("Couldn't download it: {e}"));
+                }
+                match now {
+                    Some(s) => t.offer_changed(id, s),
+                    None => t.reload(),
+                }
+            },
+        );
+    }
+
+    /// The download of the file offered as message `id` moved on: its
+    /// row says so; once it is here, the chat shows the file.
+    pub fn offer_changed(self: &Rc<Self>, id: u64, s: TransferState) {
+        if s == TransferState::Done {
+            if self.offered.borrow().iter().any(|o| o.0 == id) {
+                self.reload();
+            }
+            return;
+        }
+        for (i, label, button, size) in self.offered.borrow().iter() {
+            if *i == id {
+                label.set_text(&offer_text(*size, s));
+                button.set_label(offer_action(s));
+            }
+        }
     }
 
     /// Asks our other devices for the file `device` sent at `at`.
@@ -2369,9 +2497,9 @@ impl ChatView {
             return;
         };
         let weak = self.app.clone();
-        ui::open_externally(&app.window, path, move || {
+        ui::open_externally(&app.window, path, move |why| {
             if let Some(a) = weak.upgrade() {
-                a.toast("No application can open this file");
+                a.toast(why);
             }
         });
     }
@@ -3859,6 +3987,37 @@ impl ChatView {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
+                    // Too large for one message, to a contact: offered from
+                    // where it is, never read whole. A photo to convert is
+                    // read and converted as ever.
+                    let big =
+                        threnody_ffi::media_size(p.display().to_string()).is_ok_and(|n| n > max);
+                    if big
+                        && let Dest::Contact(d) = &dest
+                        && !core.is_edit_draft(persona.as_deref(), p)
+                        && !(strip && needs_converting(p, &name))
+                    {
+                        let options = FileOptions {
+                            sensitive,
+                            caption: if i == 0 {
+                                caption.clone()
+                            } else {
+                                String::new()
+                            },
+                            album,
+                            clip: None,
+                            forwarded: false,
+                        };
+                        if let Err(e) = node.send_file_at(
+                            d.clone(),
+                            name.clone(),
+                            p.display().to_string(),
+                            options,
+                        ) {
+                            failed.push(format!("{name}: {e}"));
+                        }
+                        continue;
+                    }
                     let mut converted = false;
                     let data = match core::read_media(p) {
                         Ok(d) if !strip => d,
@@ -5245,6 +5404,41 @@ fn fetch_text(size: u64, s: FileFetch) -> String {
         FileFetch::Unavailable => "not on your other devices".into(),
     };
     format!("{} · {state}", ui::human_size(size))
+}
+
+/// Whether the picked file at `path` is a photo the node can't strip
+/// (HEIC, AVIF, raw), by its first bytes: converted before it is sent.
+fn needs_converting(path: &std::path::Path, name: &str) -> bool {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(32);
+    let read = std::fs::File::open(path).and_then(|f| f.take(32).read_to_end(&mut head));
+    read.is_ok() && threnody_ffi::image_needs_conversion(name.to_owned(), head)
+}
+
+/// How an offered file's download stands, after its size.
+fn offer_text(size: u64, s: TransferState) -> String {
+    let state = match s {
+        TransferState::Idle => "not downloaded".into(),
+        TransferState::Waiting => "waiting for the sender…".into(),
+        TransferState::Fetching { received, total } => format!(
+            "downloading… {}%",
+            (received * 100).checked_div(total).unwrap_or(100)
+        ),
+        TransferState::NoSpace => "not enough space".into(),
+        TransferState::Unavailable => "no longer available from the sender".into(),
+        TransferState::Failed => "didn't arrive intact".into(),
+        TransferState::Done => "downloaded".into(),
+    };
+    format!("{} · {state}", ui::human_size(size))
+}
+
+/// What an offered file's button does now.
+fn offer_action(s: TransferState) -> &'static str {
+    match s {
+        TransferState::Idle => "Download",
+        TransferState::Waiting | TransferState::Fetching { .. } => "Cancel",
+        _ => "Try again",
+    }
 }
 
 /// Where a chat's messages go.

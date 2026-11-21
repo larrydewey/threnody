@@ -1321,6 +1321,14 @@ impl App {
                 caption,
                 clip,
                 ..
+            }
+            | NodeEvent::FileOffered {
+                peer,
+                name,
+                sensitive,
+                caption,
+                clip,
+                ..
             } => (
                 Some(peer.clone()),
                 Some((
@@ -1328,6 +1336,16 @@ impl App {
                     core::file_label(name, *sensitive, caption, *clip),
                 )),
             ),
+            // A download's progress: its row, not a reload.
+            NodeEvent::TransferChanged { peer, id, state } => {
+                if let Some(chat) = self.chat.borrow().as_ref() {
+                    let conv = self.conversation_of(persona.as_deref(), peer);
+                    if conv.as_ref().is_some_and(|c| c.chat == chat.chat()) {
+                        chat.offer_changed(*id, *state);
+                    }
+                }
+                (None, None)
+            }
             NodeEvent::GroupMessage {
                 group,
                 from,
@@ -1745,6 +1763,7 @@ impl App {
                     event,
                     NodeEvent::Message { quiet: true, .. }
                         | NodeEvent::File { quiet: true, .. }
+                        | NodeEvent::FileOffered { quiet: true, .. }
                         | NodeEvent::GroupMessage { quiet: true, .. }
                         | NodeEvent::GroupFile { quiet: true, .. }
                         | NodeEvent::GroupInvited { quiet: true, .. }
@@ -2019,9 +2038,9 @@ impl App {
             return true;
         };
         let newest = match event {
-            NodeEvent::Message { peer, .. } | NodeEvent::File { peer, .. } => {
-                node.history(peer.clone(), 1)
-            }
+            NodeEvent::Message { peer, .. }
+            | NodeEvent::File { peer, .. }
+            | NodeEvent::FileOffered { peer, .. } => node.history(peer.clone(), 1),
             NodeEvent::GroupMessage { group, .. } | NodeEvent::GroupFile { group, .. } => {
                 node.group_history(group.clone(), 1)
             }
