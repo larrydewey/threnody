@@ -16,6 +16,13 @@
 //! they lie in `mdat`, found through that track's sample tables. A
 //! fragmented file (`moof`) with such a track is refused, since its
 //! samples are described elsewhere.
+//!
+//! Since nothing moves, what changes is a list of [`Edits`]: found by
+//! reading the top-level boxes' headers and the few boxes that hold
+//! metadata or describe the samples, never the media itself, so a video
+//! of any length is stripped as it is read.
+
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::{Error, Result};
 
@@ -25,6 +32,11 @@ const BAD: Error = Error::Malformed("video");
 /// levels in (`moov` > `trak` > `mdia` > `mdhd`); a bound keeps a file of
 /// nested boxes from exhausting the stack.
 const MAX_DEPTH: usize = 4;
+
+/// The largest top-level box read whole to find what to change: the
+/// movie box, which holds every track's sample tables (a few megabytes
+/// for an hour of video). The media itself is never read.
+pub const MAX_HELD: u64 = 64 * 1024 * 1024;
 
 /// Track handlers whose samples are kept: picture and sound.
 const KEPT_HANDLERS: [&[u8; 4]; 2] = [b"vide", b"soun"];
@@ -44,17 +56,155 @@ pub(super) fn is_bmff(d: &[u8]) -> bool {
             .any(|t| &d[4..8] == *t)
 }
 
+/// What stripping a video changes, by where in the file: bytes replaced,
+/// then ranges zeroed. Applied to any range of the original as it is
+/// read, it gives that range of the stripped video, which is the same
+/// length.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Edits {
+    /// Bytes written at an offset, in order, none overlapping.
+    patches: Vec<(u64, Vec<u8>)>,
+    /// `start..end` ranges zeroed, in order, none overlapping or
+    /// touching.
+    zeros: Vec<(u64, u64)>,
+}
+
+impl Edits {
+    /// Turns `buf`, the bytes of the original from `offset`, into those
+    /// of the stripped video.
+    pub fn apply(&self, offset: u64, buf: &mut [u8]) {
+        let end = offset.saturating_add(buf.len() as u64);
+        let first = self
+            .patches
+            .partition_point(|(at, b)| at + b.len() as u64 <= offset);
+        for (at, bytes) in &self.patches[first..] {
+            if *at >= end {
+                break;
+            }
+            let (from, to) = ((*at).max(offset), (at + bytes.len() as u64).min(end));
+            buf[(from - offset) as usize..(to - offset) as usize]
+                .copy_from_slice(&bytes[(from - at) as usize..(to - at) as usize]);
+        }
+        let first = self.zeros.partition_point(|&(_, e)| e <= offset);
+        for &(start, stop) in &self.zeros[first..] {
+            if start >= end {
+                break;
+            }
+            let (from, to) = (start.max(offset), stop.min(end));
+            buf[(from - offset) as usize..(to - offset) as usize].fill(0);
+        }
+    }
+
+    /// Whether nothing changes.
+    pub fn is_empty(&self) -> bool {
+        self.patches.is_empty() && self.zeros.is_empty()
+    }
+}
+
 /// `d` without its metadata, the same length. A file without a movie
 /// box or with boxes that don't fit is an error.
 pub(super) fn strip(mut d: Vec<u8>) -> Result<Vec<u8>> {
+    let edits = plan(&mut std::io::Cursor::new(&d[..]), d.len() as u64)?;
+    edits.apply(0, &mut d);
+    Ok(d)
+}
+
+/// What stripping the video `r`, `len` bytes long, changes. Reads the
+/// top-level boxes' headers, and whole only the movie box and any other
+/// box with headers in it; never the media. A box to read that is larger
+/// than [`MAX_HELD`] is an error.
+pub(super) fn plan<R: Read + Seek>(r: &mut R, len: u64) -> Result<Edits> {
+    let mut top = Vec::new();
+    let mut at = 0;
+    while at < len {
+        let mut head = [0u8; 16];
+        let n = usize::try_from((len - at).min(16)).map_err(|_| BAD)?;
+        read_at(r, at, &mut head[..n])?;
+        let (ty, size_len, size) = header(&head[..n], len - at)?;
+        let b = Top {
+            ty,
+            at,
+            body: at + size_len,
+            end: at + size,
+        };
+        at = b.end;
+        top.push(b);
+    }
+    let fragmented = top.iter().any(|b| &b.ty == b"moof");
+    let mut edits = Edits::default();
+    let mut zeros = Vec::new();
     let mut movie = false;
-    let len = d.len();
-    walk(&mut d, 0, len, 0, &mut movie)?;
+    for b in &top {
+        match &b.ty {
+            b"udta" | b"meta" => blank_top(&mut edits, &mut zeros, b),
+            b"uuid" => {
+                // As in a held box, the 16 bytes after the header,
+                // wherever the box ends.
+                let mut id = [0u8; 16];
+                if b.body + 16 <= len {
+                    read_at(r, b.body, &mut id)?;
+                    if id == XMP_UUID {
+                        blank_top(&mut edits, &mut zeros, b);
+                    }
+                }
+            }
+            b"moov" | b"trak" | b"mdia" | b"mvhd" | b"tkhd" | b"mdhd" => {
+                let size = b.end - b.at;
+                if size > MAX_HELD {
+                    return Err(Error::Malformed("video: movie box too large"));
+                }
+                let mut d = vec![0; usize::try_from(size).map_err(|_| BAD)?];
+                read_at(r, b.at, &mut d)?;
+                let before = d.clone();
+                let whole = d.len();
+                walk(&mut d, 0, whole, 0, &mut movie)?;
+                if &b.ty == b"moov" {
+                    zeros.extend(timed_metadata(&d, fragmented, len)?);
+                }
+                if d != before {
+                    edits.patches.push((b.at, d));
+                }
+            }
+            _ => {}
+        }
+    }
     if !movie {
         return Err(BAD);
     }
-    clear_timed_metadata(&mut d)?;
-    Ok(d)
+    zeros.retain(|&(_, n)| n > 0);
+    zeros.sort_unstable();
+    for (start, n) in zeros {
+        let end = start + n;
+        match edits.zeros.last_mut() {
+            Some((_, last)) if start <= *last => *last = (*last).max(end),
+            _ => edits.zeros.push((start, end)),
+        }
+    }
+    edits.patches.sort_unstable_by_key(|(at, _)| *at);
+    Ok(edits)
+}
+
+/// A top-level box, where in the file.
+struct Top {
+    ty: [u8; 4],
+    at: u64,
+    body: u64,
+    end: u64,
+}
+
+/// A top-level box made `free` and emptied, as [`blank`] does.
+fn blank_top(edits: &mut Edits, zeros: &mut Vec<(u64, u64)>, b: &Top) {
+    edits.patches.push((b.at + 4, b"free".to_vec()));
+    zeros.push((b.body, b.end - b.body));
+}
+
+/// Fills `buf` from `at` in `r`; a file shorter than that is damaged.
+fn read_at<R: Read + Seek>(r: &mut R, at: u64, buf: &mut [u8]) -> Result<()> {
+    r.seek(SeekFrom::Start(at))?;
+    r.read_exact(buf).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => BAD,
+        _ => Error::Io(e),
+    })
 }
 
 /// The boxes directly in `from..to`.
@@ -76,12 +226,11 @@ fn child(d: &[u8], b: &BoxAt, ty: &[u8; 4]) -> Result<Option<BoxAt>> {
         .find(|c| &c.ty == ty))
 }
 
-/// Zeroes the samples of every track that isn't video or audio.
-fn clear_timed_metadata(d: &mut [u8]) -> Result<()> {
-    let top = children(d, 0, d.len())?;
-    let fragmented = top.iter().any(|b| &b.ty == b"moof");
+/// Where the samples of every track in the movie box `d` that isn't
+/// video or audio lie in the file, `len` bytes long: `(offset, length)`.
+fn timed_metadata(d: &[u8], fragmented: bool, len: u64) -> Result<Vec<(u64, u64)>> {
     let mut clear = Vec::new();
-    for moov in top.iter().filter(|b| &b.ty == b"moov") {
+    for moov in children(d, 0, d.len())?.iter().filter(|b| &b.ty == b"moov") {
         for trak in children(d, moov.body, moov.end)?
             .iter()
             .filter(|b| &b.ty == b"trak")
@@ -106,28 +255,27 @@ fn clear_timed_metadata(d: &mut [u8]) -> Result<()> {
                 .flatten();
             // No sample table: no samples.
             if let Some(stbl) = stbl {
-                clear.extend(samples(d, &stbl)?);
+                clear.extend(samples(d, &stbl, len)?);
             }
         }
     }
-    for (at, len) in clear {
-        d.get_mut(at..at + len).ok_or(BAD)?.fill(0);
-    }
-    Ok(())
+    Ok(clear)
 }
 
-/// Where each sample of the track whose sample table is `stbl` lies:
-/// `(offset, length)`, every one inside the file.
-fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
-    let u32_at = |o: usize| -> Result<u32> {
-        Ok(u32::from_be_bytes(
-            d.get(o..o + 4).ok_or(BAD)?.try_into().map_err(|_| BAD)?,
-        ))
-    };
-    let mut sizes: Option<Vec<usize>> = None;
-    let mut chunks: Option<Vec<usize>> = None;
+/// Where each sample of the track whose sample table is `stbl` lies in
+/// the file, `len` bytes long: `(offset, length)`, every one inside it.
+fn samples(whole: &[u8], stbl: &BoxAt, len: u64) -> Result<Vec<(u64, u64)>> {
+    let mut sizes: Option<Vec<u64>> = None;
+    let mut chunks: Option<Vec<u64>> = None;
     let mut runs: Option<Vec<(u32, u32)>> = None;
-    for b in children(d, stbl.body, stbl.end)? {
+    for b in children(whole, stbl.body, stbl.end)? {
+        // A table's entries end where its box does.
+        let d = &whole[..b.end];
+        let u32_at = |o: usize| -> Result<u32> {
+            Ok(u32::from_be_bytes(
+                d.get(o..o + 4).ok_or(BAD)?.try_into().map_err(|_| BAD)?,
+            ))
+        };
         // Every table starts with version and flags, then a count.
         let count = |b: &BoxAt| -> Result<usize> {
             let n = usize::try_from(u32_at(b.body + 4)?).map_err(|_| BAD)?;
@@ -139,12 +287,12 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
         };
         match &b.ty {
             b"stsz" => {
-                let fixed = u32_at(b.body + 4)? as usize;
+                let fixed = u64::from(u32_at(b.body + 4)?);
                 let n = usize::try_from(u32_at(b.body + 8)?).map_err(|_| BAD)?;
-                sizes = Some(if fixed != 0 {
+                sizes = Some(if let Some(most) = len.checked_div(fixed) {
                     // One size for all: bounded by the file, as each
                     // sample must fit in it.
-                    if n > d.len() / fixed.max(1) {
+                    if n as u64 > most {
                         return Err(BAD);
                     }
                     vec![fixed; n]
@@ -153,7 +301,7 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
                         return Err(BAD);
                     }
                     (0..n)
-                        .map(|i| Ok(u32_at(b.body + 12 + 4 * i)? as usize))
+                        .map(|i| Ok(u64::from(u32_at(b.body + 12 + 4 * i)?)))
                         .collect::<Result<_>>()?
                 });
             }
@@ -172,10 +320,10 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
                             Ok(match field {
                                 4 => {
                                     let byte = *d.get(at + i / 2).ok_or(BAD)?;
-                                    usize::from(if i % 2 == 0 { byte >> 4 } else { byte & 15 })
+                                    u64::from(if i % 2 == 0 { byte >> 4 } else { byte & 15 })
                                 }
-                                8 => usize::from(*d.get(at + i).ok_or(BAD)?),
-                                16 => usize::from(u16::from_be_bytes(
+                                8 => u64::from(*d.get(at + i).ok_or(BAD)?),
+                                16 => u64::from(u16::from_be_bytes(
                                     d.get(at + 2 * i..at + 2 * i + 2)
                                         .ok_or(BAD)?
                                         .try_into()
@@ -191,7 +339,7 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
                 let n = count(&b)?;
                 chunks = Some(
                     (0..n)
-                        .map(|i| Ok(u32_at(b.body + 8 + 4 * i)? as usize))
+                        .map(|i| Ok(u64::from(u32_at(b.body + 8 + 4 * i)?)))
                         .collect::<Result<_>>()?,
                 );
             }
@@ -201,10 +349,9 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
                     (0..n)
                         .map(|i| {
                             let o = b.body + 8 + 8 * i;
-                            let v = u64::from_be_bytes(
+                            Ok(u64::from_be_bytes(
                                 d.get(o..o + 8).ok_or(BAD)?.try_into().map_err(|_| BAD)?,
-                            );
-                            usize::try_from(v).map_err(|_| BAD)
+                            ))
                         })
                         .collect::<Result<_>>()?,
                 );
@@ -244,12 +391,12 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
             .map_or(0, |(_, n)| *n);
         let mut at = start;
         for _ in 0..per {
-            let Some(&len) = next.next() else { break };
-            let end = at.checked_add(len).ok_or(BAD)?;
-            if end > d.len() {
+            let Some(&n) = next.next() else { break };
+            let end = at.checked_add(n).ok_or(BAD)?;
+            if end > len {
                 return Err(BAD);
             }
-            out.push((at, len));
+            out.push((at, n));
             at = end;
         }
     }
@@ -260,8 +407,8 @@ fn samples(d: &[u8], stbl: &BoxAt) -> Result<Vec<(usize, usize)>> {
     Ok(out)
 }
 
-/// A box in the file: its type, where its contents start and where it
-/// ends.
+/// A box in a held part of the file: its type, where its contents start
+/// and where it ends.
 struct BoxAt {
     ty: [u8; 4],
     at: usize,
@@ -269,37 +416,38 @@ struct BoxAt {
     end: usize,
 }
 
-/// The box at `at`, which must end by `limit`.
-fn box_at(d: &[u8], at: usize, limit: usize) -> Result<BoxAt> {
+/// The type, header length and size of the box whose header starts
+/// `h`, which must end within `room` bytes.
+fn header(h: &[u8], room: u64) -> Result<([u8; 4], u64, u64)> {
     let word =
-        |o: usize| -> Result<[u8; 4]> { d.get(o..o + 4).ok_or(BAD)?.try_into().map_err(|_| BAD) };
-    let ty = word(at + 4)?;
-    let (head, size) = match u32::from_be_bytes(word(at)?) {
+        |o: usize| -> Result<[u8; 4]> { h.get(o..o + 4).ok_or(BAD)?.try_into().map_err(|_| BAD) };
+    let ty = word(4)?;
+    let (head, size) = match u32::from_be_bytes(word(0)?) {
         // A 64-bit size follows the type.
         1 => {
-            let large: [u8; 8] = d
-                .get(at + 8..at + 16)
-                .ok_or(BAD)?
-                .try_into()
-                .map_err(|_| BAD)?;
-            (
-                16,
-                usize::try_from(u64::from_be_bytes(large)).map_err(|_| BAD)?,
-            )
+            let large: [u8; 8] = h.get(8..16).ok_or(BAD)?.try_into().map_err(|_| BAD)?;
+            (16, u64::from_be_bytes(large))
         }
         // To the end of what holds it.
-        0 => (8, limit - at),
-        n => (8, usize::try_from(n).map_err(|_| BAD)?),
+        0 => (8, room),
+        n => (8, u64::from(n)),
     };
-    let end = at.checked_add(size).ok_or(BAD)?;
-    if size < head || end > limit {
+    if size < head || size > room {
         return Err(BAD);
     }
+    Ok((ty, head, size))
+}
+
+/// The box at `at`, which must end by `limit`.
+fn box_at(d: &[u8], at: usize, limit: usize) -> Result<BoxAt> {
+    let (ty, head, size) = header(d.get(at..limit).ok_or(BAD)?, (limit - at) as u64)?;
+    // Both fit in `limit - at`.
+    let (head, size) = (head as usize, size as usize);
     Ok(BoxAt {
         ty,
         at,
         body: at + head,
-        end,
+        end: at + size,
     })
 }
 
