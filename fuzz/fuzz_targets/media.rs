@@ -11,6 +11,16 @@ fuzz_target!(|data: &[u8]| {
         // Video boxes are blanked where they are, so nothing moves.
         if kind == Some(Kind::Bmff) {
             assert_eq!(out.len(), data.len());
+            // Edits applied range by range, as a large video is read,
+            // give the same bytes.
+            let mut r = std::io::Cursor::new(data);
+            let edits = media::video_edits(&mut r, data.len() as u64).unwrap();
+            let step = 1 + data.first().copied().unwrap_or(0) as usize;
+            for (i, part) in data.chunks(step).enumerate() {
+                let mut p = part.to_vec();
+                edits.apply((i * step) as u64, &mut p);
+                assert_eq!(p, &out[i * step..i * step + p.len()]);
+            }
         }
     }
     let _ = media::as_sent(data.to_vec(), data.len() as u64);
