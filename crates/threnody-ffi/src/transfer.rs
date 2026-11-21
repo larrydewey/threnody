@@ -159,9 +159,17 @@ impl ThrenodyNode {
                     album: options.album,
                     clip: options.clip.map(Into::into),
                     forwarded: options.forwarded,
+                    thumbnail: options.thumbnail.unwrap_or_default(),
                 },
             )
             .map_err(fail)
+    }
+
+    /// The thumbnail `peer` offered with message `id` (a JPEG), while the
+    /// file isn't here yet; null if it came without one.
+    pub fn offer_thumbnail(&self, peer: String, id: u64) -> Option<Vec<u8>> {
+        let conv = self.conv_of(&peer).ok()?;
+        self.node.offer_thumbnail(conv, id)
     }
 
     /// Where the download of the file `peer` offered as message `id` is;

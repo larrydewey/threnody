@@ -1466,6 +1466,7 @@ impl Core {
                     album,
                     clip,
                     forwarded,
+                    thumbnail: None,
                 };
                 if let Err(x) = node.record_received_file(
                     peer.clone(),
@@ -1524,6 +1525,7 @@ impl Core {
                     album,
                     clip,
                     forwarded,
+                    thumbnail: None,
                 };
                 if let Err(x) = node.record_received_group_file(
                     group.clone(),
@@ -2532,6 +2534,7 @@ mod tests {
             album: 0,
             clip: None,
             forwarded: false,
+            thumbnail: None,
         };
         alice
             .send_file_at(
@@ -2650,6 +2653,7 @@ mod tests {
             album: 0,
             clip: None,
             forwarded: false,
+            thumbnail: None,
         };
         let location = note.display().to_string();
         node.add_note_file("note.jpg".into(), 5, Some(location.clone()), options)

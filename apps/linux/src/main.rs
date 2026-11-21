@@ -25,6 +25,7 @@ mod scan;
 mod schedule;
 mod settings;
 mod sketch;
+mod thumb;
 mod ui;
 mod viewer;
 mod window;

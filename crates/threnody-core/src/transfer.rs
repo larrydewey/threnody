@@ -83,6 +83,9 @@ pub const STATE_OUT: &str = "transfers-out";
 pub const STATE_IN: &str = "transfers-in";
 /// Prefix of the state holding one file's piece hashes.
 pub const HASHES_STATE_PREFIX: &str = "xfer-";
+/// Prefix of the state holding a received offer's thumbnail (within
+/// [`HASHES_STATE_PREFIX`], so backups leave it out too).
+pub const THUMBNAIL_STATE_PREFIX: &str = "xfer-thumb-";
 
 /// Whether `name` is transfer state: left out of backups, since a
 /// restore has none of the files or partial downloads it refers to.

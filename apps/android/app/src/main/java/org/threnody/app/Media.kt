@@ -42,6 +42,41 @@ object Media {
 
     fun isImage(name: String) = name.substringAfterLast('.', "").lowercase() in IMAGE
 
+    private val VIDEO = setOf("mp4", "m4v", "mov", "3gp", "webm", "mkv")
+
+    fun isVideo(name: String) = name.substringAfterLast('.', "").lowercase() in VIDEO
+
+    /**
+     * A small JPEG of the photo or video at `location`, for an offered
+     * file's bubble before it is downloaded; null if it isn't one or
+     * can't be made small enough. Encoded afresh from pixels, so nothing
+     * of the original's metadata goes with it (the node strips it again
+     * all the same). Reads the file: call off the main thread.
+     */
+    fun offerThumbnail(ctx: Context, name: String, location: String): ByteArray? {
+        val side = 320
+        val bitmap = try {
+            when {
+                isImage(name) -> decode(source(ctx, location), side)
+                isVideo(name) -> android.media.MediaMetadataRetriever().use { r ->
+                    val sealed = dataSource(location)
+                    if (sealed != null) r.setDataSource(sealed) else r.setDataSource(ctx, Uri.parse(location))
+                    r.getScaledFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC, side, side)
+                }
+                else -> null
+            }
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        val limit = uniffi.threnody_ffi.maxOfferThumbnail().toInt()
+        for (quality in listOf(70, 55, 40, 30)) {
+            val out = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            if (out.size() <= limit) return out.toByteArray()
+        }
+        return null
+    }
+
     /**
      * Makes a picked file ready to send: an image the node can't strip
      * metadata from (HEIC, AVIF, DNG, …) is re-encoded as JPEG, which

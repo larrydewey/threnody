@@ -22,6 +22,7 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -1289,6 +1290,77 @@ class ChatActivity : Activity() {
         }
     }
 
+    /** Thumbnails offered files came with, by message id (null: none). */
+    private val offerThumbs = HashMap<ULong, android.graphics.Bitmap?>()
+
+    /**
+     * The thumbnail `e`'s offer came with, decoded, for `done` on the main
+     * thread; nothing for a sensitive file (it stays covered until it is
+     * downloaded and opened) or one that isn't an offer.
+     */
+    private fun offerThumbnail(f: FileInfo, e: HistoryEntry, done: (android.graphics.Bitmap) -> Unit) {
+        if (f.sensitive || offerState(e) == null) return
+        if (offerThumbs.containsKey(e.id)) return offerThumbs[e.id]?.let(done) ?: Unit
+        val id = e.id
+        Threading.io {
+            val b = try {
+                node.offerThumbnail(device, id)?.let { android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size) }
+            } catch (_: Exception) {
+                null
+            }
+            runOnUiThread {
+                // A few hundred KB each: a long scroll doesn't keep them all.
+                if (offerThumbs.size >= 64) offerThumbs.clear()
+                offerThumbs[id] = b
+                if (b != null) done(b)
+            }
+        }
+    }
+
+    /** `cover` (an offered photo's label) over the thumbnail it came with, if any. */
+    private fun behindOfferThumbnail(cover: TextView, f: FileInfo, e: HistoryEntry): View {
+        val frame = FrameLayout(this)
+        val image = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = rounded(color(R.color.cover), dp(12).toFloat())
+            clipToOutline = true
+            visibility = View.GONE
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        frame.addView(image, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        frame.addView(cover, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        offerThumbnail(f, e) { b ->
+            image.setImageBitmap(b)
+            image.visibility = View.VISIBLE
+            // The words stay readable over the picture.
+            cover.background = rounded(0x99000000.toInt(), dp(12).toFloat())
+            cover.setTextColor(android.graphics.Color.WHITE)
+        }
+        return frame
+    }
+
+    /** The thumbnail an offered file (a video, say) came with, shown above its state. */
+    private fun offerImage(f: FileInfo, e: HistoryEntry): View? {
+        if (f.sensitive || offerState(e) == null) return null
+        val image = ImageView(this).apply {
+            adjustViewBounds = true
+            maxHeight = dp(220)
+            // The bubble's width, cropped rather than letterboxed.
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = rounded(color(R.color.surface), dp(12).toFloat())
+            clipToOutline = true
+            visibility = View.GONE
+            contentDescription = "Preview of ${f.name}"
+            setOnClickListener { offerTap(e) }
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(4) }
+        }
+        offerThumbnail(f, e) { b ->
+            image.setImageBitmap(b)
+            image.visibility = View.VISIBLE
+        }
+        return image
+    }
+
     /** Labels of offered files shown, by message id, how each words its state, and the file's size. */
     private val offerLabels = HashMap<ULong, Triple<TextView, (String) -> String, ULong>>()
 
@@ -1589,7 +1661,7 @@ class ChatActivity : Activity() {
             }
         }
         if (f.sensitive || location == null) {
-            return label(if (location == null) "📷\n${missingText(f, e) ?: "not available"}" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
+            val cover = label(if (location == null) "📷\n${missingText(f, e) ?: "not available"}" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
                 gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
                 // Opaque and dark in either theme: covered, without glare.
@@ -1601,6 +1673,7 @@ class ChatActivity : Activity() {
                 setOnClickListener(open)
                 if (location == null) fetchable(this, f, e) { "📷\n$it" }
             }
+            return if (location == null) behindOfferThumbnail(cover, f, e) else cover
         }
         val view = ImageView(this).apply {
             adjustViewBounds = true
@@ -1728,6 +1801,7 @@ class ChatActivity : Activity() {
                     val uri = f.location?.let(Uri::parse)
                     if (uri != null) setOnClickListener { open(uri) }
                 })
+                if (f.location == null) offerImage(f, r.entry)?.let { body.addView(it) }
                 if (f.location == null) missingText(f, r.entry)?.let { t ->
                     body.addView(TextView(this).apply {
                         text = t
@@ -2794,7 +2868,11 @@ class ChatActivity : Activity() {
                     if (data != null) sendFileTo(p.name, data, location, options)
                     else {
                         runOnUiThread { Toast.makeText(this, "Preparing ${p.name}…", Toast.LENGTH_SHORT).show() }
-                        node.sendFileAt(device, p.name, location ?: p.uri.toString(), options)
+                        val at = location ?: p.uri.toString()
+                        // Shown in their chat before they download it; never
+                        // for a sensitive file, which stays covered there.
+                        val thumbnail = if (sensitive) null else Media.offerThumbnail(this, p.name, at)
+                        node.sendFileAt(device, p.name, at, options.copy(thumbnail = thumbnail))
                     }
                 } catch (e: Exception) {
                     Media.forget(this, location)
