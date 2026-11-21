@@ -881,11 +881,10 @@ impl Node {
         {
             let t = lock(&self.shared.transfers);
             let mut active = t.incoming.iter().filter(|i| i.run.is_some()).count();
-            for i in 0..t.incoming.len() {
+            for (i, inc) in t.incoming.iter().enumerate() {
                 if active >= MAX_ACTIVE {
                     break;
                 }
-                let inc = &t.incoming[i];
                 if inc.status != Status::Wanted || inc.run.is_some() {
                     continue;
                 }
@@ -1721,9 +1720,7 @@ mod tests {
                 ..
             }
         ));
-        for i in 0..8 {
-            run.have[i] = true;
-        }
+        run.have[..8].fill(true);
         run.have[10] = true;
         let w = next_want(&mut run, [0; 32], size).unwrap();
         assert!(matches!(
