@@ -8,7 +8,7 @@ val calls = (findProperty("threnody.calls") as String?)?.toBooleanStrict() ?: tr
 
 android {
     namespace = "org.threnody.app"
-    compileSdk = 36
+    compileSdk = 37
     defaultConfig {
         applicationId = "org.threnody.app"
         minSdk = 29
