@@ -17,7 +17,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use threnody_core::crypto::random_bytes;
 use threnody_core::message::{
-    FEATURE_DELETE, FEATURE_EDIT, FEATURE_LISTS, FEATURE_PIN, FEATURE_REACT, FEATURE_RECEIPTS,
+    FEATURE_DELETE, FEATURE_EDIT, FEATURE_LARGE_FILES, FEATURE_LISTS, FEATURE_PIN, FEATURE_REACT,
+    FEATURE_RECEIPTS,
 };
 use threnody_core::{AppMessage, PublicIdentity};
 
@@ -43,6 +44,7 @@ pub fn trackable(m: &AppMessage) -> bool {
         m,
         AppMessage::Text { .. }
             | AppMessage::File { .. }
+            | AppMessage::Offer(_)
             | AppMessage::Group(_)
             | AppMessage::Mailbox(_)
             | AppMessage::Receipt(_)
@@ -63,8 +65,18 @@ pub fn needs(m: &AppMessage) -> u64 {
         // can't read it (an older build would end the session), and a run
         // of them can't push out the texts held for the same device.
         AppMessage::Receipt(_) => FEATURE_RECEIPTS,
+        // Only sent to peers that said they take them; held across a
+        // restart, dropped if the peer's next Hello no longer does.
+        AppMessage::Offer(_) | AppMessage::Transfer(_) => FEATURE_LARGE_FILES,
         _ => 0,
     }
+}
+
+/// Whether `m` counts among the changes held for a peer, which have
+/// places of their own: anything that needs a feature bit but an offered
+/// file, which is content like a text.
+fn is_change(m: &AppMessage) -> bool {
+    needs(m) != 0 && !matches!(m, AppMessage::Offer(_))
 }
 
 /// What an acknowledgement means: our outgoing history entry `local_id`
@@ -241,16 +253,11 @@ impl Delivery {
         // Changes (deletions, edits, reactions, pins, lists) and other
         // messages each have MAX_UNACKED places, so a run of changes for a
         // device that is away can't push out the texts held for it.
-        let change = needs(&m) != 0;
+        let change = is_change(&m);
         q.push_back((id, m.clone(), len, tag));
         let mut bytes: usize = q.iter().map(|(_, _, l, _)| l).sum();
-        while q
-            .iter()
-            .filter(|(_, m, ..)| (needs(m) != 0) == change)
-            .count()
-            > MAX_UNACKED
-        {
-            let Some(i) = q.iter().position(|(_, m, ..)| (needs(m) != 0) == change) else {
+        while q.iter().filter(|(_, m, ..)| is_change(m) == change).count() > MAX_UNACKED {
+            let Some(i) = q.iter().position(|(_, m, ..)| is_change(m) == change) else {
                 break;
             };
             if let Some((_, _, l, _)) = q.remove(i) {

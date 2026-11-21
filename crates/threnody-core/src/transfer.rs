@@ -77,6 +77,19 @@ pub const MAX_THUMBNAIL: usize = 24 * 1024;
 /// Largest encoded offer: offers are small enough for any mailbox.
 pub const MAX_OFFER_BYTES: usize = 96 * 1024;
 
+/// State where a node keeps the offers it made (`threnody-net`).
+pub const STATE_OUT: &str = "transfers-out";
+/// State where a node keeps the offers it received.
+pub const STATE_IN: &str = "transfers-in";
+/// Prefix of the state holding one file's piece hashes.
+pub const HASHES_STATE_PREFIX: &str = "xfer-";
+
+/// Whether `name` is transfer state: left out of backups, since a
+/// restore has none of the files or partial downloads it refers to.
+pub fn is_transfer_state(name: &str) -> bool {
+    name == STATE_OUT || name == STATE_IN || name.starts_with(HASHES_STATE_PREFIX)
+}
+
 const OP_WANT: u64 = 1;
 const OP_PIECE: u64 = 2;
 const OP_HASHES: u64 = 3;

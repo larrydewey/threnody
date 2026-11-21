@@ -93,6 +93,7 @@ impl Home {
         let mut states = Vec::new();
         for name in self.state_names()? {
             if LEFT_OUT.contains(&name.as_str())
+                || crate::transfer::is_transfer_state(&name)
                 || name == CONTACTS_STATE
                 || crate::history::is_history_name(&name)
             {

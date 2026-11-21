@@ -1482,7 +1482,7 @@ impl Node {
         self.append_file(peer, false, file, caption, 0, remote_id);
     }
 
-    fn append_file(
+    pub(crate) fn append_file(
         &self,
         peer: &PublicIdentity,
         outgoing: bool,
@@ -1681,6 +1681,7 @@ impl Node {
                         node.sweep_mailbox(now_ms());
                         node.shared.expire_saved_tunnels(now_ms());
                         node.resume_fetches();
+                        node.sweep_transfers();
                     }
                     () = &mut closed => break,
                 }

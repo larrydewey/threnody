@@ -37,6 +37,7 @@ mod recover;
 pub mod relay;
 pub mod schedule;
 pub mod sync;
+pub mod transfer;
 mod tunnels;
 pub mod volunteer;
 #[cfg(feature = "boringtun")]
@@ -53,6 +54,7 @@ pub use groupcall::GroupCallInfo;
 pub use handle::{EXPECT_FOR, INVITE_KEY_STATE};
 pub use node::{AcceptPolicy, Event, FallbackPath, MAX_REQUESTS, Node, NodeConfig, SessionInfo};
 pub use push::WakeReport;
+pub use transfer::{LargeFileStore, SendOptions, TransferState};
 pub use volunteer::{DirectoryInfo, ListedRelay, TestPay};
 #[cfg(feature = "boringtun")]
 pub use wg_userspace::{TunIo, WgDevice};
