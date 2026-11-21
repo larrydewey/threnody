@@ -48,6 +48,7 @@ import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
 import uniffi.threnody_ffi.TickMark
+import uniffi.threnody_ffi.TransferState
 
 /**
  * One conversation, with a contact (extras [KEY] and [DEVICE]) or a group
@@ -566,7 +567,7 @@ class ChatActivity : Activity() {
         if (location == null || (f.sensitive && !e.outgoing && mark(e) !in shownClips)) {
             val head = "${if (clip.video) "🎥" else "🎤"} ${what.replaceFirstChar { it.uppercase() }}"
             val cover = label(
-                if (location == null) "$head\n${fetchText(f) ?: "not on this device"}"
+                if (location == null) "$head\n${missingText(f, e) ?: "not on this device"}"
                 else "🔒\nSensitive $what\nTap to play",
                 14f, R.color.on_cover,
             ).apply {
@@ -575,7 +576,7 @@ class ChatActivity : Activity() {
                 background = rounded(color(R.color.cover), dp(12).toFloat()).apply { setStroke(dp(1), color(R.color.cover_edge)) }
                 setPadding(dp(16), dp(16), dp(16), dp(16))
                 minWidth = dp(200)
-                contentDescription = if (location == null) "$what: ${fetchText(f) ?: "not available"}" else "Sensitive $what, tap to uncover"
+                contentDescription = if (location == null) "$what: ${missingText(f, e) ?: "not available"}" else "Sensitive $what, tap to uncover"
             }
             if (location == null) fetchable(cover, f, e) { "$head\n$it" }
             if (location != null) cover.setOnClickListener {
@@ -754,6 +755,11 @@ class ChatActivity : Activity() {
                 runOnUiThread { showTyping(e.active) }
                 return@subscribe
             }
+            // A download's progress: its label, not a reload.
+            if (e is NodeEvent.TransferChanged && e.state !is TransferState.Done) {
+                runOnUiThread { showOffer(e.id, e.state) }
+                return@subscribe
+            }
             // A message from them ends their typing.
             if (e is NodeEvent.Message) runOnUiThread { showTyping(false) }
             when (e) {
@@ -828,6 +834,8 @@ class ChatActivity : Activity() {
             is NodeEvent.MessagesDeleted -> e.peer
             is NodeEvent.MessageEdited -> e.peer
             is NodeEvent.File -> e.peer
+            is NodeEvent.FileOffered -> e.peer
+            is NodeEvent.TransferChanged -> e.peer
             is NodeEvent.Connected -> e.peer
             is NodeEvent.Disconnected -> e.peer
             is NodeEvent.ApprovalChanged -> e.peer
@@ -1212,6 +1220,7 @@ class ChatActivity : Activity() {
         mentionRanges.clear()
         linkCache.clear()
         fetchLabels.clear()
+        offerLabels.clear()
         onScreen = items.map { it.entry }
         texts.clear()
         voiceViews.clear()
@@ -1253,6 +1262,62 @@ class ChatActivity : Activity() {
      */
     private fun fetchText(f: FileInfo): String? = fetchText(f.fetch)
 
+    /**
+     * What a file whose contents aren't on this device says: how its
+     * download from the sender is going, if it was offered (too large for
+     * one message), else how getting it from our other devices is.
+     */
+    private fun missingText(f: FileInfo, e: HistoryEntry): String? =
+        offerState(e)?.let { offerText(it, f.size) } ?: fetchText(f)
+
+    /** Where the download of `e`'s file is, if it was offered and isn't here yet. */
+    private fun offerState(e: HistoryEntry): TransferState? =
+        if (e.outgoing || group != null || note || e.file?.location != null) null
+        else try { node.transferState(device, e.id) } catch (_: Exception) { null }
+
+    private fun offerText(s: TransferState, size: ULong): String {
+        val total = Formatter.formatShortFileSize(this, size.toLong())
+        return when (s) {
+            is TransferState.Idle -> "Tap to download · $total"
+            is TransferState.Waiting -> "Waiting for the sender… · tap to cancel"
+            is TransferState.Fetching ->
+                "Downloading… ${if (s.total == 0uL) 100uL else s.received * 100uL / s.total}% of $total · tap to cancel"
+            is TransferState.NoSpace -> "Not enough space for $total · tap to try again"
+            is TransferState.Unavailable -> "No longer available from the sender · tap to try again"
+            is TransferState.Failed -> "Didn't arrive intact · tap to try again"
+            is TransferState.Done -> "Downloaded"
+        }
+    }
+
+    /** Labels of offered files shown, by message id, how each words its state, and the file's size. */
+    private val offerLabels = HashMap<ULong, Triple<TextView, (String) -> String, ULong>>()
+
+    /** A download moved on: its label says so. */
+    private fun showOffer(id: ULong, s: TransferState) {
+        val (view, word, size) = offerLabels[id] ?: return
+        view.text = word(offerText(s, size))
+    }
+
+    /**
+     * Downloads `e`'s offered file on a tap, or stops a download under
+     * way (deleting what came).
+     */
+    private fun offerTap(e: HistoryEntry) {
+        Threading.background {
+            try {
+                when (node.transferState(device, e.id)) {
+                    is TransferState.Waiting, is TransferState.Fetching -> node.cancelDownload(device, e.id)
+                    null, is TransferState.Done -> {}
+                    else -> node.downloadFile(device, e.id)
+                }
+                val now = node.transferState(device, e.id)
+                runOnUiThread { if (now != null) showOffer(e.id, now) else refreshSoon() }
+            } catch (x: Exception) {
+                runOnUiThread { Toast.makeText(this, x.message ?: "Couldn't download that file", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
     private fun fetchText(s: FileFetch): String? = when (s) {
         is FileFetch.NotHere -> null
         is FileFetch.Idle -> "Tap to get from your other device"
@@ -1270,6 +1335,11 @@ class ChatActivity : Activity() {
      * our devices on a tap, while it can, and keep its progress current.
      */
     private fun fetchable(view: TextView, f: FileInfo, e: HistoryEntry, word: (String) -> String) {
+        if (offerState(e) != null) {
+            offerLabels[e.id] = Triple(view, word, f.size)
+            view.setOnClickListener { offerTap(e) }
+            return
+        }
         if (f.fetch is FileFetch.Idle || f.fetch is FileFetch.Unavailable) view.setOnClickListener { fetch(e) }
         if (f.fetch is FileFetch.Waiting || f.fetch is FileFetch.Fetching) {
             fetchLabels[mark(e)] = view to word
@@ -1519,7 +1589,7 @@ class ChatActivity : Activity() {
             }
         }
         if (f.sensitive || location == null) {
-            return label(if (location == null) "📷\n${fetchText(f) ?: "not available"}" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
+            return label(if (location == null) "📷\n${missingText(f, e) ?: "not available"}" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
                 gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
                 // Opaque and dark in either theme: covered, without glare.
@@ -1527,7 +1597,7 @@ class ChatActivity : Activity() {
                     setStroke(dp(1), color(R.color.cover_edge))
                 }
                 height = if (limit == width) width else dp(180)
-                contentDescription = if (location == null) "Photo: ${fetchText(f) ?: "not available"}" else "Sensitive photo, tap to view"
+                contentDescription = if (location == null) "Photo: ${missingText(f, e) ?: "not available"}" else "Sensitive photo, tap to view"
                 setOnClickListener(open)
                 if (location == null) fetchable(this, f, e) { "📷\n$it" }
             }
@@ -1658,7 +1728,7 @@ class ChatActivity : Activity() {
                     val uri = f.location?.let(Uri::parse)
                     if (uri != null) setOnClickListener { open(uri) }
                 })
-                if (f.location == null) fetchText(f)?.let { t ->
+                if (f.location == null) missingText(f, r.entry)?.let { t ->
                     body.addView(TextView(this).apply {
                         text = t
                         textSize = 13f
@@ -2318,6 +2388,7 @@ class ChatActivity : Activity() {
             Threading.background {
                 try {
                     val max = node.maxFileSize().toLong()
+                    val offers = group == null && !note
                     val picked = uris.take(MAX_PICK).map { uri ->
                         // Keep access so a sent file can be opened from the chat later.
                         try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {
@@ -2331,6 +2402,15 @@ class ChatActivity : Activity() {
                         // A GIF must be named one to be shown animated.
                         val gif = contentResolver.getType(uri) == "image/gif" && !Media.isGif(shown)
                         val name = if (gif) shown.substringBeforeLast('.') + ".gif" else shown
+                        // Too large for one message: offered in a chat with
+                        // one contact, read in pieces where it is, never
+                        // whole. A photo to convert is decoded from there.
+                        if (size > max && offers) {
+                            if (!Media.needsConverting(this, name, uri)) return@map Picked(name, null, uri, size)
+                            val (n, d) = Media.converted(name, android.graphics.ImageDecoder.createSource(contentResolver, uri))
+                            if (d.size > max) throw IllegalArgumentException("$n is too large")
+                            return@map Picked(n, d, uri)
+                        }
                         if (size > max * 2) throw IllegalArgumentException("$name is too large")
                         val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                             ?: throw IllegalArgumentException("couldn't read $name")
@@ -2427,8 +2507,11 @@ class ChatActivity : Activity() {
         }
     }
 
-    /** A picked file, read and ready to send. */
-    private class Picked(val name: String, val data: ByteArray, val uri: Uri)
+    /**
+     * A picked file, read and ready to send; or (no `data`) one too large
+     * for one message, offered from where it is.
+     */
+    private class Picked(val name: String, val data: ByteArray?, val uri: Uri, val size: Long = data?.size?.toLong() ?: 0)
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (!ActivityResultRegistry.dispatch(this, requestCode, resultCode, data)) {
@@ -2441,13 +2524,28 @@ class ChatActivity : Activity() {
         val images = picked.count { Media.isImage(it.name) }
         val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for ((i, p) in picked.withIndex()) {
-            val cell = if (Media.isGif(p.name)) {
+            val data = p.data
+            val cell = if (data == null) {
+                if (Media.isImage(p.name)) ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    background = rounded(color(R.color.surface), dp(8).toFloat())
+                    clipToOutline = true
+                    contentDescription = p.name
+                    Threading.background {
+                        val b = Media.decode(android.graphics.ImageDecoder.createSource(contentResolver, p.uri), dp(200))
+                        runOnUiThread { setImageBitmap(b) }
+                    }
+                } else label("📎\n${p.name}\n${Formatter.formatShortFileSize(this, p.size)}", 12f, R.color.text, maxLines = 4).apply {
+                    gravity = Gravity.CENTER
+                    background = rounded(color(R.color.surface), dp(8).toFloat())
+                }
+            } else if (Media.isGif(p.name)) {
                 ImageView(this).apply {
                     scaleType = ImageView.ScaleType.CENTER_CROP
                     background = rounded(color(R.color.surface), dp(8).toFloat())
                     clipToOutline = true
                     contentDescription = "GIF"
-                    Media.animated({ android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)) }, dp(200)) { d ->
+                    Media.animated({ android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(data)) }, dp(200)) { d ->
                         runOnUiThread { setImageDrawable(d); (d as? android.graphics.drawable.AnimatedImageDrawable)?.start() }
                     }
                 }
@@ -2462,7 +2560,7 @@ class ChatActivity : Activity() {
                         clipToOutline = true
                         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                         Threading.background {
-                            val b = Media.decode(android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(p.data)), dp(200))
+                            val b = Media.decode(android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(data)), dp(200))
                             runOnUiThread { setImageBitmap(b) }
                         }
                     }, MATCH_PARENT, MATCH_PARENT)
@@ -2479,7 +2577,7 @@ class ChatActivity : Activity() {
                     })
                 }
             } else {
-                label("📎\n${p.name}", 12f, R.color.text).apply {
+                label("📎\n${p.name}", 12f, R.color.text, maxLines = 3).apply {
                     gravity = Gravity.CENTER
                     background = rounded(color(R.color.surface), dp(8).toFloat())
                 }
@@ -2538,9 +2636,10 @@ class ChatActivity : Activity() {
     private fun annotate(picked: List<Picked>, i: Int) {
         val s = sheet ?: return
         val p = picked[i]
+        val data = p.data ?: return
         Threading.background {
             val f = java.io.File(java.io.File(cacheDir, AnnotateActivity.DIR).apply { mkdirs() }, "source-$i")
-            try { f.writeBytes(p.data) } catch (_: Exception) { return@background }
+            try { f.writeBytes(data) } catch (_: Exception) { return@background }
             runOnUiThread {
                 s.annotating = true
                 s.dialog.dismiss()
@@ -2641,6 +2740,7 @@ class ChatActivity : Activity() {
      * so deleting one message never takes another's file.
      */
     private fun copyOf(f: uniffi.threnody_ffi.FileInfo): Pair<ByteArray, String?> {
+        if (f.size > node.maxFileSize()) throw IllegalStateException("files this large can't be forwarded yet")
         val data = readFile(f.location)
         return data to (Media.savePrivate(this, f.name, data, persona) ?: f.location)
     }
@@ -2685,10 +2785,17 @@ class ChatActivity : Activity() {
             var failed: String? = null
             for ((i, p) in picked.withIndex()) {
                 val options = FileOptions(sensitive, if (i == 0) caption else "", album)
-                // Keep our own copy of a photo privately, so the chat can show it.
-                val location = if (Media.isImage(p.name)) Media.savePrivate(this, p.name, p.data, persona) else p.uri.toString()
+                val data = p.data
+                // Keep our own copy of a photo privately, so the chat can
+                // show it; a large file stays where it is, and is read
+                // from there whenever they download it.
+                val location = if (data != null && Media.isImage(p.name)) Media.savePrivate(this, p.name, data, persona) else p.uri.toString()
                 try {
-                    sendFileTo(p.name, p.data, location, options)
+                    if (data != null) sendFileTo(p.name, data, location, options)
+                    else {
+                        runOnUiThread { Toast.makeText(this, "Preparing ${p.name}…", Toast.LENGTH_SHORT).show() }
+                        node.sendFileAt(device, p.name, location ?: p.uri.toString(), options)
+                    }
                 } catch (e: Exception) {
                     Media.forget(this, location)
                     failed = e.message

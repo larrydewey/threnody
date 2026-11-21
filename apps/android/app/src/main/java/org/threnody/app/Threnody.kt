@@ -18,6 +18,7 @@ import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.PersonaRecord
 import uniffi.threnody_ffi.ThrenodyNode
+import uniffi.threnody_ffi.TransferState
 
 /**
  * The node lives for the whole process, not an Activity: rotating the
@@ -66,6 +67,10 @@ object Threnody {
         // Settings before listening: listening starts internet
         // reachability, which mustn't join the DHT, even briefly, when off.
         applyPrivacyTo(ctx, it)
+        // Files too large for one message, sent and downloaded in pieces;
+        // before listening, so every session says this device takes them.
+        // Only the main identity: it seals what it downloads.
+        it.setLargeFileStore(AndroidLargeFiles(ctx.applicationContext))
         listenAddr = it.listen("0.0.0.0:7450")
         instance = it
         // Only the main identity: personas are never linked to other devices.
@@ -792,6 +797,19 @@ object Threnody {
                             fileLabel(e.name, e.sensitive, e.caption, e.clip), persona,
                             disappearing { node.history(e.peer, 1u) })
                     }
+                }
+                is NodeEvent.FileOffered -> {
+                    // Recorded by the node; it may be downloading already.
+                    say("* ${short(e.peer)} offered a file (${e.size} bytes)")
+                    if (!e.quiet && (visible == 0 || e.peer !in visibleChat)) {
+                        val contacts = node.contacts()
+                        ThrenodyService.notifyMessage(ctx, key(contacts, e.peer), e.peer, nameOf(node, e.peer),
+                            fileLabel(e.name, e.sensitive, e.caption, e.clip), persona,
+                            disappearing { node.history(e.peer, 1u) })
+                    }
+                }
+                is NodeEvent.TransferChanged -> if (e.state is TransferState.Failed || e.state is TransferState.NoSpace) {
+                    say("* download from ${short(e.peer)}: ${e.state}")
                 }
                 is NodeEvent.GroupMessage -> {
                     say("* group ${e.group.take(6)}: message from ${short(e.from)} (${e.text.length} chars)")

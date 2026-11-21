@@ -36,6 +36,14 @@ class FilesProvider : ContentProvider() {
         if (mode != "r") throw SecurityException("read only")
         val f = file(uri) ?: throw java.io.FileNotFoundException(uri.toString())
         val ctx = context ?: throw java.io.FileNotFoundException(uri.toString())
+        // A large sealed file: read through, decrypted a range at a time,
+        // with no copy at all.
+        val large = try {
+            Media.sealedSize(Uri.fromFile(f).toString())?.takeIf { it.second > Media.IN_MEMORY }
+        } catch (_: Exception) {
+            null
+        }
+        if (large != null) return proxy(ctx, large.first, large.second)
         val copy: File? = try {
             Media.plainCopy(ctx, Uri.fromFile(f).toString())
         } catch (e: Exception) {
@@ -49,6 +57,32 @@ class FilesProvider : ContentProvider() {
             // Readable through the descriptor until it is closed, by no name.
             plain.delete()
         }
+    }
+
+    /** A descriptor that reads the sealed file at `path`, `size` bytes as opened, through [Media.readSealed]. */
+    private fun proxy(ctx: Context, path: String, size: Long): ParcelFileDescriptor {
+        val storage = ctx.getSystemService(android.os.storage.StorageManager::class.java)
+        return storage.openProxyFileDescriptor(
+            ParcelFileDescriptor.MODE_READ_ONLY,
+            object : android.os.ProxyFileDescriptorCallback() {
+                override fun onGetSize(): Long = size
+
+                override fun onRead(offset: Long, n: Int, data: ByteArray): Int {
+                    if (offset >= size || n == 0) return 0
+                    val b = try {
+                        Media.readSealed(path, offset, minOf(n.toLong(), size - offset).toInt())
+                    } catch (_: Exception) {
+                        throw android.system.ErrnoException("read", android.system.OsConstants.EIO)
+                    }
+                    System.arraycopy(b, 0, data, 0, b.size)
+                    b.fill(0)
+                    return b.size
+                }
+
+                override fun onRelease() {}
+            },
+            android.os.Handler(proxyThread.looper),
+        )
     }
 
     override fun getType(uri: Uri): String =
@@ -70,6 +104,9 @@ class FilesProvider : ContentProvider() {
     override fun update(uri: Uri, v: ContentValues?, s: String?, a: Array<out String>?) = 0
 
     companion object {
+        /** Where proxied reads of large files run. */
+        private val proxyThread by lazy { android.os.HandlerThread("files-proxy").apply { start() } }
+
         /** A shareable URI for a privately kept `file://` location; others pass through. */
         fun shareable(ctx: Context, location: Uri): Uri {
             if (location.scheme != "file") return location

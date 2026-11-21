@@ -51,8 +51,30 @@ object Media {
      */
     fun prepare(ctx: Context, name: String, data: ByteArray): Pair<String, ByteArray> {
         if (!imageNeedsConversion(name, data.copyOf(minOf(data.size, 32)))) return name to data
-        val bitmap = decode(ImageDecoder.createSource(java.nio.ByteBuffer.wrap(data)), 4096)
-            ?: throw IllegalArgumentException("couldn't read $name")
+        return converted(name, ImageDecoder.createSource(java.nio.ByteBuffer.wrap(data)))
+    }
+
+    /**
+     * A picked file too large for one message, unread: whether it is a
+     * photo to convert first (see [prepare]), from its first bytes.
+     */
+    fun needsConverting(ctx: Context, name: String, uri: Uri): Boolean {
+        val head = ctx.contentResolver.openInputStream(uri)?.use { s ->
+            val b = ByteArray(32)
+            var n = 0
+            while (n < b.size) {
+                val r = s.read(b, n, b.size - n)
+                if (r < 0) break
+                n += r
+            }
+            b.copyOf(n)
+        } ?: return false
+        return imageNeedsConversion(name, head)
+    }
+
+    /** The photo `src` reads as a JPEG of at most 4096 px a side, which carries no metadata. */
+    fun converted(name: String, src: ImageDecoder.Source): Pair<String, ByteArray> {
+        val bitmap = decode(src, 4096) ?: throw IllegalArgumentException("couldn't read $name")
         val out = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
         return name.substringBeforeLast('.') + ".jpg" to out.toByteArray()
@@ -65,13 +87,33 @@ object Media {
     /** The main node, whose identity seals kept files. */
     private fun sealer(): ThrenodyNode = Threnody.running() ?: throw IllegalStateException("Threnody isn't running")
 
+    /** A new file's place in an identity's private folder, for a file called `name`. */
+    private fun newPrivate(ctx: Context, name: String, persona: String?): File {
+        val dir = dir(ctx, persona).apply { mkdirs() }
+        val safe = name.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_").takeLast(80)
+        return File(dir, "${System.currentTimeMillis()}-${(1000..9999).random()}-$safe")
+    }
+
+    /**
+     * An empty private file for a download of `name` (the main identity's),
+     * which the node seals as it writes; null if none can be made.
+     */
+    fun reserve(ctx: Context, name: String): uniffi.threnody_ffi.ReservedFile? = if (Threnody.wiping) {
+        null
+    } else try {
+        val f = newPrivate(ctx, name, null)
+        f.createNewFile()
+        uniffi.threnody_ffi.ReservedFile(f.path, Uri.fromFile(f).toString())
+    } catch (e: Exception) {
+        Threnody.say("! reserving $name: ${e.message}")
+        null
+    }
+
     /** Keeps a file privately, sealed; returns its location for history. */
     fun savePrivate(ctx: Context, name: String, data: ByteArray, persona: String? = null): String? = if (Threnody.wiping) {
         null
     } else try {
-        val dir = dir(ctx, persona).apply { mkdirs() }
-        val safe = name.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_").takeLast(80)
-        val f = File(dir, "${System.currentTimeMillis()}-${(1000..9999).random()}-$safe")
+        val f = newPrivate(ctx, name, persona)
         sealer().sealMedia(data, f.path)
         Uri.fromFile(f).toString()
     } catch (e: Exception) {
@@ -93,7 +135,75 @@ object Media {
      * MediaMetadataRetriever, so no plaintext file is written; null if it
      * isn't sealed (play it from its location).
      */
-    fun dataSource(location: String): android.media.MediaDataSource? = opened(location)?.let(::BytesSource)
+    fun dataSource(location: String): android.media.MediaDataSource? {
+        val path = sealedPath(location) ?: return null
+        val size = mediaSize(path).toLong()
+        return if (size > IN_MEMORY) SealedSource(sealer(), path, size) else BytesSource(sealer().openMedia(path))
+    }
+
+    /** Larger sealed files are read a piece at a time, never decrypted whole. */
+    const val IN_MEMORY = 16L * 1024 * 1024
+
+    /** The path and plaintext size of the sealed file at `location`, or null for anything else. */
+    fun sealedSize(location: String): Pair<String, Long>? =
+        sealedPath(location)?.let { it to mediaSize(it).toLong() }
+
+    /** Up to `len` bytes of the sealed file at `path` from `offset`, decrypting only those. */
+    fun readSealed(path: String, offset: Long, len: Int): ByteArray =
+        sealer().readMediaRange(path, offset.toULong(), len.toUInt())
+
+    /**
+     * How many bytes the file at `location` holds as read (a sealed one
+     * opened); null if it is gone.
+     */
+    fun size(ctx: Context, location: String): Long? = try {
+        val sealed = sealedPath(location)
+        when {
+            sealed != null -> mediaSize(sealed).toLong()
+            location.startsWith("content:") || location.startsWith("file:") -> {
+                val uri = Uri.parse(location)
+                ctx.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize }?.takeIf { it >= 0 }
+                    ?: ctx.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { c ->
+                        if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
+                    }
+            }
+            else -> File(location).takeIf { it.isFile }?.length()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * Up to `len` bytes of the file at `location` from `offset`, fewer
+     * only at its end; a sealed file is decrypted only where they lie.
+     * Null if it can't be read.
+     */
+    fun readAt(ctx: Context, location: String, offset: Long, len: Int): ByteArray? = try {
+        val sealed = sealedPath(location)
+        if (sealed != null) {
+            sealer().readMediaRange(sealed, offset.toULong(), len.toUInt())
+        } else {
+            val pfd = if (location.startsWith("content:") || location.startsWith("file:")) {
+                ctx.contentResolver.openFileDescriptor(Uri.parse(location), "r")
+            } else {
+                android.os.ParcelFileDescriptor.open(File(location), android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+            }
+            pfd?.use { fd ->
+                java.io.FileInputStream(fd.fileDescriptor).channel.use { ch ->
+                    val buf = java.nio.ByteBuffer.allocate(len)
+                    var at = offset
+                    while (buf.hasRemaining()) {
+                        val n = ch.read(buf, at)
+                        if (n < 0) break
+                        at += n
+                    }
+                    buf.array().copyOf(buf.position())
+                }
+            }
+        }
+    } catch (_: Exception) {
+        null
+    }
 
     /** Where decrypted copies wait: the cache, never backed up. */
     private fun plainDir(ctx: Context) = File(ctx.cacheDir, "plain")
@@ -275,6 +385,54 @@ object Media {
     }
 }
 
+/**
+ * A sealed clip too large to decrypt in memory, for MediaPlayer and
+ * MediaMetadataRetriever: read a window at a time, decrypting only the
+ * chunks it lies in.
+ */
+class SealedSource(
+    private val node: ThrenodyNode,
+    private val path: String,
+    private val size: Long,
+) : android.media.MediaDataSource() {
+    private var at = -1L
+    private var window = ByteArray(0)
+
+    @Synchronized
+    override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+        if (position >= this.size) return -1
+        if (size == 0) return 0
+        if (at < 0 || position < at || position >= at + window.size) {
+            window.fill(0)
+            at = position - position % WINDOW
+            window = try {
+                node.readMediaRange(path, at.toULong(), WINDOW.toUInt())
+            } catch (_: Exception) {
+                at = -1
+                ByteArray(0)
+            }
+            if (window.isEmpty()) return -1
+        }
+        val from = (position - at).toInt()
+        val n = minOf(size, window.size - from)
+        System.arraycopy(window, from, buffer, offset, n)
+        return n
+    }
+
+    override fun getSize(): Long = size
+
+    @Synchronized
+    override fun close() {
+        window.fill(0)
+        window = ByteArray(0)
+        at = -1
+    }
+
+    private companion object {
+        const val WINDOW = 256 * 1024
+    }
+}
+
 /** A clip decrypted in memory, for MediaPlayer and MediaMetadataRetriever. */
 class BytesSource(private val data: ByteArray) : android.media.MediaDataSource() {
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
@@ -302,4 +460,25 @@ class AndroidFiles(private val ctx: Context) : uniffi.threnody_ffi.SyncedFileSto
 
     override fun keep(name: String, data: ByteArray, clip: Boolean): String? =
         Media.savePrivate(ctx, name, data, null)
+}
+
+/**
+ * Where the main identity keeps files too large for one message
+ * (Appendix U): what it sends is read in pieces where it is (a picked
+ * file through its `content:` URI, never read whole), and what it
+ * downloads is sealed into the private folder as it is written.
+ */
+class AndroidLargeFiles(private val ctx: Context) : uniffi.threnody_ffi.LargeFileStore {
+    override fun size(location: String): ULong? = Media.size(ctx, location)?.toULong()
+
+    override fun readAt(location: String, offset: ULong, len: UInt): ByteArray? =
+        Media.readAt(ctx, location, offset.toLong(), len.toInt())
+
+    override fun reserve(name: String, clip: Boolean): uniffi.threnody_ffi.ReservedFile? = Media.reserve(ctx, name)
+
+    override fun freeSpace(): ULong? = try {
+        android.os.StatFs(ctx.filesDir.path).availableBytes.toULong()
+    } catch (_: Exception) {
+        null
+    }
 }
