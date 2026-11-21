@@ -818,6 +818,7 @@ impl Node {
         }
         let conv = self.conversation_for(peer);
         let contact = self.is_accepted(peer);
+        self.rekey_transfers();
         {
             let t = lock(&self.shared.transfers);
             if t.find_in(conv, offer.id).is_some() {
@@ -872,6 +873,7 @@ impl Node {
     /// Where the download of message `id` in `conv` is; None if it isn't
     /// an offer still kept (contents here already, or never offered).
     pub fn transfer_state(&self, conv: ConversationId, id: u64) -> Option<TransferState> {
+        self.rekey_transfers();
         let t = lock(&self.shared.transfers);
         t.find_in(conv, id).map(|i| t.incoming[i].state())
     }
@@ -879,6 +881,7 @@ impl Node {
     /// Downloads the offered file of message `id` in `conv` (again, after
     /// it ran out of space or failed).
     pub fn download(&self, conv: ConversationId, id: u64) -> Result<TransferState> {
+        self.rekey_transfers();
         {
             let mut t = lock(&self.shared.transfers);
             let i = t
@@ -899,6 +902,7 @@ impl Node {
 
     /// Stops downloading message `id` in `conv`, deleting what came.
     pub fn cancel_download(&self, conv: ConversationId, id: u64) {
+        self.rekey_transfers();
         let mut t = lock(&self.shared.transfers);
         if let Some(i) = t.find_in(conv, id) {
             let inc = &mut t.incoming[i];
@@ -928,6 +932,62 @@ impl Node {
 
     fn drop_partial(&self, t: &Transfers, inc: &Incoming) {
         self.remove_partial(t, &inc.offer.root);
+    }
+
+    /// A peer's conversation moves from its device to its account once
+    /// the account is known (see `conversation_for`), and its history
+    /// with it: offers recorded before follow, so they are still found,
+    /// served and recorded where their entries are. Cheap: once per peer.
+    fn rekey_transfers(&self) {
+        let (mut froms, mut convs) = {
+            let t = lock(&self.shared.transfers);
+            let f: Vec<PublicIdentity> = t.incoming.iter().map(|i| i.from).collect();
+            let c: Vec<ConversationId> = t.outgoing.iter().map(|o| o.conv).collect();
+            (f, c)
+        };
+        froms.sort_by_key(|p| *p.as_bytes());
+        froms.dedup();
+        convs.sort_by_key(ConversationId::to_bytes);
+        convs.dedup();
+        let ins: HashMap<PublicIdentity, ConversationId> = froms
+            .into_iter()
+            .map(|p| (p, self.conversation_for(&p)))
+            .collect();
+        // Ours were recorded under the device they went to, until its
+        // account was known.
+        let outs: HashMap<ConversationId, ConversationId> = convs
+            .into_iter()
+            .filter_map(|c| match c {
+                ConversationId::Peer(b) => PublicIdentity::from_bytes(&b)
+                    .ok()
+                    .map(|p| (c, self.conversation_for(&p))),
+                ConversationId::Group(_) => None,
+            })
+            .filter(|(a, b)| a != b)
+            .collect();
+        let mut t = lock(&self.shared.transfers);
+        let mut moved_in = false;
+        for i in &mut t.incoming {
+            if let Some(c) = ins.get(&i.from)
+                && *c != i.conv
+            {
+                i.conv = *c;
+                moved_in = true;
+            }
+        }
+        let mut moved_out = false;
+        for o in &mut t.outgoing {
+            if let Some(c) = outs.get(&o.conv) {
+                o.conv = *c;
+                moved_out = true;
+            }
+        }
+        if moved_in {
+            self.save_incoming(&t);
+        }
+        if moved_out {
+            self.save_outgoing(&t);
+        }
     }
 
     fn emit_transfer(&self, inc: &Incoming) {
@@ -1060,6 +1120,7 @@ impl Node {
         let Ok(m) = TransferMsg::decode(bytes) else {
             return;
         };
+        self.rekey_transfers();
         match m {
             TransferMsg::Want { .. } => self.on_want(from, m),
             TransferMsg::Have { root } => self.on_have(&from, &root),
@@ -1403,6 +1464,7 @@ impl Node {
     /// Keeps every download whose pieces are all in: decrypted into the
     /// app's store, recorded in history, and the sender told.
     fn finish_ready(&self) {
+        self.rekey_transfers();
         let ready: Vec<(usize, ConversationId, u64)> = {
             let t = lock(&self.shared.transfers);
             t.incoming
@@ -1534,6 +1596,7 @@ impl Node {
     /// Drops offers whose history entry is gone, and ours past
     /// [`SERVE_DAYS`].
     fn drop_stale_transfers(&self) {
+        self.rekey_transfers();
         let (convs, now) = {
             let t = lock(&self.shared.transfers);
             let mut c: Vec<ConversationId> = t

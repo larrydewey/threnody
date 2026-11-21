@@ -102,7 +102,9 @@ Type a line to send it to the current peer. Commands:
   /safety [peer]                        show the safety number
   /verify [peer]                        mark safety number as confirmed
   /file [-s] <path>... [| caption]      send files (photos) to the current peer;
-                                        -s marks them sensitive
+                                        -s marks them sensitive; one over 8 MiB is
+                                        offered and downloaded from here
+  /download <id>                        download a file the current peer offered
   /drop [peer]                          close a session
   /clear [peer]                         delete the messages, keep the contact (all your devices)
   /forget <peer>                        delete a contact and the conversation, on all your devices
@@ -157,6 +159,8 @@ struct Ui {
     asked_direct: std::cell::RefCell<std::collections::HashMap<PublicIdentity, std::time::Instant>>,
     /// The latest offer nobody asked for, for `/wifi-direct join`.
     offered: std::cell::RefCell<Option<(PublicIdentity, threnody_net::DirectOffer)>>,
+    /// Downloads' progress last shown, in tenths, by message id.
+    progress: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
     scratch: PathBuf,
     main_identity: Option<Identity>,
 }
@@ -231,6 +235,13 @@ pub async fn run(opts: Options) -> Result<()> {
     }
     node.set_strip_metadata(opts.strip_metadata);
     node.set_default_timer(opts.default_timer);
+    // Files too large for one message (Appendix U), from and to disk; the
+    // main identity's only, as in the apps.
+    if opts.main_identity.is_none() {
+        node.set_large_file_store(std::sync::Arc::new(DiskLarge {
+            downloads: downloads.clone(),
+        }));
+    }
     if opts.main_identity.is_some() {
         say!(
             "Threnody — anonymous identity {}. Nothing links it to your main one unless you /reveal it.",
@@ -302,6 +313,7 @@ pub async fn run(opts: Options) -> Result<()> {
     }
     let wifi = threnody_radio::wifidirect::Groups::new(&node.identity());
     let mut ui = Ui {
+        progress: std::cell::RefCell::default(),
         node,
         downloads,
         listen_addr,
@@ -735,6 +747,25 @@ impl Ui {
                     id,
                 );
             }
+            AppMessage::Offer(b) => match threnody_core::transfer::Offer::decode(&b) {
+                Ok(o) => {
+                    let state = self
+                        .node
+                        .transfer_state(self.node.conversation_for(&peer), o.id);
+                    say!(
+                        "* {who} offered {}{} ({} bytes): {} — /download {}",
+                        o.name,
+                        file_mark(o.sensitive, o.clip),
+                        o.size,
+                        state.map_or("here".into(), |s| format!("{s:?}")),
+                        o.id
+                    );
+                    if !o.caption.is_empty() && !crate::out::private() {
+                        say!("<{who}> {}", o.caption);
+                    }
+                }
+                Err(e) => say!("! {who} offered a file that doesn't decode: {e}"),
+            },
             AppMessage::Group(payload) => {
                 let node = self.node.clone();
                 let name = |p: &PublicIdentity| name_of(&node, p);
@@ -1463,7 +1494,26 @@ impl Ui {
             // Ticks and files from our other devices: not shown here.
             Event::DeviceSync { .. } => {}
             // The CLI keeps no files, so it takes no offers.
-            Event::Transfer { .. } => {}
+            Event::Transfer {
+                peer, id, state, ..
+            } => {
+                use threnody_net::TransferState as S;
+                let who = self.name(&peer);
+                match state {
+                    S::Fetching { received, total } => {
+                        let tenth = received.saturating_mul(10) / total.max(1);
+                        let mut shown = self.progress.borrow_mut();
+                        if shown.insert(id, tenth) != Some(tenth) {
+                            say!("* download {id} from {who}: {}%", tenth * 10);
+                        }
+                    }
+                    S::Done => {
+                        self.progress.borrow_mut().remove(&id);
+                        say!("* download {id} from {who} done (/history to see where)");
+                    }
+                    other => say!("* download {id} from {who}: {other:?}"),
+                }
+            }
             Event::HistorySynced { from, added } => {
                 say!(
                     "* {added} message(s) synced from your device {}",
@@ -2016,6 +2066,17 @@ impl Ui {
             "file" => {
                 let arg = arg.ok_or_else(|| anyhow!("usage: /file [-s] <path>... [| caption]"))?;
                 let peer = self.current.ok_or_else(|| anyhow!("no current peer"))?;
+                if let Some((path, opts)) = large_file(arg) {
+                    let name = Path::new(&path)
+                        .file_name()
+                        .map_or("file".into(), |n| n.to_string_lossy().into_owned());
+                    let node = self.node.clone();
+                    // Read through once to hash it: off the event loop.
+                    tokio::task::spawn_blocking(move || node.send_file_at(&peer, name, path, opts))
+                        .await??;
+                    say!("* offered it to {}", self.name(&peer));
+                    return Ok(false);
+                }
                 let files = read_files(arg).await?;
                 let (n, len) = (
                     files.len(),
@@ -2025,6 +2086,14 @@ impl Ui {
                     self.node.send_file(&peer, f)?;
                 }
                 say!("* sent {n} file(s), {len} bytes, to {}", self.name(&peer));
+            }
+            "download" => {
+                let id: u64 = arg
+                    .and_then(|a| a.trim().parse().ok())
+                    .ok_or_else(|| anyhow!("usage: /download <id>"))?;
+                let peer = self.current.ok_or_else(|| anyhow!("no current peer"))?;
+                let state = self.node.download(self.node.conversation_for(&peer), id)?;
+                say!("* download {id}: {state:?}");
             }
             "drop" => {
                 let p = self.resolve_peer(arg)?;
@@ -2635,6 +2704,66 @@ pub(crate) async fn read_files(arg: &str) -> Result<Vec<OutgoingFile>> {
     Ok(out)
 }
 
+/// For `/file`: one file larger than fits a message, as `[-s] <path> [|
+/// caption]`, with how to send it; None for anything else.
+fn large_file(arg: &str) -> Option<(String, threnody_net::SendOptions)> {
+    let (path, caption) = match arg.split_once('|') {
+        Some((p, c)) => (p.trim(), c.trim()),
+        None => (arg.trim(), ""),
+    };
+    let (sensitive, path) = match path.strip_prefix("-s ") {
+        Some(rest) => (true, rest.trim()),
+        None => (false, path),
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() <= threnody_core::message::MAX_FILE as u64 {
+        return None;
+    }
+    let path = std::fs::canonicalize(path).ok()?.display().to_string();
+    Some((
+        path,
+        threnody_net::SendOptions {
+            sensitive,
+            caption: caption.to_owned(),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Files too large for one message, on disk (Appendix U): sent from
+/// their paths, downloads saved under `downloads` as received files are.
+struct DiskLarge {
+    downloads: PathBuf,
+}
+
+impl threnody_net::LargeFileStore for DiskLarge {
+    fn size(&self, location: &str) -> Option<u64> {
+        std::fs::metadata(location)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+    }
+
+    fn read_at(&self, location: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(location).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut out = Vec::with_capacity(len);
+        f.take(len as u64).read_to_end(&mut out).ok()?;
+        Some(out)
+    }
+
+    fn keep_stream(&self, name: &str, _clip: bool, src: &mut dyn std::io::Read) -> Option<String> {
+        save_download_from(&self.downloads, name, src)
+            .ok()
+            .map(|p| p.display().to_string())
+    }
+
+    fn free_space(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// Saves a received file under `dir` using only its final path component,
 /// never overwriting an existing file.
 /// What to say after a received file's name: whether it is sensitive,
@@ -2653,6 +2782,12 @@ pub(crate) fn file_mark(sensitive: bool, clip: Option<Clip>) -> String {
 }
 
 pub(crate) fn save_download(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
+    save_download_from(dir, name, &mut &data[..])
+}
+
+/// As [`save_download`], for what `src` reads; nothing is left if reading
+/// fails.
+fn save_download_from(dir: &Path, name: &str, src: &mut dyn std::io::Read) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let base: String = Path::new(name)
         .file_name()
@@ -2677,8 +2812,11 @@ pub(crate) fn save_download(dir: &Path, name: &str, data: &[u8]) -> Result<PathB
             .open(&candidate)
         {
             Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(data)?;
+                if let Err(e) = std::io::copy(src, &mut f) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(e.into());
+                }
                 return Ok(candidate);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
