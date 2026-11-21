@@ -69,6 +69,8 @@ extension NodeEvent {
             return peer
         case let .file(peer, _, _, _, _, _, _, _, _, _):
             return peer
+        case let .fileOffered(peer, _, _, _, _, _, _, _, _, _), let .transferChanged(peer, _, _):
+            return peer
         case let .scheduledChanged(peer?, _):
             return peer
         case let .scheduledFailed(peer?, _, _, _):
@@ -216,6 +218,9 @@ final class NodeStore: ObservableObject {
         // The user's settings before it listens: with "Reach contacts over
         // the internet" off, it never joins the DHT, even for a moment.
         Privacy.apply(to: n, persona: false)
+        // Before it listens, so its first sessions already say it takes
+        // files too large for one message (Appendix U).
+        n.setLargeFileStore(store: IosLargeFiles())
         // The usual port, or any free one if it's taken.
         let addr: String
         if let a = try? n.listen(addr: "0.0.0.0:7450") {
@@ -364,7 +369,8 @@ final class NodeStore: ObservableObject {
         case let .message(peer, text, _, quiet):
             setTyping(peer, false)
             notifyContact(peer, persona: persona, node: n, body: text, quiet: quiet)
-        case let .file(peer, name, _, _, sensitive, caption, _, clip, quiet, _):
+        case let .file(peer, name, _, _, sensitive, caption, _, clip, quiet, _),
+             let .fileOffered(peer, name, _, _, sensitive, caption, _, clip, quiet, _):
             let label = fileLabel(name: name, sensitive: sensitive, caption: caption, clip: clip)
             notifyContact(peer, persona: persona, node: n, body: label, quiet: quiet)
         case let .messageRequest(peer, _, _):
