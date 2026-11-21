@@ -48,7 +48,9 @@ pub use push::{PushEndpoint, WakeReport};
 mod schedule;
 pub use schedule::{ScheduleFailure, ScheduledInfo};
 mod tap;
+mod transfer;
 pub use tap::{NfcCard, NfcFailure, NfcOutcome, NfcReader, NfcStep, NfcTransport};
+pub use transfer::{LargeFileStore, ReservedFile, TransferState};
 mod volunteer;
 pub use persona::{PersonaRecord, ProfileAttr};
 pub use volunteer::{
@@ -814,6 +816,29 @@ pub enum NodeEvent {
         /// Forwarded from another chat: pass it on in `FileOptions`.
         forwarded: bool,
     },
+    /// `peer` offered a file too large for one message (Appendix U). The
+    /// node recorded it in history without its contents: reload the
+    /// conversation, and download it with `download_file(peer, id)` (or
+    /// show `transfer_state`). It may already be downloading by itself.
+    FileOffered {
+        peer: String,
+        name: String,
+        size: u64,
+        id: u64,
+        sensitive: bool,
+        caption: String,
+        album: u64,
+        clip: Option<Clip>,
+        /// As for `Message`.
+        quiet: bool,
+        forwarded: bool,
+    },
+    /// The download of the file `peer` offered as message `id` changed.
+    TransferChanged {
+        peer: String,
+        id: u64,
+        state: TransferState,
+    },
     /// `peer` edited a message: reload its conversation.
     MessageEdited {
         peer: String,
@@ -1377,8 +1402,38 @@ fn convert(e: Event) -> NodeEvent {
             text: text_of(&msg),
             file: match msg {
                 AppMessage::File { name, .. } => Some(name),
+                AppMessage::Offer(b) => threnody_core::transfer::Offer::decode(&b)
+                    .ok()
+                    .map(|o| o.name),
                 _ => None,
             },
+        },
+        Event::Message {
+            peer,
+            msg: AppMessage::Offer(b),
+        } => match threnody_core::transfer::Offer::decode(&b) {
+            Ok(o) => NodeEvent::FileOffered {
+                peer: fp(&peer),
+                name: o.name,
+                size: o.size,
+                id: o.id,
+                sensitive: o.sensitive,
+                caption: o.caption,
+                album: o.album,
+                clip: o.clip.map(Into::into),
+                quiet: false,
+                forwarded: o.forwarded,
+            },
+            Err(_) => NodeEvent::Other {
+                description: "an offer that doesn't decode".into(),
+            },
+        },
+        Event::Transfer {
+            peer, id, state, ..
+        } => NodeEvent::TransferChanged {
+            peer: fp(&peer),
+            id,
+            state: state.into(),
         },
         Event::Read { peer, .. } => NodeEvent::Read { peer: fp(&peer) },
         Event::ProfileChanged { peer } => NodeEvent::ProfileChanged { peer: fp(&peer) },
@@ -3041,7 +3096,9 @@ impl ThrenodyNode {
         // us directly (its breakthrough); the chat's own "off" stays off.
         let device = |s: &str| self.resolve(s).ok().map(|p| *p.as_bytes());
         match &mut e {
-            NodeEvent::Message { peer, quiet, .. } | NodeEvent::File { peer, quiet, .. } => {
+            NodeEvent::Message { peer, quiet, .. }
+            | NodeEvent::File { peer, quiet, .. }
+            | NodeEvent::FileOffered { peer, quiet, .. } => {
                 if let Ok(p) = self.resolve(peer) {
                     let conv = self.node.conversation_for(&p);
                     *quiet = level(conv) != Notify::All
@@ -3213,6 +3270,7 @@ impl ThrenodyNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use threnody_core::transfer as tx;
 
     /// Apps open nodes with tunnels off and call `set_tunnel_port(None)`
     /// when they find them off at start: that deletes saved tunnel keys a
@@ -5637,5 +5695,204 @@ mod tests {
             .delete_group_entry(g, sent.at_ms, sent.device)
             .unwrap();
         assert_eq!(alice.file_locations().unwrap(), ["media/p-b.txt"]);
+    }
+
+    /// Files in a directory, for transfers too large for one message.
+    struct TempLarge {
+        dir: std::path::PathBuf,
+        free: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl LargeFileStore for TempLarge {
+        fn size(&self, location: String) -> Option<u64> {
+            std::fs::metadata(location).ok().map(|m| m.len())
+        }
+
+        fn read_at(&self, location: String, offset: u64, len: u32) -> Option<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(location).ok()?;
+            f.seek(SeekFrom::Start(offset)).ok()?;
+            let mut out = Vec::new();
+            f.take(u64::from(len)).read_to_end(&mut out).ok()?;
+            Some(out)
+        }
+
+        fn reserve(&self, name: String, _clip: bool) -> Option<ReservedFile> {
+            let p = self
+                .dir
+                .join(format!("kept-{}-{name}", threnody_net::history::local_id()));
+            std::fs::write(&p, b"").ok()?;
+            let path = p.display().to_string();
+            Some(ReservedFile {
+                path: path.clone(),
+                location: path,
+            })
+        }
+
+        fn free_space(&self) -> Option<u64> {
+            Some(self.free.load(std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    #[test]
+    fn large_files_are_offered_and_pulled_in_pieces() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let open = |n: &str| {
+            ThrenodyNode::open(dir.path().join(n).display().to_string(), None, None).unwrap()
+        };
+        let (alice, bob) = (open("a"), open("b"));
+        alice.set_call_devices(false);
+        bob.set_call_devices(false);
+        let free = Arc::new(AtomicU64::new(u64::MAX / 2));
+        for (n, name) in [(&alice, "a"), (&bob, "b")] {
+            n.set_large_file_store(Arc::new(TempLarge {
+                dir: dir.path().join(name),
+                free: free.clone(),
+            }));
+            // Offered past one piece, so the test needn't move 8 MiB.
+            n.node.set_large_threshold(tx::PIECE as u64);
+        }
+        let addr = bob.listen("127.0.0.1:0".into()).unwrap();
+        let bob_fp = alice.connect(bob.invite_link(addr)).unwrap();
+        let alice_fp = alice.device_fingerprint();
+        wait(&bob, |e| matches!(e, NodeEvent::Connected { .. }));
+        bob.accept_contact(alice_fp.clone()).unwrap();
+
+        // A file that fits a message still goes inline.
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, b"short").unwrap();
+        alice
+            .send_file_at(
+                bob_fp.clone(),
+                "small.txt".into(),
+                small.display().to_string(),
+                file_options(),
+            )
+            .unwrap();
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::File { name, .. } if name == "small.txt"),
+        );
+
+        // A large one is offered, and waits for a tap.
+        let data: Vec<u8> = (0..3 * tx::PIECE + 1234)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let big = dir.path().join("data.bin");
+        std::fs::write(&big, &data).unwrap();
+        alice
+            .send_file_at(
+                bob_fp.clone(),
+                "data.bin".into(),
+                big.display().to_string(),
+                FileOptions {
+                    caption: "the data".into(),
+                    ..file_options()
+                },
+            )
+            .unwrap();
+        let e = wait(&bob, |e| matches!(e, NodeEvent::FileOffered { .. }));
+        let NodeEvent::FileOffered {
+            name,
+            size,
+            id,
+            caption,
+            ..
+        } = e
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (name.as_str(), size, caption.as_str()),
+            ("data.bin", data.len() as u64, "the data")
+        );
+        assert_eq!(
+            bob.transfer_state(alice_fp.clone(), id),
+            Some(TransferState::Idle)
+        );
+        let entry = bob.history(alice_fp.clone(), 1).unwrap().pop().unwrap();
+        assert!(entry.file.as_ref().is_some_and(|f| f.location.is_none()));
+
+        // Too little room: it doesn't start.
+        free.store(1000, Ordering::Relaxed);
+        bob.download_file(alice_fp.clone(), id).unwrap();
+        assert_eq!(
+            bob.transfer_state(alice_fp.clone(), id),
+            Some(TransferState::NoSpace)
+        );
+        free.store(u64::MAX / 2, Ordering::Relaxed);
+
+        bob.download_file(alice_fp.clone(), id).unwrap();
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::TransferChanged { id: i, state: TransferState::Done, .. } if *i == id),
+        );
+        assert_eq!(bob.transfer_state(alice_fp.clone(), id), None);
+        let entry = bob.history(alice_fp.clone(), 1).unwrap().pop().unwrap();
+        let loc = entry.file.unwrap().location.expect("kept");
+        assert!(is_sealed_media(loc.clone()), "kept sealed");
+        assert_eq!(bob.open_media(loc).unwrap(), data);
+        // No piece outlives the transfer.
+        let partial = dir.path().join("b").join("transfers");
+        let left: Vec<_> = std::fs::read_dir(&partial)
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+        // The sender hears `Have` and stops serving.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while alice.node.files_served() != 0 {
+            assert!(std::time::Instant::now() < end, "sender still serving");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // A photo from a contact comes by itself.
+        let pic = dir.path().join("pic.png");
+        std::fs::write(&pic, &data[..2 * tx::PIECE]).unwrap();
+        alice
+            .send_file_at(
+                bob_fp.clone(),
+                "pic.png".into(),
+                pic.display().to_string(),
+                file_options(),
+            )
+            .unwrap();
+        wait(&bob, |e| {
+            matches!(
+                e,
+                NodeEvent::TransferChanged {
+                    state: TransferState::Done,
+                    ..
+                }
+            )
+        });
+        let entry = bob.history(alice_fp.clone(), 1).unwrap().pop().unwrap();
+        let loc = entry.file.unwrap().location.expect("kept");
+        assert_eq!(bob.open_media(loc).unwrap(), &data[..2 * tx::PIECE]);
+
+        // A file changed since it was offered isn't served as something
+        // else: the download says it's unavailable.
+        let doc = dir.path().join("doc.bin");
+        std::fs::write(&doc, &data).unwrap();
+        alice
+            .send_file_at(
+                bob_fp.clone(),
+                "doc.bin".into(),
+                doc.display().to_string(),
+                file_options(),
+            )
+            .unwrap();
+        let e = wait(&bob, |e| matches!(e, NodeEvent::FileOffered { .. }));
+        let NodeEvent::FileOffered { id, .. } = e else {
+            unreachable!()
+        };
+        let mut changed = data.clone();
+        changed[tx::PIECE + 5] ^= 1;
+        std::fs::write(&doc, &changed).unwrap();
+        bob.download_file(alice_fp.clone(), id).unwrap();
+        wait(
+            &bob,
+            |e| matches!(e, NodeEvent::TransferChanged { id: i, state: TransferState::Unavailable, .. } if *i == id),
+        );
     }
 }

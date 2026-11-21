@@ -40,7 +40,7 @@ Hello    = { 0 => 0, ? 5 => uint }                         ; feature bits (1 ack
                                                            ; 512 read, 1024 calls, 2048 pin, 4096 lists,
                                                            ; 8192 tunnel, 16384 push, 32768 timed probes, 65536 timer off,
                                                            ; 131072 receipts, 262144 device sync,
-                                                           ; 524288 large files, reserved: not yet sent); absent = 0
+                                                           ; 524288 large files: only nodes with a large-file store, Appendix U); absent = 0
 Text     = { 0 => 1, 1 => uint, 2 => tstr, ? 4 => uint, ? 5 => uint,   ; sent_ms, body, disappear after (s), sender's message id,
              ? 6 => uint,                                              ; flags (8 forwarded, 16 timer off)
              ? 10 => uint, ? 11 => bstr .size 32, ? 12 => tstr,    ; quoted message id, its sender's device, its text (≤ 200 chars)

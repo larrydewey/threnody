@@ -225,6 +225,14 @@ pub enum Event {
     DeviceSync {
         from: PublicIdentity,
     },
+    /// The download of the file `peer` offered as message `id` in `conv`
+    /// changed (Appendix U).
+    Transfer {
+        conv: threnody_core::history::ConversationId,
+        peer: PublicIdentity,
+        id: u64,
+        state: crate::transfer::TransferState,
+    },
     /// `peer` (or one of our devices) pinned (or unpinned) message `id`.
     Pinned {
         peer: PublicIdentity,
@@ -643,7 +651,11 @@ pub(crate) struct Shared {
     pub(crate) receipt_delay: Mutex<(u64, u64)>,
     /// Feature bits this node puts in its contact sessions' `Hello`
     /// (`FEATURES` less any withheld with [`Node::withhold_features`]).
-    features: AtomicU64,
+    pub(crate) features: AtomicU64,
+    /// Files offered and pulled in pieces (see `transfer`).
+    pub(crate) transfers: Mutex<crate::transfer::Transfers>,
+    /// Files over this many bytes are offered rather than sent inline.
+    pub(crate) large_threshold: AtomicU64,
     /// How far each of our other devices has our history (see `sync`).
     pub(crate) sync: Mutex<crate::sync::SyncState>,
     /// How far each of our other devices has our ticks (see `sync`).
@@ -959,6 +971,17 @@ impl Node {
                 .flatten()
                 .unwrap_or_default(),
         );
+        let transfers = {
+            let load = |name| cfg.home.load_state(&cfg.identity, name).ok().flatten();
+            let (out, inc) = (
+                load(threnody_core::transfer::STATE_OUT),
+                load(threnody_core::transfer::STATE_IN),
+            );
+            crate::transfer::Transfers::decode(
+                out.as_deref().map(|v| &v[..]),
+                inc.as_deref().map(|v| &v[..]),
+            )
+        };
         let ticks_sync = crate::sync::SyncState::decode(
             &cfg.home
                 .load_state(&cfg.identity, crate::sync::TICKS_STATE)
@@ -1049,6 +1072,8 @@ impl Node {
                 crate::receipts::MAX_DELAY_MS,
             )),
             features: AtomicU64::new(FEATURES),
+            transfers: Mutex::new(transfers),
+            large_threshold: AtomicU64::new(threnody_core::message::MAX_FILE as u64),
             quic: Mutex::new(None),
             reach: crate::reach::ReachState::new(!persona),
             recover: crate::recover::RecoverState::new(),
@@ -2556,6 +2581,7 @@ where
                         }
                         node.send_profile(&peer);
                         node.device_sync_hello(&peer);
+                        node.transfers_hello(&peer);
                         node.offer_to_late_device(&peer);
                         if let Some(addr) = observed
                             && features & FEATURE_OBSERVED != 0
@@ -2607,9 +2633,19 @@ where
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }
                         | AppMessage::Ack(_) => {}
-                        // Not advertised yet (FEATURE_LARGE_FILES), so no
-                        // peer should send these: dropped.
-                        AppMessage::Offer(_) | AppMessage::Transfer(_) => {}
+                        AppMessage::Offer(bytes) => {
+                            // Recorded in history by the node itself: the
+                            // app downloads it when it wants it.
+                            if node.on_file_offer(&peer, &bytes) {
+                                let msg = AppMessage::Offer(bytes);
+                                if node.is_accepted(&peer) {
+                                    shared.emit(Event::Message { peer, msg });
+                                } else {
+                                    shared.emit(Event::MessageRequest { peer, msg });
+                                }
+                            }
+                        }
+                        AppMessage::Transfer(bytes) => node.on_transfer(peer, &bytes),
                         AppMessage::Approval { approved } => {
                             let changed = {
                                 let mut contacts = lock(&shared.contacts);
@@ -2926,6 +2962,7 @@ fn personal(m: &AppMessage) -> bool {
     match m {
         AppMessage::Text { .. }
         | AppMessage::File { .. }
+        | AppMessage::Offer(_)
         | AppMessage::Group(_)
         | AppMessage::Edit { .. }
         | AppMessage::Delete { .. }
@@ -2963,11 +3000,16 @@ fn next_personal(
     None
 }
 
-/// Call signalling and media, and tunnel packets: sent at once even under
-/// constant-rate cover traffic.
+/// Call signalling and media, tunnel packets, and the pieces of large
+/// files (Appendix U): sent at once even under constant-rate cover
+/// traffic. Their volume shows whatever the ticks do, and a piece a tick
+/// would take hours over a large file.
 fn urgent(m: &AppMessage) -> bool {
     match m {
-        AppMessage::Call(_) | AppMessage::Media(_) | AppMessage::Tunnel(_) => true,
+        AppMessage::Call(_)
+        | AppMessage::Media(_)
+        | AppMessage::Tunnel(_)
+        | AppMessage::Transfer(_) => true,
         AppMessage::Tracked { inner, .. } => urgent(inner),
         _ => false,
     }

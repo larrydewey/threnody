@@ -306,6 +306,76 @@ impl MediaKey {
         replace_with(dst, |w| self.seal_stream(data, w).map(|_| ()))
     }
 
+    /// Seals everything `r` reads into a new file at `dst` (replacing one
+    /// there), a chunk at a time; the plaintext length.
+    pub fn seal_reader_to_file(&self, r: impl Read, dst: &Path) -> Result<u64> {
+        let mut total = 0;
+        replace_with(dst, |w| {
+            total = self.seal_stream(r, w)?;
+            Ok(())
+        })?;
+        Ok(total)
+    }
+
+    /// Up to `len` bytes of what the file at `path` holds from `offset`
+    /// (fewer at its end, none past it): decrypting only the chunks they
+    /// lie in if it is sealed, read as they are if it was kept before
+    /// media was sealed.
+    pub fn read_range(&self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Seek, SeekFrom};
+        let mut f = fs::File::open(path)?;
+        let file_len = f.metadata()?.len();
+        let mut header = [0u8; HEADER_LEN];
+        let n = read_full(&mut f, &mut header)?;
+        if !is_sealed(&header[..n.min(MAGIC.len())]) || n < HEADER_LEN {
+            let end = offset.saturating_add(len as u64).min(file_len);
+            if offset >= end {
+                return Ok(Vec::new());
+            }
+            f.seek(SeekFrom::Start(offset))?;
+            let mut out = vec![0u8; (end - offset) as usize];
+            f.read_exact(&mut out)?;
+            return Ok(out);
+        }
+        let total = plaintext_len(file_len).ok_or(Error::Malformed("damaged media file"))?;
+        let end = offset.saturating_add(len as u64).min(total);
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        let body = file_len - HEADER_LEN as u64;
+        let chunks = body.div_ceil(SEALED_CHUNK as u64);
+        let first = offset / CHUNK as u64;
+        let last = (end - 1) / CHUNK as u64;
+        let mut c = Cipher::new(self, header);
+        c.counter = first;
+        f.seek(SeekFrom::Start(
+            HEADER_LEN as u64 + first * SEALED_CHUNK as u64,
+        ))?;
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        let mut ct = vec![0u8; SEALED_CHUNK];
+        for i in first..=last {
+            let want = if i + 1 == chunks {
+                (body - i * SEALED_CHUNK as u64) as usize
+            } else {
+                SEALED_CHUNK
+            };
+            f.read_exact(&mut ct[..want])?;
+            let pt = Zeroizing::new(c.open(&ct[..want], i + 1 == chunks)?);
+            let from = if i == first {
+                (offset - first * CHUNK as u64) as usize
+            } else {
+                0
+            };
+            let to = if i == last {
+                (end - last * CHUNK as u64) as usize
+            } else {
+                pt.len()
+            };
+            out.extend_from_slice(pt.get(from..to).ok_or(Error::Decrypt)?);
+        }
+        Ok(out)
+    }
+
     /// Seals the file `src` into `dst`, a chunk at a time. With `src` and
     /// `dst` the same file, seals it in place: the plaintext is overwritten
     /// ([`crate::store::secure_delete`]) before the sealed copy takes its
@@ -466,6 +536,49 @@ fn replace_with(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ranges_read_only_what_they_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = MediaKey::from_bytes([3; 32]);
+        for len in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK + 17] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 256) as u8).collect();
+            let sealed = dir.path().join(format!("s{len}"));
+            assert_eq!(
+                key.seal_reader_to_file(&data[..], &sealed).unwrap(),
+                len as u64
+            );
+            let plain = dir.path().join(format!("p{len}"));
+            fs::write(&plain, &data).unwrap();
+            for (off, n) in [
+                (0, len),
+                (0, 10),
+                (5, CHUNK),
+                (CHUNK.saturating_sub(3), 7),
+                (len.saturating_sub(1), 100),
+                (len, 5),
+                (len + 10, 5),
+            ] {
+                let start = off.min(len);
+                let end = (off + n).min(len);
+                let want = &data[start..end.max(start)];
+                for p in [&sealed, &plain] {
+                    assert_eq!(
+                        key.read_range(p, off as u64, n).unwrap(),
+                        want,
+                        "len {len} at {off}+{n}"
+                    );
+                }
+            }
+        }
+        // A sealed file cut at a chunk boundary doesn't read as ending there.
+        let data = vec![9u8; 2 * CHUNK + 5];
+        let p = dir.path().join("cut");
+        key.seal_reader_to_file(&data[..], &p).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_len((HEADER_LEN + SEALED_CHUNK) as u64).unwrap();
+        assert!(key.read_range(&p, 0, 10).is_err());
+    }
     use super::*;
 
     fn key() -> MediaKey {

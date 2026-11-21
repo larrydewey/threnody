@@ -116,7 +116,8 @@ pub const FEATURE_RECEIPTS: u64 = 131072;
 pub const FEATURE_DEVICE_SYNC: u64 = 262144;
 /// The peer understands `AppMessage::Offer` and `AppMessage::Transfer`:
 /// files over [`MAX_FILE`] offered and pulled in pieces (Appendix U). Not
-/// in [`FEATURES`] until the node can take part in transfers.
+/// in [`FEATURES`]: a node adds it once the app installs a large-file
+/// store (`Node::set_large_file_store`).
 pub const FEATURE_LARGE_FILES: u64 = 524288;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
@@ -1094,8 +1095,8 @@ mod tests {
             assert_eq!(all & b, 0, "{b} is used twice");
             all |= b;
         }
-        // FEATURE_LARGE_FILES is reserved, not advertised until the node
-        // takes part in transfers.
+        // FEATURE_LARGE_FILES is added per node, once it has a large-file
+        // store (see threnody-net).
         assert_eq!(
             all & !FEATURE_LARGE_FILES,
             FEATURES,

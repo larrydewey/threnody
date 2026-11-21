@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft. Phase 1 has begun: the offer and transfer codecs and the piece cryptography are in `threnody_core::transfer`, but the node doesn't send or answer them yet. Today a file travels whole inside one `File` message (Appendix C), so it is capped at 8 MiB (`message::MAX_FILE`). Every receiver rejects anything larger as malformed. That number is load-bearing: the 16 MiB encoder cap (`cbor::MAX_ENCODED`) and transport frame, the sender's 32 MiB of tracked messages per peer, group holds (32 MiB per member), device sync (`Part.total ≤ 8 MiB`) and whole-buffer metadata stripping (`media::strip`) are all sized around it. Apps also read the whole file into memory before sending (Android's `readBytes`, `send_file(data: Vec<u8>)`).
+Draft. Phase 1 is under way. The codecs and piece cryptography are in `threnody_core::transfer`, and the node offers, serves and downloads files (`threnody_net::transfer`, see *Phase 1 as built*), but only once an app installs a large-file store, and no app does yet. Until then nothing changes on the wire. Today a file travels whole inside one `File` message (Appendix C), so it is capped at 8 MiB (`message::MAX_FILE`). Every receiver rejects anything larger as malformed. That number is load-bearing: the 16 MiB encoder cap (`cbor::MAX_ENCODED`) and transport frame, the sender's 32 MiB of tracked messages per peer, group holds (32 MiB per member), device sync (`Part.total ≤ 8 MiB`) and whole-buffer metadata stripping (`media::strip`) are all sized around it. Apps also read the whole file into memory before sending (Android's `readBytes`, `send_file(data: Vec<u8>)`).
 
 This appendix replaces the cap for files over 8 MiB with an **offer** plus **pieces pulled by the receiver**. The only practical limit is then the receiver's free space, which the receiver checks itself and never reveals. The piece format is built so that a file can later come from several sources at once (a swarm) among parties who already hold it: the sender's devices, the receiver's own devices, and group members.
 
@@ -102,7 +102,7 @@ Simpler, and private to you: **your own always-on relay node** (docs/relay-node.
 
 ## Policy and settings
 
-- **Receiver.** Automatic downloads follow today's rules (photos, voice and video, not sensitive, not disappearing), with an extra limit: files under the auto-download size (default 25 MB on Wi-Fi, 8 MB on mobile data) when free space after the download stays above the margin (default 10% of the volume or 1 GB, whichever is less). Message requests never download automatically. Anything else waits for a tap.
+- **Receiver.** Automatic downloads follow today's rules (photos, voice and video, not sensitive), with an extra limit: files of at most 25 MB on Wi-Fi and 8 MB on mobile data. Message requests never download automatically. Anything else waits for a tap. Any download, automatic or asked for, starts only if the space free covers the partial file, the kept copy and 512 MiB more; otherwise it shows *not enough space* and nothing goes on the network.
 - **Serving for others** (siblings serving the other account, group members serving each other): on unmetered networks only by default; a setting "Help deliver files in groups" turns it off. The sender always serves its own sends.
 - **Disappearing messages.** When the entry expires, the holder discards `K`, stops serving and deletes the file, partial or complete, along with any shares it can still reach in stores.
 - **Sensitive files.** Never downloaded automatically. Holders that downloaded one may serve it to other parties of the same chat.
@@ -110,7 +110,7 @@ Simpler, and private to you: **your own always-on relay node** (docs/relay-node.
 
 ## Metadata
 
-`media::strip` and `as_sent` take the whole file in memory. Large videos need streaming stripping (the BMFF walker in `media/bmff.rs` rewriting box by box into a temporary file). Images over 8 MiB are rare once converted, but conversion still decodes at most 4096 px on the longer side (memory-bound bitmaps); that stays. A file that can't be stripped streaming is refused, as now, never sent with its metadata.
+For now a photo or video whose metadata is removed is read whole to strip it, so one over 64 MiB is refused while metadata removal is on (the app says to turn it off to send it). A sender serving it strips it again, keeping the stripped copy in memory for two minutes between windows. `media::strip` and `as_sent` take the whole file in memory. Large videos need streaming stripping (the BMFF walker in `media/bmff.rs` rewriting box by box into a temporary file). Images over 8 MiB are rare once converted, but conversion still decodes at most 4096 px on the longer side (memory-bound bitmaps); that stays. A file that can't be stripped streaming is refused, as now, never sent with its metadata.
 
 ## Limits that change
 
@@ -124,6 +124,16 @@ Simpler, and private to you: **your own always-on relay node** (docs/relay-node.
 | Device sync `Part.total` | 8 MiB | replaced by this format |
 
 Inline `File` stays for files of at most 8 MiB to peers without the bit. To such a peer a larger file fails at once with "Alex's app needs an update to receive files over 8 MB".
+
+## Phase 1 as built
+
+- **Opting in.** An app installs a large-file store (`set_large_file_store`): size and range reads of a location, a reserved private path for a received file, and the free space. The node then adds `FEATURE_LARGE_FILES` to the `Hello` of sessions that start afterwards. Without a store (the CLI, personas for now), nothing changes.
+- **Sending.** `send_file_at(peer, name, location, options)` reads through the store. A file of at most 8 MiB, or any file to a peer without the bit, goes inline as before (a larger one to such a peer fails with "their app needs an update"). Otherwise the node prepares it once, keeps `K`, the root and where it is in `transfers-out`, and the hash list in `xfer-<first 16 bytes of the root, hex>`, then sends the `Offer` tracked, like a file: it waits for a session, since offers aren't sealed for mailboxes yet. History records the file at its location.
+- **Receiving.** The node records an offer in history itself, without contents, keeps it in `transfers-in` (at most 256), and tells the app (`FileOffered`). Downloads run at most two at a time, only over a live session with the sender. The hash list comes first, one part at a time, and is checked against the root. Pieces follow in windows of 8: each is checked against its hash and written, still encrypted under `K`, to `transfers/<root>.part` in the node's home. After a restart that file is checked piece by piece and the download goes on from the first missing piece. A window with nothing for 60 s is asked again. A `Missing` from the sender makes the download *unavailable*.
+- **Finishing.** With every piece in, the node decrypts the partial file a piece at a time into the path the store reserved, sealing it as received media is sealed, records that location in history, deletes the partial file and the hash list, and sends `Have`. The sender then forgets the offer.
+- **Serving.** The sender answers only a `Want` from the conversation it offered the file to. Each piece is made again from the file as it is now and sent only if its hash is the one committed to; otherwise the piece is listed in `Missing`. Offers go after 30 days, or once their history entry is deleted or expired, as do incoming offers whose entry is gone (with their partial files).
+- **Cover traffic.** `Transfer` messages skip constant-rate ticks, as calls do: a transfer's volume shows whatever the ticks do, and one 256 KiB piece per tick (every 2 s by default) would take hours over a large file. The `Offer` itself waits for a tick like any message.
+- **Backups** leave transfer state out (`transfers-out`, `transfers-in`, `xfer-*`): a restore has none of the files it refers to.
 
 ## Work plan
 

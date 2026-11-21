@@ -1462,6 +1462,8 @@ impl Ui {
             }
             // Ticks and files from our other devices: not shown here.
             Event::DeviceSync { .. } => {}
+            // The CLI keeps no files, so it takes no offers.
+            Event::Transfer { .. } => {}
             Event::HistorySynced { from, added } => {
                 say!(
                     "* {added} message(s) synced from your device {}",
