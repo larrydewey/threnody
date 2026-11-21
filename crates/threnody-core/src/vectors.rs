@@ -19,6 +19,7 @@ use crate::crypto::rng::Rng as RngSource;
 use crate::handshake::{Initiator, Responder};
 use crate::identity::{Identity, safety_number};
 use crate::message::AppMessage;
+use crate::transfer;
 
 const HEADER: &str = "\
 # Threnody protocol v1 test vectors.
@@ -151,6 +152,38 @@ fn generate() -> String {
         hex(&m1),
     );
     put("ratchet.2 (a -> b, Approval true)", hex(&m2));
+
+    // Offered files (Appendix U): one full piece and a 16-byte last one.
+    let key = transfer::FileKey::from_bytes(seed(0x40));
+    let size = transfer::PIECE as u64 + 16;
+    let file: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let (hashes, root) = transfer::prepare(&key, size, &file[..]).unwrap();
+    let last = transfer::seal_piece(&key, size, 1, &file[transfer::PIECE..]).unwrap();
+    let offer = transfer::Offer {
+        sent_ms: 1_791_000_000_000,
+        id: 7,
+        name: "boat.mp4".into(),
+        size,
+        root,
+        key: *key.as_bytes(),
+        sensitive: false,
+        forwarded: false,
+        clip: None,
+        caption: String::new(),
+        album: 0,
+        thumbnail: Vec::new(),
+    };
+    put(
+        "\n# offered file (byte i of the file is i mod 251)",
+        String::new(),
+    );
+    put("file.key", hex(key.as_bytes()));
+    put("file.size", size.to_string());
+    put("file.hash.0", hex(&hashes[0]));
+    put("file.piece.1", hex(&last));
+    put("file.hash.1", hex(&hashes[1]));
+    put("file.root", hex(&root));
+    put("file.offer", hex(&offer.encode().unwrap()));
     out
 }
 

@@ -55,6 +55,9 @@ pub mod label {
     pub const APP_LOCK_KEY: &str = "threnody v1 2026-11-05 app lock file key";
     pub const MEDIA_KEY: &str = "threnody v1 2026-11-17 media at rest";
     pub const MEDIA_FILE_KEY: &str = "threnody v1 2026-11-17 media file key";
+    pub const FILE_PIECE_KEY: &str = "threnody v1 2026-11-20 file piece key";
+    pub const FILE_PIECE_NONCE: &str = "threnody v1 2026-11-20 file piece nonce";
+    pub const FILE_ROOT: &str = "threnody v1 2026-11-20 file root";
 }
 
 /// Fills `out` from the KDF.

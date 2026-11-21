@@ -60,3 +60,9 @@ name = "nfc_card"
 path = "fuzz_targets/nfc_card.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "transfer"
+path = "fuzz_targets/transfer.rs"
+test = false
+doc = false

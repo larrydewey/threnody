@@ -2607,6 +2607,9 @@ where
                         | AppMessage::Cover
                         | AppMessage::Tracked { .. }
                         | AppMessage::Ack(_) => {}
+                        // Not advertised yet (FEATURE_LARGE_FILES), so no
+                        // peer should send these: dropped.
+                        AppMessage::Offer(_) | AppMessage::Transfer(_) => {}
                         AppMessage::Approval { approved } => {
                             let changed = {
                                 let mut contacts = lock(&shared.contacts);

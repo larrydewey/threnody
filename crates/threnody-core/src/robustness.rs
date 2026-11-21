@@ -340,6 +340,85 @@ fn device_sync_parsers_survive_mutated_input() {
     }
 }
 
+/// Offers and transfer messages for large files (Appendix U): no mutation
+/// may panic a decoder, and what decodes keeps its limits.
+#[test]
+fn transfer_parsers_survive_mutated_input() {
+    use crate::transfer::{
+        HASHES_PER_PART, MAX_OFFERED, MAX_THUMBNAIL, MAX_WANT, Offer, PIECE, PIECE_OVERHEAD,
+        TransferMsg,
+    };
+
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed([14; 32]);
+    let offer = Offer {
+        sent_ms: 1,
+        id: 2,
+        name: "film.mkv".into(),
+        size: 3 * PIECE as u64,
+        root: [3; 32],
+        key: [4; 32],
+        sensitive: true,
+        forwarded: true,
+        clip: None,
+        caption: "caption".into(),
+        album: 5,
+        thumbnail: vec![6; 100],
+    }
+    .encode()
+    .unwrap();
+    let msgs: Vec<Vec<u8>> = [
+        TransferMsg::Want {
+            request: 1,
+            root: [2; 32],
+            first: 3,
+            count: 4,
+            hashes: true,
+        },
+        TransferMsg::Piece {
+            request: 1,
+            index: 2,
+            data: vec![3; 1000],
+        },
+        TransferMsg::Hashes {
+            request: 1,
+            first: 0,
+            data: vec![4; 64],
+        },
+        TransferMsg::Missing {
+            request: 1,
+            pieces: vec![1, 2],
+        },
+        TransferMsg::Have { root: [5; 32] },
+    ]
+    .iter()
+    .map(|m| m.encode().unwrap())
+    .collect();
+
+    for _ in 0..ITERATIONS {
+        if let Ok(o) = Offer::decode(&mutate(&mut rng, &offer)) {
+            assert!(o.size <= MAX_OFFERED);
+            assert!(o.thumbnail.len() <= MAX_THUMBNAIL);
+            assert!(o.name.len() <= 255);
+        }
+        for m in &msgs {
+            match TransferMsg::decode(&mutate(&mut rng, m)) {
+                Ok(TransferMsg::Want { count, .. }) => assert!((1..=MAX_WANT).contains(&count)),
+                Ok(TransferMsg::Piece { data, .. }) => {
+                    assert!(data.len() <= PIECE + PIECE_OVERHEAD)
+                }
+                Ok(TransferMsg::Hashes { data, .. }) => {
+                    assert!(!data.is_empty() && data.len() % 32 == 0);
+                    assert!(data.len() / 32 <= HASHES_PER_PART);
+                }
+                Ok(TransferMsg::Missing { pieces, .. }) => {
+                    assert!(pieces.len() as u64 <= MAX_WANT)
+                }
+                Ok(TransferMsg::Have { .. }) | Err(_) => {}
+            }
+        }
+    }
+}
+
 #[test]
 fn tap_card_survives_mutated_apdus() {
     use crate::crypto::hybrid::HybridSecret;

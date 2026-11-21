@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft plan, not implemented. Today a file travels whole inside one `File` message (Appendix C), so it is capped at 8 MiB (`message::MAX_FILE`). Every receiver rejects anything larger as malformed. That number is load-bearing: the 16 MiB encoder cap (`cbor::MAX_ENCODED`) and transport frame, the sender's 32 MiB of tracked messages per peer, group holds (32 MiB per member), device sync (`Part.total ≤ 8 MiB`) and whole-buffer metadata stripping (`media::strip`) are all sized around it. Apps also read the whole file into memory before sending (Android's `readBytes`, `send_file(data: Vec<u8>)`).
+Draft. Phase 1 has begun: the offer and transfer codecs and the piece cryptography are in `threnody_core::transfer`, but the node doesn't send or answer them yet. Today a file travels whole inside one `File` message (Appendix C), so it is capped at 8 MiB (`message::MAX_FILE`). Every receiver rejects anything larger as malformed. That number is load-bearing: the 16 MiB encoder cap (`cbor::MAX_ENCODED`) and transport frame, the sender's 32 MiB of tracked messages per peer, group holds (32 MiB per member), device sync (`Part.total ≤ 8 MiB`) and whole-buffer metadata stripping (`media::strip`) are all sized around it. Apps also read the whole file into memory before sending (Android's `readBytes`, `send_file(data: Vec<u8>)`).
 
 This appendix replaces the cap for files over 8 MiB with an **offer** plus **pieces pulled by the receiver**. The only practical limit is then the receiver's free space, which the receiver checks itself and never reveals. The piece format is built so that a file can later come from several sources at once (a swarm) among parties who already hold it: the sender's devices, the receiver's own devices, and group members.
 
@@ -28,26 +28,35 @@ This appendix replaces the cap for files over 8 MiB with an **offer** plus **pie
 
 ## Wire format
 
-Feature bit: `FEATURE_LARGE_FILES = 524288` (bit 19) in `Hello`.
+Feature bit: `FEATURE_LARGE_FILES = 524288` in `Hello`. It is reserved but not yet sent: the codecs exist (`threnody_core::transfer`), the node doesn't take part in transfers yet. Message kinds (Appendix C): `Offer = { 0 => 32, 2 => bstr .cbor FileOffer }` and `Transfer = { 0 => 33, 2 => bstr .cbor TransferMsg }`.
 
 ```
-Offer  = { 0: name tstr (≤ 255 bytes), 1: size uint, 2: root (32), 3: key (32),
-           4: piece size uint (262144), ? 5: flags uint (as File key 6), ? 6: caption,
-           ? 7: clip [video bool, duration_ms uint], ? 8: thumbnail bstr (≤ 24 KiB JPEG) }
-Want   = { 0: request uint, 1: root (32), 2: first piece uint, 3: count uint (≤ 16), ? 4: hashes bool }
-Piece  = { 0: request uint, 1: index uint, 2: data bstr (≤ 262144 + 16) }
-Hashes = { 0: request uint, 1: offset uint, 2: data bstr (≤ 262144) }
-Missing = { 0: request uint, 1: [* uint] }               ; piece indexes the source doesn't have
-Have   = { 0: root (32) }
+FileOffer   = { 0: sent_ms uint, 1: sender's message id uint (0 = none), 2: name tstr (≤ 255 bytes),
+                3: size uint (≤ 64 GiB), 4: root (32), 5: key (32), 6: piece size uint (262144),
+                ? 7: flags uint (File key 6: 1 sensitive, 2 voice, 4 video, 8 forwarded),
+                ? 8: duration_ms uint, ? 9: caption tstr, ? 10: album uint,
+                ? 11: thumbnail bstr (≤ 24 KiB JPEG) }                     ; ≤ 96 KiB encoded
+TransferMsg = { 0: op uint, ... }
+  op 1 Want    { 1: request uint, 2: root (32), 3: first uint, 4: count uint (1..=16), ? 5: true (hashes) }
+  op 2 Piece   { 1: request uint, 2: index uint, 3: data bstr (≤ 262144 + 40) }
+  op 3 Hashes  { 1: request uint, 2: first uint, 3: data bstr (n × 32, 1 ≤ n ≤ 8192) }
+  op 4 Missing { 1: request uint, 2: bstr (n × u64be piece index, n ≤ 16) }   ; none: has nothing of the file
+  op 5 Have    { 2: root (32) }
 
-piece_i   = ChaCha20-Poly1305(K, nonce = 0^4 || u64be(i), plaintext_i, aad = "threnody file" || u64be(size) || u32be(piece size))
+piece_key = KDF(FILE_PIECE_KEY, K)
+nonce_key = KDF(FILE_PIECE_NONCE, K)
+nonce_i   = BLAKE3-keyed(nonce_key, u64be(i) || plaintext_i)[..24]
+piece_i   = nonce_i || XChaCha20-Poly1305(piece_key, nonce_i, plaintext_i, aad = u64be(size) || u64be(i))
 hash_i    = BLAKE3(piece_i)
-root      = BLAKE3("threnody file root" || u64be(size) || u32be(piece size) || hash_0 || ... || hash_n)
+root      = BLAKE3-derive_key(FILE_ROOT, u64le(size) || u64le(262144) || hash_0 || ... || hash_n)
 ```
+
+The KDF labels are `"threnody v1 2026-11-20 file piece key"`, `"… file piece nonce"` and `"… file root"`; `KDF` is the one in the spec (§3.2). Test vectors are under *offered file* in `docs/test-vectors/v1.txt`.
 
 - `Offer` is a new message kind for 1:1 chats and a new group content kind (Appendix F, *Message content*), so groups use the same offer inside MLS.
-- `Want` with `hashes: true` asks for the piece-hash list (32 bytes per piece) as `Hashes` parts instead of pieces.
-- Every piece but the last is exactly the piece size, and the count follows from `size`. Truncating, reordering or appending pieces fails the hash check before decryption.
+- A `Want` for pieces asks for `count` pieces from `first`. One with key 5 asks for `count` parts of the hash list (8192 hashes, 256 KiB, each), the first starting at hash `first`. Answers carry the `request` back.
+- Every piece but the last is exactly 262144 bytes of plaintext. An empty file is one empty piece. The count follows from `size`. Truncating, reordering or appending pieces fails the hash check before decryption, and the AEAD binds each piece to its index and the file's size.
+- **Nonces.** The nonce is derived from the piece's plaintext, so every holder makes byte-identical pieces. A source whose copy changed can't reuse a nonce for other bytes: it makes a different piece, which fails its hash. Sources still never send a piece whose hash isn't the committed one.
 - Hashes are over ciphertext, so `root` reveals nothing about the plaintext. Because `K` is fresh for every send, the same file sent twice (or forwarded) has unrelated roots. Forwarding re-encrypts under a new key.
 - The AEAD stops a party without `K` from forging pieces. Every legitimate source holds `K`, so it is the hash list committed by `root` inside the sender's authenticated offer that rules out a bad source poisoning a piece. A piece that fails its hash is dropped, and its source isn't asked again for that file.
 

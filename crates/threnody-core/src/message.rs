@@ -114,6 +114,10 @@ pub const FEATURE_RECEIPTS: u64 = 131072;
 /// The peer understands account messages 11-14: file fetches between our
 /// own devices and tick sync (Appendix J, *Files* and *Ticks*).
 pub const FEATURE_DEVICE_SYNC: u64 = 262144;
+/// The peer understands `AppMessage::Offer` and `AppMessage::Transfer`:
+/// files over [`MAX_FILE`] offered and pulled in pieces (Appendix U). Not
+/// in [`FEATURES`] until the node can take part in transfers.
+pub const FEATURE_LARGE_FILES: u64 = 524288;
 pub const FEATURES: u64 = FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -280,6 +284,13 @@ pub enum AppMessage {
     Receipt(Vec<u8>),
     /// A profile or a revealed identity ([`crate::persona::IdentityMsg`]).
     Identity(Vec<u8>),
+    /// A file offered rather than sent inline
+    /// ([`crate::transfer::Offer`], Appendix U). Only to peers whose
+    /// `Hello` has [`FEATURE_LARGE_FILES`]; may be sealed for a mailbox.
+    Offer(Vec<u8>),
+    /// Pulling an offered file ([`crate::transfer::TransferMsg`]). Only to
+    /// peers whose `Hello` has [`FEATURE_LARGE_FILES`].
+    Transfer(Vec<u8>),
     /// `inner`, which the receiver acknowledges by `id` and delivers once
     /// even if it arrives again. Only sent to peers whose `Hello` has
     /// [`FEATURE_ACKS`]; never nested.
@@ -380,6 +391,8 @@ mod kind {
     pub const TUNNEL: u64 = 29;
     pub const PUSH: u64 = 30;
     pub const RECEIPT: u64 = 31;
+    pub const OFFER: u64 = 32;
+    pub const TRANSFER: u64 = 33;
 }
 
 impl AppMessage {
@@ -642,6 +655,14 @@ impl AppMessage {
                     e.map_len(2)?.u8(0)?.uint(kind::IDENTITY)?;
                     e.u8(2)?.bytes(payload)?;
                 }
+                Self::Offer(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::OFFER)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
+                Self::Transfer(payload) => {
+                    e.map_len(2)?.u8(0)?.uint(kind::TRANSFER)?;
+                    e.u8(2)?.bytes(payload)?;
+                }
                 Self::Paths(payload) => {
                     e.map_len(2)?.u8(0)?.uint(kind::PATHS)?;
                     e.u8(2)?.bytes(payload)?;
@@ -720,6 +741,8 @@ impl AppMessage {
             | Self::Tunnel(p)
             | Self::Push(p)
             | Self::Receipt(p)
+            | Self::Offer(p)
+            | Self::Transfer(p)
             | Self::Identity(p) => p.len() + 16,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
@@ -909,6 +932,8 @@ impl AppMessage {
             | kind::LIST
             | kind::PUSH
             | kind::RECEIPT
+            | kind::OFFER
+            | kind::TRANSFER
             | kind::IDENTITY => {
                 let p = required(bytes, "payload")?;
                 if p.len() > MAX_FILE + 4096 {
@@ -931,6 +956,8 @@ impl AppMessage {
                     Some(kind::TUNNEL) => Self::Tunnel(p),
                     Some(kind::PUSH) => Self::Push(p),
                     Some(kind::RECEIPT) => Self::Receipt(p),
+                    Some(kind::OFFER) => Self::Offer(p),
+                    Some(kind::TRANSFER) => Self::Transfer(p),
                     _ => Self::Mailbox(p),
                 }
             }
@@ -1059,6 +1086,7 @@ mod tests {
             FEATURE_TIMER_OFF,
             FEATURE_RECEIPTS,
             FEATURE_DEVICE_SYNC,
+            FEATURE_LARGE_FILES,
         ];
         let mut all = 0;
         for b in bits {
@@ -1066,7 +1094,14 @@ mod tests {
             assert_eq!(all & b, 0, "{b} is used twice");
             all |= b;
         }
-        assert_eq!(all, FEATURES, "every bit is advertised, and only those");
+        // FEATURE_LARGE_FILES is reserved, not advertised until the node
+        // takes part in transfers.
+        assert_eq!(
+            all & !FEATURE_LARGE_FILES,
+            FEATURES,
+            "every bit is advertised, and only those"
+        );
+        assert_eq!(FEATURES & FEATURE_LARGE_FILES, 0);
     }
 
     #[test]
@@ -1272,6 +1307,8 @@ mod tests {
             AppMessage::Tunnel(vec![13]),
             AppMessage::Push(vec![14]),
             AppMessage::Receipt(vec![1, 2, 3]),
+            AppMessage::Offer(vec![4, 5]),
+            AppMessage::Transfer(vec![6]),
         ] {
             assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
         }
