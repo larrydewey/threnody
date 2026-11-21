@@ -47,7 +47,12 @@ private struct Deleting: Identifiable {
 struct PickedFile: Identifiable, Sendable {
     let id = UUID()
     let name: String
+    /// Its bytes; empty for one too large for a message, kept at `location`.
     let data: Data
+    /// Where a file too large for one message was kept (sealed) to offer.
+    var location: String? = nil
+    /// The thumbnail its offer carries.
+    var thumbnail: Data? = nil
 }
 
 @MainActor
@@ -96,6 +101,8 @@ struct ChatView: View {
     @State private var pickingFiles = false
     @State private var picked: [PickedFile] = []
     @State private var sending = false
+    /// Files the contact offered, too large for one message.
+    @State private var offers = Offers()
     @State private var previewURL: URL?
     @FocusState private var focused: Bool
     @Environment(\.scenePhase) private var scenePhase
@@ -225,7 +232,7 @@ struct ChatView: View {
             Task { await loadPhotos(items) }
         }
         .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            if case let .success(urls) = result { loadFiles(urls) }
+            if case let .success(urls) = result { Task { await loadFiles(urls) } }
         }
         .quickLookPreview($previewURL)
         // A decrypted copy of a sealed file goes when QuickLook closes.
@@ -285,10 +292,17 @@ struct ChatView: View {
 
     private func withEvents(_ content: some View) -> some View {
         content
+        .environment(\.offers, offers)
         .task { await appear() }
         .onDisappear(perform: close)
         .onReceive(store.events) { se in
-            if concerns(se) { Task { await load() } }
+            guard concerns(se) else { return }
+            // A download moving on changes its bubble only, until it's here.
+            if case let .transferChanged(_, id, state) = se.event, state != .done {
+                offers.states[id] = state
+                return
+            }
+            Task { await load() }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await load() } }
@@ -568,6 +582,7 @@ struct ChatView: View {
     // MARK: Loading
 
     private func appear() async {
+        offers.tap = { e in toggleDownload(e) }
         store.visibleChat = ref
         store.visibleDevices = devices
         // Not connected: look for them across the internet now.
@@ -615,6 +630,7 @@ struct ChatView: View {
             return h
         }) else { return }
         entries = h
+        await loadOffers(h, t)
         scheduled = (try? await offMain { try t.scheduled() }) ?? []
         guard scenePhase == .active else { return }
         _ = try? await offMain { t.markSeen() }
@@ -627,6 +643,45 @@ struct ChatView: View {
         // Without a session now, they're reported on a later load.
         if (try? await offMain { try n.reportRead(peer: d, ids: ids) }) != nil {
             sentRead.formUnion(ids)
+        }
+    }
+
+    /// Where each offered file's download is, and the thumbnails they
+    /// came with (once each; none for a sensitive file).
+    private func loadOffers(_ h: [HistoryEntry], _ t: ChatTarget) async {
+        guard t.isContact else { return }
+        let offered = h.filter { !$0.outgoing && $0.file != nil && $0.file?.location == nil }
+        guard !offered.isEmpty else {
+            offers.states = [:]
+            return
+        }
+        let known = Set(offers.thumbs.keys).union(offers.thumbless)
+        let found = (try? await offMain { () -> ([UInt64: TransferState], [UInt64: Data?]) in
+            var states: [UInt64: TransferState] = [:]
+            var thumbs: [UInt64: Data?] = [:]
+            for e in offered {
+                guard let s = t.offerState(e) else { continue }
+                states[e.id] = s
+                if !known.contains(e.id), e.file?.sensitive == false { thumbs[e.id] = t.offerThumbnail(e) }
+            }
+            return (states, thumbs)
+        }) ?? ([:], [:])
+        offers.states = found.0
+        for (id, data) in found.1 {
+            if let data, let image = UIImage(data: data) { offers.thumbs[id] = image } else { offers.thumbless.insert(id) }
+        }
+    }
+
+    /// Downloads an offered file on a tap, or stops its download.
+    private func toggleDownload(_ e: HistoryEntry) {
+        guard let t = target else { return }
+        Task {
+            do {
+                let now = try await offMain { try t.toggleDownload(e) }
+                if let now { offers.states[e.id] = now } else { await load() }
+            } catch {
+                failure = error.localizedDescription
+            }
         }
     }
 
@@ -742,15 +797,29 @@ struct ChatView: View {
     /// is metadata too).
     private func loadPhotos(_ items: [PhotosPickerItem]) async {
         var files: [PickedFile] = []
+        let limit = node?.maxFileSize() ?? UInt64.max
         for (i, item) in items.enumerated() {
             guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
             let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
-            files.append(PickedFile(name: items.count > 1 ? "photo-\(i + 1).\(ext)" : "photo.\(ext)", data: data))
+            let name = items.count > 1 ? "photo-\(i + 1).\(ext)" : "photo.\(ext)"
+            // Too large for one message: kept, then offered from here.
+            if UInt64(data.count) > limit && offersLarge {
+                let kept = try? await offMain { (Media.save(name: name, data: data, persona: nil), Media.offerThumbnail(data: data)) }
+                if case let (location?, thumb)? = kept {
+                    files.append(PickedFile(name: name, data: Data(), location: location, thumbnail: thumb))
+                }
+                continue
+            }
+            files.append(PickedFile(name: name, data: data))
         }
         if files.isEmpty { failure = "Couldn't read the photos." } else { picked = files }
     }
 
-    private func loadFiles(_ urls: [URL]) {
+    /// Whether a file too large for one message can be offered here: to
+    /// one contact, from the main identity (which keeps such files).
+    private var offersLarge: Bool { ref.persona == nil && target?.isContact == true }
+
+    private func loadFiles(_ urls: [URL]) async {
         let limit = node?.maxFileSize() ?? UInt64.max
         var files: [PickedFile] = []
         var refused: [String] = []
@@ -758,8 +827,20 @@ struct ChatView: View {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            if UInt64(max(0, size)) > limit {
-                refused.append("\(url.lastPathComponent) is too large to send")
+            let name = url.lastPathComponent
+            if UInt64(max(0, size)) > limit && offersLarge {
+                // Kept sealed (the picked file may not stay readable for
+                // the 30 days it is offered), never read whole.
+                let thumb = await Media.offerThumbnail(url, name: name)
+                if let location = try? await offMain({ Media.keep(file: url, name: name) }) {
+                    files.append(PickedFile(name: name, data: Data(), location: location, thumbnail: thumb))
+                } else {
+                    refused.append("Couldn't read \(name)")
+                }
+            } else if UInt64(max(0, size)) > limit {
+                refused.append(ref.persona == nil
+                    ? "\(name) is too large to send here: files this large go to one contact at a time"
+                    : "\(name) is too large to send")
             } else if let data = try? Data(contentsOf: url) {
                 files.append(PickedFile(name: url.lastPathComponent, data: data))
             } else {
@@ -784,6 +865,18 @@ struct ChatView: View {
                 let album = files.count > 1 ? albumId() : 0
                 var errors: [String] = []
                 for (i, f) in files.enumerated() {
+                    // Too large for one message: offered, read from our copy.
+                    if let location = f.location {
+                        do {
+                            let options = FileOptions(sensitive: sensitive, caption: i == 0 ? caption : "", album: album,
+                                                      thumbnail: sensitive ? nil : f.thumbnail)
+                            try t.sendFileAt(name: f.name, location: location, options: options)
+                        } catch {
+                            Media.forget(location)
+                            errors.append(error.localizedDescription)
+                        }
+                        continue
+                    }
                     do {
                         let (name, data) = try Media.prepare(name: f.name, data: f.data, strip: strip, max: limit)
                         let location = Media.save(name: name, data: data, persona: persona)

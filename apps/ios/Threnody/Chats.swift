@@ -262,6 +262,36 @@ struct ChatTarget: Sendable {
         }
     }
 
+    /// Sends a file too large for one message, kept by us (sealed) at
+    /// `location`: offered to the contact, who downloads it from here.
+    func sendFileAt(name: String, location: String, options: FileOptions) throws {
+        guard case .contact = ref.target else { throw AppError("Files this large go to one contact at a time.") }
+        try node.sendFileAt(peer: device, name: name, location: location, options: options)
+    }
+
+    /// Where the download of `e`'s file is, if the contact offered it (too
+    /// large for one message) and it isn't here yet; nil otherwise.
+    func offerState(_ e: HistoryEntry) -> TransferState? {
+        guard isContact, !e.outgoing, let f = e.file, f.location == nil else { return nil }
+        return node.transferState(peer: device, id: e.id)
+    }
+
+    /// The thumbnail `e`'s offer came with (a JPEG), if any.
+    func offerThumbnail(_ e: HistoryEntry) -> Data? {
+        node.offerThumbnail(peer: device, id: e.id)
+    }
+
+    /// Downloads `e`'s offered file, or stops its download (deleting what
+    /// came), as it now stands; where it is then.
+    func toggleDownload(_ e: HistoryEntry) throws -> TransferState? {
+        switch offerState(e) {
+        case .waiting?, .fetching?: try node.cancelDownload(peer: device, id: e.id)
+        case nil, .done?: break
+        default: _ = try node.downloadFile(peer: device, id: e.id)
+        }
+        return offerState(e)
+    }
+
     /// Whether reactions are offered: not in notes, not without an id.
     func canReact(_ e: HistoryEntry) -> Bool {
         if case .notes = ref.target { return false }

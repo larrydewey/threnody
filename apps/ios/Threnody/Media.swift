@@ -1,5 +1,7 @@
+import AVFoundation
 import Foundation
 import ImageIO
+import UIKit
 import UniformTypeIdentifiers
 import os
 
@@ -66,6 +68,68 @@ enum Media {
         } catch {
             return nil
         }
+    }
+
+    /// Keeps a sealed copy of the file at `src` (too large for one message,
+    /// so offered from here for its contact to download), read and sealed
+    /// a chunk at a time; its location, or nil if it couldn't. The main
+    /// identity's only: it alone takes part in such transfers.
+    static func keep(file src: URL, name: String) -> String? {
+        guard let sealer else { return nil }
+        let folder = dir(nil)
+        let location = "\(dirName(nil))/\(UUID().uuidString)-\(safeFileName(name: name))"
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Paths.excludeFromBackup(folder)
+            let path = Paths.support.appendingPathComponent(location).path
+            try sealer.sealMediaFile(src: src.path, dst: path)
+            try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUnlessOpen], ofItemAtPath: path)
+            return location
+        } catch {
+            return nil
+        }
+    }
+
+    /// A small JPEG of the photo or video at `url` (as picked, before it is
+    /// sealed), for the offer its contact sees before downloading it; nil
+    /// if it is neither or can't be made small enough. Encoded afresh from
+    /// pixels, so none of the original's metadata comes with it (the node
+    /// strips it again all the same).
+    static func offerThumbnail(_ url: URL, name: String) async -> Data? {
+        let side = 320
+        var cg: CGImage?
+        if isImageName(name: name) {
+            if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) {
+                cg = downsample(source, maxSide: side)
+            }
+        } else if isVideo(name) {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: side, height: side)
+            cg = try? await generator.image(at: .zero).image
+        }
+        guard let cg else { return nil }
+        return offerJPEG(cg)
+    }
+
+    /// As above, for a photo picked as bytes.
+    static func offerThumbnail(data: Data) -> Data? {
+        thumbnail(data: data, maxSide: 320).flatMap(offerJPEG)
+    }
+
+    /// `cg` as a JPEG within what an offer carries, the quality lowered
+    /// until it fits; nil if it never does.
+    private static func offerJPEG(_ cg: CGImage) -> Data? {
+        let limit = Int(maxOfferThumbnail())
+        let image = UIImage(cgImage: cg)
+        for quality in [0.7, 0.55, 0.4, 0.3] {
+            if let j = image.jpegData(compressionQuality: quality), j.count <= limit { return j }
+        }
+        return nil
+    }
+
+    static func isVideo(_ name: String) -> Bool {
+        ["mp4", "m4v", "mov", "3gp", "webm", "mkv"].contains((name as NSString).pathExtension.lowercased())
     }
 
     /// What the kept file at `url` holds: decrypted in memory if sealed,
@@ -296,5 +360,47 @@ enum Media {
             if UInt64(out.length) <= max { return ("\(stem.isEmpty ? "photo" : stem).jpg", out as Data) }
         }
         throw AppError("\(name) is too large to send")
+    }
+}
+
+/// Where files too large for one message are kept (Appendix U): sealed
+/// copies in the main identity's media folder, read a range at a time.
+/// Received ones are sealed by the node into a file reserved here. Called
+/// from a Rust worker thread.
+final class IosLargeFiles: LargeFileStore {
+    func size(location: String) -> UInt64? {
+        guard let url = Media.resolve(location) else { return nil }
+        return try? mediaSize(path: url.path)
+    }
+
+    func readAt(location: String, offset: UInt64, len: UInt32) -> Data? {
+        guard let url = Media.resolve(location) else { return nil }
+        if isSealedMedia(path: url.path) {
+            return try? Media.sealer?.readMediaRange(path: url.path, offset: offset, len: len)
+        }
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard (try? h.seek(toOffset: offset)) != nil else { return nil }
+        return (try? h.read(upToCount: Int(len))) ?? Data()
+    }
+
+    func reserve(name: String, clip: Bool) -> ReservedFile? {
+        let folder = Media.dir(nil)
+        let location = "\(Media.dirName(nil))/\(UUID().uuidString)-\(safeFileName(name: name))"
+        let path = Paths.support.appendingPathComponent(location).path
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Paths.excludeFromBackup(folder)
+        } catch {
+            return nil
+        }
+        let attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o600, .protectionKey: FileProtectionType.completeUnlessOpen]
+        guard FileManager.default.createFile(atPath: path, contents: nil, attributes: attributes) else { return nil }
+        return ReservedFile(path: path, location: location)
+    }
+
+    func freeSpace() -> UInt64? {
+        let values = try? Paths.support.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage.map { UInt64(max(0, $0)) }
     }
 }
