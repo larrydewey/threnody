@@ -52,6 +52,15 @@ pub struct ChatView {
     title: adw::WindowTitle,
     /// The chat's face beside its name in the header.
     face: adw::Avatar,
+    /// The chat's theme (Appendix W) drawn behind its messages, whether we
+    /// keep our own look, and whether we may change it.
+    backdrop: gtk::DrawingArea,
+    look: Rc<RefCell<Option<threnody_ffi::ThemeInfo>>>,
+    own_look: Rc<Cell<bool>>,
+    may_theme: Cell<bool>,
+    /// The accent, as CSS on this chat's widgets (class `look_class`).
+    look_css: gtk::CssProvider,
+    look_class: String,
     banner: gtk::Box,
     /// Credential offers and asks from this contact, waiting for an answer.
     cred_banner: gtk::Box,
@@ -397,8 +406,39 @@ impl ChatView {
         pin_bar.set_visible(false);
         pin_bar.set_tooltip_text(Some("Show the pinned message"));
         body.append(&pin_bar);
-        body.append(&stack);
+        // The theme is drawn behind the messages.
+        let backdrop = gtk::DrawingArea::new();
+        let look: Rc<RefCell<Option<threnody_ffi::ThemeInfo>>> = Rc::new(RefCell::new(None));
+        let own_look = Rc::new(Cell::new(false));
+        {
+            let (look, own) = (look.clone(), own_look.clone());
+            backdrop.set_draw_func(move |_, cr, w, h| {
+                if own.get() {
+                    return;
+                }
+                if let Some(t) = look.borrow().as_ref() {
+                    crate::themes::draw(cr, w, h, &t.background, 132);
+                }
+            });
+        }
+        let layered = gtk::Overlay::new();
+        layered.set_child(Some(&backdrop));
+        layered.add_overlay(&stack);
+        layered.set_vexpand(true);
+        body.append(&layered);
+        static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let look_class = format!(
+            "look-{}",
+            LOOKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let look_css = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().expect("display"),
+            &look_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
         let root = adw::ToolbarView::new();
+        root.add_css_class(&look_class);
         root.add_top_bar(&header);
         root.add_top_bar(&search_bar);
         root.set_content(Some(&body));
@@ -441,6 +481,12 @@ impl ChatView {
             root,
             title,
             face,
+            backdrop,
+            look,
+            own_look,
+            may_theme: Cell::new(true),
+            look_css,
+            look_class,
             banner,
             cred_banner,
             messages,
@@ -1512,6 +1558,7 @@ impl ChatView {
             add("New poll…", "poll", Self::new_poll);
             add("Disappearing messages", "timer", Self::disappearing);
             add("Notifications", "notify", Self::notifications);
+            add("Group theme…", "theme", Self::choose_theme);
             add("Clear chat…", "clear", Self::clear);
             if g.owned {
                 add("Delete group…", "delete", Self::delete_group);
@@ -1528,6 +1575,7 @@ impl ChatView {
             }
             add("Disappearing messages", "timer", Self::disappearing);
             add("Notifications", "notify", Self::notifications);
+            add("Chat theme…", "theme", Self::choose_theme);
             add("Share your profile…", "share", Self::share_profile);
             add(
                 "Offer a credential…",
@@ -1616,10 +1664,26 @@ impl ChatView {
                 let pending = (group.is_none() && !note)
                     .then(|| node.pending_credentials(device.clone()).ok())
                     .flatten();
-                (n, entries, pins, may_pin, draft, scheduled, timer, pending)
+                let look = match &group {
+                    _ if note => (node.note_theme(), false, true),
+                    Some(g) => (
+                        node.group_theme(g.clone()).ok().flatten(),
+                        node.group_own_look(g.clone()).unwrap_or(false),
+                        node.may_theme_group(g.clone()).unwrap_or(false),
+                    ),
+                    None => (
+                        node.chat_theme(device.clone()).ok().flatten(),
+                        node.own_look(device.clone()).unwrap_or(false),
+                        true,
+                    ),
+                };
+                (
+                    n, entries, pins, may_pin, draft, scheduled, timer, pending, look,
+                )
             },
-            move |(n, entries, pins, may_pin, draft, scheduled, timer, pending)| {
+            move |(n, entries, pins, may_pin, draft, scheduled, timer, pending, look)| {
                 let Some(t) = weak.upgrade() else { return };
+                t.apply_look(look);
                 t.show_credentials(pending);
                 // What we left unsent here last time.
                 if !t.loaded.get() && !draft.is_empty() {
@@ -1724,6 +1788,81 @@ impl ChatView {
         if at_bottom && self.jump.borrow().is_none() {
             self.scroll_to_end();
         }
+    }
+
+    /// Draws the chat's theme (Appendix W): the backdrop, the accent on our
+    /// bubbles and the send button, a group's picture.
+    fn apply_look(
+        self: &Rc<Self>,
+        (theme, own, may): (Option<threnody_ffi::ThemeInfo>, bool, bool),
+    ) {
+        self.may_theme.set(may);
+        if *self.look.borrow() == theme && self.own_look.get() == own {
+            return;
+        }
+        let accent = theme.as_ref().and_then(|t| t.accent).filter(|_| !own);
+        self.look_css
+            .load_from_string(&crate::themes::accent_css(&self.look_class, accent));
+        if self.group().is_some() {
+            let picture = theme
+                .as_ref()
+                .and_then(|t| t.picture.clone())
+                .filter(|_| !own);
+            crate::themes::show_picture(&self.face, picture.as_ref());
+        }
+        *self.look.borrow_mut() = theme;
+        self.own_look.set(own);
+        self.backdrop.queue_draw();
+    }
+
+    /// The chat's look: a theme for everyone in it, or our own plain look.
+    fn choose_theme(self: &Rc<Self>) {
+        let (group, device, note) = (self.group(), self.device(), self.is_note());
+        let title = self.conv.borrow().title.clone();
+        let weak = self.weak_self.clone();
+        let set_own = {
+            let (weak, group, device) = (weak.clone(), group.clone(), device.clone());
+            move |on: bool| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let (group, device) = (group.clone(), device.clone());
+                app.run(
+                    t.persona(),
+                    "change the look",
+                    move |n| match &group {
+                        Some(g) => n.set_group_own_look(g.clone(), on),
+                        None => n.set_own_look(device, on),
+                    },
+                    None,
+                );
+                t.reload();
+            }
+        };
+        crate::themes::pick(
+            &self.root,
+            self.look.borrow().clone(),
+            group.is_some(),
+            self.may_theme.get(),
+            self.own_look.get(),
+            &title,
+            set_own,
+            move |theme| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let (group, device) = (group.clone(), device.clone());
+                app.run(
+                    t.persona(),
+                    "set the theme",
+                    move |n| match &group {
+                        _ if note => n.set_note_theme(theme),
+                        Some(g) => n.set_group_theme(g.clone(), theme),
+                        None => n.set_chat_theme(device, theme),
+                    },
+                    None,
+                );
+                t.reload();
+            },
+        );
     }
 
     /// A notice as a centred line: its icon and what happened, and on a

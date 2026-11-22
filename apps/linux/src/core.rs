@@ -170,6 +170,8 @@ pub struct Conversation {
     /// Where it is among the pinned chats.
     pub pinned: Option<usize>,
     pub archived: bool,
+    /// A group's picture (Appendix W), unless we keep our own look there.
+    pub picture: Option<threnody_ffi::PictureInfo>,
 }
 
 impl Conversation {
@@ -1775,6 +1777,7 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
                 unread: 0,
                 pinned: None,
                 archived: false,
+                picture: None,
             },
             &k,
         ));
@@ -1803,6 +1806,14 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
                 revealed: None,
                 revealed_invite: None,
                 draft: node.group_draft(g.id.clone()).unwrap_or_default(),
+                picture: if node.group_own_look(g.id.clone()).unwrap_or(false) {
+                    None
+                } else {
+                    node.group_theme(g.id.clone())
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.picture)
+                },
                 group: Some(g),
                 invite: None,
                 last,
@@ -1841,6 +1852,7 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
                 unread: 0,
                 pinned: None,
                 archived: false,
+                picture: None,
             },
             "notes",
         ));
@@ -1870,6 +1882,7 @@ fn conversations(node: &Node, persona: Option<String>) -> Vec<Conversation> {
             unread: 0,
             pinned: None,
             archived: false,
+            picture: None,
         });
     }
     out

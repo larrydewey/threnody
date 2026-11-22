@@ -888,6 +888,7 @@ impl App {
         if c.group.is_some() || c.invite.is_some() {
             avatar.set_icon_name(Some("system-users-symbolic"));
             avatar.set_show_initials(false);
+            crate::themes::show_picture(&avatar, c.picture.as_ref());
         }
         let avatar_overlay = gtk::Overlay::new();
         avatar_overlay.set_child(Some(&avatar));
