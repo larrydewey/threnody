@@ -212,21 +212,25 @@ struct ChatTarget: Sendable {
         }
     }
 
-    /// Sends `text`, quoting `replyTo`, with `preview` (a card for a link
-    /// in it) if there is one; a warning to show, if any.
-    func send(_ text: String, replyTo: HistoryEntry?, preview: LinkPreviewInfo? = nil) throws -> String? {
+    /// Sends `text`, quoting `replyTo` (just `part` of its text, if given),
+    /// with `preview` (a card for a link in it) if there is one; a warning
+    /// to show, if any.
+    func send(_ text: String, replyTo: HistoryEntry?, part: String? = nil,
+              preview: LinkPreviewInfo? = nil) throws -> String? {
         if let p = preview {
             switch ref.target {
             case .contact:
                 let reached = try node.sendTextWithPreview(peer: device, text: text, quoteAtMs: replyTo?.atMs,
-                                                           quoteDevice: replyTo?.device, preview: p)
+                                                           quoteDevice: replyTo?.device, preview: p, quotePart: part)
                 return reached == 0 ? Self.notDelivered : nil
             case let .group(g), let .groupInvite(g):
                 try node.sendGroupTextWithPreview(group: g, text: text, quoteAtMs: replyTo?.atMs,
-                                                  quoteDevice: replyTo?.device, mentions: [], preview: p)
+                                                  quoteDevice: replyTo?.device, mentions: [], preview: p,
+                                                  quotePart: part)
                 return nil
             case .notes:
-                try node.writeNoteWithPreview(text: text, quoteAtMs: replyTo?.atMs, quoteDevice: replyTo?.device, preview: p)
+                try node.writeNoteWithPreview(text: text, quoteAtMs: replyTo?.atMs, quoteDevice: replyTo?.device,
+                                              preview: p, quotePart: part)
                 return nil
             }
         }
@@ -234,20 +238,20 @@ struct ChatTarget: Sendable {
         case .contact:
             let reached: UInt32
             if let q = replyTo {
-                reached = try node.sendReply(peer: device, text: text, atMs: q.atMs, device: q.device)
+                reached = try node.sendReply(peer: device, text: text, atMs: q.atMs, device: q.device, quotePart: part)
             } else {
                 reached = try node.sendText(peer: device, text: text)
             }
             return reached == 0 ? Self.notDelivered : nil
         case let .group(g), let .groupInvite(g):
             if let q = replyTo {
-                try node.sendGroupReply(group: g, text: text, atMs: q.atMs, device: q.device)
+                try node.sendGroupReply(group: g, text: text, atMs: q.atMs, device: q.device, quotePart: part)
             } else {
                 try node.sendGroupText(group: g, text: text)
             }
             return nil
         case .notes:
-            try node.writeNote(text: text, quoteAtMs: replyTo?.atMs, quoteDevice: replyTo?.device)
+            try node.writeNote(text: text, quoteAtMs: replyTo?.atMs, quoteDevice: replyTo?.device, quotePart: part)
             return nil
         }
     }

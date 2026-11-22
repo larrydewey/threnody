@@ -2692,7 +2692,7 @@ mod tests {
         let node_dir = temp("preview");
         let node =
             ThrenodyNode::open(node_dir.join("node").display().to_string(), None, None).unwrap();
-        node.write_note("first line\nsecond".into(), None, None)
+        node.write_note("first line\nsecond".into(), None, None, None)
             .unwrap();
         let e = node.note_history(1).unwrap().pop().unwrap();
         assert_eq!(preview(&e), "first line");

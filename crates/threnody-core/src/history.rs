@@ -449,6 +449,18 @@ impl Quote {
     pub fn of(e: &Entry) -> Self {
         Self::new(e.message_id(), e.device, snippet(e))
     }
+
+    /// A quote of just `part` of `e`'s text, chosen by the user (a
+    /// selection), when `part` is in it; otherwise as [`Quote::of`].
+    /// Only for a message with an id: one from before ids is found by
+    /// the start of its text, which an excerpt isn't.
+    pub fn excerpt(e: &Entry, part: &str) -> Self {
+        let part = part.trim();
+        if part.is_empty() || e.message_id() == 0 || !e.text.contains(part) {
+            return Self::of(e);
+        }
+        Self::new(e.message_id(), e.device, part)
+    }
 }
 
 /// Whether `q` quotes `e`: by the sender's id for the message, or, for a
@@ -2288,6 +2300,22 @@ mod tests {
             History::decode(&h.encode().unwrap()).unwrap().entries()[0].reactions,
             e.reactions
         );
+    }
+
+    #[test]
+    fn a_reply_can_quote_part_of_a_message() {
+        let mut e = entry(1, "first line\nthe part that matters\nlast", None);
+        e.remote_id = 5;
+        let q = Quote::excerpt(&e, "  the part that matters ");
+        assert_eq!((q.id, q.text.as_str()), (5, "the part that matters"));
+        assert!(quotes(&q, &e));
+        // Not in the message, or nothing chosen: the usual quote.
+        assert_eq!(Quote::excerpt(&e, "made up"), Quote::of(&e));
+        assert_eq!(Quote::excerpt(&e, " "), Quote::of(&e));
+        // A message without an id is found by its start, so it's quoted whole.
+        e.remote_id = 0;
+        e.outgoing = false;
+        assert_eq!(Quote::excerpt(&e, "the part"), Quote::of(&e));
     }
 
     #[test]

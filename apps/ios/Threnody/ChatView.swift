@@ -58,6 +58,10 @@ struct ChatView: View {
     @State private var pending: [String] = []
     @State private var text = ""
     @State private var replyTo: HistoryEntry?
+    /// The part of `replyTo` the reply quotes (a selection), if not its start.
+    @State private var replyPart: String?
+    /// A message shown with its text selectable, to copy or quote a part.
+    @State private var selecting: Reacting?
     @State private var editing: HistoryEntry?
     @State private var editText = ""
     @State private var deleting: Deleting?
@@ -217,6 +221,15 @@ struct ChatView: View {
         .sheet(item: $reactingTo) { r in
             EmojiInputSheet { emoji in react(r.entry, emoji) }
         }
+        .sheet(item: $selecting) { s in
+            // A message without an id is found by the start of its text,
+            // so it's only ever quoted whole.
+            SelectTextSheet(text: s.entry.text, canQuote: s.entry.id != 0) { part in
+                replyTo = s.entry
+                replyPart = part
+                focused = true
+            }
+        }
         .photosPicker(isPresented: $pickingPhotos, selection: $photoItems, maxSelectionCount: 10,
                       matching: .images, preferredItemEncoding: .current)
         .onChange(of: photoItems) { _, items in
@@ -361,9 +374,11 @@ struct ChatView: View {
         }
         Button("Reply", systemImage: "arrowshape.turn.up.left") {
             replyTo = e
+            replyPart = nil
             focused = true
         }
         if !e.text.isEmpty {
+            Button("Select Text", systemImage: "selection.pin.in.out") { selecting = Reacting(entry: e) }
             Button("Copy", systemImage: "doc.on.doc") {
                 UIPasteboard.general.setItems([[UTType.plainText.identifier: e.text]], options: [.localOnly: true])
             }
@@ -439,10 +454,11 @@ struct ChatView: View {
             Rectangle().fill(Color.accentColor).frame(width: 3)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Replying to \(store.name(r.device, persona: ref.persona))").font(.caption.bold())
-                Text(entryPreview(entry: r)).font(.caption).lineLimit(1).foregroundStyle(.secondary)
+                Text(replyPart.map { "“\($0)”" } ?? entryPreview(entry: r))
+                    .font(.caption).lineLimit(1).foregroundStyle(.secondary)
             }
             Spacer()
-            Button { replyTo = nil } label: { Image(systemName: "xmark.circle.fill") }
+            Button { replyTo = nil; replyPart = nil } label: { Image(systemName: "xmark.circle.fill") }
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Cancel reply")
         }
@@ -669,10 +685,12 @@ struct ChatView: View {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, let t = target else { return }
         let quoted = replyTo
+        let part = replyPart
         // The card goes if its link is still in the text.
         let card = linkCard.flatMap { c in textLinks(text: body).contains { $0.url == c.url } ? c : nil }
         text = ""
         replyTo = nil
+        replyPart = nil
         linkOffer = nil
         linkCard = nil
         linkDropped = []
@@ -680,7 +698,7 @@ struct ChatView: View {
         sendTyping(false)
         Task {
             do {
-                if let warning = try await offMain({ try t.send(body, replyTo: quoted, preview: card) }) { failure = warning }
+                if let warning = try await offMain({ try t.send(body, replyTo: quoted, part: part, preview: card) }) { failure = warning }
             } catch {
                 // Back in the box, unless something else was typed meanwhile.
                 if text.isEmpty { text = body }
@@ -928,6 +946,74 @@ enum Emoji {
 }
 
 /// A message to react to with any emoji.
+/// A message's text, any part of which can be selected to copy, or (with
+/// `canQuote`) to reply quoting just that part: *Quote* in the selection's
+/// menu.
+private struct SelectTextSheet: View {
+    let text: String
+    let canQuote: Bool
+    let onQuote: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            SelectableText(text: text, onQuote: canQuote ? { part in
+                dismiss()
+                onQuote(part)
+            } : nil)
+            .padding(.horizontal)
+            .navigationTitle("Select Text")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+/// Read-only text with a selection (SwiftUI's own selects only the whole
+/// text), and *Quote* beside Copy when `onQuote` is set.
+private struct SelectableText: UIViewRepresentable {
+    let text: String
+    let onQuote: ((String?) -> Void)?
+
+    func makeUIView(context: Context) -> UITextView {
+        let v = UITextView()
+        v.isEditable = false
+        v.isSelectable = true
+        v.font = .preferredFont(forTextStyle: .body)
+        v.adjustsFontForContentSizeCategory = true
+        v.backgroundColor = .clear
+        v.text = text
+        v.delegate = context.coordinator
+        return v
+    }
+
+    func updateUIView(_ v: UITextView, context: Context) {
+        if v.text != text { v.text = text }
+        context.coordinator.onQuote = onQuote
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onQuote: onQuote) }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var onQuote: ((String?) -> Void)?
+        init(onQuote: ((String?) -> Void)?) { self.onQuote = onQuote }
+
+        func textView(_ textView: UITextView, editMenuForTextIn range: NSRange,
+                      suggestedActions: [UIMenuElement]) -> UIMenu? {
+            guard let onQuote, range.length > 0 else { return UIMenu(children: suggestedActions) }
+            let part = (textView.text as NSString).substring(with: range)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let quote = UIAction(title: "Quote", image: UIImage(systemName: "text.quote")) { _ in
+                onQuote(part.isEmpty ? nil : part)
+            }
+            return UIMenu(children: [quote] + suggestedActions)
+        }
+    }
+}
+
 private struct Reacting: Identifiable {
     let entry: HistoryEntry
     var id: String { ChatItem.key(entry) }

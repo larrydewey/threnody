@@ -1703,6 +1703,19 @@ impl ThrenodyNode {
         }
     }
 
+    /// What a reply quotes: the message in `conv` at `at_ms` from
+    /// `device`, or just `part` of its text (a selection) if given.
+    pub(crate) fn quote_in(
+        &self,
+        conv: ConversationId,
+        at_ms: Option<u64>,
+        device: Option<&str>,
+        part: Option<&str>,
+    ) -> Option<threnody_core::message::Quote> {
+        let (at, d) = (at_ms?, device?);
+        self.node.quote_part_of(conv, entry_at(at, d), part)
+    }
+
     pub(crate) fn resolve(&self, peer: &str) -> Result<PublicIdentity> {
         match self.node.contacts().find(peer) {
             Lookup::Found(c) => Ok(c.key),
@@ -2135,6 +2148,7 @@ PersistentKeepalive = 25\n",
     /// `send_reply` (or `send_text`, without `quote_at_ms` and
     /// `quote_device`) with a card for a link in `text`. The card goes
     /// only if its URL is a link in `text`; its image loses any metadata.
+    #[uniffi::method(default(quote_part = None))]
     pub fn send_text_with_preview(
         &self,
         peer: String,
@@ -2142,14 +2156,15 @@ PersistentKeepalive = 25\n",
         quote_at_ms: Option<u64>,
         quote_device: Option<String>,
         preview: LinkPreviewInfo,
+        quote_part: Option<String>,
     ) -> Result<u32> {
         let p = self.resolve(&peer)?;
-        let quote = match (quote_at_ms, &quote_device) {
-            (Some(at), Some(d)) => self
-                .node
-                .quote_of(self.node.conversation_for(&p), entry_at(at, d)),
-            _ => None,
-        };
+        let quote = self.quote_in(
+            self.node.conversation_for(&p),
+            quote_at_ms,
+            quote_device.as_deref(),
+            quote_part.as_deref(),
+        );
         self.node.seek(&p);
         self.try_reach(&p);
         let _guard = self.rt.enter();
@@ -2167,18 +2182,22 @@ PersistentKeepalive = 25\n",
 
     /// `write_note` with a card for a link in `text` (as
     /// `send_text_with_preview`).
+    #[uniffi::method(default(quote_part = None))]
     pub fn write_note_with_preview(
         &self,
         text: String,
         quote_at_ms: Option<u64>,
         quote_device: Option<String>,
         preview: LinkPreviewInfo,
+        quote_part: Option<String>,
     ) -> Result<()> {
         let conv = self.node.notes();
-        let quote = match (quote_at_ms, &quote_device) {
-            (Some(at), Some(d)) => self.node.quote_of(conv, entry_at(at, d)),
-            _ => None,
-        };
+        let quote = self.quote_in(
+            conv,
+            quote_at_ms,
+            quote_device.as_deref(),
+            quote_part.as_deref(),
+        );
         let _guard = self.rt.enter();
         self.node
             .write_note_with(&text, quote, None, Some(preview.into()));
@@ -2304,17 +2323,22 @@ PersistentKeepalive = 25\n",
 
     /// `send_text`, replying to the message in the chat with `peer` that
     /// `at_ms` and `device` name (as in [`HistoryEntry`]), which it quotes.
+    #[uniffi::method(default(quote_part = None))]
     pub fn send_reply(
         &self,
         peer: String,
         text: String,
         at_ms: u64,
         device: String,
+        quote_part: Option<String>,
     ) -> Result<u32> {
         let p = self.resolve(&peer)?;
-        let quote = self
-            .node
-            .quote_of(self.node.conversation_for(&p), entry_at(at_ms, &device));
+        let quote = self.quote_in(
+            self.node.conversation_for(&p),
+            Some(at_ms),
+            Some(&device),
+            quote_part.as_deref(),
+        );
         self.node.seek(&p);
         self.try_reach(&p);
         let _guard = self.rt.enter();
@@ -2681,17 +2705,21 @@ PersistentKeepalive = 25\n",
 
     /// Writes a note to self, optionally replying to the note at
     /// `quote_at_ms` from `quote_device`.
+    #[uniffi::method(default(quote_part = None))]
     pub fn write_note(
         &self,
         text: String,
         quote_at_ms: Option<u64>,
         quote_device: Option<String>,
+        quote_part: Option<String>,
     ) -> Result<()> {
         let conv = self.node.notes();
-        let quote = match (quote_at_ms, &quote_device) {
-            (Some(at), Some(d)) => self.node.quote_of(conv, entry_at(at, d)),
-            _ => None,
-        };
+        let quote = self.quote_in(
+            conv,
+            quote_at_ms,
+            quote_device.as_deref(),
+            quote_part.as_deref(),
+        );
         let _guard = self.rt.enter();
         self.node.write_note(&text, quote, None);
         Ok(())
@@ -4580,6 +4608,44 @@ mod tests {
         // Bob reported it read; to Bob it is still just a message.
         let incoming = bob.history(a_fp, 10).unwrap();
         assert!(incoming.iter().all(|e| !e.outgoing && !e.read));
+    }
+
+    #[test]
+    fn a_reply_quotes_just_the_part_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        let alice = ThrenodyNode::open(path("a"), None, None).unwrap();
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let bob = ThrenodyNode::open(path("b"), None, None).unwrap();
+        let a_fp = bob.connect(alice.invite_link(addr)).unwrap();
+        let b_fp = bob.device_fingerprint();
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp.clone(), true).unwrap();
+        wait(&bob, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+        alice
+            .send_text(
+                b_fp.clone(),
+                "Milk, eggs.\nAnd call the plumber at 3.".into(),
+            )
+            .unwrap();
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        let theirs = bob.history(a_fp.clone(), 10).unwrap().pop().unwrap();
+        bob.send_reply(
+            a_fp,
+            "will do".into(),
+            theirs.at_ms,
+            theirs.device.clone(),
+            Some("call the plumber".into()),
+        )
+        .unwrap();
+        wait(&alice, |e| matches!(e, NodeEvent::Message { .. }));
+        let reply = alice.history(b_fp, 10).unwrap().pop().unwrap();
+        let q = reply.quote.unwrap();
+        assert_eq!(q.text, "call the plumber");
+        assert_eq!(q.id, theirs.id, "still points at the whole message");
     }
 
     #[test]

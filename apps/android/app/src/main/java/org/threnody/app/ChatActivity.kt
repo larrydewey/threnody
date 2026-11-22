@@ -100,6 +100,8 @@ class ChatActivity : Activity() {
     private val pending = mutableListOf<Pair<String, QuoteInfo?>>()
     /** The message the next one replies to, shown above the compose bar. */
     private var replyTo: HistoryEntry? = null
+    /** The part of [replyTo] the reply quotes (a selection), if not its start. */
+    private var replyPart: String? = null
     private lateinit var replyBar: LinearLayout
     /** Offers, and holds, a card for a link being written. */
     private val previewBar by lazy { PreviewBar(this) { if (::node.isInitialized) node else null } }
@@ -1968,14 +1970,15 @@ class ChatActivity : Activity() {
         else e.device == q.author && q.text.isNotEmpty() && snippet(e).startsWith(q.text)
 
     /** Starts (or with null, cancels) a reply to `e`. */
-    private fun replyingTo(e: HistoryEntry?) {
+    private fun replyingTo(e: HistoryEntry?, part: String? = null) {
         replyTo = e
+        replyPart = part
         replyBar.removeAllViews()
         if (e == null) {
             replyBar.visibility = View.GONE
             return
         }
-        val snippet = snippet(e)
+        val snippet = part?.let { "“$it”" } ?: snippet(e)
         replyBar.addView(View(this).apply { setBackgroundColor(color(R.color.accent)) },
             LinearLayout.LayoutParams(dp(3), MATCH_PARENT).apply { marginEnd = dp(10) })
         replyBar.addView(LinearLayout(this).apply {
@@ -2008,15 +2011,13 @@ class ChatActivity : Activity() {
         val canEdit = mine && e.file == null
         val options = buildList {
             add("Reply")
+            // Text isn't selectable in the bubble (it would take the long
+            // press), so selecting (to copy or quote a part) is offered here.
+            if (e.text.isNotEmpty()) add("Select text")
             if (e.poll == null) add("Forward")
             if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
             if (e.poll != null && e.outgoing && e.poll?.closed == false) add("End poll")
-            // Text isn't selectable in the bubble (it would take the long
-            // press), so copying is offered here.
-            if (e.text.isNotEmpty()) {
-                add("Copy text")
-                add("Select text")
-            }
+            if (e.text.isNotEmpty()) add("Copy text")
             if (canEdit) add("Edit")
             add("Delete for me")
             if (mine) add("Delete for everyone")
@@ -2045,7 +2046,7 @@ class ChatActivity : Activity() {
                 getSystemService(android.content.ClipboardManager::class.java)?.setPrimaryClip(clip)
                 return
             }
-            if (option == "Select text") return selectText(e.text)
+            if (option == "Select text") return selectText(e)
             val everyone = option == "Delete for everyone"
             Threading.background {
                 run("delete") {
@@ -2072,16 +2073,40 @@ class ChatActivity : Activity() {
         ) { emoji, add -> react(e, emoji, add) }.show()
     }
 
-    /** Shows a message's text where any part of it can be selected and copied. */
-    private fun selectText(text: String) {
+    /**
+     * Shows a message's text where any part of it can be selected, to copy
+     * or to reply quoting just that part (*Quote* by the selection's Copy).
+     */
+    private fun selectText(e: HistoryEntry) {
+        var dialog: android.app.Dialog? = null
         val view = TextView(this).apply {
-            this.text = text
+            text = e.text
             textSize = 16f
             setTextColor(color(R.color.text))
             setTextIsSelectable(true)
             setPadding(dp(24), dp(16), dp(24), dp(8))
         }
-        SecureBuilder(this)
+        // A message without an id is found by the start of its text, so
+        // it's only ever quoted whole.
+        if (e.id != 0uL) view.customSelectionActionModeCallback = object : android.view.ActionMode.Callback {
+            override fun onCreateActionMode(mode: android.view.ActionMode, menu: android.view.Menu): Boolean {
+                menu.add(android.view.Menu.NONE, QUOTE_ITEM, 0, "Quote")
+                return true
+            }
+            override fun onPrepareActionMode(mode: android.view.ActionMode, menu: android.view.Menu) = false
+            override fun onActionItemClicked(mode: android.view.ActionMode, item: android.view.MenuItem): Boolean {
+                if (item.itemId != QUOTE_ITEM) return false
+                val (a, b) = view.selectionStart to view.selectionEnd
+                val part = if (a in 0..<b) view.text.substring(a, b).trim().ifEmpty { null } else null
+                mode.finish()
+                dialog?.dismiss()
+                replyingTo(e, part)
+                compose.requestFocus()
+                return true
+            }
+            override fun onDestroyActionMode(mode: android.view.ActionMode) {}
+        }
+        dialog = SecureBuilder(this)
             .setView(android.widget.ScrollView(this).apply { addView(view) })
             .setPositiveButton("Done", null)
             .show()
@@ -2148,7 +2173,8 @@ class ChatActivity : Activity() {
         if (text.isEmpty() || !::node.isInitialized) return
         val mentions = if (group != null) Mentions.of(compose.text, raw.indexOf(text), text) else emptyList()
         val to = replyTo
-        val quote = to?.let { QuoteInfo(it.id, it.device, snippet(it).take(MAX_QUOTE_CHARS)) }
+        val part = replyPart
+        val quote = to?.let { QuoteInfo(it.id, it.device, (part ?: snippet(it)).take(MAX_QUOTE_CHARS)) }
         val item = text to quote
         val card = previewBar.take(text)
         replyingTo(null)
@@ -2161,17 +2187,17 @@ class ChatActivity : Activity() {
             val g = group
             val error = try {
                 if (note) {
-                    if (card != null) node.writeNoteWithPreview(text, to?.atMs, to?.device, card)
-                    else node.writeNote(text, to?.atMs, to?.device)
+                    if (card != null) node.writeNoteWithPreview(text, to?.atMs, to?.device, card, part)
+                    else node.writeNote(text, to?.atMs, to?.device, part)
                     null
                 } else if (g != null) {
-                    if (card != null) node.sendGroupTextWithPreview(g, text, to?.atMs, to?.device, mentions, card)
-                    else if (to != null || mentions.isNotEmpty()) node.sendGroupMessage(g, text, to?.atMs, to?.device, mentions)
+                    if (card != null) node.sendGroupTextWithPreview(g, text, to?.atMs, to?.device, mentions, card, part)
+                    else if (to != null || mentions.isNotEmpty()) node.sendGroupMessage(g, text, to?.atMs, to?.device, mentions, part)
                     else node.sendGroupText(g, text)
                     null
                 } else if ((when {
-                        card != null -> node.sendTextWithPreview(device, text, to?.atMs, to?.device, card)
-                        to != null -> node.sendReply(device, text, to.atMs, to.device)
+                        card != null -> node.sendTextWithPreview(device, text, to?.atMs, to?.device, card, part)
+                        to != null -> node.sendReply(device, text, to.atMs, to.device, part)
                         else -> node.sendText(device, text)
                     }) == 0u) {
                     // Reaches the contact directly, by relay, or sealed for mailboxes.
@@ -3469,6 +3495,8 @@ class ChatActivity : Activity() {
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
         private const val WIFI_DIRECT = 2
+        /** The *Quote* item in a message's text selection. */
+        private const val QUOTE_ITEM = 0x51
         private const val VOICE_PERMISSION = 5
         private const val VIDEO_PERMISSION = 6
         /** We're taken to have stopped typing after this long without a keystroke. */

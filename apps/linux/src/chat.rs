@@ -141,6 +141,8 @@ pub struct ChatView {
     mentions: RefCell<Vec<(gtk::TextMark, gtk::TextMark, String, String)>>,
     /// The message the next one replies to.
     reply_to: RefCell<Option<HistoryEntry>>,
+    /// The part of it the reply quotes (a selection), if not the start.
+    reply_part: RefCell<Option<String>>,
     /// Weak reference to self for creating weak pointers in callbacks.
     weak_self: Weak<ChatView>,
 }
@@ -464,6 +466,7 @@ impl ChatView {
             timer_on: Cell::new(false),
             later_menu,
             reply_to: RefCell::new(None),
+            reply_part: RefCell::new(None),
             pin_bar,
             pins: RefCell::new(Vec::new()),
             pin_shown: Cell::new(0),
@@ -843,7 +846,9 @@ impl ChatView {
                                         options,
                                     )?;
                                 }
-                                (_, _, Dest::Note) => n.write_note(e.text.clone(), None, None)?,
+                                (_, _, Dest::Note) => {
+                                    n.write_note(e.text.clone(), None, None, None)?
+                                }
                                 (_, _, Dest::Group(g)) => {
                                     n.forward_group_text(g, e.text.clone())?;
                                 }
@@ -2610,6 +2615,21 @@ impl ChatView {
                 }),
             );
         }
+        // Text selected in the bubble: a reply can quote just that. (Not
+        // for a message without an id: it's found by the start of its text.)
+        if e.id != 0
+            && let Some(part) = selected_text(anchor.upcast_ref())
+        {
+            let (weak, entry) = (self.weak_self.clone(), e.clone());
+            item(
+                "Reply quoting selection",
+                Box::new(move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.reply_with(Some(entry.clone()), Some(part.clone()));
+                    }
+                }),
+            );
+        }
         if e.outgoing && e.poll.as_ref().is_some_and(|p| !p.closed) {
             let (weak, id) = (self.weak_self.clone(), e.id);
             item(
@@ -3097,6 +3117,11 @@ impl ChatView {
 
     /// Starts (or with `None`, cancels) a reply to `e`.
     fn reply(self: &Rc<Self>, e: Option<HistoryEntry>) {
+        self.reply_with(e, None);
+    }
+
+    /// Replies to `e`, quoting just `part` of its text if given.
+    fn reply_with(self: &Rc<Self>, e: Option<HistoryEntry>, part: Option<String>) {
         while let Some(c) = self.reply_bar.first_child() {
             self.reply_bar.remove(&c);
         }
@@ -3113,7 +3138,9 @@ impl ChatView {
                 &format!("Replying to {who}"),
                 &["caption-heading", "accent"],
             ));
-            let snippet = if e.text.is_empty() {
+            let snippet = if let Some(p) = &part {
+                format!("“{p}”")
+            } else if e.text.is_empty() {
                 e.file.as_ref().map(|f| f.name.clone()).unwrap_or_default()
             } else {
                 e.text.clone()
@@ -3137,6 +3164,7 @@ impl ChatView {
             self.input.grab_focus();
         }
         *self.reply_to.borrow_mut() = e;
+        *self.reply_part.borrow_mut() = part;
     }
 
     fn react(self: &Rc<Self>, e: &HistoryEntry, emoji: String, add: bool) {
@@ -3610,6 +3638,7 @@ impl ChatView {
             .borrow()
             .as_ref()
             .map(|e| (e.at_ms, e.device.clone()));
+        let part = self.reply_part.borrow().clone();
         self.reply(None);
         let weak = self.weak_self.clone();
         let sent = text.clone();
@@ -3619,8 +3648,8 @@ impl ChatView {
                 _ if note => {
                     let (at, d) = quote.unzip();
                     match card {
-                        Some(c) => node.write_note_with_preview(sent, at, d, c),
-                        None => node.write_note(sent, at, d),
+                        Some(c) => node.write_note_with_preview(sent, at, d, c, part),
+                        None => node.write_note(sent, at, d, part),
                     }
                     .map(|()| None)
                     .map_err(|e| e.to_string())
@@ -3628,9 +3657,11 @@ impl ChatView {
                 Some(g) => {
                     let (at, d) = quote.unzip();
                     match card {
-                        Some(c) => node.send_group_text_with_preview(g, sent, at, d, mentions, c),
+                        Some(c) => {
+                            node.send_group_text_with_preview(g, sent, at, d, mentions, c, part)
+                        }
                         None if at.is_some() || !mentions.is_empty() => {
-                            node.send_group_message(g, sent, at, d, mentions)
+                            node.send_group_message(g, sent, at, d, mentions, part)
                         }
                         None => node.send_group_text(g, sent),
                     }
@@ -3641,9 +3672,9 @@ impl ChatView {
                 None => match match (card, quote) {
                     (Some(c), q) => {
                         let (at, d) = q.unzip();
-                        node.send_text_with_preview(device, sent, at, d, c)
+                        node.send_text_with_preview(device, sent, at, d, c, part)
                     }
-                    (None, Some((at, d))) => node.send_reply(device, sent, at, d),
+                    (None, Some((at, d))) => node.send_reply(device, sent, at, d, part),
                     (None, None) => node.send_text(device, sent),
                 } {
                     Ok(0) => Ok(Some(
@@ -5572,6 +5603,27 @@ fn action_confirm(a: GroupMemberAction, name: &str, group: &str) -> String {
         ),
         GroupMemberAction::StepDown => format!("You stay in {group} as a member."),
     }
+}
+
+/// The text selected in a label within `w` (a message's bubble), if any.
+fn selected_text(w: &gtk::Widget) -> Option<String> {
+    if let Some(l) = w.downcast_ref::<gtk::Label>()
+        && let Some((a, b)) = l.selection_bounds()
+        && a != b
+    {
+        let (a, b) = (a.min(b).max(0) as usize, a.max(b).max(0) as usize);
+        let part: String = l.text().chars().skip(a).take(b - a).collect();
+        let part = part.trim();
+        return (!part.is_empty()).then(|| part.to_owned());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(t) = selected_text(&c) {
+            return Some(t);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 #[cfg(test)]
