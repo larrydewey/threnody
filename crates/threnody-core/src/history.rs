@@ -166,6 +166,9 @@ pub struct Entry {
     pub preview: Option<LinkPreview>,
     /// A card (Appendix V) the text stands for.
     pub card: Option<crate::card::Card>,
+    /// What happened here, when the entry is a notice rather than a
+    /// message (its `text` then says it in a plain sentence).
+    pub notice: Option<crate::notice::Notice>,
 }
 
 /// Most options a poll has, and longest question and option, in
@@ -267,6 +270,10 @@ impl Entry {
     /// Adds or removes `who`'s `emoji`; returns true if anything changed.
     /// Adding beyond the limits is ignored.
     pub fn react(&mut self, who: [u8; 32], emoji: &str, add: bool) -> bool {
+        // Nothing to react to on a notice.
+        if self.notice.is_some() {
+            return false;
+        }
         let has = self.reactions.iter().any(|(w, e)| *w == who && e == emoji);
         if add {
             let mine = self.reactions.iter().filter(|(w, _)| *w == who).count();
@@ -287,6 +294,33 @@ impl Entry {
 
     /// The id other devices know this message by: ours if we sent it, the
     /// sender's otherwise (0 = none).
+    /// Turns a message into the placeholder left where it was deleted for
+    /// everyone: who and when stay (so replies still point somewhere),
+    /// everything it said goes.
+    pub fn tombstone(&mut self) {
+        self.text = if self.outgoing {
+            "You deleted this message".into()
+        } else {
+            "This message was deleted".into()
+        };
+        self.file = None;
+        self.reactions.clear();
+        self.quote = None;
+        self.mentions.clear();
+        self.poll = None;
+        self.list = None;
+        self.preview = None;
+        self.card = None;
+        self.edited_ms = 0;
+        self.forwarded = false;
+        self.notice = Some(crate::notice::Notice::Deleted);
+    }
+
+    /// Whether this is the placeholder of a deleted message.
+    pub fn is_tombstone(&self) -> bool {
+        self.notice == Some(crate::notice::Notice::Deleted)
+    }
+
     pub fn message_id(&self) -> u64 {
         // A sibling's message is ours, under the sender's id.
         if self.outgoing && self.local_id != 0 {
@@ -692,7 +726,13 @@ impl History {
         };
         self.entries
             .iter()
-            .filter(move |e| !e.outgoing && e.at_ms > seen)
+            .filter(move |e| !e.outgoing && e.at_ms > seen && !e.is_tombstone())
+    }
+
+    /// Whether the user has seen incoming entry `e` here: displayed (and
+    /// reported read), or older than when they last looked.
+    pub fn was_seen(&self, e: &Entry) -> bool {
+        e.read_ms != 0 || (self.seen_ms != 0 && e.at_ms <= self.seen_ms)
     }
 
     /// Pinned messages, oldest pin first.
@@ -809,7 +849,8 @@ impl History {
                         + usize::from(e.list.is_some())
                         + usize::from(e.ticked_ms != 0)
                         + usize::from(e.preview.is_some())
-                        + usize::from(e.card.is_some()),
+                        + usize::from(e.card.is_some())
+                        + usize::from(e.notice.is_some()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -891,6 +932,10 @@ impl History {
                     let c = c.encode().map_err(|_| const_cbor::Error::TYPE_MISMATCH)?;
                     enc.u8(22)?.bytes(&c)?;
                 }
+                if let Some(n) = &e.notice {
+                    let n = n.encode().map_err(|_| const_cbor::Error::TYPE_MISMATCH)?;
+                    enc.u8(23)?.bytes(&n)?;
+                }
                 if let Some(p) = &e.poll {
                     enc.u8(17)?.array_len(4)?;
                     enc.array_len(p.options.len())?;
@@ -957,6 +1002,7 @@ impl History {
                         let mut ticked_ms = 0;
                         let mut card = None;
                         let mut preview = None;
+                        let mut notice = None;
                         read_map(d, |k, d| {
                             match k {
                                 0 => at = Some(d.u64()?),
@@ -986,6 +1032,11 @@ impl History {
                                 // Kept as stored; one that no longer decodes is dropped.
                                 21 => preview = LinkPreview::decode(d.bytes()?).ok(),
                                 22 => card = crate::card::Card::decode(d.bytes()?).ok(),
+                                // A kind this version doesn't know: the text stands in.
+                                23 => {
+                                    notice =
+                                        crate::notice::Notice::decode(d.bytes()?).ok().flatten()
+                                }
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -1044,6 +1095,7 @@ impl History {
                             ticked_ms,
                             preview,
                             card,
+                            notice,
                         });
                     }
                 }
@@ -1532,6 +1584,49 @@ impl Home {
         Ok(gone)
     }
 
+    /// Deletes the entries `pick` chooses as `mode` says: gone, or (for a
+    /// message deleted for everyone) leaving its placeholder. With
+    /// [`DeleteMode::NoTrace`], only entries the user hasn't seen here go
+    /// without a trace; one they saw keeps its placeholder, since no one
+    /// gets to erase what someone else already read. Returns how many
+    /// changed.
+    pub fn delete_entries_as(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        mode: crate::message::DeleteMode,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Result<usize> {
+        use crate::message::DeleteMode;
+        if mode == DeleteMode::Remove {
+            return self.delete_entries(identity, c, now_ms, pick);
+        }
+        let _lock = history_lock();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let picked: Vec<Entry> = h
+            .entries
+            .iter()
+            .filter(|e| pick(e) && !e.is_tombstone())
+            .cloned()
+            .collect();
+        if picked.is_empty() {
+            return Ok(0);
+        }
+        let erase = |e: &Entry| mode == DeleteMode::NoTrace && (e.outgoing || !h.was_seen(e));
+        let gone: Vec<Entry> = picked.iter().filter(|e| erase(e)).cloned().collect();
+        let marked: Vec<Entry> = picked.iter().filter(|e| !erase(e)).cloned().collect();
+        h.entries.retain(|e| !gone.contains(e));
+        for e in &mut h.entries {
+            if marked.contains(e) {
+                e.tombstone();
+            }
+        }
+        h.forget_quotes(&picked);
+        self.save_history(identity, c, &h)?;
+        Ok(picked.len())
+    }
+
     /// Adds or removes `who`'s `emoji` on the entries `pick` chooses;
     /// returns how many changed.
     #[allow(clippy::too_many_arguments)]
@@ -1710,7 +1805,13 @@ impl Home {
         let _lock = history_lock();
         let mut h = self.load_history(identity, c, now_ms)?;
         let mut n = 0;
-        for e in h.entries.iter_mut().filter(|e| e.file.is_none() && pick(e)) {
+        // A deleted message's placeholder stays one: a late edit doesn't
+        // bring it back.
+        for e in h
+            .entries
+            .iter_mut()
+            .filter(|e| e.file.is_none() && e.notice.is_none() && pick(e))
+        {
             e.text = body.to_owned();
             e.edited_ms = now_ms;
             n += 1;
@@ -2024,6 +2125,7 @@ mod tests {
             ticked_ms: 0,
             preview: None,
             card: None,
+            notice: None,
         }
     }
 
@@ -2351,6 +2453,56 @@ mod tests {
         e.remote_id = 0;
         e.outgoing = false;
         assert_eq!(Quote::excerpt(&e, "the part"), Quote::of(&e));
+    }
+
+    #[test]
+    fn a_deletion_leaves_its_placeholder_unless_unseen_and_without_a_trace() {
+        use crate::message::DeleteMode;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([1; 32]);
+        for (at, text) in [(1, "seen"), (2, "also seen"), (5, "unseen")] {
+            let mut e = entry(at, text, None);
+            e.outgoing = false;
+            e.remote_id = at;
+            e.reactions.push(([2; 32], "👍".into()));
+            home.append_history(&id, c, e, 1).unwrap();
+        }
+        home.mark_seen(&id, c, 3).unwrap();
+        let texts = || -> Vec<String> {
+            home.load_history(&id, c, 6)
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|e| e.text.clone())
+                .collect()
+        };
+        // Without a trace: only the unseen one goes; the seen one is a placeholder.
+        let n = home
+            .delete_entries_as(&id, c, 6, DeleteMode::NoTrace, |e| e.remote_id != 2)
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(texts(), ["This message was deleted", "also seen"]);
+        let h = home.load_history(&id, c, 6).unwrap();
+        let t = &h.entries()[0];
+        assert!(t.is_tombstone() && t.reactions.is_empty());
+        assert_eq!(h.unread().count(), 0, "a placeholder isn't unread");
+        // A late edit doesn't bring it back, and it survives a reload.
+        home.edit_entries(&id, c, 6, "back!", |e| e.remote_id == 1)
+            .unwrap();
+        assert_eq!(texts()[0], "This message was deleted");
+        // With a trace: a placeholder whether seen or not.
+        home.delete_entries_as(&id, c, 6, DeleteMode::Trace, |e| e.remote_id == 2)
+            .unwrap();
+        assert_eq!(
+            texts(),
+            ["This message was deleted", "This message was deleted"]
+        );
+        // Removed (delete for me): the placeholder goes too.
+        home.delete_entries_as(&id, c, 6, DeleteMode::Remove, |e| e.remote_id == 1)
+            .unwrap();
+        assert_eq!(texts(), ["This message was deleted"]);
     }
 
     #[test]
@@ -2901,6 +3053,7 @@ mod names_at_rest_tests {
             ticked_ms: 0,
             preview: None,
             card: None,
+            notice: None,
         }
     }
 

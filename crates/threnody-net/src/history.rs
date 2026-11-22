@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::time::Duration;
+use threnody_core::message::DeleteMode;
 
 use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Query};
 use threnody_core::{AppMessage, LinkPreview, PublicIdentity, now_ms};
@@ -110,8 +111,17 @@ impl Node {
     /// Deletes messages (by [`Entry::message_id`]) from `peer`'s
     /// conversation, here and on our other devices. With `everyone`, our
     /// own messages among them are also deleted on the devices of `peer`'s
-    /// account that support it. Returns how many entries went here.
-    pub fn delete_messages(&self, peer: &PublicIdentity, ids: &[u64], everyone: bool) -> usize {
+    /// account that support it, leaving a placeholder ("This message was
+    /// deleted") there and here; with `no_trace` as well, none here, and
+    /// none there where it hadn't been seen yet. Returns how many entries
+    /// changed here.
+    pub fn delete_messages(
+        &self,
+        peer: &PublicIdentity,
+        ids: &[u64],
+        everyone: bool,
+        no_trace: bool,
+    ) -> usize {
         let conv = self.conversation_for(peer);
         let me = *self.identity().as_bytes();
         let ours: Vec<u64> = self
@@ -124,34 +134,49 @@ impl Node {
                     .collect()
             })
             .unwrap_or_default();
-        let gone = self.delete_local(conv, ids);
-        let msg = |ids: Vec<u64>| AppMessage::Delete {
+        // Here and on our devices: "delete for me" leaves nothing; taking
+        // our own back from everyone leaves "You deleted this message",
+        // unless without a trace.
+        let everyone = everyone && !ours.is_empty();
+        let mine = if everyone && !no_trace {
+            DeleteMode::Trace
+        } else {
+            DeleteMode::Remove
+        };
+        let gone = self.delete_local(conv, ids, mine);
+        let msg = |ids: Vec<u64>, mode| AppMessage::Delete {
             conversation: conv.to_bytes(),
             ids,
+            mode,
         };
         // Our other devices delete the same, whatever they are, and those
         // away now when they come back.
         for d in self.own_devices() {
-            self.send_change(&d, &msg(ids.to_vec()));
+            self.send_change(&d, &msg(ids.to_vec(), mine));
         }
-        if everyone && !ours.is_empty() {
+        if everyone {
+            let theirs = if no_trace {
+                DeleteMode::NoTrace
+            } else {
+                DeleteMode::Trace
+            };
             let devices: Vec<PublicIdentity> = match self.account_of(peer) {
                 Some(a) => a.state().devices.iter().map(|(d, _)| *d).collect(),
                 None => vec![*peer],
             };
             for d in devices {
                 if d != self.identity() {
-                    self.send_change(&d, &msg(ours.clone()));
+                    self.send_change(&d, &msg(ours.clone(), theirs));
                 }
             }
         }
         gone
     }
 
-    fn delete_local(&self, conv: ConversationId, ids: &[u64]) -> usize {
+    fn delete_local(&self, conv: ConversationId, ids: &[u64], mode: DeleteMode) -> usize {
         self.shared
             .home
-            .delete_entries(self.identity_ref(), conv, now_ms(), |e| {
+            .delete_entries_as(self.identity_ref(), conv, now_ms(), mode, |e| {
                 let id = e.message_id();
                 id != 0 && ids.contains(&id)
             })
@@ -172,17 +197,30 @@ impl Node {
 
     /// Handles a `Delete` from `from`: one of our devices deleting in a
     /// conversation, or a peer taking back its own messages.
-    pub(crate) fn on_delete(&self, from: &PublicIdentity, conversation: &[u8], ids: &[u64]) {
+    pub(crate) fn on_delete(
+        &self,
+        from: &PublicIdentity,
+        conversation: &[u8],
+        ids: &[u64],
+        mode: DeleteMode,
+    ) {
         let gone = if self.is_own_device(from) {
             match ConversationId::from_bytes(conversation) {
                 // Our sibling's chat with *us* is our chat with it.
                 Some(ConversationId::Peer(k)) if k == *self.identity().as_bytes() => {
-                    self.delete_local(self.conversation_for(from), ids)
+                    self.delete_local(self.conversation_for(from), ids, mode)
                 }
-                Some(conv) => self.delete_local(conv, ids),
+                Some(conv) => self.delete_local(conv, ids, mode),
                 None => 0,
             }
         } else {
+            // A peer only ever deletes for everyone: a placeholder stays,
+            // unless it asked for none and we hadn't seen the message.
+            let mode = if mode == DeleteMode::NoTrace {
+                DeleteMode::NoTrace
+            } else {
+                DeleteMode::Trace
+            };
             // Only messages that device's account sent us.
             let conv = self.conversation_for(from);
             let senders: Vec<[u8; 32]> = match self.account_of(from) {
@@ -217,12 +255,13 @@ impl Node {
             let gone = self
                 .shared
                 .home
-                .delete_entries(self.identity_ref(), conv, now_ms(), theirs)
+                .delete_entries_as(self.identity_ref(), conv, now_ms(), mode, theirs)
                 .unwrap_or(0);
             if gone > 0 && !files.is_empty() {
                 let msg = AppMessage::Delete {
                     conversation: conv.to_bytes(),
                     ids: files,
+                    mode,
                 };
                 for d in self.own_devices() {
                     self.send_change(&d, &msg);
@@ -392,6 +431,7 @@ impl Node {
                 ticked_ms: 0,
                 preview,
                 card,
+                notice: None,
             },
         );
     }
@@ -1157,6 +1197,7 @@ impl Node {
                 ticked_ms: 0,
                 preview,
                 card: card.as_ref().map(threnody_core::card::Card::sender_copy),
+                notice: None,
             },
         );
         Ok(r)
@@ -1571,6 +1612,7 @@ impl Node {
             ticked_ms: 0,
             preview: extras.preview,
             card: extras.card,
+            notice: None,
         };
         if let Err(e) = self
             .shared
@@ -1654,6 +1696,7 @@ impl Node {
             ticked_ms: if received { now } else { 0 },
             preview: None,
             card: None,
+            notice: None,
         };
         let received = received.then(|| entry.clone());
         self.append(conv, entry);

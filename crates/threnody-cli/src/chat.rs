@@ -1971,7 +1971,7 @@ impl Ui {
                 let e = &e;
                 let gone = if e.message_id() != 0 {
                     self.node
-                        .delete_messages(&peer, &[e.message_id()], everyone)
+                        .delete_messages(&peer, &[e.message_id()], everyone, false)
                 } else {
                     self.node.delete_entry(conv, e.at_ms, e.device)
                 };

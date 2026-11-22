@@ -1661,7 +1661,9 @@ impl ChatView {
         let mut prev: Option<&HistoryEntry> = None;
         // One sender, the same day, within three minutes: one group of bubbles.
         let joins = |p: &HistoryEntry, e: &HistoryEntry| {
-            p.outgoing == e.outgoing
+            p.notice.is_none()
+                && e.notice.is_none()
+                && p.outgoing == e.outgoing
                 && p.device == e.device
                 && ui::day_heading(p.at_ms) == ui::day_heading(e.at_ms)
                 && e.at_ms.saturating_sub(p.at_ms) < 180_000
@@ -1682,6 +1684,12 @@ impl ChatView {
             }
             // Consecutive messages from the same sender within a few minutes
             // don't repeat the name.
+            // A notice (a deleted message's placeholder): a quiet centred line.
+            if let Some(n) = &e.notice {
+                self.messages.append(&self.notice_view(e, n));
+                prev = None;
+                continue;
+            }
             let continued = prev.is_some_and(|p| joins(p, e));
             // And into the next one: their corners tuck in where they meet.
             let next = entries.get(run.end);
@@ -1716,6 +1724,50 @@ impl ChatView {
         if at_bottom && self.jump.borrow().is_none() {
             self.scroll_to_end();
         }
+    }
+
+    /// A notice as a centred line: its icon and what happened, and on a
+    /// right-click, *Remove* (from this chat, here and on our devices).
+    fn notice_view(&self, e: &HistoryEntry, n: &threnody_ffi::NoticeInfo) -> gtk::Widget {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        line.add_css_class("chat-notice");
+        line.set_halign(gtk::Align::Center);
+        line.set_margin_top(6);
+        line.set_margin_bottom(6);
+        let icon = match n {
+            threnody_ffi::NoticeInfo::Deleted => "user-trash-symbolic",
+        };
+        line.append(&gtk::Image::from_icon_name(icon));
+        let text = ui::label(&e.text, &["caption"]);
+        line.append(&text);
+        line.set_tooltip_text(Some(&ui::time_label(e.at_ms)));
+        let click = gtk::GestureClick::builder().button(3).build();
+        let (weak, entry) = (self.weak_self.clone(), e.clone());
+        click.connect_pressed(move |g, _, x, y| {
+            let Some(t) = weak.upgrade() else { return };
+            let Some(w) = g.widget() else { return };
+            let pop = gtk::Popover::new();
+            pop.set_parent(&w);
+            #[allow(clippy::cast_possible_truncation)]
+            pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            let b = gtk::Button::with_label("Remove");
+            b.add_css_class("flat");
+            let (weak, entry, p) = (Rc::downgrade(&t), entry.clone(), pop.clone());
+            b.connect_clicked(move |_| {
+                p.popdown();
+                if let Some(t) = weak.upgrade() {
+                    t.delete(std::slice::from_ref(&entry), false, false);
+                }
+            });
+            pop.set_child(Some(&b));
+            pop.connect_closed(|p| {
+                let p = p.clone();
+                glib::idle_add_local_once(move || p.unparent());
+            });
+            pop.popup();
+        });
+        line.add_controller(click);
+        line.upcast()
     }
 
     fn scroll_to_end(&self) {
@@ -2759,20 +2811,29 @@ impl ChatView {
             "Delete for me",
             Box::new(move || {
                 if let Some(t) = weak.upgrade() {
-                    t.delete(&entries, false);
+                    t.delete(&entries, false, false);
                 }
             }),
         );
-        if run.iter().all(|e| e.outgoing && e.id != 0) && !group {
-            let (weak, entries) = (self.weak_self.clone(), run.to_vec());
-            item(
-                "Delete for everyone",
-                Box::new(move || {
-                    if let Some(t) = weak.upgrade() {
-                        t.delete(&entries, true);
-                    }
-                }),
-            );
+        if run
+            .iter()
+            .all(|e| e.outgoing && e.id != 0 && e.notice.is_none())
+            && !group
+        {
+            for (label, no_trace) in [
+                ("Delete for everyone", false),
+                ("Delete without a trace", true),
+            ] {
+                let (weak, entries) = (self.weak_self.clone(), run.to_vec());
+                item(
+                    label,
+                    Box::new(move || {
+                        if let Some(t) = weak.upgrade() {
+                            t.delete(&entries, true, no_trace);
+                        }
+                    }),
+                );
+            }
         }
         pop.set_child(Some(&b));
         pop.popup();
@@ -3282,15 +3343,24 @@ impl ChatView {
         );
     }
 
-    /// Deletes messages: one, or every photo of an album.
-    fn delete(self: &Rc<Self>, entries: &[HistoryEntry], everyone: bool) {
+    /// Deletes messages: one, or every photo of an album. With `everyone`,
+    /// for the other side too (a placeholder stays); with `no_trace` as
+    /// well, none stays, except for someone who had already seen it.
+    fn delete(self: &Rc<Self>, entries: &[HistoryEntry], everyone: bool, no_trace: bool) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
         let (group, device, entries) = (self.group(), self.device(), entries.to_vec());
         let note = self.is_note();
         let ok = everyone.then(|| {
-            "Deleted. Their devices delete it too, if they're running a current version.".to_owned()
+            if no_trace {
+                "Deleted without a trace where it hadn't been seen yet. Anyone who saw it sees \
+                 \u{201c}This message was deleted\u{201d}."
+                    .to_owned()
+            } else {
+                "Deleted. They see \u{201c}This message was deleted\u{201d} in its place."
+                    .to_owned()
+            }
         });
         app.run(
             self.persona(),
@@ -3299,7 +3369,9 @@ impl ChatView {
                 // With a chat's message ids, all in one go.
                 if !note && group.is_none() && entries.iter().all(|e| e.id != 0) {
                     let ids = entries.iter().map(|e| e.id).collect();
-                    return n.delete_messages(device, ids, everyone).map(|_| ());
+                    return n
+                        .delete_messages(device, ids, everyone, no_trace)
+                        .map(|_| ());
                 }
                 for e in entries {
                     match &group {
@@ -3308,7 +3380,7 @@ impl ChatView {
                             .delete_group_entry(g.clone(), e.at_ms, e.device)
                             .map(|_| ()),
                         None if e.id != 0 => n
-                            .delete_messages(device.clone(), vec![e.id], everyone)
+                            .delete_messages(device.clone(), vec![e.id], everyone, no_trace)
                             .map(|_| ()),
                         None => n
                             .delete_entry(device.clone(), e.at_ms, e.device)
@@ -6002,6 +6074,7 @@ mod tests {
             tick: threnody_ffi::TickMark::None,
             preview: None,
             card: None,
+            notice: None,
         }
     }
 

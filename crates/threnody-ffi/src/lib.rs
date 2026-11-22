@@ -260,6 +260,26 @@ pub struct HistoryEntry {
     /// without its contents (`opened` false): `open_card` gives them.
     #[uniffi(default = None)]
     pub card: Option<CardInfo>,
+    /// When the entry is a notice of what happened (not a message): drawn
+    /// as a quiet centred line; `text` says it in a sentence.
+    #[uniffi(default = None)]
+    pub notice: Option<NoticeInfo>,
+}
+
+/// What a notice in a chat says happened.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum NoticeInfo {
+    /// A message deleted for everyone stood here: "This message was
+    /// deleted", or on our own, "You deleted this message".
+    Deleted,
+}
+
+impl From<threnody_core::notice::Notice> for NoticeInfo {
+    fn from(n: threnody_core::notice::Notice) -> Self {
+        match n {
+            threnody_core::notice::Notice::Deleted => Self::Deleted,
+        }
+    }
 }
 
 /// The ticks an outgoing message shows, weakest first (so the weakest
@@ -1249,6 +1269,7 @@ fn history_entries(
             tick: tick_mark(e, this_device),
             preview: e.preview.clone().map(Into::into),
             card: e.card.as_ref().map(|c| cards::shown(c, e.outgoing)),
+            notice: e.notice.map(Into::into),
             forwarded: e.forwarded || e.file.as_ref().is_some_and(|f| f.forwarded),
             list: e.list.as_ref().map(lists::list_hex),
             poll: e.poll.as_ref().map(|p| {
@@ -2518,11 +2539,21 @@ PersistentKeepalive = 25\n",
 
     /// Deletes messages (by `HistoryEntry.id`) with `peer`, here and on
     /// our other devices; with `everyone`, our own among them also on
-    /// `peer`'s devices that support it. Returns how many went here.
-    pub fn delete_messages(&self, peer: String, ids: Vec<u64>, everyone: bool) -> Result<u32> {
+    /// `peer`'s devices that support it, leaving "This message was
+    /// deleted" in their place. With `no_trace` too, no placeholder here,
+    /// nor there where it hadn't been seen yet. Returns how many changed
+    /// here.
+    #[uniffi::method(default(no_trace = false))]
+    pub fn delete_messages(
+        &self,
+        peer: String,
+        ids: Vec<u64>,
+        everyone: bool,
+        no_trace: bool,
+    ) -> Result<u32> {
         let p = self.resolve(&peer)?;
         let _guard = self.rt.enter();
-        let n = self.node.delete_messages(&p, &ids, everyone);
+        let n = self.node.delete_messages(&p, &ids, everyone, no_trace);
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
@@ -3612,6 +3643,7 @@ mod tests {
             ticked_ms: 0,
             preview: None,
             card: None,
+            notice: None,
         }
     }
 

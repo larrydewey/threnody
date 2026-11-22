@@ -345,7 +345,7 @@ async fn history_follows_us_across_our_devices() {
         .find(|e| e.text == "from the laptop")
         .unwrap()
         .message_id();
-    laptop.node.delete_messages(&bid, &[id], false);
+    laptop.node.delete_messages(&bid, &[id], false, false);
     wait_for(|| texts(&phone.node, &bid).len() == 3).await;
     assert!(
         texts(&phone.node, &bid)
@@ -482,8 +482,31 @@ async fn deleting_in_a_chat_between_our_own_devices() {
             .map(|e| e.text.clone())
     };
     wait_for(|| text(&phone.node, &lid).as_deref() == Some("self-destruct, edited")).await;
-    assert_eq!(laptop.node.delete_messages(&pid, &[id], true), 1);
-    wait_for(|| text(&phone.node, &lid).is_none()).await;
+    // For everyone: the placeholder stays in its place.
+    assert_eq!(laptop.node.delete_messages(&pid, &[id], true, false), 1);
+    wait_for(|| text(&phone.node, &lid).as_deref() == Some("This message was deleted")).await;
+    // Without a trace (the phone had seen nothing, nor reported it read):
+    // gone on both.
+    laptop.node.send_text(&pid, "oops").unwrap();
+    wait_for(|| text(&phone.node, &lid).as_deref() == Some("oops")).await;
+    let oops = laptop
+        .node
+        .history(laptop.node.conversation_for(&pid))
+        .unwrap()
+        .entries()
+        .last()
+        .unwrap()
+        .message_id();
+    let count = |n: &Node, p| n.history(n.conversation_for(p)).unwrap().entries().len();
+    let (on_phone, on_laptop) = (count(&phone.node, &lid), count(&laptop.node, &pid));
+    laptop.node.delete_messages(&pid, &[oops], true, true);
+    wait_for(|| count(&phone.node, &lid) == on_phone - 1).await;
+    assert_eq!(count(&laptop.node, &pid), on_laptop - 1);
+    // What's left is the earlier placeholder.
+    assert_eq!(
+        text(&laptop.node, &pid).as_deref(),
+        Some("You deleted this message")
+    );
 }
 
 #[tokio::test]
@@ -716,7 +739,7 @@ async fn deleting_and_editing_reach_a_sibling_that_was_away() {
     assert_eq!(
         laptop
             .node
-            .delete_messages(&bid, &[id_of("to delete")], false),
+            .delete_messages(&bid, &[id_of("to delete")], false, false),
         1
     );
     assert!(laptop.node.edit_message(&bid, id_of("to edit"), "edited"));
@@ -1151,6 +1174,7 @@ fn file_entry(
         ticked_ms: 0,
         preview: None,
         card: None,
+        notice: None,
     }
 }
 
@@ -2096,6 +2120,8 @@ async fn a_contacts_deletion_of_a_file_reaches_our_other_devices_through_us() {
             threnody_core::AppMessage::Delete {
                 conversation: conv.to_bytes(),
                 ids: vec![id],
+                // As an older version sends it: a placeholder is left.
+                mode: threnody_core::message::DeleteMode::Remove,
             },
         )
         .unwrap();

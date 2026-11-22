@@ -37,6 +37,7 @@ import uniffi.threnody_ffi.FileFetch
 import uniffi.threnody_ffi.FileInfo
 import uniffi.threnody_ffi.FileOptions
 import uniffi.threnody_ffi.GroupBanner
+import uniffi.threnody_ffi.NoticeInfo
 import uniffi.threnody_ffi.GroupInfo
 import uniffi.threnody_ffi.GroupInvite
 import uniffi.threnody_ffi.GroupMemberAction
@@ -1344,6 +1345,7 @@ class ChatActivity : Activity() {
         fun joins(a: List<Item>?, b: List<Item>?): Boolean {
             val x = a?.last()?.entry ?: return false
             val y = b?.first()?.entry ?: return false
+            if (x.notice != null || y.notice != null) return false
             return x.outgoing == y.outgoing && x.device == y.device &&
                 dayHeading(x.atMs.toLong()) == dayHeading(y.atMs.toLong()) &&
                 y.atMs.toLong() - x.atMs.toLong() in 0L..GROUP_GAP_MS
@@ -1368,6 +1370,18 @@ class ChatActivity : Activity() {
                     bottomMargin = dp(Design.sm)
                 })
             }
+            // A notice (a deleted message's placeholder): a quiet centred line.
+            e.notice?.let { n ->
+                val v = noticeView(e, n)
+                messages.addView(v, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    topMargin = dp(6)
+                    bottomMargin = dp(6)
+                })
+                bubbles[mark(e)] = v
+                lastSender = null
+                continue
+            }
             // In groups, name the sender above the first of their run of messages.
             val sender = if (group != null && !e.outgoing && e.device != lastSender) names[e.device] else null
             lastSender = if (e.outgoing) null else e.device
@@ -1379,6 +1393,40 @@ class ChatActivity : Activity() {
         if (stick && hit < 0 && jump == null || items.lastOrNull()?.sending == true) toBottom()
         // Otherwise stay where the reader is, not at the top.
         else scroll.post { scroll.scrollTo(0, y) }
+    }
+
+    /**
+     * A notice as a centred pill: its icon and what happened. A long press
+     * offers to remove it from this chat (here and on our devices).
+     */
+    private fun noticeView(e: HistoryEntry, n: NoticeInfo): View {
+        val icon = when (n) {
+            NoticeInfo.DELETED -> R.drawable.ic_delete
+        }
+        return label(e.text, 13f, R.color.muted).apply {
+            icon(icon, 16)
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(color(R.color.card), dp(14).toFloat())
+            setPadding(dp(12), dp(6), dp(14), dp(6))
+            contentDescription = "${e.text}, ${time(e.atMs.toLong())}"
+            setOnLongClickListener { v ->
+                Design.mediumHaptic(v)
+                SecureBuilder(this@ChatActivity)
+                    .setItems(arrayOf("Remove")) { _, _ ->
+                        Threading.background {
+                            run("remove") {
+                                when {
+                                    note -> node.deleteNote(e.atMs, e.device)
+                                    e.id != 0uL -> node.deleteMessages(device, listOf(e.id), false)
+                                    else -> node.deleteEntry(device, e.atMs, e.device)
+                                }
+                            }
+                        }
+                    }
+                    .show()
+                true
+            }
+        }
     }
 
     /** Identifies a message across reloads and search results. */
@@ -2192,7 +2240,10 @@ class ChatActivity : Activity() {
             if (e.text.isNotEmpty()) add("Copy text")
             if (canEdit) add("Edit")
             add("Delete for me")
-            if (mine) add("Delete for everyone")
+            if (mine) {
+                add("Delete for everyone")
+                add("Delete without a trace")
+            }
         }
         fun pick(option: String) {
             if (option == "Edit") return editMessage(e)
@@ -2219,20 +2270,22 @@ class ChatActivity : Activity() {
                 return
             }
             if (option == "Select text") return selectText(e)
-            val everyone = option == "Delete for everyone"
+            val noTrace = option == "Delete without a trace"
+            val everyone = option == "Delete for everyone" || noTrace
             Threading.background {
                 run("delete") {
                     when {
                         note -> entries.forEach { node.deleteNote(it.atMs, it.device) }
                         g != null -> entries.forEach { node.deleteGroupEntry(g, it.atMs, it.device) }
-                        entries.all { it.id != 0uL } -> node.deleteMessages(device, entries.map { it.id }, everyone)
+                        entries.all { it.id != 0uL } -> node.deleteMessages(device, entries.map { it.id }, everyone, noTrace)
                         else -> entries.forEach { node.deleteEntry(device, it.atMs, it.device) }
                     }
                 }
                 entries.forEach { Media.forget(this, it.file?.location) }
                 if (everyone) runOnUiThread {
-                    Toast.makeText(this, "Deleted. Their devices delete it too, if they're running a current version.",
-                        Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, if (noTrace) {
+                        "Deleted without a trace where it hadn't been seen yet. Anyone who saw it sees “This message was deleted”."
+                    } else "Deleted. They see “This message was deleted” in its place.", Toast.LENGTH_LONG).show()
                 }
             }
         }

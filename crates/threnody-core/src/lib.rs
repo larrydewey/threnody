@@ -27,6 +27,7 @@ pub mod lists;
 pub mod media;
 pub mod media_seal;
 pub mod message;
+pub mod notice;
 pub mod onion;
 pub mod persona;
 pub mod prekey;

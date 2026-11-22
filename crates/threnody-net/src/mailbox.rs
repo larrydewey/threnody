@@ -1143,8 +1143,12 @@ impl Node {
                 return;
             }
             match &msg {
-                AppMessage::Delete { conversation, ids } => {
-                    return self.on_delete(&from, conversation, ids);
+                AppMessage::Delete {
+                    conversation,
+                    ids,
+                    mode,
+                } => {
+                    return self.on_delete(&from, conversation, ids, *mode);
                 }
                 AppMessage::Edit {
                     conversation,

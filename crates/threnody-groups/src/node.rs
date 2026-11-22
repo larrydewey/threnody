@@ -1567,6 +1567,7 @@ impl GroupNode {
                     Content::Text { card, .. } => card.as_ref().map(|c| c.sender_copy()),
                     _ => None,
                 },
+                notice: None,
             },
         );
         Ok(())
@@ -1613,6 +1614,7 @@ impl GroupNode {
                 ticked_ms: 0,
                 preview: None,
                 card: None,
+                notice: None,
             },
         );
     }
@@ -2641,6 +2643,7 @@ impl GroupNode {
                         ticked_ms: 0,
                         preview: None,
                         card: None,
+                        notice: None,
                     },
                 );
                 Update::Text {
