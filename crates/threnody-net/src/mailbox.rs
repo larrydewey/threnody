@@ -1444,6 +1444,7 @@ mod tests {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         };
         let r = p.open(dest, msg.clone(), tag, 2);
         assert!(p.dirty);
@@ -1509,6 +1510,7 @@ mod tests {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         };
         a.hold(&bid, secret.clone(), Tag::NONE);
         a.seal_expired_unacked(now_ms() + 31_000);

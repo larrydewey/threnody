@@ -205,6 +205,7 @@ async fn removing_a_device_revokes_it_everywhere() {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     };
     assert!(bob.node.send_offline(&pid, &note).is_err());
     // The laptop is now the account's only device: it can't remove itself.
@@ -246,6 +247,7 @@ async fn contacts_can_seal_to_a_sibling_they_never_met() {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     };
     bob.node.send_offline(&pid, &text).unwrap();
     wait_for(|| laptop.node.held_messages() == 1).await;
@@ -851,6 +853,7 @@ async fn a_removed_device_cannot_write_through_a_mailbox() {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     };
     phone.node.send_offline(&bid, &text).unwrap();
     next(&mut phone.rx, |e| matches!(e, Event::DepositReceipt { .. })).await;
@@ -1147,6 +1150,7 @@ fn file_entry(
         list: None,
         ticked_ms: 0,
         preview: None,
+        card: None,
     }
 }
 

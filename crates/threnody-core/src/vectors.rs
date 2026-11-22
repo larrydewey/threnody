@@ -137,6 +137,7 @@ fn generate() -> String {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     };
     let m1 = cb.seal(&text).unwrap();
     assert_eq!(ca.open(&m1).unwrap(), text);

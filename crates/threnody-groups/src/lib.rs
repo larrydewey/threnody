@@ -113,6 +113,9 @@ pub enum GroupError {
     /// A group call couldn't start or be joined (already in a call, say).
     #[error("{0}")]
     Call(String),
+    /// A card that can't go to a group, or isn't one (Appendix V).
+    #[error("{0}")]
+    Card(String),
 }
 
 pub(crate) fn mls<E: std::fmt::Debug>(e: E) -> GroupError {
@@ -210,6 +213,8 @@ pub enum GroupEvent {
         forwarded: bool,
         /// The sender's card for a link in `text`.
         preview: Option<threnody_core::LinkPreview>,
+        /// A card (Appendix V) the text stands for.
+        card: Option<Box<threnody_core::card::Card>>,
     },
     File {
         group: GroupId,
@@ -1621,6 +1626,7 @@ impl Groups {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             },
         )
     }
@@ -3369,6 +3375,7 @@ fn application_event(group: GroupId, sender: Pid, plain: &[u8]) -> Result<GroupE
             mentions,
             forwarded,
             preview,
+            card,
         } => GroupEvent::Text {
             group,
             from: sender,
@@ -3378,6 +3385,7 @@ fn application_event(group: GroupId, sender: Pid, plain: &[u8]) -> Result<GroupE
             mentions,
             forwarded,
             preview,
+            card,
         },
         Content::File {
             name,

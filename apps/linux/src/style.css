@@ -266,3 +266,56 @@ windowtitle.warning .subtitle {
 .swatch-5 { background: #43a047; }
 .swatch-6 { background: #1e88e5; }
 .swatch-7 { background: #8e24aa; }
+
+/* Cards (Appendix V): a surface inside the bubble, an icon in a circle. */
+.card-box {
+  background-color: alpha(currentColor, 0.08);
+  border-radius: 12px;
+  padding: 10px 12px 8px 12px;
+  min-width: 240px;
+}
+.card-icon {
+  background-color: alpha(currentColor, 0.10);
+  border-radius: 999px;
+  min-width: 36px;
+  min-height: 36px;
+  font-size: 18px;
+}
+.card-box button.card-action {
+  border-radius: 999px;
+  padding: 2px 12px;
+  min-height: 28px;
+  background-color: alpha(currentColor, 0.10);
+  font-weight: bold;
+}
+
+/* A payment card drawn as one: ID-1 proportions, its network's colours. */
+.payment-card {
+  border-radius: 14px;
+  padding: 14px 18px;
+  color: white;
+  background-image: linear-gradient(135deg, #334155, #64748b);
+  box-shadow: 0 2px 6px alpha(black, 0.25);
+}
+.payment-card label { color: white; }
+.payment-card.visa { background-image: linear-gradient(135deg, #1a1f71, #3949c8); }
+.payment-card.mastercard { background-image: linear-gradient(135deg, #1f1f1f, #b4410e); }
+.payment-card.amex { background-image: linear-gradient(135deg, #0b4f7c, #2e9bd6); }
+.payment-card.discover { background-image: linear-gradient(135deg, #2b1a10, #d9731c); }
+.payment-card.diners { background-image: linear-gradient(135deg, #0f3d5e, #5b8db8); }
+.payment-card.jcb { background-image: linear-gradient(135deg, #0e4d2e, #2f9e5e); }
+.payment-card.unionpay { background-image: linear-gradient(135deg, #7a0e1c, #1c5d8c); }
+.payment-card .card-brand { font-weight: 800; font-style: italic; font-size: 16px; }
+.payment-card .card-number {
+  font-family: monospace;
+  font-size: 18px;
+  letter-spacing: 2px;
+  text-shadow: 0 1px 2px alpha(black, 0.35);
+}
+.payment-card .card-caption { font-size: 8px; letter-spacing: 1px; opacity: 0.75; }
+.payment-card .card-chip {
+  min-width: 36px;
+  min-height: 27px;
+  border-radius: 5px;
+  background-image: linear-gradient(135deg, #e9d38c, #b8963e);
+}

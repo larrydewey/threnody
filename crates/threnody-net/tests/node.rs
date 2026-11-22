@@ -69,6 +69,7 @@ async fn chat_and_mutual_approval_over_tcp() {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
         )
         .unwrap();
@@ -89,6 +90,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         }
     );
 
@@ -102,6 +104,7 @@ async fn chat_and_mutual_approval_over_tcp() {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         },
     )
     .unwrap();
@@ -281,6 +284,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
         )
         .unwrap();
@@ -298,6 +302,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         }
     );
 }
@@ -345,6 +350,7 @@ async fn cover_traffic_can_be_switched_on_and_off_live() {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     };
     for (rate, body) in [
         (Some(Duration::from_millis(20)), "at a constant rate"),
@@ -723,6 +729,7 @@ async fn no_tunnel_without_mutual_approval() {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
         )
         .unwrap();
@@ -900,6 +907,7 @@ async fn sessions_run_over_any_byte_stream() {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
         )
         .unwrap();
@@ -1383,6 +1391,7 @@ async fn constant_rate_frames_are_all_one_size() {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
         )
         .unwrap();

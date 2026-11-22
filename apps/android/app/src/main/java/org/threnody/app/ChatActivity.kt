@@ -45,6 +45,7 @@ import uniffi.threnody_ffi.MentionInfo
 import uniffi.threnody_ffi.NotifyLevel
 import uniffi.threnody_ffi.QuoteInfo
 import uniffi.threnody_ffi.ScheduledInfo
+import uniffi.threnody_ffi.CardInfo
 import uniffi.threnody_ffi.HistoryEntry
 import uniffi.threnody_ffi.NodeEvent
 import uniffi.threnody_ffi.ThrenodyNode
@@ -1750,6 +1751,9 @@ class ChatActivity : Activity() {
                 })
             }
             time
+        } else if (file == null && e.card != null) {
+            body.addView(Cards.view(this, e.card!!, outgoing, fg, connect = { addFromCard(it) }) { openCard(e) }, matchWrap)
+            time
         } else if (file == null && e.poll != null) {
             val p = e.poll!!
             body.addView(TextView(this).apply {
@@ -2008,13 +2012,13 @@ class ChatActivity : Activity() {
         val e = entries.first()
         val g = group
         val mine = g == null && !note && e.outgoing && e.device == myDevice && entries.all { it.id != 0uL }
-        val canEdit = mine && e.file == null
+        val canEdit = mine && e.file == null && e.card == null
         val options = buildList {
             add("Reply")
             // Text isn't selectable in the bubble (it would take the long
             // press), so selecting (to copy or quote a part) is offered here.
             if (e.text.isNotEmpty()) add("Select text")
-            if (e.poll == null) add("Forward")
+            if (e.poll == null && e.card?.noForward != true) add("Forward")
             if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
             if (e.poll != null && e.outgoing && e.poll?.closed == false) add("End poll")
             if (e.text.isNotEmpty()) add("Copy text")
@@ -2454,6 +2458,15 @@ class ChatActivity : Activity() {
             menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
             menu.add("File").setOnMenuItemClickListener { pick(photos = false); true }
             menu.add("Video message").setOnMenuItemClickListener { recordVideo(); true }
+            menu.add("Contact").setOnMenuItemClickListener { shareContact(); true }
+            menu.add("Location").setOnMenuItemClickListener { Cards.composeLocation(this@ChatActivity, LOCATION_PERMISSION) { sendCard(it) }; true }
+            menu.add("Event").setOnMenuItemClickListener { Cards.composeEvent(this@ChatActivity) { sendCard(it) }; true }
+            menu.add("Wi-Fi network").setOnMenuItemClickListener { Cards.composeWifi(this@ChatActivity) { sendCard(it) }; true }
+            // Secrets go to one person (or our own notes), never a group.
+            if (group == null) menu.add("Login, card or secret note").setOnMenuItemClickListener {
+                Cards.composeSecret(this@ChatActivity, inNotes = note) { sendCard(it) }
+                true
+            }
             val g = group
             if (g != null) menu.add("Poll").setOnMenuItemClickListener {
                 Polls.compose(this@ChatActivity) { q, options, multi ->
@@ -2971,6 +2984,87 @@ class ChatActivity : Activity() {
             .show()
     }
 
+    /** Sends a card here (Appendix V): to the contact, the group, or our notes. */
+    private fun sendCard(card: CardInfo) {
+        Threading.background {
+            val g = group
+            val error = try {
+                when {
+                    note -> node.writeNoteCard(card)
+                    g != null -> node.sendGroupCard(g, card)
+                    node.sendCard(device, card) == 0u -> throw Exception("they're offline and no mutual contact can hold it")
+                }
+                null
+            } catch (e: Exception) {
+                e.message ?: "it didn't go"
+            }
+            refresh()
+            if (error != null) runOnUiThread { Toast.makeText(this, "Not sent: $error", Toast.LENGTH_LONG).show() }
+        }
+    }
+
+    /** Opens a card in full: a secret's fields, or a view-once card (which empties it). */
+    private fun openCard(e: HistoryEntry) {
+        Threading.background {
+            val g = group
+            val c = try {
+                when {
+                    note -> node.openNoteCard(e.atMs, e.device)
+                    g != null -> node.openGroupCard(g, e.atMs, e.device)
+                    else -> node.openCard(device, e.atMs, e.device)
+                }
+            } catch (_: Exception) { null } ?: return@background
+            runOnUiThread {
+                Cards.show(this, c) { addFromCard(it) }
+                if (c.viewOnce) refreshSoon()
+            }
+        }
+    }
+
+    /** Adds the person a contact card names, by its invite link or handle. */
+    private fun addFromCard(link: String) {
+        Threading.background {
+            val error = try { node.connect(link); null } catch (e: Exception) { e.message }
+            runOnUiThread {
+                Toast.makeText(this, error?.let { "Couldn't reach them: $it" } ?: "Added. They're in your conversations.",
+                    Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** Shares a contact: ourselves (with this identity's invite), one from the phone's contacts, or one typed in. */
+    private fun shareContact() {
+        val options = arrayOf("My contact", "From your contacts", "Type one in")
+        SecureBuilder(this)
+            .setTitle("Share a contact")
+            .setItems(options) { _, i ->
+                when (i) {
+                    0 -> Threading.background {
+                        val addr = Threnody.inviteAddr(this, Threnody.listenAddr.substringAfterLast(':'))
+                        val invite = if (addr.isEmpty() && !node.reachInternet()) "" else node.inviteLink(addr)
+                        val handle = try { node.ownHandle() } catch (_: Exception) { null } ?: ""
+                        val name = try { node.profile().firstOrNull { it.key == "name" }?.value } catch (_: Exception) { null } ?: ""
+                        runOnUiThread { Cards.composeContact(this, name, "", "", invite, handle) { sendCard(it) } }
+                    }
+                    1 -> pickFileLauncher.launch(Intent(Intent.ACTION_PICK, android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI)) { code, data ->
+                        val uri = data?.data
+                        if (code != RESULT_OK || uri == null) return@launch
+                        // The pick grants reading this one entry; no contacts permission.
+                        val (name, phone) = contentResolver.query(uri, arrayOf(
+                            android.provider.ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                            android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER,
+                        ), null, null, null)?.use { c ->
+                            if (c.moveToFirst()) (c.getString(0) ?: "") to (c.getString(1) ?: "") else "" to ""
+                        } ?: ("" to "")
+                        Cards.composeContact(this, name, phone, "", "", "") { sendCard(it) }
+                    }
+                    else -> Cards.composeContact(this, "", "", "", "", "") { sendCard(it) }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     /** Our main identity's invite, on this device's current address. */
     private fun mainInvite(main: ThrenodyNode): String? {
         val addr = Threnody.inviteAddr(this, Threnody.listenAddr.substringAfterLast(':'))
@@ -3433,6 +3527,11 @@ class ChatActivity : Activity() {
         Calls.permissionResult(code, results)
         if (code == WIFI_DIRECT && results.isNotEmpty() && results.all { it == 0 }) wifiDirect()
         if (code == VIDEO_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) recordVideo()
+        if (code == LOCATION_PERMISSION) {
+            val then = Cards.pendingLocation
+            Cards.pendingLocation = null
+            if (results.any { it == 0 }) then?.invoke()
+        }
         if (code == VOICE_PERMISSION && results.isNotEmpty() && results.all { it == 0 }) {
             Toast.makeText(this, "Hold the microphone to record", Toast.LENGTH_SHORT).show()
         }
@@ -3497,6 +3596,7 @@ class ChatActivity : Activity() {
         private const val WIFI_DIRECT = 2
         /** The *Quote* item in a message's text selection. */
         private const val QUOTE_ITEM = 0x51
+        private const val LOCATION_PERMISSION = 7
         private const val VOICE_PERMISSION = 5
         private const val VIDEO_PERMISSION = 6
         /** We're taken to have stopped typing after this long without a keystroke. */

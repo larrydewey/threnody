@@ -147,13 +147,16 @@ pub fn file_label(name: String, sensitive: bool, caption: String, clip: Option<C
 }
 
 /// A one-line preview of a stored message: [`file_label`] for files, "📊
-/// question" for polls, "📋 title" for shared lists, else the first line
+/// question" for polls, "📋 title" for shared lists, a card's icon and
+/// what it is ("💳 Joint Visa", "👁 View once"), else the first line
 /// of the text. Apps put "You: " in front of outgoing ones themselves.
 #[uniffi::export]
 pub fn entry_preview(entry: HistoryEntry) -> String {
     let first = entry.text.lines().next().unwrap_or("").to_owned();
     if let Some(f) = entry.file {
         file_label(f.name, f.sensitive, entry.text, f.clip)
+    } else if let Some(c) = &entry.card {
+        crate::cards::summary(c)
     } else if entry.poll.is_some() {
         format!("📊 {first}")
     } else if entry.list.is_some() {
@@ -363,6 +366,7 @@ mod tests {
             list: None,
             tick: TickMark::None,
             preview: None,
+            card: None,
         }
     }
 

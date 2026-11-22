@@ -67,6 +67,7 @@ fn parsers_survive_mutated_input() {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         })
         .unwrap();
     let app = AppMessage::File {
@@ -123,6 +124,7 @@ fn parsers_survive_mutated_input() {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         }
     );
 }

@@ -7,6 +7,7 @@
 
 use const_cbor::Decoder;
 
+use crate::card::Card;
 use crate::cbor::{self, finish, read_map, required};
 use crate::error::{Error, Result};
 use crate::preview::LinkPreview;
@@ -119,7 +120,11 @@ pub const FEATURE_DEVICE_SYNC: u64 = 262144;
 /// in [`FEATURES`]: a node adds it once the app installs a large-file
 /// store (`Node::set_large_file_store`).
 pub const FEATURE_LARGE_FILES: u64 = 524288;
-pub const FEATURES: u64 = FEATURE_ACKS
+/// The peer shows cards (Appendix V): only such peers get a card that
+/// must not fall back to plain text (a secret, or one viewed once).
+pub const FEATURE_CARDS: u64 = 1_048_576;
+pub const FEATURES: u64 = FEATURE_CARDS
+    | FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
     | FEATURE_IDENTITY
@@ -221,6 +226,9 @@ pub enum AppMessage {
         /// The sender's card for a link in `body` (key 13). Receivers keep
         /// it only if [`LinkPreview::for_text`] does.
         preview: Option<Box<LinkPreview>>,
+        /// A card (Appendix V) the text stands for (key 14): `body` is its
+        /// fallback text. Receivers keep it only if [`Card::clean`] does.
+        card: Option<Box<Card>>,
     },
     File {
         sent_ms: u64,
@@ -492,6 +500,10 @@ impl AppMessage {
             } => Some(p.encode()?),
             _ => None,
         };
+        let text_card = match self {
+            Self::Text { card: Some(c), .. } => Some(c.encode()?),
+            _ => None,
+        };
         cbor::to_vec(self.size_hint(), |e| {
             match self {
                 Self::Hello { features } => {
@@ -522,8 +534,10 @@ impl AppMessage {
                     quote,
                     forwarded,
                     preview: _,
+                    card: _,
                 } => {
                     let preview = &text_preview;
+                    let card = &text_card;
                     let expiry = expires_in_s.filter(|&s| s > 0);
                     let flags = u64::from(*forwarded) * FORWARDED
                         + u64::from(*expires_in_s == Some(0)) * TIMER_OFF;
@@ -532,7 +546,8 @@ impl AppMessage {
                             + usize::from(*id != 0)
                             + usize::from(flags != 0)
                             + 3 * usize::from(quote.is_some())
-                            + usize::from(preview.is_some()),
+                            + usize::from(preview.is_some())
+                            + usize::from(card.is_some()),
                     )?
                     .u8(0)?
                     .uint(kind::TEXT)?;
@@ -554,6 +569,9 @@ impl AppMessage {
                     }
                     if let Some(p) = preview {
                         e.u8(13)?.bytes(p)?;
+                    }
+                    if let Some(c) = card {
+                        e.u8(14)?.bytes(c)?;
                     }
                 }
                 Self::File {
@@ -712,9 +730,11 @@ impl AppMessage {
                 body,
                 quote,
                 preview,
+                card,
                 ..
             } => {
-                body.len()
+                card.as_ref().map_or(0, |_| 512)
+                    + body.len()
                     + quote.as_ref().map_or(0, |q| q.text.len() + 48)
                     + preview.as_ref().map_or(0, |p| {
                         p.url.len() + p.title.len() + p.description.len() + p.site.len()
@@ -769,6 +789,7 @@ impl AppMessage {
         let (mut caption, mut album, mut duration) = (None, 0, 0);
         let (mut quote_id, mut quote_author, mut quote_text) = (0, None, None);
         let mut preview = None;
+        let mut card = None;
         read_map(&mut dec, |key, d| {
             match key {
                 0 => k = Some(d.u64()?),
@@ -793,6 +814,7 @@ impl AppMessage {
                 11 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
                 12 => quote_text = Some(d.str()?.to_owned()),
                 13 => preview = Some(d.bytes()?.to_vec()),
+                14 => card = Some(d.bytes()?.to_vec()),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -887,10 +909,16 @@ impl AppMessage {
                     .and_then(|p| LinkPreview::decode(&p).ok())
                     .and_then(|p| p.for_text(&body))
                     .map(Box::new);
+                // So is a card that doesn't decode or isn't fit to show.
+                let card = card
+                    .and_then(|c| Card::decode(&c).ok())
+                    .and_then(Card::clean)
+                    .map(Box::new);
                 Self::Text {
                     sent_ms: ts.unwrap_or(0),
                     body,
                     preview,
+                    card,
                     expires_in_s: expiry.or((flags & TIMER_OFF != 0).then_some(0)),
                     id: five.unwrap_or(0),
                     forwarded: flags & FORWARDED != 0,
@@ -1055,6 +1083,7 @@ mod tests {
             quote: None,
             forwarded: false,
             preview,
+            card: None,
         };
         let m = text(Some(card("https://a.example/")));
         assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
@@ -1088,6 +1117,7 @@ mod tests {
             FEATURE_RECEIPTS,
             FEATURE_DEVICE_SYNC,
             FEATURE_LARGE_FILES,
+            FEATURE_CARDS,
         ];
         let mut all = 0;
         for b in bits {
@@ -1120,6 +1150,7 @@ mod tests {
             quote: Some(Quote::new(0, [1; 32], "nothing")),
             forwarded: false,
             preview: None,
+            card: None,
         };
         // Messages from before ids are quoted by sender and text alone.
         assert_eq!(AppMessage::decode(&m.encode().unwrap()).unwrap(), m);
@@ -1176,6 +1207,7 @@ mod tests {
                 quote: Some(Quote::new(5, [4; 32], "shall we?")),
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             AppMessage::Pin {
                 conversation: vec![0; 33],
@@ -1208,6 +1240,7 @@ mod tests {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             AppMessage::Text {
                 sent_ms: 43,
@@ -1217,6 +1250,7 @@ mod tests {
                 quote: None,
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             AppMessage::Text {
                 sent_ms: 44,
@@ -1226,6 +1260,7 @@ mod tests {
                 quote: None,
                 forwarded: true,
                 preview: None,
+                card: None,
             },
             AppMessage::File {
                 sent_ms: 1,

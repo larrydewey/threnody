@@ -1077,7 +1077,36 @@ impl GroupNode {
             quote: extras.quote,
             mentions: Mention::valid(extras.mentions, text),
             forwarded: extras.forwarded,
-            preview: node.sendable_preview(extras.preview, text),
+            preview: if extras.card.is_some() {
+                None
+            } else {
+                node.sendable_preview(extras.preview, text)
+            },
+            card: node
+                .sendable_card(extras.card, None)
+                .map_err(|e| GroupError::Card(e.to_string()))?
+                .map(Box::new),
+        };
+        // A card's text is what it says to an app without cards.
+        let content = match content {
+            Content::Text {
+                card: Some(c),
+                id,
+                quote,
+                mentions,
+                forwarded,
+                preview,
+                ..
+            } => Content::Text {
+                text: c.fallback_text(),
+                mentions: Mention::valid(mentions, &c.fallback_text()),
+                card: Some(c),
+                id,
+                quote,
+                forwarded,
+                preview,
+            },
+            other => other,
         };
         self.send(node, group, &content, None, id)
     }
@@ -1534,6 +1563,10 @@ impl GroupNode {
                     Content::Text { preview, .. } => preview.clone(),
                     _ => None,
                 },
+                card: match content {
+                    Content::Text { card, .. } => card.as_ref().map(|c| c.sender_copy()),
+                    _ => None,
+                },
             },
         );
         Ok(())
@@ -1579,6 +1612,7 @@ impl GroupNode {
                 list: None,
                 ticked_ms: 0,
                 preview: None,
+                card: None,
             },
         );
     }
@@ -2488,6 +2522,7 @@ impl GroupNode {
                 mentions,
                 forwarded,
                 preview,
+                card,
             } => {
                 self.seen_by(&group, Some(&from));
                 // What our other devices send to the group is ours too.
@@ -2514,6 +2549,7 @@ impl GroupNode {
                         mentions,
                         forwarded,
                         preview,
+                        card: card.map(|c| *c),
                     },
                 );
                 Update::Text {
@@ -2604,6 +2640,7 @@ impl GroupNode {
                         list: None,
                         ticked_ms: 0,
                         preview: None,
+                        card: None,
                     },
                 );
                 Update::Text {

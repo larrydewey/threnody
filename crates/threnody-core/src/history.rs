@@ -164,6 +164,8 @@ pub struct Entry {
     pub ticked_ms: u64,
     /// The sender's card for a link in the text.
     pub preview: Option<LinkPreview>,
+    /// A card (Appendix V) the text stands for.
+    pub card: Option<crate::card::Card>,
 }
 
 /// Most options a poll has, and longest question and option, in
@@ -669,15 +671,14 @@ impl History {
 
     /// Drops every disappearing entry, expired or not, and what quotes
     /// of them keep: for copies that outlive this device, such as backups,
-    /// where a timer would no longer run.
+    /// where a timer would no longer run. Secrets and view-once cards
+    /// (Appendix V) go too: they are never meant to be kept.
     pub fn drop_disappearing(&mut self) {
-        let timed: Vec<Entry> = self
-            .entries
-            .iter()
-            .filter(|e| e.expires_at_ms.is_some())
-            .cloned()
-            .collect();
-        self.entries.retain(|e| e.expires_at_ms.is_none());
+        let gone = |e: &Entry| {
+            e.expires_at_ms.is_some() || e.card.as_ref().is_some_and(crate::card::Card::needs_cards)
+        };
+        let timed: Vec<Entry> = self.entries.iter().filter(|e| gone(e)).cloned().collect();
+        self.entries.retain(|e| !gone(e));
         self.forget_quotes(&timed);
     }
 
@@ -807,7 +808,8 @@ impl History {
                         + usize::from(e.forwarded)
                         + usize::from(e.list.is_some())
                         + usize::from(e.ticked_ms != 0)
-                        + usize::from(e.preview.is_some()),
+                        + usize::from(e.preview.is_some())
+                        + usize::from(e.card.is_some()),
                 )?;
                 enc.u8(0)?.u64(e.at_ms)?;
                 enc.u8(1)?.bool(e.outgoing)?;
@@ -885,6 +887,10 @@ impl History {
                     let p = p.encode().map_err(|_| const_cbor::Error::TYPE_MISMATCH)?;
                     enc.u8(21)?.bytes(&p)?;
                 }
+                if let Some(c) = &e.card {
+                    let c = c.encode().map_err(|_| const_cbor::Error::TYPE_MISMATCH)?;
+                    enc.u8(22)?.bytes(&c)?;
+                }
                 if let Some(p) = &e.poll {
                     enc.u8(17)?.array_len(4)?;
                     enc.array_len(p.options.len())?;
@@ -949,6 +955,7 @@ impl History {
                         let mut forwarded = false;
                         let mut list = None;
                         let mut ticked_ms = 0;
+                        let mut card = None;
                         let mut preview = None;
                         read_map(d, |k, d| {
                             match k {
@@ -978,6 +985,7 @@ impl History {
                                 20 => ticked_ms = d.u64()?,
                                 // Kept as stored; one that no longer decodes is dropped.
                                 21 => preview = LinkPreview::decode(d.bytes()?).ok(),
+                                22 => card = crate::card::Card::decode(d.bytes()?).ok(),
                                 16 => {
                                     for _ in 0..d.array_len()? {
                                         if d.array_len()? != 3 {
@@ -1035,6 +1043,7 @@ impl History {
                             list,
                             ticked_ms,
                             preview,
+                            card,
                         });
                     }
                 }
@@ -1664,6 +1673,31 @@ impl Home {
         Ok(changed)
     }
 
+    /// The card of the newest entry `pick` chooses, to show. A view-once
+    /// card someone sent us is emptied as it is opened (Appendix V), so
+    /// it can be shown this once; opening it again gives the emptied card.
+    pub fn open_card(
+        &self,
+        identity: &Identity,
+        c: ConversationId,
+        now_ms: u64,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Result<Option<crate::card::Card>> {
+        let _lock = history_lock();
+        let mut h = self.load_history(identity, c, now_ms)?;
+        let Some(e) = h.entries.iter_mut().rev().find(|e| pick(e)) else {
+            return Ok(None);
+        };
+        let Some(card) = e.card.clone() else {
+            return Ok(None);
+        };
+        if card.view_once() && !card.opened() && !e.outgoing {
+            e.card = Some(card.emptied());
+            self.save_history(identity, c, &h)?;
+        }
+        Ok(Some(card))
+    }
+
     /// Replaces the text of the entries `pick` chooses; returns how many.
     pub fn edit_entries(
         &self,
@@ -1989,6 +2023,7 @@ mod tests {
             list: None,
             ticked_ms: 0,
             preview: None,
+            card: None,
         }
     }
 
@@ -2316,6 +2351,54 @@ mod tests {
         e.remote_id = 0;
         e.outgoing = false;
         assert_eq!(Quote::excerpt(&e, "the part"), Quote::of(&e));
+    }
+
+    #[test]
+    fn a_view_once_card_opens_once_and_stays_out_of_backups() {
+        use crate::card::{CARD_VIEW_ONCE, Card, CardItem, SecretCard, SecretField};
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        let id = Identity::generate();
+        let c = ConversationId::Peer([1; 32]);
+        let mut secret = Card::new(CardItem::Secret(SecretCard {
+            title: "Bank".into(),
+            fields: vec![SecretField {
+                name: "password".into(),
+                value: "hunter2".into(),
+                hidden: true,
+            }],
+            ..Default::default()
+        }));
+        secret.flags = CARD_VIEW_ONCE;
+        let mut e = entry(1, "🔒 Bank", None);
+        e.card = Some(secret.clone());
+        home.append_history(&id, c, e, 1).unwrap();
+        home.append_history(&id, c, entry(3, "plain", None), 1)
+            .unwrap();
+        let first = home
+            .open_card(&id, c, 2, |e| e.at_ms == 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, secret);
+        let again = home
+            .open_card(&id, c, 2, |e| e.at_ms == 1)
+            .unwrap()
+            .unwrap();
+        assert!(again.opened());
+        let CardItem::Secret(s) = again.item else {
+            panic!()
+        };
+        assert!(s.fields.is_empty());
+        assert!(
+            home.open_card(&id, c, 2, |e| e.at_ms == 3)
+                .unwrap()
+                .is_none()
+        );
+        // A backup keeps the plain message, not the card.
+        let mut h = home.load_history(&id, c, 2).unwrap();
+        h.drop_disappearing();
+        assert_eq!(h.entries().len(), 1);
+        assert_eq!(h.entries()[0].text, "plain");
     }
 
     #[test]
@@ -2817,6 +2900,7 @@ mod names_at_rest_tests {
             list: None,
             ticked_ms: 0,
             preview: None,
+            card: None,
         }
     }
 

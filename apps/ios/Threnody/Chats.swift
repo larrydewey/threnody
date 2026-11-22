@@ -256,6 +256,26 @@ struct ChatTarget: Sendable {
         }
     }
 
+    /// Sends a card (Appendix V); a warning to show, if any.
+    func sendCard(_ card: CardInfo) throws -> String? {
+        switch ref.target {
+        case .contact: return try node.sendCard(peer: device, card: card) == 0 ? Self.notDelivered : nil
+        case let .group(g), let .groupInvite(g): try node.sendGroupCard(group: g, card: card)
+        case .notes: try node.writeNoteCard(card: card)
+        }
+        return nil
+    }
+
+    /// A message's card in full; a view-once card from someone else is
+    /// emptied as it opens.
+    func openCard(_ e: HistoryEntry) throws -> CardInfo? {
+        switch ref.target {
+        case .contact: return try node.openCard(peer: device, atMs: e.atMs, device: e.device)
+        case let .group(g), let .groupInvite(g): return try node.openGroupCard(group: g, atMs: e.atMs, device: e.device)
+        case .notes: return node.openNoteCard(atMs: e.atMs, device: e.device)
+        }
+    }
+
     /// Sends a file, kept by us at `location`.
     func sendFile(name: String, data: Data, location: String?, options: FileOptions) throws {
         switch ref.target {

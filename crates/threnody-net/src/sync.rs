@@ -620,6 +620,7 @@ mod tests {
                 list: None,
                 ticked_ms: 0,
                 preview: None,
+                card: None,
             },
             0,
         );
