@@ -50,6 +50,8 @@ pub struct ChatView {
     conv: RefCell<Conversation>,
     root: adw::ToolbarView,
     title: adw::WindowTitle,
+    /// The chat's face beside its name in the header.
+    face: adw::Avatar,
     banner: gtk::Box,
     /// Credential offers and asks from this contact, waiting for an answer.
     cred_banner: gtk::Box,
@@ -159,8 +161,13 @@ impl Drop for ChatView {
 impl ChatView {
     pub fn new(app: &Rc<App>, conv: Conversation) -> Rc<Self> {
         let title = adw::WindowTitle::new(&conv.title, "");
+        // The chat's face beside its name, as on the phone.
+        let face = adw::Avatar::new(32, Some(&conv.title), true);
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        heading.append(&face);
+        heading.append(&title);
         let header = adw::HeaderBar::new();
-        header.set_title_widget(Some(&title));
+        header.set_title_widget(Some(&heading));
         let menu = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .tooltip_text("Conversation options")
@@ -209,7 +216,11 @@ impl ChatView {
         header.pack_end(&find);
         // Calls, with a contact or a group, in builds with calls: voice, or
         // video.
-        if conv.invite.is_none() && threnody_ffi::calls_built_in() {
+        // No one to call in our own notes.
+        if conv.invite.is_none()
+            && conv.chat.target != Target::Note
+            && threnody_ffi::calls_built_in()
+        {
             for (icon, tip, video) in [
                 ("camera-video-symbolic", "Video call", true),
                 ("call-start-symbolic", "Call", false),
@@ -346,10 +357,10 @@ impl ChatView {
         typing_row.append(&dots);
         typing_row.set_visible(false);
 
-        // Composer with "(Message)" placeholder overlay.
+        // Composer with a "Message" placeholder over the empty field.
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&input_scroll));
-        let placeholder = gtk::Label::new(Some("(Message)"));
+        let placeholder = gtk::Label::new(Some("Message"));
         placeholder.add_css_class("composer-placeholder");
         placeholder.set_halign(gtk::Align::Start);
         placeholder.set_valign(gtk::Align::Center);
@@ -357,12 +368,18 @@ impl ChatView {
         placeholder.set_can_target(false);
         overlay.add_overlay(&placeholder);
 
+        // One rounded field holding emoji, the text, GIF and attach; the
+        // recording and send buttons beside it, round.
+        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        pill.add_css_class("composer-pill");
+        pill.set_hexpand(true);
+        overlay.set_hexpand(true);
+        pill.append(&emoji);
+        pill.append(&overlay);
+        pill.append(&attach);
         let composer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         composer.add_css_class("composer");
-        composer.append(&attach);
-        composer.append(&emoji);
-        composer.append(&gif);
-        composer.append(&overlay);
+        composer.append(&pill);
         composer.append(&voice);
         composer.append(&video);
         composer.append(&send);
@@ -423,6 +440,7 @@ impl ChatView {
             conv: RefCell::new(conv.clone()),
             root,
             title,
+            face,
             banner,
             cred_banner,
             messages,
@@ -1089,6 +1107,7 @@ impl ChatView {
             .as_deref()
             .and_then(|p| app.as_ref()?.core.persona_label(p));
         self.title.set_title(&c.title);
+        self.face.set_text(Some(&c.title));
         while let Some(child) = self.banner.first_child() {
             self.banner.remove(&child);
         }
@@ -1199,18 +1218,21 @@ impl ChatView {
             } else if !c.approved {
                 self.show_banner(
                     &format!(
-                        "Approve {} once you trust them, and compare safety numbers to make sure no one is in \
-                         the middle. Mutually approved contacts find each other nearby, relay for each other and \
-                         hold each other's messages while offline.",
+                        "Approve {} once you trust them, and compare safety numbers to be sure no one is in \
+                         the middle.",
                         c.title
                     ),
                     false,
-                    &[("Approve", Self::approve as Action), ("Compare", Self::safety)],
+                    &[
+                        ("Approve", Self::approve as Action),
+                        ("Compare", Self::safety),
+                        ("Why?", Self::why_approve),
+                    ],
                 );
             } else if !c.verified {
                 self.show_banner(
                     &format!(
-                        "⚠ Not verified. Compare safety numbers with {} to make sure no one is in the middle.",
+                        "Not verified. Compare safety numbers with {} to make sure no one is in the middle.",
                         c.title
                     ),
                     true,
@@ -1405,16 +1427,50 @@ impl ChatView {
         }
     }
 
+    /// Why approving matters, for the banner's *Why?*.
+    fn why_approve(self: &Rc<Self>) {
+        let d = adw::AlertDialog::new(
+            Some("Approving a contact"),
+            Some(
+                "Mutually approved contacts find each other nearby, relay for each other and hold each \
+                 other's messages while offline.\n\nComparing safety numbers, in person or over a call, \
+                 proves no one is in the middle.",
+            ),
+        );
+        d.add_response("ok", "OK");
+        d.present(Some(&self.window()));
+    }
+
+    /// A notice above the chat, as a tinted card: a round icon, what it
+    /// says, and its actions under it (the first filled, the second tonal,
+    /// the rest plain).
     fn show_banner(self: &Rc<Self>, text: &str, warning: bool, buttons: &[(&str, Action)]) {
+        let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let icon = gtk::Image::from_icon_name(if warning {
+            "dialog-warning-symbolic"
+        } else {
+            "security-high-symbolic"
+        });
+        icon.add_css_class("banner-icon");
+        icon.set_valign(gtk::Align::Start);
+        card.append(&icon);
+        let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        col.set_hexpand(true);
         let l = ui::label(text, &[]);
-        self.banner.append(&l);
+        col.append(&l);
+        card.append(&col);
+        self.banner.append(&card);
         if !buttons.is_empty() {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.set_halign(gtk::Align::End);
+            row.set_halign(gtk::Align::Start);
             for (i, (name, f)) in buttons.iter().enumerate() {
                 let b = gtk::Button::with_label(name);
-                if i == 0 {
-                    b.add_css_class("suggested-action");
+                b.add_css_class("pill");
+                b.add_css_class("banner-button");
+                match i {
+                    0 => b.add_css_class("suggested-action"),
+                    1 => b.add_css_class("tonal"),
+                    _ => b.add_css_class("flat"),
                 }
                 let (weak, f) = (self.weak_self.clone(), *f);
                 b.connect_clicked(move |_| {
@@ -1424,7 +1480,7 @@ impl ChatView {
                 });
                 row.append(&b);
             }
-            self.banner.append(&row);
+            col.append(&row);
         }
         if warning {
             self.banner.add_css_class("warning");
@@ -1603,19 +1659,22 @@ impl ChatView {
         let group = self.group().is_some();
         let mut last_day = String::new();
         let mut prev: Option<&HistoryEntry> = None;
+        // One sender, the same day, within three minutes: one group of bubbles.
+        let joins = |p: &HistoryEntry, e: &HistoryEntry| {
+            p.outgoing == e.outgoing
+                && p.device == e.device
+                && ui::day_heading(p.at_ms) == ui::day_heading(e.at_ms)
+                && e.at_ms.saturating_sub(p.at_ms) < 180_000
+        };
         for run in album_runs(&entries) {
             let e = &entries[run.start];
-            let day = glib::DateTime::from_unix_local(i64::try_from(e.at_ms / 1000).unwrap_or(0))
-                .ok()
-                .and_then(|d| d.format("%A %-d %B %Y").ok())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let day = ui::day_heading(e.at_ms);
             if day != last_day {
                 let l = gtk::Label::new(Some(&day));
                 l.add_css_class("day-separator");
-                l.add_css_class("caption");
-                l.add_css_class("dim-label");
-                l.set_margin_top(10);
+                l.add_css_class("caption-heading");
+                l.set_halign(gtk::Align::Center);
+                l.set_margin_top(14);
                 l.set_margin_bottom(6);
                 self.messages.append(&l);
                 last_day = day;
@@ -1623,17 +1682,25 @@ impl ChatView {
             }
             // Consecutive messages from the same sender within a few minutes
             // don't repeat the name.
-            let continued = prev.is_some_and(|p| {
-                p.outgoing == e.outgoing
-                    && p.device == e.device
-                    && e.at_ms.saturating_sub(p.at_ms) < 300_000
-            });
+            let continued = prev.is_some_and(|p| joins(p, e));
+            // And into the next one: their corners tuck in where they meet.
+            let next = entries.get(run.end);
+            let into_next = next.is_some_and(|n| joins(&entries[run.end - 1], n));
             let sender = (group && !e.outgoing && !continued).then(|| {
                 node.as_ref()
                     .map_or_else(|| core::short(&e.device), |n| Core::name_of(n, &e.device))
             });
-            self.messages
-                .append(&self.bubble(&entries[run.clone()], sender));
+            let row = self.bubble(&entries[run.clone()], sender);
+            if let Some(b) = row.first_child() {
+                if continued {
+                    b.add_css_class("joins-prev");
+                }
+                if into_next {
+                    b.add_css_class("joins-next");
+                }
+            }
+            row.set_margin_top(if continued { 1 } else { 6 });
+            self.messages.append(&row);
             prev = entries.get(run.end - 1);
         }
         self.messages.append(&self.typing_row);
@@ -1674,7 +1741,6 @@ impl ChatView {
         } else {
             gtk::Align::Start
         });
-        row.set_margin_top(if sender.is_some() { 8 } else { 2 });
 
         let bubble = gtk::Box::new(gtk::Orientation::Vertical, 4);
         bubble.add_css_class("bubble");
@@ -1684,7 +1750,11 @@ impl ChatView {
             bubble.append(&l);
         }
         if e.forwarded {
-            bubble.append(&ui::label("↪ Forwarded", &["caption", "dim-label"]));
+            let fwd = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            fwd.add_css_class("dim-label");
+            fwd.append(&gtk::Image::from_icon_name("mail-forward-symbolic"));
+            fwd.append(&ui::label("Forwarded", &["caption"]));
+            bubble.append(&fwd);
         }
         if let Some(q) = &e.quote {
             bubble.append(&self.quote_view(q));
@@ -1754,7 +1824,7 @@ impl ChatView {
                 bits.push("from your other device".into());
             }
             match e.tick {
-                TickMark::Read => bits.push("👁️".into()),
+                TickMark::Read => bits.push("✓✓ Seen".into()),
                 TickMark::Delivered => bits.push("✓✓".into()),
                 TickMark::Partial {
                     delivered,
@@ -1893,7 +1963,8 @@ impl ChatView {
             None if core::is_image(&f.name) => "image-x-generic-symbolic",
             None => "text-x-generic-symbolic",
         });
-        icon.set_pixel_size(32);
+        icon.set_pixel_size(20);
+        icon.add_css_class("file-tile");
         row.append(&icon);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let label = match f.clip {
@@ -2085,7 +2156,8 @@ impl ChatView {
             None if core::is_image(&f.name) => "image-x-generic-symbolic",
             None => "text-x-generic-symbolic",
         });
-        icon.set_pixel_size(32);
+        icon.set_pixel_size(20);
+        icon.add_css_class("file-tile");
         row.append(&icon);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let label = match f.clip {
@@ -2153,7 +2225,8 @@ impl ChatView {
             None if core::is_image(&f.name) => "image-x-generic-symbolic",
             None => "folder-download-symbolic",
         });
-        icon.set_pixel_size(32);
+        icon.set_pixel_size(20);
+        icon.add_css_class("file-tile");
         row.append(&icon);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let label = match f.clip {
@@ -3816,12 +3889,32 @@ impl ChatView {
         let pop = gtk::Popover::new();
         pop.set_parent(anchor);
         pop.set_has_arrow(false);
-        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        type Item<'a> = (&'a str, fn(&Rc<ChatView>));
+        // A grid of round, coloured tiles, four to a row, as on the phone.
+        let b = gtk::Grid::builder()
+            .column_spacing(4)
+            .row_spacing(4)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(8)
+            .margin_end(8)
+            .column_homogeneous(true)
+            .build();
+        type Item<'a> = (&'a str, &'a str, &'a str, fn(&Rc<ChatView>));
         let mut items: Vec<Item> = vec![
-            ("Photos or files…", Self::pick_files),
-            ("Contact…", Self::share_contact),
-            ("Location…", |t| {
+            (
+                "Photos or files",
+                "image-x-generic-symbolic",
+                "tile-violet",
+                Self::pick_files,
+            ),
+            ("GIF", "", "tile-teal", |t| t.gifs()),
+            (
+                "Contact",
+                "avatar-default-symbolic",
+                "tile-sky",
+                Self::share_contact,
+            ),
+            ("Location", "mark-location-symbolic", "tile-green", |t| {
                 let w = t.window();
                 let weak = t.weak_self.clone();
                 crate::cards::compose_location(&w, move |c| {
@@ -3830,7 +3923,7 @@ impl ChatView {
                     }
                 });
             }),
-            ("Event…", |t| {
+            ("Event", "x-office-calendar-symbolic", "tile-orange", |t| {
                 let w = t.window();
                 let weak = t.weak_self.clone();
                 crate::cards::compose_event(&w, move |c| {
@@ -3839,7 +3932,7 @@ impl ChatView {
                     }
                 });
             }),
-            ("Wi-Fi network…", |t| {
+            ("Wi-Fi", "network-wireless-symbolic", "tile-purple", |t| {
                 let w = t.window();
                 let weak = t.weak_self.clone();
                 crate::cards::compose_wifi(&w, move |c| {
@@ -3851,16 +3944,44 @@ impl ChatView {
         ];
         // Secrets go to one person (or our own notes), never a group.
         if self.group().is_none() {
-            items.push(("Login…", |t| t.compose_secret("login")));
-            items.push(("Payment card…", |t| t.compose_secret("card")));
-            items.push(("Secure note…", |t| t.compose_secret("note")));
+            items.push(("Login", "dialog-password-symbolic", "tile-pink", |t| {
+                t.compose_secret("login")
+            }));
+            items.push((
+                "Payment card",
+                "auth-smartcard-symbolic",
+                "tile-blue",
+                |t| t.compose_secret("card"),
+            ));
+            items.push((
+                "Secure note",
+                "x-office-document-symbolic",
+                "tile-red",
+                |t| t.compose_secret("note"),
+            ));
         }
-        for (label, f) in items {
-            let btn = gtk::Button::with_label(label);
+        for (i, (label, icon, tone, f)) in items.into_iter().enumerate() {
+            let tile = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            // GIF has no icon in the theme: its tile says it in letters.
+            let image: gtk::Widget = if icon.is_empty() {
+                ui::label("GIF", &["heading"]).upcast()
+            } else {
+                gtk::Image::from_icon_name(icon).upcast()
+            };
+            image.add_css_class("attach-tile");
+            image.add_css_class(tone);
+            image.set_halign(gtk::Align::Center);
+            tile.append(&image);
+            let name = ui::label(label, &["caption"]);
+            name.set_justify(gtk::Justification::Center);
+            name.set_xalign(0.5);
+            tile.append(&name);
+            let btn = gtk::Button::builder()
+                .child(&tile)
+                .tooltip_text(label)
+                .build();
             btn.add_css_class("flat");
-            if let Some(l) = btn.child().and_downcast::<gtk::Label>() {
-                l.set_xalign(0.0);
-            }
+            btn.add_css_class("attach-choice");
             let (weak, p) = (self.weak_self.clone(), pop.clone());
             btn.connect_clicked(move |_| {
                 p.popdown();
@@ -3868,7 +3989,8 @@ impl ChatView {
                     f(&t);
                 }
             });
-            b.append(&btn);
+            let i = i32::try_from(i).unwrap_or(0);
+            b.attach(&btn, i % 4, i / 4, 1, 1);
         }
         pop.set_child(Some(&b));
         pop.connect_closed(|p| {

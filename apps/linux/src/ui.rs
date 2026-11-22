@@ -496,6 +496,32 @@ pub fn snippet_markup(text: &str, terms: &[String], width: usize) -> Option<Stri
     Some(out)
 }
 
+/// A day as a chat heading: Today, Yesterday, the weekday within a week,
+/// else the date (with the year only when it isn't this one).
+pub fn day_heading(at_ms: u64) -> String {
+    let Ok(t) = glib::DateTime::from_unix_local(i64::try_from(at_ms / 1000).unwrap_or(0)) else {
+        return String::new();
+    };
+    let Ok(now) = glib::DateTime::now_local() else {
+        return String::new();
+    };
+    let day = |d: &glib::DateTime| {
+        glib::DateTime::from_local(d.year(), d.month(), d.day_of_month(), 0, 0, 0.0).ok()
+    };
+    let ago = match (day(&now), day(&t)) {
+        (Some(a), Some(b)) => a.difference(&b).as_seconds().div_euclid(86_400),
+        _ => i64::MAX,
+    };
+    let fmt = match ago {
+        0 => return "Today".into(),
+        1 => return "Yesterday".into(),
+        2..=6 => "%A",
+        _ if now.year() == t.year() => "%a %-d %b",
+        _ => "%-d %b %Y",
+    };
+    t.format(fmt).map(|s| s.to_string()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

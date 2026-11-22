@@ -227,10 +227,10 @@ impl App {
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&header);
         sidebar_view.add_top_bar(&search_bar);
-        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        tabs.add_css_class("linked");
-        tabs.add_css_class("list-tabs");
-        tabs.set_halign(gtk::Align::Center);
+        // Filter chips, set apart (as on the phone), not one joined bar.
+        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        tabs.add_css_class("chip-row");
+        tabs.set_halign(gtk::Align::Start);
         sidebar_view.add_top_bar(&tabs);
         sidebar_view.set_content(Some(&list_stack));
         let sidebar = adw::NavigationPage::builder()
