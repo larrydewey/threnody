@@ -1,0 +1,4 @@
+- Deleted messages leave "This message was deleted", so replies still make sense. Or delete without a trace: gone for anyone who hadn't seen it yet.
+- Calls show in the chat: how long they lasted, or that you missed one (tap to call back). Missed calls count as unread.
+- Group changes show in the chat: who joined, left, was added or removed, and new admins.
+- Notices when disappearing messages change, when a contact adds a device, and when you verify them.
