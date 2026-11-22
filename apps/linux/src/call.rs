@@ -542,7 +542,7 @@ impl CallBar {
             .is_some_and(|s| s.id == id && s.joined)
     }
 
-    fn is(&self, id: u64) -> bool {
+    pub fn is(&self, id: u64) -> bool {
         self.shown.borrow().as_ref().is_some_and(|s| s.id == id)
     }
 

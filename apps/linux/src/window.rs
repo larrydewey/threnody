@@ -82,6 +82,11 @@ pub struct App {
     log: RefCell<Option<gtk::TextBuffer>>,
     /// The current call, across the top of the window.
     call: Rc<CallBar>,
+    /// While a call we started waits for its id: events for a call the
+    /// bar doesn't know yet, which may be that one's. Over a session
+    /// already open, its ringing (or busy) answer can come back before the
+    /// id does, and then the ringback tone never played.
+    call_early: RefCell<Option<Vec<UiEvent>>>,
     /// App lock: the lock page in front of everything.
     pub lock: Rc<crate::lock::Lock>,
     /// The copied link last offered, so it's offered once. Memory only:
@@ -297,6 +302,7 @@ impl App {
             rebuilding: Cell::new(false),
             log: RefCell::new(None),
             call,
+            call_early: RefCell::new(None),
             lock,
             offered: RefCell::new(None),
             scanner: RefCell::new(None),
@@ -1308,6 +1314,15 @@ impl App {
             UiEvent::PersonasChanged => return self.refresh_soon(),
             UiEvent::Node { persona, event } => (persona, event),
         };
+        if let NodeEvent::CallRinging { call, .. }
+        | NodeEvent::CallStarted { call, .. }
+        | NodeEvent::CallEnded { call, .. } = &event
+            && !self.call.is(*call)
+            && let Some(early) = self.call_early.borrow_mut().as_mut()
+        {
+            early.push(UiEvent::Node { persona, event });
+            return;
+        }
         // Which conversation it concerns, and whether it's news.
         let (about, news): (Option<String>, Option<(String, String)>) = match &event {
             NodeEvent::Message { peer, text, .. } => (
@@ -1931,14 +1946,20 @@ impl App {
         let (device, title) = (conv.device.clone(), conv.title.clone());
         // Without a session, reaching them first can take up to 45 s.
         self.toast(&format!("Calling {title}…"));
+        *self.call_early.borrow_mut() = Some(Vec::new());
         let weak = Rc::downgrade(self);
         bg(
             move || node.start_call(device, video),
             move |r| {
                 let Some(this) = weak.upgrade() else { return };
+                let early = this.call_early.take().unwrap_or_default();
                 match r {
                     Ok(id) => this.call.outgoing(persona, id, &title, video),
                     Err(e) => this.toast(&format!("Couldn't call {title}: {e}")),
+                }
+                // Now the bar knows the call, they go where they belong.
+                for e in early {
+                    this.handle(e);
                 }
             },
         );
