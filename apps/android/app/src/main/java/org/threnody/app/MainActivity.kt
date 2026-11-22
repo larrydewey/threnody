@@ -66,17 +66,40 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // Top bar with dynamic color support
+        // A large title and the main menu; search is the pill below it, and
+        // a new conversation the button at the foot.
         val bar = TopBar(this, null).apply {
             title.text = "Threnody"
-            title.setTextAppearance(Design.styleTitleLarge)
-            // Three actions at most: the rest are a tap away in More.
-            action(R.drawable.ic_search, "Search messages") { search.open() }
-            action(R.drawable.ic_add, "New conversation") { add(it) }
+            large()
             action(R.drawable.ic_more, "More") { more(it) }
         }
+        lateinit var searchPill: View
         search = SearchBox(this, bar, "Search messages", stepper = false, query = ::find) {
+            searchPill.visibility = View.VISIBLE
             refreshSoon()
+        }
+        searchPill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(color(R.color.field), dp(28).toFloat())
+            foreground = ripple()
+            minimumHeight = dp(52)
+            setPadding(dp(Design.lg), 0, dp(Design.lg), 0)
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Search messages"
+            addView(android.widget.ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_search)
+                imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.muted))
+            }, LinearLayout.LayoutParams(dp(24), dp(24)))
+            addView(label("Search messages", Design.typeSubtitle, R.color.muted), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply {
+                marginStart = dp(Design.md)
+            })
+            setOnClickListener { v ->
+                Design.lightHaptic(v)
+                visibility = View.GONE
+                search.open()
+            }
         }
 
         // Empty state container (shown when no conversations)
@@ -87,11 +110,11 @@ class MainActivity : Activity() {
             setPadding(dp(Design.xl), dp(Design.xxl), dp(Design.xl), dp(Design.xxl))
         }
 
-        // Conversation list
+        // Conversation list (its foot clear of the New chat button)
         list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             clipToPadding = false
-            setPadding(dp(Design.screenPadding), dp(Design.md), dp(Design.screenPadding), dp(Design.xl))
+            setPadding(dp(Design.sm), dp(Design.xs), dp(Design.sm), dp(96))
         }
 
         // Scroll content container holds both list and empty state
@@ -110,19 +133,50 @@ class MainActivity : Activity() {
         tabKey = getSharedPreferences(UI_PREFS, MODE_PRIVATE).getString(TAB, null) ?: Tab.All.name
         tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(Design.screenPadding), dp(Design.xs), dp(Design.screenPadding), dp(Design.sm))
+            setPadding(dp(Design.lg), dp(Design.md), dp(Design.lg), dp(Design.sm))
         }
         drawTabs()
 
+        // New chat: an extended button at the foot, where the thumb is.
+        val newChat = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(color(R.color.accent_container), dp(18).toFloat())
+            foreground = ripple()
+            elevation = dp(3).toFloat()
+            minimumHeight = dp(56)
+            setPadding(dp(Design.lg), 0, dp(Design.xl - 4), 0)
+            isClickable = true
+            isFocusable = true
+            contentDescription = "New conversation"
+            addView(android.widget.ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_edit)
+                imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.on_accent_container))
+            }, LinearLayout.LayoutParams(dp(24), dp(24)))
+            addView(label("New chat", Design.typeSubtitle, R.color.on_accent_container, Design.weightBold), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+                marginStart = dp(Design.md)
+            })
+            setOnClickListener { v -> Design.mediumHaptic(v); add(v) }
+        }
+        val listArea = android.widget.FrameLayout(this).apply {
+            addView(scroll, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(newChat, android.widget.FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.END).apply {
+                setMargins(0, 0, dp(Design.lg), dp(Design.lg))
+            })
+        }
+
         root.addView(bar, matchWrap)
+        root.addView(searchPill, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
+            setMargins(dp(Design.lg), dp(Design.xs), dp(Design.lg), 0)
+        })
         root.addView(callBanner.view, matchWrap)
         root.addView(android.widget.HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             addView(tabBar)
         }, matchWrap)
-        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(listArea, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
-        fitSystemBars(root, bar, scroll)
+        fitSystemBars(root, bar, listArea)
 
         // Woken by pushes: no permanent connection (and notification).
         if (!Push.active(this)) ThrenodyService.start(this)
@@ -232,7 +286,7 @@ class MainActivity : Activity() {
                 open = { openChat(c.key, c.device) }, section = Row.Section.Requests)
         }
         if (requests.isNotEmpty()) {
-            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Message Requests", section = Row.Section.Requests))
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Message requests", section = Row.Section.Requests))
             rows.addAll(requests)
         }
 
@@ -304,7 +358,7 @@ class MainActivity : Activity() {
             }
         }
         if (anonymous.isNotEmpty()) {
-            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Anonymous Identities", section = Row.Section.Anonymous))
+            rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Anonymous identities", section = Row.Section.Anonymous))
             rows.addAll(anonymous)
         }
 
@@ -424,18 +478,9 @@ class MainActivity : Activity() {
             val waiting = rows.count {
                 key != Tab.All.name && (it.unread > 0 || it.section == Row.Section.Requests || it.section == Row.Section.Invites)
             }
-            tabBar.addView(TextView(this).apply {
-                text = if (waiting > 0) "$label · $waiting" else label
-                setTextAppearance(Design.styleLabelMedium)
-                setTypeface(typeface, if (selected) Design.weightMedium else android.graphics.Typeface.NORMAL)
-                setTextColor(color(if (selected) R.color.on_bubble_out else R.color.text))
-                background = if (selected) rounded(color(R.color.accent), dp(18).toFloat())
-                    else rounded(color(R.color.field), dp(18).toFloat())
-                setPadding(dp(16), dp(8), dp(16), dp(8))
-                isSelected = selected
+            tabBar.addView(filterChip(if (waiting > 0) "$label  $waiting" else label, selected) { onClick() }.apply {
                 contentDescription = "$label tab" + (if (waiting > 0) ", $waiting unread or waiting" else "") +
                     (if (selected) ", selected" else "")
-                setOnClickListener { onClick() }
                 onLong?.let { l -> setOnLongClickListener { v -> Design.mediumHaptic(v); l(); true } }
             }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(8) })
         }
@@ -716,23 +761,17 @@ class MainActivity : Activity() {
 
     private fun addSectionHeader(title: String) {
         list.addView(TextView(this).apply {
-            text = title.uppercase()
-            setTextAppearance(Design.styleLabelMedium)
-            setTextColor(color(R.color.muted))
-            setTypeface(typeface, Design.weightMedium)
-            letterSpacing = 0.05f
-            setPadding(dp(Design.listItemPaddingH), dp(Design.lg), dp(Design.listItemPaddingH), dp(Design.sm))
+            text = title
+            textSize = 14f
+            setTextColor(color(R.color.accent))
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(dp(Design.lg), dp(Design.lg), dp(Design.lg), dp(Design.xs))
         }, matchWrap)
     }
 
+    /** Sections are set apart by their headings and a little air. */
     private fun addSectionDivider() {
-        list.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(1)).apply {
-                topMargin = dp(Design.md)
-                bottomMargin = dp(Design.md)
-            }
-            background = color(R.color.divider).let { ColorDrawable(it) }
-        })
+        list.addView(View(this), LinearLayout.LayoutParams(MATCH_PARENT, dp(Design.sm)))
     }
 
     private fun row(r: Row): View {
@@ -752,6 +791,7 @@ class MainActivity : Activity() {
         }
 
         val title = label(r.title, 17f, R.color.text, Design.weightMedium).apply {
+            setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL))
             isSingleLine = true
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -759,7 +799,7 @@ class MainActivity : Activity() {
 
         val previewColor = if (r.atMs == Long.MAX_VALUE) R.color.accent else R.color.muted
         val preview = label("", 14f, previewColor, Design.weightRegular).apply {
-            text = r.preview
+            text = iconized(r.preview, currentTextColor)
             isSingleLine = true
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -771,9 +811,10 @@ class MainActivity : Activity() {
             addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(2) })
         }
 
-        val timeText = (if (r.pinned >= 0) "📌 " else "") + (if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else "")
-        val time = label(timeText, Design.typeCaption, R.color.muted, Design.weightRegular).apply {
+        val timeText = if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else ""
+        val time = label(timeText, Design.typeCaption, if (r.unread > 0) R.color.accent else R.color.muted, Design.weightRegular).apply {
             isSingleLine = true
+            if (r.unread > 0) setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
         if (r.unread > 0) {
             title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
@@ -784,44 +825,82 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
             addView(time, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            val marks = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            }
+            if (r.pinned >= 0) marks.addView(android.widget.ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_pin)
+                imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.muted))
+                contentDescription = "pinned"
+            }, LinearLayout.LayoutParams(dp(18), dp(18)))
             if (r.unread > 0) {
-                addView(TextView(this@MainActivity).apply {
+                marks.addView(TextView(this@MainActivity).apply {
                     text = if (r.unread > 99) "99+" else r.unread.toString()
                     textSize = 12f
-                    setTextColor(color(R.color.on_bubble_out))
+                    setTextColor(color(R.color.on_accent))
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    background = rounded(color(R.color.accent), dp(10).toFloat())
-                    setPadding(dp(7), dp(1), dp(7), dp(1))
+                    background = rounded(color(R.color.accent), dp(11).toFloat())
+                    setPadding(dp(7), 0, dp(7), 0)
                     gravity = Gravity.CENTER
-                    minWidth = dp(20)
+                    minWidth = dp(22)
+                    minHeight = dp(22)
                     contentDescription = "${r.unread} unread"
-                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(Design.xs); gravity = Gravity.END })
+                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = dp(Design.xs) })
             }
+            if (marks.childCount > 0) addView(marks, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+                topMargin = dp(6); gravity = Gravity.END
+            })
         }
 
         val rowView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(Design.listItemPaddingH), dp(Design.listItemPaddingV), dp(Design.listItemPaddingH), dp(Design.listItemPaddingV))
-            minimumHeight = dp(72)
-            background = ripple()
+            setPadding(dp(Design.md), dp(10), dp(Design.md), dp(10))
+            minimumHeight = dp(76)
+            // Rounded touch feedback, inset from the screen's edges.
+            background = android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(withAlpha(color(R.color.text), 0x1F)), null,
+                rounded(android.graphics.Color.BLACK, dp(20).toFloat()),
+            )
             addView(avatar)
-            addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.md); marginEnd = dp(Design.sm) })
+            addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.lg); marginEnd = dp(Design.sm) })
             addView(side)
             setOnClickListener { v -> Design.lightHaptic(v); r.open() }
             r.manage?.let { m -> setOnLongClickListener { v -> Design.mediumHaptic(v); m(); true } }
         }
 
         // Add section color accent for anonymous identities
-        if (r.section == Row.Section.Anonymous) {
-            val accent = View(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(3), MATCH_PARENT)
-                background = color(R.color.accent).let { ColorDrawable(it) }
-            }
-            (rowView as LinearLayout).addView(accent, 0)
-        }
+        // An anonymous identity's chat wears a mask on its avatar.
+        if (r.section == Row.Section.Anonymous) avatar.addView(iconTile(R.drawable.ic_mask, 22, color(R.color.on_accent), color(R.color.accent)).apply {
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            contentDescription = "anonymous"
+        }, android.widget.FrameLayout.LayoutParams(dp(22), dp(22), Gravity.BOTTOM or Gravity.START))
 
         return rowView
+    }
+
+    /**
+     * A preview with its kind marks (📎 file, 📊 poll, 📋 list, shared with
+     * the other apps) drawn as the app's own icons, in the text's colour.
+     */
+    private fun iconized(text: CharSequence, tint: Int): CharSequence {
+        val marks = mapOf("📎" to R.drawable.ic_file, "📊" to R.drawable.ic_poll, "📋" to R.drawable.ic_list)
+        if (marks.keys.none { text.contains(it) }) return text
+        val out = android.text.SpannableStringBuilder(text)
+        for ((mark, icon) in marks) {
+            var at = out.indexOf(mark)
+            while (at >= 0) {
+                val d = getDrawable(icon)!!.mutate().apply {
+                    setTint(tint)
+                    setBounds(0, 0, dp(16), dp(16))
+                }
+                out.setSpan(android.text.style.ImageSpan(d, android.text.style.DynamicDrawableSpan.ALIGN_CENTER),
+                    at, at + mark.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                at = out.indexOf(mark, at + mark.length)
+            }
+        }
+        return out
     }
 
     private fun ago(ms: Long): String = when {
@@ -906,10 +985,10 @@ class MainActivity : Activity() {
 
     private fun add(anchor: View) {
         PopupMenu(this, anchor).apply {
-            menu.add("Scan a QR code").setOnMenuItemClickListener { scan(); true }
-            menu.add("Add a contact").setOnMenuItemClickListener { addContact(null); true }
-            menu.add("New group").setOnMenuItemClickListener { newGroup(); true }
-            menu.add("Anonymous invite").setOnMenuItemClickListener { newPersona(); true }
+            item(this@MainActivity, "Scan a QR code", R.drawable.ic_qr) { scan() }
+            item(this@MainActivity, "Add a contact", R.drawable.ic_person) { addContact(null) }
+            item(this@MainActivity, "New group", R.drawable.ic_group) { newGroup() }
+            item(this@MainActivity, "Anonymous invite", R.drawable.ic_mask) { newPersona() }
             show()
         }
     }
@@ -962,18 +1041,14 @@ class MainActivity : Activity() {
     /** The main menu: the few things people look for, then Settings. */
     private fun more(anchor: View) {
         PopupMenu(this, anchor).apply {
-            menu.add("My invite").setOnMenuItemClickListener { showInvite(); true }
-            menu.add("Lists").setOnMenuItemClickListener { startActivity(Intent(this@MainActivity, ListsActivity::class.java)); true }
-            menu.add("Your profile").setOnMenuItemClickListener {
-                node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile") }
-                true
-            }
-            menu.add("Devices").setOnMenuItemClickListener { devices(); true }
-            menu.add("Anonymous identities").setOnMenuItemClickListener { personas(); true }
-            if (AppLock.enabled(this@MainActivity)) {
-                menu.add("Lock now").setOnMenuItemClickListener { AppLock.lockNow(this@MainActivity); true }
-            }
-            menu.add("Settings").setOnMenuItemClickListener { settings(); true }
+            val a = this@MainActivity
+            item(a, "My invite", R.drawable.ic_qr) { showInvite() }
+            item(a, "Lists", R.drawable.ic_list) { startActivity(Intent(a, ListsActivity::class.java)) }
+            item(a, "Your profile", R.drawable.ic_person) { node?.let { ProfileUi.edit(a, it, "Your profile") } }
+            item(a, "Devices", R.drawable.ic_phone_device) { devices() }
+            item(a, "Anonymous identities", R.drawable.ic_mask) { personas() }
+            if (AppLock.enabled(a)) item(a, "Lock now", R.drawable.ic_lock) { AppLock.lockNow(a) }
+            item(a, "Settings", R.drawable.ic_settings) { settings() }
             show()
         }
     }
@@ -1481,19 +1556,25 @@ class MainActivity : Activity() {
                             ellipsize = android.text.TextUtils.TruncateAt.END
                         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
                         if (d.thisDevice) addView(label("This device", 12f, R.color.accent, Design.weightMedium).apply {
-                            background = rounded((color(R.color.accent) and 0x00FFFFFF) or 0x1F000000, dp(10).toFloat())
+                            background = rounded(color(R.color.accent_container), dp(10).toFloat())
                             setPadding(dp(8), dp(2), dp(8), dp(2))
                         })
                     }
-                    box.addView(LinearLayout(this).apply {
+                    val texts = LinearLayout(this).apply {
                         orientation = LinearLayout.VERTICAL
-                        setPadding(dp(Design.xl), dp(Design.md), dp(Design.xl), dp(Design.md))
-                        minimumHeight = dp(Design.touchTargetMin)
-                        background = ripple()
                         addView(name, matchWrap)
                         addView(label(Threnody.short(d.fingerprint), 13f, R.color.muted).apply {
                             typeface = android.graphics.Typeface.MONOSPACE
                         })
+                    }
+                    box.addView(LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(Design.xl), dp(Design.md), dp(Design.xl), dp(Design.md))
+                        minimumHeight = dp(Design.touchTargetMin)
+                        background = ripple()
+                        addView(iconTile(R.drawable.ic_phone_device, 40))
+                        addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.lg) })
                         setOnClickListener { dialog.dismiss(); deviceActions(d, list.size) }
                     }, matchWrap)
                 }

@@ -54,7 +54,7 @@
     <color name="surface_variant">@color/md_sys_color_surface_container_high</color>
     <color name="surface_container">@color/md_sys_color_surface_container</color>
     <color name="surface_container_low">@color/md_sys_color_surface_container_low</color>
-    <color name="bar">@color/md_sys_color_surface</color>
+    <color name="bar">@color/background</color>
     <color name="sheet">@color/md_sys_color_surface_container_low</color>
     <color name="field">@color/md_sys_color_surface_container_highest</color>
     <color name="text">@color/md_sys_color_on_surface</color>
@@ -83,4 +83,11 @@
     <color name="on_primary">@color/md_sys_color_on_primary</color>
     <color name="primary_container">@color/md_sys_color_primary_container</color>
     <color name="on_primary_container">@color/md_sys_color_on_primary_container</color>
+
+    <!-- Containers: cards, settings groups, chips -->
+    <color name="accent_container">@color/md_sys_color_primary_container</color>
+    <color name="on_accent_container">@color/md_sys_color_on_primary_container</color>
+    <color name="card">@color/md_sys_color_surface_container_low</color>
+    <color name="popup">@color/md_sys_color_surface_container</color>
+    <color name="divider_soft">@color/md_sys_color_surface_container_high</color>
 </resources>

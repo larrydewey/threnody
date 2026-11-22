@@ -72,6 +72,8 @@ class CallActivity : Activity() {
     private var feed: CallCamera? = null
     /** Which camera `feed` is. */
     private var feedFront = true
+    private lateinit var face: Avatar
+
     /** Which drawing thread is current: each start makes a new one, and older ones stop. */
     private val watching = java.util.concurrent.atomic.AtomicInteger(0)
 
@@ -82,6 +84,7 @@ class CallActivity : Activity() {
         setShowWhenLocked(true)
         setTurnScreenOn(true)
 
+        face = Avatar(this, 112)
         who = label("", Design.typeTitle * 1.4f, R.color.text, Design.weightBold).apply {
             gravity = Gravity.CENTER
             setShadowLayer(4f, 0f, 1f, Color.BLACK)
@@ -105,8 +108,8 @@ class CallActivity : Activity() {
                 onClick()
             }
         }
-        val red = getColor(android.R.color.holo_red_dark)
-        val green = getColor(android.R.color.holo_green_dark)
+        val red = 0xFFE5484D.toInt()
+        val green = 0xFF22A559.toInt()
         val white = getColor(android.R.color.white)
         val big = dp(72)
         fun row(vararg views: View) = LinearLayout(this).apply {
@@ -220,6 +223,7 @@ class CallActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(Design.xl), dp(Design.xxl * 2), dp(Design.xl), dp(Design.xxl * 2))
+            addView(face, LinearLayout.LayoutParams(dp(112), dp(112)).apply { bottomMargin = dp(Design.xl) })
             addView(who, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(Design.sm) })
             addView(View(this@CallActivity), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -489,12 +493,25 @@ class CallActivity : Activity() {
         showTiles(c, group && !ringing, hide)
         local.visibility = if (c.video && !ringing) View.VISIBLE else View.GONE
         flip.visibility = if (c.video && !ringing && CallCamera.canSwitch(this)) View.VISIBLE else View.GONE
-        mute.alpha = if (c.muted) 1f else 0.6f
+        // The face, unless video or the group's tiles fill the screen.
+        face.show(if (hide) "?" else c.title, c.group ?: c.peer)
+        face.visibility = if ((c.peerVideo && !ringing && !group) || (group && !ringing)) View.GONE else View.VISIBLE
+        // Text needs a shadow only over video, where the picture is behind it.
+        val shade = if (face.visibility == View.VISIBLE) 0f else 4f
+        who.setShadowLayer(shade, 0f, 1f, Color.BLACK)
+        status.setShadowLayer(shade, 0f, 1f, Color.BLACK)
+        // A toggle that's on is filled (light on dark, dark on light), as Material does.
+        fun toggled(b: ImageButton, on: Boolean) {
+            (b.background as? GradientDrawable)?.setColor(getColor(if (on) R.color.text else R.color.surface_container))
+            b.imageTintList = android.content.res.ColorStateList.valueOf(getColor(if (on) R.color.background else R.color.text))
+        }
+        toggled(mute, c.muted)
+        mute.alpha = 1f
         mute.contentDescription = if (c.muted) "Unmute" else "Mute"
-        camera.alpha = if (c.video) 1f else 0.6f
+        toggled(camera, c.video)
         camera.contentDescription = if (c.video) "Turn camera off" else "Turn camera on"
         val heard = Calls.outputNow(this)
-        speaker.alpha = if (heard != null && heard != "earpiece") 1f else 0.6f
+        toggled(speaker, heard != null && heard != "earpiece")
         speaker.contentDescription = "Sound: " +
             (Calls.outputs(this).firstOrNull { it.key == heard }?.label ?: if (c.speaker) "Speaker" else "Phone")
         cameraIfWanted()

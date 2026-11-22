@@ -58,6 +58,15 @@ object Cards {
         is CardItemInfo.Secret -> when (i.kind) { "login" -> "🔑"; "card" -> "💳"; else -> "🔒" }
     }
 
+    /** The kind's icon, as the app's other icons are drawn. */
+    fun kindDrawable(c: CardInfo): Int = when (val i = c.item) {
+        is CardItemInfo.Contact -> R.drawable.ic_person
+        is CardItemInfo.Wifi -> R.drawable.ic_wifi
+        is CardItemInfo.Location -> R.drawable.ic_place
+        is CardItemInfo.Event -> R.drawable.ic_event
+        is CardItemInfo.Secret -> when (i.kind) { "login" -> R.drawable.ic_key; "card" -> R.drawable.ic_credit_card; else -> R.drawable.ic_lock }
+    }
+
     fun kindName(c: CardInfo): String = when (val i = c.item) {
         is CardItemInfo.Contact -> "Contact"
         is CardItemInfo.Wifi -> "Wi-Fi network"
@@ -109,7 +118,7 @@ object Cards {
         val tint = (fg and 0x00FFFFFF) or 0x1A000000
         val box = LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            background = rounded(tint, a.dp(Design.radiusMd).toFloat())
+            background = rounded(tint, a.dp(16).toFloat())
             setPadding(a.dp(Design.md), a.dp(Design.md), a.dp(Design.md), a.dp(Design.sm))
             minimumWidth = a.dp(240)
         }
@@ -126,12 +135,8 @@ object Cards {
         box.addView(LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
-            addView(TextView(a).apply {
-                text = if (sealed) "👁" else kindIcon(c)
-                textSize = 18f
-                gravity = android.view.Gravity.CENTER
-                background = GradientDrawableCircle(tint)
-            }, LinearLayout.LayoutParams(a.dp(40), a.dp(40)).apply { marginEnd = a.dp(Design.md) })
+            addView(a.iconTile(if (sealed) R.drawable.ic_visibility else kindDrawable(c), 40, fg, withAlpha(fg, 0x2A)),
+                LinearLayout.LayoutParams(a.dp(40), a.dp(40)).apply { marginEnd = a.dp(Design.md) })
             addView(LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(TextView(a).apply {
@@ -241,13 +246,6 @@ object Cards {
         if (details.childCount > 0) box.addView(details)
         if (actions.childCount > 0) box.addView(actions)
         return box
-    }
-
-    /** A filled circle, for a card's icon. */
-    @Suppress("FunctionName")
-    private fun GradientDrawableCircle(color: Int) = android.graphics.drawable.GradientDrawable().apply {
-        shape = android.graphics.drawable.GradientDrawable.OVAL
-        setColor(color)
     }
 
     /**

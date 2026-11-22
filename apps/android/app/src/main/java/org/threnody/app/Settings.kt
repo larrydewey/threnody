@@ -10,8 +10,8 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
+import com.google.android.material.materialswitch.MaterialSwitch
 
 /**
  * A full-screen settings page: named sections of switches and links.
@@ -26,18 +26,39 @@ class SettingsPage(private val activity: Activity, private val title: String) {
     private val rows = mutableListOf<() -> Unit>()
     private val body = LinearLayout(activity).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(0, 0, 0, activity.dp(Design.xl))
+        setPadding(activity.dp(Design.lg), 0, activity.dp(Design.lg), activity.dp(Design.xl))
     }
+    /** The rounded card the current section's rows go in. */
+    private var group: LinearLayout? = null
 
-    /** Starts a new section called `name`. */
+    /** Starts a new section called `name`: a heading, then its rows in one card. */
     fun section(name: String) {
         val first = body.childCount == 0
         body.addView(activity.label(name, Design.typeBodySmall, R.color.accent, Design.weightBold).apply {
             setPadding(
-                activity.dp(Design.listItemPaddingH), activity.dp(if (first) Design.md else Design.xl),
-                activity.dp(Design.listItemPaddingH), activity.dp(Design.xs),
+                activity.dp(Design.lg), activity.dp(if (first) Design.sm else Design.xl),
+                activity.dp(Design.lg), activity.dp(Design.sm),
             )
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        group = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = activity.cardBackground(24)
+            clipToOutline = true
+        }.also { body.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
+    }
+
+    /** A switch in the theme's colours, Material 3's shape (a pill with a sliding knob). */
+    private fun switch(): MaterialSwitch {
+        val themed = android.view.ContextThemeWrapper(activity, com.google.android.material.R.style.Theme_Material3_DayNight_NoActionBar)
+        return MaterialSwitch(themed).apply {
+            val on = intArrayOf(android.R.attr.state_checked)
+            val off = intArrayOf()
+            fun states(checked: Int, unchecked: Int) =
+                android.content.res.ColorStateList(arrayOf(on, off), intArrayOf(checked, unchecked))
+            trackTintList = states(activity.color(R.color.accent), activity.color(R.color.field))
+            trackDecorationTintList = states(android.graphics.Color.TRANSPARENT, activity.color(R.color.muted))
+            thumbTintList = states(activity.color(R.color.on_accent), activity.color(R.color.muted))
+        }
     }
 
     /**
@@ -45,7 +66,7 @@ class SettingsPage(private val activity: Activity, private val title: String) {
      * the given state means. A tap calls `set` with the new state.
      */
     fun toggle(name: String, on: () -> Boolean, describe: (Boolean) -> String, set: (Boolean) -> Unit) {
-        val sw = Switch(activity).apply {
+        val sw = switch().apply {
             isClickable = false
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -68,7 +89,12 @@ class SettingsPage(private val activity: Activity, private val title: String) {
 
     /** A row that does something when tapped: opens a screen, asks, erases. */
     fun link(name: String, subtitle: String? = null, danger: Boolean = false, onClick: () -> Unit) {
-        val (row, _) = row(name, subtitle, danger = danger)
+        val chevron = if (danger) null else android.widget.ImageView(activity).apply {
+            setImageResource(R.drawable.ic_chevron)
+            imageTintList = android.content.res.ColorStateList.valueOf(activity.color(R.color.muted))
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        val (row, _) = row(name, subtitle, trailing = chevron, danger = danger)
         row.setOnClickListener { v ->
             Design.lightHaptic(v)
             onClick()
@@ -84,22 +110,21 @@ class SettingsPage(private val activity: Activity, private val title: String) {
         val texts = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
         }
-        texts.addView(activity.label(name, Design.typeBody, if (danger) R.color.md_sys_color_error else R.color.text, maxLines = 2))
-        val sub = activity.label(subtitle ?: "", Design.typeBodySmall, R.color.muted, maxLines = 4).apply {
+        texts.addView(activity.label(name, Design.typeSubtitle, if (danger) R.color.md_sys_color_error else R.color.text, maxLines = 2))
+        val sub = activity.label(subtitle ?: "", 14f, R.color.muted, maxLines = 4).apply {
             visibility = if (subtitle == null) View.GONE else View.VISIBLE
+            setPadding(0, activity.dp(2), 0, 0)
+            setLineSpacing(0f, 1.1f)
         }
         texts.addView(sub)
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = activity.dp(Design.touchTargetMin)
+            minimumHeight = activity.dp(56)
             background = activity.ripple()
             isClickable = true
             isFocusable = true
-            setPadding(
-                activity.dp(Design.listItemPaddingH), activity.dp(Design.listItemPaddingV),
-                activity.dp(Design.listItemPaddingH), activity.dp(Design.listItemPaddingV),
-            )
+            setPadding(activity.dp(Design.lg + 4), activity.dp(14), activity.dp(Design.lg), activity.dp(14))
             addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             if (trailing != null) {
                 addView(trailing, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
@@ -107,7 +132,12 @@ class SettingsPage(private val activity: Activity, private val title: String) {
                 })
             }
         }
-        body.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        val into = group ?: body
+        // A hairline between rows of a card, set in from its left edge.
+        if (into.childCount > 0) into.addView(View(activity).apply {
+            setBackgroundColor(activity.color(R.color.divider_soft))
+        }, LinearLayout.LayoutParams(MATCH_PARENT, activity.dp(1)).apply { marginStart = activity.dp(Design.lg + 4) })
+        into.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         return row to sub
     }
 
@@ -127,7 +157,10 @@ class SettingsPage(private val activity: Activity, private val title: String) {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(activity.color(R.color.background))
         }
-        val bar = TopBar(activity) { dialog.dismiss() }.apply { this.title.text = page.title }
+        val bar = TopBar(activity) { dialog.dismiss() }.apply {
+            this.title.text = page.title
+            this.title.textSize = 24f
+        }
         val scroll = ScrollView(activity).apply { addView(body) }
         root.addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -137,6 +170,22 @@ class SettingsPage(private val activity: Activity, private val title: String) {
         dialog.window?.apply {
             setLayout(MATCH_PARENT, MATCH_PARENT)
             setBackgroundDrawable(ColorDrawable(activity.color(R.color.background)))
+            // A full page, not a dialog: no dimming over the status bar, whose
+            // icons follow the theme like the screen's own.
+            clearFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            // Flat with the screen: a dialog's shadow would draw a line under the status bar.
+            setElevation(0f)
+            setWindowAnimations(android.R.style.Animation_Activity)
+            statusBarColor = android.graphics.Color.TRANSPARENT
+            navigationBarColor = android.graphics.Color.TRANSPARENT
+            if (Build.VERSION.SDK_INT >= 30) {
+                val light = if (activity.isNight) 0 else
+                    android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                        android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                insetsController?.setSystemBarsAppearance(light,
+                    android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                        android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS)
+            }
             if (Build.VERSION.SDK_INT >= 30) {
                 setDecorFitsSystemWindows(false)
                 val top = bar.paddingTop
