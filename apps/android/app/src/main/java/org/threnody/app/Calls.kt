@@ -247,6 +247,7 @@ object Calls {
         Threading.background {
             val id = try { node.startCall(device, video) } catch (e: Exception) {
                 Threnody.say("! call ${Threnody.short(device)}: ${e.message}")
+                synchronized(early) { early.clear() }
                 if (attempt == mine && current?.id == REACHING) {
                     current = null
                     ended = "Couldn't reach $title"
@@ -258,14 +259,18 @@ object Calls {
                 }
                 return@background
             }
-            val now = current
-            if (now == null || now.id != REACHING || attempt != mine) {
+            val held = synchronized(early) {
+                val now = current?.takeIf { it.id == REACHING && attempt == mine }
+                if (now != null) current = now.copy(id = id, state = "calling")
+                early.filter { callOf(it) == id }.also { early.clear() }.takeIf { now != null }
+            }
+            if (held == null) {
                 // Hung up while we were reaching them.
                 node.hangupCall(id)
                 return@background
             }
-            current = now.copy(id = id, state = "calling")
             changed()
+            held.forEach { onEvent(a.applicationContext, node, persona, it) }
         }
     }
 
@@ -466,8 +471,31 @@ object Calls {
         changed()
     }
 
+    /**
+     * Events for a one-to-one call that came while we were still waiting
+     * for [start]'s call to have an id: they may be that call's. Over a
+     * session already open, its ringing (or busy) answer can come back
+     * before the id does, and then the ringback tone never played.
+     */
+    private val early = mutableListOf<NodeEvent>()
+
+    private fun callOf(e: NodeEvent): ULong? = when (e) {
+        is NodeEvent.CallRinging -> e.call
+        is NodeEvent.CallStarted -> e.call
+        is NodeEvent.CallEnded -> e.call
+        else -> null
+    }
+
     /** Call events from a node's event thread (the main identity's or a persona's). */
     fun onEvent(ctx: Context, node: ThrenodyNode, persona: String?, e: NodeEvent) {
+        callOf(e)?.let { id ->
+            synchronized(early) {
+                if (current?.id == REACHING && id != REACHING) {
+                    early.add(e)
+                    return
+                }
+            }
+        }
         when (e) {
             is NodeEvent.CallIncoming -> {
                 ended = null
