@@ -240,6 +240,8 @@ class MainActivity : Activity() {
         /** Where it is among the pinned chats (-1: not pinned). */
         val pinned: Int = -1,
         val archived: Boolean = false,
+        /** A group's picture (Appendix W), in place of its initial. */
+        val picture: uniffi.threnody_ffi.PictureInfo? = null,
     ) {
         enum class Section { Requests, Invites, Contacts, Groups, Anonymous }
     }
@@ -327,11 +329,13 @@ class MainActivity : Activity() {
             val last = try { n.groupHistory(g.id, 1u).lastOrNull() } catch (_: Exception) { null }
             val who = last?.let { if (it.outgoing) "You" else Threnody.nameOf(n, it.device) }
             val draft = try { n.groupDraft(g.id) } catch (_: Exception) { "" }
+            // The group's picture, unless we keep our own look there.
+            val picture = try { if (n.groupOwnLook(g.id)) null else n.groupTheme(g.id)?.picture } catch (_: Exception) { null }
             Row(g.name, g.id, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { "$who: ${preview(it)}" } ?: members(g.members.size),
                 last?.atMs?.toLong() ?: 0, null,
                 open = { openGroup(g.id) },
                 manage = { manage(n, g.name, null, g.id, g.id) },
-                section = Row.Section.Groups, chatKey = g.id)
+                section = Row.Section.Groups, chatKey = g.id, picture = picture)
         }
         if (groups.isNotEmpty()) {
             rows.add(Row("", "", "", 0, null, {}, isSectionHeader = true, sectionTitle = "Groups", section = Row.Section.Groups))
@@ -658,7 +662,13 @@ class MainActivity : Activity() {
     /** What a list of rows looks like, without their actions. */
     private fun shown(rows: List<Row>): List<Any?> = rows.map {
         listOf(it.title, it.avatarKey, it.preview.toString(), it.atMs, it.connected, it.section, it.isSectionHeader,
-            it.sectionTitle, it.manage != null, it.unread, it.pinned, it.archived)
+            it.sectionTitle, it.manage != null, it.unread, it.pinned, it.archived,
+            // By content: a photo's bytes compare by reference.
+            when (val p = it.picture) {
+                is uniffi.threnody_ffi.PictureInfo.Emoji -> p.emoji + p.color
+                is uniffi.threnody_ffi.PictureInfo.Photo -> p.data.contentHashCode()
+                null -> null
+            })
     }
 
     private fun show(rows: List<Row>) {
@@ -775,7 +785,7 @@ class MainActivity : Activity() {
     }
 
     private fun row(r: Row): View {
-        val face = Avatar(this, 52).apply { show(r.title, r.avatarKey) }
+        val face = Avatar(this, 52).apply { if (!Themes.showPicture(this, r.picture)) show(r.title, r.avatarKey) }
         // Connected: a small green dot on the avatar's corner; nothing otherwise,
         // so a list of mostly-offline contacts isn't a column of grey dots.
         val avatar = android.widget.FrameLayout(this).apply {

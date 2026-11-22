@@ -86,6 +86,10 @@ class ChatActivity : Activity() {
     private var pinShown = 0
     /** In a group: whether we may pin (owner or admin). */
     private var mayPin = false
+    /** The chat's shared theme, whether we keep our own look, and whether we may change it. */
+    private var look: uniffi.threnody_ffi.ThemeInfo? = null
+    private var ownLook = false
+    private var mayTheme = true
     private lateinit var messages: LinearLayout
     private lateinit var scroll: ScrollView
     /** The chat is at its newest message, and stays there as it grows. */
@@ -968,6 +972,15 @@ class ChatActivity : Activity() {
             }
         } catch (_: Exception) { "" } else ""
         val canPin = g == null || try { node.mayPinInGroup(g) } catch (_: Exception) { false }
+        val theme = try {
+            when {
+                note -> node.noteTheme()
+                g != null -> node.groupTheme(g)
+                else -> node.chatTheme(device)
+            }
+        } catch (_: Exception) { null }
+        val own = !note && try { if (g != null) node.groupOwnLook(g) else node.ownLook(device) } catch (_: Exception) { false }
+        val canTheme = g == null || try { node.mayThemeGroup(g) } catch (_: Exception) { false }
         val later = try {
             when {
                 note -> emptyList()
@@ -988,6 +1001,12 @@ class ChatActivity : Activity() {
             convo = c
             info = gi
             mayPin = canPin
+            mayTheme = canTheme
+            if (theme != look || own != ownLook) {
+                look = theme
+                ownLook = own
+                applyLook()
+            }
             showPins(pinned)
             timerOn = timer
             showScheduled(later)
@@ -1157,7 +1176,9 @@ class ChatActivity : Activity() {
         }
         composeBar.visibility = View.VISIBLE
         bar.title.text = g.name
-        bar.face?.show(g.name, g.id)
+        bar.face?.let { f ->
+            if (!Themes.showPicture(f, if (ownLook) null else look?.picture)) f.show(g.name, g.id)
+        }
         bar.subtitle.text = listOfNotNull(
             members(g.members.size),
             when (g.myRole) {
@@ -1394,6 +1415,67 @@ class ChatActivity : Activity() {
         if (stick && hit < 0 && jump == null || items.lastOrNull()?.sending == true) toBottom()
         // Otherwise stay where the reader is, not at the top.
         else scroll.post { scroll.scrollTo(0, y) }
+    }
+
+    /** Draws the chat's theme: its background, its accent on our bubbles, a group's picture. */
+    private fun applyLook() {
+        scroll.background = Themes.background(this, look, ownLook)
+        // The round send and voice buttons take the accent too.
+        val accent = Themes.accent(look, ownLook) ?: color(R.color.accent)
+        for (b in listOf(sendButton, micButton)) {
+            ((b.background as? android.graphics.drawable.RippleDrawable)?.getDrawable(0) as? android.graphics.drawable.GradientDrawable)
+                ?.setColor(accent)
+            b.imageTintList = android.content.res.ColorStateList.valueOf(
+                if (Themes.accent(look, ownLook) != null) Themes.onColor(accent) else color(R.color.on_accent),
+            )
+        }
+        // Bubbles take the accent: draw them again.
+        lastShown = null
+        if (group != null) bar.face?.let { f ->
+            if (!Themes.showPicture(f, if (ownLook) null else look?.picture)) f.show(bar.title.text.toString(), key)
+        }
+    }
+
+    /** The chat's look: a theme for everyone in it, or one's own plain look. */
+    private fun chooseTheme() {
+        val g = group
+        Themes.pick(
+            this, look, group = g != null, canSet = mayTheme, own = ownLook, title = bar.title.text.toString(),
+            onPhoto = { picture, done ->
+                val pick = Intent(Intent.ACTION_GET_CONTENT).setType("image/*").addCategory(Intent.CATEGORY_OPENABLE)
+                pickFileLauncher.launch(pick) { code, data ->
+                    val uri = data?.data
+                    if (code != RESULT_OK || uri == null) return@launch
+                    Threading.background {
+                        val max = (if (picture) uniffi.threnody_ffi.maxPicturePhoto() else uniffi.threnody_ffi.maxBackgroundPhoto()).toInt()
+                        val bytes = Themes.shrink(this, uri, if (picture) 512 else 1600, max)
+                        runOnUiThread {
+                            if (bytes == null) Toast.makeText(this, "Couldn't use that photo.", Toast.LENGTH_SHORT).show()
+                            else done(bytes)
+                        }
+                    }
+                }
+            },
+            setOwn = { on ->
+                Threading.background {
+                    run("change the look") {
+                        if (g != null) node.setGroupOwnLook(g, on) else node.setOwnLook(device, on)
+                    }
+                    refresh()
+                }
+            },
+        ) { theme ->
+            Threading.background {
+                run("set the theme") {
+                    when {
+                        note -> node.setNoteTheme(theme)
+                        g != null -> node.setGroupTheme(g, theme)
+                        else -> node.setChatTheme(device, theme)
+                    }
+                }
+                refresh()
+            }
+        }
     }
 
     /**
@@ -1907,7 +1989,12 @@ class ChatActivity : Activity() {
         val item = run.first()
         val e = item.entry
         val outgoing = e.outgoing
-        val fg = color(if (outgoing) R.color.on_bubble_out else R.color.text)
+        val accent = Themes.accent(look, ownLook)
+        val fg = when {
+            outgoing && accent != null -> Themes.onColor(accent)
+            outgoing -> color(R.color.on_bubble_out)
+            else -> color(R.color.text)
+        }
         val big = dp(20).toFloat()
         val small = dp(6).toFloat()
         val top = if (joinsPrev) small else big
@@ -1915,7 +2002,7 @@ class ChatActivity : Activity() {
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(color(if (outgoing) R.color.bubble_out else R.color.bubble_in))
+                setColor(if (outgoing) accent ?: color(R.color.bubble_out) else color(R.color.bubble_in))
                 // Corners: top-left, top-right, bottom-right, bottom-left (x, y each).
                 cornerRadii = if (outgoing) floatArrayOf(big, big, top, top, bottom, bottom, big, big)
                     else floatArrayOf(top, top, big, big, big, big, bottom, bottom)
@@ -3218,6 +3305,7 @@ class ChatActivity : Activity() {
             item(a, "Media, files and links", R.drawable.ic_image) { media(c?.title) }
             item(a, "Disappearing messages", R.drawable.ic_timer) { disappearing() }
             item(a, "Notifications", R.drawable.ic_notifications) { notifications() }
+            item(a, "Chat theme", R.drawable.ic_image) { chooseTheme() }
             item(a, "Contact details", R.drawable.ic_info) { details() }
             show()
         }
@@ -3417,6 +3505,7 @@ class ChatActivity : Activity() {
             item(a, "Members", R.drawable.ic_group) { members() }
             if (g.myRole != MemberRole.MEMBER) item(a, "Invite contacts", R.drawable.ic_add) { inviteToGroup() }
             item(a, "Disappearing messages", R.drawable.ic_timer) { disappearing() }
+            item(a, "Group theme", R.drawable.ic_image) { chooseTheme() }
             item(a, "Clear chat…", R.drawable.ic_delete) { Chats.clear(a, node, g.name, null, g.id) { refresh() } }
             if (g.owned) item(a, "Delete group", R.drawable.ic_delete) { deleteGroup() }
             item(a, "Leave group", R.drawable.ic_back) { leaveGroup() }
