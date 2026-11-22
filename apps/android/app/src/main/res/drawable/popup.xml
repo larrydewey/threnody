@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A menu: a rounded card with a little air above and below its items -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="0dp" android:insetRight="0dp">
+    <shape android:shape="rectangle">
+        <solid android:color="@color/popup" />
+        <corners android:radius="16dp" />
+        <padding android:top="8dp" android:bottom="8dp" />
+    </shape>
+</inset>

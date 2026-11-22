@@ -79,6 +79,36 @@ fun Activity.fitSystemBars(root: View, top: View, bottom: View) {
     }
 }
 
+/** True when the dark theme is showing. */
+val Context.isNight: Boolean
+    get() = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+        android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+/** `color` at `alpha` (0–255): tints and soft fills drawn from a theme colour. */
+fun withAlpha(color: Int, alpha: Int) = (color and 0x00FFFFFF) or (alpha shl 24)
+
+/** A card's fill: the theme's card colour, rounded (dp). */
+fun Context.cardBackground(radiusDp: Int = 20, colorId: Int = R.color.card) = rounded(color(colorId), dp(radiusDp).toFloat())
+
+/**
+ * An icon on a soft round tile of its own colour: the leading mark of a
+ * notice, a file, a settings group.
+ */
+fun Context.iconTile(res: Int, sizeDp: Int = 40, tint: Int = color(R.color.accent), fill: Int = withAlpha(tint, 0x24)) =
+    android.widget.ImageView(this).apply {
+        setImageResource(res)
+        imageTintList = android.content.res.ColorStateList.valueOf(tint)
+        scaleType = android.widget.ImageView.ScaleType.CENTER_INSIDE
+        val pad = dp(sizeDp) / 4
+        setPadding(pad, pad, pad, pad)
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(fill)
+        }
+        layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
 /** A screen's top bar: optional back arrow, title (and subtitle), actions. */
 class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
     val title = TextView(ctx).apply {
@@ -86,13 +116,16 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
         setTypeface(typeface, Design.weightBold)
         setTextColor(ctx.color(R.color.text))
         isSingleLine = true
+        ellipsize = android.text.TextUtils.TruncateAt.END
     }
     val subtitle = TextView(ctx).apply {
         textSize = Design.typeBodySmall
         setTextColor(ctx.color(R.color.muted))
         isSingleLine = true
+        ellipsize = android.text.TextUtils.TruncateAt.END
         visibility = GONE
     }
+    private var titles: LinearLayout
 
     init {
         orientation = HORIZONTAL
@@ -103,12 +136,39 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
         if (back != null) {
             addView(icon(R.drawable.ic_back, "Back") { back() })
         }
-        val titles = LinearLayout(ctx).apply {
+        titles = LinearLayout(ctx).apply {
             orientation = VERTICAL
             addView(title)
             addView(subtitle)
         }
         addView(titles, LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = ctx.dp(if (back == null) 0 else Design.sm) })
+    }
+
+    /** The face beside the title, once [avatar] adds it. */
+    var face: Avatar? = null
+        private set
+
+    /** Puts a face before the title (a chat's contact or group). */
+    fun avatar(): Avatar = face ?: Avatar(context, 40).also { a ->
+        face = a
+        addView(a, indexOfChild(titles), LayoutParams(context.dp(40), context.dp(40)).apply {
+            marginStart = context.dp(Design.xs)
+        })
+        (titles.layoutParams as LayoutParams).marginStart = context.dp(Design.md)
+    }
+
+    /** A tap on the title (or face) does `click`: a chat's details. */
+    fun onTitle(click: () -> Unit) {
+        titles.background = context.ripple()
+        titles.setOnClickListener { v -> Design.lightHaptic(v); click() }
+        face?.setOnClickListener { v -> Design.lightHaptic(v); click() }
+    }
+
+    /** The main screen's bar: a large title, no back arrow. */
+    fun large() {
+        title.textSize = 28f
+        setPadding(context.dp(Design.xl), context.dp(Design.md), context.dp(Design.sm), context.dp(Design.sm))
+        minimumHeight = context.dp(64)
     }
 
     fun icon(res: Int, label: String, onClick: (View) -> Unit) = ImageButton(context).apply {
@@ -150,22 +210,30 @@ class TopBar(ctx: Context, back: (() -> Unit)?) : LinearLayout(ctx) {
     }
 }
 
-/** A circle with a contact's initial, tinted from its fingerprint. */
+/**
+ * A circle with a contact's initial, in a soft colour of its own drawn from
+ * its fingerprint: a pale fill with a deep letter (deep fill, pale letter
+ * in the dark), the way Material tints its containers.
+ */
 class Avatar(ctx: Context, size: Int = 44) : TextView(ctx) {
     init {
         gravity = Gravity.CENTER
-        textSize = size / 2.6f
-        setTextColor(Color.WHITE)
+        textSize = size / 2.5f
         setTypeface(typeface, Design.weightBold)
         layoutParams = LinearLayout.LayoutParams(ctx.dp(size), ctx.dp(size))
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 
     fun show(title: String, fingerprint: String) {
-        text = title.trim().take(1).uppercase()
+        text = title.trim().firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: title.trim().take(1)
         val hue = (fingerprint.hashCode().toLong() and 0xffff).toFloat() % 360f
+        val night = context.isNight
+        val fill = Color.HSVToColor(if (night) floatArrayOf(hue, 0.55f, 0.42f) else floatArrayOf(hue, 0.22f, 0.96f))
+        val ink = Color.HSVToColor(if (night) floatArrayOf(hue, 0.18f, 1f) else floatArrayOf(hue, 0.75f, 0.45f))
+        setTextColor(ink)
         background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            setColor(Color.HSVToColor(floatArrayOf(hue, 0.45f, 0.62f)))
+            setColor(fill)
         }
     }
 }
@@ -257,7 +325,7 @@ fun Activity.bottomSheet(content: View): android.app.Dialog = android.app.Dialog
         }
         setPadding(activity.dp(Design.screenPadding), activity.dp(Design.md), activity.dp(Design.screenPadding), activity.dp(Design.md))
         addView(View(activity).apply {
-            background = roundedRes(R.color.muted, Design.radiusSm)
+            background = rounded(activity.color(R.color.muted), activity.dp(Design.radiusSm).toFloat())
             alpha = 0.4f
         }, LinearLayout.LayoutParams(activity.dp(32), activity.dp(4)).apply {
             gravity = Gravity.CENTER_HORIZONTAL
@@ -313,7 +381,7 @@ fun Context.primaryButton(text: String, onClick: (View) -> Unit) = android.widge
     this.text = text
     isAllCaps = false
     setTextColor(color(R.color.on_accent))
-    background = roundedRes(R.color.accent, Design.radiusXl)
+    background = rounded(color(R.color.accent), dp(Design.radiusXl).toFloat())
     minHeight = dp(Design.touchTargetMin)
     setPadding(dp(Design.lg), dp(Design.buttonPaddingV), dp(Design.lg), dp(Design.buttonPaddingV))
     setOnClickListener { v -> Design.mediumHaptic(v); onClick(v) }
@@ -383,3 +451,45 @@ fun Activity.emptyState(
 }
 
 fun members(n: Int) = if (n == 1) "1 member" else "$n members"
+
+/** A menu item with a leading icon in the theme's muted colour. */
+fun android.widget.PopupMenu.item(ctx: Context, title: String, icon: Int, onClick: () -> Unit): android.view.MenuItem {
+    setForceShowIcon(true)
+    return menu.add(title).apply {
+        setIcon(icon)
+        iconTintList = android.content.res.ColorStateList.valueOf(ctx.color(R.color.muted))
+        setOnMenuItemClickListener { onClick(); true }
+    }
+}
+
+/**
+ * A Material filter chip: the chosen one filled with the accent's soft
+ * tint, the rest outlined. Used for every row of tabs, so they all match.
+ */
+fun Context.filterChip(text: String, selected: Boolean, onClick: () -> Unit) = TextView(this).apply {
+    this.text = text
+    textSize = 14f
+    setTypeface(typeface, if (selected) Typeface.BOLD else Typeface.NORMAL)
+    setTextColor(color(if (selected) R.color.on_accent_container else R.color.text))
+    background = GradientDrawable().apply {
+        cornerRadius = dp(10).toFloat()
+        if (selected) setColor(color(R.color.accent_container)) else setStroke(dp(1), color(R.color.divider))
+    }
+    foreground = ripple()
+    gravity = Gravity.CENTER
+    minHeight = dp(36)
+    setPadding(dp(16), dp(6), dp(16), dp(6))
+    isSelected = selected
+    setOnClickListener { v -> Design.lightHaptic(v); onClick() }
+}
+
+/** Puts icon `res` before (or, with `top`, above) the text, in the text's colour. */
+fun TextView.icon(res: Int, sizeDp: Int = 20, top: Boolean = false): TextView {
+    val d = context.getDrawable(res)?.mutate()?.apply {
+        setTint(currentTextColor)
+        setBounds(0, 0, context.dp(sizeDp), context.dp(sizeDp))
+    }
+    if (top) setCompoundDrawablesRelative(null, d, null, null) else setCompoundDrawablesRelative(d, null, null, null)
+    compoundDrawablePadding = context.dp(if (top) 6 else 8)
+    return this
+}

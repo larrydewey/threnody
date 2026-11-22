@@ -207,14 +207,22 @@ class ChatActivity : Activity() {
                 action(R.drawable.ic_call, if (group != null) "Group call" else "Call") { call() }
                 callButtons = (childCount - 2 until childCount).map { getChildAt(it) }
             }
-            action(R.drawable.ic_search, "Search this chat") { search.open() }
-            action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
+            if (note) action(R.drawable.ic_search, "Search notes") { more(it) }
+            else action(R.drawable.ic_more, if (group != null) "Group options" else "Contact options") { more(it) }
         }
         search = SearchBox(this, bar, "Search this chat", stepper = true, query = ::find, step = ::step) { endSearch() }
+        // The chat's face beside its name; a tap on either shows its details.
+        bar.avatar().show(bar.title.text.toString(), if (note) "notes" else key)
+        bar.onTitle {
+            when {
+                group != null -> members()
+                !note -> details()
+            }
+        }
         banner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(color(R.color.surface))
-            setPadding(dp(12), dp(8), dp(12), dp(4))
+            setBackgroundColor(color(R.color.bar))
+            setPadding(dp(12), dp(4), dp(12), 0)
             visibility = View.GONE
         }
         messages = LinearLayout(this).apply {
@@ -327,8 +335,10 @@ class ChatActivity : Activity() {
             hint = "Message"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             wrapping(max = 6)
-            background = rounded(color(R.color.field), dp(22).toFloat())
-            setPadding(dp(16), dp(10), dp(16), dp(10))
+            // The pill around it is the field; the text sits in it bare.
+            background = null
+            textSize = 16f
+            setPadding(dp(4), dp(12), dp(4), dp(12))
             setTextColor(color(R.color.text))
             setHintTextColor(color(R.color.muted))
             addTextChangedListener(object : TextWatcher {
@@ -358,19 +368,37 @@ class ChatActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(dp(Design.touchTargetMin), dp(Design.touchTargetMin))
             setOnClickListener { v -> Design.mediumHaptic(v); onClick(v) }
         }
-        return LinearLayout(this).apply {
+        // One rounded field holding emoji, the text and attach; beside it a
+        // round button that records voice, or sends once there's text.
+        val pill = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.BOTTOM
-            setBackgroundColor(color(R.color.bar))
-            setPadding(dp(4), dp(6), dp(4), dp(6))
-            addView(button(R.drawable.ic_attach, "Send photos or files", R.color.muted) { attach(it) }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            background = rounded(color(R.color.field), dp(26).toFloat())
+            setPadding(dp(2), 0, dp(2), 0)
             addView(button(R.drawable.ic_emoji, "Emoji", R.color.muted) {
                 EmojiPicker(this@ChatActivity, "Emoji", stay = true) { e ->
                     val at = compose.selectionStart.coerceAtLeast(0)
                     compose.text.replace(at, compose.selectionEnd.coerceAtLeast(at), e)
                 }.show()
-            }, LinearLayout.LayoutParams(dp(44), dp(48)))
-            addView(button(R.drawable.ic_gif, "GIF", R.color.muted) { gifs() }, LinearLayout.LayoutParams(dp(44), dp(48)))
+            }, LinearLayout.LayoutParams(dp(46), dp(50)))
+            addView(compose, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(button(R.drawable.ic_attach, "Send photos, files and more", R.color.muted) { attach(it) },
+                LinearLayout.LayoutParams(dp(46), dp(50)))
+        }
+        fun round(res: Int, label: String, onClick: (View) -> Unit) = button(res, label, R.color.on_accent, onClick).apply {
+            background = android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(withAlpha(color(R.color.on_accent), 0x40)),
+                android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(color(R.color.accent))
+                }, null,
+            )
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            setBackgroundColor(color(R.color.bar))
+            setPadding(dp(Design.sm), dp(6), dp(Design.sm), dp(Design.sm))
             recordingTime = label("● 0:00", 16f, R.color.warning).apply { setTypeface(typeface, Typeface.BOLD) }
             recordingHint = label("‹ Slide to cancel · slide up to lock", 13f, R.color.muted).apply {
                 gravity = Gravity.END
@@ -379,7 +407,7 @@ class ChatActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 visibility = View.GONE
-                background = rounded(color(R.color.field), dp(22).toFloat())
+                background = rounded(color(R.color.field), dp(26).toFloat())
                 setPadding(dp(4), 0, dp(14), 0)
                 addView(button(R.drawable.ic_delete, "Cancel the voice message", R.color.muted) { cancelVoice() },
                     LinearLayout.LayoutParams(dp(44), dp(44)))
@@ -387,21 +415,21 @@ class ChatActivity : Activity() {
                 addView(recordingHint, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(8) })
             }
             val field = android.widget.FrameLayout(this@ChatActivity).apply {
-                addView(compose, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                addView(pill, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
                 addView(recordingBar, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             }
-            addView(field, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { bottomMargin = dp(2) })
-            sendButton = button(R.drawable.ic_send, "Send", R.color.accent) { send() }.apply { visibility = View.GONE }
+            addView(field, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginEnd = dp(Design.sm) })
+            sendButton = round(R.drawable.ic_send, "Send") { send() }.apply { visibility = View.GONE }
             if (!note) {
                 // Holding Send offers to send later; the press doesn't send.
                 sendButton.contentDescription = "Send (hold to send later)"
                 sendButton.tooltipText = "Send (hold to send later)"
                 sendButton.setOnLongClickListener { v -> Design.mediumHaptic(v); laterMenu(v); true }
             }
-            addView(sendButton, LinearLayout.LayoutParams(dp(48), dp(48)))
-            micButton = button(R.drawable.ic_mic, "Hold to record a voice message", R.color.accent) {}
+            addView(sendButton, LinearLayout.LayoutParams(dp(50), dp(50)))
+            micButton = round(R.drawable.ic_mic, "Hold to record a voice message") {}
             micButton.setOnTouchListener { v, ev -> voiceTouch(v, ev) }
-            addView(micButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(micButton, LinearLayout.LayoutParams(dp(50), dp(50)))
         }
     }
 
@@ -570,12 +598,17 @@ class ChatActivity : Activity() {
         val what = if (clip.video) "video message" else "voice message"
         val length = if (clip.durationMs > 0u) Clips.clock(clip.durationMs.toLong()) else ""
         if (location == null || (f.sensitive && !e.outgoing && mark(e) !in shownClips)) {
-            val head = "${if (clip.video) "🎥" else "🎤"} ${what.replaceFirstChar { it.uppercase() }}"
+            val head = what.replaceFirstChar { it.uppercase() }
             val cover = label(
                 if (location == null) "$head\n${missingText(f, e) ?: "not on this device"}"
-                else "🔒\nSensitive $what\nTap to play",
+                else "Sensitive $what\nTap to play",
                 14f, R.color.on_cover,
             ).apply {
+                icon(when {
+                    location != null -> R.drawable.ic_lock
+                    clip.video -> R.drawable.ic_videocam
+                    else -> R.drawable.ic_mic
+                }, 28, top = true)
                 gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
                 background = rounded(color(R.color.cover), dp(12).toFloat()).apply { setStroke(dp(1), color(R.color.cover_edge)) }
@@ -1008,6 +1041,9 @@ class ChatActivity : Activity() {
 
     private fun noteHeader() {
         bar.title.text = "Note to self"
+        // No one to call in our own notes.
+        callButtons.forEach { it.visibility = View.GONE }
+        bar.face?.show("Note to self", "notes")
         bar.subtitle.visibility = View.VISIBLE
         bar.subtitle.text = "On all your devices"
         bar.subtitle.setTextColor(color(R.color.muted))
@@ -1017,6 +1053,7 @@ class ChatActivity : Activity() {
 
     private fun header(c: Conversation?) {
         bar.title.text = c?.title ?: Threnody.short(device)
+        bar.face?.show(bar.title.text.toString(), key)
         bar.subtitle.visibility = View.VISIBLE
         // Short, in a quiet colour; only "Not verified" stands out (the banner says what to do).
         val parts = listOfNotNull(
@@ -1058,20 +1095,25 @@ class ChatActivity : Activity() {
             // Someone we'd verified now has a device we haven't: a key we
             // don't know is in the conversation.
             !c.verified && c.anyVerified -> banner(
-                "⚠ ${c.title} added a device you haven't verified. Until you compare its safety number, " +
+                "${c.title} added a device you haven't verified. Until you compare its safety number, " +
                     "someone else could be reading as them.",
                 "Compare" to { safety() },
                 warning = true,
             )
             !c.approved -> banner(
-                "Approve ${c.title} once you trust them, and compare safety numbers to make sure no one is in " +
-                    "the middle. Mutually approved contacts find each other nearby, relay for each other and " +
-                    "hold each other's messages while offline.",
+                "Approve ${c.title} once you trust them, and compare safety numbers to be sure no one is in the middle.",
                 "Approve" to { setApproval(true) },
                 "Compare" to { safety() },
+                "Why?" to {
+                    SecureBuilder(this).setTitle("Approving a contact")
+                        .setMessage("Mutually approved contacts find each other nearby, relay for each other and " +
+                            "hold each other's messages while offline.\n\nComparing safety numbers, in person or " +
+                            "over a call, proves no one is in the middle.")
+                        .setPositiveButton("OK", null).show()
+                },
             )
             !c.verified -> banner(
-                "⚠ Not verified. Compare safety numbers with ${c.title} to make sure no one is in the middle.",
+                "Not verified. Compare safety numbers with ${c.title} to make sure no one is in the middle.",
                 "Compare" to { safety() },
                 warning = true,
             )
@@ -1113,6 +1155,7 @@ class ChatActivity : Activity() {
         }
         composeBar.visibility = View.VISIBLE
         bar.title.text = g.name
+        bar.face?.show(g.name, g.id)
         bar.subtitle.text = listOfNotNull(
             members(g.members.size),
             when (g.myRole) {
@@ -1210,35 +1253,47 @@ class ChatActivity : Activity() {
         banner.visibility = View.VISIBLE
         val tone = color(if (warning) R.color.warning else R.color.accent)
         val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = rounded((tone and 0x00FFFFFF) or 0x1A000000, dp(Design.radiusLg).toFloat())
-            setPadding(dp(Design.lg), dp(Design.md), dp(Design.lg), dp(Design.md))
-        }
-        card.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(label(if (warning) "⚠️" else "ℹ️", 16f, R.color.text).apply {
-                setPadding(0, 0, dp(Design.md), 0)
-            })
-            addView(label(text, 14f, R.color.text, maxLines = 0), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            background = rounded(withAlpha(tone, if (isNight) 0x2E else 0x16), dp(20).toFloat())
+            setPadding(dp(Design.md), dp(Design.md), dp(Design.lg), dp(Design.md))
+        }
+        card.addView(iconTile(if (warning) R.drawable.ic_warning else R.drawable.ic_shield, 36, tone),
+            LinearLayout.LayoutParams(dp(36), dp(36)))
+        val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        texts.addView(label(text, 14f, R.color.text, maxLines = 0).apply {
+            setLineSpacing(0f, 1.15f)
+            setPadding(0, dp(Design.xs), 0, 0)
         }, matchWrap)
         if (actions.isNotEmpty()) {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.END
-                setPadding(0, dp(Design.sm), 0, 0)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(10), 0, 0)
             }
+            // The first action filled, the next tonal, the rest plain text.
             actions.forEachIndexed { i, (name, onClick) ->
-                row.addView(label(name, 14f, if (i == 0) R.color.md_sys_color_on_primary else R.color.accent, Design.weightBold).apply {
+                row.addView(label(name, 14f, when (i) {
+                    0 -> R.color.on_accent
+                    1 -> R.color.on_accent_container
+                    else -> R.color.accent
+                }, Design.weightBold).apply {
                     gravity = Gravity.CENTER
                     minHeight = dp(36)
-                    setPadding(dp(Design.lg), 0, dp(Design.lg), 0)
-                    background = if (i == 0) rounded(color(R.color.accent), dp(18).toFloat()) else ripple()
+                    setPadding(dp(if (i < 2) Design.lg else Design.sm), 0, dp(if (i < 2) Design.lg else Design.sm), 0)
+                    background = when (i) {
+                        0 -> rounded(tone.takeIf { warning } ?: color(R.color.accent), dp(18).toFloat())
+                        1 -> rounded(color(R.color.accent_container), dp(18).toFloat())
+                        else -> null
+                    }
+                    if (i == 0 && warning) setTextColor(color(R.color.md_sys_color_on_error))
+                    foreground = ripple()
                     setOnClickListener { v -> Design.lightHaptic(v); onClick() }
-                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = dp(Design.sm) })
+                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(Design.sm) })
             }
-            card.addView(row, matchWrap)
+            texts.addView(row, matchWrap)
         }
-        banner.addView(card, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(Design.xs) })
+        card.addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.md) })
+        banner.addView(card, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(Design.sm) })
     }
 
     /** A day as a chat heading: Today, Yesterday, the weekday within a week, else the date. */
@@ -1283,7 +1338,17 @@ class ChatActivity : Activity() {
         }
         var lastSender: String? = null
         var lastDay = ""
-        for (run in albums(items)) {
+        val runs = albums(items)
+        // Messages from one sender within a few minutes read as one group:
+        // close together, their inner corners tucked in.
+        fun joins(a: List<Item>?, b: List<Item>?): Boolean {
+            val x = a?.last()?.entry ?: return false
+            val y = b?.first()?.entry ?: return false
+            return x.outgoing == y.outgoing && x.device == y.device &&
+                dayHeading(x.atMs.toLong()) == dayHeading(y.atMs.toLong()) &&
+                y.atMs.toLong() - x.atMs.toLong() in 0L..GROUP_GAP_MS
+        }
+        for ((i, run) in runs.withIndex()) {
             val e = run.first().entry
             // A quiet heading where the day changes ("Today", "Yesterday", "Sat 21 Nov").
             val day = dayHeading(e.atMs.toLong())
@@ -1295,18 +1360,18 @@ class ChatActivity : Activity() {
                     textSize = 12f
                     setTextColor(color(R.color.muted))
                     setTypeface(typeface, Typeface.BOLD)
-                    background = rounded(color(R.color.bubble_in), dp(12).toFloat())
-                    setPadding(dp(12), dp(4), dp(12), dp(4))
+                    background = rounded(color(R.color.card), dp(12).toFloat())
+                    setPadding(dp(12), dp(5), dp(12), dp(5))
                 }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
                     gravity = Gravity.CENTER_HORIZONTAL
-                    topMargin = dp(Design.md)
+                    topMargin = dp(Design.lg)
                     bottomMargin = dp(Design.sm)
                 })
             }
             // In groups, name the sender above the first of their run of messages.
             val sender = if (group != null && !e.outgoing && e.device != lastSender) names[e.device] else null
             lastSender = if (e.outgoing) null else e.device
-            val view = bubble(run, sender)
+            val view = bubble(run, sender, joins(runs.getOrNull(i - 1), run), joins(run, runs.getOrNull(i + 1)))
             messages.addView(view)
             for (item in run) bubbles[mark(item.entry)] = view
         }
@@ -1732,7 +1797,8 @@ class ChatActivity : Activity() {
             }
         }
         if (f.sensitive || location == null) {
-            val cover = label(if (location == null) "📷\n${missingText(f, e) ?: "not available"}" else "🔒\nSensitive photo\nTap to view", 14f, R.color.on_cover).apply {
+            val cover = label(if (location == null) missingText(f, e) ?: "not available" else "Sensitive photo\nTap to view", 14f, R.color.on_cover).apply {
+                icon(if (location == null) R.drawable.ic_image else R.drawable.ic_lock, 28, top = true)
                 gravity = Gravity.CENTER
                 setTypeface(typeface, Typeface.BOLD)
                 // Opaque and dark in either theme: covered, without glare.
@@ -1742,7 +1808,7 @@ class ChatActivity : Activity() {
                 height = if (limit == width) width else dp(180)
                 contentDescription = if (location == null) "Photo: ${missingText(f, e) ?: "not available"}" else "Sensitive photo, tap to view"
                 setOnClickListener(open)
-                if (location == null) fetchable(this, f, e) { "📷\n$it" }
+                if (location == null) fetchable(this, f, e) { it }
             }
             return if (location == null) behindOfferThumbnail(cover, f, e) else cover
         }
@@ -1770,14 +1836,28 @@ class ChatActivity : Activity() {
         return view
     }
 
-    private fun bubble(run: List<Item>, sender: String?): View {
+    /**
+     * One message (or album) as a bubble. `joinsPrev` and `joinsNext` say it
+     * runs on from, or into, the same sender's neighbours: its corners on
+     * the sender's side are tucked in there, and the gap is small.
+     */
+    private fun bubble(run: List<Item>, sender: String?, joinsPrev: Boolean = false, joinsNext: Boolean = false): View {
         val item = run.first()
         val e = item.entry
         val outgoing = e.outgoing
         val fg = color(if (outgoing) R.color.on_bubble_out else R.color.text)
+        val big = dp(20).toFloat()
+        val small = dp(6).toFloat()
+        val top = if (joinsPrev) small else big
+        val bottom = if (joinsNext) small else big
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = rounded(color(if (outgoing) R.color.bubble_out else R.color.bubble_in), dp(18).toFloat())
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(color(if (outgoing) R.color.bubble_out else R.color.bubble_in))
+                // Corners: top-left, top-right, bottom-right, bottom-left (x, y each).
+                cornerRadii = if (outgoing) floatArrayOf(big, big, top, top, bottom, bottom, big, big)
+                    else floatArrayOf(top, top, big, big, big, big, bottom, bottom)
+            }
             setPadding(dp(14), dp(8), dp(14), dp(6))
         }
         if (sender != null) {
@@ -1785,7 +1865,12 @@ class ChatActivity : Activity() {
         }
         if (e.forwarded) {
             body.addView(TextView(this).apply {
-                text = "↪ Forwarded"
+                text = "Forwarded"
+                setCompoundDrawablesRelativeWithIntrinsicBounds(getDrawable(R.drawable.ic_forward)?.mutate()?.apply {
+                    setTint(fg)
+                    setBounds(0, 0, dp(14), dp(14))
+                }, null, null, null)
+                compoundDrawablePadding = dp(4)
                 textSize = 12f
                 setTextColor(fg)
                 alpha = 0.7f
@@ -1867,24 +1952,39 @@ class ChatActivity : Activity() {
         } else {
             for (r in run) {
                 val f = r.entry.file ?: continue
-                body.addView(TextView(this).apply {
-                    searchable(r.entry, (if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name)
-                    textSize = 16f
+                val uri = f.location?.let(Uri::parse)
+                // A file as a card: a round tile (a page once it's here, an
+                // arrow while it's to fetch), its name, and what to do.
+                val names = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                names.addView(TextView(this).apply {
+                    searchable(r.entry, (if (f.sensitive) "Sensitive file: " else "") + f.name)
+                    textSize = 15f
                     setTextColor(fg)
                     setTypeface(typeface, Typeface.BOLD)
-                    val uri = f.location?.let(Uri::parse)
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
                     if (uri != null) setOnClickListener { open(uri) }
                 })
-                if (f.location == null) offerImage(f, r.entry)?.let { body.addView(it) }
                 if (f.location == null) missingText(f, r.entry)?.let { t ->
-                    body.addView(TextView(this).apply {
+                    names.addView(TextView(this).apply {
                         text = t
                         textSize = 13f
                         setTextColor(fg)
-                        alpha = 0.75f
+                        alpha = 0.8f
                         fetchable(this, f, r.entry) { it }
                     })
                 }
+                body.addView(LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(2), 0, dp(4))
+                    addView(iconTile(if (f.location == null) R.drawable.ic_download else R.drawable.ic_file, 44, fg, withAlpha(fg, 0x2A)))
+                    addView(names, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = dp(Design.md) })
+                    if (uri != null) setOnClickListener { open(uri) }
+                    // The tile and name fetch it too, as its status line does.
+                    else names.getChildAt(1)?.let { status -> setOnClickListener { status.performClick() } }
+                })
+                if (f.location == null) offerImage(f, r.entry)?.let { body.addView(it) }
             }
             if (e.text.isNotBlank()) {
                 body.addView(TextView(this).apply {
@@ -1903,7 +2003,7 @@ class ChatActivity : Activity() {
         // them on, never a lone "sent", which only that device knows.
         val elsewhere = outgoing && !item.sending && e.device != myDevice
         val marks = when (val t = run.map { it.entry.tick }.minByOrNull(::tickRank) ?: e.tick) {
-            is TickMark.Read -> " 👁️"
+            is TickMark.Read -> " ✓✓ Seen"
             is TickMark.Delivered -> " ✓✓"
             is TickMark.Partial -> " ✓ ${t.delivered}/${t.recipients}"
             is TickMark.Sent -> " ✓"
@@ -1917,7 +2017,7 @@ class ChatActivity : Activity() {
         reactionChips(e, fg)?.let { body.addView(it, matchWrap) }
         body.addView(TextView(this).apply {
             val metaText = meta + (if (e.edited) " · edited" else "") + (if (e.disappearing) " · ⏱" else "") + tick
-            contentDescription = metaText.replace("👁️", "read").replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
+            contentDescription = metaText.replace("✓✓ Seen", "read").replace("✓✓", "delivered").replace(" ✓ ", " delivered to ").replace("✓", "sent")
             textSize = 11f
             setTextColor(fg)
             alpha = 0.7f
@@ -1936,7 +2036,7 @@ class ChatActivity : Activity() {
         }
         val row = LinearLayout(this).apply {
             gravity = if (outgoing) Gravity.END else Gravity.START
-            setPadding(if (outgoing) dp(48) else 0, dp(3), if (outgoing) 0 else dp(48), dp(3))
+            setPadding(if (outgoing) dp(56) else 0, dp(if (joinsPrev) 1 else 4), if (outgoing) 0 else dp(56), dp(if (joinsNext) 1 else 4))
             addView(body, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
         // Swiping a message to the right replies to it.
@@ -2461,7 +2561,7 @@ class ChatActivity : Activity() {
                     ellipsize = android.text.TextUtils.TruncateAt.END
                 })
                 item.failed?.let {
-                    addView(label("⚠ Not sent: ${Scheduled.reasonText(it)}", 13f, R.color.warning, maxLines = 2))
+                    addView(label("Not sent: ${Scheduled.reasonText(it)}", 13f, R.color.warning, maxLines = 2).icon(R.drawable.ic_warning, 16))
                 }
                 if (item.sending) addView(label("Sending now…", 13f, R.color.muted))
                 setOnClickListener {
@@ -2521,28 +2621,63 @@ class ChatActivity : Activity() {
             .show()
     }
 
+    /**
+     * What can be sent besides text: a sheet of round, coloured tiles (four
+     * to a row), each a kind of thing to share.
+     */
+    @Suppress("UNUSED_PARAMETER")
     private fun attach(anchor: View) {
-        PopupMenu(this, anchor).apply {
-            menu.add("Photos").setOnMenuItemClickListener { pick(photos = true); true }
-            menu.add("File").setOnMenuItemClickListener { pick(photos = false); true }
-            menu.add("Video message").setOnMenuItemClickListener { recordVideo(); true }
-            menu.add("Contact").setOnMenuItemClickListener { shareContact(); true }
-            menu.add("Location").setOnMenuItemClickListener { Cards.composeLocation(this@ChatActivity, LOCATION_PERMISSION) { sendCard(it) }; true }
-            menu.add("Event").setOnMenuItemClickListener { Cards.composeEvent(this@ChatActivity) { sendCard(it) }; true }
-            menu.add("Wi-Fi network").setOnMenuItemClickListener { Cards.composeWifi(this@ChatActivity) { sendCard(it) }; true }
+        val a = this
+        val g = group
+        val choices = buildList<Triple<String, Pair<Int, Int>, () -> Unit>> {
+            add(Triple("Photos", R.drawable.ic_image to 0xFF7C4DFF.toInt()) { pick(photos = true) })
+            add(Triple("File", R.drawable.ic_file to 0xFF3D7BF7.toInt()) { pick(photos = false) })
+            add(Triple("Video note", R.drawable.ic_videocam to 0xFFE5484D.toInt()) { recordVideo() })
+            add(Triple("GIF", R.drawable.ic_gif to 0xFF12A594.toInt()) { gifs() })
+            add(Triple("Contact", R.drawable.ic_person to 0xFF0EA5E9.toInt()) { shareContact() })
+            add(Triple("Location", R.drawable.ic_place to 0xFF22A559.toInt()) { Cards.composeLocation(a, LOCATION_PERMISSION) { sendCard(it) } })
+            add(Triple("Event", R.drawable.ic_event to 0xFFF76B15.toInt()) { Cards.composeEvent(a) { sendCard(it) } })
+            add(Triple("Wi-Fi", R.drawable.ic_wifi to 0xFF8E4EC6.toInt()) { Cards.composeWifi(a) { sendCard(it) } })
             // Secrets go to one person (or our own notes), never a group.
-            if (group == null) menu.add("Login, card or secret note").setOnMenuItemClickListener {
-                Cards.composeSecret(this@ChatActivity, inNotes = note) { sendCard(it) }
-                true
-            }
-            val g = group
-            if (g != null) menu.add("Poll").setOnMenuItemClickListener {
-                Polls.compose(this@ChatActivity) { q, options, multi ->
+            if (g == null) add(Triple("Login or card", R.drawable.ic_lock to 0xFFD6409F.toInt()) {
+                Cards.composeSecret(a, inNotes = note) { sendCard(it) }
+            })
+            if (g != null) add(Triple("Poll", R.drawable.ic_poll to 0xFFE5A000.toInt()) {
+                Polls.compose(a) { q, options, multi ->
                     Threading.background { run("send the poll") { node.sendGroupPoll(g, q, options, multi) } }
                 }
-                true
-            }
-        }.show()
+            })
+        }
+        lateinit var sheet: android.app.Dialog
+        val grid = android.widget.GridLayout(this).apply {
+            columnCount = 4
+            setPadding(0, dp(Design.sm), 0, dp(Design.sm))
+        }
+        for ((name, look, onClick) in choices) {
+            val (icon, tone) = look
+            grid.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(0, dp(Design.md), 0, dp(Design.md))
+                background = ripple()
+                contentDescription = name
+                addView(iconTile(icon, 56, android.graphics.Color.WHITE, tone))
+                addView(label(name, 13f, R.color.text, maxLines = 2).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dp(2), dp(Design.sm), dp(2), 0)
+                }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                setOnClickListener { v ->
+                    Design.lightHaptic(v)
+                    sheet.dismiss()
+                    onClick()
+                }
+            }, android.widget.GridLayout.LayoutParams(
+                android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED),
+                android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED, 1f),
+            ).apply { width = 0 })
+        }
+        sheet = bottomSheet(grid)
+        sheet.show()
     }
 
     /**
@@ -2716,9 +2851,11 @@ class ChatActivity : Activity() {
                         val b = Media.decode(android.graphics.ImageDecoder.createSource(contentResolver, p.uri), dp(200))
                         runOnUiThread { setImageBitmap(b) }
                     }
-                } else label("📎\n${p.name}\n${Formatter.formatShortFileSize(this, p.size)}", 12f, R.color.text, maxLines = 4).apply {
+                } else label("${p.name}\n${Formatter.formatShortFileSize(this, p.size)}", 12f, R.color.text, maxLines = 4).apply {
                     gravity = Gravity.CENTER
-                    background = rounded(color(R.color.surface), dp(8).toFloat())
+                    icon(R.drawable.ic_file, 28, top = true)
+                    setPadding(dp(6), dp(6), dp(6), dp(6))
+                    background = rounded(color(R.color.card), dp(12).toFloat())
                 }
             } else if (Media.isGif(p.name)) {
                 ImageView(this).apply {
@@ -2758,9 +2895,11 @@ class ChatActivity : Activity() {
                     })
                 }
             } else {
-                label("📎\n${p.name}", 12f, R.color.text, maxLines = 3).apply {
+                label(p.name, 12f, R.color.text, maxLines = 3).apply {
                     gravity = Gravity.CENTER
-                    background = rounded(color(R.color.surface), dp(8).toFloat())
+                    icon(R.drawable.ic_file, 28, top = true)
+                    setPadding(dp(6), dp(6), dp(6), dp(6))
+                    background = rounded(color(R.color.card), dp(12).toFloat())
                 }
             }
             strip.addView(cell, LinearLayout.LayoutParams(dp(104), dp(104)).apply { marginEnd = dp(6) })
@@ -3004,13 +3143,15 @@ class ChatActivity : Activity() {
 
     private fun more(anchor: View) {
         if (group != null) return groupMenu(anchor)
-        if (note) return
+        if (note) return search.open()
         val c = convo
         PopupMenu(this, anchor).apply {
-            menu.add("Media, files and links").setOnMenuItemClickListener { media(c?.title); true }
-            menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
-            menu.add("Notifications").setOnMenuItemClickListener { notifications(); true }
-            menu.add("Contact details").setOnMenuItemClickListener { details(); true }
+            val a = this@ChatActivity
+            item(a, "Search", R.drawable.ic_search) { search.open() }
+            item(a, "Media, files and links", R.drawable.ic_image) { media(c?.title) }
+            item(a, "Disappearing messages", R.drawable.ic_timer) { disappearing() }
+            item(a, "Notifications", R.drawable.ic_notifications) { notifications() }
+            item(a, "Contact details", R.drawable.ic_info) { details() }
             show()
         }
     }
@@ -3203,18 +3344,15 @@ class ChatActivity : Activity() {
     private fun groupMenu(anchor: View) {
         val g = info ?: return
         PopupMenu(this, anchor).apply {
-            menu.add("Media, files and links").setOnMenuItemClickListener { media(g.name); true }
-            menu.add("Members").setOnMenuItemClickListener { members(); true }
-            if (g.myRole != MemberRole.MEMBER) {
-                menu.add("Invite contacts").setOnMenuItemClickListener { inviteToGroup(); true }
-            }
-            menu.add("Disappearing messages").setOnMenuItemClickListener { disappearing(); true }
-            menu.add("Clear chat…").setOnMenuItemClickListener {
-                Chats.clear(this@ChatActivity, node, g.name, null, g.id) { refresh() }
-                true
-            }
-            if (g.owned) menu.add("Delete group").setOnMenuItemClickListener { deleteGroup(); true }
-            menu.add("Leave group").setOnMenuItemClickListener { leaveGroup(); true }
+            val a = this@ChatActivity
+            item(a, "Search", R.drawable.ic_search) { search.open() }
+            item(a, "Media, files and links", R.drawable.ic_image) { media(g.name) }
+            item(a, "Members", R.drawable.ic_group) { members() }
+            if (g.myRole != MemberRole.MEMBER) item(a, "Invite contacts", R.drawable.ic_add) { inviteToGroup() }
+            item(a, "Disappearing messages", R.drawable.ic_timer) { disappearing() }
+            item(a, "Clear chat…", R.drawable.ic_delete) { Chats.clear(a, node, g.name, null, g.id) { refresh() } }
+            if (g.owned) item(a, "Delete group", R.drawable.ic_delete) { deleteGroup() }
+            item(a, "Leave group", R.drawable.ic_back) { leaveGroup() }
             show()
         }
     }
@@ -3661,6 +3799,8 @@ class ChatActivity : Activity() {
         private const val SEARCH_LIMIT = 1_000u
         /** Most photos or files sent at once. */
         private const val MAX_PICK = 30
+        /** Messages from one sender this close together are drawn as one group. */
+        private const val GROUP_GAP_MS = 3 * 60 * 1000L
         private const val WIFI_DIRECT = 2
         /** The *Quote* item in a message's text selection. */
         private const val QUOTE_ITEM = 0x51

@@ -62,7 +62,7 @@ class SearchBox(
         textSize = Design.typeSubtitle
         setTextColor(activity.color(R.color.text))
         setHintTextColor(activity.color(R.color.muted))
-        background = activity.roundedRes(R.color.field, Design.radiusXl)
+        background = rounded(activity.color(R.color.field), activity.dp(Design.radiusXl).toFloat())
         setPadding(activity.dp(Design.lg), activity.dp(Design.sm), activity.dp(Design.lg), activity.dp(Design.sm))
         addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}

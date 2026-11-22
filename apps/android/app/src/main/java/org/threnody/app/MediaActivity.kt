@@ -93,12 +93,8 @@ class MediaActivity : Activity() {
         val counts = listOf(photos.size, files.size, links.size)
         tabs.removeAllViews()
         listOf("Photos", "Files", "Links").forEachIndexed { i, name ->
-            tabs.addView(label("$name · ${counts[i]}", 14f, if (i == tab) R.color.on_accent else R.color.text).apply {
-                gravity = Gravity.CENTER
-                setPadding(dp(12), dp(8), dp(12), dp(8))
-                background = rounded(color(if (i == tab) R.color.accent else R.color.surface), dp(18).toFloat())
-                setOnClickListener { tab = i; show() }
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginEnd = if (i < 2) dp(6) else 0 })
+            tabs.addView(filterChip("$name  ${counts[i]}", i == tab) { tab = i; show() },
+                LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(Design.sm) })
         }
         content.removeAllViews()
         when (tab) {
@@ -110,7 +106,7 @@ class MediaActivity : Activity() {
 
     private fun empty(what: String) {
         content.addView(label("No $what in this conversation" +
-            " (disappearing messages take theirs with them).", 14f, R.color.muted).apply {
+            " (disappearing messages take theirs with them).", 14f, R.color.muted, maxLines = 0).apply {
             gravity = Gravity.CENTER
             setPadding(dp(16), dp(48), dp(16), 0)
         }, matchWrap)
@@ -127,15 +123,17 @@ class MediaActivity : Activity() {
             val location = f.location
             val cell: View = if (f.sensitive || location == null) {
                 // Covered here too, and never decoded until opened.
-                label(if (location == null) "📷" else "🔒", 22f, R.color.on_cover).apply {
-                    gravity = Gravity.CENTER
+                ImageView(this).apply {
+                    setImageResource(if (location == null) R.drawable.ic_image else R.drawable.ic_lock)
+                    imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.on_cover))
+                    scaleType = ImageView.ScaleType.CENTER
                     background = rounded(color(R.color.cover), dp(6).toFloat()).apply { setStroke(dp(1), color(R.color.cover_edge)) }
                     contentDescription = if (location == null) "Photo not available" else "Sensitive photo"
                 }
             } else {
                 ImageView(this).apply {
                     scaleType = ImageView.ScaleType.CENTER_CROP
-                    background = rounded(color(R.color.surface), dp(6).toFloat())
+                    background = rounded(color(R.color.card), dp(8).toFloat())
                     clipToOutline = true
                     contentDescription = e.text.ifBlank { f.name }
                     Media.thumbnail(this@MediaActivity, location, side) { b -> runOnUiThread { setImageBitmap(b) } }
@@ -165,7 +163,7 @@ class MediaActivity : Activity() {
             val f = e.file ?: continue
             row(
                 f.clip?.let { Threnody.fileLabel(f.name, f.sensitive, "", it) }
-                    ?: ((if (f.sensitive) "📎 Sensitive file: " else "📎 ") + f.name),
+                    ?: ((if (f.sensitive) "Sensitive file: " else "") + f.name),
                 Formatter.formatShortFileSize(this, f.size.toLong()) + " · " + date(e) +
                     (if (e.text.isNotBlank()) " · ${e.text}" else ""),
             ) {
@@ -184,17 +182,24 @@ class MediaActivity : Activity() {
         val list = links
         if (list.isEmpty()) return empty("links")
         for ((l, e) in list) {
-            row(l.url, date(e) + if (e.outgoing) " · you" else "") { Links.confirm(this, l.url, l.host) }
+            row(l.url, date(e) + if (e.outgoing) " · you" else "", R.drawable.ic_link) { Links.confirm(this, l.url, l.host) }
         }
     }
 
-    private fun row(title: String, detail: String, onClick: () -> Unit) {
-        content.addView(LinearLayout(this).apply {
+    /** A file or link: a round tile, its name, and when (and how big) underneath. */
+    private fun row(title: String, detail: String, icon: Int = R.drawable.ic_file, onClick: () -> Unit) {
+        val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            addView(label(title, 15f).apply { maxLines = 2 })
+            addView(label(detail, 13f, R.color.muted).apply { maxLines = 2 })
+        }
+        content.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(10), dp(8), dp(10))
             background = ripple()
-            addView(label(title, 15f).apply { maxLines = 2 })
-            addView(label(detail, 12f, R.color.muted).apply { maxLines = 2 })
+            addView(iconTile(icon, 40))
+            addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.lg) })
             setOnClickListener { onClick() }
         }, matchWrap)
     }

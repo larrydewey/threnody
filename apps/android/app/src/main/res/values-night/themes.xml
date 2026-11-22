@@ -31,7 +31,7 @@
         <item name="colorOutline">@color/md_sys_color_outline</item>
         <item name="colorOutlineVariant">@color/md_sys_color_outline_variant</item>
 
-        <item name="android:windowBackground">@color/md_sys_color_surface</item>
+        <item name="android:windowBackground">@color/background</item>
 
         <!-- Status & Navigation bars - transparent for edge-to-edge -->
         <item name="android:statusBarColor">@android:color/transparent</item>
@@ -62,10 +62,28 @@
         <!-- Motion -->
         <item name="android:windowActivityTransitions">true</item>
 
+        <!-- Menus: rounded cards that float, not square boxes -->
+        <item name="android:popupMenuStyle">@style/Threnody.PopupMenu</item>
+        <item name="android:contextPopupMenuStyle">@style/Threnody.PopupMenu</item>
+        <item name="android:listPopupWindowStyle">@style/Threnody.PopupMenu</item>
+        <item name="android:textAppearanceLargePopupMenu">@style/Threnody.TextAppearance.Menu</item>
+        <item name="android:textAppearanceSmallPopupMenu">@style/Threnody.TextAppearance.Menu</item>
+
         <!-- Dialogs: rounder, with sentence-case buttons (Material 3), not ALL CAPS -->
         <item name="android:alertDialogTheme">@style/Threnody.Dialog</item>
         <item name="alertDialogTheme">@style/Threnody.Dialog</item>
         <item name="textAppearanceButton">@style/Threnody.TextAppearance.Button</item>
+    </style>
+
+    <style name="Threnody.PopupMenu" parent="@android:style/Widget.Material.PopupMenu">
+        <item name="android:popupBackground">@drawable/popup</item>
+        <item name="android:popupElevation">6dp</item>
+        <item name="android:dropDownVerticalOffset">4dp</item>
+    </style>
+
+    <style name="Threnody.TextAppearance.Menu" parent="@android:style/TextAppearance.Material.Widget.PopupMenu.Large">
+        <item name="android:textSize">16sp</item>
+        <item name="android:textColor">@color/text</item>
     </style>
 
     <!-- Dialog theme -->
@@ -76,6 +94,12 @@
         <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
         <item name="android:editTextStyle">@style/Threnody.EditText</item>
         <item name="android:dialogCornerRadius">28dp</item>
+        <!-- The dialog's own surface, in this theme's colours (light or dark). -->
+        <item name="android:windowBackground">@drawable/dialog</item>
+        <item name="android:colorBackground">@color/sheet</item>
+        <item name="android:colorBackgroundFloating">@color/sheet</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/muted</item>
         <item name="android:buttonBarButtonStyle">@style/Threnody.DialogButton</item>
         <item name="buttonBarButtonStyle">@style/Threnody.DialogButton</item>
         <item name="textAppearanceButton">@style/Threnody.TextAppearance.Button</item>

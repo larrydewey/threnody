@@ -275,16 +275,17 @@ pub struct Actions {
     pub open: Box<dyn Fn()>,
 }
 
+/// The kind's icon, from the icon theme like the app's other icons.
 fn kind_icon(c: &CardInfo) -> &'static str {
     match &c.item {
-        CardItemInfo::Contact { .. } => "👤",
-        CardItemInfo::Wifi { .. } => "📶",
-        CardItemInfo::Location { .. } => "📍",
-        CardItemInfo::Event { .. } => "📅",
+        CardItemInfo::Contact { .. } => "avatar-default-symbolic",
+        CardItemInfo::Wifi { .. } => "network-wireless-symbolic",
+        CardItemInfo::Location { .. } => "mark-location-symbolic",
+        CardItemInfo::Event { .. } => "x-office-calendar-symbolic",
         CardItemInfo::Secret { kind, .. } => match kind.as_str() {
-            "login" => "🔑",
-            "card" => "💳",
-            _ => "🔒",
+            "login" => "dialog-password-symbolic",
+            "card" => "auth-smartcard-symbolic",
+            _ => "changes-prevent-symbolic",
         },
     }
 }
@@ -350,8 +351,12 @@ pub fn view(
         title
     };
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let icon = ui::label(if sealed { "👁" } else { kind_icon(c) }, &["card-icon"]);
-    icon.set_xalign(0.5);
+    let icon = gtk::Image::from_icon_name(if sealed {
+        "view-reveal-symbolic"
+    } else {
+        kind_icon(c)
+    });
+    icon.add_css_class("card-icon");
     icon.set_valign(gtk::Align::Center);
     header.append(&icon);
     let words = gtk::Box::new(gtk::Orientation::Vertical, 0);
