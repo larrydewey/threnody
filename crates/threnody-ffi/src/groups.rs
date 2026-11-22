@@ -686,17 +686,21 @@ impl ThrenodyNode {
 
     /// `send_group_text`, replying to the message in the group that
     /// `at_ms` and `device` name (as in [`crate::HistoryEntry`]).
+    #[uniffi::method(default(quote_part = None))]
     pub fn send_group_reply(
         &self,
         group: String,
         text: String,
         at_ms: u64,
         device: String,
+        quote_part: Option<String>,
     ) -> Result<()> {
         let g = self.group_id(&group)?;
-        let quote = self.node.quote_of(
+        let quote = self.quote_in(
             threnody_core::history::ConversationId::Group(g),
-            crate::entry_at(at_ms, &device),
+            Some(at_ms),
+            Some(&device),
+            quote_part.as_deref(),
         );
         let _guard = self.rt.enter();
         self.group_node()
@@ -885,6 +889,7 @@ impl ThrenodyNode {
     /// Sends text to the group, mentioning `mentions` (each naming a
     /// member's device; `start` and `len` count characters of `text`) and,
     /// with `quote_at_ms` and `quote_device`, replying to that message.
+    #[uniffi::method(default(quote_part = None))]
     pub fn send_group_message(
         &self,
         group: String,
@@ -892,13 +897,16 @@ impl ThrenodyNode {
         quote_at_ms: Option<u64>,
         quote_device: Option<String>,
         mentions: Vec<MentionInfo>,
+        quote_part: Option<String>,
     ) -> Result<()> {
         let g = self.group_id(&group)?;
         let conv = ConversationId::Group(g);
-        let quote = match (quote_at_ms, &quote_device) {
-            (Some(at), Some(d)) => self.node.quote_of(conv, crate::entry_at(at, d)),
-            _ => None,
-        };
+        let quote = self.quote_in(
+            conv,
+            quote_at_ms,
+            quote_device.as_deref(),
+            quote_part.as_deref(),
+        );
         let mentions = self.group_mentions(&g, &mentions);
         let _guard = self.rt.enter();
         self.group_node()
@@ -908,6 +916,8 @@ impl ThrenodyNode {
 
     /// `send_group_message` with a card for a link in `text` (as
     /// `send_text_with_preview`).
+    #[uniffi::method(default(quote_part = None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn send_group_text_with_preview(
         &self,
         group: String,
@@ -916,13 +926,16 @@ impl ThrenodyNode {
         quote_device: Option<String>,
         mentions: Vec<MentionInfo>,
         preview: crate::LinkPreviewInfo,
+        quote_part: Option<String>,
     ) -> Result<()> {
         let g = self.group_id(&group)?;
         let conv = ConversationId::Group(g);
-        let quote = match (quote_at_ms, &quote_device) {
-            (Some(at), Some(d)) => self.node.quote_of(conv, crate::entry_at(at, d)),
-            _ => None,
-        };
+        let quote = self.quote_in(
+            conv,
+            quote_at_ms,
+            quote_device.as_deref(),
+            quote_part.as_deref(),
+        );
         let mentions = self.group_mentions(&g, &mentions);
         let _guard = self.rt.enter();
         let extras = threnody_net::history::Extras {

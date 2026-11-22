@@ -367,13 +367,13 @@ mod tests {
         let node = ThrenodyNode::open(s(&dir), None, None).unwrap();
         let before = node.device_fingerprint();
         node.create_persona("p".into(), None, None).unwrap();
-        node.write_note("hello".into(), None, None).unwrap();
+        node.write_note("hello".into(), None, None, None).unwrap();
 
         let homes = wipe_home(s(&dir)).unwrap();
         assert_eq!(homes.len(), 2);
         assert_eq!(homes[0], s(&dir));
         assert!(!dir.exists());
-        let _ = node.write_note("again".into(), None, None);
+        let _ = node.write_note("again".into(), None, None, None);
         assert!(node.create_persona("q".into(), None, None).is_err());
         assert!(!dir.exists());
         node.shutdown();
@@ -389,7 +389,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("node");
         let node = ThrenodyNode::open(s(&dir), None, None).unwrap();
-        node.write_note("hello".into(), None, None).unwrap();
+        node.write_note("hello".into(), None, None, None).unwrap();
         node.shutdown();
         drop(node);
         std::fs::remove_file(dir.join("identity.cbor")).unwrap();

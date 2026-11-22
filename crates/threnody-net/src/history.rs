@@ -987,8 +987,23 @@ impl Node {
     /// A quote of the message in `conv` that `pick` chooses (the newest
     /// such), to reply to it with; `None` if there's none.
     pub fn quote_of(&self, conv: ConversationId, pick: impl Fn(&Entry) -> bool) -> Option<Quote> {
+        self.quote_part_of(conv, pick, None)
+    }
+
+    /// [`Node::quote_of`], quoting only `part` of the message's text (as
+    /// [`Quote::excerpt`]) if given.
+    pub fn quote_part_of(
+        &self,
+        conv: ConversationId,
+        pick: impl Fn(&Entry) -> bool,
+        part: Option<&str>,
+    ) -> Option<Quote> {
         let h = self.history(conv).ok()?;
-        h.entries().iter().rev().find(|e| pick(e)).map(Quote::of)
+        let e = h.entries().iter().rev().find(|e| pick(e))?;
+        Some(match part {
+            Some(p) => Quote::excerpt(e, p),
+            None => Quote::of(e),
+        })
     }
 
     /// [`Node::send_text`], replying to (quoting) an earlier message.
