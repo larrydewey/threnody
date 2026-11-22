@@ -94,6 +94,12 @@
         <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
         <item name="android:editTextStyle">@style/Threnody.EditText</item>
         <item name="android:dialogCornerRadius">28dp</item>
+        <!-- The dialog's own surface, in this theme's colours (light or dark). -->
+        <item name="android:windowBackground">@drawable/dialog</item>
+        <item name="android:colorBackground">@color/sheet</item>
+        <item name="android:colorBackgroundFloating">@color/sheet</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/muted</item>
         <item name="android:buttonBarButtonStyle">@style/Threnody.DialogButton</item>
         <item name="buttonBarButtonStyle">@style/Threnody.DialogButton</item>
         <item name="textAppearanceButton">@style/Threnody.TextAppearance.Button</item>
