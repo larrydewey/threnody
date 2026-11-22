@@ -54,6 +54,11 @@ mod schedule;
 pub use schedule::{ScheduleFailure, ScheduledInfo};
 mod tap;
 mod themes;
+pub use themes::{
+    BackgroundInfo, PatternInfo, PictureInfo, ShapeInfo, ThemeInfo, ThemePackInfo,
+    max_background_photo, max_picture_photo, night_color, pattern_name, pattern_shapes,
+    theme_colors, theme_gradients, theme_packs, theme_patterns,
+};
 mod transfer;
 pub use tap::{NfcCard, NfcFailure, NfcOutcome, NfcReader, NfcStep, NfcTransport};
 pub use transfer::{LargeFileStore, ReservedFile, TransferState};

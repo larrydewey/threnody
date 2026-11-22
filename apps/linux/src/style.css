@@ -415,3 +415,8 @@ windowtitle.warning .subtitle {
 
 /* Grouped rows of settings and details: rounded cards. */
 .boxed-list { border-radius: 16px; }
+
+/* Chat themes: the picker's preview and pack tiles, rounded. */
+.theme-preview { border-radius: 20px; }
+.theme-pack { border-radius: 16px; }
+.theme-swatch { padding: 2px; }
