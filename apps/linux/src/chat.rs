@@ -1734,13 +1734,44 @@ impl ChatView {
         line.set_halign(gtk::Align::Center);
         line.set_margin_top(6);
         line.set_margin_bottom(6);
+        use threnody_ffi::{CallOutcomeInfo as O, NoticeInfo as N};
         let icon = match n {
-            threnody_ffi::NoticeInfo::Deleted => "user-trash-symbolic",
+            N::Deleted => "user-trash-symbolic",
+            N::Call {
+                outcome: O::Missed | O::Busy,
+                ..
+            } if !e.outgoing => "call-missed-symbolic",
+            N::Call { video: true, .. } => "camera-video-symbolic",
+            N::Call { .. } => "call-start-symbolic",
         };
         line.append(&gtk::Image::from_icon_name(icon));
+        if matches!(n, N::Call { outcome: O::Missed | O::Busy, .. } if !e.outgoing) {
+            line.add_css_class("missed");
+        }
+        // A call: click to call back, the same way.
+        if let N::Call { video, .. } = *n
+            && threnody_ffi::calls_built_in()
+        {
+            line.add_css_class("callable");
+            line.set_tooltip_text(Some(&format!(
+                "{} · click to call back",
+                ui::time_label(e.at_ms)
+            )));
+            let click = gtk::GestureClick::new();
+            let weak = self.weak_self.clone();
+            click.connect_released(move |_, _, _, _| {
+                let Some(t) = weak.upgrade() else { return };
+                let Some(app) = t.app.upgrade() else { return };
+                let c = t.conv.borrow().clone();
+                app.start_call(&c, video);
+            });
+            line.add_controller(click);
+        }
         let text = ui::label(&e.text, &["caption"]);
         line.append(&text);
-        line.set_tooltip_text(Some(&ui::time_label(e.at_ms)));
+        if line.tooltip_text().is_none() {
+            line.set_tooltip_text(Some(&ui::time_label(e.at_ms)));
+        }
         let click = gtk::GestureClick::builder().button(3).build();
         let (weak, entry) = (self.weak_self.clone(), e.clone());
         click.connect_pressed(move |g, _, x, y| {

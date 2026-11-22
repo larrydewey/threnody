@@ -72,6 +72,19 @@ async fn meet(caller: &Node, callee: &Node, quic: Option<std::net::SocketAddr>, 
     .expect("hellos exchanged");
 }
 
+/// The texts of the call notices in `n`'s chat with `peer`.
+fn call_notes(n: &Node, peer: &threnody_core::PublicIdentity) -> Vec<String> {
+    n.history(n.conversation_for(peer))
+        .map(|h| {
+            h.entries()
+                .iter()
+                .filter(|e| matches!(e.notice, Some(threnody_core::notice::Notice::Call { .. })))
+                .map(|e| e.text.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Alice and Bob connected over QUIC or TCP, accepting each other, and
 /// Bob's QUIC address.
 async fn pair(dir: &tempfile::TempDir, quic: bool) -> (Peer, Peer, std::net::SocketAddr) {
@@ -200,6 +213,10 @@ async fn declined_busy_and_requests() {
         unreachable!()
     };
     assert_eq!(reason, HangupReason::Declined);
+    // Each side notes the call in the chat, once.
+    let a_id = alice.identity();
+    assert_eq!(call_notes(&alice, &b_id), ["Voice call · declined"]);
+    assert_eq!(call_notes(&bob, &a_id), ["You declined a voice call"]);
 
     // Busy: Carol calls Bob while he's talking to Alice.
     let id = alice.start_call(&b_id, false).unwrap();
@@ -215,8 +232,34 @@ async fn declined_busy_and_requests() {
     };
     assert!(reason == HangupReason::Busy && !by_us);
     assert_eq!(bob.call().unwrap().call, id, "still with Alice");
+    let c_id = carol.identity();
+    assert_eq!(call_notes(&carol, &b_id), ["Voice call · they were busy"]);
+    assert_eq!(
+        call_notes(&bob, &c_id),
+        ["Missed voice call · you were on another call"]
+    );
+    let unread = |n: &Node, p| n.history(n.conversation_for(p)).unwrap().unread().count();
+    assert_eq!(unread(&bob, &c_id), 1, "a missed call is unread");
     alice.hangup_call(id);
     next(&mut brx, 10, |e| matches!(e, Event::CallEnded { .. })).await;
+    // An answered call, with how long it lasted.
+    let notes = call_notes(&bob, &a_id);
+    assert!(
+        notes.len() == 2 && notes[1].starts_with("Voice call · ") && notes[1].ends_with(" s"),
+        "{notes:?}"
+    );
+    assert_eq!(unread(&bob, &a_id), 0, "an answered call isn't");
+
+    // Cancelled before it was answered: missed on the other side.
+    let id = alice.start_call(&b_id, false).unwrap();
+    next(&mut brx, 10, |e| matches!(e, Event::CallIncoming { .. })).await;
+    alice.hangup_call(id);
+    next(&mut brx, 10, |e| matches!(e, Event::CallEnded { .. })).await;
+    assert_eq!(
+        call_notes(&alice, &b_id).last().unwrap(),
+        "Cancelled voice call"
+    );
+    assert_eq!(call_notes(&bob, &a_id).last().unwrap(), "Missed voice call");
 
     // A stranger (a message request to Bob) calling doesn't ring.
     let (dave, _drx) = node(&dir, "dave");
@@ -224,6 +267,10 @@ async fn declined_busy_and_requests() {
     dave.start_call(&b_id, false).unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(bob.call().is_none(), "requests don't ring");
+    assert!(
+        call_notes(&bob, &dave.identity()).is_empty(),
+        "nor leave a trace"
+    );
 }
 
 /// Alice and Bob call each other at the same moment: instead of both

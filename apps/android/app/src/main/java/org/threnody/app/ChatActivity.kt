@@ -32,6 +32,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Date
+import uniffi.threnody_ffi.CallOutcomeInfo
 import uniffi.threnody_ffi.Clip
 import uniffi.threnody_ffi.FileFetch
 import uniffi.threnody_ffi.FileInfo
@@ -1400,11 +1401,19 @@ class ChatActivity : Activity() {
      * offers to remove it from this chat (here and on our devices).
      */
     private fun noticeView(e: HistoryEntry, n: NoticeInfo): View {
+        val missed = n is NoticeInfo.Call && !e.outgoing &&
+            (n.outcome == CallOutcomeInfo.MISSED || n.outcome == CallOutcomeInfo.BUSY)
         val icon = when (n) {
-            NoticeInfo.DELETED -> R.drawable.ic_delete
+            is NoticeInfo.Deleted -> R.drawable.ic_delete
+            is NoticeInfo.Call -> if (n.video) R.drawable.ic_videocam else R.drawable.ic_call
         }
-        return label(e.text, 13f, R.color.muted).apply {
+        return label(e.text, 13f, if (missed) R.color.warning else R.color.muted).apply {
             icon(icon, 16)
+            // A call: a tap calls back, the same way.
+            if (n is NoticeInfo.Call && uniffi.threnody_ffi.callsBuiltIn() && group == null && !note) {
+                foreground = ripple()
+                setOnClickListener { v -> Design.lightHaptic(v); call(video = n.video) }
+            }
             gravity = Gravity.CENTER_VERTICAL
             background = rounded(color(R.color.card), dp(14).toFloat())
             setPadding(dp(12), dp(6), dp(14), dp(6))

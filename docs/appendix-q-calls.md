@@ -158,3 +158,7 @@ A pair without a session sends its packets to a participant R that it reaches an
 - Media over onion circuits.
 - A Tamarin model of the call key derivation.
 - Fuzzing `CallMsg`.
+
+## Calls in the chat
+
+Each call leaves a notice in the chat (Appendix C, history key 23, kind 2): `{ 0 => 2, 1 => call id, ? 2 => 1 (video), 3 => outcome, 4 => seconds }`, on the entry the call's direction gives (`outgoing` when we called). The outcome is how this device saw it: 0 answered (with how long it lasted from the answer), 1 missed (it rang here unanswered: the caller gave up, it rang out, or it failed), 2 declined (by us here or on another of our devices; or, calling, by them), 3 busy (they were in another call; or, rung, we were, which is also missed), 4 no answer, 5 cancelled (we hung up before an answer), 6 couldn't connect (also when the contact couldn't be reached at all), 7 answered on another of our devices. A call is noted once, by its id. A missed call counts as unread. A call we made goes to our other devices like our sent messages (Appendix J); one that rang here rang on them too, and each notes its own. When two calls cross (both sides calling at once), the one that gives way leaves no notice. Group calls aren't noted yet.

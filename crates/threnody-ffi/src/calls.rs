@@ -151,9 +151,11 @@ impl ThrenodyNode {
             return Err(fail("this build has no calls"));
         }
         let p = self.resolve(&peer)?;
-        self.rt
-            .block_on(self.node.reach_for_call(&p))
-            .map_err(fail)?;
+        if let Err(e) = self.rt.block_on(self.node.reach_for_call(&p)) {
+            // The chat notes the attempt: "Voice call · couldn't connect".
+            self.node.note_unreached_call(&p, video);
+            return Err(fail(e));
+        }
         // The call's watchdog runs on the node's runtime.
         let _guard = self.rt.enter();
         self.node.start_call(&p, video).map_err(fail)

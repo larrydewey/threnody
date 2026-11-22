@@ -294,15 +294,42 @@ impl Entry {
 
     /// The id other devices know this message by: ours if we sent it, the
     /// sender's otherwise (0 = none).
+    /// An empty entry, to fill in with `..Entry::blank()`: no time,
+    /// device, text or anything else.
+    pub fn blank() -> Self {
+        Self {
+            at_ms: 0,
+            outgoing: false,
+            device: [0; 32],
+            text: String::new(),
+            offline: false,
+            expires_at_ms: None,
+            file: None,
+            local_id: 0,
+            delivered: false,
+            read_ms: 0,
+            recipients: 0,
+            delivered_to: Vec::new(),
+            remote_id: 0,
+            edited_ms: 0,
+            reactions: Vec::new(),
+            quote: None,
+            mentions: Vec::new(),
+            poll: None,
+            forwarded: false,
+            list: None,
+            ticked_ms: 0,
+            preview: None,
+            card: None,
+            notice: None,
+        }
+    }
+
     /// Turns a message into the placeholder left where it was deleted for
     /// everyone: who and when stay (so replies still point somewhere),
     /// everything it said goes.
     pub fn tombstone(&mut self) {
-        self.text = if self.outgoing {
-            "You deleted this message".into()
-        } else {
-            "This message was deleted".into()
-        };
+        self.text = crate::notice::Notice::Deleted.text(self.outgoing);
         self.file = None;
         self.reactions.clear();
         self.quote = None;
@@ -724,9 +751,9 @@ impl History {
         } else {
             self.seen_ms
         };
-        self.entries
-            .iter()
-            .filter(move |e| !e.outgoing && e.at_ms > seen && !e.is_tombstone())
+        self.entries.iter().filter(move |e| {
+            !e.outgoing && e.at_ms > seen && e.notice.is_none_or(|n| n.is_unread_kind())
+        })
     }
 
     /// Whether the user has seen incoming entry `e` here: displayed (and

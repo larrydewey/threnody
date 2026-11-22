@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use threnody_core::call::{self, CallMsg, HangupReason, MediaKeys};
 use threnody_core::crypto::random_bytes;
+use threnody_core::history::Entry;
 use threnody_core::message::FEATURE_CALLS;
+use threnody_core::notice::{CallOutcome, Notice};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -621,8 +623,13 @@ impl Node {
             // ringing on our other devices too, so stay quiet.
             return;
         }
+        // Busy elsewhere: the call is missed here, and noted as such.
+        let busy = |reason| {
+            reply(reason);
+            self.note_call(&peer, false, id, video, CallOutcome::Busy, 0);
+        };
         if self.in_group_call() {
-            return reply(HangupReason::Busy);
+            return busy(HangupReason::Busy);
         }
         let mut calls = lock(&self.shared.calls);
         match &calls.current {
@@ -641,16 +648,18 @@ impl Node {
                     return;
                 }
                 drop(calls);
-                self.end_call(ours, HangupReason::Ended, true);
+                // Our call gives way to theirs, which takes its place: no
+                // "Cancelled" notice for it.
+                self.end_call_as(ours, HangupReason::Ended, true, false);
                 calls = lock(&self.shared.calls);
                 if calls.current.is_some() {
                     drop(calls);
-                    return reply(HangupReason::Busy);
+                    return busy(HangupReason::Busy);
                 }
             }
             Some(_) => {
                 drop(calls);
-                return reply(HangupReason::Busy);
+                return busy(HangupReason::Busy);
             }
             None => {}
         }
@@ -716,8 +725,13 @@ impl Node {
         }
     }
 
-    /// Ends call `id` with `reason`, telling the peer when `tell`.
+    /// Ends call `id` with `reason`, telling the peer when `tell`, and
+    /// notes it in the chat.
     fn end_call(&self, id: u64, reason: HangupReason, tell: bool) {
+        self.end_call_as(id, reason, tell, true);
+    }
+
+    fn end_call_as(&self, id: u64, reason: HangupReason, tell: bool, note: bool) {
         let ended = {
             let mut calls = lock(&self.shared.calls);
             if calls.current.as_ref().is_some_and(|c| c.info.call == id) {
@@ -735,11 +749,93 @@ impl Node {
             };
             self.tell_hangup(id, &to, reason);
         }
+        if note {
+            let i = &c.info;
+            let outcome = call_outcome(i, reason, tell);
+            let secs = if i.answered_ms == 0 {
+                0
+            } else {
+                u32::try_from(now_ms().saturating_sub(i.answered_ms) / 1000).unwrap_or(u32::MAX)
+            };
+            self.note_call(
+                &i.peer,
+                i.outgoing,
+                id,
+                i.video || i.peer_video,
+                outcome,
+                secs,
+            );
+        }
         self.emit(Event::CallEnded {
             peer: c.info.peer,
             call: id,
             reason,
             by_us: tell,
+        });
+    }
+
+    /// Notes, in the chat with `peer`, a call that couldn't be made: it
+    /// never reached them ([`Node::reach_for_call`] gave up).
+    pub fn note_unreached_call(&self, peer: &PublicIdentity, video: bool) {
+        let id = u64::from_le_bytes(random_bytes::<8>());
+        self.note_call(peer, true, id, video, CallOutcome::Failed, 0);
+    }
+
+    /// Notes a call in the chat with `peer`'s account, once per call: a
+    /// line saying how it went (Missed, Video call · 12 min…). One we
+    /// made goes to our other devices too, as our sent messages do; one
+    /// that rang here rang on them, which note it themselves.
+    fn note_call(
+        &self,
+        peer: &PublicIdentity,
+        outgoing: bool,
+        call: u64,
+        video: bool,
+        outcome: CallOutcome,
+        duration_s: u32,
+    ) {
+        let conv = self.conversation_for(peer);
+        let noted = self.history(conv).is_ok_and(|h| {
+            h.entries()
+                .iter()
+                .any(|e| matches!(e.notice, Some(Notice::Call { call: c, .. }) if c == call))
+        });
+        if noted {
+            return;
+        }
+        let notice = Notice::Call {
+            call,
+            video,
+            outcome,
+            duration_s,
+        };
+        let now = now_ms();
+        let entry = Entry {
+            at_ms: now,
+            outgoing,
+            device: if outgoing {
+                *self.identity().as_bytes()
+            } else {
+                *peer.as_bytes()
+            },
+            text: notice.text(outgoing),
+            notice: Some(notice),
+            ..Entry::blank()
+        };
+        if self
+            .shared
+            .home
+            .append_history(self.identity_ref(), conv, entry.clone(), now)
+            .is_err()
+        {
+            return;
+        }
+        if outgoing {
+            self.push_entry(conv, &entry);
+        }
+        self.emit(Event::HistorySynced {
+            from: *peer,
+            added: 1,
         });
     }
 
@@ -868,5 +964,26 @@ impl Drop for Rescue {
         if let Some(h) = self.0.take() {
             h.abort();
         }
+    }
+}
+
+/// How a 1:1 call went, as this device saw it: answered, or why not.
+/// `by_us`: this side ended it (hung up, declined, or timed out ringing
+/// out).
+fn call_outcome(i: &CallInfo, reason: HangupReason, by_us: bool) -> CallOutcome {
+    if i.answered_ms != 0 {
+        return CallOutcome::Answered;
+    }
+    match (i.outgoing, reason) {
+        (true, HangupReason::Declined | HangupReason::DeclinedElsewhere) => CallOutcome::Declined,
+        (true, HangupReason::Busy) => CallOutcome::Busy,
+        (true, HangupReason::Unanswered) => CallOutcome::NoAnswer,
+        (_, HangupReason::Failed) => CallOutcome::Failed,
+        (true, _) if by_us => CallOutcome::Cancelled,
+        (true, _) => CallOutcome::NoAnswer,
+        (false, HangupReason::AnsweredElsewhere) => CallOutcome::AnsweredElsewhere,
+        (false, HangupReason::DeclinedElsewhere) => CallOutcome::Declined,
+        (false, HangupReason::Declined) if by_us => CallOutcome::Declined,
+        (false, _) => CallOutcome::Missed,
     }
 }

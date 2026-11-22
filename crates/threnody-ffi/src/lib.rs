@@ -272,12 +272,54 @@ pub enum NoticeInfo {
     /// A message deleted for everyone stood here: "This message was
     /// deleted", or on our own, "You deleted this message".
     Deleted,
+    /// A call (the entry's `outgoing` says who called): how it went, and
+    /// how long it lasted once answered. Tapping it calls back.
+    Call {
+        video: bool,
+        outcome: CallOutcomeInfo,
+        duration_s: u32,
+    },
+}
+
+/// How a call went, as this device saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CallOutcomeInfo {
+    Answered,
+    /// Rang here unanswered (counts as unread).
+    Missed,
+    Declined,
+    /// They were busy, or (rang here) we were: missed.
+    Busy,
+    NoAnswer,
+    Cancelled,
+    Failed,
+    AnsweredElsewhere,
 }
 
 impl From<threnody_core::notice::Notice> for NoticeInfo {
     fn from(n: threnody_core::notice::Notice) -> Self {
+        use threnody_core::notice::{CallOutcome as O, Notice};
         match n {
-            threnody_core::notice::Notice::Deleted => Self::Deleted,
+            Notice::Deleted => Self::Deleted,
+            Notice::Call {
+                video,
+                outcome,
+                duration_s,
+                ..
+            } => Self::Call {
+                video,
+                outcome: match outcome {
+                    O::Answered => CallOutcomeInfo::Answered,
+                    O::Missed => CallOutcomeInfo::Missed,
+                    O::Declined => CallOutcomeInfo::Declined,
+                    O::Busy => CallOutcomeInfo::Busy,
+                    O::NoAnswer => CallOutcomeInfo::NoAnswer,
+                    O::Cancelled => CallOutcomeInfo::Cancelled,
+                    O::Failed => CallOutcomeInfo::Failed,
+                    O::AnsweredElsewhere => CallOutcomeInfo::AnsweredElsewhere,
+                },
+                duration_s,
+            },
         }
     }
 }
@@ -1266,7 +1308,12 @@ fn history_entries(
     entries
         .iter()
         .map(|e| HistoryEntry {
-            tick: tick_mark(e, this_device),
+            // A notice isn't sent anywhere: no ticks.
+            tick: if e.notice.is_some() {
+                TickMark::None
+            } else {
+                tick_mark(e, this_device)
+            },
             preview: e.preview.clone().map(Into::into),
             card: e.card.as_ref().map(|c| cards::shown(c, e.outgoing)),
             notice: e.notice.map(Into::into),
@@ -4225,7 +4272,13 @@ mod tests {
             assert!(alice.start_call(bob_fp.clone(), false).is_err());
             assert!(alice.node.call().is_none());
         }
-        let h = alice.history(bob_fp.clone(), 10).unwrap();
+        // The messages, without the call's notice (with call media).
+        let h: Vec<_> = alice
+            .history(bob_fp.clone(), 10)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.notice.is_none())
+            .collect();
         assert_eq!(
             h.len(),
             4,
@@ -4259,14 +4312,14 @@ mod tests {
                 .history(bob_fp.clone(), 10)
                 .unwrap()
                 .iter()
-                .all(|e| e.delivered)
+                .all(|e| e.delivered || e.notice.is_some())
             {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         let h = alice.history(bob_fp.clone(), 10).unwrap();
-        assert!(h.iter().all(|e| e.delivered), "{h:?}");
+        assert!(h.iter().all(|e| e.delivered || e.notice.is_some()), "{h:?}");
         assert_eq!(f.location.as_deref(), Some("/tmp/notes.txt"));
         let hb = bob.history(alice.device_fingerprint(), 10).unwrap();
         assert!(!hb[2].outgoing && hb[2].file.as_ref().is_some_and(|f| f.name == "notes.txt"));

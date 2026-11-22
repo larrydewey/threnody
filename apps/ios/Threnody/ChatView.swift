@@ -351,13 +351,17 @@ struct ChatView: View {
 
     @ViewBuilder private func itemView(_ item: ChatItem) -> some View {
         if let n = item.first.notice {
-            NoticeLine(entry: item.first, notice: n) {
+            NoticeLine(entry: item.first, notice: n, onCallBack: callBack(n)) {
                 deleting = Deleting(entries: item.entries, everyone: false)
             }
         } else {
             messageView(item)
         }
     }
+
+    /// What tapping a call notice does: nothing yet, since this app makes
+    /// no calls.
+    private func callBack(_ n: NoticeInfo) -> (() -> Void)? { nil }
 
     @ViewBuilder private func messageView(_ item: ChatItem) -> some View {
         let e = item.first
@@ -1290,12 +1294,15 @@ struct ScheduledList: View {
 private struct NoticeLine: View {
     let entry: HistoryEntry
     let notice: NoticeInfo
+    /// For a call: calls back the same way (nil where calls can't be made).
+    let onCallBack: (() -> Void)?
     let onRemove: () -> Void
 
     var body: some View {
         Label(entry.text, systemImage: icon)
             .font(.footnote)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(missed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+            .onTapGesture { onCallBack?() }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(.quaternary.opacity(0.5), in: Capsule())
@@ -1306,9 +1313,17 @@ private struct NoticeLine: View {
             }
     }
 
+    private var missed: Bool {
+        if case let .call(_, outcome, _) = notice, !entry.outgoing {
+            return outcome == .missed || outcome == .busy
+        }
+        return false
+    }
+
     private var icon: String {
         switch notice {
         case .deleted: "trash"
+        case .call(let video, _, _): missed ? "phone.arrow.down.left" : video ? "video" : "phone"
         }
     }
 }
