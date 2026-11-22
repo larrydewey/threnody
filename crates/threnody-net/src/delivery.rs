@@ -58,6 +58,7 @@ pub fn needs(m: &AppMessage) -> u64 {
     match m {
         AppMessage::Delete { .. } => FEATURE_DELETE,
         AppMessage::Edit { .. } => FEATURE_EDIT,
+        AppMessage::Theme { .. } => threnody_core::message::FEATURE_THEMES,
         AppMessage::React { .. } => FEATURE_REACT,
         AppMessage::Pin { .. } => FEATURE_PIN,
         AppMessage::List(_) => FEATURE_LISTS,

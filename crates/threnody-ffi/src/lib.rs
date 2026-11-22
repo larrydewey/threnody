@@ -53,6 +53,7 @@ pub use push::{PushEndpoint, WakeReport};
 mod schedule;
 pub use schedule::{ScheduleFailure, ScheduledInfo};
 mod tap;
+mod themes;
 mod transfer;
 pub use tap::{NfcCard, NfcFailure, NfcOutcome, NfcReader, NfcStep, NfcTransport};
 pub use transfer::{LargeFileStore, ReservedFile, TransferState};
@@ -287,6 +288,8 @@ pub enum NoticeInfo {
     Timer { secs: u32 },
     /// A contact's device came or went, or we verified them.
     Security,
+    /// The chat's theme (or a group's picture) changed (Appendix W).
+    Theme,
 }
 
 /// How a call went, as this device saw it.
@@ -332,6 +335,7 @@ impl From<threnody_core::notice::Notice> for NoticeInfo {
             Notice::Role { .. } => Self::Role,
             Notice::Timer { secs } => Self::Timer { secs },
             Notice::Security { .. } => Self::Security,
+            Notice::Theme { .. } => Self::Theme,
         }
     }
 }
@@ -1403,7 +1407,8 @@ fn history_entries(
             text: match e.notice {
                 Some(
                     n @ (threnody_core::notice::Notice::Member { .. }
-                    | threnody_core::notice::Notice::Role { .. }),
+                    | threnody_core::notice::Notice::Role { .. }
+                    | threnody_core::notice::Notice::Theme { .. }),
                 ) => n.describe(e.outgoing, &name),
                 _ => e.text.clone(),
             },

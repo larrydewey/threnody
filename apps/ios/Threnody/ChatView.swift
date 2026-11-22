@@ -1328,6 +1328,7 @@ private struct NoticeLine: View {
         case .role: "star"
         case .timer: "timer"
         case .security: "checkmark.shield"
+        case .theme: "paintpalette"
         }
     }
 }

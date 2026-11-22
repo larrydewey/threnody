@@ -1747,6 +1747,7 @@ impl ChatView {
             N::Role => "starred-symbolic",
             N::Timer { .. } => "alarm-symbolic",
             N::Security => "security-high-symbolic",
+            N::Theme => "preferences-desktop-appearance-symbolic",
         };
         line.append(&gtk::Image::from_icon_name(icon));
         if matches!(n, N::Call { outcome: O::Missed | O::Busy, .. } if !e.outgoing) {

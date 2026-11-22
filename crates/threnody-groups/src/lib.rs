@@ -236,6 +236,13 @@ pub enum GroupEvent {
         emoji: String,
         add: bool,
     },
+    /// `from` set the group's theme (`theme`, encoded; see
+    /// `threnody_core::theme`).
+    Theme {
+        group: GroupId,
+        from: PublicIdentity,
+        theme: Vec<u8>,
+    },
     /// `from` pinned (or unpinned) message `id`.
     Pin {
         group: GroupId,
@@ -3454,6 +3461,11 @@ fn application_event(group: GroupId, sender: Pid, plain: &[u8]) -> Result<GroupE
             group,
             from: sender,
             msg,
+        },
+        Content::Theme(theme) => GroupEvent::Theme {
+            group,
+            from: sender,
+            theme,
         },
     })
 }

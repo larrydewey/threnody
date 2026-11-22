@@ -2624,6 +2624,7 @@ where
                     match msg {
                         AppMessage::Delete { conversation, ids, mode } => node.on_delete(&peer, &conversation, &ids, mode),
                         AppMessage::Edit { conversation, id, body } => node.on_edit(&peer, &conversation, id, &body),
+                        AppMessage::Theme { conversation, theme } => node.on_theme(&peer, &conversation, &theme),
                         AppMessage::Identity(payload) => node.on_identity(peer, &payload),
                         AppMessage::React { conversation, id, emoji, add } => node.on_react(&peer, &conversation, id, &emoji, add),
                         AppMessage::Pin { conversation, id, pin } => node.on_pin(&peer, &conversation, id, pin),
@@ -2965,6 +2966,7 @@ fn personal(m: &AppMessage) -> bool {
         | AppMessage::Offer(_)
         | AppMessage::Group(_)
         | AppMessage::Edit { .. }
+        | AppMessage::Theme { .. }
         | AppMessage::Delete { .. }
         | AppMessage::React { .. }
         | AppMessage::Pin { .. } => true,

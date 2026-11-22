@@ -20,6 +20,7 @@ use threnody_core::history::{ConversationId, Entry, FileNote, MAX_POLL_QUESTION,
 use threnody_core::message::{Clip, Mention, Quote};
 use threnody_core::notice::{MemberChange, Notice};
 use threnody_core::store::Home;
+use threnody_core::theme::Theme;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::{Extras, OutgoingFile};
 use threnody_net::{Node, Tag};
@@ -1460,6 +1461,38 @@ impl GroupNode {
         Ok(true)
     }
 
+    /// Sets `group`'s theme for every member (Appendix W): its owners and
+    /// admins may. The chat notes the change.
+    pub fn set_theme(&mut self, node: &Node, group: &GroupId, mut theme: Theme) -> Result<()> {
+        if !self.may_pin(group, &node.identity()) {
+            return Err(GroupError::NotOwner);
+        }
+        theme.set_ms = threnody_core::now_ms();
+        theme.check().map_err(GroupError::from)?;
+        let bytes = theme.encode().map_err(GroupError::from)?;
+        node.take_theme(
+            ConversationId::Group(*group),
+            theme,
+            *node.identity().as_bytes(),
+            true,
+        );
+        let out = self.groups.send(group, &Content::Theme(bytes))?;
+        self.apply(node, out, true)?;
+        Ok(())
+    }
+
+    /// Sends `group`'s theme again, as it is, so members added since have
+    /// it (those who had it already keep theirs: it isn't newer).
+    fn resend_theme(&mut self, node: &Node, group: &GroupId) {
+        let Some(t) = node.chat_theme(ConversationId::Group(*group)) else {
+            return;
+        };
+        let Ok(bytes) = t.encode() else { return };
+        if let Ok(out) = self.groups.send(group, &Content::Theme(bytes)) {
+            let _ = self.apply(node, out, true);
+        }
+    }
+
     /// Whether `who` may pin messages in `group`: its owners and admins,
     /// as the roster every member holds says.
     pub fn may_pin(&self, group: &GroupId, who: &PublicIdentity) -> bool {
@@ -2464,6 +2497,10 @@ impl GroupNode {
                 if let Some(by) = by {
                     self.sibling_role(node, &group, &member, &by, &mut extra);
                 }
+                // We added them: they get the group's theme too.
+                if by == Some(node.identity()) {
+                    self.resend_theme(node, &group);
+                }
                 // Our own device joining is no news in the chat.
                 if !node.is_own_device(&member) {
                     note_member(node, &group, MemberChange::Added, *member.as_bytes(), by);
@@ -2739,6 +2776,21 @@ impl GroupNode {
                     return;
                 }
                 Update::Pinned { group, from, pin }
+            }
+            GroupEvent::Theme { group, from, theme } => {
+                self.seen_by(&group, Some(&from));
+                // Only the owners' and admins' count.
+                if !self.may_pin(&group, &from) {
+                    return;
+                }
+                let Ok(mut theme) = Theme::decode(&theme) else {
+                    return;
+                };
+                // Not ahead of our clock, or it would hold off every later one.
+                theme.set_ms = theme.set_ms.min(threnody_core::now_ms());
+                let ours = node.is_own_device(&from);
+                node.take_theme(ConversationId::Group(group), theme, *from.as_bytes(), ours);
+                return;
             }
         };
         updates.push(update);
