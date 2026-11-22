@@ -22,6 +22,10 @@ struct Bubble: View {
     let onLink: (TextLink) -> Void
     let onQuote: (QuoteInfo) -> Void
     let onReact: (ReactionInfo) -> Void
+    /// Shows a card in full (Appendix V); a view-once card opens for good.
+    var onCard: (HistoryEntry) -> Void = { _ in }
+    /// Adds the person a contact card names; nil where that isn't offered.
+    var onAddContact: ((String) -> Void)? = nil
 
     private var entry: HistoryEntry { item.first }
 
@@ -71,6 +75,8 @@ struct Bubble: View {
         } else if entry.file != nil {
             FileContent(entry: entry, caption: entry.text, compact: false, revealed: revealed.contains(ChatItem.key(entry)),
                         onReveal: { onReveal(entry) }, onOpen: onOpen)
+        } else if let card = entry.card {
+            CardContent(card: card, out: out, onOpen: { onCard(entry) }, onAdd: onAddContact)
         } else if let poll = entry.poll {
             pollView(poll)
         } else if let list = entry.list {

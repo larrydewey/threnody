@@ -7,6 +7,7 @@ mod autostart;
 mod backup;
 mod call;
 mod camera;
+mod cards;
 mod chat;
 mod clip;
 mod core;

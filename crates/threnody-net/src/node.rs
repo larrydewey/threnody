@@ -3368,6 +3368,7 @@ mod tests {
             quote: None,
             forwarded: false,
             preview: None,
+            card: None,
         };
 
         // A peer whose fresh Hello lacks the bit (an older build, say):

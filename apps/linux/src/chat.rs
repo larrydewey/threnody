@@ -540,9 +540,9 @@ impl ChatView {
             send.add_controller(hold);
         }
         let weak = Rc::downgrade(&this);
-        attach.connect_clicked(move |_| {
+        attach.connect_clicked(move |b| {
             if let Some(t) = weak.upgrade() {
-                t.pick_files();
+                t.attach_menu(b);
             }
         });
         let weak = Rc::downgrade(&this);
@@ -1697,7 +1697,9 @@ impl ChatView {
         if let Some(q) = &e.quote {
             bubble.append(&self.quote_view(q));
         }
-        if let (Some(p), None) = (&e.poll, &e.file) {
+        if let (Some(c), None) = (&e.card, &e.file) {
+            bubble.append(&self.card_view(e, c));
+        } else if let (Some(p), None) = (&e.poll, &e.file) {
             let q = ui::label(&e.text, &["message-text", "heading"]);
             q.set_selectable(true);
             q.set_max_width_chars(60);
@@ -2659,7 +2661,7 @@ impl ChatView {
                 }),
             );
         }
-        if e.poll.is_none() {
+        if e.poll.is_none() && !e.card.as_ref().is_some_and(|c| c.no_forward) {
             let (weak, entries) = (self.weak_self.clone(), run.to_vec());
             item(
                 "Forward",
@@ -2676,7 +2678,7 @@ impl ChatView {
         }
         // Notes have no one to edit or delete for.
         let group = self.group().is_some() || self.is_note();
-        if e.outgoing && e.file.is_none() && e.id != 0 && !group {
+        if e.outgoing && e.file.is_none() && e.card.is_none() && e.id != 0 && !group {
             let (weak, entry) = (self.weak_self.clone(), e.clone());
             item(
                 "Edit",
@@ -3812,6 +3814,222 @@ impl ChatView {
                 match kept {
                     Ok(path) => t.confirm_files(vec![path.into()], String::new(), false),
                     Err(e) => t.toast(&format!("Couldn't get the GIF: {e}")),
+                }
+            },
+        );
+    }
+
+    /// What the attach button offers: files, or a card (Appendix V).
+    fn attach_menu(self: &Rc<Self>, anchor: &gtk::Button) {
+        let pop = gtk::Popover::new();
+        pop.set_parent(anchor);
+        pop.set_has_arrow(false);
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        type Item<'a> = (&'a str, fn(&Rc<ChatView>));
+        let mut items: Vec<Item> = vec![
+            ("Photos or files…", Self::pick_files),
+            ("Contact…", Self::share_contact),
+            ("Location…", |t| {
+                let w = t.window();
+                let weak = t.weak_self.clone();
+                crate::cards::compose_location(&w, move |c| {
+                    if let Some(t) = weak.upgrade() {
+                        t.send_card(c);
+                    }
+                });
+            }),
+            ("Event…", |t| {
+                let w = t.window();
+                let weak = t.weak_self.clone();
+                crate::cards::compose_event(&w, move |c| {
+                    if let Some(t) = weak.upgrade() {
+                        t.send_card(c);
+                    }
+                });
+            }),
+            ("Wi-Fi network…", |t| {
+                let w = t.window();
+                let weak = t.weak_self.clone();
+                crate::cards::compose_wifi(&w, move |c| {
+                    if let Some(t) = weak.upgrade() {
+                        t.send_card(c);
+                    }
+                });
+            }),
+        ];
+        // Secrets go to one person (or our own notes), never a group.
+        if self.group().is_none() {
+            items.push(("Login…", |t| t.compose_secret("login")));
+            items.push(("Payment card…", |t| t.compose_secret("card")));
+            items.push(("Secure note…", |t| t.compose_secret("note")));
+        }
+        for (label, f) in items {
+            let btn = gtk::Button::with_label(label);
+            btn.add_css_class("flat");
+            if let Some(l) = btn.child().and_downcast::<gtk::Label>() {
+                l.set_xalign(0.0);
+            }
+            let (weak, p) = (self.weak_self.clone(), pop.clone());
+            btn.connect_clicked(move |_| {
+                p.popdown();
+                if let Some(t) = weak.upgrade() {
+                    f(&t);
+                }
+            });
+            b.append(&btn);
+        }
+        pop.set_child(Some(&b));
+        pop.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        pop.popup();
+    }
+
+    fn window(&self) -> adw::ApplicationWindow {
+        self.app
+            .upgrade()
+            .map(|a| a.window.clone())
+            .unwrap_or_default()
+    }
+
+    fn compose_secret(self: &Rc<Self>, kind: &'static str) {
+        let w = self.window();
+        let weak = self.weak_self.clone();
+        crate::cards::compose_secret(&w, kind, self.is_note(), move |c| {
+            if let Some(t) = weak.upgrade() {
+                t.send_card(c);
+            }
+        });
+    }
+
+    /// Shares a contact: ourselves (with this identity's invite, and our
+    /// handle if we have one), or one typed in.
+    fn share_contact(self: &Rc<Self>) {
+        let d = ui::alert(
+            "Share a contact",
+            "",
+            &[
+                ("cancel", "Cancel"),
+                ("other", "Someone else"),
+                ("me", "My contact"),
+            ],
+        );
+        let weak = self.weak_self.clone();
+        d.connect_response(None, move |_, r| {
+            let Some(t) = weak.upgrade() else { return };
+            let w = t.window();
+            let send = {
+                let weak = t.weak_self.clone();
+                move |c| {
+                    if let Some(t) = weak.upgrade() {
+                        t.send_card(c);
+                    }
+                }
+            };
+            match r {
+                "other" => {
+                    crate::cards::compose_contact(&w, "", String::new(), String::new(), send)
+                }
+                "me" => {
+                    let (Some(node), Some(app)) = (t.node(), t.app.upgrade()) else {
+                        return;
+                    };
+                    let (core, persona) = (app.core.clone(), t.persona());
+                    ui::bg(
+                        move || {
+                            // This chat's identity: an anonymous one shares
+                            // its own invite, never the main one.
+                            let invite = core.invite(persona.as_deref()).unwrap_or_default();
+                            let name = node
+                                .profile()
+                                .into_iter()
+                                .find(|a| a.key == "name")
+                                .map(|a| a.value)
+                                .unwrap_or_default();
+                            (invite, node.own_handle().unwrap_or_default(), name)
+                        },
+                        move |(invite, handle, name)| {
+                            crate::cards::compose_contact(&w, &name, invite, handle, send);
+                        },
+                    );
+                }
+                _ => {}
+            }
+        });
+        d.present(Some(&self.window()));
+    }
+
+    /// Sends a card here: to the contact, the group, or our notes.
+    fn send_card(self: &Rc<Self>, card: threnody_ffi::CardInfo) {
+        let dest = self.dest();
+        self.run(
+            "send it",
+            move |n| match dest {
+                Dest::Note => n.write_note_card(card),
+                Dest::Group(g) => n.send_group_card(g, card),
+                Dest::Contact(d) => n.send_card(d, card).map(|_| ()),
+            },
+            None,
+        );
+    }
+
+    /// A message's card, with what it can do.
+    fn card_view(&self, e: &HistoryEntry, c: &threnody_ffi::CardInfo) -> gtk::Box {
+        let add: Option<Box<dyn Fn(String)>> = if self.persona().is_none() {
+            let app = self.app.clone();
+            Some(Box::new(move |link| {
+                if let Some(a) = app.upgrade() {
+                    a.connect(link);
+                }
+            }))
+        } else {
+            // Adding them would use our main identity, not this one.
+            None
+        };
+        let (weak, entry) = (self.weak_self.clone(), e.clone());
+        crate::cards::view(
+            &self.window(),
+            c,
+            e.outgoing,
+            crate::cards::Actions {
+                add,
+                open: Box::new(move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.open_card(&entry);
+                    }
+                }),
+            },
+        )
+    }
+
+    /// Shows a card in full; a view-once card is emptied as it opens.
+    fn open_card(self: &Rc<Self>, e: &HistoryEntry) {
+        let Some(node) = self.node() else { return };
+        let (dest, at, dev) = (self.dest(), e.at_ms, e.device.clone());
+        let weak = self.weak_self.clone();
+        ui::bg(
+            move || match dest {
+                Dest::Note => Ok(node.open_note_card(at, dev)),
+                Dest::Group(g) => node.open_group_card(g, at, dev),
+                Dest::Contact(d) => node.open_card(d, at, dev),
+            },
+            move |r| {
+                let (Some(t), Ok(Some(c))) = (weak.upgrade(), r) else {
+                    return;
+                };
+                let app = t.app.clone();
+                let add: Option<Box<dyn Fn(String)>> = t.persona().is_none().then(|| {
+                    Box::new(move |link: String| {
+                        if let Some(a) = app.upgrade() {
+                            a.connect(link);
+                        }
+                    }) as Box<dyn Fn(String)>
+                });
+                crate::cards::show(&t.window(), &c, add);
+                if c.view_once {
+                    let conv = t.conv.borrow().clone();
+                    t.update(conv);
                 }
             },
         );
@@ -5669,6 +5887,7 @@ mod tests {
             list: None,
             tick: threnody_ffi::TickMark::None,
             preview: None,
+            card: None,
         }
     }
 

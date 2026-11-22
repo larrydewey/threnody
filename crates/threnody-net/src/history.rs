@@ -65,6 +65,8 @@ pub struct Extras {
     /// A card for a link in the text (sent only if it fits the text, see
     /// [`LinkPreview::for_text`]).
     pub preview: Option<LinkPreview>,
+    /// A card (Appendix V) the text stands for.
+    pub card: Option<threnody_core::card::Card>,
 }
 
 /// A fresh album id for files sent together.
@@ -331,7 +333,34 @@ impl Node {
         file: Option<FileNote>,
         preview: Option<LinkPreview>,
     ) {
-        let preview = self.sendable_preview(preview, text);
+        self.write_note_card(text, quote, file, preview, None);
+    }
+
+    /// [`Node::write_note_with`], or a note that is a card (Appendix V),
+    /// whose text is then the card's fallback. A card that isn't one is
+    /// dropped.
+    pub fn write_note_card(
+        &self,
+        text: &str,
+        quote: Option<Quote>,
+        file: Option<FileNote>,
+        preview: Option<LinkPreview>,
+        card: Option<threnody_core::card::Card>,
+    ) {
+        // Our own note: nobody to view it once.
+        let card = card
+            .and_then(threnody_core::card::Card::clean)
+            .map(|mut c| {
+                c.flags &= !threnody_core::card::CARD_VIEW_ONCE;
+                c
+            });
+        let fallback = card.as_ref().map(threnody_core::card::Card::fallback_text);
+        let text = fallback.as_deref().unwrap_or(text);
+        let preview = if card.is_some() {
+            None
+        } else {
+            self.sendable_preview(preview, text)
+        };
         let now = now_ms();
         let conv = self.notes();
         self.append(
@@ -362,6 +391,7 @@ impl Node {
                 list: None,
                 ticked_ms: 0,
                 preview,
+                card,
             },
         );
     }
@@ -1047,9 +1077,18 @@ impl Node {
             quote,
             forwarded,
             preview,
+            card,
             ..
         } = extras;
-        let preview = self.sendable_preview(preview, body);
+        let card = self.sendable_card(card, Some(peer))?;
+        // A card's text is what it says to an app without cards.
+        let fallback = card.as_ref().map(threnody_core::card::Card::fallback_text);
+        let body = fallback.as_deref().unwrap_or(body);
+        let preview = if card.is_some() {
+            None
+        } else {
+            self.sendable_preview(preview, body)
+        };
         // Writing to someone accepts them.
         self.accept_contact(peer);
         let conv = self.conversation_for(peer);
@@ -1063,6 +1102,7 @@ impl Node {
             quote: quote.clone(),
             forwarded,
             preview: preview.clone().map(Box::new),
+            card: card.clone().map(Box::new),
         };
         let devices: Vec<PublicIdentity> = match self.account_of(peer) {
             Some(a) if !self.is_own_device(peer) => {
@@ -1116,9 +1156,64 @@ impl Node {
                 list: None,
                 ticked_ms: 0,
                 preview,
+                card: card.as_ref().map(threnody_core::card::Card::sender_copy),
             },
         );
         Ok(r)
+    }
+
+    /// The card of the message in `conv` that `pick` chooses, to show;
+    /// a view-once card from someone else is emptied as it opens (see
+    /// [`threnody_core::store::Home::open_card`]).
+    pub fn open_card(
+        &self,
+        conv: ConversationId,
+        pick: impl Fn(&Entry) -> bool,
+    ) -> Option<threnody_core::card::Card> {
+        self.shared
+            .home
+            .open_card(self.identity_ref(), conv, now_ms(), pick)
+            .ok()
+            .flatten()
+    }
+
+    /// A card (Appendix V) ready to send: cleaned up, or refused if it
+    /// would go as plain text, or stay, where it must not: a secret or a
+    /// view-once card goes only to a contact whose every device shows
+    /// cards (`to`), never to a group (`to` None).
+    pub fn sendable_card(
+        &self,
+        card: Option<threnody_core::card::Card>,
+        to: Option<&PublicIdentity>,
+    ) -> Result<Option<threnody_core::card::Card>> {
+        let Some(card) = card else {
+            return Ok(None);
+        };
+        let card = card
+            .clean()
+            .ok_or_else(|| NetError::NotAllowed("that card is empty or malformed".into()))?;
+        if card.needs_cards() {
+            let Some(peer) = to else {
+                return Err(NetError::NotAllowed(
+                    "secrets and view-once cards go to one person, not a group".into(),
+                ));
+            };
+            let devices: Vec<PublicIdentity> = match self.account_of(peer) {
+                Some(a) if !self.is_own_device(peer) => {
+                    a.state().devices.iter().map(|(d, _)| *d).collect()
+                }
+                _ => vec![*peer],
+            };
+            if !devices
+                .iter()
+                .all(|d| self.known_to_support(d, threnody_core::message::FEATURE_CARDS))
+            {
+                return Err(NetError::NotAllowed(
+                    "their app can't open this yet: it needs updating".into(),
+                ));
+            }
+        }
+        Ok(Some(card))
     }
 
     /// A link card ready to send with `body`: only if it fits the text
@@ -1441,13 +1536,24 @@ impl Node {
             self.unarchive(conv);
         }
         let now = now_ms();
+        // A card with a time of its own goes then, or with the chat's
+        // timer if that comes first.
+        let card_expiry = extras
+            .card
+            .as_ref()
+            .filter(|c| c.expires_in_s != 0)
+            .map(|c| now + u64::from(c.expires_in_s) * 1000);
+        let expires_at_ms = match (timer.map(|s| now + u64::from(s) * 1000), card_expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let entry = Entry {
             at_ms: now,
             outgoing,
             device,
             text: text.to_owned(),
             offline,
-            expires_at_ms: timer.map(|s| now + u64::from(s) * 1000),
+            expires_at_ms,
             file: None,
             local_id: 0,
             delivered: false,
@@ -1464,6 +1570,7 @@ impl Node {
             list: None,
             ticked_ms: 0,
             preview: extras.preview,
+            card: extras.card,
         };
         if let Err(e) = self
             .shared
@@ -1546,6 +1653,7 @@ impl Node {
             list: None,
             ticked_ms: if received { now } else { 0 },
             preview: None,
+            card: None,
         };
         let received = received.then(|| entry.clone());
         self.append(conv, entry);
@@ -1613,6 +1721,7 @@ impl Node {
             quote,
             forwarded,
             preview,
+            card,
             ..
         } = msg
         else {
@@ -1665,6 +1774,7 @@ impl Node {
                 quote: quote.clone(),
                 forwarded: *forwarded,
                 preview: preview.as_deref().cloned(),
+                card: card.as_deref().cloned(),
                 ..Extras::default()
             },
         );

@@ -394,6 +394,9 @@ pub enum Content {
         /// The sender's card for a link in `text`; receivers keep it only
         /// if `LinkPreview::for_text` does.
         preview: Option<LinkPreview>,
+        /// A card (Appendix V) the text stands for; receivers keep it only
+        /// if `Card::clean` does.
+        card: Option<Box<threnody_core::card::Card>>,
     },
     File {
         name: String,
@@ -453,6 +456,7 @@ impl Content {
                 mentions,
                 forwarded: false,
                 preview: None,
+                card: None,
             } if mentions.is_empty() => return Ok(text.as_bytes().to_vec()),
             Self::Text {
                 text,
@@ -520,6 +524,10 @@ impl Content {
             } => Some(p.encode()?),
             _ => None,
         };
+        let card = match self {
+            Self::Text { card: Some(c), .. } => Some(c.encode()?),
+            _ => None,
+        };
         let size = text.len()
             + data.map_or(0, <[u8]>::len)
             + caption.len()
@@ -528,6 +536,7 @@ impl Content {
             + options.iter().map(|o| o.len() + 4).sum::<usize>()
             + choices.len() * 5
             + preview.as_ref().map_or(0, |p| p.len() + 8)
+            + card.as_ref().map_or(0, |c| c.len() + 8)
             + 48;
         let body = cbor::to_vec(size, |e| {
             e.map_len(
@@ -541,7 +550,8 @@ impl Content {
                     + usize::from(!mentions.is_empty())
                     + usize::from(!options.is_empty())
                     + usize::from(!choices.is_empty())
-                    + usize::from(preview.is_some()),
+                    + usize::from(preview.is_some())
+                    + usize::from(card.is_some()),
             )?;
             e.u8(0)?.u8(kind)?;
             e.u8(1)?.str(text)?;
@@ -589,6 +599,9 @@ impl Content {
             if let Some(p) = &preview {
                 e.u8(14)?.bytes(p)?;
             }
+            if let Some(c) = &card {
+                e.u8(15)?.bytes(c)?;
+            }
             Ok(())
         })?;
         let mut out = Vec::with_capacity(body.len() + 1);
@@ -606,6 +619,7 @@ impl Content {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             });
         };
         let mut dec = Decoder::new(rest);
@@ -616,6 +630,7 @@ impl Content {
         let mut mentions = Vec::new();
         let (mut options, mut choices) = (Vec::new(), Vec::new());
         let mut preview = None;
+        let mut card = None;
         read_map(&mut dec, |k, d| {
             match k {
                 0 => kind = Some(d.u8()?),
@@ -630,6 +645,7 @@ impl Content {
                 9 => quote_author = Some(cbor::fixed_bytes::<32>(d)?),
                 10 => quote_text = Some(d.str()?.to_owned()),
                 14 => preview = Some(d.bytes()?.to_vec()),
+                15 => card = Some(d.bytes()?.to_vec()),
                 12 => {
                     for _ in 0..d.array_len()? {
                         let o = d.str()?.to_owned();
@@ -665,6 +681,10 @@ impl Content {
         finish(&dec)?;
         Ok(match required(kind, "content kind")? {
             1 => Self::Text {
+                card: card
+                    .and_then(|c| threnody_core::card::Card::decode(&c).ok())
+                    .and_then(threnody_core::card::Card::clean)
+                    .map(Box::new),
                 // A card that doesn't decode or fit the text is dropped.
                 preview: preview
                     .and_then(|p| LinkPreview::decode(&p).ok())
@@ -737,6 +757,7 @@ mod tests {
             mentions: Vec::new(),
             forwarded: false,
             preview,
+            card: None,
         };
         let m = text(Some(card.clone()));
         assert_eq!(Content::decode(&m.encode().unwrap()).unwrap(), m);
@@ -760,6 +781,7 @@ mod tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             Content::Text {
                 text: String::new(),
@@ -768,6 +790,7 @@ mod tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             Content::Text {
                 text: "with an id".into(),
@@ -776,6 +799,7 @@ mod tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             Content::Text {
                 text: "a reply".into(),
@@ -784,6 +808,7 @@ mod tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             Content::Text {
                 text: "@Bo and @Al".into(),
@@ -803,6 +828,7 @@ mod tests {
                 ],
                 forwarded: false,
                 preview: None,
+                card: None,
             },
             Content::React {
                 id: 42,
@@ -878,6 +904,7 @@ mod tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             }
         );
         // A tagged text, as a later sender might write it.
@@ -891,6 +918,7 @@ mod tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 preview: None,
+                card: None,
             }
         );
         assert!(Content::decode(&[TAGGED, 0xa1, 0, 9]).is_err());

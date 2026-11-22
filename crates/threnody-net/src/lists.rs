@@ -442,6 +442,7 @@ impl Node {
                 list: Some(l.id),
                 ticked_ms: 0,
                 preview: None,
+                card: None,
             },
         );
     }

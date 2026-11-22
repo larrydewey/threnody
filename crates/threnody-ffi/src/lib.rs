@@ -26,6 +26,11 @@ pub use applock::{
     set_lock_policy, unlock_app, wipe_home,
 };
 mod calls;
+mod cards;
+pub use cards::{
+    CardInfo, CardItemInfo, SecretFieldInfo, card_brand, card_number_valid, card_text,
+    format_card_expiry, format_card_number,
+};
 mod folders;
 mod lists;
 mod media;
@@ -250,6 +255,11 @@ pub struct HistoryEntry {
     /// The sender's card for a link in `text`.
     #[uniffi(default = None)]
     pub preview: Option<LinkPreviewInfo>,
+    /// A card the message stands for (Appendix V); `text` is what it says
+    /// to an app without cards. A view-once card from someone else comes
+    /// without its contents (`opened` false): `open_card` gives them.
+    #[uniffi(default = None)]
+    pub card: Option<CardInfo>,
 }
 
 /// The ticks an outgoing message shows, weakest first (so the weakest
@@ -1238,6 +1248,7 @@ fn history_entries(
         .map(|e| HistoryEntry {
             tick: tick_mark(e, this_device),
             preview: e.preview.clone().map(Into::into),
+            card: e.card.as_ref().map(|c| cards::shown(c, e.outgoing)),
             forwarded: e.forwarded || e.file.as_ref().is_some_and(|f| f.forwarded),
             list: e.list.as_ref().map(lists::list_hex),
             poll: e.poll.as_ref().map(|p| {
@@ -3600,6 +3611,7 @@ mod tests {
             list: None,
             ticked_ms: 0,
             preview: None,
+            card: None,
         }
     }
 
@@ -4646,6 +4658,123 @@ mod tests {
         let q = reply.quote.unwrap();
         assert_eq!(q.text, "call the plumber");
         assert_eq!(q.id, theirs.id, "still points at the whole message");
+    }
+
+    #[test]
+    fn cards_arrive_whole_and_secrets_open_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        let alice = ThrenodyNode::open(path("a"), None, None).unwrap();
+        let addr = alice.listen("127.0.0.1:0".into()).unwrap();
+        let bob = ThrenodyNode::open(path("b"), None, None).unwrap();
+        let a_fp = bob.connect(alice.invite_link(addr)).unwrap();
+        let b_fp = bob.device_fingerprint();
+        wait(&alice, |e| matches!(e, NodeEvent::Connected { .. }));
+        alice.set_approval(b_fp.clone(), true).unwrap();
+        bob.set_approval(a_fp.clone(), true).unwrap();
+        wait(&bob, |e| {
+            matches!(e, NodeEvent::ApprovalChanged { mutual: true, .. })
+        });
+        let wifi = CardInfo {
+            item: CardItemInfo::Wifi {
+                ssid: "Home".into(),
+                password: "correct horse".into(),
+                security: "wpa".into(),
+                hidden: false,
+            },
+            view_once: false,
+            no_forward: false,
+            opened: false,
+            expires_in_s: 0,
+        };
+        alice.send_card(b_fp.clone(), wifi.clone()).unwrap();
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        let got = bob.history(a_fp.clone(), 10).unwrap().pop().unwrap();
+        assert_eq!(got.card, Some(wifi));
+        assert!(got.text.contains("Wi-Fi: Home"), "{}", got.text);
+
+        let secret = CardInfo {
+            item: CardItemInfo::Secret {
+                kind: "login".into(),
+                title: "Bank".into(),
+                fields: vec![
+                    SecretFieldInfo {
+                        name: "username".into(),
+                        value: "ada".into(),
+                        hidden: false,
+                    },
+                    SecretFieldInfo {
+                        name: "password".into(),
+                        value: "hunter2".into(),
+                        hidden: true,
+                    },
+                ],
+                source: "symbolon".into(),
+            },
+            view_once: true,
+            no_forward: false,
+            opened: false,
+            expires_in_s: 3600,
+        };
+        alice.send_card(b_fp.clone(), secret.clone()).unwrap();
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        let got = bob.history(a_fp.clone(), 10).unwrap().pop().unwrap();
+        assert!(got.disappearing, "goes after an hour");
+        assert!(!got.text.contains("hunter2"));
+        let shown = got.card.clone().unwrap();
+        assert!(shown.view_once && !shown.opened && shown.no_forward);
+        assert!(
+            matches!(&shown.item, CardItemInfo::Secret { fields, .. } if fields.is_empty()),
+            "history keeps its contents for opening"
+        );
+        let opened = bob
+            .open_card(a_fp.clone(), got.at_ms, got.device.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            opened,
+            CardInfo {
+                no_forward: true,
+                ..secret
+            }
+        );
+        let again = bob
+            .open_card(a_fp.clone(), got.at_ms, got.device)
+            .unwrap()
+            .unwrap();
+        assert!(again.opened);
+        assert!(matches!(again.item, CardItemInfo::Secret { fields, .. } if fields.is_empty()));
+        // Alice's own copy says what she sent, not what it held.
+        let mine = alice.history(b_fp, 10).unwrap().pop().unwrap();
+        let mine = mine.card.unwrap();
+        assert!(mine.opened);
+        assert!(
+            matches!(mine.item, CardItemInfo::Secret { title, fields, .. } if title == "Bank" && fields.is_empty())
+        );
+        // Not to a group.
+        let g = alice.create_group("g".into()).unwrap();
+        let mut secret_again = opened_secret();
+        secret_again.view_once = false;
+        assert!(alice.send_group_card(g, secret_again).is_err());
+    }
+
+    fn opened_secret() -> CardInfo {
+        CardInfo {
+            item: CardItemInfo::Secret {
+                kind: "note".into(),
+                title: "Alarm".into(),
+                fields: vec![SecretFieldInfo {
+                    name: "pin".into(),
+                    value: "1234".into(),
+                    hidden: true,
+                }],
+                source: String::new(),
+            },
+            view_once: false,
+            no_forward: false,
+            opened: false,
+            expires_in_s: 0,
+        }
     }
 
     #[test]

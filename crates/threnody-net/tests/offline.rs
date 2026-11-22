@@ -87,6 +87,7 @@ fn text(s: &str) -> AppMessage {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     }
 }
 
@@ -904,6 +905,7 @@ async fn a_text_that_comes_twice_shows_once() {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     };
     a.node.send_offline(&bid, &twice).unwrap();
     a.node.send_offline(&bid, &text("after")).unwrap();

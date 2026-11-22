@@ -62,6 +62,11 @@ struct ChatView: View {
     @State private var replyPart: String?
     /// A message shown with its text selectable, to copy or quote a part.
     @State private var selecting: Reacting?
+    /// A card shown in full, and the kind of card being made.
+    @State private var shownCard: ShownCard?
+    @State private var composingCard: CardKind?
+    @State private var myInvite = ""
+    @State private var myHandle = ""
     @State private var editing: HistoryEntry?
     @State private var editText = ""
     @State private var deleting: Deleting?
@@ -230,6 +235,12 @@ struct ChatView: View {
                 focused = true
             }
         }
+        .sheet(item: $shownCard) { s in
+            CardDetailSheet(card: s.card, onAdd: ref.persona == nil ? { link in addContact(link) } : nil)
+        }
+        .sheet(item: $composingCard) { kind in
+            CardComposer(kind: kind, invite: myInvite, handle: myHandle) { card in sendCard(card) }
+        }
         .photosPicker(isPresented: $pickingPhotos, selection: $photoItems, maxSelectionCount: 10,
                       matching: .images, preferredItemEncoding: .current)
         .onChange(of: photoItems) { _, items in
@@ -354,7 +365,9 @@ struct ChatView: View {
             onReact: { reaction in
                 guard let t = target, t.canReact(e) else { return }
                 toggle(e, reaction.emoji, add: !reaction.mine)
-            }
+            },
+            onCard: { openCard($0) },
+            onAddContact: ref.persona == nil ? { link in addContact(link) } : nil
         )
         .contextMenu { menu(item) }
     }
@@ -383,7 +396,7 @@ struct ChatView: View {
                 UIPasteboard.general.setItems([[UTType.plainText.identifier: e.text]], options: [.localOnly: true])
             }
         }
-        if mine && e.file == nil && e.poll == nil {
+        if mine && e.file == nil && e.poll == nil && e.card == nil {
             Button("Edit", systemImage: "pencil") {
                 editText = e.text
                 editing = e
@@ -534,6 +547,19 @@ struct ChatView: View {
             Menu {
                 Button("Photos", systemImage: "photo.on.rectangle") { pickingPhotos = true }
                 Button("File", systemImage: "doc") { pickingFiles = true }
+                Menu("Card", systemImage: "rectangle.on.rectangle") {
+                    Button("My Contact", systemImage: "person.crop.circle") { shareMyContact() }
+                    Button("Contact", systemImage: "person") { composingCard = .contact }
+                    Button("Location", systemImage: "mappin") { composingCard = .location }
+                    Button("Event", systemImage: "calendar") { composingCard = .event }
+                    Button("Wi-Fi Network", systemImage: "wifi") { composingCard = .wifi }
+                    // Secrets go to one person (or our own notes), never a group.
+                    if !ref.isGroup {
+                        Button("Login", systemImage: "key") { composingCard = .login }
+                        Button("Payment Card", systemImage: "creditcard") { composingCard = .paymentCard }
+                        Button("Secure Note", systemImage: "lock") { composingCard = .note }
+                    }
+                }
             } label: {
                 Image(systemName: sending ? "hourglass" : "paperclip").font(.system(size: 22))
             }
@@ -886,6 +912,46 @@ struct ChatView: View {
         Task.detached { try? n.setTyping(peer: d, active: on) }
     }
 
+    // MARK: Cards
+
+    private func sendCard(_ card: CardInfo) {
+        guard let t = target else { return }
+        Task {
+            do {
+                if let warning = try await offMain({ try t.sendCard(card) }) { failure = warning }
+            } catch {
+                failure = error.localizedDescription
+            }
+            store.refresh()
+            await load()
+        }
+    }
+
+    private func openCard(_ e: HistoryEntry) {
+        guard let t = target else { return }
+        Task {
+            guard let c = try? await offMain({ try t.openCard(e) }) else { return }
+            shownCard = ShownCard(card: c)
+            if c.viewOnce { await load() }
+        }
+    }
+
+    private func addContact(_ link: String) {
+        act { _ = try $0.connect(target: link) }
+    }
+
+    /// Our own contact card: this identity's invite (and handle, if any).
+    private func shareMyContact() {
+        guard let n = node else { return }
+        Task {
+            let mine = try? await offMain { (n.inviteLink(addr: ""), n.ownHandle() ?? "") }
+            let (invite, handle) = mine ?? ("", "")
+            myInvite = invite
+            myHandle = handle
+            composingCard = .myContact
+        }
+    }
+
     private func act(_ f: @escaping @Sendable (ThrenodyNode) throws -> Void) {
         guard let n = node else { return }
         Task {
@@ -945,7 +1011,6 @@ enum Emoji {
     }
 }
 
-/// A message to react to with any emoji.
 /// A message's text, any part of which can be selected to copy, or (with
 /// `canQuote`) to reply quoting just that part: *Quote* in the selection's
 /// menu.
@@ -1014,6 +1079,13 @@ private struct SelectableText: UIViewRepresentable {
     }
 }
 
+/// A card opened to be shown in full.
+private struct ShownCard: Identifiable {
+    let card: CardInfo
+    let id = UUID()
+}
+
+/// A message to react to with any emoji.
 private struct Reacting: Identifiable {
     let entry: HistoryEntry
     var id: String { ChatItem.key(entry) }

@@ -67,6 +67,7 @@ fn text(s: &str) -> AppMessage {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     }
 }
 

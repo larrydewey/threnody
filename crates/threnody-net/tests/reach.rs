@@ -50,6 +50,7 @@ fn text(body: &str) -> AppMessage {
         quote: None,
         forwarded: false,
         preview: None,
+        card: None,
     }
 }
 
