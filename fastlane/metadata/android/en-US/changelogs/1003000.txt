@@ -1,0 +1,5 @@
+- Send files too large for one message: they arrive as an offer, with a thumbnail, and download when you tap.
+- Select part of a message to copy it, or reply quoting just that part.
+- Cards: share a contact, Wi-Fi network, place, event or payment card as a message; secrets can be view-once.
+- A calmer, clearer look: tidier chat list, day headings, readable status, rounder dialogs.
+- Fixed: a ringback tone or answer could be lost when the other side answered very quickly.
