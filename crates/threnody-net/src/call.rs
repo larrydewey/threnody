@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use threnody_core::call::{self, CallMsg, HangupReason, MediaKeys};
 use threnody_core::crypto::random_bytes;
-use threnody_core::history::Entry;
 use threnody_core::message::FEATURE_CALLS;
 use threnody_core::notice::{CallOutcome, Notice};
 use threnody_core::{AppMessage, PublicIdentity, now_ms};
@@ -809,34 +808,12 @@ impl Node {
             outcome,
             duration_s,
         };
-        let now = now_ms();
-        let entry = Entry {
-            at_ms: now,
-            outgoing,
-            device: if outgoing {
-                *self.identity().as_bytes()
-            } else {
-                *peer.as_bytes()
-            },
-            text: notice.text(outgoing),
-            notice: Some(notice),
-            ..Entry::blank()
+        let device = if outgoing {
+            *self.identity().as_bytes()
+        } else {
+            *peer.as_bytes()
         };
-        if self
-            .shared
-            .home
-            .append_history(self.identity_ref(), conv, entry.clone(), now)
-            .is_err()
-        {
-            return;
-        }
-        if outgoing {
-            self.push_entry(conv, &entry);
-        }
-        self.emit(Event::HistorySynced {
-            from: *peer,
-            added: 1,
-        });
+        self.add_notice(conv, outgoing, device, notice);
     }
 
     /// Tells `devices` call `id` is over for them. Tracked: if the session

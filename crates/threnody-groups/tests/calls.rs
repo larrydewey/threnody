@@ -80,7 +80,14 @@ impl N {
     fn texts(&self, group: &threnody_groups::GroupId) -> Vec<String> {
         self.node
             .history(ConversationId::Group(*group))
-            .map(|h| h.entries().iter().map(|e| e.text.clone()).collect())
+            // The messages, not notices of who joined.
+            .map(|h| {
+                h.entries()
+                    .iter()
+                    .filter(|e| e.notice.is_none())
+                    .map(|e| e.text.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

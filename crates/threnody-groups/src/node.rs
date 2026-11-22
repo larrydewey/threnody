@@ -18,6 +18,7 @@
 use threnody_core::call::GroupCallMsg;
 use threnody_core::history::{ConversationId, Entry, FileNote, MAX_POLL_QUESTION, Poll};
 use threnody_core::message::{Clip, Mention, Quote};
+use threnody_core::notice::{MemberChange, Notice};
 use threnody_core::store::Home;
 use threnody_core::{AppMessage, Identity, PublicIdentity};
 use threnody_net::history::{Extras, OutgoingFile};
@@ -2360,6 +2361,8 @@ impl GroupNode {
                     self.expected.retain(|(g, _)| *g != group);
                     self.save_expected();
                 }
+                let me = *node.identity().as_bytes();
+                note_member(node, &group, MemberChange::Joined, me, Some(owner));
                 Update::Joined { group, name, owner }
             }
             GroupEvent::InviteRequested { group, name, peer } => {
@@ -2461,6 +2464,10 @@ impl GroupNode {
                 if let Some(by) = by {
                     self.sibling_role(node, &group, &member, &by, &mut extra);
                 }
+                // Our own device joining is no news in the chat.
+                if !node.is_own_device(&member) {
+                    note_member(node, &group, MemberChange::Added, *member.as_bytes(), by);
+                }
                 Update::MemberAdded { group, member, by }
             }
             GroupEvent::MemberRemoved { group, member, by } => {
@@ -2469,6 +2476,14 @@ impl GroupNode {
                 if node.is_own_device(&member) && !self.offered.contains(&(member, group)) {
                     self.offered.push((member, group));
                     self.save_offered();
+                }
+                if !node.is_own_device(&member) {
+                    let change = if by == Some(member) {
+                        MemberChange::Left
+                    } else {
+                        MemberChange::Removed
+                    };
+                    note_member(node, &group, change, *member.as_bytes(), by);
                 }
                 Update::MemberRemoved { group, member, by }
             }
@@ -2501,6 +2516,20 @@ impl GroupNode {
                 if role == MemberRole::Member {
                     self.mirror_step_down(node, &group, &member, &mut extra);
                 }
+                let role_n = match role {
+                    MemberRole::Owner => 0,
+                    MemberRole::Admin => 1,
+                    MemberRole::Member => 2,
+                };
+                node.add_notice(
+                    ConversationId::Group(group),
+                    false,
+                    *member.as_bytes(),
+                    Notice::Role {
+                        member: *member.as_bytes(),
+                        role: role_n,
+                    },
+                );
                 Update::RoleChanged {
                     group,
                     member,
@@ -3066,6 +3095,25 @@ fn decode_held(b: &[u8]) -> Vec<Held> {
         }
     }
     out
+}
+
+/// Notes in `group`'s chat that `member` joined, left, or was added or
+/// removed (`by` whom). Ours (made by one of our devices) count as sent by us.
+fn note_member(
+    node: &Node,
+    group: &GroupId,
+    change: MemberChange,
+    member: [u8; 32],
+    by: Option<PublicIdentity>,
+) {
+    let ours = by.is_some_and(|b| b == node.identity() || node.is_own_device(&b));
+    let device = by.map_or(member, |b| *b.as_bytes());
+    let notice = Notice::Member {
+        change,
+        member,
+        by: by.map(|b| *b.as_bytes()),
+    };
+    node.add_notice(ConversationId::Group(*group), ours, device, notice);
 }
 
 #[cfg(test)]

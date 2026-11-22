@@ -273,11 +273,14 @@ async fn contacts_can_seal_to_a_sibling_they_never_met() {
     let _ = (&mut laptop.rx, &mut phone.rx);
 }
 
+/// The messages in `n`'s chat with `peer` (not notices, such as a new
+/// device of theirs): who sent each, and its text.
 fn texts(n: &Node, peer: &threnody_core::PublicIdentity) -> Vec<(bool, String)> {
     n.history(n.conversation_for(peer))
         .unwrap()
         .entries()
         .iter()
+        .filter(|e| e.notice.is_none())
         .map(|e| (e.outgoing, e.text.clone()))
         .collect()
 }
@@ -1424,14 +1427,17 @@ async fn a_photo_follows_us_to_a_newly_linked_device() {
     phone.node.link_with(&code).await.unwrap();
     wait_for(|| contents(&phone.node, &bid, "IMG_1.png").as_deref() == Some(&photo[..])).await;
     assert_eq!(ls.reads(), 1);
-    assert_eq!(
-        bob.node
-            .history(bob.node.conversation_for(&laptop.node.identity()))
-            .unwrap()
-            .entries(),
-        &bob_before[..],
-        "nothing reaches the contact"
-    );
+    // Bob notes the new device, and nothing more.
+    let bob_now: Vec<_> = bob
+        .node
+        .history(bob.node.conversation_for(&laptop.node.identity()))
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|e| e.notice.is_none())
+        .cloned()
+        .collect();
+    assert_eq!(bob_now, bob_before, "nothing reaches the contact");
     let _ = &mut laptop.rx;
 }
 
