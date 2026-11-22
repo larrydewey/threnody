@@ -356,17 +356,24 @@ fun Activity.emptyState(
     setPadding(dp(Design.xl), dp(Design.xxl), dp(Design.xl), dp(Design.xxl))
     val activity = this@emptyState
     if (iconRes != 0) {
+        // The icon in a soft circle of the accent colour, not a bare grey glyph.
         addView(android.widget.ImageView(activity).apply {
             setImageResource(iconRes)
-            setColorFilter(activity.color(R.color.muted))
-            layoutParams = LinearLayout.LayoutParams(dp(80), dp(80)).apply { bottomMargin = dp(Design.lg) }
+            setColorFilter(activity.color(R.color.accent))
+            scaleType = android.widget.ImageView.ScaleType.CENTER_INSIDE
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor((activity.color(R.color.accent) and 0x00FFFFFF) or 0x1F000000)
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(96), dp(96)).apply { bottomMargin = dp(Design.lg) }
         })
     }
-    addView(label(title, Design.typeTitle, R.color.text, Design.weightBold).apply {
+    addView(label(title, Design.typeTitle, R.color.text, Design.weightBold, maxLines = 2).apply {
         gravity = Gravity.CENTER
         setPadding(0, 0, 0, dp(Design.sm))
     }, matchWrap)
-    addView(label(message, Design.typeBody, R.color.muted).apply {
+    addView(label(message, Design.typeBody, R.color.muted, maxLines = 0).apply {
         gravity = Gravity.CENTER
         setPadding(0, 0, 0, dp(Design.lg))
     }, matchWrap)

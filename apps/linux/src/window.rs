@@ -167,11 +167,9 @@ impl App {
         let search_bar = gtk::SearchBar::builder().child(&search_entry).build();
         search_bar.connect_entry(&search_entry);
 
+        // Search, New and the menu: the rest is a click away in those, so
+        // the title has room.
         let header = adw::HeaderBar::new();
-        let invite = gtk::Button::from_icon_name("threnody-qr-symbolic");
-        invite.set_tooltip_text(Some("My invite"));
-        invite.set_action_name(Some("win.invite"));
-        header.pack_start(&invite);
         let search = gtk::ToggleButton::builder()
             .icon_name("system-search-symbolic")
             .tooltip_text("Search all messages (Ctrl+Shift+F)")
@@ -184,6 +182,7 @@ impl App {
         header.pack_start(&search);
 
         let add_menu = gio::Menu::new();
+        add_menu.append(Some("My invite"), Some("win.invite"));
         add_menu.append(Some("Add a contact"), Some("win.add-contact"));
         add_menu.append(Some("Scan a QR code"), Some("win.scan"));
         add_menu.append(Some("New group"), Some("win.new-group"));
@@ -196,6 +195,7 @@ impl App {
 
         let main_menu = gio::Menu::new();
         let s1 = gio::Menu::new();
+        s1.append(Some("Lists"), Some("win.lists"));
         s1.append(Some("Your profile"), Some("win.profile"));
         s1.append(Some("Anonymous identities"), Some("win.personas"));
         s1.append(Some("Credentials"), Some("win.credentials"));
@@ -223,9 +223,6 @@ impl App {
             .build();
         header.pack_end(&menu_button);
         header.pack_end(&add_button);
-        let lists_button = gtk::Button::from_icon_name("view-list-bullet-symbolic");
-        lists_button.set_tooltip_text(Some("Lists"));
-        header.pack_start(&lists_button);
 
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&header);
@@ -314,12 +311,6 @@ impl App {
         this.watch_window();
         this.watch_network();
 
-        let weak = Rc::downgrade(&this);
-        lists_button.connect_clicked(move |_| {
-            if let Some(this) = weak.upgrade() {
-                this.open_lists(None);
-            }
-        });
         let weak = Rc::downgrade(&this);
         this.list.connect_row_selected(move |_, row| {
             let (Some(this), Some(row)) = (weak.upgrade(), row) else {
@@ -2263,6 +2254,7 @@ impl App {
             self.window.add_action(&a);
         };
         add("invite", |t| t.show_invite(None));
+        add("lists", |t| t.open_lists(None));
         add("add-contact", |t| t.add_contact(""));
         add("scan", Self::scan);
         add("new-group", |t| t.new_group(None));

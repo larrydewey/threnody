@@ -338,7 +338,7 @@ class ListActivity : Activity() {
         content.removeAllViews()
         if (l.items.isEmpty()) {
             content.addView(label("Nothing here yet. Add items below, or paste a markdown list from the menu.",
-                Design.typeBodySmall, R.color.muted, Design.weightRegular).apply {
+                Design.typeBodySmall, R.color.muted, Design.weightRegular, maxLines = 0).apply {
                 setPadding(0, dp(24), 0, 0)
                 gravity = Gravity.CENTER
             }, matchWrap)

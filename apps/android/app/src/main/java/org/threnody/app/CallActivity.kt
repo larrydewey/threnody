@@ -86,7 +86,7 @@ class CallActivity : Activity() {
             gravity = Gravity.CENTER
             setShadowLayer(4f, 0f, 1f, Color.BLACK)
         }
-        status = label("", Design.typeSubtitle, R.color.muted).apply {
+        status = label("", Design.typeSubtitle, R.color.muted, maxLines = 0).apply {
             gravity = Gravity.CENTER
             setShadowLayer(4f, 0f, 1f, Color.BLACK)
         }

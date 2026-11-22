@@ -70,7 +70,7 @@ Threading.background {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText("365")
         }
-        v.addView(a.label("You vouch for these. $title can later prove any of them to others, without showing the rest.", 14f, R.color.muted), matchWrap)
+        v.addView(a.label("You vouch for these. $title can later prove any of them to others, without showing the rest.", 14f, R.color.muted, maxLines = 0), matchWrap)
         v.addView(schema, matchWrap)
         v.addView(body, matchWrap)
         v.addView(days, matchWrap)
@@ -104,7 +104,7 @@ Threading.background {
         val v = box(a)
         val schema = field(a, "Kind, e.g. hackspace/member")
         val keys = field(a, "Attributes, comma-separated (optional)")
-        v.addView(a.label("$title chooses whether to answer, and with what. You learn only what they show.", 14f, R.color.muted), matchWrap)
+        v.addView(a.label("$title chooses whether to answer, and with what. You learn only what they show.", 14f, R.color.muted, maxLines = 0), matchWrap)
         v.addView(schema, matchWrap)
         v.addView(keys, matchWrap)
         SecureBuilder(a)
@@ -174,7 +174,7 @@ Threading.background {
                     return@runOnUiThread
                 }
                 val v = box(a)
-                v.addView(a.label("From your ${ask.schema} credential. Choose what to show; nothing else is revealed.", 14f, R.color.muted), matchWrap)
+                v.addView(a.label("From your ${ask.schema} credential. Choose what to show; nothing else is revealed.", 14f, R.color.muted, maxLines = 0), matchWrap)
                 val group = RadioGroup(a)
                 matching.forEachIndexed { i, c ->
                     group.addView(RadioButton(a).apply {
