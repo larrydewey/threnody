@@ -367,6 +367,7 @@ mod tests {
             tick: TickMark::None,
             preview: None,
             card: None,
+            notice: None,
         }
     }
 

@@ -149,7 +149,7 @@ struct ChatRow: Identifiable, Sendable {
         func row(_ ref: ChatRef, _ title: String, last: HistoryEntry?, conversation: Conversation? = nil,
                  group: GroupInfo? = nil, invite: GroupInvite? = nil) -> ChatRow {
             let key = ref.chatKey
-            let preview = last.map { ($0.outgoing ? "You: " : "") + entryPreview(entry: $0) } ?? ""
+            let preview = last.map { ($0.outgoing && $0.notice == nil ? "You: " : "") + entryPreview(entry: $0) } ?? ""
             return ChatRow(
                 ref: ref, title: title, tag: tag, preview: preview, at: last?.atMs ?? 0,
                 unread: counts[key]?.unread ?? 0, mentions: counts[key]?.mentions ?? 0,
@@ -302,11 +302,11 @@ struct ChatTarget: Sendable {
 
     /// Deletes `entries` here (and, with `everyone`, for the contact too),
     /// and our copies of their files.
-    func delete(_ entries: [HistoryEntry], everyone: Bool) throws {
+    func delete(_ entries: [HistoryEntry], everyone: Bool, noTrace: Bool = false) throws {
         switch ref.target {
         case .contact:
             if entries.allSatisfy({ $0.id != 0 }) {
-                _ = try node.deleteMessages(peer: device, ids: entries.map(\.id), everyone: everyone)
+                _ = try node.deleteMessages(peer: device, ids: entries.map(\.id), everyone: everyone, noTrace: noTrace)
             } else {
                 for e in entries { _ = try node.deleteEntry(peer: device, atMs: e.atMs, device: e.device) }
             }

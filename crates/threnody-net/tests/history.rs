@@ -324,31 +324,88 @@ async fn messages_can_be_deleted_for_me_or_for_everyone() {
     // Both sides know the message by the same id.
     assert_eq!(id_of(&alice, &bob_id, "oops"), id_of(&bob, &a_id, "oops"));
 
-    // For everyone: gone on both sides.
+    // For everyone: a placeholder on both sides, saying who deleted it.
     let oops = id_of(&alice, &bob_id, "oops");
-    assert_eq!(alice.delete_messages(&bob_id, &[oops], true), 1);
+    assert_eq!(alice.delete_messages(&bob_id, &[oops], true, false), 1);
     next(&mut brx, |e| {
         matches!(e, Event::MessagesDeleted { count: 1, .. })
     })
     .await;
-    assert_eq!(texts(&bob, &a_id), ["keep", "also mine"]);
+    assert_eq!(
+        texts(&bob, &a_id),
+        ["keep", "This message was deleted", "also mine"]
+    );
+    assert_eq!(
+        texts(&alice, &bob_id),
+        ["keep", "You deleted this message", "also mine"]
+    );
 
-    // For me: only here.
+    // For me: only here, and without a placeholder.
     let mine = id_of(&alice, &bob_id, "also mine");
-    alice.delete_messages(&bob_id, &[mine], false);
-    assert_eq!(texts(&alice, &bob_id), ["keep"]);
+    alice.delete_messages(&bob_id, &[mine], false, false);
+    assert_eq!(texts(&alice, &bob_id), ["keep", "You deleted this message"]);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(texts(&bob, &a_id), ["keep", "also mine"]);
+    assert_eq!(
+        texts(&bob, &a_id),
+        ["keep", "This message was deleted", "also mine"]
+    );
 
     // Bob can't delete Alice's messages for her.
     let keep = id_of(&bob, &a_id, "keep");
-    bob.delete_messages(&a_id, &[keep], true);
+    bob.delete_messages(&a_id, &[keep], true, false);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(texts(&alice, &bob_id), ["keep"]);
+    assert_eq!(texts(&alice, &bob_id), ["keep", "You deleted this message"]);
     assert!(
         texts(&bob, &a_id).iter().all(|t| t != "keep"),
         "but gone for him"
     );
+}
+
+#[tokio::test]
+async fn without_a_trace_only_where_it_was_not_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, _) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    let texts = |n: &Node, p| -> Vec<String> {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect()
+    };
+    let id_of = |n: &Node, p, t: &str| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| e.text == t)
+            .unwrap()
+            .message_id()
+    };
+    // One Bob looked at, then one he hasn't yet.
+    alice.send_text(&bob_id, "read it").unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    bob.mark_seen(bob.conversation_for(&a_id));
+    alice.send_text(&bob_id, "wrong chat").unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+    let ids = [
+        id_of(&alice, &bob_id, "read it"),
+        id_of(&alice, &bob_id, "wrong chat"),
+    ];
+    assert_eq!(alice.delete_messages(&bob_id, &ids, true, true), 2);
+    next(&mut brx, |e| {
+        matches!(e, Event::MessagesDeleted { count: 2, .. })
+    })
+    .await;
+    // What he saw keeps its placeholder; what he hadn't, leaves no trace.
+    assert_eq!(texts(&bob, &a_id), ["This message was deleted"]);
+    // Alice asked for no trace: none on her side.
+    assert!(texts(&alice, &bob_id).is_empty());
 }
 
 #[tokio::test]
@@ -481,7 +538,7 @@ async fn changes_made_while_the_contact_is_away_reach_it_when_it_returns() {
         assert!(gone.elapsed() < Duration::from_secs(10), "session stayed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(alice.delete_messages(&bob_id, &[secret], true), 1);
+    assert_eq!(alice.delete_messages(&bob_id, &[secret], true, false), 1);
     assert!(alice.edit_message(&bob_id, draft, "final"));
     assert!(alice.pin(&bob_id, pin_me, true));
     assert!(alice.react(&bob_id, pin_me, "👍", true));
@@ -492,7 +549,7 @@ async fn changes_made_while_the_contact_is_away_reach_it_when_it_returns() {
     let texts =
         |n: &Node| -> Vec<String> { entries(n, &a_id).iter().map(|e| e.text.clone()).collect() };
     let start = std::time::Instant::now();
-    while texts(&bob) != ["final", "pin me"]
+    while texts(&bob) != ["This message was deleted", "final", "pin me"]
         || bob.pinned(bob.conversation_for(&a_id)).len() != 1
         || entries(&bob, &a_id)
             .last()

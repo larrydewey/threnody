@@ -25,6 +25,14 @@
   background-color: alpha(currentColor, 0.06);
   color: alpha(currentColor, 0.7);
 }
+/* A notice in the chat (a deleted message, a call): a quiet centred pill. */
+.chat-notice {
+  padding: 4px 12px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.05);
+  color: alpha(currentColor, 0.7);
+}
+
 /* A file's icon on a round tile. */
 .file-tile {
   min-width: 40px;

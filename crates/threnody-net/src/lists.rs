@@ -443,6 +443,7 @@ impl Node {
                 ticked_ms: 0,
                 preview: None,
                 card: None,
+                notice: None,
             },
         );
     }

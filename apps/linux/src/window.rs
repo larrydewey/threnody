@@ -854,7 +854,10 @@ impl App {
         } else if !c.draft.is_empty() {
             format!("Draft: {}", c.draft)
         } else if let Some(e) = &c.last {
-            let who = if e.outgoing {
+            let who = if e.notice.is_some() {
+                // A notice says who in its own words.
+                String::new()
+            } else if e.outgoing {
                 "You: ".into()
             } else if c.group.is_some() {
                 let node = self.core.node(c.chat.persona.as_deref()).ok();

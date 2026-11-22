@@ -123,6 +123,42 @@ pub const FEATURE_LARGE_FILES: u64 = 524288;
 /// The peer shows cards (Appendix V): only such peers get a card that
 /// must not fall back to plain text (a secret, or one viewed once).
 pub const FEATURE_CARDS: u64 = 1_048_576;
+
+/// What a deletion leaves where the messages were (`Delete`'s flags).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Nothing: our own devices' "delete for me", and (read from a peer)
+    /// an older version's "delete for everyone", which counts as `Trace`.
+    #[default]
+    Remove,
+    /// A placeholder, "This message was deleted".
+    Trace,
+    /// Nothing where it hadn't been seen yet; a placeholder where it had.
+    NoTrace,
+}
+
+const DELETE_TRACE: u64 = 1;
+const DELETE_NO_TRACE: u64 = 2;
+
+impl DeleteMode {
+    fn flags(self) -> u64 {
+        match self {
+            Self::Remove => 0,
+            Self::Trace => DELETE_TRACE,
+            Self::NoTrace => DELETE_NO_TRACE,
+        }
+    }
+
+    fn from_flags(flags: u64) -> Self {
+        if flags & DELETE_NO_TRACE != 0 {
+            Self::NoTrace
+        } else if flags & DELETE_TRACE != 0 {
+            Self::Trace
+        } else {
+            Self::Remove
+        }
+    }
+}
 pub const FEATURES: u64 = FEATURE_CARDS
     | FEATURE_ACKS
     | FEATURE_DELETE
@@ -320,6 +356,10 @@ pub enum AppMessage {
     Delete {
         conversation: Vec<u8>,
         ids: Vec<u64>,
+        /// What to leave where they were (flags at key 6; none from older
+        /// versions). From a peer, anything but `NoTrace` leaves the
+        /// placeholder; from our own devices, `Remove` is "delete for me".
+        mode: DeleteMode,
     },
     /// Replace the text of message `id` (the sender's own; or, from one of
     /// our devices, in `conversation`). Only sent to peers whose `Hello`
@@ -482,12 +522,22 @@ impl AppMessage {
                     Ok(())
                 });
             }
-            Self::Delete { conversation, ids } => {
+            Self::Delete {
+                conversation,
+                ids,
+                mode,
+            } => {
                 let packed: Vec<u8> = ids.iter().flat_map(|i| i.to_be_bytes()).collect();
-                return cbor::to_vec(packed.len() + conversation.len() + 24, |e| {
-                    e.map_len(3)?.u8(0)?.uint(kind::DELETE)?;
+                let flags = mode.flags();
+                return cbor::to_vec(packed.len() + conversation.len() + 32, |e| {
+                    e.map_len(3 + usize::from(flags != 0))?
+                        .u8(0)?
+                        .uint(kind::DELETE)?;
                     e.u8(2)?.bytes(&packed)?;
                     e.u8(3)?.bytes(conversation)?;
+                    if flags != 0 {
+                        e.u8(6)?.uint(flags)?;
+                    }
                     Ok(())
                 });
             }
@@ -869,6 +919,7 @@ impl AppMessage {
                         .iter()
                         .map(|c| u64::from_be_bytes(*c))
                         .collect(),
+                    mode: DeleteMode::from_flags(flags),
                 }
             }
             kind::ACK => {
@@ -1225,6 +1276,17 @@ mod tests {
             AppMessage::Delete {
                 conversation: vec![0; 33],
                 ids: vec![7, u64::MAX],
+                mode: DeleteMode::Remove,
+            },
+            AppMessage::Delete {
+                conversation: vec![0; 33],
+                ids: vec![7],
+                mode: DeleteMode::Trace,
+            },
+            AppMessage::Delete {
+                conversation: vec![0; 33],
+                ids: vec![7],
+                mode: DeleteMode::NoTrace,
             },
             AppMessage::Edit {
                 conversation: vec![1; 17],

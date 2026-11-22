@@ -1072,6 +1072,7 @@ mod tests {
             ticked_ms: 0,
             preview: None,
             card: None,
+            notice: None,
         }
     }
 

@@ -311,7 +311,7 @@ class MainActivity : Activity() {
         val contacts = listOf(noteRow) + all.filter { it.accepted }.map { c ->
             val last = try { n.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
             val draft = try { n.draft(c.device) } catch (_: Exception) { "" }
-            Row(c.title, c.key, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { (if (it.outgoing) "You: " else "") + preview(it) } ?: status(c),
+            Row(c.title, c.key, if (draft.isNotEmpty()) "Draft: $draft" else last?.let { (if (it.outgoing && it.notice == null) "You: " else "") + preview(it) } ?: status(c),
                 last?.atMs?.toLong() ?: 0, c.connected,
                 open = { openChat(c.key, c.device) },
                 manage = { manage(n, c.title, c.device, null, c.key) },
@@ -346,7 +346,7 @@ class MainActivity : Activity() {
                 val last = try { p.history(c.device, 1u).lastOrNull() } catch (_: Exception) { null }
                 val what = when {
                     !c.accepted -> "Message request · tap to review"
-                    last != null -> (if (last.outgoing) "You: " else "") + preview(last)
+                    last != null -> (if (last.outgoing && last.notice == null) "You: " else "") + preview(last)
                     else -> status(c)
                 }
                 Row(c.title, c.key, "$tag · $what",

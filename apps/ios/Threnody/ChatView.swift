@@ -40,7 +40,9 @@ struct ChatItem: Identifiable {
 private struct Deleting: Identifiable {
     let entries: [HistoryEntry]
     let everyone: Bool
-    var id: String { (everyone ? "e" : "m") + ChatItem.key(entries[0]) }
+    /// For everyone, leaving no placeholder where it hadn't been seen yet.
+    var noTrace = false
+    var id: String { (noTrace ? "n" : everyone ? "e" : "m") + ChatItem.key(entries[0]) }
 }
 
 /// Files picked to send, before the send sheet.
@@ -294,15 +296,18 @@ struct ChatView: View {
             Text("Goes to \(l.host)\n\n\(l.url)\n\nIt opens in your browser, outside Threnody. The site sees your network address.")
         }
         .confirmationDialog(
-            deleting?.everyone == true ? "Delete for everyone?" : "Delete for you?",
+            deleting?.noTrace == true ? "Delete without a trace?"
+                : deleting?.everyone == true ? "Delete for everyone?" : "Delete for you?",
             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
             titleVisibility: .visible,
             presenting: deleting
         ) { d in
             Button("Delete", role: .destructive) { delete(d) }
         } message: { d in
-            Text(d.everyone
-                ? "Their devices delete it too, if they're running a current version."
+            Text(d.noTrace
+                ? "It goes from their devices without a trace if they haven't seen it yet. If they have, they see \u{201C}This message was deleted\u{201D}."
+                : d.everyone
+                ? "They see \u{201C}This message was deleted\u{201D} in its place."
                 : "It's deleted from this device. Others keep their copies.")
         }
     }
@@ -345,6 +350,16 @@ struct ChatView: View {
     // MARK: Rows
 
     @ViewBuilder private func itemView(_ item: ChatItem) -> some View {
+        if let n = item.first.notice {
+            NoticeLine(entry: item.first, notice: n) {
+                deleting = Deleting(entries: item.entries, everyone: false)
+            }
+        } else {
+            messageView(item)
+        }
+    }
+
+    @ViewBuilder private func messageView(_ item: ChatItem) -> some View {
         let e = item.first
         let fromGroupMember = ref.isGroup && !e.outgoing
         Bubble(
@@ -408,6 +423,9 @@ struct ChatView: View {
         if mine {
             Button("Delete for everyone", systemImage: "trash.fill", role: .destructive) {
                 deleting = Deleting(entries: item.entries, everyone: true)
+            }
+            Button("Delete without a trace", systemImage: "eye.slash", role: .destructive) {
+                deleting = Deleting(entries: item.entries, everyone: true, noTrace: true)
             }
         }
     }
@@ -889,8 +907,12 @@ struct ChatView: View {
         guard let t = target else { return }
         Task {
             do {
-                try await offMain { try t.delete(d.entries, everyone: d.everyone) }
-                if d.everyone { notice = "Deleted. Their devices delete it too, if they're running a current version." }
+                try await offMain { try t.delete(d.entries, everyone: d.everyone, noTrace: d.noTrace) }
+                if d.noTrace {
+                    notice = "Deleted without a trace where it hadn't been seen yet. Anyone who saw it sees “This message was deleted”."
+                } else if d.everyone {
+                    notice = "Deleted. They see “This message was deleted” in its place."
+                }
             } catch {
                 failure = error.localizedDescription
             }
@@ -1260,5 +1282,33 @@ struct ScheduledList: View {
     private struct Editing: Identifiable {
         let item: ScheduledInfo
         var id: UInt64 { item.id }
+    }
+}
+
+/// A notice in the chat (a deleted message's placeholder): a quiet centred
+/// line with its icon; *Remove* in its menu takes it out of this chat.
+private struct NoticeLine: View {
+    let entry: HistoryEntry
+    let notice: NoticeInfo
+    let onRemove: () -> Void
+
+    var body: some View {
+        Label(entry.text, systemImage: icon)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.quaternary.opacity(0.5), in: Capsule())
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .contextMenu {
+                Button("Remove", systemImage: "trash", role: .destructive, action: onRemove)
+            }
+    }
+
+    private var icon: String {
+        switch notice {
+        case .deleted: "trash"
+        }
     }
 }
