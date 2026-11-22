@@ -70,9 +70,8 @@ class MainActivity : Activity() {
         val bar = TopBar(this, null).apply {
             title.text = "Threnody"
             title.setTextAppearance(Design.styleTitleLarge)
+            // Three actions at most: the rest are a tap away in More.
             action(R.drawable.ic_search, "Search messages") { search.open() }
-            action(R.drawable.ic_list, "Lists") { startActivity(Intent(this@MainActivity, ListsActivity::class.java)) }
-            action(R.drawable.ic_qr, "My invite") { showInvite() }
             action(R.drawable.ic_add, "New conversation") { add(it) }
             action(R.drawable.ic_more, "More") { more(it) }
         }
@@ -364,7 +363,8 @@ class MainActivity : Activity() {
         rows = rows.filterIndexed { i, r ->
             !r.isSectionHeader || rows.getOrNull(i + 1)?.let { !it.isSectionHeader } == true
         }
-        if (rows.count { it.isSectionHeader } == 1 && key != Tab.All.name) rows = rows.filter { !it.isSectionHeader }
+        // A lone section needs no heading: the tab already says what it is.
+        if (rows.count { it.isSectionHeader } == 1) rows = rows.filter { !it.isSectionHeader }
         // The archive, at the end of the built-in tabs.
         if (Tab.entries.any { it.name == key }) {
             val t = Tab.valueOf(key)
@@ -736,16 +736,29 @@ class MainActivity : Activity() {
     }
 
     private fun row(r: Row): View {
-        val avatar = Avatar(this, 48).apply { show(r.title, r.avatarKey) }
+        val face = Avatar(this, 52).apply { show(r.title, r.avatarKey) }
+        // Connected: a small green dot on the avatar's corner; nothing otherwise,
+        // so a list of mostly-offline contacts isn't a column of grey dots.
+        val avatar = android.widget.FrameLayout(this).apply {
+            addView(face)
+            if (r.connected == true) addView(View(this@MainActivity).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(color(R.color.online))
+                    setStroke(dp(2), color(R.color.surface))
+                }
+                contentDescription = "connected"
+            }, android.widget.FrameLayout.LayoutParams(dp(14), dp(14), Gravity.BOTTOM or Gravity.END))
+        }
 
-        val title = label(r.title, Design.typeTitle, R.color.text, Design.weightMedium).apply {
+        val title = label(r.title, 17f, R.color.text, Design.weightMedium).apply {
             isSingleLine = true
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
 
         val previewColor = if (r.atMs == Long.MAX_VALUE) R.color.accent else R.color.muted
-        val preview = label("", Design.typeBodySmall, previewColor, Design.weightRegular).apply {
+        val preview = label("", 14f, previewColor, Design.weightRegular).apply {
             text = r.preview
             isSingleLine = true
             maxLines = 1
@@ -755,7 +768,7 @@ class MainActivity : Activity() {
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(title)
-            addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(Design.xs) })
+            addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(2) })
         }
 
         val timeText = (if (r.pinned >= 0) "📌 " else "") + (if (r.atMs in 1 until Long.MAX_VALUE) ago(r.atMs) else "")
@@ -784,22 +797,13 @@ class MainActivity : Activity() {
                     contentDescription = "${r.unread} unread"
                 }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(Design.xs); gravity = Gravity.END })
             }
-            if (r.connected != null) {
-                val dot = View(this@MainActivity).apply {
-                    background = roundedRes(if (r.connected!!) R.color.online else R.color.muted, dp(5).toFloat())
-                    contentDescription = if (r.connected!!) "connected" else "not connected"
-                    setMinimumWidth(dp(8))
-                    setMinimumHeight(dp(8))
-                }
-                addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply { topMargin = dp(Design.xs); gravity = Gravity.END })
-            }
         }
 
         val rowView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(Design.listItemPaddingH), dp(Design.listItemPaddingV), dp(Design.listItemPaddingH), dp(Design.listItemPaddingV))
-            minimumHeight = dp(76)
+            minimumHeight = dp(72)
             background = ripple()
             addView(avatar)
             addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(Design.md); marginEnd = dp(Design.sm) })
@@ -958,6 +962,8 @@ class MainActivity : Activity() {
     /** The main menu: the few things people look for, then Settings. */
     private fun more(anchor: View) {
         PopupMenu(this, anchor).apply {
+            menu.add("My invite").setOnMenuItemClickListener { showInvite(); true }
+            menu.add("Lists").setOnMenuItemClickListener { startActivity(Intent(this@MainActivity, ListsActivity::class.java)); true }
             menu.add("Your profile").setOnMenuItemClickListener {
                 node?.let { ProfileUi.edit(this@MainActivity, it, "Your profile") }
                 true
@@ -1460,15 +1466,44 @@ class MainActivity : Activity() {
         Threading.background {
             val list = n.devices()
             runOnUiThread {
-                val labels = list.map { d ->
-                    d.name + (if (d.thisDevice) " (this device)" else "") + "\n" + Threnody.short(d.fingerprint)
+                // One row per device: its name, "This device" beside ours, and
+                // its fingerprint underneath; tap to rename or remove.
+                lateinit var dialog: android.app.AlertDialog
+                val box = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, dp(Design.xs), 0, 0)
                 }
-                SecureBuilder(this)
+                for (d in list) {
+                    val name = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        addView(label(d.name, 16f, R.color.text, Design.weightMedium).apply {
+                            ellipsize = android.text.TextUtils.TruncateAt.END
+                        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                        if (d.thisDevice) addView(label("This device", 12f, R.color.accent, Design.weightMedium).apply {
+                            background = rounded((color(R.color.accent) and 0x00FFFFFF) or 0x1F000000, dp(10).toFloat())
+                            setPadding(dp(8), dp(2), dp(8), dp(2))
+                        })
+                    }
+                    box.addView(LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(Design.xl), dp(Design.md), dp(Design.xl), dp(Design.md))
+                        minimumHeight = dp(Design.touchTargetMin)
+                        background = ripple()
+                        addView(name, matchWrap)
+                        addView(label(Threnody.short(d.fingerprint), 13f, R.color.muted).apply {
+                            typeface = android.graphics.Typeface.MONOSPACE
+                        })
+                        setOnClickListener { dialog.dismiss(); deviceActions(d, list.size) }
+                    }, matchWrap)
+                }
+                dialog = SecureBuilder(this)
                     .setTitle("Your devices")
-                    .setItems(labels.toTypedArray()) { _, i -> deviceActions(list[i], list.size) }
+                    .setView(android.widget.ScrollView(this).apply { addView(box) })
                     .setPositiveButton("Link a new device") { _, _ -> linkDevice() }
                     .setNegativeButton("Close", null)
-                    .show()
+                    .create()
+                dialog.show()
             }
         }
     }
@@ -1572,7 +1607,15 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             Threnody.say("! QR generation failed: ${e.message}")
         }
-        box.addView(label(code, Design.typeBody, R.color.md_sys_color_on_surface, weight = Design.weightBold, maxLines = 0), matchWrap)
+        // The link itself is for copying, not reading: small, monospaced, in a
+        // tinted box, at most three lines (Copy and Share take all of it).
+        box.addView(label(code, 12f, R.color.text_secondary, maxLines = 3).apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            background = roundedRes(R.color.bubble_in, dp(Design.radiusMd).toFloat())
+            setPadding(dp(Design.md), dp(Design.sm), dp(Design.md), dp(Design.sm))
+            setTextIsSelectable(true)
+        }, matchWrap)
         box.addView(label(footer, Design.typeCaption, R.color.text_secondary, maxLines = 0).apply {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(0, dp(Design.md), 0, 0)

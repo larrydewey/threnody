@@ -115,7 +115,7 @@ class GifPicker(
 ) {
     private lateinit var dialog: android.app.Dialog
     private var gifs: List<Giphy.Gif> = emptyList()
-    private val status = a.label("", 14f, R.color.muted).apply { gravity = Gravity.CENTER }
+    private val status = a.label("", 14f, R.color.muted, maxLines = 0).apply { gravity = Gravity.CENTER }
     private val grid = GridView(a)
     /** Bumped by each search, so a slow, older answer is dropped. */
     private var generation = 0

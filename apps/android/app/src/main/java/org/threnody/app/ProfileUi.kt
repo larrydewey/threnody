@@ -30,7 +30,7 @@ object ProfileUi {
                 box.addView(a.label(
                     if (attrs.isEmpty()) "Nothing yet. Contacts see only the details you share with each of them."
                     else "Contacts see only the details you share with each of them (chat ⋮ → Share your profile).",
-                    14f, R.color.muted,
+                    14f, R.color.muted, maxLines = 0,
                 ), matchWrap)
                 lateinit var dialog: AlertDialog
                 fun row(text: String, color: Int, onClick: () -> Unit) = box.addView(a.label(text, 16f, color).apply {
@@ -58,7 +58,7 @@ object ProfileUi {
             orientation = LinearLayout.VERTICAL
             setPadding(a.dp(24), a.dp(8), a.dp(24), 0)
             if (current == null) {
-                addView(a.label("Suggestions: ${SUGGESTED.joinToString(", ")}", 12f, R.color.muted), matchWrap)
+                addView(a.label("Suggestions: ${SUGGESTED.joinToString(", ")}", 12f, R.color.muted, maxLines = 0), matchWrap)
             }
             addView(key, matchWrap)
             addView(value, matchWrap)

@@ -13,6 +13,7 @@ import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.text.format.DateFormat
+import android.text.format.DateUtils
 import android.text.format.Formatter
 import android.view.Gravity
 import android.view.MotionEvent
@@ -213,7 +214,7 @@ class ChatActivity : Activity() {
         banner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(color(R.color.surface))
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(12), dp(8), dp(12), dp(4))
             visibility = View.GONE
         }
         messages = LinearLayout(this).apply {
@@ -1017,13 +1018,20 @@ class ChatActivity : Activity() {
     private fun header(c: Conversation?) {
         bar.title.text = c?.title ?: Threnody.short(device)
         bar.subtitle.visibility = View.VISIBLE
-        bar.subtitle.text = listOfNotNull(
+        // Short, in a quiet colour; only "Not verified" stands out (the banner says what to do).
+        val parts = listOfNotNull(
             persona?.let { "🎭 as ${Threnody.personaLabels[it] ?: "anonymous"}" },
-            if (c?.connected == true) "connected" else "not connected",
-            if (c?.verified == true) "verified" else "⚠ not verified",
+            if (c?.connected == true) "Online" else "Offline",
             c?.devices?.size?.takeIf { it > 1 }?.let { "$it devices" },
-        ).joinToString(" · ")
-        bar.subtitle.setTextColor(color(if (c?.verified == true) R.color.muted else R.color.warning))
+            if (c?.verified == true) "Verified" else "Not verified",
+        )
+        val line = android.text.SpannableString(parts.joinToString(" · "))
+        if (c?.verified != true) line.setSpan(
+            android.text.style.ForegroundColorSpan(color(R.color.warning)),
+            line.length - "Not verified".length, line.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        bar.subtitle.text = line
+        bar.subtitle.setTextColor(color(R.color.muted))
         clearBanner()
         if (c == null) return
         composeBar.visibility = if (c.accepted) View.VISIBLE else View.GONE
@@ -1194,21 +1202,61 @@ class ChatActivity : Activity() {
         banner.visibility = View.GONE
     }
 
+    /**
+     * A notice above the chat, as a tinted card: an icon, what it says, and
+     * its actions as buttons at its foot (the first one filled).
+     */
     private fun banner(text: String, vararg actions: Pair<String, () -> Unit>, warning: Boolean = false) {
         banner.visibility = View.VISIBLE
-        banner.addView(label(text, 14f, if (warning) R.color.warning else R.color.muted), matchWrap)
-        if (actions.isEmpty()) return
-        val row = LinearLayout(this)
-        for ((name, onClick) in actions) {
-            row.addView(label(name, 15f, R.color.accent).apply {
-                setTypeface(typeface, Typeface.BOLD)
-                setPadding(0, dp(10), dp(24), dp(4))
-                minHeight = dp(40)
-                gravity = Gravity.CENTER_VERTICAL
-                setOnClickListener { onClick() }
-            }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        val tone = color(if (warning) R.color.warning else R.color.accent)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded((tone and 0x00FFFFFF) or 0x1A000000, dp(Design.radiusLg).toFloat())
+            setPadding(dp(Design.lg), dp(Design.md), dp(Design.lg), dp(Design.md))
         }
-        banner.addView(row, matchWrap)
+        card.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(label(if (warning) "⚠️" else "ℹ️", 16f, R.color.text).apply {
+                setPadding(0, 0, dp(Design.md), 0)
+            })
+            addView(label(text, 14f, R.color.text, maxLines = 0), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }, matchWrap)
+        if (actions.isNotEmpty()) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                setPadding(0, dp(Design.sm), 0, 0)
+            }
+            actions.forEachIndexed { i, (name, onClick) ->
+                row.addView(label(name, 14f, if (i == 0) R.color.md_sys_color_on_primary else R.color.accent, Design.weightBold).apply {
+                    gravity = Gravity.CENTER
+                    minHeight = dp(36)
+                    setPadding(dp(Design.lg), 0, dp(Design.lg), 0)
+                    background = if (i == 0) rounded(color(R.color.accent), dp(18).toFloat()) else ripple()
+                    setOnClickListener { v -> Design.lightHaptic(v); onClick() }
+                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = dp(Design.sm) })
+            }
+            card.addView(row, matchWrap)
+        }
+        banner.addView(card, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(Design.xs) })
+    }
+
+    /** A day as a chat heading: Today, Yesterday, the weekday within a week, else the date. */
+    private fun dayHeading(ms: Long): String {
+        if (ms <= 0) return ""
+        val now = java.util.Calendar.getInstance()
+        val then = java.util.Calendar.getInstance().apply { timeInMillis = ms }
+        val zone = java.util.TimeZone.getDefault()
+        fun dayOf(t: Long) = Math.floorDiv(t + zone.getOffset(t), DateUtils.DAY_IN_MILLIS)
+        val ago = dayOf(System.currentTimeMillis()) - dayOf(ms)
+        return when {
+            ago == 0L -> "Today"
+            ago == 1L -> "Yesterday"
+            ago in 2L..6L -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_WEEKDAY)
+            then.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) ->
+                DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_SHOW_WEEKDAY or DateUtils.FORMAT_ABBREV_ALL or DateUtils.FORMAT_NO_YEAR)
+            else -> DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_SHOW_YEAR or DateUtils.FORMAT_ABBREV_MONTH)
+        }
     }
 
     /** What the chat last drew, so a refresh that changes nothing leaves it be. */
@@ -1231,11 +1279,30 @@ class ChatActivity : Activity() {
         if (items.isEmpty()) {
             val text = if (group != null) "No messages yet. Group messages are end-to-end encrypted with MLS."
             else "No messages yet. Messages are end-to-end encrypted and stored encrypted on this device."
-            messages.addView(label(text, 14f, R.color.muted).apply { gravity = Gravity.CENTER; setPadding(dp(24), dp(48), dp(24), 0) }, matchWrap)
+            messages.addView(label(text, 14f, R.color.muted, maxLines = 0).apply { gravity = Gravity.CENTER; setPadding(dp(24), dp(48), dp(24), 0) }, matchWrap)
         }
         var lastSender: String? = null
+        var lastDay = ""
         for (run in albums(items)) {
             val e = run.first().entry
+            // A quiet heading where the day changes ("Today", "Yesterday", "Sat 21 Nov").
+            val day = dayHeading(e.atMs.toLong())
+            if (day != lastDay) {
+                lastDay = day
+                lastSender = null
+                messages.addView(TextView(this).apply {
+                    text = day
+                    textSize = 12f
+                    setTextColor(color(R.color.muted))
+                    setTypeface(typeface, Typeface.BOLD)
+                    background = rounded(color(R.color.bubble_in), dp(12).toFloat())
+                    setPadding(dp(12), dp(4), dp(12), dp(4))
+                }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    topMargin = dp(Design.md)
+                    bottomMargin = dp(Design.sm)
+                })
+            }
             // In groups, name the sender above the first of their run of messages.
             val sender = if (group != null && !e.outgoing && e.device != lastSender) names[e.device] else null
             lastSender = if (e.outgoing) null else e.device
@@ -1282,7 +1349,8 @@ class ChatActivity : Activity() {
     private fun offerText(s: TransferState, size: ULong): String {
         val total = Formatter.formatShortFileSize(this, size.toLong())
         return when (s) {
-            is TransferState.Idle -> "Tap to download · $total"
+            // The size is in the bubble's footer already.
+            is TransferState.Idle -> "Tap to download"
             is TransferState.Waiting -> "Waiting for the sender… · tap to cancel"
             is TransferState.Fetching ->
                 "Downloading… ${if (s.total == 0uL) 100uL else s.received * 100uL / s.total}% of $total · tap to cancel"
@@ -2713,7 +2781,7 @@ class ChatActivity : Activity() {
             addView(caption, matchWrap)
             addView(sensitive, matchWrap)
             if (images > 0 && Privacy.stripMetadata(this@ChatActivity)) {
-                addView(label("Location and camera details are removed before sending.", 12f, R.color.muted), matchWrap)
+                addView(label("Location and camera details are removed before sending.", 12f, R.color.muted, maxLines = 0), matchWrap)
             }
         }
         val gifs = picked.count { Media.isGif(it.name) }

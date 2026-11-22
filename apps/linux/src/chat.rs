@@ -1141,25 +1141,19 @@ impl ChatView {
             if let Some(l) = &persona_label {
                 parts.push(format!("🎭 as {l}"));
             }
-            parts.push(
-                if c.connected {
-                    "connected"
-                } else {
-                    "not connected"
-                }
-                .to_owned(),
-            );
-            parts.push(
-                if c.verified {
-                    "verified"
-                } else {
-                    "⚠ not verified"
-                }
-                .to_owned(),
-            );
+            // Short and quiet; the banner says what to do about verifying.
+            parts.push(if c.connected { "Online" } else { "Offline" }.to_owned());
             if c.devices.len() > 1 {
                 parts.push(format!("{} devices", c.devices.len()));
             }
+            parts.push(
+                if c.verified {
+                    "Verified"
+                } else {
+                    "Not verified"
+                }
+                .to_owned(),
+            );
             self.title.set_subtitle(&parts.join(" · "));
             if !c.accepted {
                 self.show_banner(
@@ -1235,11 +1229,9 @@ impl ChatView {
                 self.show_banner(&n, false, &[("OK", Self::dismiss_notice as Action)]);
             }
         }
-        if c.verified || c.group.is_some() {
-            self.title.remove_css_class("warning");
-        } else {
-            self.title.add_css_class("warning");
-        }
+        // The name stays in the normal colour: an unverified contact isn't
+        // an error, and the banner explains it.
+        self.title.remove_css_class("warning");
         self.composer.set_sensitive(can_send);
         self.composer.set_visible(can_send);
         self.build_menu();
