@@ -16,6 +16,7 @@ const KIND_MEMBER: u64 = 3;
 const KIND_ROLE: u64 = 4;
 const KIND_TIMER: u64 = 5;
 const KIND_SECURITY: u64 = 6;
+const KIND_THEME: u64 = 7;
 
 const CALL_VIDEO: u64 = 1;
 
@@ -51,6 +52,16 @@ pub enum Notice {
         change: SecurityChange,
         device: Option<[u8; 32]>,
     },
+    /// `by` changed the chat's theme (Appendix W): its look, the group's
+    /// picture, or back to plain.
+    Theme { change: ThemeChange, by: [u8; 32] },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeChange {
+    Look = 0,
+    Picture = 1,
+    Plain = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +228,11 @@ impl Notice {
                 SecurityChange::DeviceRemoved => "This contact removed a device".into(),
                 SecurityChange::Verified => "You verified the safety number".into(),
             },
+            Self::Theme { change, by } => match change {
+                ThemeChange::Look => format!("{} changed the chat's theme", name(&by)),
+                ThemeChange::Picture => format!("{} changed the group's picture", name(&by)),
+                ThemeChange::Plain => format!("{} took the chat's theme away", name(&by)),
+            },
         }
     }
 
@@ -272,6 +288,11 @@ impl Notice {
                 Self::Timer { secs } => {
                     e.map_len(2)?.u8(0)?.uint(KIND_TIMER)?;
                     e.u8(4)?.u32(secs)?;
+                }
+                Self::Theme { change, by } => {
+                    e.map_len(3)?.u8(0)?.uint(KIND_THEME)?;
+                    e.u8(1)?.uint(change as u64)?;
+                    e.u8(2)?.bytes(&by)?;
                 }
                 Self::Security { change, device } => {
                     e.map_len(2 + usize::from(device.is_some()))?
@@ -340,6 +361,14 @@ impl Notice {
                 role: u8::try_from(four).unwrap_or(2),
             }),
             KIND_TIMER => Some(Self::Timer { secs: four }),
+            KIND_THEME => Some(Self::Theme {
+                change: match one {
+                    1 => ThemeChange::Picture,
+                    2 => ThemeChange::Plain,
+                    _ => ThemeChange::Look,
+                },
+                by: device.ok_or(Error::Malformed("notice theme by"))?,
+            }),
             KIND_SECURITY => Some(Self::Security {
                 change: match one {
                     1 => SecurityChange::DeviceRemoved,
@@ -390,6 +419,13 @@ mod tests {
                 "You removed Alice",
             ),
             (Notice::Role { member: a, role: 1 }, "Alice is now an admin"),
+            (
+                Notice::Theme {
+                    change: ThemeChange::Look,
+                    by: a,
+                },
+                "Alice changed the chat's theme",
+            ),
             (Notice::Role { member: b, role: 0 }, "You're now an owner"),
             (
                 Notice::Timer { secs: 86_400 },

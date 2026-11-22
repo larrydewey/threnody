@@ -648,3 +648,68 @@ async fn file_locations_fail_rather_than_answer_partially() {
     .unwrap();
     assert!(a.file_locations().is_err());
 }
+
+#[tokio::test]
+async fn a_chat_theme_reaches_both_sides_and_the_newest_wins() {
+    use threnody_core::notice::Notice;
+    use threnody_core::theme::{Background, Pattern, Theme};
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _arx, _) = spawn(&dir, "alice").await;
+    let (bob, mut brx, addr) = spawn(&dir, "bob").await;
+    let bob_id = alice.connect(&addr, None).await.unwrap();
+    let a_id = alice.identity();
+    next(&mut brx, |e| matches!(e, Event::Connected { .. })).await;
+    bob.accept_contact(&a_id);
+    // Hellos both ways first, so each knows the other takes themes.
+    alice.send_text(&bob_id, "hi").unwrap();
+    next(&mut brx, |e| matches!(e, Event::Message { .. })).await;
+
+    let snow = Theme {
+        background: Background::Pattern {
+            pattern: Pattern::Snow,
+            ink: 0x405C_8DB8,
+            paper: 0xFFEE_F5FB,
+        },
+        accent: Some(0xFF1E_6FB8),
+        picture: None,
+        set_ms: 0,
+    };
+    alice.set_chat_theme(&bob_id, snow.clone()).unwrap();
+    next(&mut brx, |e| matches!(e, Event::HistorySynced { .. })).await;
+    let theme_of = |n: &Node, p| n.chat_theme(n.conversation_for(p)).unwrap();
+    let at_bob = theme_of(&bob, &a_id);
+    assert_eq!(at_bob.background, snow.background);
+    assert_eq!(at_bob, theme_of(&alice, &bob_id), "the same on both sides");
+    let noted = |n: &Node, p| {
+        n.history(n.conversation_for(p))
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.notice, Some(Notice::Theme { .. })))
+            .count()
+    };
+    assert_eq!((noted(&alice, &bob_id), noted(&bob, &a_id)), (1, 1));
+
+    // An older theme (a mailbox copy, say) doesn't undo the newer one.
+    let mut old = Theme::plain(1);
+    old.set_ms = 1;
+    assert!(!bob.take_theme(bob.conversation_for(&a_id), old, *a_id.as_bytes(), false));
+    assert_eq!(theme_of(&bob, &a_id).background, snow.background);
+
+    // Bob takes it away; a plain look is a theme too, and newer.
+    bob.set_chat_theme(&a_id, Theme::plain(0)).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !theme_of(&alice, &bob_id).is_plain() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("plain again at Alice's");
+
+    // Keeping one's own look is only here.
+    alice
+        .set_own_look(alice.conversation_for(&bob_id), true)
+        .unwrap();
+    assert!(alice.own_look(alice.conversation_for(&bob_id)));
+    assert!(!bob.own_look(bob.conversation_for(&a_id)));
+}

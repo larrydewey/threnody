@@ -1902,3 +1902,55 @@ async fn an_offer_naming_no_owner_does_not_hide_anothers_invitation() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn owners_set_a_groups_theme_and_new_members_get_it() {
+    use threnody_core::theme::{Background, Picture, Theme};
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = spawn(&dir, "alice").await;
+    let mut bob = spawn(&dir, "bob").await;
+    let mut carol = spawn(&dir, "carol").await;
+    let bid = approve(&mut alice, &mut bob).await;
+    let cid = approve(&mut alice, &mut carol).await;
+    let g = alice.groups.create("Christmas").unwrap();
+    alice.groups.invite(&alice.node, &g, &bid).unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| ns[1].in_group(&g)).await;
+
+    let gc = ConversationId::Group(g);
+    let tree = Theme {
+        background: Background::Color(0xFFFF_F5F2),
+        accent: Some(0xFFC6_2828),
+        picture: Some(Picture::Emoji {
+            emoji: "🎄".into(),
+            color: 0xFFFF_E3DE,
+        }),
+        set_ms: 0,
+    };
+    alice
+        .groups
+        .set_theme(&alice.node, &g, tree.clone())
+        .unwrap();
+    until(&mut [&mut alice, &mut bob], |ns| {
+        ns[1]
+            .node
+            .chat_theme(gc)
+            .is_some_and(|t| t.picture == tree.picture)
+    })
+    .await;
+    // A plain member can't.
+    assert!(
+        bob.groups
+            .set_theme(&bob.node, &g, Theme::plain(0))
+            .is_err()
+    );
+
+    // Carol, added later, gets it too.
+    alice.groups.invite(&alice.node, &g, &cid).unwrap();
+    until(&mut [&mut alice, &mut bob, &mut carol], |ns| {
+        ns[2]
+            .node
+            .chat_theme(gc)
+            .is_some_and(|t| t.accent == tree.accent)
+    })
+    .await;
+}

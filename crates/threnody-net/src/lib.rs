@@ -37,6 +37,7 @@ mod recover;
 pub mod relay;
 pub mod schedule;
 pub mod sync;
+mod themes;
 pub mod transfer;
 mod tunnels;
 pub mod volunteer;

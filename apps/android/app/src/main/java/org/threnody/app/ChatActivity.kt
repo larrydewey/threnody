@@ -1410,6 +1410,7 @@ class ChatActivity : Activity() {
             is NoticeInfo.Role -> R.drawable.ic_shield
             is NoticeInfo.Timer -> R.drawable.ic_timer
             is NoticeInfo.Security -> R.drawable.ic_shield
+            is NoticeInfo.Theme -> R.drawable.ic_image
         }
         return label(e.text, 13f, if (missed) R.color.warning else R.color.muted).apply {
             icon(icon, 16)

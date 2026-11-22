@@ -1155,6 +1155,10 @@ impl Node {
                     id,
                     body,
                 } => return self.on_edit(&from, conversation, *id, body),
+                AppMessage::Theme {
+                    conversation,
+                    theme,
+                } => return self.on_theme(&from, conversation, theme),
                 AppMessage::React {
                     conversation,
                     id,

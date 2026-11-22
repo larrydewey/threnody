@@ -123,6 +123,8 @@ pub const FEATURE_LARGE_FILES: u64 = 524288;
 /// The peer shows cards (Appendix V): only such peers get a card that
 /// must not fall back to plain text (a secret, or one viewed once).
 pub const FEATURE_CARDS: u64 = 1_048_576;
+/// `Hello` feature bit: this side takes `Theme` (Appendix W).
+pub const FEATURE_THEMES: u64 = 2_097_152;
 
 /// What a deletion leaves where the messages were (`Delete`'s flags).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,6 +162,7 @@ impl DeleteMode {
     }
 }
 pub const FEATURES: u64 = FEATURE_CARDS
+    | FEATURE_THEMES
     | FEATURE_ACKS
     | FEATURE_DELETE
     | FEATURE_EDIT
@@ -361,6 +364,14 @@ pub enum AppMessage {
         /// placeholder; from our own devices, `Remove` is "delete for me".
         mode: DeleteMode,
     },
+    /// A chat's theme (Appendix W, an encoded [`crate::theme::Theme`]):
+    /// from the contact, for our chat with them; from one of our devices,
+    /// for `conversation`. The newest one wins. Only sent to peers whose
+    /// `Hello` has [`FEATURE_THEMES`].
+    Theme {
+        conversation: Vec<u8>,
+        theme: Vec<u8>,
+    },
     /// Replace the text of message `id` (the sender's own; or, from one of
     /// our devices, in `conversation`). Only sent to peers whose `Hello`
     /// has [`FEATURE_EDIT`].
@@ -442,6 +453,7 @@ mod kind {
     pub const RECEIPT: u64 = 31;
     pub const OFFER: u64 = 32;
     pub const TRANSFER: u64 = 33;
+    pub const THEME: u64 = 34;
 }
 
 impl AppMessage {
@@ -486,6 +498,17 @@ impl AppMessage {
                 return cbor::to_vec(packed.len() + conversation.len() + 24, |e| {
                     e.map_len(3)?.u8(0)?.uint(kind::READ)?;
                     e.u8(2)?.bytes(&packed)?;
+                    e.u8(3)?.bytes(conversation)?;
+                    Ok(())
+                });
+            }
+            Self::Theme {
+                conversation,
+                theme,
+            } => {
+                return cbor::to_vec(theme.len() + conversation.len() + 32, |e| {
+                    e.map_len(3)?.u8(0)?.uint(kind::THEME)?;
+                    e.u8(2)?.bytes(theme)?;
                     e.u8(3)?.bytes(conversation)?;
                     Ok(())
                 });
@@ -567,6 +590,7 @@ impl AppMessage {
                 Self::Tracked { .. }
                 | Self::Ack(_)
                 | Self::Delete { .. }
+                | Self::Theme { .. }
                 | Self::Edit { .. }
                 | Self::React { .. }
                 | Self::Read { .. }
@@ -815,6 +839,10 @@ impl AppMessage {
             | Self::Offer(p)
             | Self::Transfer(p)
             | Self::Identity(p) => p.len() + 16,
+            Self::Theme {
+                conversation,
+                theme,
+            } => conversation.len() + theme.len() + 32,
             Self::Tracked { inner, .. } => inner.size_hint() + 32,
             Self::Ack(ids) => ids.len() * 8 + 16,
             Self::Read { conversation, ids } => conversation.len() + ids.len() * 8 + 16,
@@ -888,6 +916,10 @@ impl AppMessage {
                 conversation: required(conv, "conversation")?,
                 id: required(five, "message id")?,
                 pin: flags & PIN_REMOVE == 0,
+            },
+            kind::THEME => Self::Theme {
+                conversation: required(conv, "conversation")?,
+                theme: required(bytes, "theme")?,
             },
             kind::EDIT => Self::Edit {
                 conversation: required(conv, "conversation")?,
@@ -1169,6 +1201,7 @@ mod tests {
             FEATURE_DEVICE_SYNC,
             FEATURE_LARGE_FILES,
             FEATURE_CARDS,
+            FEATURE_THEMES,
         ];
         let mut all = 0;
         for b in bits {
@@ -1292,6 +1325,10 @@ mod tests {
                 conversation: vec![1; 17],
                 id: 9,
                 body: "better wording".into(),
+            },
+            AppMessage::Theme {
+                conversation: vec![1; 17],
+                theme: vec![0xa0],
             },
             AppMessage::Cover,
             AppMessage::Text {

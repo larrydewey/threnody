@@ -431,6 +431,9 @@ pub enum Content {
     List(Vec<u8>),
     /// Group call signalling (`threnody_core::call::GroupCallMsg`).
     Call(Vec<u8>),
+    /// The group's theme (Appendix W, a `threnody_core::theme::Theme`):
+    /// owners' and admins' only count.
+    Theme(Vec<u8>),
 }
 
 const TAGGED: u8 = 0xFF;
@@ -506,6 +509,7 @@ impl Content {
             Self::ClosePoll { id } => (7, "", None, 0, "", 0, *id, 0),
             Self::List(l) => (8, "", Some(l.as_slice()), 0, "", 0, 0, 0),
             Self::Call(c) => (9, "", Some(c.as_slice()), 0, "", 0, 0, 0),
+            Self::Theme(t) => (10, "", Some(t.as_slice()), 0, "", 0, 0, 0),
         };
         let (options, choices): (&[String], &[u32]) = match self {
             Self::Poll { options, .. } => (options, &[]),
@@ -730,6 +734,7 @@ impl Content {
             7 if id != 0 => Self::ClosePoll { id },
             8 => Self::List(required(data, "list")?),
             9 => Self::Call(required(data, "call")?),
+            10 => Self::Theme(required(data, "theme")?),
             4 if id != 0 => Self::Pin {
                 id,
                 pin: flags & 1 == 0,
@@ -858,6 +863,7 @@ mod tests {
             Content::ClosePoll { id: 50 },
             Content::List(vec![1, 2, 3]),
             Content::Call(vec![4, 5, 6]),
+            Content::Theme(vec![7, 8]),
             Content::Pin { id: 42, pin: false },
             Content::File {
                 name: "a.txt".into(),

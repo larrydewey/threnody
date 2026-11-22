@@ -392,6 +392,11 @@ pub struct History {
     /// When the user last looked at the conversation: incoming messages
     /// after it are unread (on this device).
     pub seen_ms: u64,
+    /// The chat's shared theme (Appendix W), the newest set.
+    pub theme: Option<crate::theme::Theme>,
+    /// The user keeps their own plain look here, whatever the theme
+    /// (on this device and synced to their others; never sent).
+    pub own_look: bool,
 }
 
 /// When a conversation's new messages notify.
@@ -639,6 +644,21 @@ fn same(a: &Entry, b: &Entry) -> bool {
 }
 
 impl History {
+    /// Takes `theme` if it is newer than the one here. Returns whether it
+    /// did.
+    pub fn take_theme(&mut self, theme: Option<crate::theme::Theme>) -> bool {
+        let Some(t) = theme else { return false };
+        if self
+            .theme
+            .as_ref()
+            .is_some_and(|ours| ours.set_ms >= t.set_ms)
+        {
+            return false;
+        }
+        self.theme = Some(t);
+        true
+    }
+
     /// Adds `incoming` entries that aren't already here, keeping time
     /// order. Returns how many were added.
     pub fn merge(&mut self, incoming: Vec<Entry>, now_ms: u64) -> usize {
@@ -674,6 +694,8 @@ impl History {
             self.notify = newer.notify;
         }
         self.seen_ms = self.seen_ms.max(newer.seen_ms);
+        self.take_theme(newer.theme);
+        self.own_look |= newer.own_look;
         for p in newer.pinned {
             if !self.pinned.contains(&p) && self.entries.iter().any(|e| e.message_id() == p) {
                 self.pinned.push(p);
@@ -693,6 +715,8 @@ impl History {
             notify: Notify::All,
             draft: String::new(),
             seen_ms: 0,
+            theme: None,
+            own_look: false,
         }
     }
 
@@ -832,6 +856,8 @@ impl History {
                     + usize::from(self.notify != Notify::All)
                     + usize::from(!self.draft.is_empty())
                     + usize::from(self.seen_ms != 0)
+                    + usize::from(self.theme.is_some())
+                    + usize::from(self.own_look)
                     + usize::from(conversation.is_some()),
             )?;
             enc.u8(0)?.u64(VERSION)?;
@@ -849,6 +875,13 @@ impl History {
             }
             if self.seen_ms != 0 {
                 enc.u8(6)?.u64(self.seen_ms)?;
+            }
+            if let Some(t) = &self.theme {
+                let t = t.encode().map_err(|_| const_cbor::Error::TYPE_MISMATCH)?;
+                enc.u8(8)?.bytes(&t)?;
+            }
+            if self.own_look {
+                enc.u8(9)?.bool(true)?;
             }
             if !self.pinned.is_empty() {
                 enc.u8(3)?.array_len(self.pinned.len())?;
@@ -1009,6 +1042,7 @@ impl History {
         let mut notify = Notify::All;
         let mut draft = String::new();
         let mut seen_ms = 0;
+        let (mut theme, mut own_look) = (None, false);
         read_map(&mut dec, |k, d| {
             match k {
                 0 => ver = Some(d.u64()?),
@@ -1129,6 +1163,9 @@ impl History {
                 4 => notify = Notify::from_u8(d.u8()?),
                 5 => draft = d.str()?.to_owned(),
                 6 => seen_ms = d.u64()?,
+                // Kept as stored; one that no longer decodes is dropped.
+                8 => theme = crate::theme::Theme::decode(d.bytes()?).ok(),
+                9 => own_look = d.bool()?,
                 7 => {
                     conversation = Some(
                         ConversationId::from_bytes(d.bytes()?)
@@ -1159,6 +1196,8 @@ impl History {
                 notify,
                 draft,
                 seen_ms,
+                theme,
+                own_look,
             },
             conversation,
         ))
