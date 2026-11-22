@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 use threnody_core::message::DeleteMode;
+use threnody_core::notice::Notice;
 
 use threnody_core::history::{ConversationId, Entry, FileNote, History, Hit, Query};
 use threnody_core::{AppMessage, LinkPreview, PublicIdentity, now_ms};
@@ -1438,16 +1439,68 @@ impl Node {
     }
 
     /// [`Node::set_timer`] for any conversation (groups too: their timer
-    /// applies on this device).
+    /// applies on this device). A change is noted in the chat.
     pub fn set_conversation_timer(&self, conv: ConversationId, secs: Option<u32>) -> Result<()> {
-        let _lock = threnody_core::history::history_lock();
-        let mut h = self.history(conv)?;
-        // 0 records "off on purpose", unlike no setting (the default).
-        h.timer_s = Some(secs.unwrap_or(0));
-        self.shared
+        let changed = {
+            let _lock = threnody_core::history::history_lock();
+            let mut h = self.history(conv)?;
+            let before = self.effective_timer(conv).unwrap_or(0);
+            // 0 records "off on purpose", unlike no setting (the default).
+            h.timer_s = Some(secs.unwrap_or(0));
+            self.shared
+                .home
+                .save_history(self.identity_ref(), conv, &h)
+                .map_err(NetError::from)?;
+            before != secs.unwrap_or(0)
+        };
+        if changed {
+            let me = *self.identity().as_bytes();
+            self.add_notice(
+                conv,
+                true,
+                me,
+                Notice::Timer {
+                    secs: secs.unwrap_or(0),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Adds notice `notice` to `conv` (see [`Notice`]): from us
+    /// (`outgoing`) or about `device`. Ours go to our other devices as our
+    /// messages do; apps hear of it as history that changed.
+    pub fn add_notice(
+        &self,
+        conv: ConversationId,
+        outgoing: bool,
+        device: [u8; 32],
+        notice: Notice,
+    ) {
+        let now = now_ms();
+        let entry = Entry {
+            at_ms: now,
+            outgoing,
+            device,
+            text: notice.text(outgoing),
+            notice: Some(notice),
+            ..Entry::blank()
+        };
+        if self
+            .shared
             .home
-            .save_history(self.identity_ref(), conv, &h)
-            .map_err(NetError::from)
+            .append_history(self.identity_ref(), conv, entry.clone(), now)
+            .is_err()
+        {
+            return;
+        }
+        if outgoing {
+            self.push_entry(conv, &entry);
+        }
+        self.emit(Event::HistorySynced {
+            from: PublicIdentity::from_bytes(&device).unwrap_or_else(|_| self.identity()),
+            added: 1,
+        });
     }
 
     /// The timer our messages in `conv` carry: the effective one, or
@@ -1794,6 +1847,7 @@ impl Node {
         } else {
             self.effective_timer(conv)
         };
+        let mut timer_note = None;
         if chosen
             && self.effective_timer(conv) != expiry
             && let Ok(mut h) = self.history(conv)
@@ -1804,6 +1858,8 @@ impl Node {
                 peer: *from,
                 secs: expiry,
             });
+            // Noted once the lock below lets go.
+            timer_note = Some(expiry.unwrap_or(0));
         }
         let stored = self.record_with_id(
             conv,
@@ -1822,6 +1878,9 @@ impl Node {
             },
         );
         drop(lock);
+        if let Some(secs) = timer_note {
+            self.add_notice(conv, false, *from.as_bytes(), Notice::Timer { secs });
+        }
         if stored {
             Recorded::New
         } else {

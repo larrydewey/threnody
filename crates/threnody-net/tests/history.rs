@@ -60,6 +60,7 @@ async fn history_records_both_sides_and_disappearing_messages_vanish() {
             .unwrap()
             .entries()
             .iter()
+            .filter(|e| e.notice.is_none())
             .map(|e| (e.outgoing, e.text.clone()))
             .collect::<Vec<_>>()
     };
@@ -112,7 +113,9 @@ async fn a_peer_without_a_timer_does_not_turn_ours_off() {
         n.history(n.conversation_for(p))
             .unwrap()
             .entries()
-            .last()
+            .iter()
+            .rev()
+            .find(|e| e.notice.is_none())
             .cloned()
             .unwrap()
     };
@@ -174,7 +177,9 @@ async fn messages_stay_by_default_and_disappear_when_chosen() {
         n.history(n.conversation_for(p))
             .unwrap()
             .entries()
-            .last()
+            .iter()
+            .rev()
+            .find(|e| e.notice.is_none())
             .cloned()
             .unwrap()
     };
@@ -423,7 +428,9 @@ async fn senders_can_edit_their_messages() {
         n.history(n.conversation_for(p))
             .unwrap()
             .entries()
-            .last()
+            .iter()
+            .rev()
+            .find(|e| e.notice.is_none())
             .cloned()
             .unwrap()
     };
@@ -457,7 +464,9 @@ async fn reactions_several_per_person_both_ways() {
         n.history(n.conversation_for(p))
             .unwrap()
             .entries()
-            .last()
+            .iter()
+            .rev()
+            .find(|e| e.notice.is_none())
             .cloned()
             .unwrap()
     };

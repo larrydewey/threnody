@@ -1743,6 +1743,10 @@ impl ChatView {
             } if !e.outgoing => "call-missed-symbolic",
             N::Call { video: true, .. } => "camera-video-symbolic",
             N::Call { .. } => "call-start-symbolic",
+            N::Member => "system-users-symbolic",
+            N::Role => "starred-symbolic",
+            N::Timer { .. } => "alarm-symbolic",
+            N::Security => "security-high-symbolic",
         };
         line.append(&gtk::Image::from_icon_name(icon));
         if matches!(n, N::Call { outcome: O::Missed | O::Busy, .. } if !e.outgoing) {

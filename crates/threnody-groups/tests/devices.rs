@@ -103,7 +103,14 @@ impl N {
     fn texts(&self, group: &threnody_groups::GroupId) -> Vec<String> {
         self.node
             .history(ConversationId::Group(*group))
-            .map(|h| h.entries().iter().map(|e| e.text.clone()).collect())
+            // The messages, not notices of who joined.
+            .map(|h| {
+                h.entries()
+                    .iter()
+                    .filter(|e| e.notice.is_none())
+                    .map(|e| e.text.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -698,6 +705,7 @@ async fn replies_quote_what_they_answer() {
             .map(|h| {
                 h.entries()
                     .iter()
+                    .filter(|e| e.notice.is_none())
                     .map(|e| e.quote.as_ref().map(|q| (q.text.clone(), q.author)))
                     .collect()
             })
@@ -714,7 +722,15 @@ async fn replies_quote_what_they_answer() {
             .is_ok_and(|h| h.entries().len() == 1)
     })
     .await;
-    let asked = bob.node.history(bconv).unwrap().entries()[0].message_id();
+    let asked = bob
+        .node
+        .history(bconv)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.notice.is_none())
+        .unwrap()
+        .message_id();
     let q = bob.node.quote_of(bconv, |e| e.message_id() == asked);
     bob.node.send_reply(&aid, "yes!", q).unwrap();
     let aconv = alice.node.conversation_for(&bid);
@@ -736,7 +752,15 @@ async fn replies_quote_what_they_answer() {
     })
     .await;
     let gc = ConversationId::Group(g);
-    let id = alice.node.history(gc).unwrap().entries()[0].message_id();
+    let id = alice
+        .node
+        .history(gc)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.notice.is_none())
+        .unwrap()
+        .message_id();
     let q = alice.node.quote_of(gc, |e| e.message_id() == id);
     alice
         .groups
@@ -772,7 +796,15 @@ async fn pins_reach_both_sides_and_only_admins_pin_in_groups() {
             .is_ok_and(|h| h.entries().len() == 1)
     })
     .await;
-    let id = bob.node.history(bconv).unwrap().entries()[0].message_id();
+    let id = bob
+        .node
+        .history(bconv)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.notice.is_none())
+        .unwrap()
+        .message_id();
     assert!(bob.node.pin(&aid, id, true));
     until(&mut [&mut alice, &mut bob], |ns| {
         pins(ns[0], aconv) == ["the address"]
@@ -795,7 +827,15 @@ async fn pins_reach_both_sides_and_only_admins_pin_in_groups() {
     })
     .await;
     let gc = ConversationId::Group(g);
-    let id = bob.node.history(gc).unwrap().entries()[0].message_id();
+    let id = bob
+        .node
+        .history(gc)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.notice.is_none())
+        .unwrap()
+        .message_id();
     assert!(!alice.groups.may_pin(&g, &aid));
     assert!(alice.groups.pin(&alice.node, &g, id, true).is_err());
     assert!(bob.groups.pin(&bob.node, &g, id, true).unwrap());
@@ -856,7 +896,10 @@ async fn mentions_reach_who_they_name() {
         .node
         .history(ConversationId::Group(g))
         .unwrap()
-        .entries()[0]
+        .entries()
+        .iter()
+        .find(|e| e.notice.is_none())
+        .unwrap()
         .mentions
         .clone();
     assert_eq!(stored, [mention]);
@@ -883,13 +926,23 @@ async fn polls_collect_votes_until_closed() {
         .unwrap();
     let gc = ConversationId::Group(g);
     let poll = |n: &N| {
-        n.node
-            .history(gc)
-            .ok()
-            .and_then(|h| h.entries().first().and_then(|e| e.poll.clone()))
+        n.node.history(gc).ok().and_then(|h| {
+            h.entries()
+                .iter()
+                .find(|e| e.notice.is_none())
+                .and_then(|e| e.poll.clone())
+        })
     };
     until(&mut [&mut alice, &mut bob], |ns| poll(ns[1]).is_some()).await;
-    let id = bob.node.history(gc).unwrap().entries()[0].message_id();
+    let id = bob
+        .node
+        .history(gc)
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|e| e.notice.is_none())
+        .unwrap()
+        .message_id();
     assert!(bob.groups.vote(&bob.node, &g, id, &[1]).unwrap());
     until(&mut [&mut alice, &mut bob], |ns| {
         poll(ns[0]).is_some_and(|p| p.counts() == [0, 1])
@@ -924,7 +977,16 @@ async fn forwards_drafts_and_notes_to_self() {
             .is_ok_and(|h| h.entries().len() == 1)
     })
     .await;
-    assert!(bob.node.history(bconv).unwrap().entries()[0].forwarded);
+    assert!(
+        bob.node
+            .history(bconv)
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| e.notice.is_none())
+            .unwrap()
+            .forwarded
+    );
 
     // Drafts stay, encrypted, until cleared.
     let lconv = laptop.node.conversation_for(&bid);
@@ -940,7 +1002,14 @@ async fn forwards_drafts_and_notes_to_self() {
     let notes = |n: &N| -> Vec<String> {
         n.node
             .history(n.node.notes())
-            .map(|h| h.entries().iter().map(|e| e.text.clone()).collect())
+            // The messages, not notices of who joined.
+            .map(|h| {
+                h.entries()
+                    .iter()
+                    .filter(|e| e.notice.is_none())
+                    .map(|e| e.text.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     };
     until(&mut [&mut laptop, &mut phone], |ns| {

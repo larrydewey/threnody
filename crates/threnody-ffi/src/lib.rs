@@ -279,6 +279,14 @@ pub enum NoticeInfo {
         outcome: CallOutcomeInfo,
         duration_s: u32,
     },
+    /// Someone joined or left a group, or was added or removed.
+    Member,
+    /// A group member's role changed.
+    Role,
+    /// Disappearing messages were set (seconds; 0: turned off).
+    Timer { secs: u32 },
+    /// A contact's device came or went, or we verified them.
+    Security,
 }
 
 /// How a call went, as this device saw it.
@@ -320,6 +328,10 @@ impl From<threnody_core::notice::Notice> for NoticeInfo {
                 },
                 duration_s,
             },
+            Notice::Member { .. } => Self::Member,
+            Notice::Role { .. } => Self::Role,
+            Notice::Timer { secs } => Self::Timer { secs },
+            Notice::Security { .. } => Self::Security,
         }
     }
 }
@@ -1305,6 +1317,35 @@ fn history_entries(
     me: [u8; 32],
 ) -> Vec<HistoryEntry> {
     let this_device = *node.identity().as_bytes();
+    // Notices about people name them as the user knows them: "You" for
+    // our own devices, a contact's name, else a short fingerprint. Looked
+    // up only if there's such a notice.
+    let names = std::cell::OnceCell::new();
+    let name = |d: &[u8; 32]| -> String {
+        let names: &Vec<([u8; 32], String)> = names.get_or_init(|| {
+            node.contacts()
+                .iter()
+                .filter_map(|c| {
+                    // As `contacts` names them: ours, else theirs once accepted.
+                    let n = c.petname.clone().or_else(|| {
+                        c.shared_name()
+                            .filter(|_| c.accepted && !c.blocked)
+                            .map(str::to_owned)
+                    })?;
+                    Some((*c.key.as_bytes(), n))
+                })
+                .collect()
+        });
+        let own =
+            threnody_core::PublicIdentity::from_bytes(d).is_ok_and(|p| node.is_own_device(&p));
+        if *d == this_device || own {
+            return "You".into();
+        }
+        names
+            .iter()
+            .find(|(id, _)| id == d)
+            .map_or_else(|| threnody_core::notice::short_name(d), |(_, n)| n.clone())
+    };
     entries
         .iter()
         .map(|e| HistoryEntry {
@@ -1359,7 +1400,13 @@ fn history_entries(
             device: PublicIdentity::from_bytes(&e.device)
                 .map(|d| fp(&d))
                 .unwrap_or_default(),
-            text: e.text.clone(),
+            text: match e.notice {
+                Some(
+                    n @ (threnody_core::notice::Notice::Member { .. }
+                    | threnody_core::notice::Notice::Role { .. }),
+                ) => n.describe(e.outgoing, &name),
+                _ => e.text.clone(),
+            },
             disappearing: e.expires_at_ms.is_some(),
             file: e.file.as_ref().map(|f| FileInfo {
                 name: f.name.clone(),
@@ -2984,11 +3031,22 @@ PersistentKeepalive = 25\n",
     /// Records that the safety number with `peer` was compared out of band.
     pub fn mark_verified(&self, peer: String) -> Result<()> {
         let p = self.resolve(&peer)?;
+        let mut newly = false;
         self.node.update_contacts(|c| {
             if let Some(c) = c.get_mut(&p) {
+                newly = !c.verified;
                 c.verified = true;
             }
         });
+        if newly {
+            let notice = threnody_core::notice::Notice::Security {
+                change: threnody_core::notice::SecurityChange::Verified,
+                device: Some(*p.as_bytes()),
+            };
+            let me = *self.node.identity().as_bytes();
+            self.node
+                .add_notice(self.node.conversation_for(&p), true, me, notice);
+        }
         Ok(())
     }
 
@@ -4981,7 +5039,15 @@ mod tests {
                 }
             );
         }
-        assert_eq!(bob.group_history(g.clone(), 10).unwrap()[0].text, "hi all");
+        // (After the notice that Bob joined.)
+        let said: Vec<String> = bob
+            .group_history(g.clone(), 10)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.notice.is_none())
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(said[0], "hi all");
         assert_eq!(
             bob.search_group_messages(g.clone(), "HI".into(), 10)
                 .unwrap()[0]
@@ -4990,10 +5056,23 @@ mod tests {
         );
         let hit = bob.search_all("hi all".into(), 10).unwrap();
         assert!(hit.iter().any(|h| h.group.as_deref() == Some(g.as_str())));
-        assert!(carol.group_history(g.clone(), 10).unwrap()[0].outgoing);
+        assert!(
+            carol
+                .group_history(g.clone(), 10)
+                .unwrap()
+                .iter()
+                .find(|e| e.notice.is_none())
+                .unwrap()
+                .outgoing
+        );
         // Alice acknowledges her own copy, and forwards Bob's: when Bob
         // acknowledges it, Alice sends Carol a receipt. Both count.
-        let mine = &carol.group_history(g.clone(), 10).unwrap()[0];
+        let mine = &carol
+            .group_history(g.clone(), 10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.notice.is_none())
+            .unwrap();
         assert_eq!(mine.recipients, 2);
         for _ in 0..2 {
             all.until(
@@ -5001,7 +5080,12 @@ mod tests {
                 |e| matches!(e, NodeEvent::Delivered { group: Some(x), .. } if *x == g),
             );
         }
-        let mine = &carol.group_history(g.clone(), 10).unwrap()[0];
+        let mine = &carol
+            .group_history(g.clone(), 10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.notice.is_none())
+            .unwrap();
         assert!(mine.delivered_to == 2 && mine.delivered, "{mine:?}");
         // The owner reaches both directly: delivered.
         alice

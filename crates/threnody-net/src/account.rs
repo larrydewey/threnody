@@ -23,6 +23,7 @@
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use threnody_core::notice::{Notice, SecurityChange};
 
 use const_cbor::Decoder;
 use threnody_core::account::{
@@ -653,6 +654,19 @@ impl Node {
                 self.tag_devices(&chain);
                 for d in &removed {
                     self.revoke_device(d);
+                }
+                // The chat says so: a new device is a new safety number.
+                let conv = self.conversation_for(&from);
+                for (d, change) in added
+                    .iter()
+                    .map(|d| (d, SecurityChange::NewDevice))
+                    .chain(removed.iter().map(|d| (d, SecurityChange::DeviceRemoved)))
+                {
+                    let notice = Notice::Security {
+                        change,
+                        device: Some(*d.as_bytes()),
+                    };
+                    self.add_notice(conv, false, *d.as_bytes(), notice);
                 }
                 self.emit(Event::AccountChanged {
                     account: id,

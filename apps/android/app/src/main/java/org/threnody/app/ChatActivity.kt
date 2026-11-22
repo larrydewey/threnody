@@ -1406,6 +1406,10 @@ class ChatActivity : Activity() {
         val icon = when (n) {
             is NoticeInfo.Deleted -> R.drawable.ic_delete
             is NoticeInfo.Call -> if (n.video) R.drawable.ic_videocam else R.drawable.ic_call
+            is NoticeInfo.Member -> R.drawable.ic_group
+            is NoticeInfo.Role -> R.drawable.ic_shield
+            is NoticeInfo.Timer -> R.drawable.ic_timer
+            is NoticeInfo.Security -> R.drawable.ic_shield
         }
         return label(e.text, 13f, if (missed) R.color.warning else R.color.muted).apply {
             icon(icon, 16)

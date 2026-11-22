@@ -1324,6 +1324,10 @@ private struct NoticeLine: View {
         switch notice {
         case .deleted: "trash"
         case .call(let video, _, _): missed ? "phone.arrow.down.left" : video ? "video" : "phone"
+        case .member: "person.2"
+        case .role: "star"
+        case .timer: "timer"
+        case .security: "checkmark.shield"
         }
     }
 }
