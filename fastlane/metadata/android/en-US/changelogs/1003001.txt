@@ -1,0 +1,4 @@
+- A fresh look: one design across the app, with a search bar, filter chips, a New chat button, grouped message bubbles, file cards, a rounder message box and an attach sheet of coloured tiles.
+- Settings and contact details in tidy grouped cards with modern switches.
+- A calmer call screen with a large picture of who you're calling.
+- Fixed: dialogs were blank white boxes in dark mode.
