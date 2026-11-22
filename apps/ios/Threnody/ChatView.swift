@@ -66,6 +66,12 @@ struct ChatView: View {
     @State private var selecting: Reacting?
     /// A card shown in full, and the kind of card being made.
     @State private var shownCard: ShownCard?
+    /// The chat's theme (Appendix W), whether we keep our own look, and
+    /// whether we may change it.
+    @State private var look: ThemeInfo?
+    @State private var ownLook = false
+    @State private var mayTheme = true
+    @State private var choosingTheme = false
     @State private var composingCard: CardKind?
     @State private var myInvite = ""
     @State private var myHandle = ""
@@ -176,6 +182,7 @@ struct ChatView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }
+                .background(ThemeBackdrop(background: ownLook ? nil : look?.background))
                 .defaultScrollAnchor(.bottom)
                 .onChange(of: entries.count + pending.count) { if jump == nil { proxy.scrollTo("bottom") } }
                 .onChange(of: scrollTarget) { _, id in
@@ -198,6 +205,8 @@ struct ChatView: View {
                     Image(systemName: "magnifyingglass")
                 }
                 .accessibilityLabel("Search this chat")
+                Button { choosingTheme = true } label: { Image(systemName: "paintpalette") }
+                    .accessibilityLabel(ref.isGroup ? "Group theme" : "Chat theme")
                 switch ref.target {
                 case .contact:
                     NavigationLink { ContactInfoView(ref: ref) } label: { Image(systemName: "info.circle") }
@@ -212,6 +221,21 @@ struct ChatView: View {
 
     private func withSheets(_ content: some View) -> some View {
         content
+        .sheet(isPresented: $choosingTheme) {
+            ThemeSheet(current: look, group: ref.isGroup, canSet: mayTheme, own: ownLook) { on in
+                guard let t = target else { return }
+                Task {
+                    try? await offMain { try t.setOwnLook(on) }
+                    await load()
+                }
+            } onSet: { theme in
+                guard let t = target else { return }
+                Task {
+                    do { try await offMain { try t.setTheme(theme) } } catch { failure = error.localizedDescription }
+                    await load()
+                }
+            }
+        }
         .sheet(isPresented: $showLater) {
             LaterSheet(initial: nil, text: nil) { date, _ in if let date { sendLater(date) } }
         }
@@ -386,7 +410,8 @@ struct ChatView: View {
                 toggle(e, reaction.emoji, add: !reaction.mine)
             },
             onCard: { openCard($0) },
-            onAddContact: ref.persona == nil ? { link in addContact(link) } : nil
+            onAddContact: ref.persona == nil ? { link in addContact(link) } : nil,
+            accent: Themes.accent(look, own: ownLook) ?? .accentColor
         )
         .contextMenu { menu(item) }
     }
@@ -680,6 +705,9 @@ struct ChatView: View {
         }) else { return }
         entries = h
         scheduled = (try? await offMain { try t.scheduled() }) ?? []
+        look = (try? await offMain { try t.theme() }) ?? nil
+        ownLook = (try? await offMain { t.ownLook() }) ?? false
+        mayTheme = (try? await offMain { t.mayTheme() }) ?? true
         guard scenePhase == .active else { return }
         _ = try? await offMain { t.markSeen() }
         // Incoming messages now on screen are read: reported to contacts

@@ -26,6 +26,8 @@ struct Bubble: View {
     var onCard: (HistoryEntry) -> Void = { _ in }
     /// Adds the person a contact card names; nil where that isn't offered.
     var onAddContact: ((String) -> Void)? = nil
+    /// Our bubbles' colour: the chat theme's accent, or the app's.
+    var accent: Color = .accentColor
 
     private var entry: HistoryEntry { item.first }
 
@@ -54,7 +56,7 @@ struct Bubble: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .foregroundStyle(out ? Color.white : Color.primary)
-                .background(out ? Color.accentColor : Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+                .background(out ? accent : Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
                 if !entry.reactions.isEmpty { reactions }
             }
             .fixedSize(horizontal: false, vertical: true)
