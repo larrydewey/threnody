@@ -356,6 +356,49 @@ struct ChatTarget: Sendable {
         }
     }
 
+    /// The chat's shared theme (Appendix W), if set.
+    func theme() throws -> ThemeInfo? {
+        switch ref.target {
+        case .contact: return try node.chatTheme(peer: device)
+        case let .group(g), let .groupInvite(g): return try node.groupTheme(group: g)
+        case .notes: return node.noteTheme()
+        }
+    }
+
+    /// Sets the chat's theme for everyone in it (nil: plain).
+    func setTheme(_ t: ThemeInfo?) throws {
+        switch ref.target {
+        case .contact: try node.setChatTheme(peer: device, theme: t)
+        case let .group(g), let .groupInvite(g): try node.setGroupTheme(group: g, theme: t)
+        case .notes: try node.setNoteTheme(theme: t)
+        }
+    }
+
+    /// Whether we keep our own plain look here.
+    func ownLook() -> Bool {
+        switch ref.target {
+        case .contact: (try? node.ownLook(peer: device)) ?? false
+        case let .group(g), let .groupInvite(g): (try? node.groupOwnLook(group: g)) ?? false
+        case .notes: false
+        }
+    }
+
+    func setOwnLook(_ own: Bool) throws {
+        switch ref.target {
+        case .contact: try node.setOwnLook(peer: device, own: own)
+        case let .group(g), let .groupInvite(g): try node.setGroupOwnLook(group: g, own: own)
+        case .notes: break
+        }
+    }
+
+    /// Whether we may change the theme (a group's owners and admins).
+    func mayTheme() -> Bool {
+        switch ref.target {
+        case let .group(g), let .groupInvite(g): (try? node.mayThemeGroup(group: g)) ?? false
+        default: true
+        }
+    }
+
     func markSeen() {
         _ = try? node.markSeen(chat: ref.chatKey)
     }
