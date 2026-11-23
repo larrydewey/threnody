@@ -90,7 +90,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("androidx.core:core-ktx:1.19.1")
     // UnifiedPush wake-ups (Appendix R), off unless the user turns them on.
-    implementation("org.unifiedpush.android:connector:3.3.5")
+    implementation("org.unifiedpush.android:connector:3.3.6")
     // WebRTC's Java half for calls (audio devices), from LiveKit's prebuilt
     // WebRTC; build.sh copies it here.
     if (calls) implementation(files("libs/libwebrtc.jar"))
