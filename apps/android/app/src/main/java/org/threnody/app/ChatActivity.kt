@@ -2339,6 +2339,9 @@ class ChatActivity : Activity() {
             if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
             if (e.poll != null && e.outgoing && e.poll?.closed == false) add("End poll")
             if (e.text.isNotEmpty()) add("Copy text")
+            // A file kept privately (sealed, so out of other apps' reach):
+            // a copy can go to Downloads. One already there needs none.
+            if (entries.size == 1 && e.file?.location?.startsWith("file:") == true) add("Save to Downloads")
             if (canEdit) add("Edit")
             add("Delete for me")
             if (mine) {
@@ -2371,6 +2374,7 @@ class ChatActivity : Activity() {
                 return
             }
             if (option == "Select text") return selectText(e)
+            if (option == "Save to Downloads") return saveToDownloads(e)
             val noTrace = option == "Delete without a trace"
             val everyone = option == "Delete for everyone" || noTrace
             Threading.background {
@@ -2397,6 +2401,35 @@ class ChatActivity : Activity() {
             canReact = e.id != 0uL && !note,
             actions = options.map { option -> option to { pick(option) } },
         ) { emoji, add -> react(e, emoji, add) }.show()
+    }
+
+    /**
+     * Copies a message's privately kept file to Downloads/Threnody. A
+     * sensitive or disappearing one is asked about first: the copy outlives
+     * the message, and any app can read it.
+     */
+    private fun saveToDownloads(e: HistoryEntry) {
+        val f = e.file ?: return
+        val location = f.location ?: return
+        val save = {
+            if (f.size > SAVE_NOTICE) Toast.makeText(this, "Saving ${f.name}…", Toast.LENGTH_SHORT).show()
+            Threading.background {
+                val ok = Media.saveToDownloads(this, location, f.name)
+                runOnUiThread {
+                    Toast.makeText(this, if (ok) "Saved to Downloads/Threnody" else "Couldn't save", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        if (!f.sensitive && !e.disappearing) return save()
+        SecureBuilder(this)
+            .setTitle("Save to Downloads?")
+            .setMessage(
+                (if (f.sensitive) "This file was sent as sensitive. " else "This message disappears. ") +
+                    "The copy in Downloads stays after the message is gone, and any app with access to your files can read it."
+            )
+            .setPositiveButton("Save") { _, _ -> save() }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /**
@@ -3934,6 +3967,8 @@ class ChatActivity : Activity() {
 
     companion object {
         private const val FETCH_POLL = 1
+        /** Files larger than this (8 MiB) say they're being saved, as it takes a moment. */
+        private const val SAVE_NOTICE = 8_388_608uL
         /** Longest quote snippet, as the node cuts it. */
         const val MAX_QUOTE_CHARS = 200
         /** Opens the notes to self. */

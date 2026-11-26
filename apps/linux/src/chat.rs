@@ -2835,6 +2835,38 @@ impl ChatView {
         });
     }
 
+    /// Saves a copy of a message's file where the user picks. A sensitive
+    /// or disappearing one (`warn` says which) is asked about first: the
+    /// copy outlives the message, and other applications can read it.
+    fn save_file_copy(&self, path: &std::path::Path, name: &str, warn: Option<&str>) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let (weak, path, name) = (self.app.clone(), path.to_owned(), name.to_owned());
+        let save = move || {
+            let Some(app) = weak.upgrade() else { return };
+            let told = weak.clone();
+            crate::viewer::save_copy(&app, &path, &name, move |msg| {
+                if let Some(a) = told.upgrade() {
+                    a.toast(&msg);
+                }
+            });
+        };
+        let Some(why) = warn else {
+            return save();
+        };
+        ui::confirm(
+            &app.window,
+            "Save a copy?",
+            &format!(
+                "{why} The copy stays after the message is gone, and other applications can read it."
+            ),
+            "Save a copy…",
+            false,
+            save,
+        );
+    }
+
     /// A message's menu. For an album (`run`: its photos), reply, react
     /// and pin use the first photo; forward and delete take them all.
     fn message_menu(self: &Rc<Self>, anchor: &gtk::Box, run: &[HistoryEntry], x: f64, y: f64) {
@@ -2967,6 +2999,33 @@ impl ChatView {
         if e.file.is_none() && !e.text.is_empty() {
             let (text, a) = (e.text.clone(), anchor.clone());
             item("Copy text", Box::new(move || a.clipboard().set_text(&text)));
+        }
+        // A file here, often sealed so nothing else can read it: a copy
+        // where the user picks.
+        if run.len() == 1
+            && let Some(f) = &e.file
+            && let Some(path) = f
+                .location
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.exists())
+        {
+            let (weak, name) = (self.weak_self.clone(), f.name.clone());
+            let warn = if f.sensitive {
+                Some("This file was sent as sensitive.")
+            } else if e.disappearing {
+                Some("This message disappears.")
+            } else {
+                None
+            };
+            item(
+                "Save a copy…",
+                Box::new(move || {
+                    if let Some(t) = weak.upgrade() {
+                        t.save_file_copy(&path, &name, warn);
+                    }
+                }),
+            );
         }
         // Notes have no one to edit or delete for.
         let group = self.group().is_some() || self.is_note();

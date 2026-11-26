@@ -2,15 +2,12 @@ package org.threnody.app
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.os.Bundle
-import android.os.Environment
-import android.provider.MediaStore
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -187,21 +184,7 @@ class ImageActivity : Activity() {
     /** Copies the image at `location` to Downloads; deletes `then` afterwards. */
     private fun save(location: String, name: String, then: java.io.File? = null) {
         Threading.background {
-            val ok = try {
-                // Decrypted in memory if it was kept sealed.
-                val bytes = Media.read(this, location, Long.MAX_VALUE)
-                    ?: throw IllegalStateException("unreadable")
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, name.substringAfterLast('/').ifBlank { "photo" })
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Threnody")
-                }
-                val out = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IllegalStateException("no Downloads")
-                contentResolver.openOutputStream(out)?.use { it.write(bytes) }
-                true
-            } catch (_: Exception) {
-                false
-            }
+            val ok = Media.saveToDownloads(this, location, name.substringAfterLast('/').ifBlank { "photo" })
             then?.delete()
             runOnUiThread {
                 Toast.makeText(this, if (ok) "Saved to Downloads/Threnody" else "Couldn't save", Toast.LENGTH_SHORT).show()
