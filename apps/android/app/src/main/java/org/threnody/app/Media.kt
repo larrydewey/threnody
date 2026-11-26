@@ -240,6 +240,72 @@ object Media {
         null
     }
 
+    /**
+     * Copies the file at `location` into Downloads/Threnody as `name`; true
+     * once it is there. A sealed file is decrypted a piece at a time, so a
+     * large one is never whole in memory. Copies in Downloads outlive their
+     * messages and any app can read them, so this happens only when the
+     * user asks for it.
+     */
+    fun saveToDownloads(ctx: Context, location: String, name: String): Boolean {
+        if (Threnody.wiping) return false
+        val r = ctx.contentResolver
+        val values = android.content.ContentValues().apply {
+            // Strip any path the sender put in the name.
+            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name.substringAfterLast('/').ifBlank { "file" })
+            put(android.provider.MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/Threnody")
+            // Hidden from other apps until it's all there.
+            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val out = try {
+            r.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        } catch (e: Exception) {
+            Threnody.say("! saving $name to Downloads: ${e.message}")
+            null
+        } ?: return false
+        val ok = try {
+            r.openOutputStream(out)?.use { sink ->
+                val sealed = sealedPath(location)
+                if (sealed != null) {
+                    val size = mediaSize(sealed).toLong()
+                    var at = 0L
+                    while (at < size) {
+                        val piece = readSealed(sealed, at, COPY_PIECE)
+                        if (piece.isEmpty()) throw java.io.IOException("couldn't read it all")
+                        sink.write(piece)
+                        at += piece.size
+                        piece.fill(0)
+                    }
+                } else {
+                    val input = if (location.startsWith("content:") || location.startsWith("file:")) {
+                        r.openInputStream(Uri.parse(location))
+                    } else {
+                        java.io.FileInputStream(location)
+                    }
+                    (input ?: throw java.io.IOException("unreadable")).use { it.copyTo(sink) }
+                }
+                true
+            } ?: false
+        } catch (e: Exception) {
+            Threnody.say("! saving $name to Downloads: ${e.message}")
+            false
+        }
+        try {
+            if (ok) {
+                r.update(out, android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                }, null, null)
+            } else {
+                r.delete(out, null, null)
+            }
+        } catch (_: Exception) {
+        }
+        return ok
+    }
+
+    /** How much of a sealed file [saveToDownloads] decrypts at a time. */
+    private const val COPY_PIECE = 1024 * 1024
+
     /** Where decrypted copies wait: the cache, never backed up. */
     private fun plainDir(ctx: Context) = File(ctx.cacheDir, "plain")
 
