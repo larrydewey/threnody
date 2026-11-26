@@ -1,0 +1,2 @@
+- Save a downloaded file to Downloads: long-press it in the chat and choose Save to Downloads. Large files you tap to download are kept privately until you do.
+- Sensitive files and files in disappearing chats ask first, since the copy stays after the message is gone.

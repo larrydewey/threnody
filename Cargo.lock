@@ -5760,7 +5760,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-cli"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5779,7 +5779,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-core"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5807,7 +5807,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-desktop"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "async-channel",
  "gstreamer",
@@ -5826,7 +5826,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-ffi"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "qrcode",
  "rqrr",
@@ -5844,7 +5844,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-groups"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "const-cbor",
  "openmls",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-media"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "anyhow",
  "futures-lite",
@@ -5875,7 +5875,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-net"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "anyhow",
  "blake2 0.10.6",
@@ -5903,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-radio"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5917,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "threnody-tun"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "libc",
  "tokio",
