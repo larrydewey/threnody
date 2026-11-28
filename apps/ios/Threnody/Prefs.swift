@@ -23,7 +23,11 @@ enum Prefs {
     static let handleVersion = "handle_version"
 
     /// The switches that are on unless turned off.
-    static let protective = [cover, pace, onion, strip, reach, volunteers, sendRead, sendTyping]
+    static let protective = [cover, onion, strip, reach, volunteers, sendRead, sendTyping]
+    /// Switches read through `flag` that stay off until turned on: pacing
+    /// makes every message wait for a cover tick (up to 10 s on mobile data,
+    /// at every relay hop), so speed wins by default.
+    static let optIn: Set<String> = [pace]
 
     /// The port an anonymous identity listens on, kept so its invites
     /// keep working across launches.
@@ -39,7 +43,7 @@ enum Prefs {
     private static var bound = 0
 
     /// On unless set to off.
-    static func flag(_ key: String) -> Bool { text(key) != "false" }
+    static func flag(_ key: String) -> Bool { optIn.contains(key) ? text(key) == "true" : text(key) != "false" }
 
     static func setFlag(_ key: String, _ on: Bool) { setText(key, on ? "true" : "false") }
 

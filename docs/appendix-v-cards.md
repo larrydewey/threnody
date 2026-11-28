@@ -50,10 +50,10 @@ History keeps the card with the entry (history key 22, the same encoding).
 ## Secrets, view once, no forwarding
 
 - **Who may get them.** A secret or a view-once card goes only to one contact, and only if every device of theirs said in its `Hello` that it shows cards (`FEATURE_CARDS`, 1 048 576). An older app would show the fallback, or keep the card for good. Sending one to a group fails.
-- **The sender's copy.** The sender's own history keeps only what it was: a secret's kind and title, or a view-once card's kind. What it held is not stored on the sending device.
+- **The sender's copy.** The sender's own history keeps only what it was: a secret's kind and title, or a view-once card's kind. What it held is not stored on the sending device, unless the user asks to keep what they send (`set_keep_sent_secrets`, off by default): then the sending device keeps the whole card, to open as often as it likes, still out of backups. What the receiver gets doesn't change.
 - **View once.** The receiver's history entry shows the card's kind but not its contents. Opening it (`open_card`) gives the contents once and empties the stored card in the same step, so it can't be opened again. The receiver's other devices get their own copy and each can open it once.
 - **No forwarding.** Apps offer no *Forward* for a card marked so, for a secret, or for a view-once card.
-- **A time of its own.** A card may say how long it stays (`expires_in_s`, at most a week): it then disappears like a disappearing message, at that time or the chat's timer, whichever comes first. Unlike a disappearing message, it doesn't change the chat's timer.
+- **A time of its own.** A card may say how long it stays (`expires_in_s`, at most a week; none means for good): it then disappears like a disappearing message, at that time or the chat's timer, whichever comes first. Unlike a disappearing message, it doesn't change the chat's timer.
 - **Kept out of copies.** Backups leave out secrets and view-once cards, as they leave out disappearing messages (Appendix C, *Backups*). Apps copy a secret's fields as sensitive (kept out of keyboard clipboard history where the platform allows) and show hidden fields covered until revealed.
 
 ## Privacy

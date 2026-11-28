@@ -594,6 +594,8 @@ pub(crate) struct Shared {
     pub(crate) profile: Mutex<threnody_core::persona::Profile>,
     /// Strip identifying metadata from images we send.
     pub(crate) strip_metadata: std::sync::atomic::AtomicBool,
+    /// See [`Node::keep_sent_secrets`].
+    pub(crate) keep_sent_secrets: std::sync::atomic::AtomicBool,
     /// Under cover traffic, what we write waits for the next tick, so
     /// sending looks like idling (on by default).
     pub(crate) pace_messages: std::sync::atomic::AtomicBool,
@@ -1029,7 +1031,8 @@ impl Node {
             persona,
             profile: Mutex::new(profile),
             strip_metadata: std::sync::atomic::AtomicBool::new(true),
-            pace_messages: std::sync::atomic::AtomicBool::new(true),
+            keep_sent_secrets: std::sync::atomic::AtomicBool::new(false),
+            pace_messages: std::sync::atomic::AtomicBool::new(false),
             default_timer: std::sync::atomic::AtomicU32::new(0),
             tunnel: Mutex::new(tunnel),
             tunnel_peers: Mutex::new(HashMap::new()),
@@ -1203,11 +1206,25 @@ impl Node {
         self.shared.strip_metadata.store(on, Ordering::Relaxed);
     }
 
+    /// Whether our own history keeps all of a secret or view-once card we
+    /// send (off by default: it keeps only what it was, see
+    /// [`threnody_core::card::Card::sender_copy`]). On, what we sent stays
+    /// readable here, for good unless a timer says otherwise; backups
+    /// still leave it out.
+    pub fn keep_sent_secrets(&self) -> bool {
+        self.shared.keep_sent_secrets.load(Ordering::Relaxed)
+    }
+
+    pub fn set_keep_sent_secrets(&self, on: bool) {
+        self.shared.keep_sent_secrets.store(on, Ordering::Relaxed);
+    }
+
     /// Whether, under cover traffic, what we write waits for the next tick
-    /// like everything else (on by default), so someone watching the
-    /// network can't tell sending from idling. Off, texts and other
-    /// messages go at once (padded like a tick) and arrive faster, but
-    /// their timing shows.
+    /// like everything else, so someone watching the network can't tell
+    /// sending from idling. Off (the default), messages, receipts and the
+    /// relay and onion cells we carry go at once (padded like a tick) and
+    /// arrive faster, but their timing shows; cover traffic still fills
+    /// the quiet.
     pub fn pace_messages(&self) -> bool {
         self.shared.pace_messages.load(Ordering::Relaxed)
     }
@@ -2472,11 +2489,18 @@ where
                     }
                 }
             }
-            if ticker.is_none() && chan.can_send() {
+            // Unpaced (see `Node::pace_messages`), nothing waits for a tick:
+            // what someone wrote, its receipts and acks, and the relay and
+            // onion cells carrying other people's messages through us all
+            // go at once, padded as a tick is. A cell that waited a tick at
+            // every hop made a voice message over a two-hop circuit on
+            // mobile data take minutes.
+            let unpaced = ticker.is_some() && !shared.pace_messages.load(Ordering::Relaxed);
+            if (ticker.is_none() || unpaced) && chan.can_send() {
                 let mut waiting = VecDeque::new();
                 while let Some(m) = pending.pop_front() {
                     match ready(node, &peer, m, peer_acks) {
-                        Ok(Some(m)) => write_frame(&mut wr, &chan.seal(&m)?).await?,
+                        Ok(Some(m)) => write_frame(&mut wr, &seal_link(&mut chan, &m, unpaced)?).await?,
                         Ok(None) => {}
                         Err(m) => waiting.push_back(m),
                     }

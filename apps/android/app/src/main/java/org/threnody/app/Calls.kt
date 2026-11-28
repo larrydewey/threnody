@@ -924,7 +924,8 @@ object Calls {
         // (voice only stays one tap away).
         val video = c.group == null && c.peerVideo
         val answerVideo = answering(5, true)
-        val hide = hideCaller(ctx)
+        // Named while the phone is unlocked, if asked (see CallerId).
+        val hide = hideCaller(ctx) && !CallerId.nameNow(ctx)
         val n = Notification.Builder(ctx, CHANNEL_RING)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(when {
@@ -956,6 +957,7 @@ object Calls {
             .setVisibility(Notification.VISIBILITY_PRIVATE)
             .setPublicVersion(public(ctx, "Incoming call"))
             .setCategory(Notification.CATEGORY_CALL)
+            .setOnlyAlertOnce(quietUpdate)
             .setFullScreenIntent(open, true)
             .setContentIntent(open)
             .setOngoing(true)
@@ -963,6 +965,13 @@ object Calls {
         // Rings (and vibrates) over and over until answered or declined.
         n.flags = n.flags or Notification.FLAG_INSISTENT
         post(ctx, ID_RINGING, n)
+        // Said aloud while unlocked, if asked; shown again (unnamed) when the
+        // phone locks, named again when it unlocks. Showing it again doesn't
+        // start the ringing over.
+        CallerId.ringing(
+            ctx,
+            if (c.group != null) "Group call in ${c.title}" else "${c.title} is calling",
+        ) { if (current?.state == "incoming") ringAgain(ctx) }
     }
 
     /**
@@ -1021,8 +1030,18 @@ object Calls {
     }
 
     private fun cancelRinging(ctx: Context) {
+        CallerId.stop()
         ctx.getSystemService(NotificationManager::class.java)?.cancel(ID_RINGING)
     }
+
+    /** The ringing notification again, as the phone now is: it doesn't ring anew. */
+    private fun ringAgain(ctx: Context) {
+        quietUpdate = true
+        try { ring(ctx) } finally { quietUpdate = false }
+    }
+
+    /** While [ringAgain] shows the ringing call again. */
+    private var quietUpdate = false
 
     private fun missed(ctx: Context, c: Call) {
         val n = Notification.Builder(ctx, CHANNEL_MISSED)

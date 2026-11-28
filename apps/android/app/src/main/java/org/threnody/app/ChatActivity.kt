@@ -137,6 +137,35 @@ class ChatActivity : Activity() {
     private var voice: VoiceRecorder? = null
     /** Slid up: it goes on recording without a finger on the button. */
     private var voiceLocked = false
+    /**
+     * The press that slid up to lock is still down: lifting it keeps the
+     * recording going, where lifting any other press stops it.
+     */
+    private var lockingPress = false
+    /**
+     * A voice message recorded and not sent yet (its plain file and length):
+     * it waits in the message box, to play back, delete or send.
+     */
+    private var voiceDraft: Pair<java.io.File, Long>? = null
+    /** In place of the message box while [voiceDraft] waits. */
+    private lateinit var draftBar: LinearLayout
+    private lateinit var draftPlay: ImageButton
+    private lateinit var draftSeek: SeekBar
+    private lateinit var draftTime: TextView
+    /** Plays [voiceDraft] back; made when first played. */
+    private var draftPlayer: android.media.MediaPlayer? = null
+    private val draftTick = object : Runnable {
+        override fun run() {
+            val p = draftPlayer ?: return
+            val (_, ms) = voiceDraft ?: return
+            val length = if (p.duration > 0) p.duration else ms.toInt()
+            if (length > 0) draftSeek.progress = (p.currentPosition * 1000L / length).toInt()
+            draftTime.text = if (p.isPlaying || p.currentPosition > 0) Clips.clock(p.currentPosition.toLong()) else Clips.clock(ms)
+            draftPlay.setImageResource(if (p.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
+            draftPlay.contentDescription = if (p.isPlaying) "Pause" else "Play the voice message"
+            if (p.isPlaying) typingHandler.postDelayed(this, 100)
+        }
+    }
     private var pressX = 0f
     private var pressY = 0f
     private val recordTick = object : Runnable {
@@ -420,9 +449,39 @@ class ChatActivity : Activity() {
                 addView(recordingTime, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
                 addView(recordingHint, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginStart = dp(8) })
             }
+            draftPlay = button(R.drawable.ic_play, "Play the voice message", R.color.accent) { toggleDraftPlayback() }
+            draftSeek = SeekBar(this@ChatActivity).apply {
+                max = 1000
+                contentDescription = "Voice message position"
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                        val p = draftPlayer ?: return
+                        if (fromUser && p.duration > 0) {
+                            p.seekTo((p.duration.toLong() * progress / 1000).toInt())
+                            draftTime.text = Clips.clock(p.currentPosition.toLong())
+                        }
+                    }
+                    override fun onStartTrackingTouch(bar: SeekBar) {}
+                    override fun onStopTrackingTouch(bar: SeekBar) {}
+                })
+            }
+            draftTime = label("0:00", 14f, R.color.muted)
+            draftBar = LinearLayout(this@ChatActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                visibility = View.GONE
+                background = rounded(color(R.color.field), dp(26).toFloat())
+                setPadding(dp(4), 0, dp(14), 0)
+                addView(button(R.drawable.ic_delete, "Delete the voice message", R.color.muted) { discardVoiceDraft() },
+                    LinearLayout.LayoutParams(dp(44), dp(44)))
+                addView(draftPlay, LinearLayout.LayoutParams(dp(44), dp(44)))
+                addView(draftSeek, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                addView(draftTime, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            }
             val field = android.widget.FrameLayout(this@ChatActivity).apply {
                 addView(pill, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
                 addView(recordingBar, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+                addView(draftBar, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             }
             addView(field, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginEnd = dp(Design.sm) })
             sendButton = round(R.drawable.ic_send, "Send") { send() }.apply { visibility = View.GONE }
@@ -442,42 +501,74 @@ class ChatActivity : Activity() {
     // ----- Voice and video messages -----
 
     /**
-     * Hold the microphone to record; let go to send. Sliding left cancels,
-     * sliding up locks it on (then the button sends).
+     * Hold the microphone to record; let go and the recording waits in the
+     * message box, to play back, delete or send. Sliding left cancels;
+     * sliding up locks it on, so the finger can lift and recording goes on
+     * until the stop button. Nothing is sent until Send is tapped.
      */
     private fun voiceTouch(v: View, ev: MotionEvent): Boolean {
+        fun inside() = ev.x >= 0 && ev.y >= 0 && ev.x <= v.width && ev.y <= v.height
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                if (voice != null && voiceLocked) return true
+                // A tap on Send (a draft) or Stop (locked): acted on when lifted.
+                if (voiceDraft != null || (voice != null && voiceLocked)) {
+                    v.isPressed = true
+                    return true
+                }
                 pressX = ev.rawX
                 pressY = ev.rawY
+                lockingPress = false
+                // The slide is ours: the chat behind mustn't take it as a scroll.
+                v.parent?.requestDisallowInterceptTouchEvent(true)
                 startVoice(v)
             }
             MotionEvent.ACTION_MOVE -> if (voice != null && !voiceLocked) {
                 if (pressX - ev.rawX > dp(120)) cancelVoice()
-                else if (pressY - ev.rawY > dp(80)) lockVoice()
-            }
-            MotionEvent.ACTION_UP -> {
-                val rec = voice ?: return true
-                if (voiceLocked || rec.elapsed >= Clips.MIN_MS) finishVoice()
-                else {
-                    cancelVoice()
-                    Toast.makeText(this, "Hold to record a voice message", Toast.LENGTH_SHORT).show()
+                else if (pressY - ev.rawY > dp(80)) {
+                    lockingPress = true
+                    lockVoice(v)
                 }
             }
-            MotionEvent.ACTION_CANCEL -> if (!voiceLocked) cancelVoice()
+            MotionEvent.ACTION_UP -> {
+                v.isPressed = false
+                if (voiceDraft != null) {
+                    if (inside()) {
+                        Design.mediumHaptic(v)
+                        sendVoiceDraft()
+                    }
+                    return true
+                }
+                val rec = voice ?: return true
+                when {
+                    // The finger that locked it lifts: recording goes on.
+                    voiceLocked && lockingPress -> lockingPress = false
+                    voiceLocked -> if (inside()) stopVoice()
+                    rec.elapsed >= Clips.MIN_MS -> stopVoice()
+                    else -> {
+                        cancelVoice()
+                        Toast.makeText(this, "Hold to record a voice message", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                v.isPressed = false
+                // Only a held recording ends with the press; a locked one goes on.
+                if (voice != null && !voiceLocked) cancelVoice()
+                lockingPress = false
+            }
         }
         return true
     }
 
     private fun startVoice(v: View) {
-        if (!::node.isInitialized || voice != null) return
+        if (!::node.isInitialized || voice != null || voiceDraft != null) return
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             return requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), VOICE_PERMISSION)
         }
         clipPlayer?.stop()
         voice = try {
-            VoiceRecorder(this, Clips.file(this, persona, video = false)) { runOnUiThread { finishVoice() } }
+            // At the longest a voice message may be, it stops into a draft.
+            VoiceRecorder(this, Clips.file(this, persona, video = false)) { runOnUiThread { stopVoice() } }
         } catch (e: Exception) {
             Toast.makeText(this, "Couldn't record: ${e.message}", Toast.LENGTH_LONG).show()
             return
@@ -490,21 +581,25 @@ class ChatActivity : Activity() {
         typingHandler.post(recordTick)
     }
 
-    private fun lockVoice() {
+    private fun lockVoice(v: View) {
         voiceLocked = true
-        recordingHint.text = "Tap send when done"
-        micButton.setImageResource(R.drawable.ic_send)
-        micButton.contentDescription = "Send the voice message"
+        Design.mediumHaptic(v)
+        recordingHint.text = "Locked · tap stop to review"
+        micButton.setImageResource(R.drawable.ic_stop)
+        micButton.contentDescription = "Stop recording"
+        micButton.tooltipText = "Stop recording"
     }
 
     private fun endVoice() {
         typingHandler.removeCallbacks(recordTick)
         voice = null
         voiceLocked = false
+        lockingPress = false
         recordingBar.visibility = View.GONE
         compose.visibility = View.VISIBLE
         micButton.setImageResource(R.drawable.ic_mic)
         micButton.contentDescription = "Hold to record a voice message"
+        micButton.tooltipText = "Hold to record a voice message"
     }
 
     private fun cancelVoice() {
@@ -513,11 +608,83 @@ class ChatActivity : Activity() {
         rec.cancel()
     }
 
-    private fun finishVoice() {
+    /** Stops recording; what was recorded waits in the message box as a draft. */
+    private fun stopVoice() {
         val rec = voice ?: return
         endVoice()
         val (file, ms) = rec.stop() ?: return
+        showVoiceDraft(file, ms)
+    }
+
+    private fun showVoiceDraft(file: java.io.File, ms: Long) {
+        voiceDraft = file to ms
+        draftSeek.progress = 0
+        draftTime.text = Clips.clock(ms)
+        draftPlay.setImageResource(R.drawable.ic_play)
+        draftBar.visibility = View.VISIBLE
+        compose.visibility = View.INVISIBLE
+        micButton.setImageResource(R.drawable.ic_send)
+        micButton.contentDescription = "Send the voice message"
+        micButton.tooltipText = "Send the voice message"
+    }
+
+    /** Takes the draft out of the message box; its file is the caller's. */
+    private fun clearVoiceDraft(): Pair<java.io.File, Long>? {
+        val draft = voiceDraft ?: return null
+        voiceDraft = null
+        typingHandler.removeCallbacks(draftTick)
+        draftPlayer?.release()
+        draftPlayer = null
+        draftBar.visibility = View.GONE
+        compose.visibility = View.VISIBLE
+        micButton.setImageResource(R.drawable.ic_mic)
+        micButton.contentDescription = "Hold to record a voice message"
+        micButton.tooltipText = "Hold to record a voice message"
+        return draft
+    }
+
+    private fun discardVoiceDraft() {
+        val (file, _) = clearVoiceDraft() ?: return
+        Threading.io { Media.dropPlain(file) }
+    }
+
+    private fun sendVoiceDraft() {
+        val (file, ms) = clearVoiceDraft() ?: return
         sendClip(file, ms, video = false)
+    }
+
+    private fun pauseVoiceDraft() {
+        draftPlayer?.takeIf { it.isPlaying }?.pause()
+        typingHandler.post(draftTick)
+    }
+
+    /** Plays the draft back from where it was, or pauses it. */
+    private fun toggleDraftPlayback() {
+        val (file, _) = voiceDraft ?: return
+        val p = draftPlayer ?: try {
+            android.media.MediaPlayer().apply {
+                setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                setDataSource(file.path)
+                setOnCompletionListener {
+                    seekTo(0)
+                    typingHandler.post(draftTick)
+                }
+                prepare()
+            }.also { draftPlayer = it }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Couldn't play it: ${e.message}", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (p.isPlaying) p.pause() else {
+            clipPlayer?.stop()
+            p.start()
+        }
+        typingHandler.post(draftTick)
     }
 
     /** Records a video message on a screen of its own, then sends it. */
@@ -839,9 +1006,11 @@ class ChatActivity : Activity() {
         started = false
         callBanner.stop()
         saveDraft()
-        // Leaving the chat stops a voice message, and drops one recording.
+        // Leaving the chat stops a voice message playing. A recording stops
+        // too, and waits as a draft (a press too short to be one is dropped).
         clipPlayer?.stop()
-        cancelVoice()
+        pauseVoiceDraft()
+        voice?.let { if (voiceLocked || it.elapsed >= Clips.MIN_MS) stopVoice() else cancelVoice() }
         typingHandler.removeCallbacks(stopTyping)
         sendTyping(false)
         Threnody.visible--
@@ -3962,6 +4131,8 @@ class ChatActivity : Activity() {
 
     override fun onDestroy() {
         fetchPoll.removeCallbacksAndMessages(null)
+        // A draft never sent goes with the chat: its plain file is deleted.
+        if (::draftBar.isInitialized) discardVoiceDraft()
         super.onDestroy()
     }
 

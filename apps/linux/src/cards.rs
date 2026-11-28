@@ -823,6 +823,26 @@ fn ask(
     d.present(Some(window));
 }
 
+/// How long a shared secret lasts, as its form offers it: gone after an
+/// hour, a day (the first choice) or a week, or kept for good.
+const SECRET_LIVES: &[&str] = &[
+    "Gone after 1 hour",
+    "Gone after 1 day",
+    "Gone after 1 week",
+    "Kept for good",
+];
+const SECRET_LIFE_DEFAULT: u32 = 1;
+
+/// Seconds for [`SECRET_LIVES`]' choice `i`; 0 is for good.
+fn secret_life_s(i: u32) -> u32 {
+    match i {
+        0 => 3600,
+        2 => 7 * 86_400,
+        3 => 0,
+        _ => 86_400,
+    }
+}
+
 fn card(item: CardItemInfo, view_once: bool, expires_in_s: u32) -> CardInfo {
     CardInfo {
         item,
@@ -1120,12 +1140,8 @@ pub fn compose_secret(
     // In our own notes there's nobody to view it once.
     once.set_active(!in_notes);
     once.set_visible(!in_notes);
-    let expiry = gtk::DropDown::from_strings(&[
-        "Gone after 1 hour",
-        "Gone after 1 day",
-        "Gone after 1 week",
-    ]);
-    expiry.set_selected(1);
+    let expiry = gtk::DropDown::from_strings(SECRET_LIVES);
+    expiry.set_selected(SECRET_LIFE_DEFAULT);
     form.append(&once);
     form.append(&expiry);
     ask(
@@ -1151,11 +1167,7 @@ pub fn compose_secret(
             if t.is_empty() || fs.is_empty() {
                 return None;
             }
-            let secs = match expiry.selected() {
-                0 => 3600,
-                2 => 7 * 86_400,
-                _ => 86_400,
-            };
+            let secs = secret_life_s(expiry.selected());
             Some(card(
                 CardItemInfo::Secret {
                     kind: kind.into(),
@@ -1274,12 +1286,8 @@ fn compose_payment_card(
     // In our own notes there's nobody to view it once.
     once.set_active(!in_notes);
     once.set_visible(!in_notes);
-    let keep = gtk::DropDown::from_strings(&[
-        "Gone after 1 hour",
-        "Gone after 1 day",
-        "Gone after 1 week",
-    ]);
-    keep.set_selected(1);
+    let keep = gtk::DropDown::from_strings(SECRET_LIVES);
+    keep.set_selected(SECRET_LIFE_DEFAULT);
     form.append(&once);
     form.append(&keep);
     ask(
@@ -1320,11 +1328,7 @@ fn compose_payment_card(
                 hidden,
             })
             .collect();
-            let secs = match keep.selected() {
-                0 => 3600,
-                2 => 7 * 86_400,
-                _ => 86_400,
-            };
+            let secs = secret_life_s(keep.selected());
             Some(card(
                 CardItemInfo::Secret {
                     kind: "card".into(),

@@ -53,6 +53,9 @@ object Privacy {
     @Volatile var metered = false
 
     private const val TIMER = "default_timer"
+    private const val SECRET_ONCE = "secrets_view_once"
+    private const val SECRET_LIFE = "secrets_life_s"
+    private const val KEEP_SECRETS = "keep_sent_secrets"
     /** Disappearing-timer choices, in seconds (null = off). */
     val TIMERS = listOf<Pair<String, UInt?>>(
         "Off" to null, "30 seconds" to 30u, "5 minutes" to 300u, "1 hour" to 3600u,
@@ -71,8 +74,12 @@ object Privacy {
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun coverTraffic(ctx: Context) = prefs(ctx).getBoolean(COVER, true)
-    /** Messages wait for the next cover tick (on unless turned off). */
-    fun paceMessages(ctx: Context) = prefs(ctx).getBoolean(PACE, true)
+    /**
+     * Messages wait for the next cover tick (off unless turned on: then
+     * everything goes at once, which on mobile data and through relays is
+     * the difference between a second and a minute).
+     */
+    fun paceMessages(ctx: Context) = prefs(ctx).getBoolean(PACE, false)
     fun onionFirst(ctx: Context) = prefs(ctx).getBoolean(ONION, true)
     fun stripMetadata(ctx: Context) = prefs(ctx).getBoolean(STRIP, true)
     /**
@@ -81,6 +88,28 @@ object Privacy {
      * old), on unmetered networks only. On unless turned off.
      */
     fun autoFetchFiles(ctx: Context) = prefs(ctx).getBoolean(AUTO_FETCH, true)
+    /** How long a secret (login, payment card, note) lasts, as the form first offers: label and seconds, 0 for for good. */
+    val SECRET_LIVES = listOf("Kept for good" to 0u, "Gone after 1 hour" to 3600u, "Gone after 1 day" to 86_400u, "Gone after 1 week" to 604_800u)
+
+    /** Whether a secret's form starts out "They can view it once" (it did before this was a setting). */
+    fun secretsViewOnce(ctx: Context) = prefs(ctx).getBoolean(SECRET_ONCE, true)
+
+    fun setSecretsViewOnce(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(SECRET_ONCE, on).apply()
+
+    /** Seconds a secret's form starts out with, 0 for for good: a day unless changed. */
+    fun secretsLife(ctx: Context): UInt =
+        prefs(ctx).getLong(SECRET_LIFE, 86_400L).toUInt().takeIf { s -> SECRET_LIVES.any { it.second == s } } ?: 86_400u
+
+    fun setSecretsLife(ctx: Context, secs: UInt) = prefs(ctx).edit().putLong(SECRET_LIFE, secs.toLong()).apply()
+
+    /** Whether this phone keeps all of a secret it sends, not only its title (off unless turned on). */
+    fun keepSentSecrets(ctx: Context) = prefs(ctx).getBoolean(KEEP_SECRETS, false)
+
+    fun setKeepSentSecrets(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(KEEP_SECRETS, on).apply()
+        Threnody.applyPrivacy(ctx)
+    }
+
     fun privateNotifications(ctx: Context) = prefs(ctx).getBoolean(NOTIFY_PRIVATE, true)
 
     fun setPrivateNotifications(ctx: Context, on: Boolean) =

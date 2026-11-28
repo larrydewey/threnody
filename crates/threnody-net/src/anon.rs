@@ -316,9 +316,12 @@ where
     let mut last_use = tokio::time::Instant::now();
     let result: Result<()> = async {
         loop {
-            if ticker.is_none() && chan.can_send() {
+            // Unpaced (see `Node::pace_messages`), cells go at once, padded
+            // as a tick is, rather than one per tick.
+            let unpaced = ticker.is_some() && !node.pace_messages();
+            if (ticker.is_none() || unpaced) && chan.can_send() {
                 while let Some(m) = pending.pop() {
-                    write_frame(&mut wr, &chan.seal(&m)?).await?;
+                    write_frame(&mut wr, &crate::node::seal_link(&mut chan, &m, unpaced)?).await?;
                 }
             }
             tokio::select! {

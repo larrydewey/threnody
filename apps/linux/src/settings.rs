@@ -8,6 +8,10 @@ use std::path::PathBuf;
 pub const COVER: &str = "cover_traffic";
 /// Under cover traffic, messages wait for the next beat (on unless off).
 pub const PACE: &str = "pace_messages";
+/// Switches among the [`Settings::flag`]s that are off until turned on:
+/// pacing makes every message wait for a cover tick (up to 10 s on a
+/// metered link, at every relay hop), so speed wins by default.
+const OPT_IN: &[&str] = &[PACE];
 pub const ONION: &str = "onion_first";
 pub const STRIP: &str = "strip_metadata";
 /// Photos and voice and video messages from our other devices download by
@@ -144,6 +148,9 @@ impl Settings {
 
     /// A switch; protective ones default to on.
     pub fn flag(&self, key: &str) -> bool {
+        if OPT_IN.contains(&key) {
+            return self.opted_in(key);
+        }
         self.values.get(key).is_none_or(|v| v != "false")
     }
 
@@ -237,5 +244,18 @@ mod tests {
         );
         assert!(s.opted_in(BLUETOOTH));
         assert!(!s.opted_in(WIFI_DIRECT));
+    }
+
+    #[test]
+    fn pacing_is_off_until_turned_on_and_cover_on_until_turned_off() {
+        let s = Settings::parse(PathBuf::from("/nonexistent/desktop.conf"), "");
+        assert!(!s.flag(PACE));
+        assert!(s.flag(COVER));
+        let s = Settings::parse(
+            PathBuf::from("/nonexistent/desktop.conf"),
+            "pace_messages=true\ncover_traffic=false\n",
+        );
+        assert!(s.flag(PACE));
+        assert!(!s.flag(COVER));
     }
 }

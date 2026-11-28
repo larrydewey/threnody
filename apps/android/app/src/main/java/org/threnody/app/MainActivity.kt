@@ -1103,6 +1103,15 @@ class MainActivity : Activity() {
                 else "Contacts don't see when you're typing"
             }) { Privacy.setSendTyping(ctx, it) }
             link("Default disappearing timer", "For new chats") { defaultTimer() }
+            toggle("Secrets are view once", { Privacy.secretsViewOnce(ctx) }, {
+                if (it) "Logins, payment cards and notes you share start out seen once, then gone"
+                else "Logins, payment cards and notes you share stay with them until they expire (you can still pick view once)"
+            }) { Privacy.setSecretsViewOnce(ctx, it) }
+            link("How long secrets last", "What a shared login, payment card or note starts out with") { secretsLife() }
+            toggle("Keep secrets I send", { Privacy.keepSentSecrets(ctx) }, {
+                if (it) "This phone keeps what you shared in a secret, to look at again (still left out of backups)"
+                else "This phone keeps only a secret's title once it's sent"
+            }) { Privacy.setKeepSentSecrets(ctx, it) }
             toggle("GIF search with GIPHY", { Privacy.giphy(ctx) }, {
                 if (it) "GIPHY sees your searches and this phone's IP address"
                 else "The GIF button offers only GIFs on this phone"
@@ -1111,6 +1120,18 @@ class MainActivity : Activity() {
                 if (it) "Photos, voice and video messages up to 30 days old, on Wi-Fi. Sensitive and disappearing ones only when you tap them"
                 else "Files from your other devices download only when you tap them"
             }) { Privacy.setAutoFetchFiles(ctx, it) }
+
+            if (uniffi.threnody_ffi.callsBuiltIn()) {
+                section("Calls")
+                toggle("Show who's calling when unlocked", { CallerId.showWhenUnlocked(ctx) }, {
+                    if (it) "While your phone is unlocked, a ringing call names the caller even with app lock or private notifications on. The lock screen still doesn't"
+                    else "With app lock or private notifications on, a ringing call says only that there's a call"
+                }) { CallerId.setShowWhenUnlocked(ctx, it) }
+                toggle("Say who's calling", { CallerId.announce(ctx) }, {
+                    if (it) "While your phone is unlocked and its ringer is on, a ringing call says the caller's name aloud"
+                    else "Calls only ring"
+                }) { CallerId.setAnnounce(ctx, it) }
+            }
 
             section("Security")
             link("App lock", if (AppLock.enabled(ctx)) "On" else "Off") { AppLockUi.show(ctx) }
@@ -1441,6 +1462,20 @@ class MainActivity : Activity() {
     }
 
     /** The disappearing timer for chats that haven't chosen their own. */
+    private fun secretsLife() {
+        val choices = Privacy.SECRET_LIVES
+        val checked = choices.indexOfFirst { it.second == Privacy.secretsLife(this) }
+        SecureBuilder(this)
+            .setTitle("How long secrets last")
+            .setSingleChoiceItems(choices.map { it.first }.toTypedArray(), checked) { d, i ->
+                d.dismiss()
+                Privacy.setSecretsLife(this, choices[i].second)
+                Toast.makeText(this, "Secrets: ${choices[i].first.lowercase()}", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun defaultTimer() {
         val choices = Privacy.TIMERS
         val checked = choices.indexOfFirst { it.second == Privacy.defaultTimer(this) }

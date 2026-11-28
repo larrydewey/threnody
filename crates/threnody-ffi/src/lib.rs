@@ -2618,6 +2618,16 @@ PersistentKeepalive = 25\n",
         self.node.strip_metadata()
     }
 
+    /// Whether our history keeps all of a secret or view-once card we
+    /// send, rather than only its kind and title. Off by default.
+    pub fn set_keep_sent_secrets(&self, on: bool) {
+        self.node.set_keep_sent_secrets(on);
+    }
+
+    pub fn keep_sent_secrets(&self) -> bool {
+        self.node.keep_sent_secrets()
+    }
+
     /// Whether, under cover traffic, messages wait for the next cover tick
     /// so sending can't be told from idling (on by default). Off, they go
     /// at once and arrive faster, but an observer sees when you send.
@@ -4898,7 +4908,7 @@ mod tests {
         assert!(again.opened);
         assert!(matches!(again.item, CardItemInfo::Secret { fields, .. } if fields.is_empty()));
         // Alice's own copy says what she sent, not what it held.
-        let mine = alice.history(b_fp, 10).unwrap().pop().unwrap();
+        let mine = alice.history(b_fp.clone(), 10).unwrap().pop().unwrap();
         let mine = mine.card.unwrap();
         assert!(mine.opened);
         assert!(
@@ -4909,6 +4919,34 @@ mod tests {
         let mut secret_again = opened_secret();
         secret_again.view_once = false;
         assert!(alice.send_group_card(g, secret_again).is_err());
+
+        // Asked to keep what she sends, her copy holds all of it, for
+        // good (no time of its own), and opens as often as she likes.
+        assert!(!alice.keep_sent_secrets(), "off by default");
+        alice.set_keep_sent_secrets(true);
+        let kept = CardInfo {
+            view_once: true,
+            ..opened_secret()
+        };
+        alice.send_card(b_fp.clone(), kept.clone()).unwrap();
+        let mine = alice.history(b_fp.clone(), 10).unwrap().pop().unwrap();
+        assert!(!mine.disappearing);
+        let card = mine.card.clone().unwrap();
+        assert!(!card.opened);
+        assert!(matches!(&card.item, CardItemInfo::Secret { fields, .. } if fields.len() == 1));
+        for _ in 0..2 {
+            let again = alice
+                .open_card(b_fp.clone(), mine.at_ms, mine.device.clone())
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&again.item, CardItemInfo::Secret { fields, .. } if fields[0].value == "1234")
+            );
+        }
+        // What Bob gets is unchanged: view once.
+        wait(&bob, |e| matches!(e, NodeEvent::Message { .. }));
+        let got = bob.history(a_fp, 10).unwrap().pop().unwrap();
+        assert!(got.card.unwrap().view_once);
     }
 
     fn opened_secret() -> CardInfo {

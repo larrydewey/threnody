@@ -1197,7 +1197,13 @@ impl Node {
                 list: None,
                 ticked_ms: 0,
                 preview,
-                card: card.as_ref().map(threnody_core::card::Card::sender_copy),
+                card: card.as_ref().map(|c| {
+                    if self.keep_sent_secrets() {
+                        c.clone()
+                    } else {
+                        c.sender_copy()
+                    }
+                }),
                 notice: None,
             },
         );

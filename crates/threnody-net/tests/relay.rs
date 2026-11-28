@@ -287,3 +287,39 @@ async fn bluetooth_only_device_reaches_ip_peer_through_a_relay() {
     // reach_peer reuses the live session.
     phone.node.reach_peer(&sid).await.unwrap();
 }
+
+/// Under slow cover traffic on every link, a message through a relay still
+/// arrives at once: with pacing off (the default) the cells carrying it
+/// don't wait for a tick at each hop. Paced, each hop waits for one.
+#[tokio::test]
+async fn unpaced_cells_skip_the_cover_ticks_at_every_hop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut a, mut b, mut c) = (
+        spawn(&dir, "a").await,
+        spawn(&dir, "b").await,
+        spawn(&dir, "c").await,
+    );
+    link(&mut a, &mut b, true).await;
+    link(&mut c, &mut b, true).await;
+    let cid = c.node.identity();
+    a.node.connect_relayed(cid.fingerprint()).await.unwrap();
+    c.node.accept_contact(&a.node.identity());
+    // Session setup done, then every link ticks once a minute.
+    for n in [&a, &b, &c] {
+        assert!(!n.node.pace_messages(), "unpaced by default");
+        n.node.set_constant_rate(Some(Duration::from_secs(60)));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    a.node.send(&cid, text("through b, at once")).unwrap();
+    next(
+        &mut c.rx,
+        |e| matches!(e, Event::Message { msg, .. } if *msg == text("through b, at once")),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}

@@ -307,8 +307,7 @@ async fn constant_rate_mode_delivers_and_hides_idle() {
     );
 }
 
-/// Under slow cover traffic a text waits for a tick; with pacing off it
-/// goes at once.
+/// Under slow cover traffic a text goes at once unless pacing is on.
 #[tokio::test]
 async fn unpaced_texts_skip_the_cover_ticks() {
     let dir = tempfile::tempdir().unwrap();
@@ -318,8 +317,7 @@ async fn unpaced_texts_skip_the_cover_ticks() {
     let addr = bob.listen("127.0.0.1:0").await.unwrap();
     let bob_id = alice.connect(&addr.to_string(), None).await.unwrap();
     bob.accept_contact(&alice.identity());
-    assert!(alice.pace_messages(), "paced by default");
-    alice.set_pace_messages(false);
+    assert!(!alice.pace_messages(), "unpaced by default");
     let started = std::time::Instant::now();
     alice.send_text(&bob_id, "now").unwrap();
     next(

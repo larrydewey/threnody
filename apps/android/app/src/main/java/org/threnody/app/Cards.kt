@@ -600,8 +600,7 @@ object Cards {
         ask(a, "Share a secret", body, {
             val t = title.text.toString().trim()
             val fs = fields.map { (name, f, hidden) -> SecretFieldInfo(name, f.text.toString().trim(), hidden) }.filter { it.value.isNotEmpty() }
-            val secs = when (expiry.selectedItemPosition) { 0 -> 3600u; 2 -> 7u * 86400u; else -> 86400u }
-            card(CardItemInfo.Secret(kind, t, fs, ""), viewOnce = once.isChecked, expiresInS = secs)
+            card(CardItemInfo.Secret(kind, t, fs, ""), viewOnce = once.isChecked, expiresInS = expirySeconds(expiry))
                 .takeIf { t.isNotEmpty() && fs.isNotEmpty() }
         }, send)
     }
@@ -609,18 +608,25 @@ object Cards {
     /** How long a secret stays, and whether it's seen once: the end of every secret form. */
     private fun secretOptions(a: Activity, body: LinearLayout): Pair<CheckBox, Spinner> {
         // In our own notes there's nobody to view it once.
-        val once = CheckBox(a).apply { text = "They can view it once"; isChecked = !notes; visibility = if (notes) View.GONE else View.VISIBLE }
+        val once = CheckBox(a).apply {
+            text = "They can view it once"
+            isChecked = !notes && Privacy.secretsViewOnce(a)
+            visibility = if (notes) View.GONE else View.VISIBLE
+        }
+        // As Settings starts it out: a day unless changed there; "for good" is a choice too.
+        val lives = Privacy.SECRET_LIVES
         val expiry = Spinner(a).apply {
-            adapter = ArrayAdapter(a, android.R.layout.simple_spinner_dropdown_item, listOf("Gone after 1 hour", "Gone after 1 day", "Gone after 1 week"))
-            setSelection(1)
+            adapter = ArrayAdapter(a, android.R.layout.simple_spinner_dropdown_item, lives.map { it.first })
+            setSelection(lives.indexOfFirst { it.second == Privacy.secretsLife(a) }.coerceAtLeast(0))
         }
         body.addView(once)
         body.addView(expiry)
-        body.addView(a.label("It isn't kept on this phone once sent, and isn't backed up.", 13f, R.color.muted, maxLines = 0))
+        val kept = if (notes || Privacy.keepSentSecrets(a)) "It stays readable on this phone" else "It isn't kept on this phone once sent"
+        body.addView(a.label("$kept, and isn't backed up.", 13f, R.color.muted, maxLines = 0))
         return once to expiry
     }
 
-    private fun expirySeconds(s: Spinner): UInt = when (s.selectedItemPosition) { 0 -> 3600u; 2 -> 7u * 86400u; else -> 86400u }
+    private fun expirySeconds(s: Spinner): UInt = Privacy.SECRET_LIVES.getOrNull(s.selectedItemPosition)?.second ?: 86_400u
 
     /**
      * A payment card, typed onto a picture of it: the card above updates

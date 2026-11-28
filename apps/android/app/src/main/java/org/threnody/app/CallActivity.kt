@@ -453,8 +453,9 @@ class CallActivity : Activity() {
             ticker.postDelayed({ finish() }, 1200)
             return
         }
-        // Ringing past app lock: say there's a call, not who (nor who's in it).
-        val hide = AppLock.locked()
+        // Ringing past app lock: say there's a call, not who (nor who's in
+        // it), unless asked to name them while the phone is unlocked.
+        val hide = AppLock.locked() && !CallerId.nameNow(this)
         who.text = when {
             !hide -> c.title
             c.group != null -> "Group call"

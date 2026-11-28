@@ -3290,7 +3290,7 @@ impl App {
         let page = adw::PreferencesPage::new();
         let privacy = adw::PreferencesGroup::builder()
             .title("Metadata protection")
-            .description("All on unless you switch them off.")
+            .description("All on unless you switch them off, but for hiding when you send, which slows messages down.")
             .build();
         let toggle = |group: &adw::PreferencesGroup, key: &'static str, title: &str, sub: &str| {
             let row = adw::SwitchRow::builder()

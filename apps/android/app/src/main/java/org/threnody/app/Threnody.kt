@@ -239,6 +239,7 @@ object Threnody {
         node.setOnionFirst(Privacy.onionFirst(ctx))
         node.setDefaultDisappearing(Privacy.defaultTimer(ctx))
         node.setStripMetadata(Privacy.stripMetadata(ctx))
+        node.setKeepSentSecrets(Privacy.keepSentSecrets(ctx))
         // Never on metered networks; re-applied when that changes.
         node.setAutoFetchFiles(Privacy.autoFetchFiles(ctx) && !Privacy.metered)
         // Kept by the node too, so it holds before this runs after a
