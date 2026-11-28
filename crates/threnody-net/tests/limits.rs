@@ -400,8 +400,10 @@ async fn a_session_too_far_behind_ends() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _arx) = node(&dir, "alice");
     let (bob, _brx) = node(&dir, "bob");
-    // A tick every 10 s: almost nothing leaves.
+    // A tick every 10 s, and paced, so everything waits for one: almost
+    // nothing leaves.
     alice.set_constant_rate(Some(Duration::from_secs(10)));
+    alice.set_pace_messages(true);
     let addr = bob.listen("127.0.0.1:0").await.unwrap().to_string();
     let bi = alice
         .connect(&addr, Some(bob.identity().fingerprint()))
