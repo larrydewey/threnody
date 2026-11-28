@@ -2508,9 +2508,14 @@ class ChatActivity : Activity() {
             if (e.id != 0uL && mayPin) add(if (pins.any { it.id == e.id }) "Unpin" else "Pin")
             if (e.poll != null && e.outgoing && e.poll?.closed == false) add("End poll")
             if (e.text.isNotEmpty()) add("Copy text")
-            // A file kept privately (sealed, so out of other apps' reach):
-            // a copy can go to Downloads. One already there needs none.
-            if (entries.size == 1 && e.file?.location?.startsWith("file:") == true) add("Save to Downloads")
+            // A copy of each file this phone holds can go to Downloads: kept
+            // privately (sealed, out of other apps' reach), or one we sent
+            // from wherever it was picked. An album, or a file sent with a
+            // message, offers them all. A received file already in
+            // Downloads ("· in Downloads") needs none.
+            val savable = savableFiles(entries)
+            if (savable.size == 1) add("Save to Downloads")
+            else if (savable.size > 1) add("Save all ${savable.size} to Downloads")
             if (canEdit) add("Edit")
             add("Delete for me")
             if (mine) {
@@ -2543,7 +2548,7 @@ class ChatActivity : Activity() {
                 return
             }
             if (option == "Select text") return selectText(e)
-            if (option == "Save to Downloads") return saveToDownloads(e)
+            if (option.startsWith("Save ") && option.endsWith(" to Downloads")) return saveToDownloads(savableFiles(entries))
             val noTrace = option == "Delete without a trace"
             val everyone = option == "Delete for everyone" || noTrace
             Threading.background {
@@ -2573,27 +2578,46 @@ class ChatActivity : Activity() {
     }
 
     /**
-     * Copies a message's privately kept file to Downloads/Threnody. A
+     * The files of `entries` this phone can copy to Downloads: any it holds,
+     * but a received one already kept there.
+     */
+    private fun savableFiles(entries: List<HistoryEntry>): List<HistoryEntry> = entries.filter { e ->
+        val location = e.file?.location ?: return@filter false
+        e.outgoing || !location.startsWith("content:")
+    }
+
+    /**
+     * Copies messages' files (one, or an album's) to Downloads/Threnody. A
      * sensitive or disappearing one is asked about first: the copy outlives
      * the message, and any app can read it.
      */
-    private fun saveToDownloads(e: HistoryEntry) {
-        val f = e.file ?: return
-        val location = f.location ?: return
+    private fun saveToDownloads(entries: List<HistoryEntry>) {
+        if (entries.isEmpty()) return
         val save = {
-            if (f.size > SAVE_NOTICE) Toast.makeText(this, "Saving ${f.name}…", Toast.LENGTH_SHORT).show()
+            val total = entries.sumOf { it.file?.size ?: 0uL }
+            if (total > SAVE_NOTICE || entries.size > 1) {
+                Toast.makeText(this, if (entries.size > 1) "Saving ${entries.size} files…" else "Saving ${entries[0].file?.name}…", Toast.LENGTH_SHORT).show()
+            }
             Threading.background {
-                val ok = Media.saveToDownloads(this, location, f.name)
+                val saved = entries.count { e ->
+                    val f = e.file ?: return@count false
+                    Media.saveToDownloads(this, f.location ?: return@count false, f.name)
+                }
                 runOnUiThread {
-                    Toast.makeText(this, if (ok) "Saved to Downloads/Threnody" else "Couldn't save", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, when {
+                        saved == entries.size -> if (saved > 1) "Saved $saved files to Downloads/Threnody" else "Saved to Downloads/Threnody"
+                        saved == 0 -> "Couldn't save"
+                        else -> "Saved $saved of ${entries.size} to Downloads/Threnody"
+                    }, Toast.LENGTH_SHORT).show()
                 }
             }
         }
-        if (!f.sensitive && !e.disappearing) return save()
+        val sensitive = entries.any { it.file?.sensitive == true }
+        if (!sensitive && entries.none { it.disappearing }) return save()
         SecureBuilder(this)
             .setTitle("Save to Downloads?")
             .setMessage(
-                (if (f.sensitive) "This file was sent as sensitive. " else "This message disappears. ") +
+                (if (sensitive) "This was sent as sensitive. " else "This message disappears. ") +
                     "The copy in Downloads stays after the message is gone, and any app with access to your files can read it."
             )
             .setPositiveButton("Save") { _, _ -> save() }
